@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -68,6 +69,27 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
+  const MockClaudeCodeCliSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'claude-code-cli-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'local',
+    capabilities: {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-cli-sdk'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
   const MockCodexSdkProvider = vi.fn().mockImplementation(() => ({
     id: 'codex-sdk',
     connectionMode: 'local-sdk',
@@ -87,6 +109,28 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     onComplete: vi.fn(),
     onError: vi.fn(),
     createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockQoderSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'qoder-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: false,
+      multiTurn: true,
+      attachments: false,
+      reasoningEffort: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-qoder'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
   const MockCursorHeadlessProvider = vi.fn().mockImplementation(() => ({
@@ -132,6 +176,27 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-2'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
+  const MockOpenCodeSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'opencode-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: true,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-opencode'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
   const MockKimiSdkProvider = vi.fn().mockImplementation(() => ({
     id: 'kimi-sdk',
     connectionMode: 'local-sdk',
@@ -153,8 +218,139 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-kimi'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider };
+  const MockHermesAcpProvider = vi.fn().mockImplementation(() => ({
+    id: 'hermes-acp',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-hermes'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockGrokSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'grok-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-grok'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockAgySdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'agy-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-agy'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockDeepseekHarnessProvider = vi.fn().mockImplementation(() => ({
+    id: 'deepseek-harness',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockPiProvider = vi.fn().mockImplementation(() => ({
+    id: 'pi',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-pi'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockMuseCodeSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'muse-code-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: true,
+      reasoningEffort: true,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-muse'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider };
 });
+
+vi.mock('../../src/agent/providers/muse-code-sdk.js', () => ({
+  MuseCodeSdkProvider: MockMuseCodeSdkProvider,
+}));
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
   OpenClawProvider: MockOpenClawProvider,
@@ -168,8 +364,16 @@ vi.mock('../../src/agent/providers/claude-code-sdk.js', () => ({
   ClaudeCodeSdkProvider: MockClaudeCodeSdkProvider,
 }));
 
+vi.mock('../../src/agent/providers/claude-code-cli-sdk.js', () => ({
+  ClaudeCodeCliSdkProvider: MockClaudeCodeCliSdkProvider,
+}));
+
 vi.mock('../../src/agent/providers/codex-sdk.js', () => ({
   CodexSdkProvider: MockCodexSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/qoder-sdk.js', () => ({
+  QoderSdkProvider: MockQoderSdkProvider,
 }));
 
 vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
@@ -180,8 +384,38 @@ vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
   CopilotSdkProvider: MockCopilotSdkProvider,
 }));
 
+vi.mock('../../src/agent/providers/deepseek-harness.js', () => ({
+  DeepseekHarnessProvider: MockDeepseekHarnessProvider,
+}));
+
+vi.mock('../../src/agent/providers/pi.js', () => ({
+  PiProvider: MockPiProvider,
+}));
+
+vi.mock('../../src/agent/providers/opencode-sdk.js', () => ({
+  OpenCodeSdkProvider: MockOpenCodeSdkProvider,
+}));
+
 vi.mock('../../src/agent/providers/kimi-sdk.js', () => ({
   KimiSdkProvider: MockKimiSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/hermes-acp.js', () => ({
+  HermesAcpProvider: MockHermesAcpProvider,
+}));
+
+vi.mock('../../src/agent/providers/grok-sdk.js', () => ({
+  GrokSdkProvider: MockGrokSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/agy-sdk.js', () => ({
+  AgySdkProvider: MockAgySdkProvider,
+}));
+
+// Registry lifecycle tests mock selection; native protocol selection is covered
+// by agy-acp-provider and the real-process AG ACP E2E.
+vi.mock('../../src/agent/providers/agy-acp.js', () => ({
+  createAgyProvider: async () => new MockAgySdkProvider(),
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -198,10 +432,12 @@ vi.mock('../../src/util/logger.js', () => ({
 import {
   getProvider,
   getAllProviders,
+  ensureProviderConnected,
   connectProvider,
   disconnectProvider,
   disconnectAll,
 } from '../../src/agent/provider-registry.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -248,6 +484,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('codex-sdk');
   });
 
+  it('returns qoder-sdk after connectProvider()', async () => {
+    await connectProvider('qoder-sdk', CONFIG);
+    const provider = getProvider('qoder-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('qoder-sdk');
+  });
+
   it('returns cursor-headless after connectProvider()', async () => {
     await connectProvider('cursor-headless', CONFIG);
     const provider = getProvider('cursor-headless');
@@ -262,11 +505,60 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('copilot-sdk');
   });
 
+  it('returns opencode-sdk after connectProvider()', async () => {
+    await connectProvider('opencode-sdk', CONFIG);
+    const provider = getProvider('opencode-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('opencode-sdk');
+  });
+
+  it('returns deepseek-harness after connectProvider()', async () => {
+    await connectProvider('deepseek-harness', CONFIG);
+    const provider = getProvider('deepseek-harness');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('deepseek-harness');
+  });
+
+  it('returns pi after connectProvider()', async () => {
+    await connectProvider('pi', CONFIG);
+    const provider = getProvider('pi');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('pi');
+  });
+
   it('returns kimi-sdk after connectProvider()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     const provider = getProvider('kimi-sdk');
     expect(provider).toBeDefined();
     expect(provider!.id).toBe('kimi-sdk');
+  });
+
+  it('returns muse-code-sdk after connectProvider()', async () => {
+    await connectProvider('muse-code-sdk', CONFIG);
+    const provider = getProvider('muse-code-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('muse-code-sdk');
+  });
+
+  it('returns hermes-acp after connectProvider()', async () => {
+    await connectProvider('hermes-acp', CONFIG);
+    const provider = getProvider('hermes-acp');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('hermes-acp');
+  });
+
+  it('returns grok-sdk after connectProvider()', async () => {
+    await connectProvider('grok-sdk', CONFIG);
+    const provider = getProvider('grok-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('grok-sdk');
+  });
+
+  it('returns agy-sdk after connectProvider()', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    const provider = getProvider(AGY_SDK_PROVIDER_ID);
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe(AGY_SDK_PROVIDER_ID);
   });
 
   it('returns undefined for an unknown id', () => {
@@ -294,9 +586,22 @@ describe('connectProvider', () => {
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
+  it('instantiates the independent Claude CLI stream-json SDK provider', async () => {
+    await connectProvider(CLAUDE_CODE_CLI_SDK_AGENT_TYPE, CONFIG);
+    expect(MockClaudeCodeCliSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+    expect(getProvider(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)?.id).toBe(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
+  });
+
   it('instantiates CodexSdkProvider and calls connect()', async () => {
     await connectProvider('codex-sdk', CONFIG);
     expect(MockCodexSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates QoderSdkProvider and calls connect()', async () => {
+    await connectProvider('qoder-sdk', CONFIG);
+    expect(MockQoderSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
@@ -312,10 +617,92 @@ describe('connectProvider', () => {
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
+  it('instantiates OpenCodeSdkProvider and calls connect()', async () => {
+    await connectProvider('opencode-sdk', CONFIG);
+    expect(MockOpenCodeSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates DeepseekHarnessProvider and calls connect()', async () => {
+    await connectProvider('deepseek-harness', CONFIG);
+    expect(MockDeepseekHarnessProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates PiProvider and calls connect()', async () => {
+    await connectProvider('pi', CONFIG);
+    expect(MockPiProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
   it('instantiates KimiSdkProvider and calls connect()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     expect(MockKimiSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates MuseCodeSdkProvider and calls connect()', async () => {
+    await connectProvider('muse-code-sdk', CONFIG);
+    expect(MockMuseCodeSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates HermesAcpProvider and calls connect()', async () => {
+    await connectProvider('hermes-acp', CONFIG);
+    expect(MockHermesAcpProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates GrokSdkProvider and calls connect()', async () => {
+    await connectProvider('grok-sdk', CONFIG);
+    expect(MockGrokSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('replaces an existing Grok provider before reconnecting', async () => {
+    await connectProvider('grok-sdk', CONFIG);
+    await connectProvider('grok-sdk', CONFIG);
+
+    expect(MockGrokSdkProvider).toHaveBeenCalledTimes(2);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+    expect(getAllProviders().filter((provider) => provider.id === 'grok-sdk')).toHaveLength(1);
+  });
+
+  it('reuses the connected Grok provider without starting a duplicate child', async () => {
+    const first = await ensureProviderConnected('grok-sdk', CONFIG);
+    const second = await ensureProviderConnected('grok-sdk', CONFIG);
+
+    expect(second).toBe(first);
+    expect(MockGrokSdkProvider).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+    expect(mockDisconnect).not.toHaveBeenCalled();
+  });
+
+  it('instantiates AgySdkProvider and calls connect()', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    expect(MockAgySdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('replaces an existing Agy provider before reconnecting', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+
+    expect(MockAgySdkProvider).toHaveBeenCalledTimes(2);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+    expect(getAllProviders().filter((provider) => provider.id === AGY_SDK_PROVIDER_ID)).toHaveLength(1);
+  });
+
+  it('reuses the connected Agy provider without starting a duplicate child', async () => {
+    const first = await ensureProviderConnected(AGY_SDK_PROVIDER_ID, CONFIG);
+    const second = await ensureProviderConnected(AGY_SDK_PROVIDER_ID, CONFIG);
+
+    expect(second).toBe(first);
+    expect(MockAgySdkProvider).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+    expect(mockDisconnect).not.toHaveBeenCalled();
   });
 
   it('throws for an unknown provider id', async () => {

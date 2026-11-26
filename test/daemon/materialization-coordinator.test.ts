@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor, type CompressionInput } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
-import { commitMaterialization, getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
+import { claimContextJob, commitMaterialization, getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
 import { getContextStoreClient, resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -179,6 +179,41 @@ describe('MaterializationCoordinator', () => {
     expect(second.summaryProjection.content.hadPreviousSummary).toBe(true);
   });
 
+  it('compresses a coalesced materialization job only once across overlapping callers', async () => {
+    let releaseCompression!: () => void;
+    let markCompressionStarted!: () => void;
+    const compressionStarted = new Promise<void>((resolve) => { markCompressionStarted = resolve; });
+    const compressionGate = new Promise<void>((resolve) => { releaseCompression = resolve; });
+    const compressor = vi.fn(async () => {
+      markCompressionStarted();
+      await compressionGate;
+      return {
+        summary: '## Problem\nDeduplicate overlapping materialization\n\n## Done\nCompressed once.',
+        model: 'test-model',
+        backend: 'test-backend',
+        usedBackup: false,
+        fromSdk: true,
+      };
+    });
+    const coordinator = new MaterializationCoordinator({
+      compressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'compress me once', createdAt: 100 });
+
+    const first = coordinator.materializeTarget(target, 'manual', 500);
+    await compressionStarted;
+    const duplicate = await coordinator.materializeTarget(target, 'manual', 501);
+
+    expect(duplicate).toEqual({ replicationQueued: false });
+    expect(compressor).toHaveBeenCalledTimes(1);
+
+    releaseCompression();
+    const completed = await first;
+    expect(completed.summaryProjection?.summary).toContain('Compressed once.');
+    expect(compressor).toHaveBeenCalledTimes(1);
+  });
+
   it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
@@ -206,17 +241,18 @@ describe('MaterializationCoordinator', () => {
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
     });
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor });
     expect(coordinator.modelConfig).toEqual({
+      modelSelectionMode: 'manual',
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
       primaryContextPreset: undefined,
       primaryContextSdk: undefined,
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen3-coder-plus',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
       backupContextPreset: undefined,
       backupContextSdk: undefined,
       enablePersonalMemorySync: true,
@@ -362,8 +398,13 @@ describe('MaterializationCoordinator', () => {
     const callSpy = vi.spyOn(client, 'call').mockImplementation(
       // Simulate the worker by running the real atomic commit in-process.
       (async (op: string, args: unknown[]) => {
-        if (op !== 'commitMaterialization') throw new Error(`unexpected op ${op}`);
-        return commitMaterialization(args[0] as Parameters<typeof commitMaterialization>[0]);
+        if (op === 'claimContextJob') {
+          return claimContextJob(args[0] as string, args[1] as number);
+        }
+        if (op === 'commitMaterialization') {
+          return commitMaterialization(args[0] as Parameters<typeof commitMaterialization>[0]);
+        }
+        throw new Error(`unexpected op ${op}`);
       }) as typeof client.call,
     );
 
@@ -529,5 +570,110 @@ describe('MaterializationCoordinator', () => {
     expect(result.summaryProjection.class).toBe('recent_summary');
     expect(result.durableProjection).toBeUndefined();
     expect(queryProcessedProjections({ projectId: namespace.projectId, projectionClass: 'durable_memory_candidate' })).toEqual([]);
+  });
+
+  it('auto-adapts compression backend/model live from usage context in auto mode and honors manual pinning', async () => {
+    const seenModelConfigs: Array<{ primaryContextBackend: string; primaryContextModel: string; backupContextBackend?: string; backupContextModel?: string; primaryContextPreset?: string }> = [];
+    let currentAgentType: string | undefined = 'agy-sdk';
+    let activeAgents: string[] = ['opencode-sdk', 'codex-sdk'];
+
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-6-luna',
+    });
+
+    const coordinator = new MaterializationCoordinator({
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      resolveUsageContext: () => ({
+        sessionAgentType: currentAgentType,
+        activeSessionAgentTypes: activeAgents,
+      }),
+      compressor: async (input: CompressionInput) => {
+        seenModelConfigs.push({
+          primaryContextBackend: input.modelConfig.primaryContextBackend,
+          primaryContextModel: input.modelConfig.primaryContextModel,
+          backupContextBackend: input.modelConfig.backupContextBackend,
+          backupContextModel: input.modelConfig.backupContextModel,
+          primaryContextPreset: input.modelConfig.primaryContextPreset,
+        });
+        return {
+          summary: '## Problem\nAuto adapted\n\n## Done\n- ok',
+          model: input.modelConfig.primaryContextModel,
+          backend: input.modelConfig.primaryContextBackend,
+          usedBackup: false,
+          fromSdk: true,
+          inputTokens: 10,
+          outputTokens: 10,
+          targetTokens: 200,
+          durationMs: 1,
+        };
+      },
+    });
+
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done 1', createdAt: 110 });
+    await coordinator.materializeTarget(target, 'manual', 200);
+    expect(seenModelConfigs[0]).toEqual({
+      primaryContextBackend: 'agy-sdk',
+      primaryContextModel: 'gemini-3.8-flash-low',
+      backupContextBackend: 'opencode-sdk',
+      backupContextModel: 'opencode/big-pickle',
+      primaryContextPreset: undefined,
+    });
+
+    // Switch session usage to claude-code (with only claude active) -> auto-adapts cleanly at runtime without restart.
+    currentAgentType = 'claude-code';
+    activeAgents = [];
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second', createdAt: 20_500 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done 2', createdAt: 20_510 });
+    await coordinator.materializeTarget(target, 'manual', 21_000);
+    expect(seenModelConfigs[1]).toEqual({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
+      primaryContextPreset: undefined,
+    });
+
+    // Switch live runtime config to manual with explicit model + preset -> respected immediately.
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M3',
+      primaryContextPreset: 'minimax',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
+    });
+    currentAgentType = 'agy-sdk';
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'third', createdAt: 41_000 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done 3', createdAt: 41_010 });
+    await coordinator.materializeTarget(target, 'manual', 41_500);
+    expect(seenModelConfigs[2]).toEqual({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M3',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
+      primaryContextPreset: 'minimax',
+    });
+
+    // Switch live runtime config to manual non-Luna Codex models on both primary & backup -> preserved without Luna override.
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
+    });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fourth', createdAt: 62_000 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done 4', createdAt: 62_010 });
+    await coordinator.materializeTarget(target, 'manual', 62_500);
+    expect(seenModelConfigs[3]).toEqual({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
+      primaryContextPreset: undefined,
+    });
   });
 });

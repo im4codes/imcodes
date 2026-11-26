@@ -6,16 +6,16 @@
  * Completion = file grew + agent idle.
  */
 
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile, open } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
-import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
-import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
+import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import {
   P2P_BASELINE_PROMPT,
   getLegacyExecutionRoundCount,
@@ -112,7 +112,8 @@ import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { getFreshResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import { removeResendEntries } from './transport-resend-queue.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import {
   evaluateP2pLaunchAdmission,
   sanitizeP2pLaunchOriginForProjection,
@@ -977,7 +978,8 @@ async function dispatchP2pPromptToSession(args: {
   const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
   if (transportRuntime) {
     const commandId = buildP2pPromptCommandId(args.run, args.session, args.reason);
-    const result = transportRuntime.send(args.prompt, commandId);
+    // The origin rides a queued copy too: the drain projects its user.message.
+    const result = transportRuntime.send(args.prompt, commandId, undefined, undefined, { messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
     if (result === 'sent') {
       timelineEmitter.emit(args.session, 'user.message', {
         text: args.prompt,
@@ -1000,7 +1002,16 @@ async function dispatchP2pPromptToSession(args: {
   if (record?.runtimeType === 'transport') {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
-  await sendKeysDelayedEnter(args.session, args.prompt);
+  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
+    userMessageMetadata: {
+      ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+      memoryExcluded: true,
+      p2pRunId: args.run.id,
+      p2pDiscussionId: args.run.discussionId,
+      p2pPhase: args.run.activePhase,
+    },
+  });
   return { mode: 'tmux' };
 }
 
@@ -1036,19 +1047,11 @@ function isP2pRunPromptEntry(run: P2pRun, entry: { clientMessageId?: string; com
 }
 
 function emitP2pQueueSnapshot(session: string, runtime: ReturnType<typeof getTransportRuntime> | undefined): void {
-  const resendEntries = runtime ? [] : getFreshResendEntries(session);
+  void runtime;
+  const queuePayload = buildTransportQueueSnapshotPayload(session, 'p2p_orchestrator');
   timelineEmitter.emit(session, 'session.state', {
-    state: runtime?.pendingCount || resendEntries.length > 0 ? 'queued' : 'idle',
-    pendingCount: runtime?.pendingCount ?? resendEntries.length,
-    pendingMessages: runtime?.pendingMessages ?? resendEntries.map((entry) => entry.text),
-    pendingMessageEntries: runtime?.pendingEntries ?? resendEntries.map((entry) => ({
-      clientMessageId: entry.commandId,
-      text: entry.text,
-      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-    })),
-    ...(runtime
-      ? { pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion) }
-      : (typeof getTransportQueueRevision(session) === 'number' ? { pendingMessageVersion: getTransportQueueRevision(session) } : {})),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -1113,27 +1116,7 @@ async function getOrRestoreP2pTransportRuntime(sessionName: string): Promise<Ret
 async function restoreP2pTransportRuntime(record: SessionRecord, reason: 'missing_runtime'): Promise<void> {
   logger.warn({ session: record.name, reason }, 'P2P: restoring transport runtime before prompt dispatch');
   await stopTransportRuntimeSession(record.name).catch(() => undefined);
-  await launchTransportSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: record.agentType as any,
-    projectDir: record.projectDir,
-    label: record.label,
-    description: record.description,
-    requestedModel: record.requestedModel,
-    effort: record.effort,
-    transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
-    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
-    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId } : {}),
-    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-  });
+  await launchTransportSession(buildTransportResumeLaunchOpts(record));
 }
 
 function emitP2pTransportQueuedState(
@@ -1147,17 +1130,15 @@ function emitP2pTransportQueuedState(
       runId: run.id,
       session,
       reason,
-      pendingCount: runtime.pendingCount,
-      pendingVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+      runtimePendingCount: runtime.pendingCount,
+      runtimePendingVersion: runtime.pendingVersion,
     },
     'P2P: transport prompt queued behind active turn',
   );
+  const queuePayload = buildTransportQueueSnapshotPayload(session, 'p2p_orchestrator');
   timelineEmitter.emit(session, 'session.state', {
-    state: 'queued',
-    pendingCount: runtime.pendingCount,
-    pendingMessages: runtime.pendingMessages,
-    pendingMessageEntries: runtime.pendingEntries,
-    pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -1234,12 +1215,9 @@ async function isP2pCompletionIdle(
 
   const record = getSession(session);
   const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-  const useStoreState = agentType === 'gemini';
 
   try {
-    return useStoreState
-      ? record?.state === 'idle'
-      : await detectStatusAsync(session, agentType) === 'idle';
+    return await detectStatusAsync(session, agentType) === 'idle';
   } catch (err) {
     logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while completing hop');
     return idleEventReceived;
@@ -1967,11 +1945,8 @@ async function isPostSummaryMarkerRetryReady(
   if (Date.now() - dispatchStartedAt < MIN_PROCESSING_MS) return false;
   const record = getSession(session);
   const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-  const useStoreState = agentType === 'gemini';
   try {
-    return useStoreState
-      ? record?.state === 'idle'
-      : await detectStatusAsync(session, agentType) === 'idle';
+    return await detectStatusAsync(session, agentType) === 'idle';
   } catch (err) {
     logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting to retry marker prompt');
     return false;

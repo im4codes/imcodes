@@ -47,7 +47,7 @@ beforeAll(async () => {
     APNS_KEY_ID: undefined,
     APNS_TEAM_ID: undefined,
     APNS_BUNDLE_ID: 'app.imcodes',
-    FCM_SERVER_KEY: undefined,
+    FCM_SERVICE_ACCOUNT_JSON: undefined,
     PUSH_RELAY_URL: 'https://app.im.codes',
   } as Env;
 

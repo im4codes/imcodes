@@ -1,5 +1,50 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FILE_TRANSFER_DIRECTORY_PATH, macosFullDiskAccessTargetOfError, type MacosFullDiskAccessTarget } from '@shared/transport/file-transfer.js';
+import { openMacosFullDiskAccessSettings } from '../api/machines.js';
+import { formatByteSize } from '../util/byte-size.js';
+import {
+  FILE_BROWSER_FILTER_DEBOUNCE_MS,
+  FILE_BROWSER_FILTER_MAX_QUERY_CHARS,
+  FILE_BROWSER_SORT_DIRECTIONS,
+  FILE_BROWSER_SORT_KEYS,
+  applyFileBrowserView,
+  isFileBrowserSortKeyAvailable,
+  parseFileBrowserFilter,
+  type FileBrowserSortKey,
+  type FileBrowserSortState,
+} from '@shared/file-browser-sort.js';
+import { fileKindOf } from '@shared/file-kind.js';
+import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES, type FileDirectoryListQuery } from '@shared/transport/file-transfer.js';
+import {
+  FILE_BROWSER_COLUMN_KEYS,
+  fileBrowserTableMinWidth,
+  fileBrowserMaxVisibleDepth,
+  FILE_BROWSER_INDENT_PX,
+  fileKindLabel,
+  formatFileBrowserDate,
+  loadFileBrowserHiddenColumns,
+  loadFileBrowserSortPreference,
+  saveFileBrowserHiddenColumns,
+  saveFileBrowserSortPreference,
+} from '../file-browser-list-view.js';
+import { FileBrowserListHeader, FileBrowserListToolbar } from './FileBrowserListChrome.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
+import { FileTypeIcon } from './FileTypeIcon.js';
+import {
+  areFsPathsEqual,
+  buildChildFsPath,
+  canDropPathIntoDir,
+  collectVisibleTreeEntries,
+  computeDirGitStatus,
+  getParentDirPath,
+  getPathBasename,
+  getRenameSelectionRange,
+  isPathEqualOrDescendant,
+  isValidEntryName,
+  toRelativeDisplayPath,
+  type DirGitStatusKind,
+} from './file-browser-tree-utils.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -15,31 +60,73 @@ import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
-import { lazy, Suspense } from 'preact/compat';
+import { lazy, memo, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { isInternalUploadTempFilePath, isMarkdownFilePath } from '@shared/cloud-docs.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
-import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
+import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
-import { downloadAttachment, getApiBaseUrl } from '../api.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
+import {
+  browseSharedDocFolder,
+  buildAttachmentDownloadUrl,
+  createSharedDocItem,
+  downloadAttachment,
+  listDocsSharedWithMe,
+  recordRecentDocumentApi,
+  type DocShareBrowseEntry,
+  type SharedWithMeDocItem,
+} from '../api.js';
+import { DocShareDialog, ExternalDocShareSpace } from './DocShareDialog.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  prewarmDirectFileLease,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import { isElectronPcAppRuntime } from '../download-destination.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
+import {
+  beginDownloadTransfer,
+  failDownloadTransfer,
+  isDownloadTransferPaused,
+  setDownloadTransferRetry,
+} from '../download-transfer-store.js';
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
+  subscribeSharedChangesMeta,
+  subscribeSharedChangesStatus,
   requestSharedChanges,
   __resetSharedChangesForTests,
   type ChangeFile,
+  type SharedChangesMeta,
+  type SharedChangesRequestStatus,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
+import {
+  getFileBrowserCache,
+  makeFileBrowserCacheKey,
+  mergePreservedExpandedChildren,
+  setFileBrowserCache,
+} from '../file-browser-cache.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 const PREF_KEY = 'fb_prefer_editor';
+export const CHANGES_RENDER_BATCH_SIZE = 200;
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 /** Sentinel path that asks the daemon to list Windows drive roots. */
-const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_PATH = FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -126,7 +213,45 @@ export interface FileBrowserProps {
   serverId?: string;
   /** Session whose project directory scopes rename/delete requests. */
   sessionName?: string;
-  onConfirm: (paths: string[]) => void;
+  /** Apply the session project-root boundary to all browse/read/write commands. */
+  scopeToSessionRoot?: boolean;
+  /** Hide mutation controls while preserving browse, preview, and download. */
+  readOnly?: boolean;
+  /** Allow opening DocShare controls for files/folders on this server (false for shared-in callers). */
+  canShare?: boolean;
+  /** Report the current single-selection to an embedded host control. */
+  onSelectedPathChange?: (path: string | null, isDirectory: boolean) => void;
+  /** Report directory navigation so an embedded uploader can target it. */
+  onCurrentPathChange?: (path: string) => void;
+  /** Embedded hosts may provide their own primary action outside the browser. */
+  hideBreadcrumbConfirm?: boolean;
+  /**
+   * Show a one-click row for the user's home / Desktop / Downloads / Documents.
+   *
+   * Opt-in because only a remote-machine browser can honour it: the paths are
+   * sentinels the DAEMON resolves (see FILE_TRANSFER_DIRECTORY_PATH), so a
+   * browser pointed at anything else would navigate to a literal ":desktop:".
+   */
+  quickAccess?: boolean;
+  /**
+   * Show the list as a table (name / size / kind / modified / created) with
+   * sortable column headers and a quick name filter. Opt-in: only a listing
+   * that carries file details (a controlled node's) fills the columns, so the
+   * other hosts keep the plain tree.
+   */
+  listView?: boolean;
+  /**
+   * `ws.fsListDir` honours a `query` (the machine filters and orders the
+   * listing before cutting it to its entry limit). Only meaningful with
+   * `listView`; without it the browser sorts and filters what it has.
+   */
+  /** Enable live filename filter query input above the file list. */
+  directoryQuery?: boolean;
+  /** Open Controlled Nodes → Groups management from the share dialog. */
+  onOpenNodeGroups?: () => void;
+  /** The second argument exposes the already-loaded single-file preview so a
+   * host can consume explicitly selected text without issuing a duplicate read. */
+  onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
   onDirectoryCreated?: (path: string) => void;
@@ -157,6 +282,22 @@ type FsNode = {
   hidden?: boolean;
   children?: FsNode[];  // undefined = leaf/file; [] = unloaded dir; [...] = loaded
   isLoading?: boolean;
+  /** Volume capacity, present only on volume roots the daemon could measure. */
+  totalBytes?: number;
+  freeBytes?: number;
+  /** File details a controlled node's listing carries (absent from an older node's). */
+  size?: number;
+  mtimeMs?: number;
+  birthtimeMs?: number;
+  /** Controlled download handle ID when supplied by ls metadata. */
+  downloadId?: string;
+  /**
+   * How the children of this directory were obtained. `complete`: every entry
+   * of the directory is here (an unfiltered listing that was not cut), so the
+   * browser can sort and filter it with no request. Otherwise the machine
+   * filtered or cut it, and a different sort or filter needs a new request.
+   */
+  listing?: { complete: boolean; truncated?: { total: number }; partial?: true };
 };
 
 interface FileBrowserSnapshot {
@@ -246,9 +387,15 @@ export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
-  | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
-  | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
+  /** `dataUrl` holds the chunked HTTP download URL (no inline data: payload). */
+  // tsk_5rf R3: `settling` means the URL is built and the browser is still
+  // fetching it. The pane keeps reporting loading until the real <img> load
+  // event, so a slow or never-loading handle can never look like a rendered
+  // (but empty) image.
+  | { status: 'image'; path: string; dataUrl: string; downloadId?: string; settling?: boolean }
+  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string; verified?: boolean }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
+  | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
 
 export interface FileBrowserPreviewRequest {
@@ -275,16 +422,7 @@ export interface FileBrowserPreviewUpdate {
  * and the Windows drive-root case (C: → C:\). Returns null when there is no
  * parent (already at a root). Mirrors the logic in `goUp`.
  */
-export function getParentDir(p: string): string | null {
-  const normalized = p.replace(/[/\\]+$/, '');
-  const sep = normalized.includes('\\') ? '\\' : '/';
-  const idx = normalized.lastIndexOf(sep);
-  if (idx < 0) return null;
-  if (idx === 0) return sep; // direct child of the unix root → '/'
-  let parent = normalized.slice(0, idx);
-  if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; // Windows drive root: C: → C:\
-  return parent;
-}
+export const getParentDir = getParentDirPath;
 
 export function mergePreviewState(
   current: FileBrowserPreviewState,
@@ -308,16 +446,53 @@ export function mergePreviewState(
   return filePreviewStatesEqual(current, incoming) ? current : incoming;
 }
 
-/** File extensions that can be previewed with office document libraries. */
+/** File extensions that can be previewed with office document libraries or ONLYOFFICE. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
+  '.md': 'text/markdown',
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.csv': 'text/csv',
+  '.doc': 'application/msword',
+  '.xls': 'application/vnd.ms-excel',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.odt': 'application/vnd.oasis.opendocument.text',
+  '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+  '.odp': 'application/vnd.oasis.opendocument.presentation',
 };
 
 function getOfficeType(path: string): string | null {
   const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
   return ext ? (OFFICE_EXTENSIONS[ext] ?? null) : null;
+}
+
+/** Keep `.csv` as plain text on automatic `fs.read_response` entry paths; ONLYOFFICE stays explicit opt-in. */
+function getAutoOfficePreviewType(path: string): string | null {
+  const mimeType = getOfficeType(path);
+  return mimeType && mimeType !== 'text/csv' ? mimeType : null;
+}
+
+const NATIVE_TEXT_SWITCHABLE_MIMES = new Set(['text/markdown', 'text/plain', 'text/csv']);
+
+/** Plain-text-capable formats opened in ONLYOFFICE can switch back to the native text preview/editor. */
+function isNativeTextSwitchableFile(path: string, mimeType?: string): boolean {
+  if (/\.(md|markdown|txt|csv)$/i.test(path)) return true;
+  return !!mimeType && NATIVE_TEXT_SWITCHABLE_MIMES.has(mimeType.toLowerCase());
+}
+
+function detectExternalDocShareToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get('docShare')?.trim();
+    if (fromQuery) return fromQuery;
+    const pathMatch = window.location.pathname.match(/^\/doc-share\/([^/?#]+)/);
+    if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
+  } catch {
+    /* ignore */
+  }
+  return null;
 }
 
 /** File extensions playable in the browser <video> element. Mirrored from
@@ -328,7 +503,6 @@ const VIDEO_EXTENSIONS: Record<string, string> = {
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',
   '.ogv': 'video/ogg',
-  '.ogg': 'video/ogg',
   '.mkv': 'video/x-matroska',
   '.avi': 'video/x-msvideo',
 };
@@ -338,12 +512,23 @@ function getVideoType(path: string): string | null {
   return ext ? (VIDEO_EXTENSIONS[ext] ?? null) : null;
 }
 
-/** Build the HTTP URL the <video> element fetches from. Cookies authenticate
- *  the request on desktop browsers; native (iOS) callers must use a token URL
- *  instead — handled separately when we mint the stream URL. */
-function buildVideoStreamUrl(serverId: string, downloadId: string): string {
-  const baseUrl = getApiBaseUrl();
-  return `${baseUrl}/api/server/${serverId}/uploads/${encodeURIComponent(downloadId)}/download`;
+/** File extensions playable in the browser <audio> element. Mirrored from
+ *  AUDIO_MIME_BY_EXTENSION in src/daemon/file-preview-classifier.ts — keep these in sync. */
+const AUDIO_EXTENSIONS: Record<string, string> = {
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+  '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.weba': 'audio/webm',
+};
+
+function getAudioType(path: string): string | null {
+  const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
+  return ext ? (AUDIO_EXTENSIONS[ext] ?? null) : null;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -359,6 +544,17 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
+function findNodeChildren(nodes: FsNode[], targetId: string): FsNode[] | undefined {
+  for (const node of nodes) {
+    if (node.id === targetId) return node.children;
+    if (node.children?.length) {
+      const found = findNodeChildren(node.children, targetId);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
 function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
   for (const node of nodes) {
     if (node.id === targetId) return [node.id];
@@ -370,8 +566,26 @@ function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
   return null;
 }
 
+function findNodeById(nodes: readonly FsNode[], targetId: string): FsNode | undefined {
+  for (const node of nodes) {
+    if (node.id === targetId) return node;
+    if (node.children?.length) {
+      const found = findNodeById(node.children, targetId);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 type PendingPreviewReason = 'interactive' | 'refresh';
-type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
+type PendingPreviewRequest = {
+  path: string;
+  cycleId: number;
+  reason?: PendingPreviewReason;
+  startedAt?: number;
+  forceNativeText?: boolean;
+  openEditor?: boolean;
+};
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
 type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | HtmlPreviewViewMode | 'edit';
 type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
@@ -429,6 +643,27 @@ function gitStatusBadge(code: string): string {
   return code;
 }
 
+function hasIgnoredAncestor(filePath: string, modifiedFiles: ReadonlyMap<string, string>): boolean {
+  let cur = getParentDir(filePath);
+  let guard = 0;
+  while (cur && guard++ < 64) {
+    if (modifiedFiles.get(cur) === '!!') return true;
+    cur = getParentDir(cur);
+  }
+  return false;
+}
+
+function resolveNodeGitCode(
+  filePath: string,
+  modifiedFiles: ReadonlyMap<string, string>,
+  parentIgnored = false,
+): string | undefined {
+  const direct = modifiedFiles.get(filePath);
+  if (direct) return direct;
+  if (parentIgnored || hasIgnoredAncestor(filePath, modifiedFiles)) return '!!';
+  return undefined;
+}
+
 export function FileBrowser({
   ws,
   mode,
@@ -453,34 +688,102 @@ export function FileBrowser({
   defaultTab = 'files',
   onInsertPath,
   sessionName,
+  scopeToSessionRoot = false,
+  readOnly = false,
+  canShare = true,
+  onSelectedPathChange,
+  onCurrentPathChange,
+  hideBreadcrumbConfirm = false,
+  quickAccess = false,
+  listView = false,
+  directoryQuery = false,
+  onOpenNodeGroups,
 }: FileBrowserProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const resolvedOnOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
+  // react-i18next may provide a new `t` function after every render. Keep
+  // preview callbacks stable: auto-preview effects depend on them, and a
+  // changing callback would re-dispatch the same chat preview indefinitely.
+  const tRef = useRef(t);
+  tRef.current = t;
+  const uiLocale = i18n?.language || 'en';
   const includeFiles = mode !== 'dir-only';
+  const scopedSessionName = scopeToSessionRoot ? sessionName : undefined;
   const isMulti = mode === 'file-multi';
 
-  const startPath = initialPath || '~';
-  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
-  const [data, setData] = useState<FsNode[]>([
-    {
-      id: startPath,
-      name: startPath,
-      isDir: true,
-      children: initialTreeSnapshot?.rootChildren ?? [],
-    },
-  ]);
+  const startPath = scopeToSessionRoot && (!initialPath || initialPath === '~')
+    ? FS_SESSION_ROOT_PATH
+    : (initialPath || '~');
+  const markdownReferenceRoot = [changesRootPath, startPath].find((path) => (
+    !!path && path !== '~' && path !== FS_SESSION_ROOT_PATH && path !== WINDOWS_DRIVES_PATH
+  ));
+  // A cached tree has no file details and no record of how it was listed, so
+  // the table view always lists afresh.
+  const loadSnapshot: typeof loadFileBrowserSnapshot = (...args) => (listView || scopedSessionName ? null : loadFileBrowserSnapshot(...args));
+  const initialCacheKey = makeFileBrowserCacheKey({
+    serverId,
+    scopedSessionName,
+    startPath,
+    includeFiles,
+    showHidden: DEFAULT_SHOW_HIDDEN_FILES,
+    listView: Boolean(listView),
+  });
+  const initialMemoryCache = getFileBrowserCache(initialCacheKey);
+  const initialTreeSnapshot = initialMemoryCache ? null : loadSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
+  const [data, setData] = useState<FsNode[]>(() => (
+    initialMemoryCache?.data.length
+      ? initialMemoryCache.data
+      : [
+          {
+            id: startPath,
+            name: startPath,
+            isDir: true,
+            children: initialTreeSnapshot?.rootChildren ?? [],
+          },
+        ]
+  ));
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(
     () => new Set(highlightPath ? [highlightPath] : []),
   );
-  const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
+  const [currentLabel, setCurrentLabel] = useState(() => initialMemoryCache?.currentLabel ?? initialTreeSnapshot?.currentLabel ?? startPath);
   // Refs so callbacks/handlers that are defined BEFORE `navigateTo` / read
   // `currentLabel` (fetchPreview, the WS message handler) can use the latest
   // value without a declaration-order or stale-closure problem.
   const navigateToRef = useRef<(path: string) => void>(() => {});
+  const pickingDownloadDestinationRef = useRef(false);
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  // The last root-level location a fetch actually resolved -- distinct from
+  // currentLabelRef, which by the time a failed fetch's response arrives
+  // already holds the OPTIMISTIC (possibly bogus, e.g. an unresolved
+  // ":downloads:" sentinel) label jumpTo set before the request even went
+  // out. A failed root navigation reverts HERE, not to whatever currentLabel
+  // happens to be at that moment.
+  const lastGoodLabelRef = useRef(initialMemoryCache?.currentLabel ?? initialTreeSnapshot?.currentLabel ?? startPath);
+  useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
+
+  // ── Table view: sort, quick filter ──────────────────────────────────────
+  const [sort, setSort] = useState<FileBrowserSortState>(() => loadFileBrowserSortPreference(serverId));
+  // Columns the person hid (none by default), remembered per machine. The name column is never hideable.
+  const [hiddenColumns, setHiddenColumns] = useState<ReadonlySet<FileBrowserSortKey>>(() => loadFileBrowserHiddenColumns(serverId));
+  const [filterInput, setFilterInput] = useState('');
+  const [appliedFilter, setAppliedFilter] = useState('');
+  // Read by fetchDir at request time, so a listing always carries the sort and
+  // filter in force when it was asked for, without re-creating fetchDir.
+  const sortRef = useRef(sort);
+  sortRef.current = sort;
+  const appliedFilterRef = useRef(appliedFilter);
+  appliedFilterRef.current = appliedFilter;
+  const filterComposingRef = useRef(false);
+  const pendingQueryRef = useRef(new Map<string, { hadQuery: boolean; filter: string }>());
   const [error, setError] = useState<string | null>(null);
+  // Set only for the specific "this machine's Downloads/Desktop/Documents
+  // are TCC-blocked" signal, never for generic errors -- those keep using
+  // the small ⚠ nav-button indicator. Cleared on the next successful fetch
+  // and whenever the user dismisses or acts on it.
+  const [macosFdaPrompt, setMacosFdaPrompt] = useState<{ requesting: boolean; requestFailed: boolean; target: MacosFullDiskAccessTarget } | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
@@ -505,8 +808,11 @@ export function FileBrowser({
 
   // Editor state (logic lives in FileEditor component)
   const [isEditing, setIsEditing] = useState(() => {
+    if (readOnly) return false;
     try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; }
   });
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   const [editDirty, setEditDirty] = useState(false);
   const [editContent, setEditContent] = useState('');
   const editDirtyRef = useRef(false);
@@ -522,8 +828,59 @@ export function FileBrowser({
 
   const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
   const [newEntryName, setNewEntryName] = useState('');
+  const [newDocType, setNewDocType] = useState<'' | '.docx' | '.xlsx' | '.pptx' | '.md'>('');
+  const newEntryNameRef = useRef(newEntryName);
+  newEntryNameRef.current = newEntryName;
+  const newDocTypeRef = useRef(newDocType);
+  newDocTypeRef.current = newDocType;
+  const [shareDialogTarget, setShareDialogTarget] = useState<{ path: string; kind: 'file' | 'folder' } | null>(null);
+  const [showSharedDocs, setShowSharedDocs] = useState(false);
+  const [sharedDocs, setSharedDocs] = useState<SharedWithMeDocItem[]>([]);
+  const [sharedDocsLoading, setSharedDocsLoading] = useState(false);
+  const [sharedFolderView, setSharedFolderView] = useState<{
+    serverId: string;
+    rootPath: string;
+    currentPath: string;
+    role: 'viewer' | 'editor';
+    entries: DocShareBrowseEntry[];
+  } | null>(null);
+  const [activeSharedDocServerId, setActiveSharedDocServerId] = useState<string | undefined>(undefined);
+  const [activeSharedDocReadOnly, setActiveSharedDocReadOnly] = useState<boolean | undefined>(undefined);
+  const effectivePreviewReadOnly = Boolean(activeSharedDocReadOnly ?? readOnly);
+  const effectivePreviewReadOnlyRef = useRef(effectivePreviewReadOnly);
+  effectivePreviewReadOnlyRef.current = effectivePreviewReadOnly;
+  useEffect(() => {
+    if (effectivePreviewReadOnly) setIsEditing(false);
+  }, [effectivePreviewReadOnly]);
+  const [sharedNewName, setSharedNewName] = useState('');
+  const [sharedNewKind, setSharedNewKind] = useState<'docx' | 'xlsx' | 'pptx' | 'md' | 'folder'>('docx');
+  const [sharedShowCreate, setSharedShowCreate] = useState(false);
+  const sharedFolderEpochRef = useRef(0);
+  const externalShareToken = useMemo(() => detectExternalDocShareToken(), []);
+  const [navSearchInput, setNavSearchInput] = useState('');
+  const [navSearchCommitNonce, setNavSearchCommitNonce] = useState(0);
+  const [navSearchState, setNavSearchState] = useState<{
+    status: 'idle' | 'loading' | 'done' | 'error';
+    results: string[];
+    error?: string;
+  }>({ status: 'idle', results: [] });
+  const navSearchInputElRef = useRef<HTMLInputElement | null>(null);
+  const navSearchCompositionCleanupRef = useRef<(() => void) | null>(null);
+  const navSearchComposingRef = useRef(false);
+  const navSearchRequestIdRef = useRef<string | null>(null);
+  const navSearchBasePathRef = useRef<string>('');
+  const navSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
-  const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
+  const [focusedPath, setFocusedPath] = useState<string | null>(() => highlightPath ?? null);
+  const [renamingPath, setRenamingPath] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [draggedPath, setDraggedPath] = useState<string | null>(null);
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
+  const dragSourcePathRef = useRef<string | null>(null);
+  const treeContainerRef = useRef<HTMLDivElement | null>(null);
+  const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(
+    () => (initialMemoryCache ? new Map(initialMemoryCache.modifiedFiles) : new Map()),
+  ); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
   const [treeWidth, setTreeWidth] = useState<number>(() => {
@@ -548,6 +905,10 @@ export function FileBrowser({
     try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
   };
   const [changesFiles, setChangesFiles] = useState<ChangeFile[]>([]);
+  const [changesMeta, setChangesMeta] = useState<SharedChangesMeta>({ totalCount: 0, truncated: false });
+  const [changesVisibleLimit, setChangesVisibleLimit] = useState(CHANGES_RENDER_BATCH_SIZE);
+  const [changesRefreshStatus, setChangesRefreshStatus] = useState<SharedChangesRequestStatus>('idle');
+  const changesRefreshFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadedRef = useRef(new Set<string>());
   const pendingRef = useRef(new Map<string, string>()); // requestId → nodeId
@@ -560,13 +921,17 @@ export function FileBrowser({
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
-  const pendingRenameRef = useRef(new Map<string, { parentPath: string; sourcePath: string; targetPath: string }>());
+  const pendingRenameRef = useRef(new Map<string, { parentPath: string; targetParentPath?: string; sourcePath: string; targetPath: string }>());
   const pendingDeleteRef = useRef(new Map<string, { parentPath: string | null; targetPath: string }>());
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  // A terminal error from the current request must not be treated as a fresh
+  // auto-preview target on every render, but an error supplied as the initial
+  // cached state must get one real retry when the chat opens it again.
+  const previewErrorPathRef = useRef<string | null>(null);
   const autoPreviewPathRef = useRef(autoPreviewPath);
   useEffect(() => { autoPreviewPathRef.current = autoPreviewPath; }, [autoPreviewPath]);
   const previewTabOverridePathRef = useRef<string | null>(null);
@@ -577,6 +942,13 @@ export function FileBrowser({
   const historyRef = useRef<string[]>([startPath]);
   const historyIdxRef = useRef(0);
   const [canGoBack, setCanGoBack] = useState(false);
+
+  useEffect(() => {
+    if (externalShareToken || mode === 'dir-only' || (!serverId && !activeSharedDocServerId)) {
+      return;
+    }
+    void prewarmOnlyOfficeComponents();
+  }, [externalShareToken, mode, serverId, activeSharedDocServerId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -599,6 +971,17 @@ export function FileBrowser({
       timersRef.current.clear();
     };
   }, []);
+
+  useLayoutEffect(() => {
+    if (!contextMenu || !contextMenuRef.current) return;
+    const rect = contextMenuRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const clampedX = Math.max(8, Math.min(contextMenu.x, Math.max(8, window.innerWidth - rect.width - 8)));
+    const clampedY = Math.max(8, Math.min(contextMenu.y, Math.max(8, window.innerHeight - rect.height - 8)));
+    if (clampedX !== contextMenu.x || clampedY !== contextMenu.y) {
+      setContextMenu((prev) => (prev ? { ...prev, x: clampedX, y: clampedY } : null));
+    }
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -629,8 +1012,8 @@ export function FileBrowser({
   useEffect(() => {
     const root = data[0];
     if (!root || root.isLoading || !root.children) return;
-    saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
-  }, [currentLabel, data, includeFiles, serverId, showHidden, startPath]);
+    if (!listView && !scopedSessionName) saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
+  }, [currentLabel, data, includeFiles, listView, serverId, showHidden, startPath]);
 
   const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
     const active = activePreviewCycleRef.current;
@@ -666,6 +1049,22 @@ export function FileBrowser({
     pendingPreviewTimersRef.current.clear();
   }, []);
 
+  const finishPreviewError = useCallback((
+    path: string,
+    error: string,
+    downloadId?: string,
+  ) => {
+    previewErrorPathRef.current = path;
+    activePreviewCycleRef.current = null;
+    for (const [requestId, pending] of pendingGitDiffRef.current) {
+      if (pending.path === path) clearPendingPreviewRequest('diff', requestId);
+    }
+    for (const key of pendingPreviewDiffRef.current.keys()) {
+      if (key.endsWith(`\0${path}`)) pendingPreviewDiffRef.current.delete(key);
+    }
+    setPreview({ status: 'error', path, error, ...(downloadId ? { downloadId } : {}) });
+  }, [clearPendingPreviewRequest]);
+
   const handlePreviewRequestTimeout = useCallback((kind: 'read' | 'diff', requestId: string) => {
     const request = clearPendingPreviewRequest(kind, requestId);
     if (!request || !mountedRef.current) return;
@@ -676,9 +1075,8 @@ export function FileBrowser({
     if (kind === 'diff') return;
     const active = getActivePreviewCycle();
     if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
-    activePreviewCycleRef.current = null;
-    setPreview({ status: 'error', path: request.path, error: t('file_browser.preview_error') });
-  }, [clearPendingPreviewRequest, getActivePreviewCycle, t]);
+    finishPreviewError(request.path, tRef.current('file_browser.preview_error'));
+  }, [clearPendingPreviewRequest, finishPreviewError, getActivePreviewCycle]);
 
   const trackPendingPreviewRequest = useCallback((
     kind: 'read' | 'diff',
@@ -692,40 +1090,82 @@ export function FileBrowser({
     pendingPreviewTimersRef.current.set(requestId, timer);
   }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
-  const fetchDir = useCallback((nodePath: string) => {
+  const fetchDir = useCallback((nodePath: string, fetchOptions?: { skipGitStatus?: boolean }) => {
+    if (ws.connected === false) {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
     if (loadedRef.current.has(nodePath)) return;
     const inFlight = [...pendingRef.current.values()].includes(nodePath);
     if (inFlight) return;
 
     setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
+    // The table view asks the machine to filter and order the listing before
+    // it cuts it to its entry limit (only where the machine can). The sort and
+    // filter are the ones in force right now.
+    const query: FileDirectoryListQuery | undefined = listView && directoryQuery
+      ? {
+        sort: sortRef.current,
+        ...(appliedFilterRef.current.trim() ? { nameFilter: appliedFilterRef.current.trim() } : {}),
+      }
+      : undefined;
     let requestId: string;
     try {
       // Keep the initial directory list lightweight. The tree currently only
       // renders names/dir flags, so per-file metadata (size/mime/downloadId)
       // just adds avoidable stat work on first open, especially on mobile.
-      requestId = ws.fsListDir(nodePath, includeFiles, false);
+      requestId = query
+        ? ws.fsListDir(nodePath, includeFiles, false, { ...(scopedSessionName ? { sessionName: scopedSessionName } : {}), query })
+        : scopedSessionName
+          ? ws.fsListDir(nodePath, includeFiles, false, { sessionName: scopedSessionName })
+          : ws.fsListDir(nodePath, includeFiles, false);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
     }
     pendingRef.current.set(requestId, nodePath);
+    pendingQueryRef.current.set(requestId, { hadQuery: Boolean(query), filter: query?.nameFilter ?? '' });
     // Tree/subtree refreshes only need lightweight status without includeStats.
-    try {
-      const gitId = ws.fsGitStatus(nodePath);
-      pendingGitStatusRef.current.set(gitId, nodePath);
-    } catch { /* ws disconnected — skip git status */ }
+    if (!fetchOptions?.skipGitStatus) {
+      try {
+        const gitId = scopedSessionName ? ws.fsGitStatus(nodePath, { sessionName: scopedSessionName }) : ws.fsGitStatus(nodePath);
+        pendingGitStatusRef.current.set(gitId, nodePath);
+      } catch { /* ws disconnected — skip git status */ }
+    }
 
     const timer = setTimeout(() => {
       if (!mountedRef.current) return;
       if (pendingRef.current.has(requestId)) {
         pendingRef.current.delete(requestId);
+        pendingQueryRef.current.delete(requestId);
         timersRef.current.delete(requestId);
+        // Without this, ws-client's owned-data-request dedup keeps this
+        // path's requestId parked for up to its own TTL: retrying right
+        // after a timeout would silently reuse the dead requestId and send
+        // nothing over the wire, guaranteeing the retry also times out.
+        ws.forgetOwnedDataRequest(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
+        setError(tRef.current('file_browser.timeout_detail', { defaultValue: tRef.current('file_browser.timeout') }));
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [includeFiles, showHidden, t, ws]);
+  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, ws]);
+
+  // Ask for a directory again with the sort/filter now in force, replacing a
+  // request still in flight for it: only the answer to the LAST ask is ever
+  // used (a superseded request's response finds no pending entry and is dropped).
+  const refetchDir = useCallback((nodePath: string) => {
+    for (const [requestId, pendingPath] of [...pendingRef.current]) {
+      if (pendingPath !== nodePath) continue;
+      pendingRef.current.delete(requestId);
+      pendingQueryRef.current.delete(requestId);
+      const timer = timersRef.current.get(requestId);
+      if (timer) { clearTimeout(timer); timersRef.current.delete(requestId); }
+      ws.forgetOwnedDataRequest(requestId);
+    }
+    loadedRef.current.delete(nodePath);
+    fetchDir(nodePath, { skipGitStatus: true });
+  }, [fetchDir, ws]);
 
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
@@ -738,6 +1178,14 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
+        for (const timer of timersRef.current.values()) clearTimeout(timer);
+        timersRef.current.clear();
+        navSearchRequestIdRef.current = null;
+        if (navSearchTimerRef.current) {
+          clearTimeout(navSearchTimerRef.current);
+          navSearchTimerRef.current = null;
+        }
+        setNavSearchState((prev) => (prev.status === 'loading' ? { status: 'idle', results: [] } : prev));
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
         pendingRenameRef.current.clear();
@@ -745,10 +1193,20 @@ export function FileBrowser({
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
-          setPreview({ status: 'error', path: loadingPath, error: t('file_browser.preview_error') });
+          previewErrorPathRef.current = loadingPath;
+          setPreview({ status: 'error', path: loadingPath, error: tRef.current('file_browser.preview_error') });
         }
-        // Re-fetch root and changes
-        if (mountedRef.current) fetchDir(startPath);
+        // Re-fetch root, expanded subdirectories (without collapsing), and changes
+        if (mountedRef.current) {
+          fetchDir(startPath);
+          const expandedSubs = [...expandedPathsRef.current]
+            .filter((p) => p && p !== startPath && p !== '~')
+            .slice(0, 8);
+          for (const subPath of expandedSubs) {
+            fetchDir(subPath);
+          }
+          refreshChangesRef.current();
+        }
         return;
       }
 
@@ -756,6 +1214,8 @@ export function FileBrowser({
         const nodeId = pendingRef.current.get(msg.requestId);
         if (!nodeId) return;
         pendingRef.current.delete(msg.requestId);
+        const queryUsed = pendingQueryRef.current.get(msg.requestId);
+        pendingQueryRef.current.delete(msg.requestId);
 
         const timer = timersRef.current.get(msg.requestId);
         if (timer) { clearTimeout(timer); timersRef.current.delete(msg.requestId); }
@@ -764,6 +1224,25 @@ export function FileBrowser({
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
+          const fdaTarget = macosFullDiskAccessTargetOfError(msg.error);
+          setMacosFdaPrompt(fdaTarget ? { requesting: false, requestFailed: false, target: fdaTarget } : null);
+          // A failed fetch for the CURRENT root location (as opposed to one
+          // nested child the user expanded deeper in the tree) must not
+          // leave the browser stuck showing a fake, unresolved location with
+          // no way out -- e.g. a quick-access sentinel like ":downloads:"
+          // that the controlled node refused to resolve (see
+          // well-known-directories.ts's fail-closed behavior for a root
+          // LaunchDaemon with no verifiable console user). Bounce back to
+          // the last place a fetch actually succeeded, the same way a failed
+          // browser navigation does, instead of rendering an empty "folder"
+          // literally named after the sentinel forever. Guarded against
+          // reverting to itself (the very first fetch failing has nowhere
+          // better to go) so this can never loop.
+          const isRootLevelFailure = dataRef.current[0]?.id === nodeId;
+          if (isRootLevelFailure && lastGoodLabelRef.current !== nodeId) {
+            navigateToRef.current(lastGoodLabelRef.current);
+            return;
+          }
           setData((prev) => updateNode(prev, nodeId, { isLoading: false }));
           return;
         }
@@ -780,17 +1259,40 @@ export function FileBrowser({
             isDir: e.isDir,
             hidden: e.hidden,
             children: e.isDir ? [] : undefined,
+            ...(typeof e.totalBytes === 'number' ? { totalBytes: e.totalBytes } : {}),
+            ...(typeof e.freeBytes === 'number' ? { freeBytes: e.freeBytes } : {}),
+            ...(typeof e.size === 'number' ? { size: e.size } : {}),
+            ...(typeof e.mtimeMs === 'number' ? { mtimeMs: e.mtimeMs } : {}),
+            ...(typeof e.birthtimeMs === 'number' ? { birthtimeMs: e.birthtimeMs } : {}),
+            ...(typeof e.downloadId === 'string' && e.downloadId ? { downloadId: e.downloadId } : {}),
           }));
+        const truncated = msg.truncated === true && typeof msg.total === 'number' ? { total: msg.total } : undefined;
+        const partial = msg.partial === true;
+        // Everything is here only when the machine neither cut the listing nor
+        // narrowed it by name. (A machine that cannot be queried returns what
+        // it returns, and that is all the browser can go on.)
+        const listing: FsNode['listing'] = {
+          // An order built from only part of the matches is not the order of the whole.
+          complete: !truncated && !partial && (!queryUsed?.hadQuery || !queryUsed.filter),
+          ...(truncated ? { truncated } : {}),
+          ...(partial ? { partial: true as const } : {}),
+        };
 
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
 
-        setData((prev) => updateNode(prev, nodeId, {
-          id: resolvedParent,
-          name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
-          children,
-          isLoading: false,
-        }));
+        setData((prev) => {
+          const targetId = findNodeChildren(prev, nodeId) !== undefined
+            ? nodeId
+            : (nodeId === startPath && prev.length === 1 ? prev[0].id : nodeId);
+          return updateNode(prev, targetId, {
+            id: resolvedParent,
+            name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
+            children: mergePreservedExpandedChildren(children, findNodeChildren(prev, targetId), expandedPathsRef.current),
+            isLoading: false,
+            listing,
+          });
+        });
         // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
         if (resolvedParent !== nodeId) {
           setExpandedPaths((prev) => {
@@ -801,8 +1303,14 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent);
+        const nextLabel = resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent;
+        setCurrentLabel(nextLabel);
+        // Only a root-level fetch changes "where the browser currently is";
+        // a nested child expanding deeper in the tree must not move the
+        // fallback a failed root navigation would revert to.
+        if (dataRef.current[0]?.id === nodeId) lastGoodLabelRef.current = nextLabel;
         setError(null);
+        setMacosFdaPrompt(null);
 
         // If highlightPath is under this dir, auto-expand
         if (highlightPath && (highlightPath.startsWith(resolvedParent + '/') || highlightPath.startsWith(resolvedParent + '\\'))) {
@@ -823,7 +1331,7 @@ export function FileBrowser({
 
         if (!mountedRef.current) return;
 
-        const dlId = msg.downloadId;
+        const fallbackNodeDownloadId = findNodeById(dataRef.current, filePath)?.downloadId;
 
         if (msg.status === 'error') {
           if (msg.error === FS_READ_ERROR_CODES.IS_DIRECTORY) {
@@ -845,16 +1353,46 @@ export function FileBrowser({
             previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
             return;
           }
+          const officeErrorFallbackType = pending.forceNativeText ? null : getAutoOfficePreviewType(filePath);
+          const errorCodeOrMessage = String(msg.error ?? '');
+          const isMissingFileError = msg.error === FS_READ_ERROR_CODES.PARENT_NOT_FOUND
+            || /not[_ -]?found|enoent|no such file/i.test(errorCodeOrMessage);
+          const errDlId = msg.downloadId
+            || (!isMissingFileError && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH ? fallbackNodeDownloadId : undefined);
+          if (
+            officeErrorFallbackType
+            && serverId
+            && errDlId
+            && !isMissingFileError
+            && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH
+            && msg.error !== FS_READ_ERROR_CODES.FILE_TOO_LARGE
+          ) {
+            void buildAttachmentDownloadUrl(serverId, errDlId, sessionName)
+              .then((streamUrl) => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: errDlId, verified: false });
+              })
+              .catch(() => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                finishPreviewError(filePath, t('file_browser.preview_error'), errDlId);
+              });
+            return;
+          }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
+          finishPreviewError(filePath, t(errKey), errDlId);
           return;
         }
+        const dlId = msg.downloadId || fallbackNodeDownloadId;
         previewRefreshBackoffUntilRef.current = 0;
 
-        // Video preview — daemon signals stream-mode (no inline content) and
-        // we let <video> fetch the bytes via the HTTP download endpoint.
+        // Media preview — daemon signals stream-mode (no inline content) and
+        // we let the browser media element fetch bytes via the HTTP download endpoint.
         // This avoids dragging a full 100 MB base64 payload through the
         // WebSocket and preserves browser-native streaming/seeking.
         const videoType = getVideoType(filePath);
@@ -865,28 +1403,113 @@ export function FileBrowser({
           && serverId
         ) {
           const mimeType = (msg.mimeType as string | undefined) ?? videoType;
-          const streamUrl = buildVideoStreamUrl(serverId, dlId);
-          setPreview({ status: 'video', path: filePath, streamUrl, mimeType, downloadId: dlId });
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'video', path: filePath, streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+            });
           return;
         }
 
-        // Office document preview (PDF, DOCX, XLSX) — check before image
-        const officeType = getOfficeType(filePath);
-        if (officeType && msg.encoding === 'base64') {
-          setPreview({ status: 'office', path: filePath, data: msg.content ?? '', mimeType: officeType, downloadId: dlId });
+        const audioType = getAudioType(filePath);
+        if (
+          audioType
+          && (msg as { previewMode?: string }).previewMode === 'stream'
+          && dlId
+          && serverId
+        ) {
+          const mimeType = (msg.mimeType as string | undefined) ?? audioType;
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'audio', path: filePath, streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+            });
           return;
         }
 
-        // Image files: render as <img> from base64
-        if (msg.encoding === 'base64' && msg.mimeType) {
-          const dataUrl = `data:${msg.mimeType};base64,${msg.content ?? ''}`;
-          setPreview({ status: 'image', path: filePath, dataUrl, downloadId: dlId });
+        // Office/image preview — same stream contract as video/audio: the daemon
+        // sends metadata only and the bytes come over the chunked HTTP download
+        // channel, so a large file can never monopolise the WebSocket.
+        const officeType = pending.forceNativeText ? null : getAutoOfficePreviewType(filePath);
+        if (officeType && (msg as { previewMode?: string }).previewMode === 'stream' && dlId && serverId) {
+          const mimeType = (msg.mimeType as string | undefined) ?? officeType;
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId, verified: true });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+            });
+          return;
+        }
+        if (officeType && serverId && typeof msg.content === 'string') {
+          const inlineSrcUrl = `data:${officeType};charset=utf-8,${encodeURIComponent(msg.content)}`;
+          setPreview({ status: 'office', path: filePath, srcUrl: inlineSrcUrl, mimeType: officeType, downloadId: dlId, verified: true });
+          return;
+        }
+
+        // tsk_5rf: this must verify the mime is actually an image. It previously
+        // accepted ANY streamed mimeType and handed it to <img src=...>, so a
+        // streamed binary rendered as a broken/blank box instead of an error.
+        if (
+          (msg as { previewMode?: string }).previewMode === 'stream'
+          && typeof msg.mimeType === 'string'
+          && msg.mimeType.startsWith('image/')
+          && dlId
+          && serverId
+        ) {
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'image', path: filePath, dataUrl: streamUrl, downloadId: dlId, settling: true });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+            });
+          return;
+        }
+
+        // tsk_5rf: a streamed response carries NO content by design. Before this
+        // guard it fell through to the text path below, where `msg.content ?? ''`
+        // produced an empty 'ok' preview - the silently blank Word pane users
+        // reported. Both stream branches above require serverId (and a mimeType),
+        // so any streamed response that reaches here cannot be rendered and must
+        // say so instead of pretending to be an empty document.
+        if ((msg as { previewMode?: string }).previewMode === 'stream' && !(pending.forceNativeText && typeof msg.content === 'string')) {
+          finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
           return;
         }
 
         const content = msg.content ?? '';
         if (isBinaryContent(content)) {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_binary'), downloadId: dlId });
+          finishPreviewError(filePath, t('file_browser.preview_binary'), dlId);
           return;
         }
 
@@ -908,6 +1531,9 @@ export function FileBrowser({
             downloadId: dlId,
           };
         });
+        if (pending.forceNativeText) {
+          setIsEditing(Boolean(pending.openEditor && !effectivePreviewReadOnlyRef.current));
+        }
         pendingPreviewDiffRef.current.delete(previewCycleKey(filePath, pending.cycleId));
         return;
       }
@@ -946,12 +1572,24 @@ export function FileBrowser({
           return;
         }
         loadedRef.current.delete(pendingRename.parentPath);
+        if (pendingRename.targetParentPath) {
+          loadedRef.current.delete(pendingRename.targetParentPath);
+        }
         setError(null);
         setSelectedPaths(new Set([pendingRename.targetPath]));
+        setFocusedPath((prev) => (prev === pendingRename.sourcePath ? pendingRename.targetPath : prev));
         if (previewRef.current.status !== 'idle' && (previewRef.current as { path: string }).path === pendingRename.sourcePath) {
           setPreview({ status: 'idle' });
         }
         fetchDir(pendingRename.parentPath);
+        if (pendingRename.targetParentPath && pendingRename.targetParentPath !== pendingRename.parentPath) {
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
+            next.add(pendingRename.targetParentPath!);
+            return next;
+          });
+          fetchDir(pendingRename.targetParentPath);
+        }
         return;
       }
 
@@ -993,8 +1631,16 @@ export function FileBrowser({
         if (msg.status === 'ok' && msg.files) {
           setModifiedFiles((prev) => {
             const next = new Map(prev);
-            for (const [k] of next) {
-              if (k.startsWith(dirPath + '/')) next.delete(k);
+            for (const [k, code] of next) {
+              if (areFsPathsEqual(k, dirPath)) continue;
+              if (code === '!!') {
+                const parent = getParentDir(k);
+                if (parent && areFsPathsEqual(parent, dirPath)) {
+                  next.delete(k);
+                }
+              } else if (isPathEqualOrDescendant(k, dirPath)) {
+                next.delete(k);
+              }
             }
             for (const f of msg.files!) {
               next.set(f.path, f.code);
@@ -1060,43 +1706,74 @@ export function FileBrowser({
         onDirectoryCreated?.(createdPath);
         return;
       }
+
+      if (msg.type === 'file.search_response') {
+        if (!msg.requestId || msg.requestId !== navSearchRequestIdRef.current) return;
+        if (navSearchTimerRef.current) {
+          clearTimeout(navSearchTimerRef.current);
+          navSearchTimerRef.current = null;
+        }
+        if (!mountedRef.current) return;
+        if (msg.error) {
+          setNavSearchState({ status: 'error', results: [], error: msg.error });
+        } else {
+          setNavSearchState({
+            status: 'done',
+            results: Array.isArray(msg.results) ? msg.results : [],
+          });
+        }
+        return;
+      }
     });
-  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, finishPreviewError, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((
     filePath: string,
     preferDiff = false,
     requestedViewMode?: HtmlPreviewViewMode,
+    preserveBrowserView = false,
+    options?: { forceNativeText?: boolean; openEditor?: boolean },
   ) => {
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    const forceNativeText = !!options?.forceNativeText;
+    const effectiveReadOnlyForRequest = forceNativeText ? effectivePreviewReadOnlyRef.current : readOnlyRef.current;
+    const openEditor = !!options?.openEditor && !effectiveReadOnlyForRequest;
+    if (!forceNativeText) {
+      setActiveSharedDocServerId(undefined);
+      setActiveSharedDocReadOnly(undefined);
+    }
+    previewErrorPathRef.current = null;
     const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
-      if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
+      if (!window.confirm(tRef.current('fileBrowser.unsavedChanges'))) return;
     }
     // Keep the left tree in sync with the previewed file without discarding the
     // user's expanded tree. If the file's parent already exists in the current
     // tree, reveal/select it in-place. Only re-root when the preview came from
     // outside the current tree (for example an external chat path).
-    const parentDir = getParentDir(filePath);
-    if (parentDir && parentDir !== currentLabelRef.current) {
-      const parentNodePath = findNodePath(dataRef.current, parentDir);
-      if (parentNodePath) {
-        setExpandedPaths((prev) => {
-          const next = new Set(prev);
-          for (const nodeId of parentNodePath) next.add(nodeId);
-          return next;
-        });
-        setCurrentLabel(parentDir);
-        fetchDir(parentDir);
-      } else {
-        navigateToRef.current(parentDir);
+    // When previewing from quick search results (`preserveBrowserView`), keep
+    // the active search results and multi-select checkboxes untouched.
+    if (!preserveBrowserView) {
+      const parentDir = getParentDir(filePath);
+      if (parentDir && parentDir !== currentLabelRef.current) {
+        const parentNodePath = findNodePath(dataRef.current, parentDir);
+        if (parentNodePath) {
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
+            for (const nodeId of parentNodePath) next.add(nodeId);
+            return next;
+          });
+          fetchDir(parentDir);
+        } else {
+          navigateToRef.current(parentDir);
+        }
+        setSelectedPaths(new Set([filePath]));
       }
-      setSelectedPaths(new Set([filePath]));
     }
     if (onPreviewFile) {
       onPreviewFile({
         path: filePath,
-        sessionName,
+        sessionName: scopedSessionName,
         preferDiff,
         previewViewMode: nextViewMode,
         preview: { status: 'loading', path: filePath },
@@ -1110,13 +1787,20 @@ export function FileBrowser({
     setEditDirty(false);
     setEditContent('');
     setOriginalMtime(undefined);
-    setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
+    setIsEditing(() => {
+      if (effectiveReadOnlyForRequest || forceNativeText) return false;
+      try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; }
+    });
     pendingPreviewDiffRef.current.clear();
     const active = getActivePreviewCycle(filePath);
-    const cycleId = active && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId))
+    const canReuseActiveCycle = !forceNativeText
+      && !active?.forceNativeText
+      && active
+      && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId));
+    const cycleId = canReuseActiveCycle
       ? active.cycleId
       : nextPreviewCycleIdRef.current++;
-    activePreviewCycleRef.current = { path: filePath, cycleId };
+    activePreviewCycleRef.current = { path: filePath, cycleId, forceNativeText, openEditor };
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setPreviewViewMode(nextViewMode);
@@ -1128,50 +1812,176 @@ export function FileBrowser({
       preview: loadingPreview,
     });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
-      const requestId = ws.fsReadFile(filePath);
-      trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
+      const isAutoPreview = filePath === autoPreviewPath;
+      const requestId = scopedSessionName
+        ? (isAutoPreview
+            ? ws.fsReadFile(filePath, scopedSessionName, { chatFileReference: true })
+            : ws.fsReadFile(filePath, scopedSessionName))
+        : ws.fsReadFile(filePath);
+      trackPendingPreviewRequest('read', requestId, {
+        path: filePath,
+        cycleId,
+        reason: 'interactive',
+        forceNativeText,
+        openEditor,
+      });
     }
     if (shouldFetchDiff && !hasPendingPreviewWork('diff', filePath, cycleId)) {
-      const diffId = ws.fsGitDiff(filePath);
+      const diffId = scopedSessionName ? ws.fsGitDiff(filePath, scopedSessionName) : ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
+  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, trackPendingPreviewRequest, ws]);
 
-  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(
+    () => new Set(initialMemoryCache?.expandedPaths.length ? initialMemoryCache.expandedPaths : [startPath]),
+  );
+  const expandedPathsRef = useRef(expandedPaths);
+  expandedPathsRef.current = expandedPaths;
+  const fbCacheKey = useMemo(
+    () => makeFileBrowserCacheKey({
+      serverId,
+      scopedSessionName,
+      startPath,
+      includeFiles,
+      showHidden,
+      listView: Boolean(listView),
+    }),
+    [includeFiles, listView, scopedSessionName, serverId, showHidden, startPath],
+  );
+  const hydratedCacheKeyRef = useRef(fbCacheKey);
+  const refreshChangesRef = useRef<() => void>(() => {});
 
-  const buildChildPath = useCallback((parentPath: string, childName: string) => {
-    const sep = parentPath.includes('\\') ? '\\' : '/';
-    return `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${childName}`;
-  }, []);
+  useEffect(() => {
+    const root = data[0];
+    if (!root || root.isLoading || !root.children) return;
+    const hasLoaded = loadedRef.current.has(root.id);
+    if (!hasLoaded && root.children.length === 0 && expandedPaths.size <= 1 && modifiedFiles.size === 0) return;
+    setFileBrowserCache(fbCacheKey, {
+      data,
+      currentLabel,
+      expandedPaths: [...expandedPaths],
+      modifiedFiles: [...modifiedFiles.entries()],
+      updatedAt: Date.now(),
+    });
+  }, [currentLabel, data, expandedPaths, fbCacheKey, modifiedFiles]);
+
+  const buildChildPath = useCallback((parentPath: string, childName: string) => (
+    buildChildFsPath(parentPath, childName)
+  ), []);
 
   const requestMkdir = useCallback((parentPath: string, folderName: string) => {
     const trimmed = folderName.trim();
     if (!trimmed) return;
+    if (!isValidEntryName(trimmed)) {
+      setError(t('file_browser.invalid_name'));
+      return;
+    }
     const fullPath = buildChildPath(parentPath, trimmed);
-    const requestId = ws.fsMkdir(fullPath);
+    const requestId = scopedSessionName ? ws.fsMkdir(fullPath, scopedSessionName) : ws.fsMkdir(fullPath);
     pendingMkdirRef.current.set(requestId, { parentPath, targetPath: fullPath });
     setNewEntry(null);
     setNewEntryName('');
-  }, [buildChildPath, ws]);
+  }, [buildChildPath, scopedSessionName, t, ws]);
 
-  const requestCreateFile = useCallback((parentPath: string, fileName: string) => {
-    const trimmed = fileName.trim();
-    if (!trimmed) return;
+  const requestCreateFile = useCallback((parentPath: string, fileName: string, docExt: '' | '.docx' | '.xlsx' | '.pptx' | '.md' = '') => {
+    const rawTrimmed = fileName.trim();
+    if (!rawTrimmed) return;
+    if (!isValidEntryName(rawTrimmed)) {
+      setError(t('file_browser.invalid_name'));
+      return;
+    }
+    const trimmed = docExt && !rawTrimmed.toLowerCase().endsWith(docExt)
+      ? `${rawTrimmed}${docExt}`
+      : rawTrimmed;
     const fullPath = buildChildPath(parentPath, trimmed);
-    const requestId = ws.fsWriteFile(fullPath, '', { createOnly: true });
-    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    const isOfficeDoc = Boolean(docExt) || /\.(docx|xlsx|pptx|md)$/i.test(trimmed);
+
     setNewEntry(null);
     setNewEntryName('');
-  }, [buildChildPath, ws]);
+    setNewDocType('');
 
-  const requestRename = useCallback((node: FsNode) => {
+    if (serverId && isOfficeDoc) {
+      void createSharedDocItem(serverId, {
+        parentDir: parentPath,
+        name: trimmed,
+        kind: 'file',
+      })
+        .then((res) => {
+          if (!mountedRef.current) return;
+          loadedRef.current.delete(parentPath);
+          setError(null);
+          fetchDir(parentPath);
+          if (includeFiles) {
+            setPanelView('files');
+            setSelectedPaths(new Set([res.path]));
+            fetchPreview(res.path);
+          }
+        })
+        .catch(() => {
+          if (!mountedRef.current) return;
+          const requestId = ws.fsWriteFile(fullPath, '', scopedSessionName ? { createOnly: true, sessionName: scopedSessionName } : { createOnly: true });
+          pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+        });
+      return;
+    }
+
+    const requestId = ws.fsWriteFile(fullPath, '', scopedSessionName ? { createOnly: true, sessionName: scopedSessionName } : { createOnly: true });
+    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+  }, [buildChildPath, fetchDir, fetchPreview, includeFiles, scopedSessionName, serverId, ws]);
+
+  const loadSharedDocsList = useCallback(() => {
+    setSharedDocsLoading(true);
+    void listDocsSharedWithMe(serverId)
+      .then((res) => {
+        if (!mountedRef.current) return;
+        setSharedDocs(res.shares ?? []);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setSharedDocs([]);
+      })
+      .finally(() => {
+        if (mountedRef.current) setSharedDocsLoading(false);
+      });
+  }, [serverId]);
+
+  useEffect(() => {
+    if (showSharedDocs) {
+      loadSharedDocsList();
+    }
+  }, [showSharedDocs, loadSharedDocsList]);
+
+  const startInlineRename = useCallback((node: FsNode) => {
+    if (readOnly) return;
     const parentPath = getParentDir(node.id);
     if (!parentPath) return;
-    const nextName = window.prompt(t('file_browser.rename_prompt', { name: node.name }), node.name);
-    const trimmed = nextName?.trim();
-    if (!trimmed || trimmed === node.name) return;
-    if (trimmed.includes('/') || trimmed.includes('\\')) {
+    setContextMenu(null);
+    setNewEntry(null);
+    setRenamingPath(node.id);
+    setRenameValue(node.name);
+    setFocusedPath(node.id);
+  }, [readOnly]);
+
+  const cancelInlineRename = useCallback(() => {
+    setRenamingPath(null);
+    setRenameValue('');
+  }, []);
+
+  const commitInlineRename = useCallback((node: FsNode, nextName: string) => {
+    if (readOnly) return;
+    const parentPath = getParentDir(node.id);
+    if (!parentPath) {
+      setRenamingPath(null);
+      return;
+    }
+    const trimmed = nextName.trim();
+    if (!trimmed || !isValidEntryName(trimmed)) {
       setError(t('file_browser.invalid_name'));
+      return;
+    }
+    if (trimmed === node.name) {
+      setRenamingPath(null);
+      setRenameValue('');
       return;
     }
     const targetPath = buildChildPath(parentPath, trimmed);
@@ -1179,8 +1989,9 @@ export function FileBrowser({
       ? ws.fsRename(node.id, targetPath, sessionName)
       : ws.fsRename(node.id, targetPath);
     pendingRenameRef.current.set(requestId, { parentPath, sourcePath: node.id, targetPath });
-    setContextMenu(null);
-  }, [buildChildPath, sessionName, t, ws]);
+    setRenamingPath(null);
+    setRenameValue('');
+  }, [buildChildPath, readOnly, sessionName, t, ws]);
 
   const requestDelete = useCallback((node: FsNode) => {
     const confirmed = window.confirm(t('file_browser.delete_confirm', { name: node.name }));
@@ -1190,24 +2001,59 @@ export function FileBrowser({
     setContextMenu(null);
   }, [sessionName, t, ws]);
 
-  const requestNewEntry = useCallback(() => {
+  const requestNewEntry = useCallback((nameOverride?: string) => {
     if (!newEntry) return;
+    const rawName = nameOverride ?? newEntryNameRef.current;
     if (newEntry.kind === 'folder') {
-      requestMkdir(newEntry.parentPath, newEntryName);
+      requestMkdir(newEntry.parentPath, rawName);
       return;
     }
-    requestCreateFile(newEntry.parentPath, newEntryName);
-  }, [newEntry, newEntryName, requestCreateFile, requestMkdir]);
+    requestCreateFile(newEntry.parentPath, rawName, newDocTypeRef.current);
+  }, [newEntry, requestCreateFile, requestMkdir]);
+
+  const clearNavSearch = useCallback(() => {
+    if (navSearchTimerRef.current !== null) {
+      clearTimeout(navSearchTimerRef.current);
+      navSearchTimerRef.current = null;
+    }
+    navSearchRequestIdRef.current = null;
+    navSearchBasePathRef.current = '';
+    navSearchComposingRef.current = false;
+    setNavSearchInput('');
+    setNavSearchState({ status: 'idle', results: [] });
+  }, []);
+
+  useEffect(() => () => {
+    if (navSearchTimerRef.current !== null) {
+      clearTimeout(navSearchTimerRef.current);
+      navSearchTimerRef.current = null;
+    }
+    navSearchRequestIdRef.current = null;
+  }, []);
+
+  const collapseAllFolders = useCallback(() => {
+    const rootId = dataRef.current[0]?.id;
+    setExpandedPaths(rootId ? new Set([rootId]) : new Set());
+    setFocusedPath((prev) => (prev && rootId && prev !== rootId ? rootId : prev));
+  }, []);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
+    // A filter belongs to the directory it was typed in; the sort stays.
+    setFilterInput('');
+    setAppliedFilter('');
+    appliedFilterRef.current = '';
+    clearNavSearch();
     loadedRef.current.clear();
     setData([{ id: newPath, name: newPath, isDir: true, children: [] }]);
     setExpandedPaths(new Set([newPath]));
     setSelectedPaths(new Set());
+    setFocusedPath(null);
+    setRenamingPath(null);
+    setNewEntry(null);
     setCurrentLabel(newPath);
     fetchDir(newPath);
-  }, [fetchDir]);
+  }, [clearNavSearch, fetchDir]);
 
   const navigateTo = useCallback((newPath: string) => {
     // Trim forward entries if we navigated back before
@@ -1239,14 +2085,30 @@ export function FileBrowser({
     }
   }, [currentLabel, navigateTo]);
 
+  // Only ever invoked from the `macosFdaPrompt` banner below, which only
+  // renders after a `file.directory_list_error` carrying
+  // FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED (or its `_APP` form) --
+  // meaning `serverId` is guaranteed present (the sentinel came from a
+  // remote machine, not this browser).
+  const requestMacosFullDiskAccess = useCallback(() => {
+    if (!serverId) return;
+    const target = macosFdaPrompt?.target ?? 'node';
+    setMacosFdaPrompt({ requesting: true, requestFailed: false, target });
+    void openMacosFullDiskAccessSettings(serverId).then(
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: false, target }); },
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: true, target }); },
+    );
+  }, [serverId, macosFdaPrompt?.target]);
+
   // Load root on mount and re-load when ws changes (server switch).
   // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
   const prevWsRef = useRef(ws);
+  const initialRefreshDoneRef = useRef(false);
   useEffect(() => {
+    let expandedToRefresh: string[] = [];
     if (ws !== prevWsRef.current) {
-      prevWsRef.current = ws;
-      // Clear stale state from previous ws instance
-      loadedRef.current.clear();
+      // Clear stale in-flight state from previous ws instance
+      clearNavSearch();
       pendingRef.current.clear();
       clearAllPendingPreviewRequests();
       pendingCreateFileRef.current.clear();
@@ -1254,29 +2116,113 @@ export function FileBrowser({
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
-      const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
-      setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
-      setCurrentLabel(cached?.currentLabel ?? startPath);
+    }
+    if (ws !== prevWsRef.current || hydratedCacheKeyRef.current !== fbCacheKey) {
+      prevWsRef.current = ws;
+      hydratedCacheKeyRef.current = fbCacheKey;
+      loadedRef.current.clear();
+      const mem = getFileBrowserCache(fbCacheKey);
+      const cached = mem ? null : loadSnapshot(startPath, includeFiles, showHidden, serverId);
+      setData(
+        mem?.data.length
+          ? mem.data
+          : [{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }],
+      );
+      const nextLabel = mem?.currentLabel ?? cached?.currentLabel ?? startPath;
+      setCurrentLabel(nextLabel);
+      lastGoodLabelRef.current = nextLabel;
+      const nextExpanded = mem && mem.expandedPaths.length > 0 ? mem.expandedPaths : [startPath];
+      setExpandedPaths(new Set(nextExpanded));
+      setModifiedFiles(mem ? new Map(mem.modifiedFiles) : new Map());
       setError(null);
+      expandedToRefresh = nextExpanded.filter((p) => p && p !== startPath && p !== '~').slice(0, 8);
+    } else if (!initialRefreshDoneRef.current) {
+      initialRefreshDoneRef.current = true;
+      expandedToRefresh = [...expandedPathsRef.current]
+        .filter((p) => p && p !== startPath && p !== '~')
+        .slice(0, 8);
     }
     fetchDir(startPath);
-  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, serverId, showHidden, startPath]);
+    for (const subPath of expandedToRefresh) {
+      fetchDir(subPath);
+    }
+  }, [clearAllPendingPreviewRequests, clearNavSearch, fbCacheKey, fetchDir, includeFiles, listView, serverId, showHidden, startPath, ws]);
+
+  // Opening a File Browser is the only eager direct-file action.  This creates
+  // an inert tab+daemon lease (no path, handle, session scope, or file
+  // authority), so the first explicit upload/download does not pay a second
+  // WebRTC setup round trip.  A chat/conversation by itself never mounts this
+  // component and therefore cannot allocate a file-transfer peer.
+  useEffect(() => {
+    if (!serverId) return;
+    return prewarmDirectFileLease(ws, serverId);
+  }, [serverId, ws]);
 
   useEffect(() => {
-    if (!changesRootPath) return;
-    const cacheKey = getSharedChangesKey(ws, changesRootPath);
-    return subscribeSharedChanges(cacheKey, (files) => {
+    setChangesVisibleLimit(CHANGES_RENDER_BATCH_SIZE);
+    if (!changesRootPath) {
+      setChangesFiles([]);
+      setChangesMeta({ totalCount: 0, truncated: false });
+      return;
+    }
+    const cacheKey = getSharedChangesKey(ws, changesRootPath, serverId, scopedSessionName);
+    let receivedFilesSync = false;
+    const unsubscribeFiles = subscribeSharedChanges(cacheKey, (files) => {
+      receivedFilesSync = true;
       if (!mountedRef.current) return;
-      setChangesFiles(files);
+      setChangesFiles(files.filter((f) => f.code !== '!!'));
       setModifiedFiles((prev) => {
         const next = new Map(prev);
-        for (const [k] of next) {
-          if (k.startsWith(changesRootPath + '/')) next.delete(k);
+        for (const [k, code] of next) {
+          // Shared-changes queries run with includeStats: true (no `!!` ignored rows);
+          // preserve ignored annotations populated by directory tree status lookups.
+          if (code !== '!!' && k !== changesRootPath && isPathEqualOrDescendant(k, changesRootPath)) next.delete(k);
         }
         for (const file of files) next.set(file.path, file.code);
         return next;
       });
     });
+    if (!receivedFilesSync) {
+      setChangesFiles([]);
+    }
+    let receivedMetaSync = false;
+    const unsubscribeMeta = subscribeSharedChangesMeta(cacheKey, (meta) => {
+      receivedMetaSync = true;
+      if (!mountedRef.current) return;
+      setChangesMeta(meta);
+    });
+    if (!receivedMetaSync) {
+      setChangesMeta({ totalCount: 0, truncated: false });
+    }
+    const unsubscribeStatus = subscribeSharedChangesStatus(cacheKey, (status) => {
+      if (!mountedRef.current) return;
+      if (changesRefreshFeedbackTimerRef.current) {
+        clearTimeout(changesRefreshFeedbackTimerRef.current);
+        changesRefreshFeedbackTimerRef.current = null;
+      }
+      setChangesRefreshStatus(status);
+      if (status === 'success' || status === 'error') {
+        changesRefreshFeedbackTimerRef.current = setTimeout(() => {
+          if (mountedRef.current) setChangesRefreshStatus('idle');
+          changesRefreshFeedbackTimerRef.current = null;
+        }, status === 'success' ? 1_500 : 3_000);
+      } else if (status === 'refreshing') {
+        changesRefreshFeedbackTimerRef.current = setTimeout(() => {
+          if (mountedRef.current) setChangesRefreshStatus('error');
+          changesRefreshFeedbackTimerRef.current = null;
+        }, 15_000);
+      }
+    });
+    return () => {
+      unsubscribeFiles();
+      unsubscribeMeta();
+      unsubscribeStatus();
+      if (changesRefreshFeedbackTimerRef.current) {
+        clearTimeout(changesRefreshFeedbackTimerRef.current);
+        changesRefreshFeedbackTimerRef.current = null;
+      }
+      setChangesRefreshStatus('idle');
+    };
   }, [changesRootPath, ws]);
 
   useEffect(() => {
@@ -1311,12 +2257,67 @@ export function FileBrowser({
     });
   }, [onPreviewStateChange, preview, previewViewMode, showDiff]);
 
+  const lastRecordedRecentOfficeKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    // Only record non-temp Office/PDF/Cloud Docs previews into Recent; plain text/code
+    // previews (`status === 'ok'`) and internal daemon uploads (`~/.imcodes/uploads/...`)
+    // must never auto-enter Cloud Docs Recent.
+    // Markdown (.md) files must NOT record merely on preview.status === 'office' (ONLYOFFICE
+    // might be disabled or fail & fall back locally); they record only inside handleOnlyOfficeOpened.
+    if (preview.status !== 'office' || !preview.verified || isInternalUploadTempFilePath(preview.path)) {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    if (isMarkdownFilePath(preview.path, preview.mimeType)) {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: (activeSharedDocReadOnly ?? readOnly) ? 'view' : 'edit',
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName, activeSharedDocReadOnly, readOnly]);
+
+  const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
+    if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) return;
+    if (preview.verified && !isMarkdownFilePath(preview.path, preview.mimeType)) return;
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: info.mode,
+      openedWithOnlyOffice: true,
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName]);
+
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
     if (!autoPreviewPath) return;
     if (dismissedAutoPreviewPathRef.current === autoPreviewPath) return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
+      if (preview.status === 'error' && previewErrorPathRef.current !== autoPreviewPath) {
+        fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
+        return;
+      }
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
         const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
         setPreviewViewMode(nextMode);
@@ -1340,6 +2341,8 @@ export function FileBrowser({
     pendingPreviewDiffRef.current.clear();
     setIsEditing(false);
     setEditDirty(false);
+    setActiveSharedDocServerId(undefined);
+    setActiveSharedDocReadOnly(undefined);
     setPreview({ status: 'idle' });
     if (autoPreviewPath && onClose) {
       onClose();
@@ -1360,20 +2363,21 @@ export function FileBrowser({
       try {
         const cycleId = nextPreviewCycleIdRef.current++;
         activePreviewCycleRef.current = { path, cycleId };
-        const reqId = ws.fsReadFile(path);
+        const reqId = scopedSessionName ? ws.fsReadFile(path, scopedSessionName) : ws.fsReadFile(path);
         trackPendingPreviewRequest('read', reqId, { path, cycleId, reason: 'refresh' });
         if (shouldRefreshDiff) {
-          const diffId = ws.fsGitDiff(path);
+          const diffId = scopedSessionName ? ws.fsGitDiff(path, scopedSessionName) : ws.fsGitDiff(path);
           trackPendingPreviewRequest('diff', diffId, { path, cycleId, reason: 'refresh' });
         }
       } catch { /* ws disconnected */ }
     }, PREVIEW_REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, previewViewMode, showDiff, trackPendingPreviewRequest]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, previewViewMode, scopedSessionName, showDiff, trackPendingPreviewRequest]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
   const lastChangesRefreshRef = useRef(0);
+  const lastChangesRefreshPathRef = useRef<string>('');
   const pendingChangesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const changesVisible = !!changesRootPath && panelView === 'changes';
@@ -1381,20 +2385,30 @@ export function FileBrowser({
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
     const now = Date.now();
-    const elapsed = now - lastChangesRefreshRef.current;
+    const pathChanged = lastChangesRefreshPathRef.current !== changesRootPath;
+    const elapsed = pathChanged ? CHANGES_RATE_LIMIT_MS : now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
+      if (pendingChangesTimerRef.current) {
+        clearTimeout(pendingChangesTimerRef.current);
+        pendingChangesTimerRef.current = null;
+      }
+      lastChangesRefreshPathRef.current = changesRootPath;
       lastChangesRefreshRef.current = now;
-      requestSharedChanges(ws, changesRootPath);
+      requestSharedChanges(ws, changesRootPath, false, scopedSessionName, serverId);
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
+        lastChangesRefreshPathRef.current = changesRootPath;
         lastChangesRefreshRef.current = Date.now();
-        requestSharedChanges(ws, changesRootPath, true);
+        requestSharedChanges(ws, changesRootPath, true, scopedSessionName, serverId);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
-  }, [changesRootPath, ws]);
+  }, [changesRootPath, scopedSessionName, serverId, ws]);
+  refreshChangesRef.current = () => {
+    if (changesVisible) refreshChanges();
+  };
 
   // Initial fetch on mount
   useEffect(() => {
@@ -1418,14 +2432,19 @@ export function FileBrowser({
     refreshChanges();
   }, [changesVisible, refreshTrigger, refreshChanges]);
 
-  // Reload tree when showHidden changes
-  useEffect(() => {
+  const handleRefresh = useCallback(() => {
     loadedRef.current.clear();
-    const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
-    setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
-    setCurrentLabel(cached?.currentLabel ?? startPath);
-    fetchDir(startPath);
-  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
+    setError(null);
+    fetchDir(currentLabel);
+    const targetRoot = currentLabel || startPath;
+    const expandedSubs = [...expandedPathsRef.current]
+      .filter((p) => p && p !== targetRoot && p !== '~')
+      .slice(0, 8);
+    for (const subPath of expandedSubs) {
+      fetchDir(subPath);
+    }
+    refreshChangesRef.current();
+  }, [currentLabel, fetchDir, startPath]);
 
   const toggleExpand = useCallback((nodeId: string) => {
     setExpandedPaths((prev) => {
@@ -1449,26 +2468,28 @@ export function FileBrowser({
     } else {
       setSelectedPaths(new Set([nodeId]));
     }
+    onSelectedPathChange?.(nodeId, isDir);
     if (isDir) {
       const path = nodeId.split(/[/\\]/).pop() || nodeId;
       void path;
       setCurrentLabel(nodeId);
     }
-  }, [mode, isMulti]);
+  }, [mode, isMulti, onSelectedPathChange]);
 
-  const handlePreview = useCallback((filePath: string) => {
+  const handlePreview = useCallback((filePath: string, preserveBrowserView = false) => {
     if (preview.status !== 'loading' || (preview as { path: string }).path !== filePath) {
-      fetchPreview(filePath);
+      fetchPreview(filePath, false, undefined, preserveBrowserView);
     }
   }, [fetchPreview, preview]);
 
   const handleNodeContextMenu = useCallback((node: FsNode, event: MouseEvent) => {
     event.preventDefault();
     event.stopPropagation();
+    setFocusedPath(node.id);
     setContextMenu({
       node,
-      x: Math.min(event.clientX, Math.max(0, window.innerWidth - 176)),
-      y: Math.min(event.clientY, Math.max(0, window.innerHeight - 96)),
+      x: Math.max(8, Math.min(event.clientX, Math.max(8, window.innerWidth - 220))),
+      y: Math.max(8, Math.min(event.clientY, Math.max(8, window.innerHeight - 320))),
     });
   }, []);
 
@@ -1477,8 +2498,30 @@ export function FileBrowser({
       if (mode === 'dir-only') onConfirm([currentLabel]);
       return;
     }
-    onConfirm([...selectedPaths]);
+    const paths = [...selectedPaths];
+    if (mode === 'file-single') {
+      onConfirm(paths, preview);
+      return;
+    }
+    onConfirm(paths);
   };
+
+  const copyPathText = useCallback((textToCopy: string) => {
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        setCopiedPath(textToCopy);
+        setTimeout(() => setCopiedPath((cur) => (cur === textToCopy ? null : cur)), 1500);
+      } catch {
+        // Clipboard access can be blocked in insecure contexts; keep the
+        // file picker usable and leave the path visible in the title.
+      }
+    })();
+  }, []);
+
+  const copyCurrentPath = useCallback(() => {
+    copyPathText(currentLabel);
+  }, [copyPathText, currentLabel]);
 
   const title = mode === 'dir-only' ? t('file_browser.title_dir') : t('file_browser.title_file');
   const confirmLabel = mode === 'dir-only'
@@ -1493,7 +2536,165 @@ export function FileBrowser({
   const hasPreview = hasInlinePreview;
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
+  const dirGitStatus = useMemo(() => computeDirGitStatus(modifiedFiles), [modifiedFiles]);
+  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === t('file_browser.this_pc');
+  const isAtDrives = currentLabel === t('file_browser.this_pc');
 
+  const resolveCreateTargetDir = useCallback((): string => {
+    const candidate = focusedPath
+      ?? (selectedPaths.size === 1 ? [...selectedPaths][0] : null);
+    if (candidate) {
+      const node = findNodeById(dataRef.current, candidate);
+      if (node) {
+        return node.isDir ? node.id : (getParentDir(node.id) ?? currentLabel);
+      }
+    }
+    return currentLabel;
+  }, [currentLabel, focusedPath, selectedPaths]);
+
+  const openNewEntry = useCallback((kind: NewEntryKind, explicitParentPath?: string) => {
+    if (readOnly || isAtDrives) return;
+    const targetDir = explicitParentPath ?? resolveCreateTargetDir();
+    setRenamingPath(null);
+    setContextMenu(null);
+    setPanelView('files');
+    setExpandedPaths((prev) => {
+      if (prev.has(targetDir)) return prev;
+      const next = new Set(prev);
+      next.add(targetDir);
+      return next;
+    });
+    if (!loadedRef.current.has(targetDir)) {
+      fetchDir(targetDir, { skipGitStatus: true });
+    }
+    setNewEntry({ kind, parentPath: targetDir });
+    setNewEntryName('');
+    setNewDocType('');
+  }, [fetchDir, isAtDrives, readOnly, resolveCreateTargetDir]);
+
+  const startDownloadTransferForPath = useCallback(async (selectedPath: string, initialHandle?: string) => {
+    if (!serverId || pickingDownloadDestinationRef.current) return;
+    pickingDownloadDestinationRef.current = true;
+    let ownsPickingLock = true;
+    const releasePickingLock = () => {
+      if (!ownsPickingLock) return;
+      ownsPickingLock = false;
+      pickingDownloadDestinationRef.current = false;
+    };
+    setDownloadError(null);
+    let destination: DirectPreviewDownloadDestination | null = null;
+    try {
+      try {
+        destination = await selectPreviewDownloadDestination(
+          selectedPath.split(/[/\\]/).pop() || undefined,
+        );
+      } catch (error) {
+        if (isFileUploadCanceled(error)) return;
+        setDownloadError(t('upload.download_failed'));
+        setTimeout(() => setDownloadError(null), 5000);
+        return;
+      }
+      // Older Electron PC App without the `.downloads` bridge resolves `null` and triggers
+      // Electron's native `will-download` dialog asynchronously after handle/URL resolution.
+      // Hold the re-entry guard through handoff completion so a double-click cannot launch a second dialog.
+      if (!(destination === null && isElectronPcAppRuntime())) {
+        releasePickingLock();
+      }
+      const fetchHandleFromRead = () => new Promise<string>((resolve, reject) => {
+        const requestId = scopedSessionName ? ws.fsReadFile(selectedPath, scopedSessionName) : ws.fsReadFile(selectedPath);
+        const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
+        const off = ws.onMessage((m) => {
+          if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
+          off();
+          clearTimeout(timer);
+          if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
+          else reject(new Error('no_handle'));
+        });
+      });
+      const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
+      let authorizedHandle = initialHandle;
+      const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
+        const wiring = createDownloadTransferWiring(transfer.id);
+        const download = async (handle: string) => downloadPreviewWithDirectFallback({
+          ws,
+          serverId,
+          previewHandle: handle,
+          suggestedName: selectedPath.split(/[/\\]/).pop() || undefined,
+          sessionName,
+          destination,
+          httpFallback: () => downloadAttachment(serverId, handle, sessionName, signal),
+          signal,
+          onSaveReady: wiring.onSaveReady,
+          onProgress: wiring.onProgress,
+          onMode: wiring.onMode,
+        });
+        try {
+          if (!authorizedHandle) {
+            authorizedHandle = await fetchHandleFromRead();
+          }
+          await download(authorizedHandle);
+          wiring.complete(destination);
+          return;
+        } catch (error) {
+          let failure = error;
+          let msg = failure instanceof Error ? failure.message : String(failure);
+          const staleHandle = isDirectFileTransferStaleHandleError(failure)
+            || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+          if (staleHandle && authorizedHandle) {
+            let refreshed = false;
+            try {
+              const previousHandle = authorizedHandle;
+              const freshId = await fetchHandleFromRead();
+              if (requireCurrentSelection && initialHandle) {
+                const stillSelected = previewRef.current;
+                if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
+                  || stillSelected.path !== selectedPath || stillSelected.downloadId !== previousHandle) {
+                  if (!isDownloadTransferPaused(transfer.id)) failDownloadTransfer(transfer.id, true);
+                  return;
+                }
+              }
+              authorizedHandle = freshId;
+              refreshed = true;
+              if (mountedRef.current) {
+                setPreview((prev) => {
+                  if (prev.status === 'idle' || !('downloadId' in prev) || prev.path !== selectedPath || prev.downloadId !== previousHandle) return prev;
+                  return { ...prev, downloadId: freshId } as typeof prev;
+                });
+              }
+              await download(freshId);
+              wiring.complete(destination);
+              return;
+            } catch (refreshError) {
+              if (refreshed) failure = refreshError;
+            }
+          }
+          msg = failure instanceof Error ? failure.message : String(failure);
+          if (isDownloadTransferPaused(transfer.id)) return;
+          const canceled = isFileUploadCanceled(failure) || signal.aborted;
+          failDownloadTransfer(transfer.id, canceled);
+          if (canceled) return;
+          if (mountedRef.current) {
+            if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
+            else if (staleHandle) setDownloadError(t('upload.download_expired'));
+            else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
+            else setDownloadError(t('upload.download_failed'));
+            setTimeout(() => {
+              if (mountedRef.current) setDownloadError(null);
+            }, 5000);
+          }
+          throw failure;
+        }
+      };
+      setDownloadTransferRetry(transfer.id, (signal) => runTransfer(signal, false));
+      await runTransfer(transfer.signal, true);
+    } finally {
+      releasePickingLock();
+    }
+  }, [scopedSessionName, serverId, sessionName, t, ws]);
+
+  const contextMenuRootPath = data[0]?.id ?? currentLabel;
+  const contextMenuNode = contextMenu?.node ?? null;
+  const contextMenuCanMutateNode = Boolean(contextMenuNode && !readOnly && getParentDir(contextMenuNode.id));
   const contextMenuView = contextMenu ? (
     <div
       ref={contextMenuRef}
@@ -1505,30 +2706,734 @@ export function FileBrowser({
         event.stopPropagation();
       }}
     >
-      <button type="button" onClick={() => requestRename(contextMenu.node)}>{t('common.rename')}</button>
-      <button type="button" class="danger" onClick={() => requestDelete(contextMenu.node)}>{t('common.delete')}</button>
+      {!readOnly && !isAtDrives && (
+        <>
+          {includeFiles && (
+            <button
+              type="button"
+              onClick={() => openNewEntry('file', contextMenu.node.isDir ? contextMenu.node.id : (getParentDir(contextMenu.node.id) ?? currentLabel))}
+            >
+              <span>{t('file_browser.ctx_new_file', 'New File…')}</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => openNewEntry('folder', contextMenu.node.isDir ? contextMenu.node.id : (getParentDir(contextMenu.node.id) ?? currentLabel))}
+          >
+            <span>{t('file_browser.ctx_new_folder', 'New Folder…')}</span>
+          </button>
+        </>
+      )}
+      {contextMenu.node.isDir && (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              loadedRef.current.delete(contextMenu.node.id);
+              setError(null);
+              fetchDir(contextMenu.node.id);
+              setContextMenu(null);
+            }}
+          >
+            <span>{t('file_browser.ctx_refresh_folder', 'Refresh Folder')}</span>
+          </button>
+          {expandedPaths.has(contextMenu.node.id) && contextMenu.node.id !== contextMenuRootPath && (
+            <button
+              type="button"
+              onClick={() => {
+                setExpandedPaths((prev) => {
+                  const next = new Set(prev);
+                  next.delete(contextMenu.node.id);
+                  return next;
+                });
+                setContextMenu(null);
+              }}
+            >
+              <span>{t('file_browser.ctx_collapse_folder', 'Collapse Folder')}</span>
+            </button>
+          )}
+        </>
+      )}
+      {((!readOnly && !isAtDrives) || contextMenu.node.isDir) && <div class="fb-context-sep" />}
+      {!contextMenu.node.isDir && mode !== 'dir-only' && (
+        <button
+          type="button"
+          onClick={() => {
+            if (!isMulti) handleSelect(contextMenu.node.id, false);
+            handlePreview(contextMenu.node.id);
+            setContextMenu(null);
+          }}
+        >
+          <span>{t('file_browser.ctx_open', 'Open / Preview')}</span>
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => {
+          copyPathText(contextMenu.node.id);
+          setContextMenu(null);
+        }}
+      >
+        <span>{t('fileBrowser.copyPath')}</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          copyPathText(toRelativeDisplayPath(contextMenu.node.id, contextMenuRootPath));
+          setContextMenu(null);
+        }}
+      >
+        <span>{t('file_browser.ctx_copy_relative_path', 'Copy Relative Path')}</span>
+      </button>
+      {(Boolean(onInsertPath) || isMulti) && (
+        <button
+          type="button"
+          onClick={() => {
+            if (onInsertPath) {
+              onInsertPath(contextMenu.node.id);
+            } else {
+              onConfirm([contextMenu.node.id]);
+            }
+            setContextMenu(null);
+          }}
+        >
+          <span>{t('file_browser.ctx_insert_at_path', 'Insert @path')}</span>
+        </button>
+      )}
+      {!contextMenu.node.isDir && serverId && (
+        <button
+          type="button"
+          onClick={() => {
+            const targetPath = contextMenu.node.id;
+            const handle = contextMenu.node.downloadId
+              ?? (preview.status !== 'idle' && 'path' in preview && preview.path === targetPath && 'downloadId' in preview ? preview.downloadId : undefined);
+            setContextMenu(null);
+            void startDownloadTransferForPath(targetPath, handle);
+          }}
+        >
+          <span>{t('file_browser.ctx_download', 'Download')}</span>
+        </button>
+      )}
+      {serverId && !readOnly && canShare && (
+        <>
+          <div class="fb-context-sep" />
+          <button
+            type="button"
+            onClick={() => {
+              setShareDialogTarget({
+                path: contextMenu.node.id,
+                kind: contextMenu.node.isDir ? 'folder' : 'file',
+              });
+              setContextMenu(null);
+            }}
+          >
+            <span>{t('doc_share.share_btn', 'Share')}</span>
+          </button>
+        </>
+      )}
+      {contextMenuCanMutateNode && (
+        <>
+          <div class="fb-context-sep" />
+          <button type="button" onClick={() => startInlineRename(contextMenu.node)}>
+            <span>{t('common.rename')}</span>
+            <span class="fb-context-shortcut">F2</span>
+          </button>
+          <button type="button" class="danger" onClick={() => requestDelete(contextMenu.node)}>
+            <span>{t('common.delete')}</span>
+          </button>
+        </>
+      )}
     </div>
   ) : null;
 
-  const tree = (
-    <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
-      {data.map((root) => (
-        <FsTreeNode
-          key={root.id}
-          node={root}
-          expandedPaths={expandedPaths}
-          selectedPaths={selectedPaths}
-          alreadySet={alreadySet}
-          mode={mode}
-          showHidden={showHidden}
-          modifiedFiles={modifiedFiles}
-          onToggleExpand={toggleExpand}
-          onSelect={handleSelect}
-          onPreview={handlePreview}
-          onContextMenu={handleNodeContextMenu}
-          previewPath={previewPath}
-        />
-      ))}
+  // ── Table view (name / size / kind / modified / created) ───────────────
+  const filterTerms = useMemo(() => parseFileBrowserFilter(appliedFilter), [appliedFilter]);
+  const rootNode = data[0];
+  const rootChildren = rootNode?.children;
+  const listDetailsPresent = Boolean(rootChildren?.some((child) => child.mtimeMs !== undefined));
+  // A column the machine cannot fill is not sortable, and says why.
+  const unavailableReasons: Partial<Record<FileBrowserSortKey, string>> = {};
+  // The Windows drive list has no sizes or times to report (a drive is a volume,
+  // shown with its capacity): that is not an older machine, so say nothing.
+  const showingDrives = rootNode?.id === WINDOWS_DRIVES_ROOT;
+  if (listView && !showingDrives && rootChildren && rootChildren.length > 0) {
+    if (!listDetailsPresent) {
+      for (const key of [FILE_BROWSER_SORT_KEYS.SIZE, FILE_BROWSER_SORT_KEYS.MODIFIED, FILE_BROWSER_SORT_KEYS.CREATED]) {
+        unavailableReasons[key] = t('file_browser.meta_unsupported');
+      }
+    } else if (!isFileBrowserSortKeyAvailable(rootChildren, FILE_BROWSER_SORT_KEYS.CREATED)) {
+      unavailableReasons[FILE_BROWSER_SORT_KEYS.CREATED] = t('file_browser.created_unavailable');
+    }
+  }
+  const sortKeyUnavailable = Boolean(unavailableReasons[sort.key]);
+  // A remembered key this machine cannot serve falls back to the name rather than sorting on nothing.
+  const effectiveSort = useMemo<FileBrowserSortState>(
+    () => (sortKeyUnavailable ? { ...sort, key: FILE_BROWSER_SORT_KEYS.NAME, direction: FILE_BROWSER_SORT_DIRECTIONS.ASC } : sort),
+    [sort, sortKeyUnavailable],
+  );
+  const listViewResult = useMemo(() => {
+    if (!listView || !rootNode) return null;
+    // Filter first, then sort, at every loaded level.
+    const { nodes, forceExpanded } = applyFileBrowserView(rootNode.children ?? [], filterTerms, effectiveSort, (node) => node.id);
+    return { data: [{ ...rootNode, children: nodes }] as FsNode[], forceExpanded };
+  }, [effectiveSort, filterTerms, listView, rootNode]);
+  const viewData = listViewResult?.data ?? data;
+
+  const handleSortChange = useCallback((next: FileBrowserSortState) => {
+    setSort(next);
+    saveFileBrowserSortPreference(serverId, next);
+  }, [serverId]);
+  const clearFilter = useCallback(() => {
+    filterComposingRef.current = false;
+    setFilterInput('');
+    setAppliedFilter('');
+  }, []);
+  // The text follows every keystroke; what is filtered by waits for a pause,
+  // and never happens in the middle of an IME composition.
+  useEffect(() => {
+    if (filterComposingRef.current || filterInput === appliedFilter) return;
+    const timer = setTimeout(() => setAppliedFilter(filterInput), FILE_BROWSER_FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [filterInput, appliedFilter]);
+
+  // A listing the machine filtered or cut cannot be re-sorted or re-filtered
+  // here, so a change of sort/filter asks for it again; a complete one just
+  // re-renders. Asking again replaces any request still in flight.
+  const listQueryKey = `${sort.key}:${sort.direction}:${sort.dirsFirst}:${appliedFilter}`;
+  const prevListQueryKeyRef = useRef(listQueryKey);
+  useEffect(() => {
+    if (prevListQueryKeyRef.current === listQueryKey) return;
+    prevListQueryKeyRef.current = listQueryKey;
+    if (!listView || !directoryQuery) return;
+    const inFlightPaths = new Set(pendingRef.current.values());
+    const walk = (nodes: FsNode[]) => {
+      for (const node of nodes) {
+        // Loaded, or being re-asked right now (that ask used the previous sort/filter).
+        const known = loadedRef.current.has(node.id) || inFlightPaths.has(node.id);
+        if (node.isDir && node.listing && !node.listing.complete && known) refetchDir(node.id);
+        if (node.children?.length) walk(node.children);
+      }
+    };
+    walk(dataRef.current);
+  }, [directoryQuery, listQueryKey, listView, refetchDir]);
+
+  const visibleColumns = useMemo<ReadonlySet<FileBrowserSortKey>>(
+    () => new Set(FILE_BROWSER_COLUMN_KEYS.filter((key) => !hiddenColumns.has(key))),
+    [hiddenColumns],
+  );
+  const toggleColumn = useCallback((column: FileBrowserSortKey) => {
+    setHiddenColumns((previous) => {
+      const next = new Set(previous);
+      if (next.has(column)) next.delete(column); else next.add(column);
+      saveFileBrowserHiddenColumns(serverId, next);
+      return next;
+    });
+  }, [serverId]);
+  const showAllColumns = useCallback(() => {
+    const none = new Set<FileBrowserSortKey>();
+    saveFileBrowserHiddenColumns(serverId, none);
+    setHiddenColumns(none);
+  }, [serverId]);
+
+  const listNotice = (() => {
+    if (!listView || !rootNode) return undefined;
+    const listing = rootNode.listing;
+    const shown = rootChildren?.length ?? 0;
+    const limit = FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES.toLocaleString(uiLocale);
+    if (listing?.truncated) {
+      return listing.partial
+        ? t('file_browser.notice_truncated_partial', { shown, total: listing.truncated.total, limit })
+        : t('file_browser.notice_truncated', { shown, total: listing.truncated.total });
+    }
+    if (listing?.partial) return t('file_browser.notice_partial', { limit });
+    // An older machine cut the listing to its entry limit by name and said nothing.
+    if (!directoryQuery && (rootChildren?.length ?? 0) >= FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
+      return t('file_browser.notice_capped', { count: FILE_TRANSFER_DIRECTORY_MAX_ENTRIES });
+    }
+    return undefined;
+  })();
+  // "Today"/"yesterday" only change at midnight, so the clock is read once a
+  // minute; that also keeps the row cells' props equal between renders.
+  const nowMinute = Math.floor(Date.now() / 60_000);
+  const createdUnavailable = Boolean(unavailableReasons[FILE_BROWSER_SORT_KEYS.CREATED]);
+  const emptyFilterText = filterTerms.length > 0 ? t('file_browser.filter_empty', { query: appliedFilter.trim() }) : undefined;
+  const forceExpanded = listViewResult?.forceExpanded;
+  const tableMinWidth = useMemo(() => {
+    if (!listView) return 0;
+    const deepest = fileBrowserMaxVisibleDepth(
+      viewData,
+      (node) => node.children,
+      (node) => expandedPaths.has(node.id) || Boolean(forceExpanded?.has(node.id)),
+      (node) => showHidden || !node.hidden,
+    );
+    return fileBrowserTableMinWidth(visibleColumns, deepest);
+  }, [expandedPaths, forceExpanded, listView, showHidden, viewData, visibleColumns]);
+  const listColumns = useMemo<FsListColumns | undefined>(() => (listView ? {
+    visible: visibleColumns,
+    nowMs: nowMinute * 60_000,
+    locale: uiLocale,
+    detailsPresent: listDetailsPresent,
+    createdUnavailable,
+    drivesList: showingDrives,
+    forceExpanded,
+    emptyText: emptyFilterText,
+  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, nowMinute, showingDrives, uiLocale, visibleColumns]);
+
+  // Show drive picker / home button on Windows daemons.
+  // Detected by current path looking like a Windows path or label being the localized "This PC".
+  const showNavSearch = !listView && !showSharedDocs;
+  const navSearchQuery = navSearchInput.trim();
+  const navSearchActive = showNavSearch && navSearchQuery.length > 0;
+  const canRemoteNavSearch = showNavSearch
+    && !showingDrives
+    && !isAtDrives
+    && !externalShareToken
+    && ws.connected !== false
+    && typeof ws.send === 'function';
+
+  // Preact leaves `onCompositionStart`/`onCompositionEnd` camelCased when `'oncompositionstart' in el` is false,
+  // missing lowercase native DOM events. Attach native listeners synchronously via callback ref.
+  const attachNavSearchInputRef = useCallback((el: HTMLInputElement | null) => {
+    if (navSearchInputElRef.current === el) return;
+    navSearchCompositionCleanupRef.current?.();
+    navSearchCompositionCleanupRef.current = null;
+    navSearchInputElRef.current = el;
+    if (!el) return;
+    const onCompositionStart = () => { navSearchComposingRef.current = true; };
+    const onCompositionEnd = () => {
+      navSearchComposingRef.current = false;
+      setNavSearchInput(el.value);
+      setNavSearchCommitNonce((n) => n + 1);
+    };
+    el.addEventListener('compositionstart', onCompositionStart);
+    el.addEventListener('compositionend', onCompositionEnd);
+    navSearchCompositionCleanupRef.current = () => {
+      el.removeEventListener('compositionstart', onCompositionStart);
+      el.removeEventListener('compositionend', onCompositionEnd);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!navSearchActive) {
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+        navSearchTimerRef.current = null;
+      }
+      navSearchRequestIdRef.current = null;
+      navSearchBasePathRef.current = '';
+      setNavSearchState((prev) => (prev.status === 'idle' && prev.results.length === 0 ? prev : { status: 'idle', results: [] }));
+      return;
+    }
+    if (!canRemoteNavSearch) {
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+        navSearchTimerRef.current = null;
+      }
+      navSearchRequestIdRef.current = null;
+      return;
+    }
+    if (navSearchComposingRef.current) return;
+    const timer = setTimeout(() => {
+      if (navSearchComposingRef.current || !mountedRef.current) return;
+      const basePath = currentLabelRef.current;
+      const requestId = `fbs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      navSearchRequestIdRef.current = requestId;
+      navSearchBasePathRef.current = basePath;
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+      }
+      navSearchTimerRef.current = setTimeout(() => {
+        if (navSearchRequestIdRef.current === requestId && mountedRef.current) {
+          navSearchRequestIdRef.current = null;
+          navSearchTimerRef.current = null;
+          setNavSearchState({ status: 'error', results: [], error: tRef.current('file_browser.search_timeout', 'Search timed out') });
+        }
+      }, 5000);
+      setNavSearchState((prev) => ({ status: 'loading', results: prev.results }));
+      if (typeof ws.send === 'function') {
+        Reflect.apply(ws.send, ws, [{
+          type: 'file.search',
+          requestId,
+          query: navSearchQuery,
+          projectDir: basePath,
+          ...(scopedSessionName ? { sessionName: scopedSessionName } : {}),
+        }]);
+      }
+    }, FILE_BROWSER_FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [canRemoteNavSearch, currentLabel, navSearchActive, navSearchCommitNonce, navSearchQuery, scopedSessionName, ws]);
+
+  const navRemoteItems = useMemo(() => {
+    if (!navSearchActive || !canRemoteNavSearch) return [];
+    const base = navSearchBasePathRef.current || currentLabel;
+    const useBackslash = base.includes('\\');
+    const sep = useBackslash ? '\\' : '/';
+    const cleanBase = base.length > 1 && !/^[A-Za-z]:\\$/.test(base)
+      ? base.replace(/[/\\]+$/, '')
+      : base;
+    const out: Array<{
+      id: string;
+      name: string;
+      dirLabel: string;
+      isDir: boolean;
+      hidden: boolean;
+    }> = [];
+    for (const raw of navSearchState.results) {
+      const isDir = raw.endsWith('/');
+      if (!includeFiles && !isDir) continue;
+      const rel = isDir ? raw.slice(0, -1) : raw;
+      if (!rel) continue;
+      const parts = rel.split('/').filter(Boolean);
+      const hidden = parts.some((seg) => seg.startsWith('.'));
+      if (!showHidden && hidden) continue;
+      const name = parts[parts.length - 1] ?? rel;
+      const parentParts = parts.slice(0, -1);
+      const dirLabel = parentParts.length > 0 ? parentParts.join(sep) : '';
+      const relNative = useBackslash ? parts.join('\\') : parts.join('/');
+      const fullPath = cleanBase.endsWith(sep)
+        ? `${cleanBase}${relNative}`
+        : `${cleanBase}${sep}${relNative}`;
+      out.push({ id: fullPath, name, dirLabel, isDir, hidden });
+    }
+    return out;
+  }, [canRemoteNavSearch, currentLabel, includeFiles, navSearchActive, navSearchState.results, showHidden]);
+
+  const navSearchFilterTerms = useMemo(
+    () => (navSearchActive && !canRemoteNavSearch ? parseFileBrowserFilter(navSearchQuery) : []),
+    [canRemoteNavSearch, navSearchActive, navSearchQuery],
+  );
+  const navLocalFallback = useMemo(() => {
+    if (!navSearchActive || canRemoteNavSearch || !rootNode) return null;
+    const { nodes, forceExpanded } = applyFileBrowserView(
+      rootNode.children ?? [],
+      navSearchFilterTerms,
+      effectiveSort,
+      (node) => node.id,
+    );
+    return {
+      data: [{ ...rootNode, children: nodes }] as FsNode[],
+      forceExpanded,
+    };
+  }, [canRemoteNavSearch, effectiveSort, navSearchActive, navSearchFilterTerms, rootNode]);
+  const effectiveTreeData = navLocalFallback ? navLocalFallback.data : viewData;
+  const effectiveExpandedPaths = useMemo(() => {
+    if (!navLocalFallback || navLocalFallback.forceExpanded.size === 0) return expandedPaths;
+    const next = new Set(expandedPaths);
+    for (const id of navLocalFallback.forceExpanded) next.add(id);
+    return next;
+  }, [expandedPaths, navLocalFallback]);
+
+  const handleDropNodeOnDir = useCallback((sourcePath: string, targetDirNode: FsNode) => {
+    dragSourcePathRef.current = null;
+    setDraggedPath(null);
+    setDropTargetPath(null);
+    if (readOnly || listView || isAtDrives || !targetDirNode.isDir) return;
+    if (!canDropPathIntoDir(sourcePath, targetDirNode.id)) return;
+    const sourceParent = getParentDir(sourcePath);
+    const baseName = getPathBasename(sourcePath);
+    const targetPath = buildChildPath(targetDirNode.id, baseName);
+    const requestId = sessionName
+      ? ws.fsRename(sourcePath, targetPath, sessionName)
+      : ws.fsRename(sourcePath, targetPath);
+    pendingRenameRef.current.set(requestId, {
+      parentPath: sourceParent ?? targetDirNode.id,
+      targetParentPath: targetDirNode.id,
+      sourcePath,
+      targetPath,
+    });
+  }, [buildChildPath, isAtDrives, listView, readOnly, sessionName, ws]);
+
+  const newEntryMountedInTree = Boolean(
+    newEntry
+    && !listView
+    && !(navSearchActive && canRemoteNavSearch)
+    && findNodeById(effectiveTreeData, newEntry.parentPath)
+    && effectiveExpandedPaths.has(newEntry.parentPath),
+  );
+
+  const visibleTreeEntries = useMemo(
+    () => collectVisibleTreeEntries(effectiveTreeData, effectiveExpandedPaths, showHidden, listViewResult?.forceExpanded),
+    [effectiveExpandedPaths, effectiveTreeData, listViewResult?.forceExpanded, showHidden],
+  );
+
+  const handleTreeKeyDown = useCallback((e: KeyboardEvent) => {
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl && (targetEl.closest('input, textarea, select, [contenteditable="true"]') || ['INPUT', 'TEXTAREA', 'SELECT'].includes(targetEl.tagName))) {
+      return;
+    }
+    if (renamingPath !== null || newEntry !== null || contextMenu !== null) return;
+    if (visibleTreeEntries.length === 0) return;
+
+    const currentIdx = focusedPath ? visibleTreeEntries.findIndex((entry) => entry.node.id === focusedPath) : -1;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      const nextIdx = currentIdx < 0 ? 0 : Math.min(visibleTreeEntries.length - 1, currentIdx + 1);
+      setFocusedPath(visibleTreeEntries[nextIdx].node.id);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      const prevIdx = currentIdx < 0 ? visibleTreeEntries.length - 1 : Math.max(0, currentIdx - 1);
+      setFocusedPath(visibleTreeEntries[prevIdx].node.id);
+      return;
+    }
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (currentIdx < 0) {
+        setFocusedPath(visibleTreeEntries[0].node.id);
+        return;
+      }
+      const entry = visibleTreeEntries[currentIdx];
+      if (!entry.node.isDir) return;
+      if (!effectiveExpandedPaths.has(entry.node.id)) {
+        toggleExpand(entry.node.id);
+      } else if (visibleTreeEntries[currentIdx + 1]?.parentId === entry.node.id) {
+        setFocusedPath(visibleTreeEntries[currentIdx + 1].node.id);
+      }
+      return;
+    }
+    if (e.key === 'ArrowLeft') {
+      if (currentIdx < 0) return;
+      e.preventDefault();
+      const entry = visibleTreeEntries[currentIdx];
+      if (entry.node.isDir && effectiveExpandedPaths.has(entry.node.id) && entry.depth > 0) {
+        toggleExpand(entry.node.id);
+      } else if (entry.parentId) {
+        setFocusedPath(entry.parentId);
+      }
+      return;
+    }
+    if (currentIdx < 0) return;
+    const entry = visibleTreeEntries[currentIdx];
+    const node = findNodeById(dataRef.current, entry.node.id);
+    if (!node) return;
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!isMulti && !(mode === 'dir-only' && !node.isDir)) {
+        handleSelect(node.id, node.isDir);
+      }
+      if (node.isDir) {
+        toggleExpand(node.id);
+      } else if (mode !== 'dir-only') {
+        handlePreview(node.id);
+      }
+      return;
+    }
+    if (e.key === 'F2' && !readOnly && entry.depth > 0) {
+      e.preventDefault();
+      startInlineRename(node);
+      return;
+    }
+    if ((e.key === 'Delete' || (e.metaKey && e.key === 'Backspace')) && !readOnly && entry.depth > 0) {
+      e.preventDefault();
+      requestDelete(node);
+    }
+  }, [
+    contextMenu,
+    effectiveExpandedPaths,
+    focusedPath,
+    handlePreview,
+    handleSelect,
+    isMulti,
+    mode,
+    newEntry,
+    readOnly,
+    renamingPath,
+    requestDelete,
+    startInlineRename,
+    toggleExpand,
+    visibleTreeEntries,
+  ]);
+
+  const inlineNewEntrySpec = newEntryMountedInTree && newEntry ? {
+    kind: newEntry.kind,
+    parentPath: newEntry.parentPath,
+    name: newEntryName,
+    docType: newDocType,
+    hasServer: Boolean(serverId),
+    onNameInput: (val: string) => {
+      newEntryNameRef.current = val;
+      setNewEntryName(val);
+    },
+    onDocTypeChange: (val: '' | '.docx' | '.xlsx' | '.pptx' | '.md') => {
+      newDocTypeRef.current = val;
+      setNewDocType(val);
+    },
+    onSubmit: (nameOverride?: string) => requestNewEntry(nameOverride),
+    onCancel: () => setNewEntry(null),
+  } : undefined;
+
+  const treeRows = effectiveTreeData.map((root) => (
+    <FsTreeNode
+      key={root.id}
+      node={root}
+      layout={layout}
+      listColumns={listColumns}
+      expandedPaths={effectiveExpandedPaths}
+      selectedPaths={selectedPaths}
+      focusedPath={focusedPath}
+      alreadySet={alreadySet}
+      mode={mode}
+      showHidden={showHidden}
+      readOnly={readOnly}
+      includeFiles={includeFiles}
+      isAtDrives={isAtDrives}
+      canInsertAtPath={Boolean(onInsertPath) || isMulti}
+      modifiedFiles={modifiedFiles}
+      dirGitStatus={dirGitStatus}
+      renamingPath={renamingPath}
+      renameValue={renameValue}
+      onRenameValueChange={setRenameValue}
+      onCommitRename={commitInlineRename}
+      onCancelRename={cancelInlineRename}
+      inlineNewEntry={inlineNewEntrySpec}
+      draggedPath={draggedPath}
+      dropTargetPath={dropTargetPath}
+      dragSourcePathRef={dragSourcePathRef}
+      onDragStartNode={(nodeId) => {
+        dragSourcePathRef.current = nodeId;
+        setDraggedPath(nodeId);
+      }}
+      onDragEndNode={() => {
+        dragSourcePathRef.current = null;
+        setDraggedPath(null);
+        setDropTargetPath(null);
+      }}
+      onDragTargetChange={setDropTargetPath}
+      onDropNode={handleDropNodeOnDir}
+      onToggleExpand={toggleExpand}
+      onFocusNode={setFocusedPath}
+      onSelect={handleSelect}
+      onPreview={handlePreview}
+      onContextMenu={handleNodeContextMenu}
+      onQuickNewEntry={(kind, dirPath) => openNewEntry(kind, dirPath)}
+      onQuickCopyOrInsert={(nodeId) => {
+        if (onInsertPath) {
+          onInsertPath(nodeId);
+        } else if (isMulti) {
+          onConfirm([nodeId]);
+        } else {
+          copyPathText(toRelativeDisplayPath(nodeId, contextMenuRootPath));
+        }
+      }}
+      previewPath={previewPath}
+    />
+  ));
+  const navSearchTreeBody = (() => {
+    if (!navSearchActive || listView) return null;
+    if (!canRemoteNavSearch) {
+      if (navLocalFallback && (navLocalFallback.data[0]?.children?.length ?? 0) === 0) {
+        return <div class="fb-search-status">{t('file_browser.filter_empty', { query: navSearchQuery })}</div>;
+      }
+      return treeRows;
+    }
+    if (navSearchState.status === 'error') {
+      return <div class="fb-search-error" role="alert">{navSearchState.error || t('file_browser.search_error', 'Search failed')}</div>;
+    }
+    if (navSearchState.status === 'loading' && navRemoteItems.length === 0) {
+      return <div class="fb-search-status">{t('file_browser.searching', 'Searching...')}</div>;
+    }
+    if (navSearchState.status === 'done' && navRemoteItems.length === 0) {
+      return <div class="fb-search-status">{t('file_browser.filter_empty', { query: navSearchQuery })}</div>;
+    }
+    return (
+      <div class="fb-search-results" role="list">
+        {navRemoteItems.map((item) => {
+          const isSelected = selectedPaths.has(item.id);
+          const isAlready = alreadySet.has(item.id);
+          const isPreviewing = previewPath === item.id;
+          const gitCode = resolveNodeGitCode(item.id, modifiedFiles);
+          const gitClass = gitCode ? gitStatusClass(gitCode) : null;
+          return (
+            <div
+              key={item.id}
+              role="listitem"
+              class={`fb-node fb-search-item${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
+              title={item.id}
+              onClick={() => {
+                if (item.isDir) {
+                  if (!isMulti) handleSelect(item.id, true);
+                  navigateTo(item.id);
+                  return;
+                }
+                if (!isMulti) handleSelect(item.id, false);
+                if (mode !== 'dir-only') handlePreview(item.id, true);
+              }}
+            >
+              {isMulti && (
+                <input
+                  type="checkbox"
+                  class="fb-node-check"
+                  checked={isSelected}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={() => handleSelect(item.id, item.isDir)}
+                />
+              )}
+              <span class="fb-node-icon"><FileTypeIcon name={item.name} isDir={item.isDir} /></span>
+              <div class="fb-search-item-text">
+                <span class="fb-node-name">{item.name}</span>
+                {item.dirLabel && <span class="fb-search-item-dir">{item.dirLabel}</span>}
+              </div>
+              {gitCode && gitClass && (
+                <span
+                  class={`fb-node-git-badge git-badge-${gitClass}`}
+                  title={gitCode === '!!' ? t('file_browser.git_ignored', 'Ignored by .gitignore') : `git: ${gitCode}`}
+                >
+                  {gitStatusBadge(gitCode)}
+                </span>
+              )}
+              {isAlready && <span class="fb-node-badge">↑</span>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  })();
+  // The table: filter and column controls stay put; the header and the rows scroll together, sideways when the container is
+  // narrower than the columns need, and the header stays on top while the rows scroll down.
+  const treePanelClasses = `${layout === 'panel' ? ' fb-tree-panel' : ''}${isMulti && selectedPaths.size > 0 ? ' fb-has-selection' : ''}`;
+  const tree = listView ? (
+    <div
+      ref={treeContainerRef}
+      tabIndex={0}
+      role="tree"
+      onKeyDown={handleTreeKeyDown}
+      class={`fb-tree fb-tree-list${treePanelClasses}${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}
+    >
+      <FileBrowserListToolbar
+        sort={sort}
+        onSortChange={handleSortChange}
+        filterValue={filterInput}
+        onFilterInput={setFilterInput}
+        onFilterCompositionStart={() => { filterComposingRef.current = true; }}
+        onFilterCompositionEnd={(value) => {
+          filterComposingRef.current = false;
+          setFilterInput(value);
+          setAppliedFilter(value);
+        }}
+        onFilterClear={clearFilter}
+        hiddenColumns={hiddenColumns}
+        effectiveSortKey={effectiveSort.key}
+        onToggleColumn={toggleColumn}
+        onShowAllColumns={showAllColumns}
+        notice={listNotice}
+      />
+      <div class="fb-table-scroll" style={{ '--fb-table-min': `${tableMinWidth}px` } as Record<string, string>}>
+        <FileBrowserListHeader sort={sort} onSortChange={handleSortChange} unavailableReasons={unavailableReasons} hiddenColumns={hiddenColumns} />
+        {treeRows}
+      </div>
+    </div>
+  ) : (
+    <div
+      ref={treeContainerRef}
+      tabIndex={0}
+      role="tree"
+      onKeyDown={handleTreeKeyDown}
+      class={`fb-tree${treePanelClasses}${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}
+    >
+      {navSearchTreeBody ?? treeRows}
     </div>
   );
 
@@ -1578,43 +3483,19 @@ export function FileBrowser({
   }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
 
   const downloadCurrentPreview = useCallback(async () => {
-    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId) return;
-    setDownloadError(null);
-    try {
-      await downloadAttachment(serverId, preview.downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry.
-      if (isStaleHandle && 'path' in preview) {
-        try {
-          const freshId = await new Promise<string>((resolve, reject) => {
-            const requestId = ws.fsReadFile(preview.path);
-            const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
-            const off = ws.onMessage((m) => {
-              if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
-              off();
-              clearTimeout(timer);
-              if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
-              else reject(new Error('no_handle'));
-            });
-          });
-          setPreview((prev) => {
-            if (prev.status === 'idle' || !('path' in prev)) return prev;
-            return { ...prev, downloadId: freshId } as typeof prev;
-          });
-          await downloadAttachment(serverId, freshId);
-          return;
-        } catch { /* retry failed — fall through to show error */ }
-      }
-      if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
-      else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
-      else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
-      else setDownloadError(t('upload.download_failed'));
-      setTimeout(() => setDownloadError(null), 5000);
-      throw err;
-    }
-  }, [preview, serverId, t, ws]);
+    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId || !('path' in preview)) return;
+    await startDownloadTransferForPath(preview.path, preview.downloadId);
+  }, [preview, serverId, startDownloadTransferForPath]);
+
+  const loadMarkdownImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
+    loadFsLocalImagePreview(ws, path, {
+      sessionName: scopedSessionName,
+      serverId,
+      timeoutMs: PREVIEW_REQUEST_TIMEOUT_MS,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('file_browser.timeout'),
+    })
+  ), [scopedSessionName, serverId, t, ws]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1623,13 +3504,69 @@ export function FileBrowser({
           dismissPreview();
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
-        {preview.status === 'ok' && !isEditing && (
+        <div class="fb-preview-actions">
+        {preview.status === 'ok' && !isEditing && !effectivePreviewReadOnly && (
           <button class="fb-diff-toggle" onClick={() => {
             setIsEditing(true);
             try { localStorage.setItem(PREF_KEY, '1'); } catch {}
           }}>{t('fileBrowser.edit')}</button>
         )}
-        {isEditing && preview.status === 'ok' && (
+        {preview.status === 'ok' && !isEditing && serverId && /\.(csv|md|markdown|txt|rtf)$/i.test(preview.path) && (
+          <button
+            class="fb-diff-toggle"
+            data-testid="fb-open-csv-office-btn"
+            onClick={() => {
+              const lower = preview.path.toLowerCase();
+              const mime = lower.endsWith('.csv')
+                ? 'text/csv'
+                : (lower.endsWith('.md') || lower.endsWith('.markdown'))
+                  ? 'text/markdown'
+                  : lower.endsWith('.rtf')
+                    ? 'application/rtf'
+                    : 'text/plain';
+              setPreview({
+                status: 'office',
+                path: preview.path,
+                srcUrl: '',
+                mimeType: mime,
+                downloadId: preview.downloadId,
+                verified: true,
+              });
+            }}
+          >
+            {t('office_preview.open_in_onlyoffice', 'ONLYOFFICE')}
+          </button>
+        )}
+        {preview.status === 'office'
+          && serverId
+          && !(activeSharedDocServerId && activeSharedDocServerId !== serverId)
+          && isNativeTextSwitchableFile(preview.path, preview.mimeType) && (
+          <button
+            class="fb-diff-toggle"
+            data-testid="fb-switch-native-editor-btn"
+            onClick={() => {
+              fetchPreview(preview.path, false, 'source', true, {
+                forceNativeText: true,
+                openEditor: !effectivePreviewReadOnly,
+              });
+            }}
+          >
+            {effectivePreviewReadOnly
+              ? t('file_browser.native_text_preview', 'Plain Text')
+              : t('file_browser.native_text_editor', 'Plain Text Editor')}
+          </button>
+        )}
+        {serverId && !effectivePreviewReadOnly && canShare && 'path' in preview && (
+          <button
+            class="fb-diff-toggle"
+            data-testid="fb-preview-share-btn"
+            onClick={() => setShareDialogTarget({ path: preview.path, kind: 'file' })}
+            title={t('doc_share.share_btn', 'Share')}
+          >
+            {t('doc_share.share_btn', 'Share')}
+          </button>
+        )}
+        {isEditing && !effectivePreviewReadOnly && preview.status === 'ok' && (
           <Suspense fallback={null}>
             <FileEditor
               ws={ws}
@@ -1654,6 +3591,7 @@ export function FileBrowser({
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
               onContentChange={setEditContent}
+              sessionName={scopedSessionName}
             />
           </Suspense>
         )}
@@ -1688,7 +3626,7 @@ export function FileBrowser({
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
         )}
-        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'video' || preview.status === 'error') && serverId && preview.downloadId && (
+        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'video' || preview.status === 'audio' || preview.status === 'error') && serverId && preview.downloadId && (
           <button
             class="fb-diff-toggle"
             title={downloadError || t('upload.download_file')}
@@ -1741,13 +3679,14 @@ export function FileBrowser({
             {t('fileBrowser.insertPath')}
           </button>
         )}
+        </div>
         <button class="fb-close" onClick={() => {
           dismissPreview();
         }}>✕</button>
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
       <div class="fb-preview-content" ref={previewContentRef}>
-        {preview.status === 'loading' && (
+        {(preview.status === 'loading' || (preview.status === 'image' && preview.settling)) && (
           <div class="fb-preview-loading">
             <div class="fb-loading-spinner" />
             <div class="fb-loading-text">{t('file_browser.preview_loading')}</div>
@@ -1761,6 +3700,19 @@ export function FileBrowser({
             <img
               src={preview.dataUrl}
               alt={preview.path.split(/[/\\]/).pop() ?? ''}
+              onLoad={() => {
+                setPreview((current) => (current.status === 'image' && current.path === preview.path && current.settling
+                  ? { ...current, settling: false }
+                  : current));
+              }}
+              onError={() => {
+                // tsk_5rf R2: a streamed preview resolves a URL, not bytes. A
+                // dead or expired download handle used to leave a broken image
+                // here while the preview still claimed image state.
+                setPreview((current) => (current.status === 'image' && current.path === preview.path
+                  ? { status: 'error', path: current.path, error: t('file_browser.preview_error'), downloadId: current.downloadId }
+                  : current));
+              }}
               onClick={() => setLightbox({
                 src: preview.dataUrl,
                 fileName: preview.path.split(/[/\\]/).pop() || undefined,
@@ -1772,7 +3724,17 @@ export function FileBrowser({
         )}
         {preview.status === 'office' && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <OfficePreview data={preview.data} mimeType={preview.mimeType} path={preview.path} />
+            <OfficePreview
+              srcUrl={preview.srcUrl}
+              mimeType={preview.mimeType}
+              path={preview.path}
+              serverId={activeSharedDocServerId || serverId}
+              sessionName={scopedSessionName}
+              readOnly={effectivePreviewReadOnly}
+              initialMode={effectivePreviewReadOnly ? 'view' : undefined}
+              onOpenShare={serverId && !effectivePreviewReadOnly ? () => setShareDialogTarget({ path: preview.path, kind: 'file' }) : undefined}
+              onOnlyOfficeOpened={handleOnlyOfficeOpened}
+            />
           </Suspense>
         )}
         {preview.status === 'video' && (
@@ -1783,14 +3745,31 @@ export function FileBrowser({
               controls
               preload="metadata"
               playsInline
-              style={{ maxWidth: '100%', maxHeight: '100%', width: '100%', background: '#000' }}
             >
               <source src={preview.streamUrl} type={preview.mimeType} />
               {t('file_browser.preview_video_unsupported')}
             </video>
           </div>
         )}
-        {preview.status === 'ok' && isEditing && (
+        {preview.status === 'audio' && (
+          <div class="fb-preview-audio">
+            <div class="fb-preview-audio-card">
+              <div class="fb-preview-audio-icon" aria-hidden="true">♪</div>
+              <div class="fb-preview-audio-name">{preview.path.split(/[/\\]/).pop() ?? preview.path}</div>
+              <audio
+                key={preview.streamUrl}
+                src={preview.streamUrl}
+                controls
+                preload="metadata"
+                style={{ width: '100%' }}
+              >
+                <source src={preview.streamUrl} type={preview.mimeType} />
+                {t('file_browser.preview_audio_unsupported')}
+              </audio>
+            </div>
+          </div>
+        )}
+        {preview.status === 'ok' && isEditing && !effectivePreviewReadOnly && (
           <Suspense fallback={null}>
             <FileEditorContent
               ws={ws}
@@ -1801,6 +3780,7 @@ export function FileBrowser({
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
               onContentChange={setEditContent}
+              sessionName={scopedSessionName}
               onSaved={(newMtime) => {
                 setOriginalMtime(newMtime);
                 setEditDirty(false);
@@ -1814,7 +3794,13 @@ export function FileBrowser({
         )}
         {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <FilePreviewPane content={preview.content} path={preview.path} />
+            <FilePreviewPane
+              content={preview.content}
+              path={preview.path}
+              allowedRootPath={markdownReferenceRoot}
+              onPathClick={fetchPreview}
+              onImagePreview={loadMarkdownImagePreview}
+            />
           </Suspense>
         )}
         {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (
@@ -1837,19 +3823,7 @@ export function FileBrowser({
       <button
         class="btn btn-secondary fb-footer-copy-path"
         title={currentLabel}
-        onClick={() => {
-          const path = currentLabel;
-          void (async () => {
-            try {
-              await navigator.clipboard.writeText(path);
-              setCopiedPath(path);
-              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
-            } catch {
-              // Clipboard access can be blocked in insecure contexts; keep the
-              // file picker usable and leave the path visible in the title.
-            }
-          })();
-        }}
+        onClick={copyCurrentPath}
       >
         {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
       </button>
@@ -1867,28 +3841,68 @@ export function FileBrowser({
   const STATUS_LABEL: Record<string, string> = {
     M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', '??': 'Untracked', '!!': 'Ignored',
   };
+  const effectiveChangesTotal = Math.max(changesMeta.totalCount, changesFiles.length);
+  const isChangesTruncated = changesMeta.truncated || effectiveChangesTotal > changesFiles.length;
+  const visibleChangesFiles = useMemo(
+    () => changesFiles.slice(0, changesVisibleLimit),
+    [changesFiles, changesVisibleLimit],
+  );
   const groupedChanges = useMemo(() => {
     const groups: Record<string, Array<{ path: string; code: string; additions?: number; deletions?: number }>> = {};
-    for (const f of changesFiles) {
+    for (const f of visibleChangesFiles) {
       const label = STATUS_LABEL[f.code] ?? f.code;
       if (!groups[label]) groups[label] = [];
       groups[label].push(f);
     }
     return groups;
-  }, [changesFiles]);
+  }, [visibleChangesFiles]);
 
-  const changesSection = changesFiles.length > 0 ? (
+  const changesRefreshLabel = changesRefreshStatus === 'refreshing'
+    ? t('file_browser.refreshing_changes')
+    : changesRefreshStatus === 'success'
+      ? t('file_browser.refresh_changes_success')
+      : changesRefreshStatus === 'error'
+        ? t('file_browser.refresh_changes_failed')
+        : t('file_browser.refresh_changes');
+  const changesRefreshIcon = changesRefreshStatus === 'success'
+    ? '✓'
+    : changesRefreshStatus === 'error'
+      ? '!'
+      : '↻';
+  const changesSection = (
     <div class="fb-changes-section">
       <div class="fb-changes-header">
-        <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
+        <span class="fb-changes-title">{t('file_browser.changes_title', { count: effectiveChangesTotal })}</span>
         {changesRootPath && (
-          <button class="fb-changes-refresh" onClick={() => {
-            requestSharedChanges(ws, changesRootPath!, true);
-          }} title="Refresh">↻</button>
+          <button
+            class={`fb-changes-refresh is-${changesRefreshStatus}`}
+            disabled={changesRefreshStatus === 'refreshing'}
+            onClick={() => {
+              try {
+                requestSharedChanges(ws, changesRootPath!, true, scopedSessionName, serverId);
+              } catch {
+                setChangesRefreshStatus('error');
+              }
+            }}
+            title={changesRefreshLabel}
+            aria-label={changesRefreshLabel}
+            aria-live="polite"
+            aria-atomic="true"
+          ><span class="fb-changes-refresh-icon" aria-hidden="true">{changesRefreshIcon}</span></button>
         )}
       </div>
-      <div class="fb-changes-list">
-        {Object.entries(groupedChanges).map(([label, files]) => (
+      {isChangesTruncated && (
+        <div class="fb-changes-truncated-notice" data-testid="fb-changes-truncated-notice">
+          {t('file_browser.changes_truncated_notice', {
+            shown: changesFiles.length,
+            total: effectiveChangesTotal,
+            defaultValue: 'Showing first {{shown}} of {{total}} changed files',
+          })}
+        </div>
+      )}
+      {changesFiles.length > 0 ? (
+        <div class="fb-changes-list">
+          {Object.entries(groupedChanges).map(([label, files]) => (
           <div key={label} class="fb-changes-group">
             <div class="fb-changes-group-label">{label} ({files.length})</div>
             {files.map((f) => {
@@ -1915,10 +3929,28 @@ export function FileBrowser({
               );
             })}
           </div>
-        ))}
-      </div>
+          ))}
+          {changesFiles.length > visibleChangesFiles.length && (
+            <button
+              type="button"
+              class="fb-changes-load-more"
+              data-testid="fb-changes-load-more"
+              onClick={() => setChangesVisibleLimit((prev) => prev + CHANGES_RENDER_BATCH_SIZE)}
+            >
+              {t('file_browser.changes_load_more', {
+                count: Math.min(CHANGES_RENDER_BATCH_SIZE, changesFiles.length - visibleChangesFiles.length),
+                shown: visibleChangesFiles.length,
+                total: changesFiles.length,
+                defaultValue: 'Load {{count}} more ({{shown}}/{{total}})',
+              })}
+            </button>
+          )}
+        </div>
+      ) : (
+        <div class="fb-preview-msg fb-changes-empty">{t('file_browser.no_changes')}</div>
+      )}
     </div>
-  ) : null;
+  );
 
   // Build breadcrumb segments from currentLabel (handles Unix / and Windows \ paths)
   const breadcrumbSegments = useMemo(() => {
@@ -1961,54 +3993,185 @@ export function FileBrowser({
     return [{ label, path: label }];
   }, [currentLabel]);
 
-  // Show drive picker / home button on Windows daemons.
-  // Detected by current path looking like a Windows path or label being the localized "This PC".
-  const thisPcLabel = t('file_browser.this_pc');
-  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
-  const isAtDrives = currentLabel === thisPcLabel;
+  // Sentinels, not paths: the daemon resolves each to wherever it really lives
+  // on the remote machine (a relocated Downloads, a localized XDG directory).
+  const quickAccessTargets = [
+    { path: FILE_TRANSFER_DIRECTORY_PATH.HOME, label: t('file_browser.home'), icon: '🏠' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DESKTOP, label: t('file_browser.desktop'), icon: '🖥️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, label: t('file_browser.downloads'), icon: '⬇️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS, label: t('file_browser.documents'), icon: '📄' },
+    // Only meaningful where drive letters exist.
+    ...(looksLikeWindows
+      ? [{ path: WINDOWS_DRIVES_PATH, label: t('file_browser.this_pc'), icon: '💾' }]
+      : []),
+  ];
 
   const breadcrumb = (
     <div class="fb-nav-stack">
+      {quickAccess && (
+        <div class="fb-quick-access" role="group" aria-label={t('file_browser.quick_access')}>
+          {quickAccessTargets.map((target) => (
+            <button
+              key={target.path}
+              type="button"
+              class="fb-quick-access-btn"
+              title={target.label}
+              onClick={() => navigateTo(target.path)}
+            >
+              <span aria-hidden="true">{target.icon}</span>
+              <span class="fb-quick-access-label">{target.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {quickAccess && macosFdaPrompt && (
+        <div class="fb-macos-fda-prompt" role="alert">
+          <span class="fb-macos-fda-prompt-text">
+            {t(macosFdaPrompt.requestFailed
+              ? 'file_browser.macos_fda_prompt_open_failed'
+              : macosFdaPrompt.target === 'app' ? 'file_browser.macos_fda_prompt_app' : 'file_browser.macos_fda_prompt')}
+          </span>
+          <button
+            type="button"
+            class="fb-macos-fda-prompt-btn"
+            disabled={macosFdaPrompt.requesting}
+            onClick={requestMacosFullDiskAccess}
+          >
+            {t(macosFdaPrompt.requesting ? 'file_browser.macos_fda_prompt_opening' : 'file_browser.macos_fda_prompt_action')}
+          </button>
+        </div>
+      )}
       <div class="fb-nav">
         <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
         <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
-        {looksLikeWindows && (
+        {looksLikeWindows && !quickAccess && (
           <button
             class="fb-nav-btn"
             onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
             title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
           >{isAtDrives ? '🏠' : '💾'}</button>
         )}
-        <div class="fb-nav-spacer" />
+        {showNavSearch ? (
+          <div class="fb-nav-search">
+            <input
+              ref={attachNavSearchInputRef}
+              type="text"
+              class="fb-nav-search-input"
+              data-testid="fb-nav-search-input"
+              value={navSearchInput}
+              maxLength={FILE_BROWSER_FILTER_MAX_QUERY_CHARS}
+              placeholder={t('file_browser.filter_placeholder')}
+              aria-label={t('file_browser.filter_label')}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellcheck={false}
+              enterKeyHint="search"
+              onInput={(e) => {
+                if ((e as unknown as InputEvent).isComposing) navSearchComposingRef.current = true;
+                const value = (e.currentTarget as HTMLInputElement).value;
+                setNavSearchInput(value);
+                if (!value) {
+                  clearNavSearch();
+                }
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Escape' && !e.isComposing && navSearchInput) {
+                  e.preventDefault();
+                  clearNavSearch();
+                }
+              }}
+            />
+            {navSearchInput && (
+              <button
+                type="button"
+                class="fb-nav-search-clear"
+                data-testid="fb-nav-search-clear"
+                title={t('file_browser.filter_clear')}
+                aria-label={t('file_browser.filter_clear')}
+                onClick={clearNavSearch}
+              >✕</button>
+            )}
+          </div>
+        ) : (
+          <div class="fb-nav-spacer" />
+        )}
         <button
           class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
           title={error || 'Refresh'}
-          onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
+          onClick={handleRefresh}
         >{error ? '⚠' : '↻'}</button>
+        {!listView && (
+          <button
+            type="button"
+            class="fb-nav-btn fb-collapse-all-btn"
+            data-testid="fb-collapse-all-btn"
+            title={t('file_browser.collapse_all', 'Collapse All Folders')}
+            aria-label={t('file_browser.collapse_all', 'Collapse All Folders')}
+            onClick={collapseAllFolders}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="2.25" y="2.25" width="11.5" height="11.5" rx="2" stroke="currentColor" stroke-width="1.3" />
+              <path d="M5 8H11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+          </button>
+        )}
         <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
           <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
           {' ·'}
         </label>
-        {includeFiles && (
+        {includeFiles && !readOnly && (
           <button
             class="fb-create-btn fb-create-file-btn"
             title={t('chat.new_file')}
             aria-label={t('chat.new_file')}
-            onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+            onClick={() => openNewEntry('file')}
           >
             <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
             <span class="fb-create-plus" aria-hidden="true">+</span>
           </button>
         )}
-        <button
+        {!readOnly && <button
           class="fb-create-btn fb-create-folder-btn"
           title={t('chat.new_folder')}
           aria-label={t('chat.new_folder')}
-          onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
+          onClick={() => openNewEntry('folder')}
         >
           <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
           <span class="fb-create-plus" aria-hidden="true">+</span>
-        </button>
+        </button>}
+        {serverId && !readOnly && canShare && (
+          <button
+            type="button"
+            class="fb-nav-btn"
+            data-testid="fb-toolbar-share-btn"
+            title={t('doc_share.share_btn', 'Share')}
+            aria-label={t('doc_share.share_btn', 'Share')}
+            onClick={() => {
+              const sel = selectedPaths.size === 1 ? [...selectedPaths][0] : null;
+              if (sel && preview.status !== 'idle' && 'path' in preview && preview.path === sel) {
+                setShareDialogTarget({ path: sel, kind: 'file' });
+              } else {
+                setShareDialogTarget({ path: currentLabel, kind: 'folder' });
+              }
+            }}
+          >
+            🔗
+          </button>
+        )}
+        {serverId && (
+          <button
+            type="button"
+            class={`fb-nav-btn${showSharedDocs ? ' active' : ''}`}
+            data-testid="fb-toolbar-shared-docs-btn"
+            title={t('doc_share.shared_docs_tab', 'Shared Docs')}
+            aria-label={t('doc_share.shared_docs_tab', 'Shared Docs')}
+            onClick={() => setShowSharedDocs((v) => !v)}
+          >
+            🤝
+          </button>
+        )}
       </div>
       <div class="fb-breadcrumb-row" title={currentLabel}>
         <div class="fb-breadcrumb-segments">
@@ -2026,19 +4189,64 @@ export function FileBrowser({
             );
           })}
         </div>
+        <div class="fb-breadcrumb-actions">
+          <button
+            type="button"
+            class="fb-breadcrumb-action"
+            title={currentLabel}
+            aria-label={copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+            onClick={copyCurrentPath}
+          >{copiedPath === currentLabel ? '✓' : '⧉'}</button>
+          {!hideBreadcrumbConfirm && (
+            <button
+              type="button"
+              class="fb-breadcrumb-action is-primary"
+              aria-label={confirmLabel}
+              disabled={(mode === 'dir-only' && isAtDrives)
+                || (mode !== 'dir-only' && selectedPaths.size === 0)}
+              onClick={handleConfirm}
+            >✓</button>
+          )}
+        </div>
       </div>
     </div>
   );
 
-  const newEntryDialog = newEntry !== null ? (
+  const newEntryDialog = newEntry !== null && !newEntryMountedInTree ? (
     <div class="fb-new-folder-bar">
+      {newEntry.kind === 'file' && serverId && (
+        <select
+          data-testid="fb-new-doc-type-select"
+          value={newDocType}
+          onChange={(e) => setNewDocType((e.target as HTMLSelectElement).value as '' | '.docx' | '.xlsx' | '.pptx' | '.md')}
+          style={{
+            background: '#0f172a',
+            color: '#e2e8f0',
+            border: '1px solid #334155',
+            borderRadius: 4,
+            padding: '3px 6px',
+            fontSize: 12,
+          }}
+        >
+          <option value="">{t('doc_share.new_file_plain', 'Plain File')}</option>
+          <option value=".docx">{t('doc_share.new_doc_docx', 'Word (.docx)')}</option>
+          <option value=".xlsx">{t('doc_share.new_doc_xlsx', 'Excel (.xlsx)')}</option>
+          <option value=".pptx">{t('doc_share.new_doc_pptx', 'PowerPoint (.pptx)')}</option>
+          <option value=".md">{t('doc_share.new_doc_md', 'Markdown (.md)')}</option>
+        </select>
+      )}
       <input
         type="text"
         placeholder={newEntry.kind === 'folder' ? t('chat.new_folder_name') : t('chat.new_file_name')}
         value={newEntryName}
-        onInput={(e) => setNewEntryName((e.target as HTMLInputElement).value)}
+        onInput={(e) => {
+          const val = (e.target as HTMLInputElement).value;
+          newEntryNameRef.current = val;
+          setNewEntryName(val);
+        }}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && newEntryName.trim()) requestNewEntry();
+          const val = (e.currentTarget as HTMLInputElement).value;
+          if (e.key === 'Enter' && val.trim()) requestNewEntry(val);
           if (e.key === 'Escape') setNewEntry(null);
         }}
         autoFocus
@@ -2047,10 +4255,261 @@ export function FileBrowser({
         class="btn btn-primary"
         style={{ padding: '4px 10px', fontSize: 12 }}
         disabled={!newEntryName.trim()}
-        onClick={requestNewEntry}
+        onClick={() => requestNewEntry()}
       >{t('chat.create')}</button>
       <button class="fb-close" onClick={() => setNewEntry(null)} style={{ fontSize: 12 }}>✕</button>
     </div>
+  ) : null;
+
+  const sharedDocsBanner = showSharedDocs && serverId ? (
+    <div
+      data-testid="fb-shared-docs-panel"
+      style={{
+        padding: '8px 12px',
+        background: '#0f172a',
+        borderBottom: '1px solid #334155',
+        maxHeight: 180,
+        overflowY: 'auto',
+        fontSize: 12,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <strong style={{ color: '#e2e8f0' }}>{t('doc_share.shared_docs_title', 'Team Shared Documents & Folders')}</strong>
+        <button
+          type="button"
+          class="fb-close"
+          onClick={() => setShowSharedDocs(false)}
+          style={{ fontSize: 12 }}
+        >
+          ✕
+        </button>
+      </div>
+      {sharedDocsLoading ? (
+        <div style={{ color: '#64748b' }}>…</div>
+      ) : sharedDocs.length === 0 ? (
+        <div style={{ color: '#64748b' }}>{t('doc_share.no_shared_docs', 'No shared documents or folders yet.')}</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {sharedDocs.map((item) => (
+            <div
+              key={item.id}
+              data-testid={`shared-doc-item-${item.id}`}
+              onClick={() => {
+                const targetSrv = item.serverId || serverId || '';
+                if (!targetSrv) return;
+                if (item.targetKind === 'folder') {
+                  const epoch = ++sharedFolderEpochRef.current;
+                  void browseSharedDocFolder(targetSrv, item.targetPath)
+                    .then((res) => {
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                      setSharedFolderView({
+                        serverId: targetSrv,
+                        rootPath: item.targetPath,
+                        currentPath: res.path,
+                        role: res.role,
+                        entries: res.entries,
+                      });
+                    })
+                    .catch((err: unknown) => {
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                      setError(err instanceof Error ? err.message : String(err));
+                    });
+                } else {
+                  setActiveSharedDocServerId(targetSrv);
+                  setActiveSharedDocReadOnly(item.role === 'viewer');
+                  setPreview({
+                    status: 'office',
+                    path: item.targetPath,
+                    srcUrl: '',
+                    mimeType: getOfficeType(item.targetPath) || 'text/markdown',
+                  });
+                }
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '4px 8px',
+                borderRadius: 4,
+                background: '#1e293b',
+                cursor: 'pointer',
+                color: '#e2e8f0',
+              }}
+            >
+              <span>
+                {item.targetKind === 'folder' ? '📁 ' : '📄 '}
+                {item.label || item.targetPath.split('/').pop() || item.targetPath}
+              </span>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                {item.role === 'editor' ? t('doc_share.role_editor', 'Editor') : t('doc_share.role_viewer', 'Viewer')}
+              </span>
+            </div>
+          ))}
+          {sharedFolderView && (
+            <div
+              data-testid="shared-doc-folder-entries"
+              style={{
+                marginTop: 6,
+                padding: 8,
+                background: '#020617',
+                border: '1px solid #334155',
+                borderRadius: 4,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 4,
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#94a3b8' }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{sharedFolderView.currentPath}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                  {sharedFolderView.role === 'editor' && (
+                    <button
+                      type="button"
+                      data-testid="shared-folder-create-toggle"
+                      onClick={() => setSharedShowCreate((prev) => !prev)}
+                      style={{ background: 'transparent', border: 'none', color: '#38bdf8', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}
+                      title={t('doc_share.new_doc_btn')}
+                    >
+                      +
+                    </button>
+                  )}
+                  {sharedFolderView.currentPath !== sharedFolderView.rootPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const epoch = ++sharedFolderEpochRef.current;
+                        const targetServer = sharedFolderView.serverId;
+                        const parent = sharedFolderView.currentPath.split('/').slice(0, -1).join('/') || sharedFolderView.rootPath;
+                        const safeParent = parent.startsWith(sharedFolderView.rootPath) ? parent : sharedFolderView.rootPath;
+                        void browseSharedDocFolder(targetServer, safeParent).then((res) => {
+                          if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                          setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                        });
+                      }}
+                      style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
+                    >
+                      ↑ {t('doc_share.up_dir', 'Up')}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {sharedShowCreate && sharedFolderView.role === 'editor' && (
+                <form
+                  data-testid="shared-folder-create-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!sharedNewName.trim()) return;
+                    const epoch = ++sharedFolderEpochRef.current;
+                    const targetServer = sharedFolderView.serverId;
+                    const targetPath = sharedFolderView.currentPath;
+                    const base = sharedNewName.trim();
+                    const ext = sharedNewKind === 'folder' ? '' : `.${sharedNewKind}`;
+                    const finalName = ext && base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
+                    void createSharedDocItem(targetServer, {
+                      parentDir: targetPath,
+                      name: finalName,
+                      kind: sharedNewKind === 'folder' ? 'folder' : 'file',
+                    }).then((created) => {
+                      setSharedNewName('');
+                      setSharedShowCreate(false);
+                      return browseSharedDocFolder(targetServer, targetPath).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, entries: res.entries } : null);
+                        if (created.kind === 'file') {
+                          setActiveSharedDocServerId(targetServer);
+                          setActiveSharedDocReadOnly(false);
+                          setPreview({
+                            status: 'office',
+                            path: created.path,
+                            srcUrl: '',
+                            mimeType: getOfficeType(created.path) || 'text/markdown',
+                          });
+                        }
+                      });
+                    });
+                  }}
+                  style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}
+                >
+                  <input
+                    type="text"
+                    data-testid="shared-folder-new-name-input"
+                    value={sharedNewName}
+                    onInput={(e) => setSharedNewName((e.target as HTMLInputElement).value)}
+                    placeholder={t('doc_share.new_file_name', 'Name...')}
+                    style={{ flex: 1, minWidth: 80, padding: '3px 6px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  />
+                  <select
+                    value={sharedNewKind}
+                    onChange={(e) => setSharedNewKind((e.target as HTMLSelectElement).value as any)}
+                    style={{ padding: '3px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  >
+                    <option value="docx">.docx</option>
+                    <option value="xlsx">.xlsx</option>
+                    <option value="pptx">.pptx</option>
+                    <option value="md">.md</option>
+                    <option value="folder">{t('doc_share.kind_folder')}</option>
+                  </select>
+                  <button
+                    type="submit"
+                    data-testid="shared-folder-create-submit"
+                    style={{ padding: '3px 8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >
+                    {t('common.confirm')}
+                  </button>
+                </form>
+              )}
+              {sharedFolderView.entries.map((entry) => (
+                <div
+                  key={entry.path}
+                  data-testid={`shared-folder-entry-${entry.name}`}
+                  onClick={() => {
+                    if (entry.isDir) {
+                      const epoch = ++sharedFolderEpochRef.current;
+                      const targetServer = sharedFolderView.serverId;
+                      void browseSharedDocFolder(targetServer, entry.path).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                      });
+                    } else {
+                      setActiveSharedDocServerId(sharedFolderView.serverId);
+                      setActiveSharedDocReadOnly((entry.role ?? sharedFolderView.role) === 'viewer');
+                      setPreview({
+                        status: 'office',
+                        path: entry.path,
+                        srcUrl: '',
+                        mimeType: getOfficeType(entry.path) || 'text/markdown',
+                      });
+                    }
+                  }}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    padding: '3px 6px',
+                    borderRadius: 3,
+                    background: '#1e293b',
+                    cursor: 'pointer',
+                    color: '#e2e8f0',
+                  }}
+                >
+                  <span>{entry.isDir ? `📁 ${entry.name}` : `📄 ${entry.name}`}</span>
+                  <span style={{ fontSize: 10, color: '#94a3b8' }}>{entry.role ?? sharedFolderView.role}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const shareDialogOverlay = shareDialogTarget && serverId && canShare ? (
+    <DocShareDialog
+      serverId={serverId}
+      targetPath={shareDialogTarget.path}
+      targetKind={shareDialogTarget.kind}
+      onClose={() => setShareDialogTarget(null)}
+      onOpenNodeGroups={resolvedOnOpenNodeGroups}
+    />
   ) : null;
 
   const lightboxOverlay = lightbox ? (
@@ -2062,13 +4521,17 @@ export function FileBrowser({
     />
   ) : null;
 
+  if (externalShareToken) {
+    return <ExternalDocShareSpace token={externalShareToken} />;
+  }
+
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
         <button class={`fb-panel-tab${panelView === 'files' ? ' active' : ''}`} onClick={() => setPanelView('files')}>{t('file_browser.tab_files')}</button>
         <button class={`fb-panel-tab${panelView === 'changes' ? ' active' : ''}`} onClick={() => setPanelView('changes')}>
           {t('file_browser.tab_changes')}
-          {changesFiles.length > 0 && <span class="fb-panel-tab-badge">{changesFiles.length}</span>}
+          {effectiveChangesTotal > 0 && <span class="fb-panel-tab-badge">{effectiveChangesTotal}</span>}
         </button>
       </div>
     ) : null;
@@ -2077,6 +4540,7 @@ export function FileBrowser({
       return (
         <>
           {lightboxOverlay}
+          {shareDialogOverlay}
           {contextMenuView}
           <div class="fb-panel">
             {tabs}
@@ -2096,18 +4560,21 @@ export function FileBrowser({
     return (
       <>
         {lightboxOverlay}
+        {shareDialogOverlay}
         {contextMenuView}
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
           {newEntryDialog}
+          {sharedDocsBanner}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
             </div>
             {hasPreview && (
               <div
-                class="fb-resize-handle"
+                class="fb-resize-handle resize-hover-surface"
+                {...resizeHandleHoverEvents}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   const startX = e.clientX;
@@ -2130,6 +4597,7 @@ export function FileBrowser({
   return (
     <>
       {lightboxOverlay}
+      {shareDialogOverlay}
       {contextMenuView}
       <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
         <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
@@ -2139,6 +4607,7 @@ export function FileBrowser({
           </div>
           {breadcrumb}
           {newEntryDialog}
+          {sharedDocsBanner}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}
@@ -2152,61 +4621,287 @@ export function FileBrowser({
 
 // ── Tree node ─────────────────────────────────────────────────────────────────
 
+/** What the table view needs to draw a row: how to lay it out and what to say about a missing value. */
+interface FsListColumns {
+  /** The columns shown (name always; size, kind, modified, created unless hidden). */
+  visible: ReadonlySet<FileBrowserSortKey>;
+  nowMs: number;
+  locale: string;
+  /** Any entry of the root listing came with file details (an older machine sends none). */
+  detailsPresent: boolean;
+  createdUnavailable: boolean;
+  /** The listing is the Windows drive list, which carries no file details by nature. */
+  drivesList?: boolean;
+  /** Directories shown open only because something below them matched the filter. */
+  forceExpanded?: Set<string>;
+  /** Shown instead of the empty-directory dash when the filter matched nothing. */
+  emptyText?: string;
+}
+
+interface InlineNewEntryProps {
+  kind: 'file' | 'folder';
+  parentPath: string;
+  name: string;
+  docType: '' | '.docx' | '.xlsx' | '.pptx' | '.md';
+  hasServer: boolean;
+  onNameInput: (value: string) => void;
+  onDocTypeChange: (value: '' | '.docx' | '.xlsx' | '.pptx' | '.md') => void;
+  onSubmit: (nameOverride?: string) => void;
+  onCancel: () => void;
+}
+
+function TreeIndentGuides({ depth }: { depth: number }) {
+  if (depth <= 0) return null;
+  const levels = [];
+  for (let i = 0; i < depth; i++) {
+    levels.push(
+      <span
+        key={i}
+        class="fb-indent-guide"
+        aria-hidden="true"
+        style={{ left: `${8 + i * FILE_BROWSER_INDENT_PX + 5}px` }}
+      />,
+    );
+  }
+  return <>{levels}</>;
+}
+
+function FsInlineCreateRow({ entry, depth }: { entry: InlineNewEntryProps; depth: number }) {
+  const { t } = useTranslation();
+  return (
+    <div
+      class="fb-node fb-inline-edit-row fb-inline-create-row"
+      style={{ paddingLeft: 8 + depth * FILE_BROWSER_INDENT_PX }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <TreeIndentGuides depth={depth} />
+      <span class="fb-node-expand">{' '}</span>
+      <span class="fb-node-icon">
+        <FileTypeIcon name={entry.name || (entry.kind === 'folder' ? 'folder' : `new${entry.docType}`)} isDir={entry.kind === 'folder'} />
+      </span>
+      {entry.kind === 'file' && entry.hasServer && (
+        <select
+          data-testid="fb-new-doc-type-select"
+          class="fb-inline-doc-select"
+          value={entry.docType}
+          onChange={(e) => entry.onDocTypeChange((e.target as HTMLSelectElement).value as '' | '.docx' | '.xlsx' | '.pptx' | '.md')}
+        >
+          <option value="">{t('doc_share.new_file_plain', 'Plain File')}</option>
+          <option value=".docx">{t('doc_share.new_doc_docx', 'Word (.docx)')}</option>
+          <option value=".xlsx">{t('doc_share.new_doc_xlsx', 'Excel (.xlsx)')}</option>
+          <option value=".pptx">{t('doc_share.new_doc_pptx', 'PowerPoint (.pptx)')}</option>
+          <option value=".md">{t('doc_share.new_doc_md', 'Markdown (.md)')}</option>
+        </select>
+      )}
+      <input
+        type="text"
+        class="fb-inline-input"
+        data-testid="fb-inline-create-input"
+        placeholder={entry.kind === 'folder' ? t('chat.new_folder_name') : t('chat.new_file_name')}
+        value={entry.name}
+        onInput={(e) => entry.onNameInput((e.target as HTMLInputElement).value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          const currentValue = (e.currentTarget as HTMLInputElement).value;
+          if (e.key === 'Enter' && currentValue.trim()) {
+            e.preventDefault();
+            entry.onSubmit(currentValue);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            entry.onCancel();
+          }
+        }}
+        autoFocus
+      />
+      <button
+        type="button"
+        class="fb-inline-action-btn is-primary"
+        disabled={!entry.name.trim()}
+        onClick={() => entry.onSubmit()}
+      >{t('chat.create')}</button>
+      <button type="button" class="fb-inline-action-btn" onClick={entry.onCancel} aria-label={t('common.cancel')}>✕</button>
+    </div>
+  );
+}
+
 function FsTreeNode({
   node,
+  layout,
+  listColumns,
   expandedPaths,
   selectedPaths,
+  focusedPath,
   alreadySet,
   mode,
   showHidden,
+  readOnly,
+  includeFiles,
+  isAtDrives,
+  canInsertAtPath,
   modifiedFiles,
+  dirGitStatus,
+  renamingPath,
+  renameValue,
+  onRenameValueChange,
+  onCommitRename,
+  onCancelRename,
+  inlineNewEntry,
+  draggedPath,
+  dropTargetPath,
+  dragSourcePathRef,
+  onDragStartNode,
+  onDragEndNode,
+  onDragTargetChange,
+  onDropNode,
   onToggleExpand,
+  onFocusNode,
   onSelect,
   onPreview,
   onContextMenu,
+  onQuickNewEntry,
+  onQuickCopyOrInsert,
   previewPath,
   depth = 0,
+  parentIgnored = false,
 }: {
   node: FsNode;
+  layout: 'modal' | 'panel';
+  listColumns?: FsListColumns;
   expandedPaths: Set<string>;
   selectedPaths: Set<string>;
+  focusedPath: string | null;
   alreadySet: Set<string>;
   mode: FileBrowserMode;
   showHidden: boolean;
+  readOnly: boolean;
+  includeFiles: boolean;
+  isAtDrives: boolean;
+  canInsertAtPath: boolean;
   modifiedFiles: Map<string, string>;
+  dirGitStatus: ReadonlyMap<string, DirGitStatusKind>;
+  renamingPath: string | null;
+  renameValue: string;
+  onRenameValueChange: (value: string) => void;
+  onCommitRename: (node: FsNode, value: string) => void;
+  onCancelRename: () => void;
+  inlineNewEntry?: InlineNewEntryProps;
+  draggedPath: string | null;
+  dropTargetPath: string | null;
+  dragSourcePathRef: { current: string | null };
+  onDragStartNode: (id: string) => void;
+  onDragEndNode: () => void;
+  onDragTargetChange: (id: string | null) => void;
+  onDropNode: (sourcePath: string, targetDirNode: FsNode) => void;
   onToggleExpand: (id: string) => void;
+  onFocusNode: (id: string) => void;
   onSelect: (id: string, isDir: boolean) => void;
   onPreview: (id: string) => void;
   onContextMenu: (node: FsNode, event: MouseEvent) => void;
+  onQuickNewEntry: (kind: 'file' | 'folder', dirPath: string) => void;
+  onQuickCopyOrInsert: (id: string) => void;
   previewPath: string | null;
   depth?: number;
+  parentIgnored?: boolean;
 }) {
-  const isExpanded = expandedPaths.has(node.id);
+  const { t } = useTranslation();
+  const isExpanded = expandedPaths.has(node.id) || Boolean(listColumns?.forceExpanded?.has(node.id));
   const isSelected = selectedPaths.has(node.id);
+  const isFocused = focusedPath === node.id;
   const isAlready = alreadySet.has(node.id);
   const isMulti = mode === 'file-multi';
   const isDisabled = mode === 'dir-only' && !node.isDir;
   const isPreviewing = previewPath === node.id;
-  const gitCode = modifiedFiles.get(node.id);
+  const isRenaming = renamingPath === node.id;
+  const gitCode = resolveNodeGitCode(node.id, modifiedFiles, parentIgnored);
   const gitClass = gitCode ? gitStatusClass(gitCode) : null;
+  const isIgnored = gitCode === '!!';
+  const dirGitKind = node.isDir && depth > 0 && !isIgnored && !gitCode ? dirGitStatus.get(node.id) : undefined;
+  const isDragging = draggedPath === node.id;
+  const isDropTarget = dropTargetPath === node.id;
+  const canDrag = depth > 0 && !readOnly && !listColumns && !isAtDrives && !isRenaming;
+  const hasInlineNewHere = Boolean(node.isDir && isExpanded && inlineNewEntry && inlineNewEntry.parentPath === node.id);
+
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const renameSkipBlurRef = useRef(false);
+  useEffect(() => {
+    if (!isRenaming) {
+      renameSkipBlurRef.current = false;
+      return;
+    }
+    const input = renameInputRef.current;
+    if (!input) return;
+    input.focus();
+    const { start, end } = getRenameSelectionRange(node.name, node.isDir);
+    try {
+      input.setSelectionRange(start, end);
+    } catch {
+      /* ignore */
+    }
+  }, [isRenaming, node.name, node.isDir]);
 
   if (!showHidden && node.hidden) return null;
 
   return (
     <div>
       <div
-        class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
-        style={{ paddingLeft: 8 + depth * 16 }}
+        role="treeitem"
+        aria-expanded={node.isDir ? isExpanded : undefined}
+        aria-selected={isSelected || isFocused}
+        data-path={node.id}
+        draggable={canDrag}
+        class={`fb-node${isSelected ? ' selected' : ''}${isFocused ? ' focused' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${isDragging ? ' is-dragging' : ''}${isDropTarget ? ' drop-target' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
+        style={{ paddingLeft: 8 + depth * FILE_BROWSER_INDENT_PX }}
         onClick={() => {
+          onFocusNode(node.id);
           if (!isMulti && !isDisabled) onSelect(node.id, node.isDir);
           if (node.isDir) onToggleExpand(node.id);
           if (!node.isDir && mode !== 'dir-only') onPreview(node.id);
         }}
         onContextMenu={(event) => {
-          if (depth === 0) return;
+          if (isAtDrives) return;
           onContextMenu(node, event);
         }}
+        onDragStart={(e) => {
+          if (!canDrag) return;
+          e.stopPropagation();
+          dragSourcePathRef.current = node.id;
+          onDragStartNode(node.id);
+          try {
+            e.dataTransfer?.setData('text/plain', node.id);
+            if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+          } catch {
+            /* ignore */
+          }
+        }}
+        onDragEnd={(e) => {
+          e.stopPropagation();
+          onDragEndNode();
+        }}
+        onDragOver={(e) => {
+          if (!node.isDir || readOnly || listColumns || isAtDrives) return;
+          const src = dragSourcePathRef.current || e.dataTransfer?.getData('text/plain') || '';
+          if (!canDropPathIntoDir(src, node.id)) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+          if (dropTargetPath !== node.id) onDragTargetChange(node.id);
+        }}
+        onDragLeave={(e) => {
+          if (dropTargetPath !== node.id) return;
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+            onDragTargetChange(null);
+          }
+        }}
+        onDrop={(e) => {
+          if (!node.isDir || readOnly || listColumns || isAtDrives) return;
+          const src = dragSourcePathRef.current || e.dataTransfer?.getData('text/plain') || '';
+          if (!canDropPathIntoDir(src, node.id)) return;
+          e.preventDefault();
+          e.stopPropagation();
+          onDropNode(src, node);
+        }}
       >
+        <TreeIndentGuides depth={depth} />
         {isMulti && (
           <input
             type="checkbox"
@@ -2214,42 +4909,171 @@ function FsTreeNode({
             checked={isSelected}
             disabled={isDisabled}
             onClick={(e) => e.stopPropagation()}
-            onChange={() => { if (!isDisabled) onSelect(node.id, node.isDir); }}
+            onChange={() => {
+              onFocusNode(node.id);
+              if (!isDisabled) onSelect(node.id, node.isDir);
+            }}
           />
         )}
         <span class="fb-node-expand">
           {node.isDir ? (isExpanded ? '▾' : '▸') : ' '}
         </span>
         <span class="fb-node-icon">
-          {node.isDir
-            ? (node.isLoading ? <span class="fb-icon-spin">⟳</span> : (isExpanded ? '📂' : '📁'))
-            : '📄'}
+          {node.isDir && node.isLoading
+            ? <span class="fb-icon-spin">⟳</span>
+            : <FileTypeIcon name={node.name} isDir={node.isDir} isOpen={isExpanded} />}
         </span>
-        <span class="fb-node-name">{node.name}</span>
-        {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
+        {isRenaming ? (
+          <input
+            ref={renameInputRef}
+            type="text"
+            class="fb-inline-input"
+            data-testid="fb-rename-input"
+            value={renameValue}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onInput={(e) => onRenameValueChange((e.target as HTMLInputElement).value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                renameSkipBlurRef.current = true;
+                onCommitRename(node, (e.currentTarget as HTMLInputElement).value);
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                renameSkipBlurRef.current = true;
+                onCancelRename();
+              }
+            }}
+            onBlur={() => {
+              if (renameSkipBlurRef.current) return;
+              onCancelRename();
+            }}
+          />
+        ) : (
+          <span class="fb-node-name">{node.name}</span>
+        )}
+        {typeof node.freeBytes === 'number' && typeof node.totalBytes === 'number' && (
+          <span
+            class="fb-node-capacity"
+            title={t('file_browser.capacity_detail', {
+              free: formatByteSize(node.freeBytes),
+              total: formatByteSize(node.totalBytes),
+            })}
+          >
+            {t('file_browser.capacity_free', { free: formatByteSize(node.freeBytes) })}
+            <span
+              class="fb-node-capacity-bar"
+              aria-hidden="true"
+              style={{
+                // Used share, so a nearly-full volume reads as a full bar.
+                '--fb-capacity-used': `${Math.round(
+                  Math.max(0, Math.min(1, 1 - node.freeBytes / node.totalBytes)) * 100,
+                )}%`,
+              } as Record<string, string>}
+            />
+          </span>
+        )}
+        {dirGitKind && (
+          <span
+            class={`fb-node-git-dot git-dot-${dirGitKind}`}
+            title={t('file_browser.folder_has_changes', 'Contains changed files')}
+            aria-label={t('file_browser.folder_has_changes', 'Contains changed files')}
+          />
+        )}
+        {gitCode && gitClass && (
+          <span
+            class={`fb-node-git-badge git-badge-${gitClass}`}
+            title={isIgnored ? t('file_browser.git_ignored', 'Ignored by .gitignore') : `git: ${gitCode}`}
+          >
+            {gitStatusBadge(gitCode)}
+          </span>
+        )}
         {isAlready && <span class="fb-node-badge">↑</span>}
+        {layout === 'panel' && !listColumns && !isRenaming && !isAtDrives && (
+          <span class="fb-node-actions" onClick={(e) => e.stopPropagation()}>
+            {node.isDir && !readOnly && (
+              <>
+                {includeFiles && (
+                  <button
+                    type="button"
+                    class="fb-node-action-btn"
+                    title={t('file_browser.ctx_new_file', 'New File…')}
+                    aria-label={t('file_browser.ctx_new_file', 'New File…')}
+                    onClick={() => onQuickNewEntry('file', node.id)}
+                  >+f</button>
+                )}
+                <button
+                  type="button"
+                  class="fb-node-action-btn"
+                  title={t('file_browser.ctx_new_folder', 'New Folder…')}
+                  aria-label={t('file_browser.ctx_new_folder', 'New Folder…')}
+                  onClick={() => onQuickNewEntry('folder', node.id)}
+                >+d</button>
+              </>
+            )}
+            {!node.isDir && (
+              <button
+                type="button"
+                class="fb-node-action-btn"
+                title={canInsertAtPath ? t('file_browser.ctx_insert_at_path', 'Insert @path') : t('file_browser.ctx_copy_relative_path', 'Copy Relative Path')}
+                aria-label={canInsertAtPath ? t('file_browser.ctx_insert_at_path', 'Insert @path') : t('file_browser.ctx_copy_relative_path', 'Copy Relative Path')}
+                onClick={() => onQuickCopyOrInsert(node.id)}
+              >{canInsertAtPath ? '@' : '⧉'}</button>
+            )}
+          </span>
+        )}
+        {listColumns && depth > 0 && <FsListCells node={node} columns={listColumns} />}
       </div>
-      {node.isDir && isExpanded && node.children && (
+      {node.isDir && isExpanded && (node.children || hasInlineNewHere) && (
         <>
-          {node.children.length === 0 && !node.isLoading && (
-            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>—</div>
+          {hasInlineNewHere && inlineNewEntry && (
+            <FsInlineCreateRow entry={inlineNewEntry} depth={depth + 1} />
           )}
-          {node.children.map((child) => (
+          {node.children && node.children.length === 0 && !node.isLoading && !hasInlineNewHere && (
+            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * FILE_BROWSER_INDENT_PX }}>{depth === 0 && listColumns?.emptyText ? listColumns.emptyText : '—'}</div>
+          )}
+          {node.children?.map((child) => (
             <FsTreeNode
               key={child.id}
               node={child}
+              layout={layout}
+              listColumns={listColumns}
               expandedPaths={expandedPaths}
               selectedPaths={selectedPaths}
+              focusedPath={focusedPath}
               alreadySet={alreadySet}
               mode={mode}
               showHidden={showHidden}
+              readOnly={readOnly}
+              includeFiles={includeFiles}
+              isAtDrives={isAtDrives}
+              canInsertAtPath={canInsertAtPath}
               modifiedFiles={modifiedFiles}
+              dirGitStatus={dirGitStatus}
+              renamingPath={renamingPath}
+              renameValue={renameValue}
+              onRenameValueChange={onRenameValueChange}
+              onCommitRename={onCommitRename}
+              onCancelRename={onCancelRename}
+              inlineNewEntry={inlineNewEntry}
+              draggedPath={draggedPath}
+              dropTargetPath={dropTargetPath}
+              dragSourcePathRef={dragSourcePathRef}
+              onDragStartNode={onDragStartNode}
+              onDragEndNode={onDragEndNode}
+              onDragTargetChange={onDragTargetChange}
+              onDropNode={onDropNode}
               onToggleExpand={onToggleExpand}
+              onFocusNode={onFocusNode}
               onSelect={onSelect}
               onPreview={onPreview}
               onContextMenu={onContextMenu}
+              onQuickNewEntry={onQuickNewEntry}
+              onQuickCopyOrInsert={onQuickCopyOrInsert}
               previewPath={previewPath}
               depth={depth + 1}
+              parentIgnored={isIgnored}
             />
           ))}
         </>
@@ -2257,3 +5081,47 @@ function FsTreeNode({
     </div>
   );
 }
+
+// ── Table cells ───────────────────────────────────────────────────────────────
+
+/** Size, kind, modified and created of one row: always cells, aligned under the column headers (the table scrolls, it never folds). */
+const FsListCells = memo(function FsListCells({ node, columns }: { node: FsNode; columns: FsListColumns }) {
+  const { t } = useTranslation();
+  const missingTitle = columns.drivesList
+    ? undefined
+    : !columns.detailsPresent ? t('file_browser.meta_unsupported') : t('file_browser.detail_unreadable');
+  const cells: Array<{ key: string; text: string; title: string | undefined }> = [];
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.SIZE)) {
+    cells.push(node.isDir
+      ? { key: 'size', text: '—', title: undefined }
+      : node.size !== undefined
+        ? { key: 'size', text: formatByteSize(node.size), title: `${node.size.toLocaleString(columns.locale)} B` }
+        : { key: 'size', text: '—', title: missingTitle });
+  }
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.KIND)) {
+    const kind = fileKindLabel(fileKindOf(node.name, node.isDir), t);
+    cells.push({ key: 'kind', text: kind, title: kind });
+  }
+  const dateCell = (key: string, ms: number | undefined, unavailableTitle: string | undefined) => (
+    ms === undefined
+      ? { key, text: '—', title: unavailableTitle }
+      : { key, ...formatFileBrowserDate(ms, columns.nowMs, columns.locale, t) }
+  );
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.MODIFIED)) cells.push(dateCell('modified', node.mtimeMs, missingTitle));
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.CREATED)) {
+    cells.push(dateCell('created', node.birthtimeMs, columns.detailsPresent && columns.createdUnavailable ? t('file_browser.created_unavailable') : missingTitle));
+  }
+  return (
+    <>
+      {cells.map((cell) => (
+        <span key={cell.key} class={`fb-col fb-col-${cell.key}`} title={cell.title}>{cell.text}</span>
+      ))}
+    </>
+  );
+}, (previous, next) => previous.node === next.node
+  && previous.columns.visible === next.columns.visible
+  && previous.columns.nowMs === next.columns.nowMs
+  && previous.columns.locale === next.columns.locale
+  && previous.columns.detailsPresent === next.columns.detailsPresent
+  && previous.columns.drivesList === next.columns.drivesList
+  && previous.columns.createdUnavailable === next.columns.createdUnavailable);

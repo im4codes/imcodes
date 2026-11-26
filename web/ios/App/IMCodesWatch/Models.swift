@@ -17,6 +17,7 @@ struct WatchServerRow: Identifiable, Codable, Equatable {
     let id: String
     var name: String
     var baseUrl: String
+    var isPinned: Bool? = nil
 }
 
 struct WatchRecentTextRow: Identifiable, Codable, Equatable {
@@ -26,6 +27,23 @@ struct WatchRecentTextRow: Identifiable, Codable, Equatable {
     let ts: Double
 
     var id: String { eventId }
+}
+
+struct WatchQueueEntry: Identifiable, Codable, Equatable {
+    let clientMessageId: String
+    let text: String
+    let status: String?
+    let commandId: String?
+
+    var id: String { clientMessageId }
+}
+
+struct WatchQueueReceipt: Identifiable, Codable, Equatable {
+    let commandId: String
+    let status: String
+    let reason: String?
+
+    var id: String { commandId }
 }
 
 struct WatchSessionRow: Identifiable, Codable, Equatable {
@@ -41,6 +59,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
     var previewText: String?
     var previewUpdatedAt: Double?
     var recentText: [WatchRecentTextRow]?
+    var queueEpoch: String?
+    var queueAuthorityId: String?
+    var transportPendingMessageVersion: Double?
+    var transportPendingMessageEntries: [WatchQueueEntry]?
+    var failedMessageEntries: [WatchQueueEntry]?
+    var transportQueueReceipts: [WatchQueueReceipt]?
+    var commandReceipts: [WatchQueueReceipt]?
 
     enum CodingKeys: String, CodingKey {
         case sessionName
@@ -55,6 +80,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
         case previewText
         case previewUpdatedAt
         case recentText
+        case queueEpoch
+        case queueAuthorityId
+        case transportPendingMessageVersion
+        case transportPendingMessageEntries
+        case failedMessageEntries
+        case transportQueueReceipts
+        case commandReceipts
     }
 
     init(from decoder: Decoder) throws {
@@ -76,6 +108,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
         self.previewText = try container.decodeIfPresent(String.self, forKey: .previewText)
         self.previewUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .previewUpdatedAt)
         self.recentText = try container.decodeIfPresent([WatchRecentTextRow].self, forKey: .recentText) ?? []
+        self.queueEpoch = try container.decodeIfPresent(String.self, forKey: .queueEpoch)
+        self.queueAuthorityId = try container.decodeIfPresent(String.self, forKey: .queueAuthorityId)
+        self.transportPendingMessageVersion = try container.decodeIfPresent(Double.self, forKey: .transportPendingMessageVersion)
+        self.transportPendingMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .transportPendingMessageEntries) ?? []
+        self.failedMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .failedMessageEntries) ?? []
+        self.transportQueueReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .transportQueueReceipts) ?? []
+        self.commandReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .commandReceipts) ?? []
     }
 
     var id: String { "\(serverId):\(sessionName)" }
@@ -95,6 +134,10 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
     var effectivePreviewUpdatedAt: Double? {
         previewUpdatedAt ?? latestRecentText?.ts
     }
+
+    var allCommandReceipts: [WatchQueueReceipt] {
+        (transportQueueReceipts ?? []) + (commandReceipts ?? [])
+    }
 }
 
 struct WatchServerListResponse: Codable, Equatable {
@@ -104,6 +147,163 @@ struct WatchServerListResponse: Codable, Equatable {
 struct WatchSessionListResponse: Codable, Equatable {
     let serverId: String
     let sessions: [WatchSessionRow]
+}
+
+struct WatchGlobalTaskChecklist: Codable, Equatable {
+    var total: Int
+    var implemented: Int
+    var audited: Int
+
+    enum CodingKeys: String, CodingKey {
+        case total, implemented, audited
+    }
+
+    init(total: Int = 0, implemented: Int = 0, audited: Int = 0) {
+        self.total = total
+        self.implemented = implemented
+        self.audited = audited
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.total = (try? container.decodeIfPresent(Int.self, forKey: .total)) ?? 0
+        self.implemented = (try? container.decodeIfPresent(Int.self, forKey: .implemented)) ?? 0
+        self.audited = (try? container.decodeIfPresent(Int.self, forKey: .audited)) ?? 0
+    }
+}
+
+struct WatchGlobalTaskRow: Identifiable, Codable, Equatable {
+    let taskId: String
+    let serverId: String
+    var serverName: String?
+    var serverOnline: Bool?
+    var title: String
+    var status: String
+    var round: Int?
+    var projectName: String?
+    var brainSession: String?
+    var brainLabel: String?
+    var flags: [String]?
+    var checklist: WatchGlobalTaskChecklist?
+    var liveSummary: String?
+    var updatedAt: Double?
+    var isTerminal: Bool?
+    var needsAttention: Bool?
+
+    var id: String { "\(serverId):\(taskId)" }
+
+    enum CodingKeys: String, CodingKey {
+        case taskId, serverId, serverName, serverOnline, title, status, round, projectName
+        case brainSession, brainLabel, flags, checklist, liveSummary, updatedAt, isTerminal, needsAttention
+    }
+
+    init(
+        taskId: String,
+        serverId: String,
+        serverName: String? = nil,
+        serverOnline: Bool? = nil,
+        title: String,
+        status: String,
+        round: Int? = nil,
+        projectName: String? = nil,
+        brainSession: String? = nil,
+        brainLabel: String? = nil,
+        flags: [String]? = nil,
+        checklist: WatchGlobalTaskChecklist? = nil,
+        liveSummary: String? = nil,
+        updatedAt: Double? = nil,
+        isTerminal: Bool? = nil,
+        needsAttention: Bool? = nil
+    ) {
+        self.taskId = taskId
+        self.serverId = serverId
+        self.serverName = serverName
+        self.serverOnline = serverOnline
+        self.title = title
+        self.status = status
+        self.round = round
+        self.projectName = projectName
+        self.brainSession = brainSession
+        self.brainLabel = brainLabel
+        self.flags = flags
+        self.checklist = checklist
+        self.liveSummary = liveSummary
+        self.updatedAt = updatedAt
+        self.isTerminal = isTerminal
+        self.needsAttention = needsAttention
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let taskId = try container.decode(String.self, forKey: .taskId)
+        let serverId = try container.decode(String.self, forKey: .serverId)
+        let rawTitle = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? nil
+        let title = rawTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? taskId
+        let rawStatus = (try? container.decodeIfPresent(String.self, forKey: .status)) ?? nil
+        let status = rawStatus?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "unknown"
+
+        self.taskId = taskId
+        self.serverId = serverId
+        self.serverName = (try? container.decodeIfPresent(String.self, forKey: .serverName)) ?? nil
+        self.serverOnline = (try? container.decodeIfPresent(Bool.self, forKey: .serverOnline)) ?? nil
+        self.title = title
+        self.status = status
+        self.round = (try? container.decodeIfPresent(Int.self, forKey: .round)) ?? nil
+        self.projectName = (try? container.decodeIfPresent(String.self, forKey: .projectName)) ?? nil
+        self.brainSession = (try? container.decodeIfPresent(String.self, forKey: .brainSession)) ?? nil
+        self.brainLabel = (try? container.decodeIfPresent(String.self, forKey: .brainLabel)) ?? nil
+        self.flags = (try? container.decodeIfPresent([String].self, forKey: .flags)) ?? nil
+        self.checklist = (try? container.decodeIfPresent(WatchGlobalTaskChecklist.self, forKey: .checklist)) ?? nil
+        self.liveSummary = (try? container.decodeIfPresent(String.self, forKey: .liveSummary)) ?? nil
+        self.updatedAt = (try? container.decodeIfPresent(Double.self, forKey: .updatedAt)) ?? nil
+        self.isTerminal = (try? container.decodeIfPresent(Bool.self, forKey: .isTerminal)) ?? nil
+        self.needsAttention = (try? container.decodeIfPresent(Bool.self, forKey: .needsAttention)) ?? nil
+    }
+}
+
+struct WatchGlobalTaskServerSummary: Codable, Equatable {
+    let id: String
+    let name: String
+    let online: Bool
+}
+
+struct WatchGlobalTasksResponse: Codable, Equatable {
+    let tasks: [WatchGlobalTaskRow]
+    let servers: [WatchGlobalTaskServerSummary]?
+    let ts: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case tasks, servers, ts
+    }
+
+    init(tasks: [WatchGlobalTaskRow], servers: [WatchGlobalTaskServerSummary]? = nil, ts: Double? = nil) {
+        self.tasks = tasks
+        self.servers = servers
+        self.ts = ts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        var decodedTasks: [WatchGlobalTaskRow] = []
+        if var tasksArray = try? container.nestedUnkeyedContainer(forKey: .tasks) {
+            while !tasksArray.isAtEnd {
+                if let row = try? tasksArray.decode(WatchGlobalTaskRow.self) {
+                    decodedTasks.append(row)
+                } else {
+                    _ = try? tasksArray.decode(JSONValue.self)
+                }
+            }
+        }
+        self.tasks = decodedTasks
+        self.servers = (try? container.decodeIfPresent([WatchGlobalTaskServerSummary].self, forKey: .servers)) ?? nil
+        self.ts = (try? container.decodeIfPresent(Double.self, forKey: .ts)) ?? nil
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }
 
 enum JSONValue: Codable, Equatable {
@@ -174,6 +374,11 @@ struct WatchTimelineEvent: Identifiable, Codable, Equatable {
     var text: String? {
         payload?.objectValue?["text"]?.stringValue
     }
+
+    var commandId: String? {
+        payload?.objectValue?["commandId"]?.stringValue
+            ?? payload?.objectValue?["clientMessageId"]?.stringValue
+    }
 }
 
 struct WatchHistoryResponse: Equatable {
@@ -186,7 +391,7 @@ struct WatchHistoryResponse: Equatable {
 
 extension WatchHistoryResponse: Decodable {
     enum CodingKeys: String, CodingKey {
-        case sessionName, epoch, events, hasMore, nextCursor
+        case sessionName, epoch, events, hasMore, nextCursor, earliestTs, legacyBeforeTs
     }
 
     init(from decoder: Decoder) throws {
@@ -194,7 +399,31 @@ extension WatchHistoryResponse: Decodable {
         sessionName = try container.decode(String.self, forKey: .sessionName)
         epoch = try container.decodeIfPresent(Double.self, forKey: .epoch)
         hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false
-        nextCursor = try container.decodeIfPresent(Double.self, forKey: .nextCursor)
+        let rawCursor = try? container.decodeIfPresent(JSONValue.self, forKey: .nextCursor)
+        let decodedCursor: Double?
+        switch rawCursor {
+        case .number(let value) where value.isFinite:
+            decodedCursor = value
+        case .object(let obj):
+            if case .number(let ts) = obj["ts"], ts.isFinite {
+                decodedCursor = ts
+            } else if case .string(let tsStr) = obj["ts"], let ts = Double(tsStr), ts.isFinite {
+                decodedCursor = ts
+            } else {
+                decodedCursor = nil
+            }
+        case .string(let value):
+            if let parsed = Double(value), parsed.isFinite {
+                decodedCursor = parsed
+            } else {
+                decodedCursor = nil
+            }
+        default:
+            decodedCursor = nil
+        }
+        let legacyBeforeTs = try? container.decodeIfPresent(Double.self, forKey: .legacyBeforeTs)
+        let earliestTs = try? container.decodeIfPresent(Double.self, forKey: .earliestTs)
+        nextCursor = decodedCursor ?? (hasMore ? (legacyBeforeTs ?? earliestTs) : nil)
         // Lenient event decoding — skip individual events that fail to decode
         var eventsArray = try container.nestedUnkeyedContainer(forKey: .events)
         var decoded: [WatchTimelineEvent] = []
@@ -304,21 +533,24 @@ struct WatchConversationItem: Identifiable, Equatable {
             sessionId: sessionId,
             ts: row.ts,
             type: row.type,
-            text: trimmed,
+            text: row.text,
             isWarmCache: true
         )
     }
 
     static func fromTimelineEvent(_ event: WatchTimelineEvent) -> WatchConversationItem? {
         guard event.type == "user.message" || event.type == "assistant.text" else { return nil }
-        guard let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        guard let rawText = event.text else { return nil }
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
         return WatchConversationItem(
             eventId: event.eventId,
             sessionId: event.sessionId,
             ts: event.ts,
             type: event.type,
-            text: text,
-            isWarmCache: false
+            text: rawText,
+            isWarmCache: false,
+            commandId: event.commandId
         )
     }
 

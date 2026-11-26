@@ -1,0 +1,31 @@
+import("//webrtc.gni")
+import("libwebrtc-sdk.gni")
+
+# These archives contain upstream objects only, never an IM.codes worker or
+# helper. Chromium enables thin archives globally, so the distributable SDK
+# targets suppress that config and own all object bytes they reference --
+# a thin archive would reference object files that do not survive the trip out
+# of the build directory.
+rtc_static_library("imcodes_macos_libwebrtc_sdk") {
+  sources = [ "sdk_anchor.cc" ]
+  defines = imcodes_macos_remote_desktop_defines
+  deps = imcodes_macos_remote_desktop_deps
+  complete_static_lib = true
+  suppressed_configs += [ "//build/config/compiler:thin_archive" ]
+}
+
+if (rtc_include_tests) {
+  rtc_static_library("imcodes_macos_libwebrtc_test_sdk") {
+    testonly = true
+    sources = [ "sdk_anchor.cc" ]
+    deps = [
+      ":imcodes_macos_libwebrtc_sdk",
+      "//test:test_main",
+      "//test:test_support",
+      "//testing/gmock",
+      "//testing/gtest",
+    ]
+    complete_static_lib = true
+    suppressed_configs += [ "//build/config/compiler:thin_archive" ]
+  }
+}

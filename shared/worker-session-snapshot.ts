@@ -1,4 +1,4 @@
-import { isSessionAgentType } from './agent-types.js';
+import { isRemovedSessionAgentType, isSessionAgentType } from './agent-types.js';
 import { isTransportEffortLevel, type TransportEffortLevel } from './effort-levels.js';
 
 export const WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT = 'session-snapshot';
@@ -147,6 +147,9 @@ export function normalizeWorkerSessionRows(input: unknown): NormalizedRows<Worke
     const projectName = item.project_name;
     const role = item.role;
     const agentType = item.agent_type;
+    if (typeof agentType === 'string' && isRemovedSessionAgentType(agentType)) {
+      return;
+    }
     const projectDir = item.project_dir;
     const state = item.state;
     if (typeof name !== 'string' || name.length === 0) issues.push(`${prefix}.name: expected non-empty string`);
@@ -203,6 +206,9 @@ export function normalizeWorkerSubSessionRows(input: unknown): NormalizedRows<Wo
     }
     const id = item.id;
     const type = item.type;
+    if (typeof type === 'string' && isRemovedSessionAgentType(type)) {
+      return;
+    }
     if (typeof id !== 'string' || id.length === 0) issues.push(`${prefix}.id: expected non-empty string`);
     if (typeof type !== 'string' || !isSessionAgentType(type)) issues.push(`${prefix}.type: invalid agent type`);
 

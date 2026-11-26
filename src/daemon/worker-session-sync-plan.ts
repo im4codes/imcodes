@@ -135,7 +135,16 @@ export function buildWorkerSessionSyncPlan(
     cwd: subSession.cwd,
     parentSession: subSession.parent_session,
   }));
-  const remoteMainExistenceNames = Array.from(new Set(nonTestSessions.map((session) => session.name)));
+  // A stopped remote test session is still authoritative evidence that the
+  // name exists.  It must not be pruned locally or sent back for deletion,
+  // even though active test fixtures remain excluded from normal sync.
+  const stoppedTestNames = remoteTestSessions
+    .filter((session) => session.state === 'stopped')
+    .map((session) => session.name);
+  const remoteMainExistenceNames = Array.from(new Set([
+    ...nonTestSessions.map((session) => session.name),
+    ...stoppedTestNames,
+  ]));
   const remoteSubSessionNames = Array.from(new Set(nonTestSubSessions.map((subSession) => `deck_sub_${subSession.id}`)));
   const remoteMainExistence = new Set(remoteMainExistenceNames);
   const remoteSubExistence = new Set(remoteSubSessionNames);

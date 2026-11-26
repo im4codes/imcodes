@@ -19,12 +19,18 @@ describe('isTransportAgent()', () => {
     expect(isTransportAgent('qwen')).toBe(true);
   });
 
+  it('returns true for qoder-sdk', () => {
+    expect(isTransportAgent('qoder-sdk')).toBe(true);
+    expect(isTransportAgent('deepseek-harness')).toBe(true);
+    expect(isTransportAgent('pi')).toBe(true);
+  });
+
   it('returns false for claude-code', () => {
     expect(isTransportAgent('claude-code')).toBe(false);
   });
 
   it('returns false for all process agent types', () => {
-    const processTypes = ['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini'];
+    const processTypes = ['claude-code', 'codex', 'opencode', 'shell', 'script'];
     for (const type of processTypes) {
       expect(isTransportAgent(type)).toBe(false);
     }
@@ -51,7 +57,7 @@ describe('isProcessAgent()', () => {
   });
 
   it('returns true for all process agent types', () => {
-    const processTypes = ['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini'];
+    const processTypes = ['claude-code', 'codex', 'opencode', 'shell', 'script'];
     for (const type of processTypes) {
       expect(isProcessAgent(type)).toBe(true);
     }
@@ -89,6 +95,11 @@ describe('TRANSPORT_AGENTS set', () => {
     expect(TRANSPORT_AGENTS.has('qwen')).toBe(true);
   });
 
+  it('contains qoder-sdk', () => {
+    expect(TRANSPORT_AGENTS.has('qoder-sdk')).toBe(true);
+    expect(TRANSPORT_AGENTS.has('pi')).toBe(true);
+  });
+
   it('has at least 1 entry', () => {
     expect(TRANSPORT_AGENTS.size).toBeGreaterThanOrEqual(1);
   });
@@ -103,15 +114,15 @@ describe('TRANSPORT_AGENTS set', () => {
 // ── PROCESS_AGENTS set ─────────────────────────────────────────────────────────
 
 describe('PROCESS_AGENTS set', () => {
-  it('contains all 6 process types', () => {
-    const expected: ProcessAgent[] = ['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini'];
+  it('contains all 5 process types', () => {
+    const expected: ProcessAgent[] = ['claude-code', 'codex', 'opencode', 'shell', 'script'];
     for (const type of expected) {
       expect(PROCESS_AGENTS.has(type)).toBe(true);
     }
   });
 
-  it('has exactly 6 entries', () => {
-    expect(PROCESS_AGENTS.size).toBe(6);
+  it('has exactly 5 entries', () => {
+    expect(PROCESS_AGENTS.size).toBe(5);
   });
 
   it('every entry passes isProcessAgent()', () => {
@@ -162,5 +173,10 @@ describe('detectStatus() with transport agentType', () => {
   it('does not throw for any qwen input', () => {
     expect(() => detectStatus(['partial json'], 'qwen' as AgentType)).not.toThrow();
     expect(() => detectStatus(['{"type":"assistant"}'], 'qwen' as AgentType)).not.toThrow();
+  });
+
+  it('does not throw for any qoder-sdk input', () => {
+    expect(() => detectStatus(['partial json'], 'qoder-sdk' as AgentType)).not.toThrow();
+    expect(() => detectStatus(['{"type":"assistant"}'], 'qoder-sdk' as AgentType)).not.toThrow();
   });
 });

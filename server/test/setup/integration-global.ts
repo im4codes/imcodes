@@ -11,7 +11,9 @@
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 
 export async function setup() {
-  const container = await new PostgreSqlContainer('pgvector/pgvector:pg18').start();
+  const container = await new PostgreSqlContainer('pgvector/pgvector:pg18')
+    .withResourcesQuota({ cpu: 2, memory: 1 })
+    .start();
   process.env.TEST_DATABASE_URL = container.getConnectionUri();
 
   return async function teardown() {

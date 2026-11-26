@@ -1,0 +1,27 @@
+{
+  "name": "imcodes-pc-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IM.codes PC App V1 Electron shell",
+  "main": "./dist/src/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/write-build-config.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "start": "npm run build && electron .",
+    "pack:mac": "node ../../scripts/build-pc-app.mjs --platform darwin",
+    "pack:win": "node ../../scripts/build-pc-app.mjs --platform win32",
+    "verify:bundle": "node ../../scripts/build-pc-app.mjs --verify-only"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
+  }
+}

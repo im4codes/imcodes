@@ -1,3 +1,17 @@
+import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
+import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
+import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
+import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
+import { focusComposerElement } from './util/composer-focus.js';
+import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions, isIncognitoTimelineSession } from './hooks/useTimeline.js';
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
+import {
+  extractAskQuestionsFromToolCallPayload,
+  isAskQuestionToolName,
+  normalizeAskQuestionsPayload,
+  resolveAskQuestionEventToolUseId,
+} from '@shared/ask-question-normalize.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   MutableDesktopWindowStack,
@@ -9,7 +23,9 @@ import {
 } from './window-stack.js';
 import {
   reserveWorkspaceBottom,
+  viewportWorkspaceBelowSessionTabs,
   workspaceBoundsFromRect,
+  type WindowGeometry,
   type WorkspaceBounds,
 } from './desktop-window-maximize.js';
 import { lazy, Suspense } from 'preact/compat';
@@ -18,33 +34,181 @@ import {
   type FileBrowserPreviewRequest,
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  isDaemonMainLoopBusy,
+  mergeDaemonLiveness,
+  mergeDaemonStats,
+  type DaemonStatsView,
+} from '@shared/daemon-stats.js';
+import {
+  cpuSeverity,
+  formatCpuPercent,
+  formatMemoryCompact,
+  formatStatNumber,
+  formatUptime as formatDaemonUptime,
+} from './util/daemon-stats-format.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { sessionIdentityProjectKey } from '@shared/session-identity.js';
+import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
+import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
+import { NodeGroupsNavContext } from './components/node-groups-nav.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
+import {
+  SUBSESSION_CREATED_BATCH_MSG,
+  WEB_AUTH_VERIFY_MIN_INTERVAL_MS,
+  WEB_UNLOCK_COALESCE_MS,
+} from '@shared/scale-limits.js';
+import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
+import { MobileServerMenu } from './components/MobileServerMenu.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
+import { VoiceLanguageSwitcher } from './components/VoiceLanguageSwitcher.js';
+import { remoteVoiceProvider } from './remote-voice-provider.js';
+import { installRemoteVoiceAutoRefresh, resetRemoteVoiceClientForTesting } from './remote-voice-client.js';
 import { LoginPage } from './pages/LoginPage.js';
+import { isActiveTurnFinishedError } from './session-live-status.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
-import { SessionPane } from './components/SessionPane.js';
+import { StableSessionPane as SessionPane } from './components/StableSessionPane.js';
+import {
+  SupervisionTaskConsole,
+  SupervisionTaskPairSnapshotBridge,
+  supervisionTaskConsolePreferenceBounds,
+} from './components/SupervisionTaskConsole.js';
+import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
+import { GlobalTaskModeView, TaskModeGlyphIcon } from './components/GlobalTaskModeView.js';
+import {
+  clearGlobalTaskModeSessionState,
+  clearTaskModeOpenPersistence,
+  formatTaskJumpQuote,
+  globalTaskModeStore,
+  matchesPendingTaskQuoteTarget,
+  readInitialTaskModeOpen,
+  RELOAD_INTENT_STORAGE_KEY,
+  syncTaskModeOpenPersistence,
+  type GlobalTaskJumpContext,
+  type PendingTaskQuote,
+} from './global-task-mode-store.js';
+import type { PendingTaskQuotePayload } from './hooks/usePendingTaskQuote.js';
+import type { CloudDocsMainChatContext } from './components/CloudDocsMainChatFloat.js';
+import {
+  executeCloudDocQuote,
+  mergeCloudDocQuoteText,
+  type CloudDocQuoteTarget,
+} from './cloud-docs-reference.js';
+import {
+  loadSupervisionTaskConsolePreferences,
+  saveSupervisionTaskConsolePreferences,
+} from './supervision-task-console-preferences.js';
+import { canViewSupervisionTaskConsole } from './supervision-task-console-visibility.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  clearSupervisionTaskConsoleCache,
+  clearSupervisionTaskConsoleCacheForUser,
+} from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
+import { ExternalDocShareSpace } from './components/DocShareDialog.js';
+import { resetOnlyOfficePrewarm, scheduleOnlyOfficePrewarm } from './onlyoffice-preload.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
+import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
+import { MobileServerMenuToolbar, type MobileServerMenuTab } from './components/MobileServerMenuToolbar.js';
+import { MobileRemoteDesktopMenuList } from './components/MobileRemoteDesktopMenuList.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
+import {
+  KEYBOARD_SHORTCUTS_PREF_KEY,
+  canHandleGlobalNavigationShortcut,
+  canHandleOpenSettingsShortcut,
+  canHandleReturnToMainWindowShortcut,
+  canHandleToggleTaskModeShortcut,
+  cycleOrderedId,
+  formatShortcutKeycaps,
+  hasDomBlockingOverlay,
+  isMacPlatform,
+  matchNavigationShortcutBinding,
+  matchSubSessionQuickShortcut,
+  matchTaskPairSplitQuickShortcut,
+  matchesOpenSettingsShortcut,
+  readLegacyTabOrder,
+  resolveFocusedKeyboardViewMode,
+  resolveKeyboardShortcutSlots,
+  resolveMacVoiceInlineModifier,
+  resolveSubSessionQuickModifiers,
+  resolveTaskPairSplitModifiers,
+  sortSessionsByTabOrder,
+  type KeyboardShortcutOverrides,
+  type ShortcutModifierKey,
+} from './keyboard-shortcuts.js';
+import {
+  isTaskPairSplittable,
+  resolveOrderedTaskPairRows,
+  type TaskPairConsoleSnapshotDetail,
+} from './task-pair-panel-order.js';
+import { taskPairDisplayTitle } from '@shared/task-pair-display.js';
+import {
+  installMacVoiceShortcutListener,
+  isAnyInlineVoiceComposerActive,
+  setFallbackMacVoiceModifier,
+  triggerMacVoiceComposerStopOnly,
+  triggerRegisteredMacVoiceComposer,
+} from './mac-voice-shortcut.js';
+import {
+  attachMobileNavigationGestures,
+  getMobileNavigationGestureKeycaps,
+  type MobileNavigationGestureProgress,
+} from './mobile-navigation-gestures.js';
+import {
+  projectUnifiedServerList,
+  filterRestrictedSharedEntries,
+  getServerPresence,
+  type UnifiedServerItem,
+} from './unified-server-projection.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
+import { UiScaleOnboardingCard } from './components/UiScaleOnboardingCard.js';
+import { applyGlobalFontDelta, useGlobalFontDelta } from './global-font.js';
+import {
+  UI_SCALE_EVENT,
+  applyUiScale,
+  getActiveCssZoom,
+  useUiScale,
+} from './ui-scale.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
-import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
-import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
+import {
+  loadSubSessionDesktopDockSide,
+  loadSubSessionDesktopLayout,
+  saveSubSessionDesktopDockSide,
+  saveSubSessionDesktopLayout,
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopDockSide,
+  type SubSessionDesktopLayout,
+} from './subsession-desktop-layout-preference.js';
+import {
+  defaultTeamDiscussionLayout,
+  loadTeamDiscussionLayout,
+  saveTeamDiscussionLayout,
+  TEAM_DISCUSSION_LAYOUT,
+  type TeamDiscussionLayout,
+} from './team-discussion-layout-preference.js';
+import { StableSubSessionWindow as SubSessionWindow } from './components/StableSubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
-import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
+import { useSharedGitChangesCount, requestSharedChangesCount, clearSharedChangesCache } from './git-status-store.js';
+import { clearFileBrowserCache } from './file-browser-cache.js';
+import { clearRepoPageCache } from './repo-page-cache.js';
 import {
   applyFilePreviewRequestUpdate,
   normalizePreviewViewMode,
@@ -53,34 +217,74 @@ import {
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
-import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
+import { SessionSettingsDialog, type PeerAuditSettingsSession } from './components/SessionSettingsDialog.js';
+import type { SessionSettingsOpenIntent } from './session-settings-open-intent.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
-import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
+import { AskQuestionDialog, resolveAskQuestionSource, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
+import { AskAnswerTracker, type AskAnswerFailure } from './ask-answer-tracker.js';
+import { AskAnswerFailedDialog } from './components/AskAnswerFailedDialog.js';
+import { ASK_ANSWER_ACK_WAIT_MS } from '@shared/ask-answer.js';
+import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
-import { ingestSessionRepoContext } from './session-repo-context-store.js';
+import { buildRepoCallbackTargetOptions } from './repo-callback-prefs.js';
+import { ingestSessionRepoContext, clearSessionRepoContexts } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
+import { ClientDownloadsModal } from './components/ClientDownloadsModal.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
+import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
+import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
+import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
+import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
+import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
+import { RemoteDesktopConnectionManager, remoteDesktopHostKey } from './remote-desktop-connection-manager.js';
+import { openRemoteDesktopWallWindow } from './remote-desktop-window.js';
+import {
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  activateRemoteDesktopWorkspaceTab,
+  closeRemoteDesktopWorkspace,
+  closeRemoteDesktopWorkspaceHost,
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+  reorderRemoteDesktopWorkspaceHost,
+} from './remote-desktop-workspace-state.js';
+import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
+import { listControllableMachines, type MachineListItem } from './api/machines.js';
+import { openRemoteDesktopReference } from './remote-desktop-open.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
-import { isPlausibleUsagePayload } from './usage-data.js';
+import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
+import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
+import { PcAppUpdateBanner } from './components/PcAppUpdateBanner.js';
+import { ServerSwitchWatermark } from './components/ServerSwitchWatermark.js';
+import { MobileSwipeHudOverlay, resolveMobileSwipeTargets, type MobileSwipeHudOverlayHandle } from './components/MobileSwipeHud.js';
+import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
+import { PushStatusBadge } from './components/PushStatusBadge.js';
+import { NewDevicePushPrompt, type NewDevicePushPromptServer } from './components/NewDevicePushPrompt.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
 import { useUnreadCounts } from './hooks/useUnreadCounts.js';
+import { useCronJobCount } from './hooks/useCronJobCount.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
 import {
   DEFAULT_SUBSESSION_ACCENT_COLOR,
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
-import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
+import { canSharedActorControlSession, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import {
+  clearSharedTabRestoreMarker,
+  findRememberedSharedEntry,
+  readSharedTabRestoreMarker,
+  rememberSharedTab,
+} from './shared-tab-restore.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -88,18 +292,39 @@ import {
   SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
+import {
+  clearMessagePinNavigation,
+  peekPendingMessagePinNavigation,
+  subscribeMessagePinNavigation,
+} from './message-pin-navigation.js';
+import { clearMessagePinsCache } from './hooks/useMessagePins.js';
+import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { DaemonStatusCard, DaemonUpgradeConfirmDialog, type DaemonUpgradeRequestState } from './components/DaemonStatusCard.js';
+import { DAEMON_UPGRADE_FORCED_REQUEST_BODY, isDaemonUpgradeBusyBlockReason } from '@shared/daemon-upgrade.js';
+import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
+import {
+  daemonUpgradeBlockedToastKey,
+  shouldShowDaemonUpgradeBlockedToast,
+  type DaemonUpgradeBlockedToastState,
+} from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { canSessionRoleOwnAutomaticSupervision, getSupportedSupervisionBackendOptions } from '@shared/supervision-config.js';
+import type { SupervisionExecutionPoolKind } from '@shared/supervision-execution-pool.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from './session-list-merge.js';
-import { resolveSessionInfoRuntimeType } from './runtime-type.js';
+import { isAskQuestionSessionVisible, type AskQuestionSessionVisibilityState } from './ask-question-visibility.js';
+import { resolveSessionInfoRuntimeType, resolveSubSessionRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
+import { appendMissingServerOrder, normalizePinnedServers, sameOrderIds, toggleServerPin, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -111,9 +336,10 @@ import {
   resolveP2pRootSession,
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
-import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
+import { readHashState, readTabRouteState, resolveInitialRouteState, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
+import { useProgressiveMount } from './hooks/useProgressiveMount.js';
 import {
   DEFAULT_NEW_USER_GUIDE_PREF,
   DEFAULT_TEAM_DISCUSSION_GUIDE_PREF,
@@ -125,13 +351,40 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
+import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { getAuthKey, clearAuthKey } from './biometric-auth.js';
-import { initPushNotifications, resetPushBadge } from './push-notifications.js';
+import { recordPerfRender } from './perf-render-debug.js';
+import { isExpandedMobileViewport, isMobileDevice, subscribeDeviceLayoutChange } from './mobile-device.js';
+import {
+  getAuthKey,
+  clearAuthKey,
+  getAuthKeyId,
+  clearAuthKeyId,
+  initializeServerScopedAuth,
+} from './biometric-auth.js';
+import {
+  initPushNotifications,
+  resetPushBadge,
+  getLocalPushEnabledServers,
+  fetchPushNotificationSettings,
+  subscribePushEnabledServers,
+  commitPushEnabledServers,
+  hasUnsyncedPushEnabledServerEdits,
+} from './push-notifications.js';
+import {
+  canReceiveDesktopNotifications,
+  DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT,
+  showDesktopNotification,
+} from './desktop-notifications.js';
+import { syncTtsConfigFromServer } from './tts.js';
+import {
+  resolveEffectivePushEnabledServerIds,
+  sanitizePushEnabledServerIds,
+} from '@shared/push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
+import { TerminalDiffRegistry } from './terminal-diff-registry.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import {
   buildTerminalResubscribePlan,
@@ -142,44 +395,72 @@ import {
   shouldSubscribeTerminalRaw,
   type TerminalSubscribeViewMode,
 } from './terminal-subscribe-mode.js';
-import { onWatchCommand } from './watch-bridge.js';
+import { onWatchCommand, resolveWatchApiKey, syncSnapshotToWatch } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
-import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import {
+  subscribeShareReceiver,
+  type PendingSharedSessionUpload,
+  type SharedPayload,
+} from './services/share-receiver.js';
+import { ShareTargetModal } from './components/ShareTargetModal.js';
+import { isIdleSessionStateTimelineEvent, noteLiveIdleSignal, isRunningTimelineEvent } from './timeline-running.js';
+import { isOlderActivityGeneration, isWorkingSessionState, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
-  extractTransportPendingMessages,
   extractTransportPendingVersion,
-  hasExplicitTransportPendingSnapshot,
-  mergeTransportPendingEntriesForIdleState,
-  mergeTransportPendingEntriesForRunningState,
+  buildTransportPendingSyncPatch,
   nextTransportQueueVersion,
-  normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
-import { getMobileKeyboardState } from './mobile-keyboard.js';
-import { shouldUseIosMacTextScale } from './native-platform.js';
+import { getCachedTimelineEvents, ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
+import {
+  getMobileKeyboardState,
+  installMobileKeyboardTapDismiss,
+  isMobileKeyboardInputTarget,
+  isSubSessionBarInputTarget,
+  measureMobileKeyboardShrink,
+  shouldResetMobileKeyboardOnWidthTransition,
+} from './mobile-keyboard.js';
+import { applyNativePlatformClasses, isNativeMacDesktop, shouldUseIosMacTextScale } from './native-platform.js';
+import { useMacInputInset } from './mac-input-inset.js';
+import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
+import { resolveQuickAgentDelegationModel } from './quick-agent-delegation-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
+import { computeAutoLaunchLabels } from './auto-launch-labels.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
   getDaemonBadgeState,
   getSelectedServerName,
+  mergeServerNavigation,
   hasResolvedActiveSession,
   isServerOnline,
   pickAutoEntryServer,
   pickMostRecentMainSession,
+  resolveServerSessionSnapshot,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+import { readLastRememberedServerId, readServerSession, writeServerSession } from './server-tab-state.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
-import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
-import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
-import { markSessionRunningIfNeeded } from './session-state-updates.js';
+import { markServerDaemonActivity, markServerOffline, SERVER_HEARTBEAT_TOUCH_MIN_INTERVAL_MS, touchServerHeartbeat } from './server-online-state.js';
+import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE, MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import { SHARE_CANCEL_FAILED_EVENT, notifyShareCancelFailure, shareCancelFailureReasonKey, takeTrackedShareCancel, type ShareCancelFailure } from './share-cancel-feedback.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
+import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
+import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
+import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
+import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
+import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
+import { CloudDocsWindowBlockedNotice } from './components/CloudDocsWindowBlockedNotice.js';
+import { openCloudDocsWindow, subscribeCloudDocQuotes } from './cloud-docs-window.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -191,14 +472,65 @@ import {
   type AppUpdateRequiredDetail,
 } from './app-update.js';
 
+async function clearStoredAuthForServer(serverUrl?: string | null): Promise<void> {
+  try { await clearAuthKey(serverUrl); } catch { /* local revocation is best-effort */ }
+  try { await clearAuthKeyId(serverUrl); } catch { /* local revocation is best-effort */ }
+}
+
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
+const UsageSummaryPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/UsageSummaryPage.js')).then((m) => ({ default: m.UsageSummaryPage })));
+
+function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
+  const parts: string[] = [];
+  const appendNewline = () => {
+    if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
+  };
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const child = node as HTMLElement;
+    const tag = child.tagName;
+    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    if (tag === 'BR') {
+      appendNewline();
+      return;
+    }
+    if (isBlock && parts.length > 0) appendNewline();
+    child.childNodes.forEach(walk);
+    if (isBlock) appendNewline();
+  };
+  element.childNodes.forEach(walk);
+  const current = parts.join('').replace(/\n+$/g, '');
+  element.textContent = `${current}${suffix}`.replace(/\r\n?/g, '\n');
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  focusComposerElement(element, { moveCursorToEnd: true });
+}
 
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('native_callback')
   : null;
+const desktopCallback = typeof window !== 'undefined'
+  ? parseDesktopSetupCallbackUrl(
+      new URLSearchParams(window.location.search).get(DESKTOP_SETUP_CALLBACK_QUERY_PARAM),
+    )?.href ?? null
+  : null;
+const aideskManagementQuery = typeof window !== 'undefined'
+  ? new URLSearchParams(window.location.search)
+  : null;
+const aideskManagementNodeId = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_NODE_QUERY,
+) ?? null;
+const aideskManagementAction = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_ACTION_QUERY,
+) === REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  ? REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  : REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE;
 
 type ViewMode = TerminalSubscribeViewMode;
 
@@ -206,13 +538,47 @@ type AppToast = {
   id: number;
   sessionName?: string;
   project?: string;
-  kind: 'idle' | 'notification' | 'success';
+  kind: 'idle' | 'notification' | 'success' | 'error';
   title?: string;
   message?: string;
   openRepoLatest?: boolean;
   failedJobName?: string;
   failedStepName?: string;
 };
+
+type PendingNewDevicePushPrompt = NewDevicePushPromptServer & {
+  priorAccessibleServerIds: string[];
+};
+
+function pushBindPromptedStorageKey(auth: { userId?: string; baseUrl?: string } | null): string | null {
+  if (!auth?.userId) return null;
+  return `imcodes.push_bind_prompted:${auth.baseUrl ?? ''}:${auth.userId}`;
+}
+
+function readHandledNewDevicePushIds(auth: { userId?: string; baseUrl?: string } | null): Set<string> {
+  const key = pushBindPromptedStorageKey(auth);
+  if (!key) return new Set();
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? new Set(parsed.filter((item): item is string => typeof item === 'string')) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function markHandledNewDevicePushId(auth: { userId?: string; baseUrl?: string } | null, serverId: string): void {
+  const key = pushBindPromptedStorageKey(auth);
+  if (!key) return;
+  try {
+    const existing = readHandledNewDevicePushIds(auth);
+    existing.add(serverId);
+    const trimmed = [...existing].slice(-200);
+    localStorage.setItem(key, JSON.stringify(trimmed));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 type AppUpdateNotice = {
   required: boolean;
@@ -224,10 +590,42 @@ type AppUpdateNotice = {
   dismissed?: boolean;
 };
 
-const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+// Safety ceiling for the "daemon upgrading…" badge: an npm install + restart
+// normally completes in well under a minute, but a slow network / retry storm
+// can drag on. If the daemon never reconnects (failed install), clear the badge
+// after this so it doesn't stick forever. Reconnect/online clears it sooner.
+const DAEMON_UPGRADING_MAX_MS = 5 * 60 * 1_000;
 const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
+const MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS = 128;
+
+/**
+ * Desktop sub-session maximize state belongs to the owning main-session tab,
+ * not to the currently mounted App tree.  Keep the key server-scoped too:
+ * session names are daemon-local and can legitimately repeat on two servers.
+ * The bounded parser is deliberately fail-closed for malformed/legacy values.
+ */
+function maximizedSubSessionStorageKey(serverId: string | null, sessionName: string): string {
+  return `rcc_maximized_subs_${serverId ?? 'default'}_${sessionName}`;
+}
+
+function loadPersistedMaximizedSubSessionIds(serverId: string | null, sessionName: string | null): Set<string> {
+  if (!sessionName) return new Set();
+  try {
+    const raw = localStorage.getItem(maximizedSubSessionStorageKey(serverId, sessionName));
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(
+      parsed
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+        .slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS),
+    );
+  } catch {
+    return new Set();
+  }
+}
 
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
   try {
@@ -237,34 +635,18 @@ function readOpenSpecAutoRunbarCompactPreference(): boolean {
   }
 }
 
-function markFastServerSwitchSplash(): void {
-  try {
-    sessionStorage.setItem(FAST_SERVER_SWITCH_SPLASH_KEY, '1');
-  } catch {
-    // Ignore storage failures; switching servers should still reload normally.
-  }
-}
-
-function takeFastServerSwitchSplashFlag(): boolean {
-  try {
-    const flagged = sessionStorage.getItem(FAST_SERVER_SWITCH_SPLASH_KEY) === '1';
-    if (flagged) {
-      sessionStorage.removeItem(FAST_SERVER_SWITCH_SPLASH_KEY);
-    }
-    return flagged;
-  } catch {
-    return false;
-  }
-}
-
 export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
+  const ce = el.getAttribute?.('contenteditable');
   return tag === 'INPUT'
     || tag === 'TEXTAREA'
     || tag === 'SELECT'
     || el.isContentEditable
-    || !!el.closest?.('.cm-editor, .fb-editor-cm');
+    || ce === 'true'
+    || ce === ''
+    || ce === 'plaintext-only'
+    || !!el.closest?.('[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .cm-editor, .fb-editor-cm');
 }
 
 type SharedContextDiagnosticsWindowState = {
@@ -347,8 +729,15 @@ interface ServerInfo {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
+}
+
+interface SharedReturnServer {
+  id: string;
+  name: string;
 }
 
 interface WatchSessionRow {
@@ -358,10 +747,71 @@ interface WatchSessionRow {
   isSubSession?: boolean;
 }
 
-function formatSharedAccessError(error: unknown): string {
-  if (error instanceof ApiError) return error.body || error.message;
-  if (error instanceof Error) return error.message;
-  return String(error || 'share_failed');
+const MOBILE_HIDE_SERVER_BAR_STORAGE_KEY = 'mobile_hide_server_bar';
+
+function loadMobileHideServerBar(): boolean {
+  try {
+    return localStorage.getItem(MOBILE_HIDE_SERVER_BAR_STORAGE_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+function saveMobileHideServerBar(hidden: boolean): void {
+  try {
+    localStorage.setItem(MOBILE_HIDE_SERVER_BAR_STORAGE_KEY, hidden ? '1' : '0');
+  } catch {
+    // Ignore storage failures in restricted environments.
+  }
+}
+
+function formatSharedAccessError(
+  error: unknown,
+  t?: (key: string, options?: any) => string,
+): string {
+  if (error instanceof SharedOpenTimeoutError || (error instanceof Error && error.name === 'SharedOpenTimeoutError')) {
+    return t ? t('share.sharedWithMe.openTimeout') : 'Opening shared access timed out. Please try again.';
+  }
+  if (error instanceof ApiError) {
+    try {
+      const parsed = JSON.parse(error.body) as { reason?: unknown; error?: unknown };
+      if (typeof parsed?.reason === 'string') {
+        const reasonKey = `share.reason.${parsed.reason}`;
+        if (t) {
+          const translated = t(reasonKey);
+          if (translated && translated !== reasonKey) return translated;
+        }
+      }
+    } catch { /* ignore JSON parse error */ }
+    return error.body || error.message;
+  }
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') {
+      return '';
+    }
+    return error.message;
+  }
+  return String(error || (t ? t('share.sharedWithMe.openFailed') : 'share_failed'));
+}
+
+function sharedEntryFallbackFromHash(
+  entryId: string | null,
+  serverId: string | null,
+  sessionName: string | null,
+): SharedEntrySummary | null {
+  if (!entryId || !serverId) return null;
+  const target: ShareTarget = sessionName
+    ? { kind: 'main', serverId, sessionName }
+    : { kind: 'server', serverId };
+  return {
+    id: entryId,
+    serverId,
+    serverName: serverId,
+    role: 'viewer',
+    status: 'active',
+    target,
+    targetLabel: sessionName ?? serverId,
+  };
 }
 
 function buildSharedOutStateFromShares(shares: ShareGrantSummary[]): SharedStateSummary | null {
@@ -411,59 +861,446 @@ function getRepoDesktopWindowId(parentSubId?: string | null): string {
   return parentSubId ? DESKTOP_WINDOW_IDS.subsessionRepo(parentSubId) : DESKTOP_WINDOW_IDS.repo;
 }
 
+function findSharedEntryForHash(
+  entries: SharedEntrySummary[],
+  serverId: string,
+  sessionName: string | null,
+): SharedEntrySummary | null {
+  const candidates = entries.filter((entry) => entry.status === 'active' && entry.serverId === serverId);
+  if (sessionName) {
+    const main = candidates.find((entry) => (
+      entry.target.kind === 'main' && entry.target.sessionName === sessionName
+    ));
+    if (main) return main;
+    const subSession = candidates.find((entry) => (
+      entry.target.kind === 'subsession'
+      && (`deck_sub_${entry.target.subSessionId}` === sessionName
+        || entry.target.subSessionDisplayName === sessionName)
+    ));
+    if (subSession) return subSession;
+  }
+  return candidates.find((entry) => entry.target.kind === 'server') ?? null;
+}
+
+/**
+ * The project key the identity editor starts from. A sub-session is not in the
+ * main-session list, so it falls back to its own namespace and then to its
+ * parent's project (share recipients never see `contextNamespace`; the server
+ * replaces the key with the daemon's canonical one on the session-bound route).
+ */
+function settingsIdentityProjectKey(
+  target: { sessionName: string; subId?: string; parentSession?: string | null },
+  sessions: ReadonlyArray<{ name: string; project?: string; contextNamespace?: { projectId?: unknown } | null }>,
+  subSessions: ReadonlyArray<{ id: string; sessionName: string; parentSession?: string | null; contextNamespace?: { projectId?: unknown } | null }>,
+): string | undefined {
+  const main = sessions.find((session) => session.name === target.sessionName);
+  if (main) return sessionIdentityProjectKey(main) || undefined;
+  const sub = subSessions.find((candidate) => candidate.id === target.subId || candidate.sessionName === target.sessionName);
+  const own = sub ? sessionIdentityProjectKey({ contextNamespace: sub.contextNamespace }) : '';
+  if (own) return own;
+  const parentName = sub?.parentSession ?? target.parentSession;
+  const parent = parentName ? sessions.find((session) => session.name === parentName) : undefined;
+  return (parent && sessionIdentityProjectKey(parent)) || undefined;
+}
+
+/** Token-usage bars refresh at most this often; the newest value always wins. */
+const SUB_USAGE_COMMIT_INTERVAL_MS = 250;
+
+interface SharedOpenIntent {
+  generation: number;
+  entryId: string;
+  targetKind: string;
+  serverId: string;
+  preferredSessionName: string | null;
+  subSessionId?: string;
+  source: 'ui' | 'external' | 'startup';
+}
+
+type SharedOpenResultStatus = 'opened' | 'superseded' | 'denied' | 'duplicate';
+
+function detectExternalDocShareRouteToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get('docShare')?.trim();
+    if (fromQuery) return fromQuery;
+    const pathMatch = window.location.pathname.match(/^\/doc-share\/([^/?#]+)/);
+    if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export function App() {
-  const { t: trans } = useTranslation();
+  const [externalDocShareToken, setExternalDocShareToken] = useState<string | null>(() =>
+    detectExternalDocShareRouteToken(),
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const syncExternalDocShareRoute = () => {
+      setExternalDocShareToken(detectExternalDocShareRouteToken());
+    };
+    syncExternalDocShareRoute();
+    window.addEventListener('popstate', syncExternalDocShareRoute);
+    window.addEventListener('hashchange', syncExternalDocShareRoute);
+    return () => {
+      window.removeEventListener('popstate', syncExternalDocShareRoute);
+      window.removeEventListener('hashchange', syncExternalDocShareRoute);
+    };
+  }, []);
+
+  if (externalDocShareToken) {
+    if (typeof window !== 'undefined') {
+      configureApi(window.location.origin);
+    }
+    return <ExternalDocShareSpace token={externalDocShareToken} />;
+  }
+
+  return <InternalMainApp />;
+}
+
+function InternalMainApp() {
+  recordPerfRender('App');
+  const { t: trans, i18n } = useTranslation();
+  const transRef = useRef(trans);
+  transRef.current = trans;
+  const remoteDesktopConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
+  if (!remoteDesktopConnectionManagerRef.current) {
+    remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
+  }
+  const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
+  /** Server ids this account actually owns, sourced only from /api/server. */
+  const ownedServerIdsRef = useRef<Set<string>>(new Set());
+  /** Settled baseline of owned server IDs after initial sync; null until first inventory arrives. */
+  const knownOwnedServerIdsRef = useRef<Set<string> | null>(null);
+  const queuedNewDeviceIdsRef = useRef<Set<string>>(new Set());
+  const controlledMachineServerIdsRef = useRef<string[]>([]);
+  const [controlledMachineServerIds, setControlledMachineServerIds] = useState<string[]>([]);
+  const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() => (
+    typeof getLocalPushEnabledServers === 'function' ? getLocalPushEnabledServers() : null
+  ));
+  const pushEnabledServersRef = useRef<string[] | null>(pushEnabledServers);
+  pushEnabledServersRef.current = pushEnabledServers;
+  const [newDevicePushPrompts, setNewDevicePushPrompts] = useState<PendingNewDevicePushPrompt[]>([]);
+  const [newDevicePushSaving, setNewDevicePushSaving] = useState(false);
+  const newDevicePushSavingRef = useRef(false);
+  // Only successful share discovery updates this set; a transient fetch failure
+  // must not erase navigation back to a server the user just left.
+  const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
+  const initialHashStateRef = useRef(resolveInitialRouteState());
+  const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
+  const sharedOpenGenerationRef = useRef(0);
+  const sharedOpenAbortRef = useRef<AbortController | null>(null);
+  const sharedOpenIntentRef = useRef<SharedOpenIntent | null>(null);
+  useEffect(() => {
+    return () => {
+      sharedOpenAbortRef.current?.abort();
+      sharedOpenAbortRef.current = null;
+      sharedOpenGenerationRef.current += 1;
+      sharedOpenIntentRef.current = null;
+    };
+  }, []);
+  /** Invalidates asynchronous external-route authorization after a newer navigation. */
+  const externalRouteGenerationRef = useRef(0);
+  /** Deduplicates the hashchange/popstate pair emitted for one route transition. */
+  const externalRouteInFlightKeyRef = useRef<string | null>(null);
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
   }, [globalFontPrefs.family, globalFontPrefs.cjkFamily]);
+  const [globalFontDelta] = useGlobalFontDelta();
+  useEffect(() => {
+    applyGlobalFontDelta(globalFontDelta);
+  }, [globalFontDelta]);
+  const [uiScale] = useUiScale();
+  useEffect(() => {
+    applyUiScale(uiScale);
+  }, [uiScale]);
   const [auth, setAuth] = useState<AuthState | null>(() => {
     try {
       const raw = localStorage.getItem('rcc_auth');
       const state = raw ? (JSON.parse(raw) as AuthState) : null;
-      if (state) configureApi(state.baseUrl);
+      if (state) {
+        configureApi(state.baseUrl);
+        configureExpectedUserId(state.userId);
+      }
       return state;
     } catch {
       return null;
     }
   });
+  const authRef = useRef(auth);
+  authRef.current = auth;
+  const appMountedRef = useRef(true);
+  useEffect(() => {
+    appMountedRef.current = true;
+    return () => {
+      appMountedRef.current = false;
+    };
+  }, []);
+  const sharedDiscoveryAbortRef = useRef<AbortController | null>(null);
+  const sharedDiscoveryGenerationRef = useRef(0);
+  useEffect(() => {
+    return () => {
+      sharedDiscoveryAbortRef.current?.abort();
+      sharedDiscoveryAbortRef.current = null;
+    };
+  }, []);
+  const [daemonUpgradeRequests, setDaemonUpgradeRequests] = useState<Record<string, DaemonUpgradeRequestState>>({});
+  const [daemonUpgradeConfirmTarget, setDaemonUpgradeConfirmTarget] = useState<ServerInfo | 'all' | null>(null);
+  const supervisionCacheUserRef = useRef<string | null>(auth?.userId ?? null);
+  useEffect(() => {
+    const previousUserId = supervisionCacheUserRef.current;
+    const nextUserId = auth?.userId ?? null;
+    if (previousUserId && previousUserId !== nextUserId) {
+      clearSupervisionTaskConsoleCacheForUser(previousUserId);
+    }
+    if (!nextUserId) clearAllSupervisionTaskConsoleCaches();
+    supervisionCacheUserRef.current = nextUserId;
+  }, [auth?.userId]);
+  const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
+    () => !isNative(),
+  );
+  // Set only once mount verification has actually concluded 401 AND a login
+  // had just set `rcc_login_session_not_stuck` before its own reload -- never
+  // on a bare 401 (that is the normal state of every logged-out visitor), and
+  // never before verification settles (or a session that DID stick would
+  // flash the message for the instant LoginPage mounts ahead of /me).
+  const [sessionNotStuck, setSessionNotStuck] = useState(false);
+  const authMutationGenerationRef = useRef(0);
+  const activeAuthAttemptSettlementsRef = useRef(new Set<Promise<void>>());
+  const authCredentialCleanupCountRef = useRef(0);
+  const [authCredentialCleanupPending, setAuthCredentialCleanupPending] = useState(false);
+  const holdAuthCredentialCleanupGate = useCallback(() => {
+    authCredentialCleanupCountRef.current += 1;
+    setAuthCredentialCleanupPending(true);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      authCredentialCleanupCountRef.current = Math.max(
+        0,
+        authCredentialCleanupCountRef.current - 1,
+      );
+      if (authCredentialCleanupCountRef.current === 0) {
+        setAuthCredentialCleanupPending(false);
+      }
+    };
+  }, []);
+  const beginAuthAttempt = useCallback(() => {
+    // Explicit user authentication outranks startup verification and every
+    // older login attempt. Claim a generation at admission time rather than
+    // at success: an already pending /me response must not be able to commit
+    // the previous cookie identity while this attempt is in flight.
+    authMutationGenerationRef.current += 1;
+    const generation = authMutationGenerationRef.current;
+    let finished = false;
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    activeAuthAttemptSettlementsRef.current.add(settled);
+    return {
+      isCurrent: () => generation === authMutationGenerationRef.current,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        activeAuthAttemptSettlementsRef.current.delete(settled);
+        resolveSettled();
+      },
+    };
+  }, []);
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
-  const clearAuthState = useCallback(async (reason?: string) => {
+  // In-memory-only incognito preservation across server switches & reconnects.
+  // Never written to localStorage / sessionStorage / IndexedDB.
+  const incognitoOpenSubWindowsRef = useRef<Map<string, Set<string>>>(new Map());
+  const incognitoMaximizedSubWindowsRef = useRef<Map<string, Set<string>>>(new Map());
+  const incognitoActiveSessionByServerRef = useRef<Map<string, string>>(new Map());
+  const incognitoMainSessionsByServerRef = useRef<Map<string, SessionInfo[]>>(new Map());
+  const manualStoppedMainSessionsRef = useRef<Set<string>>(new Set());
+  const clearAuthState = useCallback(async (
+    reason?: string,
+    options?: {
+      preserveSharedNavigation?: boolean;
+      preserveCredentials?: boolean;
+      credentialServerUrl?: string | null;
+    },
+  ) => {
+    // Authentication is authority, but it is not navigation state. In
+    // particular, a refresh can discover an expired cookie before LoginPage
+    // completes a fresh sign-in. Clearing the explicit shared hash here used
+    // to turn `#/server/session?shared=entry` into the dashboard URL, so the
+    // post-login render had no route left to restore. Preserve only the route
+    // that is still explicitly present in this tab; /api/shares/open remains
+    // the sole authority after authentication succeeds.
     console.warn('[auth] clearing auth state', reason ?? '');
+    // Capture the navigation intent and revoke the old authority synchronously.
+    // Credential deletion can involve native IPC; an in-flight shared open must
+    // already be fenced out while those asynchronous operations are pending.
+    const hashRoute = readHashState();
+    const sharedRoute = hashRoute.serverId ? hashRoute : readTabRouteState();
+    const preserveSharedRoute = options?.preserveSharedNavigation !== false && Boolean(
+      sharedRoute.serverId && sharedRoute.sharedEntryId,
+    );
+    const sharedRestoreMarker = preserveSharedRoute
+      ? readSharedTabRestoreMarker()
+      : null;
+    // Do not expose LoginPage until every cleanup started for the old authority
+    // has completed. Native credential deletion is unconditional, so allowing a
+    // fresh login while it is in flight could delete the newly stored key.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    authMutationGenerationRef.current += 1;
+    const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     clearApiKey();
-    try { await clearAuthKey(); } catch { /* ignore */ }
-    try {
-      const { Preferences } = await import('@capacitor/preferences');
-      await Preferences.remove({ key: 'deck_api_key_id' });
-    } catch { /* ignore */ }
+    configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
     localStorage.removeItem('rcc_auth');
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
+    clearMessagePinsCache();
+    clearMessagePinNavigation();
+    // A shared hash is only a navigation intent. Everything learned under the
+    // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
+    authRef.current = null;
+    setSharedEntries([]);
     setServers([]);
+    ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
-    setSelectedServerId(null);
+    setSessions([]);
+    setSessionsLoaded(false);
+    setSharedActiveDispatchIds(new Map());
+    setOpeningSharedEntryId(null);
+    setSharedEntriesLoading(false);
+    setSharedEntriesLoaded(false);
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
+    setOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
+    incognitoOpenSubWindowsRef.current.clear();
+    incognitoMaximizedSubWindowsRef.current.clear();
+    incognitoActiveSessionByServerRef.current.clear();
+    incognitoMainSessionsByServerRef.current.clear();
+    manualStoppedMainSessionsRef.current.clear();
+    setDiscussions([]);
+    setRepoContexts(new Map());
+    repoContextsByServerRef.current.clear();
+    repoContextsOwnerServerIdRef.current = null;
+    lastKnownSidebarScopeByServerRef.current.clear();
+    clearFileBrowserCache();
+    clearRepoPageCache();
+    clearSharedChangesCache();
+    clearSessionRepoContexts();
+    setShowTaskMode(false);
+    clearTaskModeOpenPersistence();
+    clearGlobalTaskModeSessionState();
+    if (preserveSharedRoute) {
+      initialHashStateRef.current = sharedRoute;
+      initialSharedTabRestoreRef.current = sharedRestoreMarker;
+      sharedHashRestoreStartedRef.current = false;
+    } else {
+      const emptyRoute = { serverId: null, sessionName: null, sharedEntryId: null };
+      initialHashStateRef.current = emptyRoute;
+      initialSharedTabRestoreRef.current = null;
+      sharedHashRestoreStartedRef.current = false;
+      writeHashState(null, null, null);
+    }
+    setSelectedServerId(preserveSharedRoute ? sharedRoute.serverId : null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(preserveSharedRoute ? sharedRoute.sharedEntryId : null);
+    if (preserveSharedRoute) setActiveSessionState(sharedRoute.sessionName);
+    setSharedHashRestorePending(preserveSharedRoute);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setManagedShares([]);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, []);
+    try {
+      // If an invalidated login was already inside a native credential write,
+      // let it settle first so this cleanup is guaranteed to be the last writer.
+      await Promise.allSettled(staleAuthAttempts);
+      if (!options?.preserveCredentials) {
+        await clearStoredAuthForServer(options?.credentialServerUrl);
+      }
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [holdAuthCredentialCleanupGate]);
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
+  const nativeServerUrlRef = useRef<string | null>(null);
+  nativeServerUrlRef.current = nativeServerUrl;
   const [nativeReady, setNativeReady] = useState(!isNative()); // web is immediately ready
   const [splashDone, setSplashDone] = useState(false);
 
+  const connectNativeServer = useCallback(async (url: string) => {
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    const attempt = beginAuthAttempt();
+    nativeServerUrlRef.current = url;
+    setNativeServerUrl(url);
+    configureApi(url);
+    configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
+    clearApiKey();
+    try {
+      const storedKey = await getAuthKey(url);
+      if (!storedKey || !attempt.isCurrent()) return;
+      configureApiKey(storedKey);
+      try {
+        const user = await apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me');
+        if (!attempt.isCurrent()) return;
+        const authState: AuthState = { userId: user.id, baseUrl: url };
+        authMutationGenerationRef.current += 1;
+        configureExpectedUserId(user.id);
+        setFileRelayUser(user.id);
+        setServerR2RelayEnabled(user.r2RelayEnabled === true);
+        localStorage.setItem('rcc_auth', JSON.stringify(authState));
+        setAuth(authState);
+      } catch (err) {
+        // A network outage must not destroy a still-valid saved session. Only
+        // the selected server's authoritative 401 invalidates its credentials.
+        // apiFetch notifies the global expiry handler before throwing, so the
+        // attempt may already be stale here; the URL-scoped deletion is still
+        // required and cannot affect a different server selected afterward.
+        if (err instanceof ApiError && err.status === 401) {
+          await clearStoredAuthForServer(url);
+        }
+        if (!attempt.isCurrent()) return;
+        clearApiKey();
+      }
+    } finally {
+      attempt.finish();
+      releaseCleanupGate();
+    }
+  }, [beginAuthAttempt, holdAuthCredentialCleanupGate]);
+
   const [servers, setServers] = useState<ServerInfo[]>([]);
+  const serversRef = useRef<ServerInfo[]>(servers);
+  serversRef.current = servers;
   const [serversLoaded, setServersLoaded] = useState(false);
   const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
-    () => resolveInitialServerId(),
+    () => initialHashStateRef.current.serverId,
   );
   const selectedServerIdRef = useRef<string | null>(selectedServerId);
   const [selectedServerName, setSelectedServerName] = useState<string | null>(
@@ -473,15 +1310,80 @@ export function App() {
   const [manualDashboard, setManualDashboard] = useState(false);
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
+  const [mobileServerMenuTab, setMobileServerMenuTab] = useState<MobileServerMenuTab>('servers');
+  useEffect(() => {
+    if (!showMobileServerMenu) setMobileServerMenuTab('servers');
+  }, [showMobileServerMenu]);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [showCloudDocs, setShowCloudDocs] = useState(false);
+  const [showTaskMode, setShowTaskMode] = useState(() =>
+    readInitialTaskModeOpen({ isSharedRoute: Boolean(initialHashStateRef.current.sharedEntryId) }),
+  );
+  useEffect(() => {
+    syncTaskModeOpenPersistence(showTaskMode);
+  }, [showTaskMode]);
+  const [taskModeEntrySummary, setTaskModeEntrySummary] = useState(() => {
+    const active = globalTaskModeStore.getState().tasks.filter((t) => !t.isTerminal);
+    return {
+      attentionCount: active.filter((t) => t.needsAttention).length,
+      activeCount: active.length,
+    };
+  });
+  useEffect(() => {
+    return globalTaskModeStore.subscribe((next) => {
+      const active = next.tasks.filter((t) => !t.isTerminal);
+      setTaskModeEntrySummary({
+        attentionCount: active.filter((t) => t.needsAttention).length,
+        activeCount: active.length,
+      });
+    });
+  }, []);
+  const hasTaskModeAttention = taskModeEntrySummary.attentionCount > 0;
+  const taskModeBadgeCount = taskModeEntrySummary.attentionCount > 0
+    ? taskModeEntrySummary.attentionCount
+    : taskModeEntrySummary.activeCount;
+  const showCloudDocsRef = useRef(showCloudDocs);
+  showCloudDocsRef.current = showCloudDocs;
+  const [cloudDocsRequest, setCloudDocsRequest] = useState<{ docId: string; seq: number } | null>(null);
+  const cloudDocsRequestSeqRef = useRef(0);
+  useEffect(() => {
+    if (!showCloudDocs) setCloudDocsRequest(null);
+  }, [showCloudDocs]);
+  const [desktopCloudDocsMaximized, setDesktopCloudDocsMaximized] = useState(false);
+  const [cloudDocsGeometryRequest, setCloudDocsGeometryRequest] = useState<{
+    version: number;
+    geometry: WindowGeometry;
+  } | null>(null);
+  // On phones the console is a large overlay: never re-open it by itself at
+  // launch (owner: load silently, no big box on open). Desktop keeps the remembered side-panel state.
+  const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
+    () => !isMobileDevice() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+  );
+  const closeSupervisionTaskConsole = useCallback(() => {
+    const bounds = supervisionTaskConsolePreferenceBounds();
+    const preferences = loadSupervisionTaskConsolePreferences(bounds);
+    saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);
+    setShowSupervisionTaskConsole(false);
+  }, []);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
+    () => initialHashStateRef.current.sharedEntryId,
+  );
+  const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
+    () => Boolean(initialHashStateRef.current.serverId),
+  );
+  const sharedHashRestoreStartedRef = useRef(false);
+  const [sharedReturnServer, setSharedReturnServer] = useState<SharedReturnServer | null>(null);
+  const [showSharedReturnGuide, setShowSharedReturnGuide] = useState(false);
   const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
+  const [sharedEntriesLoaded, setSharedEntriesLoaded] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
+  const [presenceTick, setPresenceTick] = useState(0);
   const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
+  const [mobileHideServerBar, setMobileHideServerBar] = useState(loadMobileHideServerBar);
   const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadSidebarCollapsed());
   const handleToggleSidebar = useCallback(() => {
@@ -492,19 +1394,77 @@ export function App() {
   }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
-  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => (
+    loadPersistedMaximizedSubSessionIds(selectedServerId, initialHashStateRef.current.sessionName)
+  ));
   const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
     try {
       const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
-      if (raw !== null) return JSON.parse(raw) === true;
+      const migrated = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY) === '1';
+      if (raw !== null) {
+        const value = JSON.parse(raw) === true;
+        // Before v2, the desktop default was expanded and indistinguishable
+        // from an explicit choice. Migrate that legacy default once; all
+        // subsequent explicit toggles are persisted normally.
+        if (!migrated && value === false) {
+          localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+          return true;
+        }
+        return value;
+      }
+      localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+      return true;
     } catch { /* ignore */ }
-    return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    return true;
   });
   useEffect(() => {
     try {
       localStorage.setItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, JSON.stringify(subSessionBarCollapsed));
     } catch { /* ignore */ }
   }, [subSessionBarCollapsed]);
+  const [subSessionDesktopLayout, setSubSessionDesktopLayout] = useState<SubSessionDesktopLayout>(
+    () => loadSubSessionDesktopLayout(),
+  );
+  const [subSessionDesktopDockSide, setSubSessionDesktopDockSide] = useState<SubSessionDesktopDockSide>(
+    () => loadSubSessionDesktopDockSide(),
+  );
+  const [subSessionVerticalRailHost, setSubSessionVerticalRailHost] = useState<HTMLElement | null>(null);
+  const handleSubSessionDesktopLayoutChange = useCallback((layout: SubSessionDesktopLayout) => {
+    setSubSessionDesktopLayout(layout);
+    // Persist only from the desktop-only control. Mobile rendering never writes or resets this preference.
+    saveSubSessionDesktopLayout(layout);
+  }, []);
+  const handleSubSessionDesktopDockSideChange = useCallback((side: SubSessionDesktopDockSide) => {
+    setSubSessionDesktopDockSide(side);
+    // Like the layout choice, docking is a desktop-only local preference.
+    saveSubSessionDesktopDockSide(side);
+  }, []);
+  const [manualTeamDiscussionLayout, setManualTeamDiscussionLayout] = useState<TeamDiscussionLayout | null>(
+    () => loadTeamDiscussionLayout(),
+  );
+  const [automaticTeamDiscussionLayout, setAutomaticTeamDiscussionLayout] = useState<TeamDiscussionLayout>(
+    () => defaultTeamDiscussionLayout(
+      window.innerHeight,
+      !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+    ),
+  );
+  const teamDiscussionLayout = manualTeamDiscussionLayout ?? automaticTeamDiscussionLayout;
+  const [teamDiscussionRailHost, setTeamDiscussionRailHost] = useState<HTMLElement | null>(null);
+  const handleTeamDiscussionLayoutChange = useCallback((layout: TeamDiscussionLayout) => {
+    setManualTeamDiscussionLayout(layout);
+    saveTeamDiscussionLayout(layout);
+  }, []);
+  useEffect(() => {
+    if (manualTeamDiscussionLayout !== null) return undefined;
+    const updateAutomaticLayout = () => {
+      setAutomaticTeamDiscussionLayout(defaultTeamDiscussionLayout(
+        window.innerHeight,
+        !isMobileDevice(),
+      ));
+    };
+    window.addEventListener('resize', updateAutomaticLayout);
+    return () => window.removeEventListener('resize', updateAutomaticLayout);
+  }, [manualTeamDiscussionLayout]);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
     const el = desktopWorkspaceBoundsRef.current;
@@ -516,6 +1476,7 @@ export function App() {
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
+  const [localWebPreviewLaunchToken, setLocalWebPreviewLaunchToken] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   // NOTE: top-bar 📁 buttons call setShowMobile/DesktopFileBrowser directly.
   // Sub-sessions now own their own FileBrowser inside SubSessionWindow
@@ -527,6 +1488,11 @@ export function App() {
     if (!auth) {
       setServersLoaded(false);
       setServersSynced(false);
+      knownOwnedServerIdsRef.current = null;
+      queuedNewDeviceIdsRef.current.clear();
+      controlledMachineServerIdsRef.current = [];
+      setControlledMachineServerIds([]);
+      setNewDevicePushPrompts([]);
       watchProjectionStore.setApiKey(null);
       watchProjectionStore.setSnapshotStatus('switching');
       watchProjectionStore.setServers([]);
@@ -535,28 +1501,57 @@ export function App() {
       return;
     }
 
-    watchProjectionStore.setApiKey(getApiKey());
-    watchProjectionStore.setServers(servers.map((server) => ({
-      id: server.id,
-      name: server.name,
-      baseUrl: auth.baseUrl,
-    })));
+    let cancelled = false;
+    const directKey = getApiKey();
+    if (directKey) {
+      watchProjectionStore.setApiKey(directKey);
+    } else if (!isNative()) {
+      watchProjectionStore.setApiKey(null);
+    } else {
+      void resolveWatchApiKey(auth).then((watchKey) => {
+        if (cancelled) return;
+        const currentAuth = authRef.current;
+        if (!currentAuth || currentAuth.userId !== auth.userId || currentAuth.baseUrl !== auth.baseUrl) return;
+        watchProjectionStore.setApiKey(getApiKey() ?? watchKey);
+      });
+    }
     watchProjectionStore.setCurrentServerId(selectedServerId);
-  }, [auth, servers, selectedServerId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, selectedServerId]);
 
   useEffect(() => {
     if (!selectedServerId) return;
     watchProjectionStore.beginServerSwitch(selectedServerId);
   }, [selectedServerId]);
 
+  // The "daemon upgrading…" badge is not server-scoped state, so drop it when
+  // the selected server changes (its target belonged to the previous device),
+  // and on unmount, so a stale badge never lingers.
+  useEffect(() => {
+    setDaemonUpgrading(null);
+    if (daemonUpgradingTimerRef.current) {
+      clearTimeout(daemonUpgradingTimerRef.current);
+      daemonUpgradingTimerRef.current = null;
+    }
+    return () => {
+      if (daemonUpgradingTimerRef.current) {
+        clearTimeout(daemonUpgradingTimerRef.current);
+        daemonUpgradingTimerRef.current = null;
+      }
+    };
+  }, [selectedServerId]);
+
   useEffect(() => {
     selectedServerIdRef.current = selectedServerId;
+    if (sharedHashRestorePending) return;
     if (selectedServerId) {
       localStorage.setItem('rcc_server', selectedServerId);
       return;
     }
     localStorage.removeItem('rcc_server');
-  }, [selectedServerId]);
+  }, [selectedServerId, sharedHashRestorePending]);
 
   const resolvedSelectedServerName = useMemo(
     () => selectedShareTarget
@@ -566,6 +1561,7 @@ export function App() {
   );
 
   useEffect(() => {
+    if (sharedHashRestorePending) return;
     if (!selectedServerId || servers.length === 0) return;
     if (resolvedSelectedServerName === selectedServerName) return;
     setSelectedServerName(resolvedSelectedServerName);
@@ -574,10 +1570,11 @@ export function App() {
       return;
     }
     localStorage.removeItem('rcc_server_name');
-  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length]);
+  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length, sharedHashRestorePending]);
 
   useEffect(() => {
     if (!serversSynced) return;
+    if (sharedHashRestorePending) return;
     if (selectedShareTarget) return;
     if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
     setSelectedServerId(null);
@@ -587,7 +1584,8 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
-  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget]);
+    clearSharedTabRestoreMarker();
+  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedHashRestorePending]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -601,6 +1599,24 @@ export function App() {
         navigateToSessionRef.current(command.sessionName);
         return;
       }
+      if (command.action === 'requestSnapshot') {
+        const pushCurrentSnapshot = () => {
+          void syncSnapshotToWatch(watchProjectionStore.getSnapshot());
+        };
+        const currentAuth = authRef.current;
+        if (!watchProjectionStore.getSnapshot().apiKey && currentAuth && isNative()) {
+          void resolveWatchApiKey(currentAuth).then((watchKey) => {
+            const latestAuth = authRef.current;
+            if (latestAuth && latestAuth.userId === currentAuth.userId && latestAuth.baseUrl === currentAuth.baseUrl) {
+              watchProjectionStore.setApiKey(getApiKey() ?? watchKey);
+            }
+            pushCurrentSnapshot();
+          });
+        } else {
+          pushCurrentSnapshot();
+        }
+        return;
+      }
       wsRef.current?.requestSessionList();
     }).then((dispose) => {
       cleanup = dispose;
@@ -610,33 +1626,128 @@ export function App() {
     };
   }, []);
 
+  const [pendingSharedPayloads, setPendingSharedPayloads] = useState<SharedPayload[]>([]);
+  const [pendingSharedUploads, setPendingSharedUploads] = useState<PendingSharedSessionUpload[]>([]);
+  const pendingSharedPayload = pendingSharedPayloads[0] ?? null;
+  const pendingSharedUpload = pendingSharedUploads[0] ?? null;
+
+  useEffect(() => {
+    return subscribeShareReceiver((payload) => {
+      setPendingSharedPayloads((prev) => (
+        prev.some((item) => item.id === payload.id) ? prev : [...prev, payload]
+      ));
+    });
+  }, []);
+
+  const [nativePlatformSnapshot, setNativePlatformSnapshot] = useState(() => ({
+    mobile: isMobileDevice(),
+    macDesktop: isNativeMacDesktop(),
+    macTextScale: shouldUseIosMacTextScale(),
+  }));
+
+  useEffect(() => {
+    const syncNativePlatform = () => {
+      applyNativePlatformClasses();
+      const next = {
+        mobile: isMobileDevice(),
+        macDesktop: isNativeMacDesktop(),
+        macTextScale: shouldUseIosMacTextScale(),
+      };
+      setNativePlatformSnapshot((prev) => (
+        prev.mobile === next.mobile
+          && prev.macDesktop === next.macDesktop
+          && prev.macTextScale === next.macTextScale
+          ? prev
+          : next
+      ));
+    };
+    syncNativePlatform();
+    return subscribeDeviceLayoutChange(syncNativePlatform, { includeResize: false });
+  }, []);
+
+  const isNativeMac = nativePlatformSnapshot.macDesktop;
+  useMacInputInset(isNativeMac);
+
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {
-    if (shouldUseIosMacTextScale()) {
+    if (isNativeMac || shouldUseIosMacTextScale()) {
       document.documentElement.style.removeProperty('--vvh');
-      document.documentElement.classList.remove('kb-open', 'input-focused');
+      document.documentElement.style.removeProperty('--kbh');
+      document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
       return;
     }
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
+    let subCardInputFocused = false;
     let hadKeyboardOpen = false;
+    let lastViewportWidth = window.innerWidth;
+    let baselineHeight = Math.max(
+      window.innerHeight,
+      boundedVisualViewportHeight(
+        vv.height,
+        window.innerHeight,
+        document.documentElement.clientHeight,
+        getActiveCssZoom(),
+      ) ?? window.innerHeight,
+    );
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
-      document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
-      // Detect keyboard open: viewport shrink + optional input-focus fallback.
-      // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
-      const shrink = window.innerHeight - vv.height;
-      const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
+      const currentWidth = window.innerWidth;
+      const shouldReset = shouldResetMobileKeyboardOnWidthTransition(lastViewportWidth, currentWidth, document.activeElement);
+      lastViewportWidth = currentWidth;
+      if (shouldReset) {
+        inputFocused = false;
+        subCardInputFocused = false;
+        hadKeyboardOpen = false;
+        baselineHeight = 0;
+      }
+      const cssZoom = getActiveCssZoom();
+      const viewportHeight = boundedVisualViewportHeight(
+        vv.height,
+        window.innerHeight,
+        document.documentElement.clientHeight,
+        cssZoom,
+      );
+      if (viewportHeight === null) return;
+      const viewportCssValue = `${Math.round(viewportHeight / cssZoom)}px`;
+      if (document.documentElement.style.getPropertyValue('--vvh') !== viewportCssValue) {
+        document.documentElement.style.setProperty('--vvh', viewportCssValue);
+      }
+      // Detect keyboard open against pre-focus baseline so Android adjustResize
+      // shrinking window.innerHeight to match vv.height keeps kbOpen accurate.
+      const measured = measureMobileKeyboardShrink({
+        inputFocused,
+        layoutHeight: window.innerHeight,
+        visualHeight: viewportHeight,
+        baselineHeight,
+        hadKeyboardOpen,
+      });
+      baselineHeight = measured.baselineHeight;
+      // Expose the soft-keyboard height so position:fixed overlays anchored to the
+      // LAYOUT viewport (e.g. the QuickInputPanel alias editor, `.qp`) can lift
+      // their bottom ABOVE the keyboard. Keep --kbh strictly from layout-vs-visual
+      // shrink so Android adjustResize does not double-lift fixed panels.
+      document.documentElement.style.setProperty(
+        '--kbh', `${Math.round(Math.max(0, measured.layoutVsVisualShrink - (vv.offsetTop || 0)) / cssZoom)}px`,
+      );
+      const state = getMobileKeyboardState(inputFocused, measured.shrink, hadKeyboardOpen);
       hadKeyboardOpen = state.hadKeyboardOpen;
       const { kbOpen, hideInputUi } = state;
       document.documentElement.classList.toggle('kb-open', kbOpen);
       document.documentElement.classList.toggle('input-focused', hideInputUi);
-      // Reset any scroll/offset caused by keyboard opening on mobile.
-      // Always reset — iOS can have vv.offsetTop > 0 even when scrollY is 0.
-      window.scrollTo(0, 0);
-      document.body.scrollTop = 0;
-      document.documentElement.scrollTop = 0;
+      document.documentElement.classList.toggle('subcard-input-focused', hideInputUi && subCardInputFocused);
+      // Reset any scroll/offset caused by keyboard opening on mobile — but ONLY
+      // when there is actually an offset to correct. Running scrollTo(0,0) on
+      // EVERY visualViewport resize (which includes IME candidate-bar toggles
+      // while composing) displaces the caret mid-typing. iOS can push
+      // vv.offsetTop > 0 even when scrollY is 0, so check both.
+      if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0
+        || document.body.scrollTop !== 0 || (vv.offsetTop || 0) > 0) {
+        window.scrollTo(0, 0);
+        document.body.scrollTop = 0;
+        document.documentElement.scrollTop = 0;
+      }
       // Auto-scroll sidebar panel into view when viewport settles (keyboard done animating).
       // Debounced 100ms — resize fires multiple times during animation, we want the final one.
       if (kbOpen && inputFocused) {
@@ -650,32 +1761,39 @@ export function App() {
         }, 100);
       }
     };
+    const settledViewportUpdater = createSettledViewportUpdater(update);
+    const scheduleUpdate = settledViewportUpdater.schedule;
     const onFocusIn = (e: FocusEvent) => {
       const el = e.target as HTMLElement | null;
       if (!el) return;
-      const tag = el.tagName;
-      inputFocused = tag === 'INPUT' || tag === 'TEXTAREA'
-        || el.getAttribute('contenteditable') === 'true'
-        || el.classList.contains('xterm-helper-textarea');
+      inputFocused = isMobileKeyboardInputTarget(el);
+      subCardInputFocused = isSubSessionBarInputTarget(el);
       // Toggle .input-focused instantly on focus (no viewport delay needed)
       document.documentElement.classList.toggle('input-focused', inputFocused);
+      document.documentElement.classList.toggle('subcard-input-focused', inputFocused && subCardInputFocused);
       // Aggressively reset scroll — iOS visual viewport push
       if (inputFocused) {
         window.scrollTo(0, 0);
         document.body.scrollTop = 0;
         document.documentElement.scrollTop = 0;
       }
-      update();
+      scheduleUpdate();
     };
     const onFocusOut = () => {
       inputFocused = false;
+      subCardInputFocused = false;
       hadKeyboardOpen = false;
-      document.documentElement.classList.remove('input-focused');
+      document.documentElement.classList.remove('input-focused', 'subcard-input-focused');
       clearTimeout(scrollTimer);
-      update();
+      scheduleUpdate();
     };
-    update();
-    vv.addEventListener('resize', update);
+    scheduleUpdate();
+    vv.addEventListener('resize', scheduleUpdate);
+    vv.addEventListener('scroll', scheduleUpdate);
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('orientationchange', scheduleUpdate);
+    window.addEventListener('pageshow', scheduleUpdate);
+    window.addEventListener(UI_SCALE_EVENT, scheduleUpdate);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     // App-resume recovery: when the app returns from background (push-notification
@@ -689,32 +1807,44 @@ export function App() {
     const onResume = () => {
       if (document.visibilityState !== 'visible') return;
       const active = document.activeElement as HTMLElement | null;
-      const activeIsInput = !!active && (
-        active.tagName === 'INPUT'
-        || active.tagName === 'TEXTAREA'
-        || active.getAttribute('contenteditable') === 'true'
-        || active.classList.contains('xterm-helper-textarea')
-      );
+      const activeIsInput = isMobileKeyboardInputTarget(active);
       // If the OS dismissed focus during background, blur the stale element so
       // update() reflects reality. If focus genuinely survived, keep it.
       if (!activeIsInput) {
         inputFocused = false;
+        subCardInputFocused = false;
         hadKeyboardOpen = false;
+      } else {
+        inputFocused = true;
+        subCardInputFocused = isSubSessionBarInputTarget(active);
       }
-      update();
+      scheduleUpdate();
     };
     document.addEventListener('visibilitychange', onResume);
+    const uninstallTapDismiss = installMobileKeyboardTapDismiss(document);
     return () => {
-      vv.removeEventListener('resize', update);
+      settledViewportUpdater.cancel();
+      clearTimeout(scrollTimer);
+      vv.removeEventListener('resize', scheduleUpdate);
+      vv.removeEventListener('scroll', scheduleUpdate);
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('orientationchange', scheduleUpdate);
+      window.removeEventListener('pageshow', scheduleUpdate);
+      window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('visibilitychange', onResume);
+      uninstallTapDismiss();
     };
-  }, []);
+  }, [isNativeMac]);
 
   // Native: initialize server URL and API key from Preferences storage
   useEffect(() => {
     if (!isNative()) return;
+    const authGeneration = authMutationGenerationRef.current;
+    const isCurrentAuthGeneration = () => (
+      authGeneration === authMutationGenerationRef.current
+    );
     // Set status bar to match app background
     import('@capacitor/status-bar').then(({ StatusBar, Style }) => {
       StatusBar.setStyle({ style: Style.Dark });
@@ -727,21 +1857,31 @@ export function App() {
     (async () => {
       try {
         const url = await getServerUrl();
+        nativeServerUrlRef.current = url;
         setNativeServerUrl(url);
         if (url) configureApi(url);
 
-        const storedKey = url ? await getAuthKey() : null;
-        if (storedKey) {
+        await initializeServerScopedAuth(url);
+        const storedKey = url ? await getAuthKey(url) : null;
+        if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);
           try {
-            const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+            const user = await apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me');
+            if (!isCurrentAuthGeneration()) return;
             const authState: AuthState = { userId: user.id, baseUrl: url! };
+            authMutationGenerationRef.current += 1;
+            configureExpectedUserId(user.id);
+            setFileRelayUser(user.id);
+            setServerR2RelayEnabled(user.r2RelayEnabled === true);
             localStorage.setItem('rcc_auth', JSON.stringify(authState));
             setAuth(authState);
           } catch (err) {
             console.warn('[native] /me failed:', err);
+            if (err instanceof ApiError && err.status === 401) {
+              await clearStoredAuthForServer(url);
+            }
+            if (!isCurrentAuthGeneration()) return;
             clearApiKey();
-            await clearAuthKey();
           }
         }
       } catch (e) {
@@ -762,8 +1902,7 @@ export function App() {
     if (!splash) { setSplashDone(true); return; }
     if (!nativeReady && !nativeCallback) return;
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
-    const fastServerSwitch = takeFastServerSwitchSplashFlag();
-    const minMs = fastServerSwitch ? 0 : 1100;
+    const minMs = 1100;
     const exitMs = 120;
     let exitTimer: ReturnType<typeof setTimeout> | undefined;
     const startExit = () => {
@@ -780,7 +1919,7 @@ export function App() {
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
-    getAuthKey().then((key) => {
+    getAuthKey(auth.baseUrl).then((key) => {
       if (key) initPushNotifications(key, auth.baseUrl).catch(console.warn);
     });
   }, [auth]);
@@ -800,48 +1939,189 @@ export function App() {
     };
   }, [auth]);
 
+  // Sync server-side TTS config (non-blocking) when authenticated session initializes
+  useEffect(() => {
+    if (!auth) return;
+    if (typeof syncTtsConfigFromServer === 'function') {
+      void syncTtsConfigFromServer();
+    }
+  }, [auth]);
+
+  // Keep per-server push preferences synchronized with Settings -> Notifications and remote devices.
+  useEffect(() => {
+    if (!auth) return;
+    const unsubscribe = typeof subscribePushEnabledServers === 'function'
+      ? subscribePushEnabledServers((next) => {
+        pushEnabledServersRef.current = next;
+        setPushEnabledServers(next);
+      })
+      : () => {};
+    if (typeof getLocalPushEnabledServers === 'function') {
+      const localServers = getLocalPushEnabledServers();
+      pushEnabledServersRef.current = localServers;
+      setPushEnabledServers(localServers);
+    }
+    if (typeof fetchPushNotificationSettings === 'function') {
+      void fetchPushNotificationSettings().then((snapshot) => {
+        if (snapshot && snapshot.enabledServerIds !== undefined && (typeof hasUnsyncedPushEnabledServerEdits !== 'function' || !hasUnsyncedPushEnabledServerEdits())) {
+          pushEnabledServersRef.current = snapshot.enabledServerIds;
+          setPushEnabledServers(snapshot.enabledServerIds);
+        }
+      });
+    }
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && typeof fetchPushNotificationSettings === 'function') {
+        void fetchPushNotificationSettings();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [auth]);
+
+  // PC App auto-registration as a shared remote ASR provider + client provider freshness sync.
+  useEffect(() => {
+    if (!auth) {
+      remoteVoiceProvider.stop();
+      resetRemoteVoiceClientForTesting();
+      return;
+    }
+    void remoteVoiceProvider.start();
+    const stopRefresh = installRemoteVoiceAutoRefresh();
+    return () => {
+      stopRefresh();
+      remoteVoiceProvider.stop();
+    };
+  }, [auth?.userId]);
+
+  // Desktop / pc-app: keep GlobalTaskHub notification stream active when OS notifications
+  // are permitted & enabled, and dispatch native Notification banners across all servers.
+  useEffect(() => {
+    if (!auth || isNative()) return;
+    let releaseStream: (() => void) | null = null;
+    const syncStream = () => {
+      const shouldListen = canReceiveDesktopNotifications();
+      if (shouldListen && !releaseStream) {
+        releaseStream = globalTaskModeStore.acquire();
+      } else if (!shouldListen && releaseStream) {
+        const rel = releaseStream;
+        releaseStream = null;
+        rel();
+      }
+    };
+    syncStream();
+    window.addEventListener(DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT, syncStream);
+    const unsubscribeNotifications = globalTaskModeStore.subscribeNotifications((event) => {
+      const hubServers = globalTaskModeStore.getState().servers.map((s) => s.id);
+      const accessible = new Set<string>([...hubServers, ...serversRef.current.map((s) => s.id)]);
+      showDesktopNotification(event, {
+        activeServerId: selectedServerIdRef.current,
+        activeSession: activeSessionRef.current,
+        accessibleServerIds: [...accessible],
+      });
+    });
+    return () => {
+      window.removeEventListener(DESKTOP_NOTIFICATION_PREFS_CHANGED_EVENT, syncStream);
+      unsubscribeNotifications();
+      if (releaseStream) {
+        releaseStream();
+        releaseStream = null;
+      }
+    };
+  }, [auth]);
+
   // When session expires mid-session (refresh failed), clear auth and show login.
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
     onAuthExpired((reason?: string) => {
-      void clearAuthState(reason ?? 'expired');
+      void clearAuthState(reason ?? 'expired', { credentialServerUrl: auth?.baseUrl });
     });
-  }, [clearAuthState]);
+  }, [auth?.baseUrl, clearAuthState]);
 
 
   // Verify session via /api/auth/user/me on mount (cookie-based auth)
   // Also handles post-OAuth redirect: cookie was set by server, we just need to confirm.
   useEffect(() => {
     if (isNative()) return; // native uses biometric auth flow above
+    const authGeneration = authMutationGenerationRef.current;
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
-    apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
+    void apiFetch<{ id: string; scope?: 'doc_collaborator' | null; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      if (user.scope === 'doc_collaborator') {
+        setIsDocCollaborator(true);
+      } else {
+        setIsDocCollaborator(false);
+      }
+      try { sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY); } catch { /* ignore */ }
+      if (authGeneration !== authMutationGenerationRef.current) return;
+      if (auth && auth.userId !== user.id) {
+        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED, { credentialServerUrl: auth.baseUrl });
+        return;
+      }
       const authState: AuthState = { userId: user.id, baseUrl };
+      authMutationGenerationRef.current += 1;
+      configureExpectedUserId(user.id);
+      setFileRelayUser(user.id);
+      setServerR2RelayEnabled(user.r2RelayEnabled === true);
       localStorage.setItem('rcc_auth', JSON.stringify(authState));
       setAuth((prev) => {
         if (prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl) return prev;
         return authState;
       });
-    }).catch((err) => {
+    }).catch(async (err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
       if (err instanceof ApiError && err.status === 401) {
-        void clearAuthState('mount_verify_401');
+        // Only a login that just completed sets this flag, right before its
+        // own reload -- an ordinary logged-out visitor never does. Consuming
+        // it here (rather than leaving it for LoginPage to read at mount)
+        // means the message only ever appears once we know verification
+        // truly failed, not the instant LoginPage renders. Checked in both
+        // branches below: a stale local `auth` record from a previous login
+        // must not swallow the flag and delay the message to a later reload.
+        try {
+          if (sessionStorage.getItem(LOGIN_SESSION_NOT_STUCK_KEY) === '1') {
+            sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY);
+            setSessionNotStuck(true);
+          }
+        } catch { /* ignore storage restrictions */ }
+        // A logged-out cold start has no auth state to clear. Running the full
+        // clear path anyway used to erase an explicit shared hash before the
+        // user could sign in and continue to that tab.
+        if (auth) {
+          await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
+        }
       }
+    }).finally(() => {
+      setInitialAuthVerificationPending(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const prevOnlyOfficeAuthScopeRef = useRef<string | null>(null);
   // Configure API client when auth changes; start/stop proactive refresh timer
   useEffect(() => {
+    configureExpectedUserId(auth?.userId ?? null);
+    let cancelPrewarm = () => {};
+    const nextAuthScope = auth ? `${auth.baseUrl ?? ''}\n${auth.userId ?? ''}` : null;
+    if (prevOnlyOfficeAuthScopeRef.current !== null && prevOnlyOfficeAuthScopeRef.current !== nextAuthScope) {
+      resetOnlyOfficePrewarm();
+    }
+    prevOnlyOfficeAuthScopeRef.current = nextAuthScope;
     if (auth) {
       configureApi(auth.baseUrl);
       startProactiveRefresh();
+      cancelPrewarm = scheduleOnlyOfficePrewarm();
     } else {
       stopProactiveRefresh();
     }
-    return () => stopProactiveRefresh();
+    return () => {
+      cancelPrewarm();
+      stopProactiveRefresh();
+    };
   }, [auth]);
 
   // Refresh session whenever the tab becomes visible again (mobile browsers pause
@@ -877,13 +2157,21 @@ export function App() {
 
   useEffect(() => {
     if (!auth) return;
+    let lastVerifyAt = 0;
+    let verifyInFlight = false;
     const verifyAuthStillValid = async (reason: string) => {
+      const now = Date.now();
+      if (verifyInFlight || now - lastVerifyAt < WEB_AUTH_VERIFY_MIN_INTERVAL_MS) return;
+      verifyInFlight = true;
+      lastVerifyAt = now;
       try {
         await fetchMe();
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
-          await clearAuthState(reason);
+          await clearAuthState(reason, { credentialServerUrl: auth.baseUrl });
         }
+      } finally {
+        verifyInFlight = false;
       }
     };
     const onVisible = () => {
@@ -909,59 +2197,157 @@ export function App() {
   }, [selectedServerId]);
 
   const handleUpgradeDaemon = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeConfirmTarget(server);
+  }, []);
+
+  const performDaemonUpgrade = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'requesting' } }));
     try {
-      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-      alert(trans('server.upgrade_sent', { name: server.name }));
+      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'sent' } }));
     } catch {
-      alert(trans('server.upgrade_failed'));
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'failed', message: trans('server.upgrade_failed') } }));
     }
   }, [trans]);
 
   const handleUpgradeAll = useCallback(async () => {
-    const results: string[] = [];
-    for (const server of servers) {
-      try {
-        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-        results.push(`✓ ${server.name}`);
-      } catch {
-        results.push(`✗ ${server.name}`);
-      }
+    setDaemonUpgradeConfirmTarget('all');
+  }, []);
+
+  const confirmDaemonUpgrade = useCallback(async () => {
+    const target = daemonUpgradeConfirmTarget;
+    setDaemonUpgradeConfirmTarget(null);
+    if (!target) return;
+    if (target === 'all') {
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        servers.forEach((server) => { next[server.id] = { phase: 'requesting' }; });
+        return next;
+      });
+      const results = await Promise.allSettled(servers.map(async (server) => {
+        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
+        return server.id;
+      }));
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        results.forEach((result, index) => {
+          const id = servers[index]?.id;
+          if (!id) return;
+          next[id] = result.status === 'rejected'
+            ? { phase: 'failed', message: trans('server.upgrade_failed') }
+            : { phase: 'sent' };
+        });
+        return next;
+      });
+      return;
     }
-    alert(results.join('\n'));
-  }, [servers]);
+    await performDaemonUpgrade(target);
+  }, [daemonUpgradeConfirmTarget, performDaemonUpgrade, servers, trans]);
 
   const handleDeleteServer = useCallback(async (server: ServerInfo) => {
     try {
       await apiFetch(`/api/server/${server.id}`, { method: 'DELETE' });
       setServers((prev) => prev.filter((s) => s.id !== server.id));
+      ownedServerIdsRef.current.delete(server.id);
+      knownOwnedServerIdsRef.current?.delete(server.id);
+      setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== server.id));
       if (server.id === selectedServerId) {
+        autoEntryRunRef.current++;
+        setManualDashboard(true);
+        selectedServerIdRef.current = null;
         setSelectedServerId(null);
         setSelectedServerName(null);
         localStorage.removeItem('rcc_server');
         localStorage.removeItem('rcc_server_name');
+        localStorage.removeItem('rcc_session');
       }
-    } catch { /* ignore */ }
-    setDeleteTarget(null);
-  }, [selectedServerId]);
+      setDeleteTarget(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      try { window.alert(trans('server.delete_error', { error: message })); } catch { /* ignore */ }
+    }
+  }, [selectedServerId, trans]);
+
+  const applyServerInventory = useCallback((incoming: ServerInfo[]) => {
+    // Authoritative ownership, kept apart from `servers` on purpose.
+    // `handleOpenSharedEntry` merges the shared server into `servers` so the
+    // rest of the UI can render it, which makes that array a MIXED inventory:
+    // membership there proves the app has seen a server, never that this
+    // account owns it. Ownership decides whether a route may skip the
+    // /api/shares/open coverage check, so it must come from /api/server and
+    // nowhere else.
+    const nextOwnedIds = new Set(incoming.map((server) => server.id));
+    ownedServerIdsRef.current = nextOwnedIds;
+
+    if (knownOwnedServerIdsRef.current === null) {
+      // Establish initial baseline once per session/auth context — never prompt on boot or refresh.
+      knownOwnedServerIdsRef.current = new Set(nextOwnedIds);
+    } else {
+      const prevOwnedIds = knownOwnedServerIdsRef.current;
+      const newlyBound = incoming.filter((server) => !prevOwnedIds.has(server.id));
+      if (newlyBound.length > 0) {
+        const priorAccessibleIds = [...new Set([...prevOwnedIds, ...controlledMachineServerIdsRef.current])];
+        const handledIds = readHandledNewDevicePushIds(authRef.current);
+        const currentExplicit = pushEnabledServersRef.current;
+        const toQueue: PendingNewDevicePushPrompt[] = [];
+        for (const server of newlyBound) {
+          if (queuedNewDeviceIdsRef.current.has(server.id) || handledIds.has(server.id)) {
+            continue;
+          }
+          if (Array.isArray(currentExplicit) && currentExplicit.includes(server.id)) {
+            markHandledNewDevicePushId(authRef.current, server.id);
+            queuedNewDeviceIdsRef.current.add(server.id);
+            continue;
+          }
+          queuedNewDeviceIdsRef.current.add(server.id);
+          toQueue.push({
+            id: server.id,
+            name: server.name,
+            priorAccessibleServerIds: priorAccessibleIds,
+          });
+        }
+        if (toQueue.length > 0) {
+          setNewDevicePushPrompts((prev) => [...prev, ...toQueue]);
+        }
+      }
+      knownOwnedServerIdsRef.current = new Set(nextOwnedIds);
+    }
+
+    setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
+  }, []);
 
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
     if (!auth) return;
     try {
-      const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
-      setServers(data.servers);
+      const [data, machinesData] = await Promise.all([
+        apiFetch<{ servers: ServerInfo[] }>('/api/server'),
+        apiFetch<{ machines?: Array<{ serverId?: unknown }> }>('/api/machines').catch(() => null),
+      ]);
+      if (Array.isArray(machinesData?.machines)) {
+        const machineIds = sanitizePushEnabledServerIds(
+          machinesData.machines.map((m) => (typeof m.serverId === 'string' ? m.serverId : '')),
+        );
+        controlledMachineServerIdsRef.current = machineIds;
+        setControlledMachineServerIds(machineIds);
+      }
+      applyServerInventory(data.servers);
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
       // considered resolved so the UI can escape the initial connecting gate.
     } finally {
       setServersLoaded(true);
+      setPresenceTick((t) => (t + 1) % 1_000_000);
     }
-  }, [auth]);
+  }, [auth, applyServerInventory]);
 
   useEffect(() => {
     setServersLoaded(false);
     setServersSynced(false);
+    knownOwnedServerIdsRef.current = null;
+    queuedNewDeviceIdsRef.current.clear();
+    setNewDevicePushPrompts([]);
     void loadServers();
   }, [loadServers]);
 
@@ -971,48 +2357,150 @@ export function App() {
     if (!selectedServer || isServerOnline(selectedServer)) return;
     void fetchMe().catch(async (err) => {
       if (err instanceof ApiError && err.status === 401) {
-        await clearAuthState('server_offline_verify_401');
+        await clearAuthState('server_offline_verify_401', { credentialServerUrl: auth.baseUrl });
       }
     });
   }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
 
   // Periodically refresh server list so lastHeartbeatAt stays current
-  useEffect(() => {
-    if (!auth) return;
-    const id = setInterval(() => { loadServers(); }, 30_000);
-    return () => clearInterval(id);
-  }, [auth, loadServers]);
+  const lastSharedAuthUserIdRef = useRef<string | null>(null);
 
-  const refreshSharedEntries = useCallback(async () => {
-    if (!auth) {
+  const refreshSharedEntries = useCallback(async (options?: { silent?: boolean }) => {
+    // Abort any prior in-flight discovery
+    sharedDiscoveryAbortRef.current?.abort();
+    const abortController = new AbortController();
+    sharedDiscoveryAbortRef.current = abortController;
+
+    const currentDiscoveryGen = ++sharedDiscoveryGenerationRef.current;
+    const currentAuthGen = authMutationGenerationRef.current;
+    const currentUserId = authRef.current?.userId ?? null;
+    const currentBaseUrl = authRef.current?.baseUrl ?? null;
+
+    if (!authRef.current || !currentUserId) {
+      lastSharedAuthUserIdRef.current = null;
       setSharedEntries([]);
       setSharedEntriesError(null);
+      setSharedEntriesLoaded(false);
+      setSharedEntriesLoading(false);
       return;
     }
-    setSharedEntriesLoading(true);
-    setSharedEntriesError(null);
-    try {
-      setSharedEntries(await discoverSharedEntries());
-    } catch (err) {
+    // Account switch boundary: if switching users, immediately clear prior user's shared entries
+    if (lastSharedAuthUserIdRef.current !== currentUserId) {
+      lastSharedAuthUserIdRef.current = currentUserId;
       setSharedEntries([]);
-      setSharedEntriesError(formatSharedAccessError(err));
+    }
+    if (!options?.silent) {
+      setSharedEntriesLoading(true);
+      setSharedEntriesLoaded(false);
+      setSharedEntriesError(null);
+    }
+
+    const timeoutTimer = setTimeout(() => {
+      abortController.abort(new Error('Shared discovery timed out after 15s'));
+    }, 15_000);
+
+    const isCurrentValidRequest = () => (
+      !abortController.signal.aborted &&
+      sharedDiscoveryGenerationRef.current === currentDiscoveryGen &&
+      authMutationGenerationRef.current === currentAuthGen &&
+      authRef.current?.userId === currentUserId &&
+      authRef.current?.baseUrl === currentBaseUrl
+    );
+
+    const isCurrentGeneration = () => (
+      sharedDiscoveryGenerationRef.current === currentDiscoveryGen &&
+      authMutationGenerationRef.current === currentAuthGen &&
+      authRef.current?.userId === currentUserId &&
+      authRef.current?.baseUrl === currentBaseUrl
+    );
+
+    try {
+      const entries = await discoverSharedEntries({ signal: abortController.signal });
+
+      if (!isCurrentValidRequest()) return;
+
+      const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
+      sharedNavigationServerIdsRef.current = activeIds;
+      setSharedEntries(entries);
+
+      // Build mapping of freshest known heartbeat per serverId from active grants
+      const grantMap = new Map<string, SharedEntrySummary>();
+      for (const entry of entries) {
+        if (entry.status === 'active' && typeof entry.lastHeartbeatAt === 'number') {
+          const cur = grantMap.get(entry.serverId);
+          if (!cur || (typeof cur.lastHeartbeatAt === 'number' && entry.lastHeartbeatAt > cur.lastHeartbeatAt)) {
+            grantMap.set(entry.serverId, entry);
+          }
+        }
+      }
+
+      // Update visited shared server heartbeat snapshots so leaving them >60s does not falsely grey them out
+      setServers((previous) => previous.map((server) => {
+        if (ownedServerIdsRef.current.has(server.id)) return server;
+        const grant = grantMap.get(server.id);
+        if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
+        const grantObservedAt = grant.statusObservedAt ?? grant.lastHeartbeatAt;
+        const serverObservedAt = (server as any).statusObservedAt ?? server.lastHeartbeatAt ?? 0;
+        // If the server was explicitly marked offline, an old or same-heartbeat grant must not overwrite it
+        if (server.status === 'offline' && grantObservedAt <= serverObservedAt && grant.lastHeartbeatAt <= (server.lastHeartbeatAt ?? 0)) {
+          return server;
+        }
+        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt || (grant.lastHeartbeatAt === server.lastHeartbeatAt && server.status !== 'offline')) {
+          return {
+            ...server,
+            status: grant.serverStatus ?? server.status,
+            lastHeartbeatAt: grant.lastHeartbeatAt,
+            statusObservedAt: grantObservedAt,
+          };
+        }
+        return server;
+      }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
+    } catch (err) {
+      if (!isCurrentGeneration()) return;
+      // On network failure during refresh: preserve existing entries; do not clear to []
+      if (!options?.silent) {
+        setSharedEntriesError(formatSharedAccessError(err, transRef.current));
+      }
     } finally {
-      setSharedEntriesLoading(false);
+      clearTimeout(timeoutTimer);
+      if (sharedDiscoveryAbortRef.current === abortController) {
+        sharedDiscoveryAbortRef.current = null;
+      }
+      if (isCurrentGeneration()) {
+        setSharedEntriesLoading(false);
+        setSharedEntriesLoaded(true);
+        setPresenceTick((t) => (t + 1) % 1_000_000);
+      }
     }
   }, [auth]);
+
+  useEffect(() => {
+    if (!auth) return;
+    const id = setInterval(() => {
+      void loadServers();
+      void refreshSharedEntries({ silent: true });
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [auth, loadServers, refreshSharedEntries]);
 
   useEffect(() => {
     void refreshSharedEntries();
   }, [refreshSharedEntries]);
 
+  const managedSharesGenerationRef = useRef(0);
   const refreshManagedShares = useCallback(async () => {
-    if (!auth || !selectedServerId || selectedShareTarget) {
+    const generation = ++managedSharesGenerationRef.current;
+    const targetServerId = selectedServerId;
+    if (!auth || !targetServerId || selectedShareTarget) {
       setManagedShares([]);
       return;
     }
     try {
-      setManagedShares(await listManagedSharesForServer(selectedServerId));
+      const shares = await listManagedSharesForServer(targetServerId);
+      if (generation !== managedSharesGenerationRef.current || selectedServerIdRef.current !== targetServerId) return;
+      setManagedShares(shares);
     } catch {
+      if (generation !== managedSharesGenerationRef.current || selectedServerIdRef.current !== targetServerId) return;
       setManagedShares([]);
     }
   }, [auth, selectedServerId, selectedShareTarget]);
@@ -1023,15 +2511,18 @@ export function App() {
 
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
-    if (!auth || !selectedServerId || selectedShareTarget) return;
+    if (!auth || !selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    const targetServerId = selectedServerId;
+    let cancelled = false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
     apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
-      `/api/server/${selectedServerId}/sessions`,
+      `/api/server/${targetServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
       clearTimeout(timer);
-      const mapped = data.sessions.map((s) => ({
+      if (cancelled || ctrl.signal.aborted || selectedServerIdRef.current !== targetServerId) return;
+      const mapped: SessionInfo[] = data.sessions.map((s) => ({
         name: s.name,
         project: s.project_name,
         role: s.role as SessionInfo['role'],
@@ -1055,25 +2546,44 @@ export function App() {
         quotaUsageLabel: undefined,
         quotaMeta: undefined,
       }));
-      setSessions((prev) => mapped.map((s) => {
-        const existing = prev.find((p) => p.name === s.name);
-        return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
-      }));
-      const navigableMapped = mapped.filter(isNavigableMainSession);
+      const preservedIncognito = incognitoMainSessionsByServerRef.current.get(targetServerId) ?? [];
+      setSessions((prev) => {
+        const mergedLoaded = mapped.map((s) => {
+          const existing = prev.find((p) => p.name === s.name);
+          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+        });
+        const loadedNames = new Set(mergedLoaded.map((s) => s.name));
+        const incogByName = new Map<string, SessionInfo>();
+        for (const s of preservedIncognito) {
+          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+        }
+        for (const s of prev) {
+          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+        }
+        return incogByName.size > 0 ? [...mergedLoaded, ...incogByName.values()] : mergedLoaded;
+      });
+      const loadedNamesSet = new Set(mapped.map((s) => s.name));
+      const allForNav = [
+        ...mapped,
+        ...preservedIncognito.filter((s) => !loadedNamesSet.has(s.name)),
+      ];
+      const navigableMapped = allForNav.filter(isNavigableMainSession);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
-      if (mapped.length > 0) {
+      if (allForNav.length > 0) {
         setSessionsLoaded(true);
       }
-      // Auto-select first session if none was previously saved
-      if (navigableMapped.length > 0 && !localStorage.getItem('rcc_session')) {
-        setActiveSession(navigableMapped[0].name);
-      }
+      // Restore the last tab for this server, never the global session value
+      // left by another server. A stale/missing snapshot safely falls back
+      // to the first navigable tab -- without being recorded as the user's
+      // choice, so the memory of what they really had open is kept.
+      restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
-    return () => { clearTimeout(timer); ctrl.abort(); };
-  }, [auth, selectedServerId, selectedShareTarget]);
+    return () => { cancelled = true; clearTimeout(timer); ctrl.abort(); };
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sharedActiveDispatchIds, setSharedActiveDispatchIds] = useState<Map<string, string>>(() => new Map());
   const navigableMainSessions = useMemo(
     () => sessions.filter(isNavigableMainSession),
     [sessions],
@@ -1093,11 +2603,16 @@ export function App() {
     if (!selectedServerId) return states;
     for (const session of navigableMainSessions) {
       const directState = managedSharedStateByTarget.get(`main:${selectedServerId}:${session.name}`);
-      const state = directState ?? selectedServerSharedOutState;
-      if (state) states.set(session.name, state);
+      const state = directState ?? selectedServerSharedOutState ?? session.sharedState;
+      if (state) {
+        states.set(session.name, {
+          ...state,
+          activeDispatchId: sharedActiveDispatchIds.get(session.name) ?? null,
+        });
+      }
     }
     return states;
-  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState]);
+  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds]);
   const visibleMainSessions = useMemo(
     () => navigableMainSessions.map((session) => {
       const sharedState = managedSharedSessionStateByName.get(session.name) ?? session.sharedState;
@@ -1105,21 +2620,40 @@ export function App() {
     }),
     [managedSharedSessionStateByName, navigableMainSessions],
   );
-  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [sessionsLoaded, setSessionsLoadedRaw] = useState(false);
+  const sessionsLoadedRef = useRef(false);
+  const setSessionsLoaded = useCallback((next: boolean | ((prev: boolean) => boolean)) => {
+    if (typeof next === 'function') {
+      setSessionsLoadedRaw((prev) => {
+        const resolved = next(prev);
+        sessionsLoadedRef.current = resolved;
+        return resolved;
+      });
+      return;
+    }
+    sessionsLoadedRef.current = next;
+    setSessionsLoadedRaw(next);
+  }, []);
   const [activeSession, setActiveSessionState] = useState<string | null>(
-    () => resolveInitialSessionName(),
+    () => initialHashStateRef.current.sessionName,
   );
 
   // Sync URL hash with current server + session so each tab has its own URL
   useEffect(() => {
-    writeHashState(selectedServerId, activeSession);
-  }, [selectedServerId, activeSession]);
+    writeHashState(selectedServerId, activeSession, selectedSharedEntryId);
+  }, [selectedServerId, activeSession, selectedSharedEntryId]);
 
   const [showNewSession, setShowNewSession] = useState(false);
   const [renameRequest, setRenameRequest] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [daemonOnline, setDaemonOnline] = useState(false);
+  // Set when the daemon announces it just spawned its upgrade script
+  // (DAEMON_MSG.UPGRADING), so the version badge shows "upgrading…" through the
+  // restart/disconnect instead of a bare offline flash. Cleared on the next
+  // reconnect/online, or by a safety timeout if the upgrade never lands.
+  const [daemonUpgrading, setDaemonUpgrading] = useState<DaemonUpgradingState>(null);
+  const daemonUpgradingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Debounce the "Daemon Offline" badge. The server broadcasts
@@ -1134,9 +2668,11 @@ export function App() {
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<AppToast[]>([]);
+  const lastUpgradeBlockedToastRef = useRef<DaemonUpgradeBlockedToastState | null>(null);
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
+  const appBuildCheckRef = useRef<{ inFlight: Promise<boolean> | null }>({ inFlight: null });
   const markAppUpdateRequired = useCallback((detail: AppUpdateRequiredDetail) => {
     appUpdateRequiredRef.current = true;
     setAppUpdateNotice((prev) => ({
@@ -1150,16 +2686,28 @@ export function App() {
     }));
   }, [loadedWebBuildId]);
   const checkForAppUpdate = useCallback(async (options?: { blocking?: boolean; featureLabel?: string }) => {
-    const current = await fetchCurrentAppBuildInfo();
-    if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
-    markAppUpdateRequired({
-      reason: 'build_mismatch',
-      currentBuildId: current.buildId,
-      loadedBuildId: loadedWebBuildId,
-      blocking: options?.blocking,
-      featureLabel: options?.featureLabel,
-    });
-    return true;
+    const state = appBuildCheckRef.current;
+    // Coalesce concurrent checks. Probe recovery never calls this path; only a
+    // real socket reconnect or an explicit version-sensitive action may check.
+    if (state.inFlight) return state.inFlight;
+    const request = (async () => {
+      const current = await fetchCurrentAppBuildInfo();
+      if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
+      markAppUpdateRequired({
+        reason: 'build_mismatch',
+        currentBuildId: current.buildId,
+        loadedBuildId: loadedWebBuildId,
+        blocking: options?.blocking,
+        featureLabel: options?.featureLabel,
+      });
+      return true;
+    })();
+    state.inFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (appBuildCheckRef.current.inFlight === request) appBuildCheckRef.current.inFlight = null;
+    }
   }, [loadedWebBuildId, markAppUpdateRequired]);
   const showAppUpdateBlocker = useCallback((featureLabel?: string, reason: AppUpdateReason = 'version_sensitive_feature') => {
     markAppUpdateRequired({
@@ -1179,20 +2727,27 @@ export function App() {
     });
   }, [checkForAppUpdate, showAppUpdateBlocker]);
   const reloadForAppUpdate = useCallback(() => {
+    syncTaskModeOpenPersistence(showTaskMode);
     try {
-      sessionStorage.setItem('imcodes:reload-intent', JSON.stringify({
+      sessionStorage.setItem(RELOAD_INTENT_STORAGE_KEY, JSON.stringify({
         serverId: selectedServerId,
         session: activeSession,
         featureLabel: appUpdateNotice?.featureLabel,
+        showTaskMode,
         at: Date.now(),
       }));
     } catch { /* ignore */ }
     window.location.reload();
-  }, [activeSession, appUpdateNotice?.featureLabel, selectedServerId]);
+  }, [activeSession, appUpdateNotice?.featureLabel, selectedServerId, showTaskMode]);
   const showSuccessToast = useCallback((title: string) => {
     const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, kind: 'success', title }]);
     setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 4000);
+  }, []);
+  const showErrorToast = useCallback((title: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, kind: 'error', title }]);
+    setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 5000);
   }, []);
   useEffect(() => {
     void checkForAppUpdate();
@@ -1241,6 +2796,26 @@ export function App() {
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
+  type SubUsageValue = { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+  const subUsagesRef = useRef(subUsages);
+  subUsagesRef.current = subUsages;
+  const subUsageBatcherRef = useRef<MapUpdateBatcher<string, SubUsageValue> | null>(null);
+  if (subUsageBatcherRef.current === null) {
+    subUsageBatcherRef.current = createMapUpdateBatcher<string, SubUsageValue>({
+      intervalMs: SUB_USAGE_COMMIT_INTERVAL_MS,
+      read: (key) => subUsagesRef.current.get(key),
+      commit: (updates) => setSubUsages((prev) => {
+        let next: Map<string, SubUsageValue> | null = null;
+        for (const [key, value] of updates) {
+          if (looselyEqual(prev.get(key), value)) continue;
+          next ??= new Map(prev);
+          next.set(key, value);
+        }
+        return next ?? prev;
+      }),
+    });
+  }
+  useEffect(() => () => subUsageBatcherRef.current?.cancel(), []);
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -1264,9 +2839,16 @@ export function App() {
   // IDs of currently-open (non-minimized) sub-session windows.
   // Persisted per main session in localStorage so open state survives
   // session switches and page reloads.
+  // The URL hash is tab-local and therefore authoritative over the shared
+  // localStorage fallback. Keep the persistence scope in a ref so session
+  // switches can update it synchronously before replacing the open-window set.
+  // Reading `localStorage.rcc_session` here made a reload in tab B restore tab
+  // A's window state (or no windows at all).
+  const openSubPersistenceSessionRef = useRef(initialHashStateRef.current.sessionName);
+  const openSubPersistenceServerRef = useRef(selectedServerId);
   const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
     try {
-      const initial = localStorage.getItem('rcc_session');
+      const initial = openSubPersistenceSessionRef.current;
       if (initial) {
         const raw = localStorage.getItem(`rcc_open_subs_${initial}`);
         if (raw) return new Set(JSON.parse(raw) as string[]);
@@ -1274,34 +2856,99 @@ export function App() {
     } catch { /* ignore */ }
     return new Set();
   });
+  // Keep windows that were open in a previously visited main-session tab
+  // mounted (but hidden) while the user looks at another tab. Main
+  // SessionPane instances already follow this lifecycle; floating sub-session
+  // windows used to be the exception: switching tabs unmounted every ChatView
+  // and switching back mounted all of them again. Two heavy timelines could
+  // then race their cache/IDB bootstrap and one pane intermittently stayed
+  // blank until the user forced a refresh. Retaining the component instances
+  // preserves their timeline/scroll/composer state and makes the return trip a
+  // visibility flip rather than a destructive rebuild.
+  const [retainedOpenSubIds, setRetainedOpenSubIds] = useState<Set<string>>(
+    () => new Set(openSubIds),
+  );
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
+  const activeSplitPairRef = useRef<{ taskId: string; title: string; executorSubId: string; auditorSubId: string } | null>(null);
+  const [activeSplitPairTaskId, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
-    let mainSession: string | null = null;
-    try {
-      mainSession = localStorage.getItem('rcc_session');
-    } catch {
-      return;
-    }
+    const mainSession = openSubPersistenceSessionRef.current;
+    const srvId = openSubPersistenceServerRef.current;
     if (!mainSession) return;
-    const ids = Array.from(next);
+    const isIncogSub = (id: string) => (
+      rawSubSessionsRef.current.some((s) => s.id === id && s.incognito === true)
+      || isIncognitoTimelineSession(srvId, `deck_sub_${id}`)
+    );
+    const normalIds: string[] = [];
+    const incogIds = new Set<string>();
+    for (const id of next) {
+      if (isIncogSub(id)) incogIds.add(id);
+      else normalIds.push(id);
+    }
+    if (srvId) {
+      const memKey = `${srvId}:${mainSession}`;
+      if (incogIds.size > 0) incognitoOpenSubWindowsRef.current.set(memKey, incogIds);
+      else incognitoOpenSubWindowsRef.current.delete(memKey);
+    }
     const storageKey = `rcc_open_subs_${mainSession}`;
+    if (normalIds.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(normalIds));
+    else safeLocalStorageRemoveItem(storageKey);
+  }, []);
+  const persistMaximizedSubIds = useCallback((next: Set<string>) => {
+    const mainSession = openSubPersistenceSessionRef.current;
+    const srvId = openSubPersistenceServerRef.current;
+    if (!mainSession) return;
+    const isIncogSub = (id: string) => (
+      rawSubSessionsRef.current.some((s) => s.id === id && s.incognito === true)
+      || isIncognitoTimelineSession(srvId, `deck_sub_${id}`)
+    );
+    const normalIds: string[] = [];
+    const incogIds = new Set<string>();
+    for (const id of next) {
+      if (isIncogSub(id)) incogIds.add(id);
+      else normalIds.push(id);
+    }
+    if (srvId) {
+      const memKey = `${srvId}:${mainSession}`;
+      if (incogIds.size > 0) incognitoMaximizedSubWindowsRef.current.set(memKey, incogIds);
+      else incognitoMaximizedSubWindowsRef.current.delete(memKey);
+    }
+    const ids = normalIds.slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS);
+    const storageKey = maximizedSubSessionStorageKey(srvId, mainSession);
     if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
-  const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
-    if (typeof updater !== 'function') {
-      openSubIdsRef.current = updater;
-      persistOpenSubIds(updater);
-      setOpenSubIdsRaw(updater);
-      return;
-    }
-    setOpenSubIdsRaw((prev) => {
-      const next = updater(prev);
-      openSubIdsRef.current = next;
-      persistOpenSubIds(next);
-      return next;
+  useEffect(() => {
+    // State changes from maximize/restore and session switches share one
+    // bounded, session-scoped persistence path.  Reading the refs avoids a
+    // transient render writing the previous tab's state under the new key.
+    persistMaximizedSubIds(maximizedSubIds);
+  }, [maximizedSubIds, persistMaximizedSubIds]);
+  const setOpenSubIds = useCallback((
+    updater: Set<string> | ((prev: Set<string>) => Set<string>),
+    options?: { retainPrevious?: boolean },
+  ) => {
+    // Resolve functional updates against the synchronous ref. Several window
+    // actions can run in one browser turn; waiting for Preact's state updater
+    // would make the retained-set reconciliation observe an older open set.
+    const previous = openSubIdsRef.current;
+    const next = typeof updater === 'function' ? updater(previous) : updater;
+    openSubIdsRef.current = next;
+    persistOpenSubIds(next);
+    setRetainedOpenSubIds((retained) => {
+      const updated = new Set(retained);
+      // Ordinary window actions replace the active tab's retained membership
+      // (so minimize/close really unmounts it). A main-tab switch instead keeps
+      // the previous tab mounted and only adds the target tab's restored set.
+      if (!options?.retainPrevious) {
+        for (const id of previous) updated.delete(id);
+      }
+      for (const id of next) updated.add(id);
+      if (updated.size === retained.size && [...updated].every((id) => retained.has(id))) return retained;
+      return updated;
     });
+    setOpenSubIdsRaw(next);
   }, [persistOpenSubIds]);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
@@ -1314,6 +2961,45 @@ export function App() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
+    'tab_order',
+    readLegacyTabOrder(),
+    0,
+  );
+  const orderedVisibleMainSessions = useMemo(
+    () => sortSessionsByTabOrder(visibleMainSessions, tabOrder, pinnedTabs),
+    [visibleMainSessions, tabOrder, pinnedTabs],
+  );
+  const [shortcutOverrides, setShortcutOverrides] = useSyncedPreference<KeyboardShortcutOverrides>(
+    KEYBOARD_SHORTCUTS_PREF_KEY,
+    {},
+    0,
+  );
+  const resolvedShortcutSlots = useMemo(
+    () => resolveKeyboardShortcutSlots(shortcutOverrides, isMacPlatform()),
+    [shortcutOverrides],
+  );
+  const resolvedSubSessionQuickModifiers = useMemo(
+    () => resolveSubSessionQuickModifiers(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const resolvedTaskPairSplitModifiers = useMemo(
+    () => resolveTaskPairSplitModifiers(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const resolvedMacVoiceModifier = useMemo(
+    () => resolveMacVoiceInlineModifier(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
+  const pinnedSubSessionIds = useMemo(() => new Set(pinnedSubSessionArr), [pinnedSubSessionArr]);
+  const togglePinnedSubSession = useCallback((id: string) => {
+    setPinnedSubSessionArr((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return [...next];
+    });
+  }, [setPinnedSubSessionArr]);
   const togglePinnedTab = useCallback((name: string) => {
     setPinnedTabsArr((prev) => {
       const set = new Set(prev);
@@ -1322,8 +3008,134 @@ export function App() {
       return [...set];
     });
   }, [setPinnedTabsArr]);
+  // Server navigation order and pin priority are user preferences, so they
+  // follow the same cross-device sync path as session tabs. Scope the browser
+  // cache by user to avoid briefly showing another account's arrangement.
+  const serverPreferenceScope = auth?.userId ?? 'anonymous';
+  const [serverOrder, setServerOrder, serverOrderHydrated] = useSyncedPreference<string[]>(
+    'server_order',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const [serverPinned, setServerPinned, serverPinnedHydrated] = useSyncedPreference<string[]>(
+    'server_pinned',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const orderedServers = useMemo(
+    () => sortServersByPreference(servers, serverOrder, serverPinned),
+    [servers, serverOrder, serverPinned],
+  );
+  const unifiedServers = useMemo(
+    () => projectUnifiedServerList(servers, sharedEntries, ownedServerIdsRef.current, serverOrder, serverPinned),
+    [servers, sharedEntries, serverOrder, serverPinned, presenceTick],
+  );
+  const pinnedServerIds = useMemo(
+    () => new Set(normalizePinnedServers(unifiedServers, serverPinned)),
+    [unifiedServers, serverPinned],
+  );
+  useEffect(() => {
+    if (!auth) return;
+    watchProjectionStore.setServers(orderedServers.map((server) => ({
+      id: server.id,
+      name: server.name,
+      baseUrl: auth.baseUrl,
+      isPinned: pinnedServerIds.has(server.id),
+    })));
+  }, [auth, orderedServers, pinnedServerIds]);
+  const restrictedSharedEntries = useMemo(
+    () => filterRestrictedSharedEntries(sharedEntries),
+    [sharedEntries],
+  );
+  useEffect(() => {
+    if (!serversSynced || !serversLoaded || !serverOrderHydrated || !serverPinnedHydrated || servers.length === 0) return;
+    const nextOrder = appendMissingServerOrder(servers, serverOrder);
+    if (sameOrderIds(nextOrder, serverOrder)) return;
+    setServerOrder((previous) => {
+      const merged = appendMissingServerOrder(servers, previous);
+      return sameOrderIds(merged, previous) ? previous : merged;
+    });
+    // Inventory may be partial (owned/shared discovery or an offline refresh).
+    // Filter pins only for rendering, never persist that projection as intent.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers, serversLoaded, serversSynced, serverOrder, serverOrderHydrated, serverPinnedHydrated]);
+  const toggleServerPinned = useCallback((serverId: string) => {
+    setServerPinned((previous) => toggleServerPin(previous, serverId));
+  }, [setServerPinned]);
+  const openUnifiedServerContextMenu = useCallback((item: UnifiedServerItem, x: number, y: number) => {
+    const matched = item.server || servers.find((srv) => srv.id === item.id && ownedServerIdsRef.current.has(srv.id));
+    if (matched) {
+      setServerCtxMenu({ server: matched as ServerInfo, x, y });
+      return;
+    }
+    if (!item.isSharedIn) return;
+    setServerCtxMenu({
+      server: {
+        id: item.id,
+        name: item.name,
+        status: item.status,
+        lastHeartbeatAt: item.lastHeartbeatAt ?? null,
+        createdAt: item.lastHeartbeatAt ?? 0,
+      },
+      x,
+      y,
+    });
+  }, [servers]);
+  const accessiblePushServerIds = useMemo(
+    () => sanitizePushEnabledServerIds([
+      ...servers.filter((s) => ownedServerIdsRef.current.has(s.id)).map((s) => s.id),
+      ...controlledMachineServerIds,
+    ]),
+    [servers, controlledMachineServerIds],
+  );
+  const effectivePushEnabledServerIdSet = useMemo(
+    () => new Set(resolveEffectivePushEnabledServerIds(pushEnabledServers, accessiblePushServerIds)),
+    [pushEnabledServers, accessiblePushServerIds],
+  );
+  const handleToggleServerPushMute = useCallback(async (serverId: string) => {
+    if (!ownedServerIdsRef.current.has(serverId)) return;
+    const prevRaw = pushEnabledServersRef.current;
+    const currentEffective = resolveEffectivePushEnabledServerIds(prevRaw, accessiblePushServerIds);
+    const next = currentEffective.includes(serverId)
+      ? currentEffective.filter((id) => id !== serverId)
+      : [...currentEffective, serverId];
+    const ok = await commitPushEnabledServers(next, prevRaw);
+    if (!ok) {
+      showErrorToast(trans('server.push_preferences_save_failed'));
+    }
+  }, [accessiblePushServerIds, showErrorToast, trans]);
+  const activeNewDevicePushPrompt = newDevicePushPrompts[0] ?? null;
+  const handleRespondToNewDevicePushPrompt = useCallback(async (mode: 'enable' | 'mute' | 'dismiss') => {
+    const prompt = newDevicePushPrompts[0];
+    if (!prompt || newDevicePushSavingRef.current) return;
+    const shouldEnable = mode === 'enable';
+    const prevRaw = pushEnabledServersRef.current;
+    const baseEffective = Array.isArray(prevRaw)
+      ? prevRaw
+      : resolveEffectivePushEnabledServerIds(null, prompt.priorAccessibleServerIds);
+    const next = shouldEnable
+      ? sanitizePushEnabledServerIds([...baseEffective, prompt.id])
+      : sanitizePushEnabledServerIds(baseEffective.filter((id) => id !== prompt.id));
+    newDevicePushSavingRef.current = true;
+    setNewDevicePushSaving(true);
+    try {
+      const ok = await commitPushEnabledServers(next, prevRaw);
+      if (ok) {
+        markHandledNewDevicePushId(authRef.current, prompt.id);
+        setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== prompt.id));
+      } else {
+        showErrorToast(trans('server.push_preferences_save_failed'));
+      }
+    } finally {
+      newDevicePushSavingRef.current = false;
+      setNewDevicePushSaving(false);
+    }
+  }, [newDevicePushPrompts, showErrorToast, trans]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
+  const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
   const [showNewUserGuide, setShowNewUserGuide] = useState(false);
   const [guidePromptSnoozed, setGuidePromptSnoozed] = useState(false);
@@ -1369,7 +3181,7 @@ export function App() {
   if (stackRef.current === null) stackRef.current = new MutableDesktopWindowStack();
   const [stackVersion, setStackVersion] = useState(0);
   const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
-  const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
+  const isMobileRef = useRef(isMobileDevice());
 
   // Active (frontmost) sub-session. Managed EXPLICITLY rather than re-derived
   // from the mutable window stack on every render: opening/focusing a window
@@ -1399,22 +3211,60 @@ export function App() {
   // `stackVersion` counter live so z-index consumers re-render on stack changes.
   useEffect(() => { recomputeFocusedSubId(); }, [stackVersion, recomputeFocusedSubId]);
 
+  const canUseWindowStackForSurface = useCallback((meta: DesktopWindowMeta): boolean => {
+    if (!isMobileRef.current) return true;
+    // Mobile sub-sessions keep their existing single-open drawer semantics and
+    // geometry, but full-screen work surfaces (remote desktop, wall, file
+    // preview, discussions, etc.) still need the shared stack ordering so the
+    // latest opened surface is not covered by an older fallback-z overlay.
+    return meta.kind !== DESKTOP_WINDOW_KINDS.subSession
+      && meta.kind !== DESKTOP_WINDOW_KINDS.subsessionFileBrowser;
+  }, []);
+
   /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
   const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
-    if (isMobileRef.current) return;
+    if (!canUseWindowStackForSurface(meta)) return;
     const stack = stackRef.current!;
     let changed = stack.ensureWindow(id, meta);
     if (opts?.bringToFront) {
       if (stack.bringToFront(id)) changed = true;
     }
     if (changed) bumpStack();
-  }, []);
+  }, [canUseWindowStackForSurface]);
+
+  const openLocalWebPreviewFromChat = useCallback<ChatLocalWebPreviewOpenHandler>(({ port, path }) => {
+    setLocalWebPreviewPort(String(port));
+    setLocalWebPreviewPath(path);
+    // LocalWebPreviewPanel auto-opens only once per mount. Remount it for each
+    // chat-link launch so a second link immediately replaces the active relay.
+    setLocalWebPreviewLaunchToken((token) => token + 1);
+    setShowDesktopLocalWebPreview(true);
+    if (!selectedServerId) return;
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId), {
+      kind: DESKTOP_WINDOW_KINDS.localWebPreview,
+      serverId: selectedServerId,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow, selectedServerId]);
 
   /** Raise an existing window. No-op (no version bump) if it is already frontmost. */
   const bringDesktopWindowToFront = useCallback((id: string) => {
-    if (isMobileRef.current) return;
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
+
+  const openCloudDocPreview = useCallback((docId: string) => {
+    const trimmed = docId.trim();
+    if (!trimmed) return;
+    setCloudDocsRequest({ docId: trimmed, seq: ++cloudDocsRequestSeqRef.current });
+    setShowCloudDocs(true);
+    bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs);
+  }, [bringDesktopWindowToFront]);
+
+  const focusFilePreviewWindow = useCallback(() => {
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
+      kind: DESKTOP_WINDOW_KINDS.filePreview,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow, selectedServerId]);
 
   /** Remove a window (and its children). Bumps only if anything was actually removed. */
   const removeDesktopWindow = useCallback((id: string) => {
@@ -1434,7 +3284,8 @@ export function App() {
   }, []);
 
   const [showSubDialog, setShowSubDialog] = useState(false);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
+  const [poolAddTarget, setPoolAddTarget] = useState<SupervisionExecutionPoolKind | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; modelDisplay?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('@shared/supervision-config.js').SupervisionMode | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -1444,6 +3295,7 @@ export function App() {
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
+  const liveIdleSessionsRef = useRef<Set<string>>(new Set());
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1507,12 +3359,32 @@ export function App() {
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
+  const repoContextsByServerRef = useRef<Map<string, Map<string, any>>>(new Map());
+  const repoContextsOwnerServerIdRef = useRef<string | null>(selectedServerId);
+  const lastKnownSidebarScopeByServerRef = useRef<Map<string, { activeSession: string; projectDir: string }>>(new Map());
 
   // ── Settings / Admin ────────────────────────────────────────────────────────
+  const [showDownloadsModal, setShowDownloadsModal] = useState(false);
   const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [showUsageSummaryPage, setShowUsageSummaryPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
+  const [showControlledNodes, setShowControlledNodes] = useState(Boolean(aideskManagementNodeId));
+  const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
+    createRemoteDesktopWorkspaceState,
+  );
+  const remoteDesktopWorkspaceRef = useRef(remoteDesktopWorkspace);
+  remoteDesktopWorkspaceRef.current = remoteDesktopWorkspace;
+  const [remoteDesktopWorkspaceMinimized, setRemoteDesktopWorkspaceMinimized] = useState(false);
+  const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
+  const remoteDesktopWallOpenRef = useRef(remoteDesktopWallOpen);
+  remoteDesktopWallOpenRef.current = remoteDesktopWallOpen;
+  const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
+  const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
+  const remoteDesktopWallHostKeysRef = useRef(remoteDesktopWallHostKeys);
+  remoteDesktopWallHostKeysRef.current = remoteDesktopWallHostKeys;
+  const [remoteDesktopGuestAccess, setRemoteDesktopGuestAccess] = useState<{ publicNodeId?: string } | null>(null);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -1521,10 +3393,110 @@ export function App() {
   const [username, setUsername] = useState<string | null>(null);
   const [userHasPassword, setUserHasPassword] = useState(false);
 
+  const openControlledNodes = useCallback(() => {
+    setShowMobileFileBrowser(false);
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+      kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+    setShowControlledNodes(true);
+  }, [ensureDesktopWindow, selectedServerId]);
+
+  const openRemoteDesktop = useCallback((machine: MachineListItem) => {
+    const hostKey = remoteDesktopHostKey(machine);
+    if (
+      hostKey
+      && !remoteDesktopWorkspaceRef.current.hosts[hostKey]
+      && remoteDesktopWallOpenRef.current
+      && remoteDesktopWallHostKeysRef.current.includes(hostKey)
+    ) {
+      setRemoteDesktopWallMinimized(false);
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall, {
+        kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
+      }, { bringToFront: true });
+      return;
+    }
+    setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
+    setRemoteDesktopWorkspaceMinimized(false);
+    ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
+      kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
+
+  const openRemoteDesktopWall = useCallback(() => {
+    setRemoteDesktopWallOpen(true);
+    setRemoteDesktopWallMinimized(false);
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall, {
+      kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
+
+  const openRemoteDesktopById = useCallback((initialPublicNodeId?: string) => {
+    setRemoteDesktopGuestAccess({
+      publicNodeId: typeof initialPublicNodeId === 'string' ? initialPublicNodeId : undefined,
+    });
+  }, []);
+
+  const handleOpenRemoteDesktopRef = useCallback((targetId: string) => {
+    void openRemoteDesktopReference(targetId, {
+      workspace: remoteDesktopWorkspaceRef.current,
+      machines: [],
+      refetchMachines: listControllableMachines,
+      servers: serversRef.current,
+      selectedServerId,
+      selectedServerCapabilities: wsRef.current?.getDaemonCapabilitySnapshot()?.capabilities ?? [],
+      openRemoteDesktop,
+      openRemoteDesktopById,
+      openControlledNodes,
+      notifyUnavailable: ({ reason, displayName }) => {
+        showErrorToast(
+          reason === 'offline'
+            ? trans('remote_desktop.citation_offline', { name: displayName })
+            : trans('remote_desktop.citation_unavailable', { name: displayName }),
+        );
+      },
+    });
+  }, [openControlledNodes, openRemoteDesktop, openRemoteDesktopById, selectedServerId, showErrorToast, trans]);
+
+  const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
+    const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
+    for (const hostKey of hostKeys) {
+      if (!retained.has(hostKey)) {
+        remoteDesktopConnectionManager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
+      }
+    }
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallMinimized(false);
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall);
+  }, [remoteDesktopConnectionManager, remoteDesktopWorkspace.orderedHostKeys, removeDesktopWindow]);
+
+  const openRemoteDesktopWallStandalone = useCallback(() => {
+    if (!openRemoteDesktopWallWindow()) return;
+    closeRemoteDesktopWall(remoteDesktopWallHostKeys);
+  }, [closeRemoteDesktopWall, remoteDesktopWallHostKeys]);
+
+  useEffect(() => {
+    if (auth) return;
+    remoteDesktopConnectionManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.APP_SIGN_OUT);
+    setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
+    setRemoteDesktopWorkspaceMinimized(false);
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallHostKeys([]);
+    setRemoteDesktopGuestAccess(null);
+    removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+    removeDesktopWindow(REMOTE_DESKTOP_WALL_WINDOW_ID);
+  }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
+
+  useEffect(() => () => remoteDesktopConnectionManager.stopAll(
+    REMOTE_DESKTOP_STOP_ORIGIN.APP_UNMOUNT,
+  ), [remoteDesktopConnectionManager]);
+
   // Fetch current user info on auth
+  const [isDocCollaborator, setIsDocCollaborator] = useState(false);
   useEffect(() => {
     if (!auth) {
       setIsAdmin(false);
+      setIsDocCollaborator(false);
       setUserDisplayName(null);
       setUsername(null);
       setUserHasPassword(false);
@@ -1532,6 +3504,7 @@ export function App() {
     }
     fetchMe().then((me) => {
       setIsAdmin(me.is_admin);
+      setIsDocCollaborator(me.scope === 'doc_collaborator');
       setUserDisplayName(me.display_name);
       setUsername(me.username);
       setUserHasPassword(me.has_password);
@@ -1552,6 +3525,39 @@ export function App() {
   // the question goes unanswered), while ignoring the question's own trailing
   // message-completion flush that arrives in the same instant.
   const pendingQuestionAtRef = useRef(0);
+  // Questions the user already answered/dismissed this session — so re-hydrating
+  // from history (below) never re-pops a question they've dealt with.
+  const dismissedQuestionsRef = useRef<Set<string>>(new Set());
+  // Answers sent to the daemon but not yet confirmed, and the one (if any) that
+  // turned out refused/lost — shown with the user's text so it is never silent.
+  const [askAnswerFailure, setAskAnswerFailure] = useState<AskAnswerFailure | null>(null);
+  const askAnswerTrackerRef = useRef<AskAnswerTracker | null>(null);
+  if (!askAnswerTrackerRef.current) {
+    askAnswerTrackerRef.current = new AskAnswerTracker(ASK_ANSWER_ACK_WAIT_MS, setAskAnswerFailure);
+  }
+  useEffect(() => () => askAnswerTrackerRef.current?.dispose(), []);
+  const subSessionViewModesRef = useRef<Record<string, ViewMode>>({});
+  const handleSubSessionViewModeChange = useCallback((sessionName: string, mode: ViewMode) => {
+    subSessionViewModesRef.current[sessionName] = mode;
+    if (mode === 'chat') {
+      setPendingQuestion((prev) => (
+        prev && prev.sessionName === sessionName && isAskQuestionSessionVisible(sessionName, askQuestionUiStateRef.current)
+          ? null
+          : prev
+      ));
+    }
+  }, []);
+  const askQuestionUiStateRef = useRef<AskQuestionSessionVisibilityState>({
+    chatObscured: false,
+    isMobile: false,
+    activeSession: null,
+    defaultViewMode: 'terminal',
+    viewModes: {},
+    openSubSessionIds: new Set<string>(),
+    hasMaximizedSubSession: false,
+    subSessions: [],
+    subSessionViewModes: {},
+  });
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
@@ -1690,27 +3696,37 @@ export function App() {
     setSubSessionMaximized(id, false);
   }, [setSubSessionMaximized]);
 
+  const isPinnedPanelForServer = useCallback((panel: PinnedPanel, serverId: string | null | undefined): boolean => (
+    hasPinnedPanelServerProvenance(panel, serverId)
+  ), []);
+
   const isSubSessionPinnedPanel = useCallback((id: string): boolean => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
     if (!sub) return false;
+    const targetServerId = sub.serverId ?? selectedServerIdRef.current;
     return pinnedPanels.some((panel) => (
-      panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+      panel.type === 'subsession'
+      && panel.props?.sessionName === sub.sessionName
+      && isPinnedPanelForServer(panel, targetServerId)
     ));
-  }, [pinnedPanels]);
+  }, [isPinnedPanelForServer, pinnedPanels]);
 
   const unpinSubSessionPanel = useCallback((id: string): boolean => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
     if (!sub) return false;
+    const targetServerId = sub.serverId ?? selectedServerIdRef.current;
     let removed = false;
     setPinnedPanels((prev) => {
       const next = prev.filter((panel) => !(
-        panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+        panel.type === 'subsession'
+        && panel.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(panel, targetServerId)
       ));
       removed = next.length !== prev.length;
       return removed ? next : prev;
     });
     return removed;
-  }, [setPinnedPanels]);
+  }, [isPinnedPanelForServer, setPinnedPanels]);
 
   const minimizeSubSessionWindow = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -1719,8 +3735,19 @@ export function App() {
       const next = new Set(prev);
       next.delete(id);
       return next;
-    });
+    // Keep the minimized pane mounted as a cheap summary shell.  Removing it
+    // from the retained set made the canonical 19-window run report only the
+    // nine full panes and forced a cold remount on restore.  `visible=false`
+    // keeps its subscription/history summary path while SubSessionWindow
+    // suppresses full controls and ChatView work until restoration.
+    }, { retainPrevious: true });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    if (activeSplitPairRef.current && (activeSplitPairRef.current.executorSubId === id || activeSplitPairRef.current.auditorSubId === id)) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
   }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
   const openSubSessionMaximized = useCallback((id: string) => {
@@ -1737,39 +3764,208 @@ export function App() {
     bringSubToFront(id);
   }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
+  // Per-session chat scroll functions — registered by SessionPane and SubSessionWindow.
+  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  const subChatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  const pendingChatScrollSessionRef = useRef<string | null>(null);
+  const pendingChatScrollRafRef = useRef<number | null>(null);
+  const settleChatScrollRafRef = useRef<number | null>(null);
+  const pendingServerSwitchScrollRef = useRef<string | null>(null);
+  const pendingSubScrollIdsRef = useRef<Set<string>>(new Set());
+  const pendingSubScrollRafsRef = useRef<Map<string, number>>(new Map());
+  const settleSubScrollRafsRef = useRef<Map<string, number>>(new Map());
+
+  const cancelMainChatScrollRafs = useCallback(() => {
+    if (pendingChatScrollRafRef.current !== null) {
+      cancelAnimationFrame(pendingChatScrollRafRef.current);
+      pendingChatScrollRafRef.current = null;
+    }
+    if (settleChatScrollRafRef.current !== null) {
+      cancelAnimationFrame(settleChatScrollRafRef.current);
+      settleChatScrollRafRef.current = null;
+    }
+  }, []);
+
+  const clearPendingMainChatScroll = useCallback((onlyIfName?: string) => {
+    if (!onlyIfName || pendingChatScrollSessionRef.current === onlyIfName) {
+      pendingChatScrollSessionRef.current = null;
+      cancelMainChatScrollRafs();
+    }
+  }, [cancelMainChatScrollRafs]);
+
+  const cancelSubChatScrollRafs = useCallback((id?: string) => {
+    if (id !== undefined) {
+      const pendingId = pendingSubScrollRafsRef.current.get(id);
+      if (pendingId !== undefined) {
+        cancelAnimationFrame(pendingId);
+        pendingSubScrollRafsRef.current.delete(id);
+      }
+      const settleId = settleSubScrollRafsRef.current.get(id);
+      if (settleId !== undefined) {
+        cancelAnimationFrame(settleId);
+        settleSubScrollRafsRef.current.delete(id);
+      }
+      return;
+    }
+    for (const rafId of pendingSubScrollRafsRef.current.values()) cancelAnimationFrame(rafId);
+    pendingSubScrollRafsRef.current.clear();
+    for (const rafId of settleSubScrollRafsRef.current.values()) cancelAnimationFrame(rafId);
+    settleSubScrollRafsRef.current.clear();
+  }, []);
+
+  const clearPendingSubChatScroll = useCallback((id?: string) => {
+    if (id !== undefined) {
+      pendingSubScrollIdsRef.current.delete(id);
+      cancelSubChatScrollRafs(id);
+      return;
+    }
+    pendingSubScrollIdsRef.current.clear();
+    cancelSubChatScrollRafs();
+  }, [cancelSubChatScrollRafs]);
+
+  useEffect(() => () => {
+    cancelMainChatScrollRafs();
+    cancelSubChatScrollRafs();
+  }, [cancelMainChatScrollRafs, cancelSubChatScrollRafs]);
+
+  const runRegisteredMainChatScroll = useCallback((name: string, fn: () => void, scheduleSettle: boolean): boolean => {
+    const handled = (fn as () => boolean | void)();
+    if (handled === false) {
+      chatScrollFnsRef.current.delete(name);
+      return false;
+    }
+    if (pendingChatScrollSessionRef.current === name) {
+      pendingChatScrollSessionRef.current = null;
+    }
+    if (pendingChatScrollRafRef.current !== null) {
+      cancelAnimationFrame(pendingChatScrollRafRef.current);
+      pendingChatScrollRafRef.current = null;
+    }
+    if (scheduleSettle) {
+      if (settleChatScrollRafRef.current !== null) {
+        cancelAnimationFrame(settleChatScrollRafRef.current);
+      }
+      settleChatScrollRafRef.current = requestAnimationFrame(() => {
+        settleChatScrollRafRef.current = null;
+        if (pendingChatScrollSessionRef.current !== null && pendingChatScrollSessionRef.current !== name) return;
+        const latest = chatScrollFnsRef.current.get(name) as (() => boolean | void) | undefined;
+        latest?.();
+      });
+    }
+    return true;
+  }, []);
+
+  const runRegisteredSubChatScroll = useCallback((id: string, fn: () => void, scheduleSettle: boolean): boolean => {
+    const handled = (fn as () => boolean | void)();
+    if (handled === false) {
+      subChatScrollFnsRef.current.delete(id);
+      return false;
+    }
+    pendingSubScrollIdsRef.current.delete(id);
+    const pendingRaf = pendingSubScrollRafsRef.current.get(id);
+    if (pendingRaf !== undefined) {
+      cancelAnimationFrame(pendingRaf);
+      pendingSubScrollRafsRef.current.delete(id);
+    }
+    if (scheduleSettle) {
+      const existingSettle = settleSubScrollRafsRef.current.get(id);
+      if (existingSettle !== undefined) cancelAnimationFrame(existingSettle);
+      const settleRaf = requestAnimationFrame(() => {
+        settleSubScrollRafsRef.current.delete(id);
+        const latest = subChatScrollFnsRef.current.get(id) as (() => boolean | void) | undefined;
+        latest?.();
+      });
+      settleSubScrollRafsRef.current.set(id, settleRaf);
+    }
+    return true;
+  }, []);
+
+  const scheduleMainChatScrollToBottom = useCallback((name: string) => {
+    cancelMainChatScrollRafs();
+    pendingChatScrollSessionRef.current = name;
+    const tryScroll = (remainingRetries: number) => {
+      pendingChatScrollRafRef.current = requestAnimationFrame(() => {
+        pendingChatScrollRafRef.current = null;
+        if (pendingChatScrollSessionRef.current !== name) return;
+        const fn = chatScrollFnsRef.current.get(name);
+        if (fn && runRegisteredMainChatScroll(name, fn, false)) {
+          return;
+        }
+        if (remainingRetries > 0) {
+          tryScroll(remainingRetries - 1);
+        }
+      });
+    };
+    tryScroll(3);
+  }, [cancelMainChatScrollRafs, runRegisteredMainChatScroll]);
+
+  const scheduleSubChatScrollToBottom = useCallback((id: string) => {
+    cancelSubChatScrollRafs(id);
+    pendingSubScrollIdsRef.current.add(id);
+    const tryScroll = (remainingRetries: number) => {
+      const rafId = requestAnimationFrame(() => {
+        pendingSubScrollRafsRef.current.delete(id);
+        if (!pendingSubScrollIdsRef.current.has(id)) return;
+        const fn = subChatScrollFnsRef.current.get(id);
+        if (fn && runRegisteredSubChatScroll(id, fn, false)) {
+          return;
+        }
+        if (remainingRetries > 0) {
+          tryScroll(remainingRetries - 1);
+        }
+      });
+      pendingSubScrollRafsRef.current.set(id, rafId);
+    };
+    tryScroll(3);
+  }, [cancelSubChatScrollRafs, runRegisteredSubChatScroll]);
+
   const maximizeOpenSubSession = useCallback((id: string) => {
     if (isMobileRef.current) return;
     unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
+    scheduleSubChatScrollToBottom(id);
+  }, [bringSubToFront, scheduleSubChatScrollToBottom, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const restoreSubSession = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized]);
+    scheduleSubChatScrollToBottom(id);
+  }, [bringSubToFront, clearSubSessionMaximized, scheduleSubChatScrollToBottom]);
 
-  const openSubSessionWindow = useCallback((id: string) => {
+  const openSubSessionWindow = useCallback((id: string, opts?: { scrollToBottom?: boolean }) => {
     clearSubSessionMaximized(id);
 
     if (isMobileRef.current) {
       setOpenSubIds(new Set([id]));
+      if (opts?.scrollToBottom !== false) {
+        scheduleSubChatScrollToBottom(id);
+      } else {
+        clearPendingSubChatScroll(id);
+      }
       return;
     }
 
     unpinSubSessionPanel(id);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds, unpinSubSessionPanel]);
+    if (opts?.scrollToBottom !== false) {
+      scheduleSubChatScrollToBottom(id);
+    } else {
+      clearPendingSubChatScroll(id);
+    }
+  }, [bringSubToFront, clearPendingSubChatScroll, clearSubSessionMaximized, scheduleSubChatScrollToBottom, setOpenSubIds, unpinSubSessionPanel]);
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
 
     if (mobile) {
       clearSubSessionMaximized(id);
-      const next = openSubIdsRef.current.has(id) ? new Set<string>() : new Set([id]);
+      const willOpen = !openSubIdsRef.current.has(id);
+      const next = willOpen ? new Set([id]) : new Set<string>();
       setOpenSubIds(next);
+      if (willOpen) scheduleSubChatScrollToBottom(id);
       return;
     }
 
@@ -1777,6 +3973,7 @@ export function App() {
     const next = new Set(openSubIdsRef.current);
     if (next.has(id) && !wasPinned && focusedSubIdRef.current !== id) {
       bringSubToFront(id);
+      scheduleSubChatScrollToBottom(id);
       return;
     }
 
@@ -1788,6 +3985,7 @@ export function App() {
       setOpenSubIds(next);
       if (wasPinned) unpinSubSessionPanel(id);
       bringSubToFront(id);
+      scheduleSubChatScrollToBottom(id);
     } else {
       next.delete(id);
       setOpenSubIds(next);
@@ -1798,6 +3996,7 @@ export function App() {
     clearSubSessionMaximized,
     isSubSessionPinnedPanel,
     removeDesktopWindow,
+    scheduleSubChatScrollToBottom,
     setOpenSubIds,
     unpinSubSessionPanel,
   ]);
@@ -1806,10 +4005,15 @@ export function App() {
   activeSessionRef.current = activeSession;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const navigableMainSessionsRef = useRef(navigableMainSessions);
+  navigableMainSessionsRef.current = navigableMainSessions;
 
   const closeAllSubSessionWindows = useCallback(() => {
     setMaximizedSubIds(new Set());
-    setOpenSubIds(new Set());
+    // This is a presentation collapse (active-tab click / toolbar arrow), not
+    // termination. Keep the ChatView instances retained so expanding the same
+    // windows is instant and cannot race two fresh timeline bootstraps.
+    setOpenSubIds(new Set(), { retainPrevious: true });
     recomputeFocusedSubId();
     if (isMobileRef.current) return;
     const stack = stackRef.current!;
@@ -1819,6 +4023,12 @@ export function App() {
       if (stack.removeWindow(entry.id)) changed = true;
     }
     if (changed) bumpStack();
+    if (activeSplitPairRef.current) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
   }, [bumpStack, recomputeFocusedSubId, setOpenSubIds]);
 
   const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
@@ -1869,7 +4079,8 @@ export function App() {
   // stack's own short-circuit logic ensures no version bump when nothing
   // changed (e.g. re-running the effect when an unrelated dep changes).
   //
-  // Mobile is a no-op (the helpers themselves bail out on isMobileRef).
+  // On mobile, sub-session entries remain no-op, while full-screen work
+  // surfaces still register so z-index follows the same frontmost ordering.
   useEffect(() => {
     if (showRepoPage) {
       if (repoPanelParentSubId) {
@@ -1950,6 +4161,17 @@ export function App() {
   }, [showSharedContextManagement, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   useEffect(() => {
+    if (showControlledNodes) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+        kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes);
+    }
+  }, [showControlledNodes, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
     if (showSharedContextDiagnostics) {
       ensureDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics, {
         kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics,
@@ -1971,31 +4193,237 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
-  const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
-    if (name) safeLocalStorageSetItem('rcc_session', name);
+  useEffect(() => {
+    if (showCloudDocs) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.cloudDocs, {
+        kind: DESKTOP_WINDOW_KINDS.cloudDocs,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.cloudDocs);
+    }
+  }, [showCloudDocs, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  // The tab the user last chose on purpose, and whether they have chosen one at
+  // all since this document loaded. Only an explicit choice is remembered per
+  // server, and a late automatic restore never overrides one.
+  const rememberIntentRef = useRef<string | null>(null);
+  // The server the user last chose a tab on in this document. Scoped to the
+  // server so a choice made elsewhere (a shared session, the previous server)
+  // never blocks restoring the tab of the server being entered.
+  const explicitSelectionServerRef = useRef<string | null>(null);
+
+  /**
+   * `remember: false` marks an AUTOMATIC selection (restoring the saved tab,
+   * replacing a tab that no longer exists, auto-entering a server). Those are
+   * never recorded as "the user's last tab", so a fallback cannot replace the
+   * memory of what the user really had open.
+   */
+  const setActiveSession = useCallback((
+    name: string | null,
+    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean; remember?: boolean },
+  ) => {
+    const deliberate = Boolean(name) && opts?.remember !== false;
+    const currentServerId = selectedServerIdRef.current ?? selectedServerId;
+    rememberIntentRef.current = deliberate ? name : null;
+    if (deliberate) explicitSelectionServerRef.current = currentServerId;
+    const isIncogActive = Boolean(
+      name
+      && selectedServerId
+      && (isIncognitoTimelineSession(selectedServerId, name)
+        || sessionsRef.current.some((s) => s.name === name && s.incognito === true)
+        || incognitoMainSessionsByServerRef.current.get(selectedServerId)?.some((s) => s.name === name)),
+    );
+    if (deliberate && selectedServerId) {
+      if (isIncogActive && name) {
+        incognitoActiveSessionByServerRef.current.set(selectedServerId, name);
+      } else {
+        incognitoActiveSessionByServerRef.current.delete(selectedServerId);
+      }
+    }
+    // Update this before setOpenSubIds: state setters below run in the same
+    // turn, before the hash-sync effect can publish the new tab-local scope.
+    openSubPersistenceSessionRef.current = name;
+    openSubPersistenceServerRef.current = selectedServerId;
+    if (name && !isIncogActive) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
+    let restoredOpenSubIds: string[] = [];
     if (!opts?.keepSubWindows) {
-      setMaximizedSubIds(new Set());
+      const persistedMax = loadPersistedMaximizedSubSessionIds(selectedServerId, name);
+      const incogMax = name && selectedServerId ? incognitoMaximizedSubWindowsRef.current.get(`${selectedServerId}:${name}`) : undefined;
+      if (incogMax && incogMax.size > 0) {
+        for (const id of incogMax) persistedMax.add(id);
+      }
+      setMaximizedSubIds(persistedMax);
       setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
+        const nextOpen = new Set<string>();
         try {
           const raw = localStorage.getItem(`rcc_open_subs_${name}`);
-          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[])); }
-          else { setOpenSubIds(new Set()); }
-        } catch { setOpenSubIds(new Set()); }
+          if (raw) {
+            for (const id of JSON.parse(raw) as string[]) nextOpen.add(id);
+          }
+        } catch { /* ignore */ }
+        const incogOpen = selectedServerId ? incognitoOpenSubWindowsRef.current.get(`${selectedServerId}:${name}`) : undefined;
+        if (incogOpen) {
+          for (const id of incogOpen) nextOpen.add(id);
+        }
+        restoredOpenSubIds = Array.from(nextOpen);
+        setOpenSubIds(nextOpen, { retainPrevious: true });
       } else {
-        setOpenSubIds(new Set());
+        setOpenSubIds(new Set(), { retainPrevious: true });
       }
     }
-    // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
-    if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
-  }, [setOpenSubIds]);
+    // scroll chat to bottom on session switch (rAF + onChatScrollFn registration handles async mount)
+    if (opts?.scrollToBottom === false) {
+      if (!name) clearPendingMainChatScroll();
+      else clearPendingMainChatScroll(name);
+      clearPendingSubChatScroll();
+      pendingServerSwitchScrollRef.current = null;
+    } else if (name) {
+      const matchesServerSwitchScroll = pendingServerSwitchScrollRef.current !== null
+        && pendingServerSwitchScrollRef.current === selectedServerIdRef.current;
+      if (matchesServerSwitchScroll) {
+        pendingServerSwitchScrollRef.current = null;
+      }
+      scheduleMainChatScrollToBottom(name);
+      if (matchesServerSwitchScroll || restoredOpenSubIds.length > 0) {
+        const subIdsToScroll = new Set<string>(restoredOpenSubIds);
+        if (matchesServerSwitchScroll && focusedSubIdRef.current && openSubIdsRef.current.has(focusedSubIdRef.current)) {
+          subIdsToScroll.add(focusedSubIdRef.current);
+        }
+        for (const subId of subIdsToScroll) {
+          scheduleSubChatScrollToBottom(subId);
+        }
+      }
+    }
+  }, [clearPendingMainChatScroll, clearPendingSubChatScroll, scheduleMainChatScrollToBottom, scheduleSubChatScrollToBottom, selectedServerId, setOpenSubIds]);
+
+  type PendingNavigationTarget = {
+    serverId?: string;
+    session: string;
+    quote?: string;
+    taskQuote?: PendingTaskQuotePayload;
+  };
+  const [pendingNav, setPendingNavState] = useState<PendingNavigationTarget | null>(() => {
+    // Post-reload fallback: pick up pending push target from localStorage if present
+    const target = localStorage.getItem('rcc_push_target');
+    if (!target) return null;
+    localStorage.removeItem('rcc_push_target');
+    const quote = localStorage.getItem('rcc_push_quote') ?? undefined;
+    if (quote) localStorage.removeItem('rcc_push_quote');
+    return { session: target, quote };
+  });
+  const pendingNavRef = useRef<PendingNavigationTarget | null>(pendingNav);
+  const updatePendingNav = useCallback((next: PendingNavigationTarget | null) => {
+    pendingNavRef.current = next;
+    setPendingNavState(next);
+  }, []);
+
+  // Keep a server-scoped snapshot of the tab the user deliberately opened.
+  // It is written ONLY for an explicit choice (rememberIntentRef): an
+  // unresolved selection (null, e.g. a boot from a server-only hash) must not
+  // erase it before the restore reads it, and an automatic fallback must not
+  // replace it. The one-render guard prevents a server switch from briefly
+  // writing the previous server's active tab before its route/session restore.
+  const sessionSnapshotServerRef = useRef<string | null>(selectedServerId);
+  useEffect(() => {
+    if (sessionSnapshotServerRef.current !== selectedServerId) {
+      sessionSnapshotServerRef.current = selectedServerId;
+      return;
+    }
+    if (!selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    if (!activeSession || rememberIntentRef.current !== activeSession) return;
+    const isIncogActive = isIncognitoTimelineSession(selectedServerId, activeSession)
+      || sessionsRef.current.some((s) => s.name === activeSession && s.incognito === true);
+    if (isIncogActive) {
+      incognitoActiveSessionByServerRef.current.set(selectedServerId, activeSession);
+      return;
+    }
+    writeServerSession(selectedServerId, activeSession);
+  }, [activeSession, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
+
+  /**
+   * Restore the tab the user last had open on `serverId` once its session list
+   * is known (shared by the REST and websocket list paths). An explicit hash
+   * session wins, then the per-server memory; a missing/disabled tab falls back
+   * to the server's most recent/first main session without being remembered.
+   * Does nothing once the user has picked a tab on this server this load, so a
+   * late list can never override a click.
+   */
+  const restoreLastTabRef = useRef<(serverId: string, navigableNames: readonly string[]) => string | null>(() => null);
+  restoreLastTabRef.current = (serverId, navigableNames) => {
+    const activePending = pendingNavRef.current;
+    if (activePending && (!activePending.serverId || activePending.serverId === serverId)) {
+      return null;
+    }
+    if (explicitSelectionServerRef.current === serverId || navigableNames.length === 0) return null;
+    const incogPreferred = incognitoActiveSessionByServerRef.current.get(serverId);
+    const incogHit = incogPreferred && navigableNames.includes(incogPreferred) ? incogPreferred : null;
+    const remembered = readServerSession(serverId);
+    const preferred = incogHit
+      ?? resolveServerSessionSnapshot(
+        serverId,
+        initialHashStateRef.current.sessionName ?? remembered,
+        navigableNames.map((sessionName) => ({ serverId, sessionName })),
+        remembered,
+      )
+      ?? navigableNames[0]!;
+    setActiveSession(preferred, { remember: false });
+    // Migration: a tab that came from the hash or from an older build's single
+    // global value (not from a fallback) is where the user really was, so it
+    // becomes this server's memory when none exists yet. Otherwise a user who
+    // upgrades and never clicks a tab would lose it on the next server switch.
+    const isIncogPreferred = isIncognitoTimelineSession(serverId, preferred)
+      || (incognitoMainSessionsByServerRef.current.get(serverId)?.some((s) => s.name === preferred) ?? false);
+    if (!isIncogPreferred && !remembered && preferred === initialHashStateRef.current.sessionName) {
+      writeServerSession(serverId, preferred);
+    }
+    if (preferred !== initialHashStateRef.current.sessionName) {
+      initialHashStateRef.current = { ...initialHashStateRef.current, serverId, sessionName: preferred };
+      writeHashState(serverId, preferred);
+    }
+    return preferred;
+  };
+
+  const claimExplicitSessionNavigation = useCallback((name: string) => {
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+
+    const keepsSharedRoute = !selectedShareTarget
+      || selectedShareTarget.kind !== 'main'
+      || selectedShareTarget.sessionName === name;
+    const nextSharedEntryId = keepsSharedRoute ? selectedSharedEntryId : null;
+    if (!keepsSharedRoute) {
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      clearSharedTabRestoreMarker();
+      initialSharedTabRestoreRef.current = null;
+    }
+
+    const nextRoute = {
+      serverId: selectedServerId,
+      sessionName: name,
+      sharedEntryId: nextSharedEntryId,
+    };
+    initialHashStateRef.current = nextRoute;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
+  }, [selectedServerId, selectedSharedEntryId, selectedShareTarget]);
 
   const selectMainSessionTab = useCallback((name: string) => {
+    claimExplicitSessionNavigation(name);
     if (name === activeSessionRef.current) {
       closeAllSubSessionWindows();
+      scheduleMainChatScrollToBottom(name);
     } else {
       setActiveSession(name);
     }
@@ -2004,24 +4432,32 @@ export function App() {
       next.delete(name);
       return next;
     });
-  }, [closeAllSubSessionWindows, setActiveSession]);
+  }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, scheduleMainChatScrollToBottom, setActiveSession]);
 
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
+    claimExplicitSessionNavigation(sub.parentSession ?? activeSessionRef.current ?? sub.sessionName);
     if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
       setActiveSession(sub.parentSession, { keepSubWindows: true });
     }
     openSubSessionWindow(sub.id);
-  }, [openSubSessionWindow, setActiveSession]);
+  }, [claimExplicitSessionNavigation, openSubSessionWindow, setActiveSession]);
 
   useEffect(() => {
-    if (!activeSession) return;
+    // Do not let a persisted/hash-selected tab survive once the current
+    // server's authoritative session list has loaded and says it is gone.
+    // This covers server switching, refresh/back-forward, and permission or
+    // role changes that remove a previously navigable tab.
+    if (!activeSession || !sessionsLoaded) return;
     if (navigableMainSessions.some((session) => session.name === activeSession)) return;
     const hiddenActive = sessions.find((session) => session.name === activeSession);
-    if (!hiddenActive || isNavigableMainSession(hiddenActive)) return;
-    const replacement = navigableMainSessions.find((session) => session.project === hiddenActive.project)
+    if (hiddenActive && isNavigableMainSession(hiddenActive)) return;
+    const replacement = (hiddenActive
+      ? navigableMainSessions.find((session) => session.project === hiddenActive.project)
+      : undefined)
       ?? navigableMainSessions[0];
-    if (replacement) setActiveSession(replacement.name);
-  }, [activeSession, navigableMainSessions, sessions, setActiveSession]);
+    // Automatic: the replacement is a fallback, not something the user chose.
+    setActiveSession(replacement?.name ?? null, { remember: false });
+  }, [activeSession, navigableMainSessions, sessions, sessionsLoaded, setActiveSession]);
 
   useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
@@ -2050,10 +4486,20 @@ export function App() {
       if (cancelled || runId !== autoEntryRunRef.current || selectedServerIdRef.current) return;
 
       const recent = pickMostRecentMainSession(rows.filter((row) => typeof row.previewUpdatedAt === 'number'));
-      const fallback = pickAutoEntryServer(servers, savedServerId);
-      const savedFallbackSession = fallback ? localStorage.getItem(`rcc_session_${fallback.serverId}`) : null;
+      // Entering with no server selected (first load after a login, the
+      // dashboard) returns to where the user last was: the saved server, else
+      // the server whose tab was remembered most recently. Only then does
+      // recent activity decide.
+      const fallback = pickAutoEntryServer(servers, savedServerId ?? readLastRememberedServerId());
+      const rememberedTab = fallback ? readServerSession(fallback.serverId) : null;
+      const rememberedStillThere = fallback && rememberedTab
+        && resolveServerSessionSnapshot(fallback.serverId, rememberedTab, rows) === rememberedTab;
+      const savedFallbackSession = fallback
+        ? resolveServerSessionSnapshot(fallback.serverId, readServerSession(fallback.serverId), rows)
+        : null;
       const firstMain = pickMostRecentMainSession(rows);
-      const selection = recent
+      const selection = (rememberedStillThere && fallback ? { ...fallback, sessionName: rememberedTab } : null)
+        ?? recent
         ?? (fallback && savedFallbackSession ? { ...fallback, sessionName: savedFallbackSession } : null)
         ?? firstMain
         ?? fallback;
@@ -2065,14 +4511,11 @@ export function App() {
       else localStorage.removeItem('rcc_server_name');
       setSelectedServerId(selection.serverId);
       setSelectedServerName(server?.name ?? null);
-      if (selection.sessionName) {
-        localStorage.setItem(`rcc_session_${selection.serverId}`, selection.sessionName);
-        setActiveSession(selection.sessionName);
-      } else {
-        const savedSession = localStorage.getItem(`rcc_session_${selection.serverId}`);
-        setActiveSession(savedSession);
-      }
-      writeHashState(selection.serverId, selection.sessionName ?? localStorage.getItem(`rcc_session_${selection.serverId}`));
+      // Automatic entry: whatever it lands on is a fallback, never recorded as
+      // the user's own last tab (that memory is only written by a real choice).
+      const entered = selection.sessionName ?? savedFallbackSession;
+      setActiveSession(entered, { remember: false });
+      writeHashState(selection.serverId, entered);
     };
 
     void choose().finally(() => {
@@ -2086,9 +4529,6 @@ export function App() {
   const wsRef = useRef<WsClient | null>(null);
 
   // ── Classic discussion startup feedback (optimistic launch + failure UX) ──
-  // Always read the latest translator inside stable callbacks.
-  const transRef = useRef(trans);
-  transRef.current = trans;
   // requestIds this tab dispatched — gates initiator-only failure toasts.
   const initiatedRequestIdsRef = useRef<Set<string>>(new Set());
   // Backstop timers keyed by requestId (send OK but no started/error).
@@ -2117,6 +4557,28 @@ export function App() {
       message: t(reasonKey),
     }]);
     setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+  }, []);
+
+  // A shared participant's Stop was refused: say why, and when the cause is that
+  // the turn changed, adopt the running turn so the next tap names the right one.
+  useEffect(() => {
+    const onShareCancelFailed = (event: Event) => {
+      const failure = (event as CustomEvent<ShareCancelFailure>).detail;
+      const t = transRef.current;
+      if (failure.session && failure.activeDispatchId) {
+        const { session, activeDispatchId } = failure;
+        setSharedActiveDispatchIds((previous) => new Map(previous).set(session, activeDispatchId));
+      }
+      const id = Date.now() + Math.random();
+      setToasts((prev) => [...prev, {
+        id, sessionName: '', project: '', kind: 'notification',
+        title: t('share.cancel_failed.title'),
+        message: t(`share.cancel_failed.reason.${shareCancelFailureReasonKey(failure.reason)}`),
+      }]);
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+    };
+    window.addEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
+    return () => window.removeEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
   }, []);
 
   // App owns the optimistic launch state and mints the requestId so the
@@ -2159,10 +4621,10 @@ export function App() {
     }
     setShowDiscussionDialog(false);
   }, [pushDiscussionFailureToast]);
-  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<DaemonStatsView | null>(null);
 
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || sharedHashRestorePending) return;
     let cancelled = false;
     void listP2pRuns(selectedServerId)
       .then((runs) => {
@@ -2177,16 +4639,95 @@ export function App() {
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, sharedHashRestorePending]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
-  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
+  const canonicalSharedSessionName = selectedShareTarget
+    ? (selectedShareTarget.kind === 'subsession'
+        ? `deck_sub_${selectedShareTarget.subSessionId}`
+        : selectedShareTarget.kind === 'main'
+          ? selectedShareTarget.sessionName
+          : undefined)
+    : undefined;
+  const staleSubSessionsSnapshotRef = useRef<readonly SubSession[] | null>(null);
+  const rawSubSessionsRef = useRef<readonly SubSession[]>([]);
+  const {
+    subSessions: rawSubSessions,
+    visibleSubSessions: rawVisibleSubSessions,
+    loadedServerId,
+    create: createSubSession,
+    close: closeSubSession,
+    restart: restartSubSession,
+    rename: renameSubSession,
+    updateLocal: updateSubLocal,
+    hydrateShared: hydrateSharedSubSessions,
+  } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
-    activeSession,
+    activeSession || canonicalSharedSessionName || null,
     Boolean(selectedShareTarget),
   );
+  rawSubSessionsRef.current = rawSubSessions;
+  useEffect(() => {
+    if (rawSubSessions !== staleSubSessionsSnapshotRef.current) {
+      staleSubSessionsSnapshotRef.current = null;
+    }
+  }, [rawSubSessions]);
+  const activeScopedSession = activeSession || canonicalSharedSessionName || null;
+  const subSessionsScopedToServer = Boolean(selectedServerId)
+    && loadedServerId === selectedServerId
+    && rawSubSessions !== staleSubSessionsSnapshotRef.current;
+  const subSessions = useMemo(
+    () => (subSessionsScopedToServer ? rawSubSessions : []),
+    [rawSubSessions, subSessionsScopedToServer],
+  );
+  const visibleSubSessions = useMemo(
+    () => (subSessionsScopedToServer && activeScopedSession ? rawVisibleSubSessions : []),
+    [activeScopedSession, rawVisibleSubSessions, subSessionsScopedToServer],
+  );
+
+  // Session settings may stay open across a daemon rolling upgrade. Keep the
+  // authority fields live instead of freezing the identity snapshot captured
+  // when the dialog opened; otherwise peer-audit candidates remain hidden
+  // until the user closes and reopens the dialog after session_list/subsession
+  // sync starts projecting sessionInstanceId + runtimeEpoch.
+  useEffect(() => {
+    setSettingsTarget((current) => {
+      if (!current) return current;
+      const source = current.subId
+        ? subSessions.find((sub) => sub.id === current.subId || sub.sessionName === current.sessionName)
+        : sessions.find((session) => session.name === current.sessionName);
+      if (!source) return current;
+      const sessionInstanceId = source.sessionInstanceId ?? current.sessionInstanceId;
+      const runtimeEpoch = source.runtimeEpoch ?? current.runtimeEpoch;
+      const activeModel = source.activeModel ?? current.activeModel;
+      const requestedModel = source.requestedModel ?? current.requestedModel;
+      const modelDisplay = source.modelDisplay ?? current.modelDisplay;
+      const providerId = source.providerId ?? current.providerId;
+      const supervisionMode = source.supervisionMode ?? current.supervisionMode;
+      if (sessionInstanceId === current.sessionInstanceId
+        && runtimeEpoch === current.runtimeEpoch
+        && activeModel === current.activeModel
+        && requestedModel === current.requestedModel
+        && modelDisplay === current.modelDisplay
+        && providerId === current.providerId
+        && supervisionMode === current.supervisionMode) {
+        return current;
+      }
+      return {
+        ...current,
+        sessionInstanceId,
+        runtimeEpoch,
+        activeModel,
+        requestedModel,
+        modelDisplay,
+        providerId,
+        supervisionMode,
+      };
+    });
+  }, [sessions, subSessions]);
+
   const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
     if (!isMobileRef.current) return null;
     const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
@@ -2246,49 +4787,208 @@ export function App() {
       const parentState = sub.parentSession ? managedSharedSessionStateByName.get(sub.parentSession) : null;
       const state = directState ?? parentState ?? selectedServerSharedOutState;
       if (!state) continue;
-      states.set(sub.id, state);
-      states.set(sub.sessionName, state);
+      const withActiveDispatch = {
+        ...state,
+        activeDispatchId: sharedActiveDispatchIds.get(sub.sessionName) ?? null,
+      };
+      states.set(sub.id, withActiveDispatch);
+      states.set(sub.sessionName, withActiveDispatch);
     }
     return states;
-  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, subSessions]);
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds, subSessions]);
 
-  const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
-    if (openingSharedEntryId) return;
+  const resetServerScopedOverlaysAndTargets = useCallback((preservePendingNavForServerId?: string | null) => {
+    askAnswerTrackerRef.current?.dispose();
+    dismissedQuestionsRef.current.clear();
+    detectedModelsRef.current = new Map();
+    subUsageBatcherRef.current?.cancel();
+    activeSplitPairRef.current = null;
+    (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+    setActiveSplitPairTaskId(null);
+    setPendingQuestion(null);
+    setAskAnswerFailure(null);
+    setShareDialogTarget(null);
+    setSettingsTarget(null);
+    setCloneSessionTarget(null);
+    setPreviewFileRequest(null);
+    setPreviewFileCache({});
+    setShowRepoPage(false);
+    setRepoPanelTarget(null);
+    setRepoFocusLatestAction(null);
+    setShowCronManager(false);
+    setShowDiscussionsPage(false);
+    setDiscussionInitialId(null);
+    setDiscussionInitialTab('team');
+    setShowSharedContextManagement(false);
+    setSharedContextManagementProps({});
+    setShowSharedContextDiagnostics(false);
+    setSharedContextDiagnosticsProps({});
+    setShowDesktopFileBrowser(false);
+    setShowMobileFileBrowser(false);
+    setDesktopFileBrowserMaximized(false);
+    setShowDesktopLocalWebPreview(false);
+    setLocalWebPreviewPort('');
+    setLocalWebPreviewPath('/');
+    setShowNewSession(false);
+    setShowSubDialog(false);
+    setPoolAddTarget(null);
+    setShowDiscussionDialog(false);
+    setAppOpenSpecAutoDetailsOpen(false);
+    setRenameRequest(null);
+    setDeleteTarget(null);
+    setDaemonUpgradeConfirmTarget(null);
+    setIdleAlerts(new Set());
+    setIdleFlashTokens(new Map());
+    setDetectedModels(new Map());
+    setSubUsages(new Map());
+    setP2pSessionNames(new Set());
+    if (!preservePendingNavForServerId || pendingNavRef.current?.serverId !== preservePendingNavForServerId) {
+      updatePendingNav(null);
+      setPendingTaskQuote(null);
+    }
+    setPendingPrefills({});
+  }, [updatePendingNav]);
+
+  const handleOpenSharedEntry = useCallback(async (
+    entry: SharedEntrySummary,
+    options?: {
+      restoreFromHash?: boolean;
+      preferredSessionName?: string | null;
+      source?: 'ui' | 'external' | 'startup';
+    },
+  ): Promise<SharedOpenResultStatus> => {
+    const preferredSession = options?.preferredSessionName
+      ?? (entry.target.kind === 'main' ? entry.target.sessionName : null);
+    const subSessionId = entry.target.kind === 'subsession' ? entry.target.subSessionId : undefined;
+
+    const currentIntent = sharedOpenIntentRef.current;
+    if (
+      currentIntent !== null
+      && currentIntent.entryId === entry.id
+      && currentIntent.targetKind === entry.target.kind
+      && currentIntent.preferredSessionName === preferredSession
+      && currentIntent.subSessionId === subSessionId
+    ) {
+      return 'duplicate';
+    }
+
+    sharedOpenAbortRef.current?.abort();
+    const abortController = new AbortController();
+    sharedOpenAbortRef.current = abortController;
+    const openGeneration = ++sharedOpenGenerationRef.current;
+
+    const source = options?.source ?? (options?.restoreFromHash ? 'startup' : 'ui');
+    if (source !== 'external') {
+      externalRouteGenerationRef.current += 1;
+      externalRouteInFlightKeyRef.current = null;
+    }
+
+    sharedOpenIntentRef.current = {
+      generation: openGeneration,
+      entryId: entry.id,
+      targetKind: entry.target.kind,
+      serverId: entry.serverId,
+      preferredSessionName: preferredSession,
+      subSessionId,
+      source,
+    };
+    const returnServer = options?.restoreFromHash
+      ? null
+      : selectedShareTarget
+      ? sharedReturnServer
+      : selectedServerId
+        ? {
+            id: selectedServerId,
+            name: resolvedSelectedServerName
+              ?? servers.find((server) => server.id === selectedServerId)?.name
+              ?? selectedServerId,
+          }
+        : null;
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
     try {
-      const opened = await openSharedEntry(entry.target);
+      const opened = await openSharedEntry(entry.target, { signal: abortController.signal });
+      if (openGeneration !== sharedOpenGenerationRef.current) return 'superseded';
+      const openedHeartbeat = typeof opened.server.lastHeartbeatAt === 'number'
+        && Number.isFinite(opened.server.lastHeartbeatAt)
+        && opened.server.lastHeartbeatAt > 0
+        ? opened.server.lastHeartbeatAt
+        : null;
+      const openedObservedAt = typeof (opened.server as any).statusObservedAt === 'number'
+        && Number.isFinite((opened.server as any).statusObservedAt)
+        && (opened.server as any).statusObservedAt > 0
+        ? (opened.server as any).statusObservedAt
+        : null;
       const nextServer: ServerInfo = {
         id: opened.server.id,
         name: opened.server.name,
-        status: opened.server.status ?? 'online',
-        lastHeartbeatAt: opened.server.lastHeartbeatAt ?? Date.now(),
+        status: opened.server.status ?? 'active',
+        lastHeartbeatAt: openedHeartbeat,
+        statusObservedAt: openedObservedAt,
         createdAt: Date.now(),
       };
       const mappedSessions: SessionInfo[] = opened.sessions.map((session) => {
         const parsed = parseMainSessionName(session.sessionName);
         return {
           name: session.sessionName,
-          project: session.title || parsed?.project || session.sessionName,
+          project: resolveSharedSessionProject(session.sessionName, session.title),
           role: parsed?.role ?? 'brain',
           agentType: session.agentType || 'unknown',
           state: session.state as SessionInfo['state'],
           label: session.title,
+          supervisionMode: session.supervisionMode ?? null,
           sharedState: {
+            targetKind: opened.target.kind,
             effectiveRole: opened.coverage.effectiveRole,
             status: 'active',
             scopeLabel: entry.targetLabel,
+            activeDispatchId: session.activeDispatchId ?? null,
           },
         };
       });
 
+      const openedDispatchIds = new Map<string, string>();
+      for (const session of opened.sessions) {
+        if (session.activeDispatchId) openedDispatchIds.set(session.sessionName, session.activeDispatchId);
+      }
+      for (const subSession of opened.subSessions) {
+        if (subSession.activeDispatchId) openedDispatchIds.set(subSession.sessionName, subSession.activeDispatchId);
+      }
+      if (opened.server.id !== selectedServerIdRef.current) {
+        resetServerScopedOverlaysAndTargets();
+        setOpenSubIds(new Set());
+        setRetainedOpenSubIds(new Set());
+        setMaximizedSubIds(new Set());
+        chatScrollFnsRef.current.clear();
+        subChatScrollFnsRef.current.clear();
+        clearPendingMainChatScroll();
+        clearPendingSubChatScroll();
+        pendingServerSwitchScrollRef.current = opened.server.id;
+        setDiscussions([]);
+        setRepoContexts(new Map());
+        setManagedShares([]);
+      }
+      setSharedActiveDispatchIds(openedDispatchIds);
+
       setSelectedShareTarget(opened.target);
+      setSelectedSharedEntryId(entry.id);
+      rememberSharedTab(entry);
       setManualDashboard(false);
+      selectedServerIdRef.current = opened.server.id;
       setSelectedServerId(opened.server.id);
       setSelectedServerName(opened.server.name);
       setServers((prev) => (
         prev.some((server) => server.id === nextServer.id)
-          ? prev.map((server) => server.id === nextServer.id ? { ...server, ...nextServer } : server)
+          ? prev.map((server) => {
+              if (server.id !== nextServer.id) return server;
+              return {
+                ...server,
+                ...nextServer,
+                status: nextServer.status !== 'active' ? nextServer.status : (server.status ?? 'active'),
+                lastHeartbeatAt: nextServer.lastHeartbeatAt ?? server.lastHeartbeatAt,
+                statusObservedAt: nextServer.statusObservedAt ?? server.statusObservedAt,
+              };
+            })
           : [nextServer, ...prev]
       ));
       setServersLoaded(true);
@@ -2297,7 +4997,11 @@ export function App() {
       hydrateSharedSubSessions(opened.server.id, opened.subSessions);
 
       const openedTarget = opened.target;
-      const activeFromTarget = openedTarget.kind === 'main'
+      const preferredSessionName = options?.preferredSessionName;
+      const activeFromTarget = preferredSessionName
+        && mappedSessions.some((session) => session.name === preferredSessionName)
+        ? preferredSessionName
+        : openedTarget.kind === 'main'
         ? openedTarget.sessionName
         : openedTarget.kind === 'subsession'
           ? (opened.subSessions.find((sub) => sub.subSessionId === openedTarget.subSessionId)?.parentSessionName ?? null)
@@ -2309,24 +5013,149 @@ export function App() {
       } else {
         localStorage.removeItem('rcc_session');
       }
-      setActiveSession(activeFromTarget, { keepSubWindows: true });
+      // A shared target is not a choice of the owner's own tab on any of their
+      // servers: never remember it, and never let it block a later restore.
+      setActiveSession(activeFromTarget, { keepSubWindows: true, remember: false });
       if (openedTarget.kind === 'subsession') {
         setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
+        scheduleSubChatScrollToBottom(openedTarget.subSessionId);
+      }
+      if (returnServer) {
+        setSharedReturnServer(returnServer);
+        setShowSharedReturnGuide(true);
       }
       setShowMobileServerMenu(false);
       setMobileSidebarOpen(false);
+
+      const nextRoute = {
+        serverId: opened.server.id,
+        sessionName: activeFromTarget,
+        sharedEntryId: entry.id,
+      };
+      initialHashStateRef.current = nextRoute;
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
+
+      return 'opened';
     } catch (err) {
-      setSharedEntriesError(formatSharedAccessError(err));
+      if (openGeneration !== sharedOpenGenerationRef.current) return 'superseded';
+      if (abortController.signal.aborted && !(err instanceof SharedOpenTimeoutError)) {
+        return 'superseded';
+      }
+      setSharedEntriesError(formatSharedAccessError(err, trans));
+      return 'denied';
     } finally {
-      setOpeningSharedEntryId(null);
+      if (openGeneration === sharedOpenGenerationRef.current) {
+        sharedOpenIntentRef.current = null;
+        sharedOpenAbortRef.current = null;
+        setOpeningSharedEntryId(null);
+      }
     }
-  }, [hydrateSharedSubSessions, openingSharedEntryId, setActiveSession]);
+  }, [clearPendingMainChatScroll, clearPendingSubChatScroll, hydrateSharedSubSessions, resetServerScopedOverlaysAndTargets, resolvedSelectedServerName, scheduleSubChatScrollToBottom, selectedServerId, selectedShareTarget, servers, setActiveSession, setOpenSubIds, sharedReturnServer, trans]);
+
+  useEffect(() => {
+    if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
+    if (sharedHashRestoreStartedRef.current) return;
+
+    const initial = initialHashStateRef.current;
+    const urlSharedEntryId = initial.sharedEntryId;
+    const remembered = initialSharedTabRestoreRef.current?.serverId === initial.serverId
+      ? initialSharedTabRestoreRef.current
+      : null;
+    if (!initial.serverId
+      || selectedServerId !== initial.serverId
+      || selectedShareTarget) {
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      return;
+    }
+    if (!urlSharedEntryId && !remembered && servers.some((server) => server.id === initial.serverId)) {
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      return;
+    }
+    if (!sharedEntriesLoaded) return;
+
+    sharedHashRestoreStartedRef.current = true;
+    const discoveredEntry = urlSharedEntryId
+      ? sharedEntries.find((candidate) => (
+          candidate.status === 'active'
+          && candidate.id === urlSharedEntryId
+          && candidate.serverId === initial.serverId
+        )) ?? null
+      : remembered
+        ? findRememberedSharedEntry(sharedEntries, remembered)
+        : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    // The shared inventory is navigation UI, not restore authority. It can be
+    // temporarily empty during auth refresh/reconnect. For an explicit shared
+    // URL, reconstruct the main/server target and let /api/shares/open perform
+    // the authoritative coverage check instead of silently dropping home.
+    const entry = discoveredEntry ?? sharedEntryFallbackFromHash(
+      urlSharedEntryId,
+      initial.serverId,
+      initial.sessionName,
+    );
+    if (!entry) {
+      if (remembered) clearSharedTabRestoreMarker();
+      setSharedHashRestorePending(false);
+      return;
+    }
+
+    void handleOpenSharedEntry(entry, {
+      restoreFromHash: true,
+      preferredSessionName: initial.sessionName,
+      source: 'startup',
+    }).then((result) => {
+      if (result === 'opened' || !urlSharedEntryId) {
+        setSharedHashRestorePending(false);
+      }
+    });
+  }, [
+    auth,
+    handleOpenSharedEntry,
+    initialAuthVerificationPending,
+    selectedServerId,
+    selectedShareTarget,
+    servers,
+    serversLoaded,
+    sharedEntries,
+    sharedEntriesLoaded,
+    sharedHashRestorePending,
+  ]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
+    // Manual user close: remove this sub-session from any in-memory open/maximized incognito window state.
+    if (selectedServerId) {
+      for (const [key, ids] of incognitoOpenSubWindowsRef.current) {
+        if (key.startsWith(`${selectedServerId}:`)) {
+          ids.delete(id);
+          if (ids.size === 0) incognitoOpenSubWindowsRef.current.delete(key);
+        }
+      }
+      for (const [key, ids] of incognitoMaximizedSubWindowsRef.current) {
+        if (key.startsWith(`${selectedServerId}:`)) {
+          ids.delete(id);
+          if (ids.size === 0) incognitoMaximizedSubWindowsRef.current.delete(key);
+        }
+      }
+    }
+    setOpenSubIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    if (activeSplitPairRef.current && (activeSplitPairRef.current.executorSubId === id || activeSplitPairRef.current.auditorSubId === id)) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
     closeSubSession(id);
-  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
+  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow, selectedServerId, setOpenSubIds]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   // Weekly (7d) quota opt-in (per-user pref → all servers). Tell the daemon
@@ -2355,6 +5184,41 @@ export function App() {
     () => visibleSubSessions.map((sub) => sub.sessionName),
     [visibleSubSessions],
   );
+  const p2pDiscussionScopeSubSessionNames = useMemo(() => {
+    if (!activeRootSession) return visibleSubSessionNames;
+    const names = new Set(visibleSubSessionNames);
+    for (const sub of subSessions) {
+      if (sub.parentSession === activeRootSession || sub.sessionName === activeSession) {
+        names.add(sub.sessionName);
+      }
+    }
+    return [...names];
+  }, [activeRootSession, activeSession, subSessions, visibleSubSessionNames]);
+  const p2pRouteResyncKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const scopeSession = activeSession ?? activeRootSession ?? null;
+    const key = `${selectedServerId ?? ''}:${scopeSession ?? ''}`;
+    const ws = wsRef.current;
+    if (!auth || !selectedServerId || sharedHashRestorePending) {
+      p2pRouteResyncKeyRef.current = key;
+      return;
+    }
+    if (!connected || !ws?.connected) return;
+    const previousKey = p2pRouteResyncKeyRef.current;
+    p2pRouteResyncKeyRef.current = key;
+    if (!previousKey || previousKey === key) return;
+    const scope = scopeSession ? { sessionName: scopeSession } : undefined;
+    ws.p2pListDiscussions(scope);
+    requestP2pStatusWithCachedRunConfirmation(ws, scope);
+  }, [
+    activeRootSession,
+    activeSession,
+    auth,
+    connected,
+    requestP2pStatusWithCachedRunConfirmation,
+    selectedServerId,
+    sharedHashRestorePending,
+  ]);
   const p2pConfigPref = usePref(
     activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
@@ -2397,35 +5261,71 @@ export function App() {
     setP2pSessionNames(names);
   }, [activeRootSession, p2pConfigPref.value]);
 
-  const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
+  const diffApplyersRef = useRef(new TerminalDiffRegistry());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
   const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
+  const hasBlockingComposerOverlayRef = useRef(false);
+  const hasBlockingNavigationOverlayRef = useRef(false);
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  // Per-session chat scroll functions — registered by SessionPane
-  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
 
-  // Auto-navigate to the session that raised an AskUserQuestion so the operator
-  // sees its context (the card itself is a global overlay, but the underlying
-  // view should follow). Runs once per question (tracked by toolUseId).
-  const navigatedQuestionRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!pendingQuestion) { navigatedQuestionRef.current = null; return; }
-    if (navigatedQuestionRef.current === pendingQuestion.toolUseId) return;
-    navigatedQuestionRef.current = pendingQuestion.toolUseId;
-    const sid = pendingQuestion.sessionName;
-    if (isSubSessionName(sid)) {
-      const sub = subSessionsRef.current.find((s) => s.sessionName === sid);
-      if (sub) openSubSessionWindow(sub.id);
-    } else {
-      setActiveSession(sid);
+  const submitAskQuestionAnswer = useCallback((sessionName: string, toolUseId: string, answer: string): boolean => {
+    const ws = wsRef.current;
+    const sent = ws?.askAnswer(
+      sessionName,
+      answer,
+      { toolUseId },
+    );
+    if (!ws || (sent && !sent.ok)) {
+      // Nothing left the browser: keep the card (and the user's
+      // selections) open instead of dismissing it as if answered.
+      const toastId = Date.now() + Math.random();
+      setToasts((prev) => [...prev, {
+        id: toastId,
+        kind: 'notification',
+        title: trans(sent && !sent.ok && sent.reason === 'too_large' ? 'askQuestion.answerTooLarge' : 'askQuestion.answerNotSent'),
+      }]);
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== toastId)), 8000);
+      return false;
     }
-  }, [pendingQuestion, openSubSessionWindow, setActiveSession]);
+    if (sent?.commandId) {
+      askAnswerTrackerRef.current?.track({
+        commandId: sent.commandId,
+        sessionName,
+        toolUseId,
+        answer,
+      });
+    }
+    dismissedQuestionsRef.current.add(toolUseId);
+    setPendingQuestion((prev) => (prev && prev.toolUseId === toolUseId ? null : prev));
+    return true;
+  }, []);
+
+  // Re-surface a still-pending question in the DEDICATED dialog from timeline
+  // history — `pendingQuestion` is otherwise only set from live WS events, so a
+  // question received via push (or after a reload / on another device) would be
+  // lost. A session view calls this with the trailing ask.question it finds.
+  // Only surfaces one that isn't already showing, hasn't been answered/dismissed,
+  // and isn't already visible inline in the active session's chat timeline.
+  const surfaceAskQuestionFromHistory = useCallback((sessionName: string, q: TrailingAskQuestion | null) => {
+    if (!q || !q.toolUseId || dismissedQuestionsRef.current.has(q.toolUseId)) return;
+    if (isAskQuestionSessionVisible(sessionName, askQuestionUiStateRef.current)) return;
+    setPendingQuestion((prev) => {
+      if (prev) return prev; // a question (live or already-hydrated) is showing — don't override
+      pendingQuestionAtRef.current = Date.now();
+      return {
+        sessionName,
+        toolUseId: q.toolUseId,
+        questions: normalizeAskQuestionsPayload(q.questions),
+        ...(typeof q.waitMs === 'number' ? { waitMs: q.waitMs } : {}),
+      };
+    });
+  }, []);
 
   const visibleSubSessionStackKey = useMemo(
     () => visibleSubSessions
@@ -2500,6 +5400,27 @@ export function App() {
     });
   }, [sessions, subSessions]);
 
+  // An idle completion alert belongs to the completed turn, not to the tab
+  // forever. If that session starts working again before the alert is
+  // dismissed, retaining the old token makes the CSS animation restart when
+  // the tab changes between active/inactive variants.
+  useEffect(() => {
+    const workingSessionNames = new Set(
+      sessions
+        .filter((session) => isWorkingSessionState(session.state))
+        .map((session) => session.name),
+    );
+    if (workingSessionNames.size === 0) return;
+    setIdleAlerts((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const sessionName of workingSessionNames) {
+        if (next.delete(sessionName)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [sessions]);
+
   // When sub-sessions load from API (after session_list already fired), sync them to Watch projection
   useEffect(() => {
     if (subSessions.length === 0 || !selectedServerId) return;
@@ -2543,17 +5464,22 @@ export function App() {
   }, [setPinnedPanels]);
 
   const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
-    runVersionSensitiveAction(trans('picker.files'), () => {
-      const cached = previewFileCache[request.path];
-      const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
-      setPreviewFileRequest({
-        ...request,
-        preview: request.preview ?? cached?.preview,
-        preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
-        previewViewMode,
-      });
+    const featureLabel = trans('picker.files');
+    if (appUpdateRequiredRef.current) {
+      showAppUpdateBlocker(featureLabel);
+      return;
+    }
+    focusFilePreviewWindow();
+    const cached = previewFileCache[request.path];
+    const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
+    setPreviewFileRequest({
+      ...request,
+      preview: request.preview ?? cached?.preview,
+      preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
+      previewViewMode,
     });
-  }, [previewFileCache, runVersionSensitiveAction, trans]);
+    void checkForAppUpdate({ blocking: true, featureLabel });
+  }, [checkForAppUpdate, focusFilePreviewWindow, previewFileCache, showAppUpdateBlocker, trans]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
     setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
@@ -2563,15 +5489,36 @@ export function App() {
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
     const removePanel = () => setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
+    const sessionsLoading = !sessionsLoaded && Boolean(selectedServerId);
     // Reopen source window based on type
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
       runVersionSensitiveAction(trans('picker.files'), () => {
         removePanel();
         setShowDesktopFileBrowser(true);
       });
     } else if (panel.type === 'repopage') {
-      const projectDir = typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined;
-      const sessionId = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : activeSession ?? null;
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
+      const tabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+      const allowCaptured = isPinnedPanelForServer(panel, selectedServerId);
+      const liveProjectDir = sessions.find((s) => s.name === activeSession)?.projectDir;
+      const currentProjectDir = typeof liveProjectDir === 'string' && liveProjectDir.trim() ? liveProjectDir : undefined;
+      const capturedProjectDir = allowCaptured && typeof panel.props?.projectDir === 'string' && panel.props.projectDir.trim()
+        ? panel.props.projectDir
+        : undefined;
+      const projectDir = tabShare
+        ? FS_SESSION_ROOT_PATH
+        : currentProjectDir ?? capturedProjectDir;
+      const capturedSessionId = allowCaptured && typeof panel.props?.sessionName === 'string' && panel.props.sessionName.trim()
+        ? panel.props.sessionName
+        : null;
+      const sessionId = activeSession ?? capturedSessionId;
       if (projectDir) {
         runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
           removePanel();
@@ -2580,48 +5527,150 @@ export function App() {
             sessionId,
             projectDir,
             initialTabToken: repoPanelOpenTokenRef.current,
+            parentServerId: selectedServerId ?? null,
           });
           setShowRepoPage(true);
         });
+      } else {
+        removePanel();
       }
     } else if (panel.type === 'cronmanager') {
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
       runVersionSensitiveAction(trans('cron.title'), () => {
         removePanel();
         setShowCronManager(true);
       });
     } else if (panel.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE) {
       removePanel();
-      setSharedContextManagementProps(panel.props);
-      setShowSharedContextManagement(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setSharedContextManagementProps(panel.props);
+        setShowSharedContextManagement(true);
+      }
     } else if (panel.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE) {
       removePanel();
-      setSharedContextDiagnosticsProps({
-        enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
-        canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
-        workspaceId: typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined,
-        enrollmentId: typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined,
-        language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
-        filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
-      });
-      setShowSharedContextDiagnostics(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setSharedContextDiagnosticsProps({
+          enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
+          canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
+          workspaceId: typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined,
+          enrollmentId: typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined,
+          language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
+          filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
+        });
+        setShowSharedContextDiagnostics(true);
+      }
     } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
       removePanel();
-      setLocalWebPreviewPort(String(panel.props?.port ?? ''));
-      setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
-      setShowDesktopLocalWebPreview(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setLocalWebPreviewPort(String(panel.props?.port ?? ''));
+        setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
+        setShowDesktopLocalWebPreview(true);
+      }
     } else if (panel.type === 'subsession') {
       removePanel();
-      const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
-      if (sub) {
-        setOpenSubIds((prev) => new Set([...prev, sub.id]));
-        bringSubToFront(sub.id);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
+        if (sub) {
+          setOpenSubIds((prev) => new Set([...prev, sub.id]));
+          bringSubToFront(sub.id);
+        }
       }
     }
-  }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
+  }, [activeSession, bringSubToFront, isPinnedPanelForServer, runVersionSensitiveAction, selectedServerId, selectedShareTarget, sessions, sessionsLoaded, setPinnedPanels, subSessions, trans]);
 
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const isMobile = isMobileDevice();
   isMobileRef.current = isMobile;
+  const [isExpandedMobile, setIsExpandedMobile] = useState(() => isExpandedMobileViewport());
+  useEffect(() => {
+    const syncExpanded = () => {
+      const next = isExpandedMobileViewport();
+      setIsExpandedMobile((prev) => (prev === next ? prev : next));
+    };
+    syncExpanded();
+    const unsubDevice = subscribeDeviceLayoutChange(syncExpanded, { includeResize: true });
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    vv?.addEventListener('resize', syncExpanded);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('orientationchange', syncExpanded);
+    }
+    return () => {
+      unsubDevice();
+      vv?.removeEventListener('resize', syncExpanded);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('orientationchange', syncExpanded);
+      }
+    };
+  }, []);
+  const toggleMobileSidebar = useCallback(() => {
+    const next = !mobileSidebarOpen;
+    if (next && isExpandedMobile && showSupervisionTaskConsole) {
+      closeSupervisionTaskConsole();
+    }
+    setMobileSidebarOpen(next);
+  }, [mobileSidebarOpen, isExpandedMobile, showSupervisionTaskConsole, closeSupervisionTaskConsole]);
+
+  const prevShowSupervisionTaskConsoleRef = useRef(showSupervisionTaskConsole);
+  useEffect(() => {
+    const wasOpen = prevShowSupervisionTaskConsoleRef.current;
+    prevShowSupervisionTaskConsoleRef.current = showSupervisionTaskConsole;
+    if (!isMobile || !isExpandedMobile) return;
+    if (showSupervisionTaskConsole && mobileSidebarOpen) {
+      if (!wasOpen) {
+        setMobileSidebarOpen(false);
+      } else {
+        closeSupervisionTaskConsole();
+      }
+    }
+  }, [isMobile, isExpandedMobile, mobileSidebarOpen, showSupervisionTaskConsole, closeSupervisionTaskConsole]);
+
   const desktopLayoutCapable = !isMobile;
+  const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (
+    isP2pDiscussionVisibleInSubSessionBar(discussion, {
+      activeSession,
+      activeRootSession,
+      visibleSubSessionNames: p2pDiscussionScopeSubSessionNames,
+    })
+  )), [activeRootSession, activeSession, discussions, p2pDiscussionScopeSubSessionNames]);
+  const mobileRemoteSurfaceActive = isMobile
+    && ((remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+      || (remoteDesktopWallOpen && !remoteDesktopWallMinimized));
+
+  // Open sub-session windows are restored from localStorage, so a reload
+  // re-mounts all of them in one render pass — which is why reloading to escape
+  // a frozen tab just freezes it again. Mount them one frame at a time instead;
+  // the work is the same, but it becomes interruptible (see useProgressiveMount
+  // for the measurements).
+  //
+  // Keep this array in the stable visible-sub-session order. Stacking is owned
+  // exclusively by the explicit z-index stack above. Moving the focused keyed
+  // window to the front of this array also moves its live DOM node; Blink and
+  // WebKit then re-run scroll anchoring/compositing for both chat scrollers,
+  // which makes the window losing focus visibly jump even though Preact keeps
+  // the component instance alive.
+  const openWindowSubs = useMemo(() => {
+    return visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
+      && (isMobile || !pinnedPanels.some((p) => (
+        p.type === 'subsession'
+        && p.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(p, sub.serverId ?? selectedServerId)
+      ))));
+  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels, isPinnedPanelForServer, selectedServerId]);
+  const visibleOpenWindowIds = useMemo(
+    () => new Set(openWindowSubs.map((sub) => sub.id)),
+    [openWindowSubs],
+  );
+  const retainedWindowSubs = useMemo(() => (
+    subSessions.filter((sub) => retainedOpenSubIds.has(sub.id)
+      && !pinnedPanels.some((p) => (
+        p.type === 'subsession'
+        && p.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(p, sub.serverId ?? selectedServerId)
+      )))
+  ), [pinnedPanels, retainedOpenSubIds, subSessions, isPinnedPanelForServer, selectedServerId]);
+  const mountedWindowCount = useProgressiveMount(retainedWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -2653,8 +5702,8 @@ export function App() {
           chatScrollFnsRef.current.get(activeSession)?.();
           // Steal focus from xterm textarea so it stops capturing keystrokes in chat mode.
           // Only on desktop — on mobile we don't want to pop up the keyboard automatically.
-          if (!/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
-            inputRefsMap.current.get(activeSession)?.focus();
+          if (!isMobileRef.current) {
+            focusComposerElement(inputRefsMap.current.get(activeSession));
           }
         });
       }
@@ -2673,20 +5722,113 @@ export function App() {
 
   // Set up WebSocket only when a server is selected
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || sharedHashRestorePending) return;
 
-    const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
+    const targetServerId = selectedServerId;
+    selectedServerIdRef.current = targetServerId;
+    let effectDisposed = false;
+    const isStaleSocket = () => (
+      effectDisposed || wsRef.current !== ws || selectedServerIdRef.current !== targetServerId
+    );
+    const ws = new WsClient(auth.baseUrl, targetServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
+    // Test-only, opt-in via an explicit query param: lets the identity-over-lease
+    // real-machine harness (test/perf/browser/identity-p2p.spec.mjs) call
+    // getSessionIdentityDirect/setSessionIdentityDirect directly against the
+    // app's own live connection, instead of driving the settings UI blindly.
+    // Never set unless a caller explicitly opts in via the URL.
+    if (new URLSearchParams(window.location.search).get('identityTestHooks') === '1') {
+      (window as unknown as { __identityTestWs__?: WsClient }).__identityTestWs__ = ws;
+      void import('./direct-file-transfer.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFileTransfer__?: unknown }).__identityTestDirectFileTransfer__ = mod;
+      });
+      void import('./session-identity-direct.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFirst__?: unknown }).__identityTestDirectFirst__ = mod;
+      });
+    }
 
     const unsub = ws.onMessage((msg) => {
+      if (isStaleSocket()) return;
+      askAnswerTrackerRef.current?.handle(msg);
+      if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
+        // The echo of an answer names the question it settled: close this
+        // device's copy of the card (answered from another tab/device).
+        const answeredId = msg.event.payload.askToolUseId;
+        if (typeof answeredId === 'string' && answeredId) {
+          dismissedQuestionsRef.current.add(answeredId);
+          setPendingQuestion((pq) => (pq?.toolUseId === answeredId ? null : pq));
+        }
+      }
+      if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS
+        && selectedServerId
+        && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('controlled-node-worker-refresh-status', {
+          detail: { serverId: selectedServerId, ...msg },
+        }));
+      }
+      if (msg.type === 'subsession.removed') {
+        const m = msg as { id?: unknown; sessionName?: unknown };
+        const rawSession = typeof m.sessionName === 'string' ? m.sessionName : '';
+        const removedId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
+        if (removedId) {
+          if (selectedServerId) {
+            for (const [key, ids] of incognitoOpenSubWindowsRef.current) {
+              if (key.startsWith(`${selectedServerId}:`)) {
+                ids.delete(removedId);
+                if (ids.size === 0) incognitoOpenSubWindowsRef.current.delete(key);
+              }
+            }
+            for (const [key, ids] of incognitoMaximizedSubWindowsRef.current) {
+              if (key.startsWith(`${selectedServerId}:`)) {
+                ids.delete(removedId);
+                if (ids.size === 0) incognitoMaximizedSubWindowsRef.current.delete(key);
+              }
+            }
+          }
+          setOpenSubIds((prev) => {
+            if (!prev.has(removedId)) return prev;
+            const next = new Set(prev);
+            next.delete(removedId);
+            return next;
+          });
+          removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(removedId));
+        }
+      }
       if (msg.type === 'session.event') {
+        const stoppedSession = msg.event === 'stopped' ? msg.session : undefined;
+        const targetSession = stoppedSession ?? msg.session;
+        const isIncognitoEventSession = Boolean(
+          targetSession
+          && selectedServerId
+          && (isIncognitoTimelineSession(selectedServerId, targetSession)
+            || sessionsRef.current.some((s) => s.name === targetSession && s.incognito === true)
+            || incognitoMainSessionsByServerRef.current.get(selectedServerId)?.some((s) => s.name === targetSession)),
+        );
+        const manualStopKey = selectedServerId && stoppedSession ? `${selectedServerId}:${stoppedSession}` : '';
+        const wasManualStop = Boolean(manualStopKey && manualStoppedMainSessionsRef.current.has(manualStopKey));
+        const shouldCloseStoppedSession = msg.event === 'stopped' && (!isIncognitoEventSession || wasManualStop);
+        if (stoppedSession && shouldCloseStoppedSession) {
+          if (manualStopKey) manualStoppedMainSessionsRef.current.delete(manualStopKey);
+          forgetIncognitoTimelineSessions(selectedServerId, stoppedSession);
+          if (selectedServerId) {
+            if (incognitoActiveSessionByServerRef.current.get(selectedServerId) === stoppedSession) {
+              incognitoActiveSessionByServerRef.current.delete(selectedServerId);
+            }
+            const remaining = (incognitoMainSessionsByServerRef.current.get(selectedServerId) ?? []).filter((s) => s.name !== stoppedSession);
+            if (remaining.length > 0) incognitoMainSessionsByServerRef.current.set(selectedServerId, remaining);
+            else incognitoMainSessionsByServerRef.current.delete(selectedServerId);
+          }
+        }
         if (msg.session) {
           watchProjectionStore.updateSessionState(msg.session, msg.state);
         }
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
-          void checkForAppUpdate();
+          const isProbeRecovered = msg.reason === 'probe_recovered';
+          if (!isProbeRecovered) void checkForAppUpdate();
           // `probe_recovered` only proves the socket is alive; control-plane
           // state (session list, P2P discussions/status) may still be stale
           // because we silently missed live events during the half-open window.
@@ -2694,8 +5836,7 @@ export function App() {
           // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
           // active-refresh listener in `useTimeline` already bare-dispatches on
           // probe_recovered (governed by the 15s success-only cooldown).
-          const isProbeRecovered = msg.reason === 'probe_recovered';
-          ws.requestSessionList();
+          if (!isProbeRecovered) ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
           // return [] if it cannot resolve a project scope from this session,
@@ -2703,7 +5844,7 @@ export function App() {
           // tracked inside the WS client via setP2pWorkflowRequestScope on
           // terminal subscribe — passing it explicitly here just makes the
           // scope source obvious at the call site.
-          {
+          if (!isProbeRecovered) {
             const initialActive = activeSessionRef.current;
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
@@ -2739,8 +5880,8 @@ export function App() {
         }
         if (msg.session && !isSubSessionName(msg.session)) {
           setSessions((prev) => {
-            // Stopped → remove the tab immediately
-            if (msg.event === 'stopped') {
+            // Stopped → remove the tab immediately ONLY for normal sessions or explicitly user-stopped incognito sessions
+            if (shouldCloseStoppedSession) {
               return prev.filter((s) => s.name !== msg.session);
             }
             const existing = prev.find((s) => s.name === msg.session);
@@ -2753,13 +5894,14 @@ export function App() {
                 role: parsed?.role ?? 'brain',
                 agentType: 'unknown',
                 state: msg.state as SessionInfo['state'],
+                ...(isIncognitoEventSession ? { incognito: true } : {}),
               }];
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });
           // Active session stopped → navigate back after a grace period
           // (allows restart to re-create the session before navigating away)
-          if (msg.event === 'stopped' && msg.session === activeSessionRef.current) {
+          if (shouldCloseStoppedSession && msg.session === activeSessionRef.current) {
             if (stoppedNavTimerRef.current) clearTimeout(stoppedNavTimerRef.current);
             stoppedNavTimerRef.current = setTimeout(() => {
               stoppedNavTimerRef.current = null;
@@ -2783,6 +5925,18 @@ export function App() {
         }
       }
       if (msg.type === 'session_list') {
+        syncIncognitoTimelineSessions(selectedServerId, msg.sessions);
+        if (selectedShareTarget) {
+          setSharedActiveDispatchIds((previous) => {
+            const next = new Map(previous);
+            for (const session of msg.sessions) {
+              if (!Object.prototype.hasOwnProperty.call(session, 'activeDispatchId')) continue;
+              if (session.activeDispatchId) next.set(session.name, session.activeDispatchId);
+              else next.delete(session.name);
+            }
+            return next;
+          });
+        }
         const watchServerName = resolvedSelectedServerName
           ?? selectedServerId;
         // Build sub-session inputs from app state (daemon filters them from session_list)
@@ -2792,11 +5946,39 @@ export function App() {
           sessionType: sub.type ?? '',
           state: sub.state,
           label: sub.label,
+          activeModel: sub.activeModel,
+          requestedModel: sub.requestedModel,
           parentSession: sub.parentSession,
+          queueEpoch: sub.queueEpoch,
+          queueAuthorityId: sub.queueAuthorityId,
+          transportPendingMessageVersion: sub.transportPendingMessageVersion,
+          transportPendingMessageEntries: sub.transportPendingMessageEntries,
+          failedMessageEntries: sub.failedMessageEntries,
+          transportPendingSettledMessageIds: sub.transportPendingSettledMessageIds,
+          activityGeneration: sub.activityGeneration,
         }));
+        // The daemon session-list is authoritative for discovery but may lag
+        // the browser's settled ledger during reconnect/restore.  Feed the
+        // watch projection the coalesced local row so its queue reducer keeps
+        // the same settled/generation fence as the main UI.
+        const watchSessions = msg.sessions.map((raw) => {
+          const incoming = raw as IncomingSessionListEntry;
+          const existing = sessionsRef.current.find((session) => session.name === incoming.name);
+          const merged = mergeSessionListEntry(incoming, existing);
+          return {
+            ...incoming,
+            activityGeneration: merged.activityGeneration,
+            queueEpoch: merged.queueEpoch,
+            queueAuthorityId: merged.queueAuthorityId,
+            transportPendingMessageVersion: merged.transportPendingMessageVersion,
+            transportPendingMessageEntries: merged.transportPendingMessageEntries,
+            failedMessageEntries: merged.failedMessageEntries,
+            transportPendingSettledMessageIds: merged.transportPendingSettledMessageIds,
+          };
+        });
         watchProjectionStore.updateFromSessionListWithSubs(
           { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
-          msg.sessions,
+          watchSessions,
           watchSubInputs,
         );
         // Daemon is connected — mark this server as online now. Also cancel
@@ -2816,6 +5998,19 @@ export function App() {
         ));
         const newSessions = msg.sessions.filter((s) => !isSubSessionName(s.name));
         const navigableNewSessions = newSessions.filter(isNavigableMainSession);
+        const mergedSessionList = newSessions.map((s) => {
+          const existing = sessionsRef.current.find((p) => p.name === s.name);
+          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+        });
+        const liveIncogMain = mergedSessionList.filter((s) => s.incognito === true);
+        if (liveIncogMain.length > 0) incognitoMainSessionsByServerRef.current.set(selectedServerId, liveIncogMain);
+        else incognitoMainSessionsByServerRef.current.delete(selectedServerId);
+        const presentNames = new Set(newSessions.map((s) => s.name));
+        for (const key of [...manualStoppedMainSessionsRef.current]) {
+          if (key.startsWith(`${selectedServerId}:`) && !presentNames.has(key.slice(selectedServerId.length + 1))) {
+            manualStoppedMainSessionsRef.current.delete(key);
+          }
+        }
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
@@ -2829,12 +6024,15 @@ export function App() {
           const replacement = hiddenActive
             ? navigableNewSessions.find((s) => s.project === hiddenActive.project)
             : null;
-          setActiveSession(replacement?.name ?? null);
+          setActiveSession(replacement?.name ?? null, { remember: false });
+        } else if (!activeSessionRef.current && !selectedShareTarget && !sharedHashRestorePending) {
+          // Nothing selected yet (the REST list is slow or failed): restore the
+          // remembered tab from this list instead of leaving the user on none.
+          restoreLastTabRef.current(selectedServerId, navigableNewSessions.map((s) => s.name));
         }
       }
       if (msg.type === 'terminal.diff') {
-        const apply = diffApplyersRef.current.get(msg.diff.sessionName);
-        apply?.(msg.diff);
+        diffApplyersRef.current.dispatch(msg.diff.sessionName, msg.diff);
         // Scan terminal lines for model keywords (catches Codex footer, fallback for all agents)
         const sessionName = msg.diff.sessionName;
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
@@ -2844,7 +6042,7 @@ export function App() {
           stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
-        const gptMatch = stripped.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+        const gptMatch = stripped.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
@@ -2854,33 +6052,45 @@ export function App() {
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
       if (msg.type === 'timeline.event') {
         const event = msg.event;
-        ingestTimelineEventForCache(event, selectedServerId);
+        ingestTimelineEventForCache(event, selectedServerId, { live: true });
         watchProjectionStore.handleTimelineEvent(event);
         if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
           const current = sessionsRef.current.find((session) => session.name === event.sessionId);
-          if (current && current.state !== 'running') {
+          const incomingGeneration = event.payload?.activityGeneration as ActivityGenerationLike;
+          if (current
+            && !isOlderActivityGeneration(incomingGeneration, current.activityGeneration)
+            && current.state !== 'running') {
             setSessions((prev) => markSessionRunningIfNeeded(prev, event.sessionId));
           }
         }
-        if (isIdleSessionStateTimelineEvent(event)) {
+        // A repeat of an idle edge already handled (idle after idle with only
+        // telemetry between) neither flashes nor alerts nor re-renders the app.
+        const repeatedIdle = noteLiveIdleSignal(liveIdleSessionsRef.current, event);
+        if (isIdleSessionStateTimelineEvent(event) && !repeatedIdle) {
           flashIdleSession(event.sessionId);
           if (!event.sessionId.startsWith('deck_sub_')) {
-            setIdleAlerts((prev) => new Set([...prev, event.sessionId]));
+            setIdleAlerts((prev) => (prev.has(event.sessionId) ? prev : new Set([...prev, event.sessionId])));
           }
         }
-        if (event.type === 'ask.question') {
-          pendingQuestionAtRef.current = Date.now();
-          setPendingQuestion({
-            sessionName: event.sessionId,
-            toolUseId: String(event.payload.toolUseId ?? ''),
-            questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
-            ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
-          });
-          const questions = Array.isArray(event.payload.questions)
-            ? event.payload.questions as Array<Record<string, unknown>>
-            : [];
-          const firstQuestion = questions
-            .map((item) => typeof item.question === 'string' ? item.question.trim() : '')
+        const isAskToolCall = event.type === 'tool.call' && isAskQuestionToolName(event.payload.tool);
+        const liveAskQuestions = event.type === 'ask.question'
+          ? normalizeAskQuestionsPayload(event.payload.questions)
+          : isAskToolCall
+            ? extractAskQuestionsFromToolCallPayload(event.payload)
+            : null;
+        if (event.type === 'ask.question' || (isAskToolCall && liveAskQuestions && liveAskQuestions.length > 0)) {
+          const normalizedQuestions = liveAskQuestions ?? [];
+          if (!isAskQuestionSessionVisible(event.sessionId, askQuestionUiStateRef.current)) {
+            pendingQuestionAtRef.current = Date.now();
+            setPendingQuestion({
+              sessionName: event.sessionId,
+              toolUseId: resolveAskQuestionEventToolUseId(event),
+              questions: normalizedQuestions,
+              ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
+            });
+          }
+          const firstQuestion = normalizedQuestions
+            .map((item) => item.question.trim())
             .find(Boolean) ?? '';
           const localSub = subSessions.find(s => s.sessionName === event.sessionId);
           const localMain = sessionsRef.current.find((s) => s.name === event.sessionId);
@@ -2929,6 +6139,8 @@ export function App() {
           const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           setSessions((prev) => prev.map((s) => {
             if (s.name !== event.sessionId) return s;
+            const incomingGeneration = event.payload.activityGeneration as ActivityGenerationLike;
+            if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
             const nextQueue = removeTransportPendingEntryForUserMessage(
               s.transportPendingMessageEntries,
               s.transportPendingMessages,
@@ -2940,10 +6152,21 @@ export function App() {
               event.sessionId,
             );
             const advancedVersion = nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion);
+            const settledId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId.trim() : '';
+            const settledIds = settledId
+              ? [...new Set([...(s.transportPendingSettledMessageIds ?? []), settledId])].sort()
+              : s.transportPendingSettledMessageIds;
             if (!nextQueue.changed) {
-              return advancedVersion === s.transportPendingMessageVersion
+              return advancedVersion === s.transportPendingMessageVersion && settledIds === s.transportPendingSettledMessageIds
                 ? s
-                : { ...s, transportPendingMessageVersion: advancedVersion };
+                : {
+                  ...s,
+                  transportPendingMessageVersion: advancedVersion,
+                  ...(event.payload.activityGeneration !== undefined
+                    ? { activityGeneration: incomingGeneration }
+                    : {}),
+                  ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
+                };
             }
             return {
               ...s,
@@ -2951,126 +6174,57 @@ export function App() {
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              ...(event.payload.activityGeneration !== undefined
+                ? { activityGeneration: incomingGeneration }
+                : {}),
+              ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
             };
           }));
         }
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          const hasPendingSnapshot = hasExplicitTransportPendingSnapshot(event.payload);
-          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
-          if (liveState === 'queued') {
-            const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-            const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-            const parsedPendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-            const pendingEntries = normalizeTransportPendingEntries(
-              event.payload.pendingMessageEntries,
-              parsedPendingMessages,
-              event.sessionId,
-              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-            );
-            const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
-              // Drop a stale `queued` snapshot wholesale: it would otherwise
-              // both resurrect drained entries AND wrongly downgrade a session
-              // that has since moved past queued.
-              if (!shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: true,
-                isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
-              })) return s;
+          if (liveState === 'queued' || liveState === 'running' || liveState === 'idle') {
+            // A frame that repeats what the record already says must not
+            // re-render the app and every mounted pane (updateSessionIfChanged
+            // returns the same array, so setSessions bails out).
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => {
+              const incomingGeneration = (event.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike;
+              if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
+              const queuePatch = buildTransportPendingSyncPatch({
+                transportPendingMessages: s.transportPendingMessages,
+                transportPendingMessageEntries: s.transportPendingMessageEntries,
+                transportPendingMessageVersion: s.transportPendingMessageVersion,
+                queueEpoch: s.queueEpoch,
+                queueAuthorityId: s.queueAuthorityId,
+                failedMessageEntries: s.failedMessageEntries,
+                transportPendingSettledMessageIds: s.transportPendingSettledMessageIds,
+              }, event.payload as Record<string, unknown>, event.sessionId);
               return {
                 ...s,
-                state: 'queued' as SessionInfo['state'],
-                transportPendingMessages: pendingMessages,
-                transportPendingMessageEntries: pendingEntries,
-                transportPendingMessageVersion: nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion),
-              };
-            }));
-          } else if (liveState === 'running') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
-              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-              const incomingEntries = normalizeTransportPendingEntries(
-                event.payload.pendingMessageEntries,
-                parsedIncomingMessages,
-                event.sessionId,
-                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-              );
-              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingSnapshot,
-                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
-              });
-              return {
-                ...s,
-                state: 'running' as SessionInfo['state'],
-                transportPendingMessages: applyPending
-                  ? incomingMessages
-                  : (s.transportPendingMessages ?? []),
-                transportPendingMessageEntries: applyPending
-                  ? mergeTransportPendingEntriesForRunningState(
-                      s.transportPendingMessageEntries,
-                      event.payload.pendingMessageEntries,
-                      event.payload.pendingMessages,
-                      hasPendingSnapshot,
-                      event.sessionId,
-                      hasPendingEntriesField,
-                    )
-                  : (s.transportPendingMessageEntries ?? []),
-                transportPendingMessageVersion: applyPending
-                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
-                  : s.transportPendingMessageVersion,
-              };
-            }));
-          } else if (liveState === 'idle') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
-              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-              const incomingEntries = normalizeTransportPendingEntries(
-                event.payload.pendingMessageEntries,
-                parsedIncomingMessages,
-                event.sessionId,
-                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-              );
-              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingSnapshot,
-                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
-              });
-              return {
-                ...s,
+                ...(event.payload.activityGeneration !== undefined
+                  ? { activityGeneration: incomingGeneration }
+                  : {}),
                 state: liveState as SessionInfo['state'],
-                transportPendingMessages: applyPending
-                  ? incomingMessages
-                  : (s.transportPendingMessages ?? []),
-                transportPendingMessageEntries: applyPending
-                  ? mergeTransportPendingEntriesForIdleState(
-                      s.transportPendingMessageEntries,
-                      event.payload.pendingMessageEntries,
-                      event.payload.pendingMessages,
-                      hasPendingSnapshot,
-                      event.sessionId,
-                      hasPendingEntriesField,
-                    )
-                  : (s.transportPendingMessageEntries ?? []),
-                transportPendingMessageVersion: applyPending
-                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
-                  : s.transportPendingMessageVersion,
+                ...queuePatch,
               };
             }));
           } else if (liveState === 'error') {
             const errorDetail = typeof event.payload.error === 'string' && event.payload.error.trim()
               ? event.payload.error.trim()
               : null;
-            setSessions((prev) => prev.map((s) => s.name === event.sessionId
-              ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
-              : s));
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => (
+              { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
+            )));
           }
+        }
+        if (event.type === 'session.state' && String(event.payload.state ?? '') === 'idle') {
+          setSharedActiveDispatchIds((previous) => {
+            if (!previous.has(event.sessionId)) return previous;
+            const next = new Map(previous);
+            next.delete(event.sessionId);
+            return next;
+          });
         }
         if (event.type === 'session.state') {
           const liveState = String(event.payload.state ?? '');
@@ -3089,7 +6243,7 @@ export function App() {
               (modelStr.includes('opus') || modelStr.includes('sonnet') || modelStr.includes('haiku'))
                 ? rawModel
                 : null;
-            const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+            const gptM = modelStr.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
             if (det) {
@@ -3097,8 +6251,8 @@ export function App() {
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
-          if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
-            const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+          if (event.sessionId.startsWith('deck_sub_')) {
+            const payload = event.payload as { inputTokens?: number; cacheTokens?: number; contextWindow?: number; contextWindowSource?: UsageContextWindowSource; model?: string };
             const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
             const detectedModel = detectedModelsRef.current.get(event.sessionId);
             const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, payload.model);
@@ -3111,11 +6265,9 @@ export function App() {
             const displayPayload = effectiveModel && payload.model !== effectiveModel
               ? { ...payload, model: effectiveModel }
               : payload;
-            setSubUsages((prev) => {
-              const next = new Map(prev);
-              next.set(event.sessionId, displayPayload);
-              return next;
-            });
+            // Token usage arrives at up to 25 Hz per session; commit it in one
+            // batch per interval instead of re-rendering the app per frame.
+            subUsageBatcherRef.current?.push(event.sessionId, (current) => mergeUsageUpdate(current, displayPayload as Record<string, unknown>));
           }
         }
       }
@@ -3150,9 +6302,9 @@ export function App() {
         });
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
-          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setSessions((prev) => updateSessionIfChanged(prev, sessionName, (s) => ({ ...s, state: 'idle' as SessionInfo['state'] })));
           // Always flash the tab — even if it's the active one
-          setIdleAlerts((prev) => new Set([...prev, sessionName]));
+          setIdleAlerts((prev) => (prev.has(sessionName) ? prev : new Set([...prev, sessionName])));
         }
         flashIdleSession(sessionName);
         // Always show a toast (main + sub sessions)
@@ -3188,20 +6340,33 @@ export function App() {
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
       }
       if (msg.type === 'session.error') {
-        void watchProjectionStore.pushDurableEvent({
-          type: 'session.error',
-          project: msg.project,
-          message: msg.message,
-        });
+        const errTargetSession = typeof msg.sessionName === 'string' && msg.sessionName
+          ? msg.sessionName
+          : (typeof msg.session === 'string' && msg.session
+            ? msg.session
+            : (typeof msg.id === 'string' && msg.id ? `deck_sub_${msg.id}` : ''));
+        if (!isIncognitoSession(msg) && !(errTargetSession && isIncognitoTimelineSession(selectedServerId, errTargetSession))) {
+          void watchProjectionStore.pushDurableEvent({
+            type: 'session.error',
+            project: msg.project ?? '',
+            message: msg.message,
+          });
+        }
       }
-      if (msg.type === 'subsession.created') {
-        watchProjectionStore.addSubSession({
-          sessionName: msg.sessionName,
-          sessionType: msg.sessionType,
-          state: msg.state,
-          label: msg.label,
-          parentSession: msg.parentSession,
-        }, selectedServerId);
+      if (msg.type === 'subsession.created' || msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        const items = msg.type === SUBSESSION_CREATED_BATCH_MSG
+          ? (Array.isArray(msg.items) ? msg.items : [])
+          : [msg];
+        for (const item of items) {
+          if (isIncognitoSession(item)) continue;
+          watchProjectionStore.addSubSession({
+            sessionName: item.sessionName,
+            sessionType: item.sessionType,
+            state: item.state,
+            label: item.label,
+            parentSession: item.parentSession,
+          }, selectedServerId);
+        }
       }
       if (msg.type === 'subsession.removed') {
         watchProjectionStore.removeSubSession(msg.sessionName);
@@ -3353,9 +6518,15 @@ export function App() {
           // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
           const context = (msg as any).context ?? msg;
           const normalized = { ...context, context, projectDir: dir };
+          const ownerServerId = selectedServerIdRef.current;
+          repoContextsOwnerServerIdRef.current = ownerServerId;
           setRepoContexts((prev) => {
             const next = new Map(prev);
             next.set(dir, normalized);
+            if (ownerServerId) {
+              repoContextsByServerRef.current.delete(ownerServerId);
+              repoContextsByServerRef.current.set(ownerServerId, next);
+            }
             return next;
           });
           const sessionIds = new Set<string>();
@@ -3365,11 +6536,26 @@ export function App() {
           for (const sub of subSessionsRef.current) {
             if (sub.cwd === dir) sessionIds.add(sub.sessionName);
           }
+          const activeSessionObj = activeSessionRef.current
+            ? sessionsRef.current.find((s) => s.name === activeSessionRef.current)
+            : null;
+          if (activeSessionObj) {
+            const activeName = activeSessionObj.name;
+            const activeDir = activeSessionObj.projectDir;
+            if (activeDir === dir || dir === FS_SESSION_ROOT_PATH) {
+              sessionIds.add(activeName);
+            }
+          }
           if (sessionIds.size === 0) {
-            ingestSessionRepoContext({ projectDir: dir, context });
+            ingestSessionRepoContext({ projectDir: dir, serverId: ownerServerId, context });
           } else {
             for (const sessionId of sessionIds) {
-              ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+              ingestSessionRepoContext({ sessionId, projectDir: dir, serverId: ownerServerId, context });
+              if (dir !== FS_SESSION_ROOT_PATH) {
+                ingestSessionRepoContext({ sessionId, projectDir: FS_SESSION_ROOT_PATH, serverId: ownerServerId, context });
+              } else if (activeSessionObj?.projectDir) {
+                ingestSessionRepoContext({ sessionId, projectDir: activeSessionObj.projectDir, serverId: ownerServerId, context });
+              }
             }
           }
         }
@@ -3387,32 +6573,71 @@ export function App() {
             : error === 'cli_error' ? 'cli_error'
             : null;
           if (status) {
+            const ownerServerId = selectedServerIdRef.current;
+            repoContextsOwnerServerIdRef.current = ownerServerId;
             setRepoContexts((prev) => {
               const next = new Map(prev);
               next.set(dir, { status, context: { status }, projectDir: dir });
+              if (ownerServerId) {
+                repoContextsByServerRef.current.delete(ownerServerId);
+                repoContextsByServerRef.current.set(ownerServerId, next);
+              }
               return next;
             });
           }
         }
       }
+      {
+        // Daemon-upgrade badge lifecycle (pure reducer): UPGRADING begins it
+        // (so the version shows "upgrading…" through the restart instead of a
+        // bare offline flash); ONLINE/RECONNECTED — the possibly-upgraded daemon
+        // is back — clears it; anything else leaves it untouched (undefined).
+        const upgradingNext = nextDaemonUpgradingState(
+          msg.type,
+          (msg as { targetVersion?: unknown }).targetVersion,
+        );
+        if (upgradingNext !== undefined) {
+          setDaemonUpgrading(upgradingNext);
+          if (daemonUpgradingTimerRef.current) {
+            clearTimeout(daemonUpgradingTimerRef.current);
+            daemonUpgradingTimerRef.current = null;
+          }
+          if (upgradingNext) {
+            // Safety auto-clear: if the daemon never reconnects (failed install)
+            // don't strand the badge forever. Reconnect/online clears it sooner.
+            daemonUpgradingTimerRef.current = setTimeout(() => {
+              daemonUpgradingTimerRef.current = null;
+              setDaemonUpgrading(null);
+            }, DAEMON_UPGRADING_MAX_MS);
+          }
+        }
+      }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const message = msg.reason === 'toolchain_unavailable'
-          ? trans('toast.upgrade_blocked_toolchain_unavailable')
-          : msg.reason === 'transport_busy'
-            ? trans('toast.upgrade_blocked_transport_busy')
-            : msg.reason === 'auto_deliver_active'
-              ? trans('toast.upgrade_blocked_auto_deliver_active')
-            : trans('toast.upgrade_blocked_p2p_active');
-        const id = Date.now() + Math.random();
-        setToasts((prev) => [...prev, {
-          id,
-          sessionName: '',
-          project: '',
-          kind: 'notification',
-          title: trans('toast.upgrade_blocked_title'),
-          message,
-        }]);
-        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => ({
+            ...previous,
+            [selectedServerId]: {
+              phase: 'failed',
+              blockedReason: msg.reason,
+              ...(msg.activeSessionNames?.length ? { blockedSessionNames: msg.activeSessionNames.slice(0, 5) } : {}),
+            },
+          }));
+        }
+        const now = Date.now();
+        if (shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) {
+          lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
+          const message = trans(daemonUpgradeBlockedToastKey(msg.reason));
+          const id = Date.now() + Math.random();
+          setToasts((prev) => [...prev, {
+            id,
+            sessionName: '',
+            project: '',
+            kind: 'notification',
+            title: trans('toast.upgrade_blocked_title'),
+            message,
+          }]);
+          setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+        }
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
         // Mark projection stale immediately — that's just a data-freshness
@@ -3440,7 +6665,16 @@ export function App() {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
+        // (The upgrading badge is cleared by the reducer block above, which also
+        // handles ONLINE/RECONNECTED.)
         setDaemonOnline(true);
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => {
+            const current = previous[selectedServerId];
+            if (!current || (current.phase !== 'requesting' && current.phase !== 'sent')) return previous;
+            return { ...previous, [selectedServerId]: { phase: 'idle' } };
+          });
+        }
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
       if (msg.type === MSG_DAEMON_OFFLINE) {
@@ -3448,7 +6682,12 @@ export function App() {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
+        if (sessionListRetryRef.current) {
+          clearTimeout(sessionListRetryRef.current);
+          sessionListRetryRef.current = null;
+        }
         setDaemonOnline(false);
+        setSessionsLoaded(true);
         setServers((prev) => markServerOffline(prev, selectedServerId));
         watchProjectionStore.setSnapshotStatus('stale');
       }
@@ -3467,6 +6706,29 @@ export function App() {
         console.error('[daemon.error]', msg.kind, msg.message, msg.stack);
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
+      }
+      // The daemon's stale-turn response is authoritative even when the
+      // terminal session.state idle frame was lost during a hidden-window
+      // burst/reconnect. Reconcile the local session immediately so queued
+      // sends stop waiting on a stale running flag; the next session_list
+      // refresh supplies the queue snapshot.
+      if (msg.type === 'command.ack'
+        && msg.status === 'error'
+        && isActiveTurnFinishedError(msg.error)
+        && typeof msg.session === 'string') {
+        const staleSession = msg.session;
+        if (isSubSessionName(staleSession)) {
+          const subId = staleSession.slice('deck_sub_'.length);
+          updateSubLocal(subId, { state: 'idle', authoritativeIdleAt: Date.now() });
+        } else {
+          setSessions((prev) => prev.map((session) => (
+            session.name === staleSession
+              ? { ...session, state: 'idle' as SessionInfo['state'], authoritativeIdleAt: Date.now() }
+              : session
+          )));
+        }
+        watchProjectionStore.updateSessionState(staleSession, 'idle');
+        ws.requestSessionList();
       }
       // P2P command errors surface as `command.ack status:error` with a
       // specific `error` code. `useTimeline` handles them per-session by
@@ -3520,6 +6782,19 @@ export function App() {
           setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
         }
       }
+      // A refused Stop must never look like nothing happened (shared participants:
+      // rate limit, the turn changed, access ended...).
+      if (msg.type === MSG_COMMAND_FAILED && takeTrackedShareCancel(msg.commandId)) {
+        notifyShareCancelFailure({ reason: msg.reason, activeDispatchId: msg.activeDispatchId, session: msg.session });
+      }
+      if (msg.type === 'command.ack' && selectedShareTarget) {
+        setSharedActiveDispatchIds((previous) => {
+          const next = new Map(previous);
+          if (msg.activeDispatchId) next.set(msg.session, msg.activeDispatchId);
+          else next.delete(msg.session);
+          return next;
+        });
+      }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();
         // Daemon came back within (or after) the grace window — cancel any
@@ -3530,6 +6805,13 @@ export function App() {
           daemonOfflineGraceTimerRef.current = null;
         }
         setDaemonOnline(true);
+        // The browser-server socket can stay healthy while the daemon-server
+        // socket drops and reconnects. Any session.state events emitted during
+        // that daemon gap may be missed by this tab, so pull the authoritative
+        // daemon snapshot now. Without this, a session that became idle while
+        // the daemon WS was down can remain visually "running" until a manual
+        // refresh or unrelated session_list broadcast.
+        ws.requestSessionList();
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
         const activeName = activeSessionRef.current;
@@ -3556,21 +6838,30 @@ export function App() {
     });
 
     ws.onLatency((ms) => {
+      if (isStaleSocket()) return;
       setLatencyMs(ms);
-      // Pong proves the WS to the server pod is alive. Refresh lastHeartbeatAt
-      // so the sidebar device dot stays green during quiet periods (no
-      // session_list / timeline events arriving). Without this, the 60s
-      // freshness window expires on idle daemons — especially when the tab is
-      // backgrounded and `loadServers()` polls are throttled — and the dot
-      // turns gray until *some* WS app-level message arrives (e.g. another
-      // client sends a message and the daemon broadcasts back). Use
-      // `touchServerHeartbeat` so a server that was explicitly marked offline
-      // via MSG_DAEMON_OFFLINE doesn't get accidentally promoted back online.
-      setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
+    });
+    ws.onPongLiveness?.(() => {
+      if (isStaleSocket()) return;
+      // Correlated pong proves the WS to the server pod is alive even when an
+      // anomalous RTT sample is suppressed pending spike confirmation. Refresh
+      // lastHeartbeatAt so the sidebar device dot stays green during quiet
+      // periods (no session_list / timeline events arriving) without letting a
+      // server explicitly marked offline via MSG_DAEMON_OFFLINE promote back
+      // online, and only for owned servers.
+      if (targetServerId && ownedServerIdsRef.current.has(targetServerId)) {
+        setServers((prev) => touchServerHeartbeat(prev, targetServerId, Date.now(), SERVER_HEARTBEAT_TOUCH_MIN_INTERVAL_MS));
+      }
     });
     const unsubStats = ws.onMessage((msg) => {
-      if (msg.type === 'daemon.stats') {
-        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+      if (isStaleSocket()) return;
+      // A liveness frame (link-worker heartbeat) proves the daemon is alive just
+      // like a stats frame, but carries no system numbers: both fold into the
+      // last snapshot instead of replacing it, so nothing ever blanks or turns NaN.
+      if (msg.type === DAEMON_STATS_MSG || msg.type === DAEMON_LIVENESS_MSG) {
+        setDaemonStats((prev) => (msg.type === DAEMON_STATS_MSG
+          ? mergeDaemonStats(prev, msg as unknown as Record<string, unknown>)
+          : mergeDaemonLiveness(prev, msg as unknown as Record<string, unknown>)));
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -3593,9 +6884,11 @@ export function App() {
     let lastResumeCheckWasForce = false;
     let hiddenSinceAt = 0;
     let lastDiscussionResyncAt = 0;
-    const handleResume = (forceIfStale = false, refreshTimeline = false) => {
+    const handleResume = (forceIfStale = false, refreshTimeline = false): boolean => {
       const now = Date.now();
-      if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
+      if (now - lastResumeCheckAt < WEB_UNLOCK_COALESCE_MS && (!forceIfStale || lastResumeCheckWasForce)) {
+        return false;
+      }
       lastResumeCheckAt = now;
       lastResumeCheckWasForce = forceIfStale;
       ws.resumeConnection(forceIfStale);
@@ -3610,19 +6903,21 @@ export function App() {
         appOpenSpecAutoRequestStatusRef.current();
       }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
+      return true;
     };
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
         hiddenSinceAt = Date.now();
         return;
       }
+      resumeDirectFileTransfers(ws, selectedServerId);
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
-      handleResume(wasLongHidden, wasLongHidden);
+      const dispatched = handleResume(wasLongHidden, wasLongHidden);
       // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
       // dispatch passes through the 15s success-only backfill cooldown, so
       // alt-tab churn is absorbed but a real gap > 15s gets one HTTP backfill.
-      if (!wasLongHidden) dispatchActiveTimelineRefresh();
+      if (dispatched && !wasLongHidden) dispatchActiveTimelineRefresh();
     };
     document.addEventListener('visibilitychange', onVisibility);
     // Desktop "messages stuck before leaving" P0 fix: a foreground tab whose
@@ -3634,8 +6929,7 @@ export function App() {
     // cooldown, so >15s real gaps fire a backfill while alt-tab churn is
     // absorbed automatically (no need to reset cooldowns).
     const onFocus = () => {
-      handleResume(false);
-      dispatchActiveTimelineRefresh();
+      if (handleResume(false)) dispatchActiveTimelineRefresh();
     };
     window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
@@ -3646,22 +6940,32 @@ export function App() {
     // reset): `online` is unreliable behind proxies/captive portals, so we
     // never want it to clear cooldowns, only to nudge a catch-up attempt.
     const onOnline = () => {
-      handleResume(false);
-      dispatchActiveTimelineRefresh();
+      resumeDirectFileTransfers(ws, selectedServerId);
+      if (handleResume(false)) dispatchActiveTimelineRefresh();
     };
     window.addEventListener('online', onOnline);
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.resumeConnection(force), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => {
+          ws.notifyForegrounded();
+          resumeDirectFileTransfers(ws, selectedServerId);
+          ws.resumeConnection(force);
+          remoteDesktopConnectionManager.resumeExhaustedConnections();
+        }, App, () => ws.notifyBackgrounded()))
         .then((cleanup) => {
-          removeAppStateListener = cleanup;
+          if (effectDisposed) {
+            cleanup();
+          } else {
+            removeAppStateListener = cleanup;
+          }
         })
         .catch(() => {});
     }
 
     return () => {
+      effectDisposed = true;
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
@@ -3670,6 +6974,7 @@ export function App() {
       unsub();
       unsubStats();
       ws.onLatency(null);
+      ws.onPongLiveness?.(null);
       ws.disconnect();
       wsRef.current = null;
       setConnected(false);
@@ -3682,7 +6987,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId, selectedShareTarget, requestP2pStatusWithCachedRunConfirmation]);
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation, remoteDesktopConnectionManager]);
 
   // Subscribe to terminal streams for process-backed sessions when connected.
   // Transport/SDK sessions have no PTY stream; their timeline updates are
@@ -3712,18 +7017,25 @@ export function App() {
   // Key includes runtimeType + agentType so effect re-runs when WebSocket merge
   // corrects null→'transport' or a pre-migration row relies on agentType fallback.
   const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}:${s.agentType}`).sort().join(',');
+  const transportSubscribedSessionsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || sessions.length === 0) return;
-    const names = listGlobalTransportSubscriptionNames(sessions);
-    for (const name of names) {
-      try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
+    const names = ws?.connected ? listGlobalTransportSubscriptionNames(sessions) : [];
+    const desired = new Set(names);
+    // Diff the desired set instead of using effect cleanup to unsubscribe the
+    // entire population. Session metadata updates can churn this effect's key
+    // while the same sessions remain present; cleanup/re-subscribe then emits
+    // thousands of chat.subscribe frames during a large-window restore.
+    for (const name of transportSubscribedSessionsRef.current) {
+      if (desired.has(name)) continue;
+      try { ws?.unsubscribeTransportSession(name); } catch { /* ignore */ }
     }
-    return () => {
-      for (const name of names) {
-        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+    if (ws?.connected) {
+      for (const name of desired) {
+        try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
       }
-    };
+    }
+    transportSubscribedSessionsRef.current = desired;
   // NOTE: `sessions` (the raw array) is intentionally omitted from the dep
   // array. Including it caused a subscribe/unsubscribe flap loop — every
   // setState produces a new array reference even when contents are identical,
@@ -3828,6 +7140,7 @@ export function App() {
   // Global keyboard passthrough
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
       // If a sub-session window is frontmost (desktop only), keystrokes —
@@ -3835,19 +7148,30 @@ export function App() {
       const focusedSubId = focusedSubIdRef.current;
       const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
       if (!ws?.connected || !session) return;
+      if (hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) return;
       const el = document.activeElement as HTMLElement | null;
       const target = e.target as HTMLElement | null;
       if (isTextEntryElement(target) || isTextEntryElement(el)) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
 
-      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      const focusedSubRecord = focusedSubId ? subSessionsRef.current.find((item) => item.id === focusedSubId) : undefined;
+      const currentViewMode = resolveFocusedKeyboardViewMode({
+        target,
+        activeElement: el,
+        focusedSubId,
+        isFocusedSubOpen: Boolean(focusedSubId && openSubIdsRef.current.has(focusedSubId)),
+        focusedSubType: focusedSubRecord?.type ?? null,
+        focusedSubSessionName: focusedSubRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModesRef.current[session] ?? defaultViewMode,
+      });
       if (currentViewMode === 'chat') {
         // In chat mode: route Up/Down/Enter to chat input (history nav + send)
         const chatInput = inputRefsMap.current.get(session) ?? null;
         if (!chatInput) return;
         if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Backspace') {
           e.preventDefault();
-          chatInput.focus();
+          focusComposerElement(chatInput);
           chatInput.dispatchEvent(new KeyboardEvent('keydown', {
             key: e.key, code: e.code, keyCode: e.keyCode,
             ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey,
@@ -3856,7 +7180,7 @@ export function App() {
         } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
           // Printable chars: focus and insert text directly into contentEditable
           e.preventDefault();
-          chatInput.focus();
+          focusComposerElement(chatInput);
           document.execCommand('insertText', false, e.key);
         }
         return;
@@ -3901,7 +7225,17 @@ export function App() {
       const target = e.target as HTMLElement | null;
       const el = document.activeElement as HTMLElement | null;
       if (isTextEntryElement(target) || isTextEntryElement(el)) return;
-      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      const focusedSubRecord = focusedSubId ? subSessionsRef.current.find((item) => item.id === focusedSubId) : undefined;
+      const currentViewMode = resolveFocusedKeyboardViewMode({
+        target,
+        activeElement: el,
+        focusedSubId,
+        isFocusedSubOpen: Boolean(focusedSubId && openSubIdsRef.current.has(focusedSubId)),
+        focusedSubType: focusedSubRecord?.type ?? null,
+        focusedSubSessionName: focusedSubRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModesRef.current[session] ?? defaultViewMode,
+      });
       if (currentViewMode !== 'terminal') return;
       const text = e.clipboardData?.getData('text/plain') ?? '';
       if (!text) return;
@@ -3938,17 +7272,32 @@ export function App() {
   const closeSidebar = useCallback(() => setMobileSidebarOpen(false), []);
 
   const handleLogout = useCallback(async () => {
+    // User intent to leave is authoritative immediately; a shared-open response
+    // that settles while logout I/O is pending must not restore the old route.
+    authMutationGenerationRef.current += 1;
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     if (isNative()) {
       // Native: revoke API key server-side, clear biometric storage
+      const credentialServerUrl = auth?.baseUrl ?? nativeServerUrl;
       try {
-        const { Preferences } = await import('@capacitor/preferences');
-        const { value: keyId } = await Preferences.get({ key: 'deck_api_key_id' });
+        const keyId = await getAuthKeyId(credentialServerUrl);
         if (keyId) {
           await apiFetch(`/api/auth/user/me/keys/${keyId}`, { method: 'DELETE' }).catch(() => {});
-          await Preferences.remove({ key: 'deck_api_key_id' });
         }
       } catch { /* ignore */ }
-      await clearAuthKey();
+      // Local authority revocation must continue even if Secure Storage is
+      // unavailable. In particular, server switching must never carry the old
+      // in-memory/localStorage identity into ServerSetupPage.
+      await clearStoredAuthForServer(credentialServerUrl);
       clearApiKey();
     } else {
       try {
@@ -3959,145 +7308,750 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
+    clearMessagePinsCache();
+    clearMessagePinNavigation();
+    configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
     setAuth(null);
+    authRef.current = null;
+    setSharedEntries([]);
+    setServers([]);
+    ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setDiscussions([]);
     setRepoContexts(new Map());
+    repoContextsByServerRef.current.clear();
+    repoContextsOwnerServerIdRef.current = null;
+    lastKnownSidebarScopeByServerRef.current.clear();
+    clearFileBrowserCache();
+    clearRepoPageCache();
+    clearSharedChangesCache();
+    clearSessionRepoContexts();
+    setShowTaskMode(false);
+    clearTaskModeOpenPersistence();
+    clearGlobalTaskModeSessionState();
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, [setActiveSession]);
+  }, [auth?.baseUrl, nativeServerUrl, setActiveSession]);
 
-  // Native only: log out + clear server URL → back to ServerSetupPage
+  // Native only: suspend the current server locally and return to the picker.
+  // Stored credentials remain isolated under that server URL, so selecting it
+  // again can restore the session after a fresh /me authority check.
   const handleChangeServer = useCallback(async () => {
     setShowMobileServerMenu(false);
-    try { await handleLogout(); } catch { /* ignore */ }
-    try { await clearServerUrl(); } catch { /* ignore */ }
-    setNativeServerUrl(null);
-  }, [handleLogout]);
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+    // Both authenticated and LoginPage-initiated switching must keep the gate
+    // held through clearServerUrl. Otherwise handleLogout can render the old
+    // server's LoginPage after setAuth(null), allowing a fresh credential write
+    // to race the remainder of this server-switch operation.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    try {
+      // LoginPage can be unmounted while a native auth Promise is still writing
+      // its server-scoped credential. Wait for it, revoke all in-memory route
+      // authority, but do not revoke/delete the saved server session.
+      await clearAuthState('change_server', {
+        preserveSharedNavigation: false,
+        preserveCredentials: true,
+        credentialServerUrl: auth?.baseUrl ?? nativeServerUrl,
+      });
+      try { await clearServerUrl(); } catch { /* ignore */ }
+      nativeServerUrlRef.current = null;
+      setNativeServerUrl(null);
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
-  const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
-    autoEntryRunRef.current++;
+  const lastNavIntentKeyRef = useRef<string | null>(null);
+  const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
+
+  const resetServerScopedStateForSwitch = useCallback((nextServerId?: string | null) => {
+    staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
+    managedSharesGenerationRef.current += 1;
+    explicitSelectionServerRef.current = null;
+    if (sessionListRetryRef.current) {
+      clearTimeout(sessionListRetryRef.current);
+      sessionListRetryRef.current = null;
+    }
+    if (daemonOfflineGraceTimerRef.current) {
+      clearTimeout(daemonOfflineGraceTimerRef.current);
+      daemonOfflineGraceTimerRef.current = null;
+    }
+    resetServerScopedOverlaysAndTargets(nextServerId);
+    const restoredIncogMain = nextServerId
+      ? (incognitoMainSessionsByServerRef.current.get(nextServerId) ?? [])
+      : [];
+    setSessions(restoredIncogMain);
+    setSessionsLoaded(false);
+    // Clear only active view state without erasing per-server incognito caches/open windows.
+    openSubPersistenceSessionRef.current = null;
+    openSubPersistenceServerRef.current = null;
+    openSubIdsRef.current = new Set();
+    setOpenSubIdsRaw(new Set());
+    setRetainedOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
+    focusedSubIdRef.current = null;
+    setFocusedSubIdState(null);
+    lastAutoFocusedRef.current = null;
+    chatScrollFnsRef.current.clear();
+    subChatScrollFnsRef.current.clear();
+    clearPendingMainChatScroll();
+    clearPendingSubChatScroll();
+    if (!nextServerId || pendingServerSwitchScrollRef.current !== nextServerId) {
+      pendingServerSwitchScrollRef.current = null;
+    }
+    setActiveSession(null, { remember: false, keepSubWindows: true });
+    setSharedActiveDispatchIds(new Map());
+    setDaemonStats(null);
+    setDaemonOnline(false);
+    setConnected(false);
+    setConnecting(true);
+    setLatencyMs(null);
+    const prevOwnerServerId = repoContextsOwnerServerIdRef.current ?? selectedServerIdRef.current;
+    if (prevOwnerServerId && repoContextsRef.current.size > 0) {
+      repoContextsByServerRef.current.delete(prevOwnerServerId);
+      repoContextsByServerRef.current.set(prevOwnerServerId, new Map(repoContextsRef.current));
+      while (repoContextsByServerRef.current.size > 20) {
+        const oldestKey = repoContextsByServerRef.current.keys().next().value;
+        if (oldestKey === undefined) break;
+        repoContextsByServerRef.current.delete(oldestKey);
+      }
+    }
+    setDiscussions([]);
+    const restoredRepoContexts = nextServerId ? repoContextsByServerRef.current.get(nextServerId) : undefined;
+    if (restoredRepoContexts && nextServerId) {
+      repoContextsByServerRef.current.delete(nextServerId);
+      repoContextsByServerRef.current.set(nextServerId, restoredRepoContexts);
+    }
+    setRepoContexts(restoredRepoContexts ? new Map(restoredRepoContexts) : new Map());
+    repoContextsOwnerServerIdRef.current = nextServerId ?? null;
+    setManagedShares([]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
+
+  const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
     setManualDashboard(false);
     setSelectedShareTarget(null);
-    // Save current active session for the server we're leaving
-    const prevServer = localStorage.getItem('rcc_server');
-    const currentSession = localStorage.getItem('rcc_session');
-    if (prevServer && currentSession) {
-      localStorage.setItem(`rcc_session_${prevServer}`, currentSession);
-    } else if (prevServer) {
-      localStorage.removeItem(`rcc_session_${prevServer}`);
+    setSelectedSharedEntryId(null);
+    clearSharedTabRestoreMarker();
+    setShowSharedReturnGuide(false);
+    // Save current active session for the server we're leaving.
+    // Prefer live route refs over the cross-tab legacy fallback.  The latter
+    // may still point at a different server while a hash/back-forward route is
+    // converging.
+    // Only a tab the user deliberately opened is remembered; leaving a server
+    // with nothing selected (or with an automatic fallback showing) must keep
+    // what was remembered before, never erase or replace it.
+    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
+    const currentSession = activeSessionRef.current;
+    if (prevServer && prevServer !== serverId && !selectedShareTarget && currentSession) {
+      const isCurrentIncog = isIncognitoTimelineSession(prevServer, currentSession)
+        || sessionsRef.current.some((s) => s.name === currentSession && s.incognito === true)
+        || (incognitoMainSessionsByServerRef.current.get(prevServer)?.some((s) => s.name === currentSession) ?? false);
+      if (isCurrentIncog) {
+        incognitoActiveSessionByServerRef.current.set(prevServer, currentSession);
+      } else if (rememberIntentRef.current === currentSession) {
+        writeServerSession(prevServer, currentSession);
+      }
     }
 
     localStorage.setItem('rcc_server', serverId);
     if (serverName) localStorage.setItem('rcc_server_name', serverName);
 
-    // Restore previously selected session for this server
-    const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
-    if (savedSession) {
-      safeLocalStorageSetItem('rcc_session', savedSession);
-    } else {
-      localStorage.removeItem('rcc_session');
+    // The destination server's session list is not loaded yet. Keep the
+    // scoped snapshot in storage, but do not put an unvalidated candidate in
+    // the hash; the destination hydrate will resolve it against navigable
+    // sessions before selecting it.
+    // This click, not the route that happened to mount the document, is now
+    // authoritative. Converge the canonical state before any hash-sync or late
+    // shared-open callback can act on the outgoing server route.
+    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
+    initialHashStateRef.current = nextRoute;
+    initialSharedTabRestoreRef.current = null;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    if (selectedServerIdRef.current !== serverId) {
+      pendingServerSwitchScrollRef.current = serverId;
+    }
+    selectedServerIdRef.current = serverId;
+    setSelectedServerId(serverId);
+    setSelectedServerName(serverName ?? null);
+    resetServerScopedStateForSwitch(serverId);
+    writeHashState(serverId, null, null);
+  }, [resetServerScopedStateForSwitch, selectedShareTarget]);
+
+  const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    const hadPendingSharedNavigation = Boolean(
+      sharedOpenAbortRef.current
+      || sharedOpenIntentRef.current
+      || externalRouteInFlightKeyRef.current,
+    );
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+    autoEntryRunRef.current++;
+    setMobileSidebarOpen(false);
+    setShowMobileServerMenu(false);
+    setServerCtxMenu(null);
+
+    const alreadyOnOwnedServer =
+      selectedServerIdRef.current === serverId
+      && selectedShareTarget === null
+      && selectedSharedEntryId === null
+      && !manualDashboard;
+    if (alreadyOnOwnedServer) {
+      if (pendingServerSwitchScrollRef.current === serverId) {
+        pendingServerSwitchScrollRef.current = null;
+      }
+      if (hadPendingSharedNavigation) {
+        writeHashState(serverId, activeSessionRef.current ?? null, null);
+      }
+      return;
     }
 
-    // Write the hash BEFORE reload so the new page picks up the right server+session
-    // from the URL rather than from (now shared) localStorage.
-    writeHashState(serverId, savedSession ?? null);
+    switchToOwnedServerInApp(serverId, serverName);
+  }, [manualDashboard, selectedShareTarget, selectedSharedEntryId, switchToOwnedServerInApp]);
 
-    // Full page reload — guarantees all components, WS connections, and pinned
-    // panels start fresh with the new server. Avoids stale WS/state bugs.
-    markFastServerSwitchSplash();
-    window.location.reload();
+  const handleSelectServerForShare = useCallback((serverId: string) => {
+    if (!serverId || serverId === selectedServerIdRef.current) return;
+    const serverName = servers.find((s) => s.id === serverId)?.name ?? null;
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+    autoEntryRunRef.current++;
+    switchToOwnedServerInApp(serverId, serverName);
+  }, [servers, switchToOwnedServerInApp]);
+
+  const handleDismissSharedPayload = useCallback((payloadId: string) => {
+    setPendingSharedPayloads((prev) => prev.filter((item) => item.id !== payloadId));
   }, []);
 
-  // Pending navigation target for sub-sessions that haven't loaded yet
-  const [pendingNav, setPendingNav] = useState<{ session: string; quote?: string } | null>(() => {
-    // Post-reload: pick up pending push target from localStorage (set before server switch reload)
-    const target = localStorage.getItem('rcc_push_target');
-    if (!target) return null;
-    localStorage.removeItem('rcc_push_target');
-    const quote = localStorage.getItem('rcc_push_quote') ?? undefined;
-    if (quote) localStorage.removeItem('rcc_push_quote');
-    return { session: target, quote };
-  });
+  const handleConfirmShareTargetSession = useCallback((targetServerId: string, targetSessionName: string) => {
+    if (!pendingSharedPayload || !targetServerId || !targetSessionName) return;
+    const payload = pendingSharedPayload;
+    const nextUpload: PendingSharedSessionUpload = {
+      id: payload.id,
+      serverId: targetServerId,
+      sessionName: targetSessionName,
+      files: payload.files,
+      ...(payload.text ? { text: payload.text } : {}),
+    };
+    setPendingSharedPayloads((prev) => prev.filter((item) => item.id !== payload.id));
+    setPendingSharedUploads((prev) => (
+      prev.some((item) => item.id === nextUpload.id) ? prev : [...prev, nextUpload]
+    ));
+    if (pendingSharedUploads.length === 0) {
+      if (targetServerId !== selectedServerIdRef.current) {
+        handleSelectServerForShare(targetServerId);
+      }
+      selectMainSessionTab(targetSessionName);
+    }
+  }, [handleSelectServerForShare, pendingSharedPayload, pendingSharedUploads.length, selectMainSessionTab]);
+
+  const handlePendingSharedUploadConsumed = useCallback((id: string) => {
+    setPendingSharedUploads((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const activeSharedUploadId = pendingSharedUpload?.id ?? null;
+  const hasPendingSharedModal = pendingSharedPayload !== null;
+  useEffect(() => {
+    if (!pendingSharedUpload) return;
+    if (pendingSharedUpload.serverId !== selectedServerIdRef.current) {
+      if (hasPendingSharedModal) return;
+      handleSelectServerForShare(pendingSharedUpload.serverId);
+      selectMainSessionTab(pendingSharedUpload.sessionName);
+      return;
+    }
+    if (pendingSharedUpload.sessionName !== activeSession) {
+      selectMainSessionTab(pendingSharedUpload.sessionName);
+    }
+  }, [activeSession, activeSharedUploadId, handleSelectServerForShare, hasPendingSharedModal, pendingSharedUpload, selectMainSessionTab]);
+
+  const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
+    if (item.isSharedIn) {
+      if (item.sharedEntry) {
+        void handleOpenSharedEntry(item.sharedEntry);
+      }
+      return;
+    }
+    handleSelectServer(item.id, item.name);
+  }, [handleOpenSharedEntry, handleSelectServer]);
+
+  const selectedServerIsSharedIn = useMemo(() => {
+    if (!selectedServerId) return false;
+    if (selectedShareTarget !== null) return true;
+    return !ownedServerIdsRef.current.has(selectedServerId) && unifiedServers.some((s) => s.id === selectedServerId && s.isSharedIn);
+  }, [selectedServerId, selectedShareTarget, unifiedServers]);
+
+  /**
+   * The single consumer of route changes this document did not initiate.
+   *
+   * Nothing used to subscribe to `popstate`/`hashchange`, so editing the
+   * address bar, following a direct link into this tab, using back/forward, or
+   * having the browser restore a session moved the URL while the app kept
+   * rendering — and kept talking to — whatever it had already selected. A user
+   * sitting in a shared session who navigated to one of their own servers was
+   * left with that server in the address bar and the shared pane still mounted
+   * and still privileged.
+   *
+   * This is deliberately NOT a second router and holds no state of its own: it
+   * parses with the existing `readHashState` helper, resolves authorization
+   * BEFORE touching any UI, and then converges the same selection setters every
+   * other navigation path already uses.
+   *
+   * Authorization is the load-bearing part. A URL is an intent, never a grant:
+   * an owned server must be present in the authorized server set, and a shared
+   * target must pass the existing `/api/shares/open` coverage check through
+   * `handleOpenSharedEntry`. Anything unknown, expired, revoked, or belonging
+   * to another account fails closed — and failing closed explicitly tears down
+   * the shared pane rather than leaving a privileged surface mounted under a
+   * route that no longer authorizes it.
+   */
+  useEffect(() => {
+    if (!auth || !serversLoaded) return;
+
+    /**
+     * Land on the dashboard as an EXPLICIT choice.
+     *
+     * Simply nulling the selection is not enough: auto-entry reads a null
+     * `selectedServerId` as "the user has not picked yet" and helpfully picks
+     * one, which is how an unauthorized route ended up re-selecting the shared
+     * server (confirmed by stack: the stale hash write came from `choose` in
+     * the auto-entry effect). `manualDashboard` is the existing signal for
+     * "empty on purpose", so reuse it rather than inventing a second flag.
+     */
+    const failClosedToDashboard = () => {
+      autoEntryRunRef.current++;
+      setManualDashboard(true);
+      localStorage.removeItem('rcc_server');
+      localStorage.removeItem('rcc_server_name');
+      localStorage.removeItem('rcc_session');
+      clearSharedTabRestoreMarker();
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      setSelectedServerId(null);
+      setSelectedServerName(null);
+      setActiveSession(null);
+    };
+
+    const consumeExternalRoute = () => {
+      const route = readHashState();
+      // Same route: nothing to do. Also makes duplicate/coalesced events
+      // (hashchange + popstate fire together for one user action) idempotent.
+      const routeKey = `${route.serverId ?? ''}|${route.sessionName ?? ''}|${route.sharedEntryId ?? ''}`;
+      if (externalRouteInFlightKeyRef.current === routeKey) return;
+      if (route.serverId === selectedServerId
+        && route.sessionName === (activeSession ?? null)
+        && route.sharedEntryId === (selectedSharedEntryId ?? null)) {
+        // Already showing this route, so there is nothing to converge — but if
+        // some OTHER route is still being authorized, navigating back here is
+        // the user abandoning it. Returning early without retiring that work
+        // let a late /api/shares/open result land and render a session the user
+        // had already left.
+        if (externalRouteInFlightKeyRef.current !== null) {
+          externalRouteInFlightKeyRef.current = null;
+          sharedOpenAbortRef.current?.abort();
+          sharedOpenAbortRef.current = null;
+          sharedOpenGenerationRef.current += 1;
+          sharedOpenIntentRef.current = null;
+          externalRouteGenerationRef.current += 1;
+          setOpeningSharedEntryId(null);
+        }
+        return;
+      }
+      externalRouteInFlightKeyRef.current = routeKey;
+
+      // An external navigation is an explicit user intent and outranks any
+      // shared-open still in flight, exactly like the in-app navigation paths.
+      sharedOpenAbortRef.current?.abort();
+      sharedOpenAbortRef.current = null;
+      sharedOpenGenerationRef.current += 1;
+      sharedOpenIntentRef.current = null;
+      setOpeningSharedEntryId(null);
+      // Auto-entry treats a null selection as "nobody has chosen yet" and picks
+      // a server on the user's behalf. Clearing the selection to fail closed
+      // would therefore hand the tab straight back to it, which is how an
+      // unauthorized route ended up re-selecting the shared server. Retire the
+      // in-flight auto-entry run the same way the in-app navigation handlers do.
+      autoEntryRunRef.current++;
+      const generation = ++externalRouteGenerationRef.current;
+
+      // Route cleared (back to the dashboard URL): drop everything, including
+      // any shared authority.
+      if (!route.serverId) {
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      // Ownership is asked of the authoritative inventory, NOT of `servers`.
+      // Using `servers.find` here meant that once a share had been opened its
+      // server was permanently treated as owned, so revisiting that route
+      // skipped /api/shares/open and a revoked or expired share still rendered.
+      const ownedServer = ownedServerIdsRef.current.has(route.serverId)
+        ? servers.find((server) => server.id === route.serverId)
+        : undefined;
+      if (ownedServer) {
+        const switchingServers = ownedServer.id !== selectedServerIdRef.current;
+        if (switchingServers) {
+          resetServerScopedStateForSwitch(ownedServer.id);
+        } else if (selectedShareTarget !== null) {
+          resetServerScopedOverlaysAndTargets(ownedServer.id);
+        }
+        // Converge atomically onto the owned server; any prior shared authority
+        // is dropped in the same turn so no privileged pane survives the move.
+        setSelectedShareTarget(null);
+        setSelectedSharedEntryId(null);
+        clearSharedTabRestoreMarker();
+        setShowSharedReturnGuide(false);
+        setManualDashboard(false);
+        localStorage.setItem('rcc_server', ownedServer.id);
+        if (ownedServer.name) localStorage.setItem('rcc_server_name', ownedServer.name);
+        initialHashStateRef.current = {
+          serverId: ownedServer.id,
+          sessionName: route.sessionName,
+          sharedEntryId: null,
+        };
+        selectedServerIdRef.current = ownedServer.id;
+        setSelectedServerId(ownedServer.id);
+        setSelectedServerName(ownedServer.name ?? null);
+        const routeSessionIsLoaded = !switchingServers && route.sessionName
+          ? sessions.some((session) => session.name === route.sessionName && isNavigableMainSession(session))
+          : false;
+        setActiveSession(routeSessionIsLoaded ? route.sessionName : null);
+        externalRouteInFlightKeyRef.current = null;
+        return;
+      }
+
+      // Not an owned server. The only way this may render is if the existing
+      // share-open path authorizes it; the inventory is navigation UI, so a
+      // hash-only target is reconstructed and left for the server to judge.
+      const entry = (route.sharedEntryId
+        ? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.id === route.sharedEntryId
+            && candidate.serverId === route.serverId
+          )) ?? null
+        : findSharedEntryForHash(sharedEntries, route.serverId, route.sessionName))
+        ?? sharedEntryFallbackFromHash(route.sharedEntryId, route.serverId, route.sessionName);
+
+      if (!entry) {
+        // Unknown/unauthorized route: fail closed. Never keep a stale shared
+        // pane alive under a route that does not authorize it.
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName, source: 'external' })
+        .then((result) => {
+          if (externalRouteInFlightKeyRef.current === routeKey) externalRouteInFlightKeyRef.current = null;
+          if (generation !== externalRouteGenerationRef.current) return;
+          if (result === 'opened' || result === 'superseded' || result === 'duplicate') return;
+          // Expired/revoked/cross-user share: the server refused. Tear the
+          // privileged surface down instead of leaving it on screen.
+          failClosedToDashboard();
+        });
+    };
+
+    window.addEventListener('hashchange', consumeExternalRoute);
+    window.addEventListener('popstate', consumeExternalRoute);
+    return () => {
+      window.removeEventListener('hashchange', consumeExternalRoute);
+      window.removeEventListener('popstate', consumeExternalRoute);
+    };
+  }, [
+    activeSession,
+    auth,
+    handleOpenSharedEntry,
+    selectedServerId,
+    selectedSharedEntryId,
+    servers,
+    serversLoaded,
+    sessions,
+    setActiveSession,
+    sharedEntries,
+  ]);
+
   const [pendingPrefills, setPendingPrefills] = useState<Record<string, string>>({});
+  const [pendingTaskQuote, setPendingTaskQuote] = useState<PendingTaskQuote | null>(null);
+  const taskQuoteNonceRef = useRef(0);
+  const consumePendingTaskQuote = useCallback((nonce: number) => {
+    setPendingTaskQuote((prev) => (prev?.nonce === nonce ? null : prev));
+  }, []);
+
+  const resolveNavigationSubSession = useCallback((sessionName: string, candidates: readonly SubSession[]) => {
+    const exact = candidates.find((candidate) => candidate.sessionName === sessionName);
+    if (exact) return { isSubSession: true, sub: exact };
+
+    const idMatch = sessionName.match(/^deck_sub_(.+)$/);
+    if (idMatch) {
+      const byId = candidates.find((candidate) => candidate.id === idMatch[1]);
+      if (byId) return { isSubSession: true, sub: byId };
+    }
+    const byIdDirect = candidates.find((candidate) => candidate.id === sessionName);
+    if (byIdDirect) return { isSubSession: true, sub: byIdDirect };
+
+    return {
+      isSubSession: !!idMatch,
+      sub: undefined,
+    };
+  }, []);
+
+  const dismissNotificationBlockingViews = useCallback(() => {
+    setManualDashboard(false);
+    setShowTaskMode(false);
+    setShowSupervisionTaskConsole(false);
+    setShowSettingsPage(false);
+    setShowAdminPage(false);
+    setShowUsageSummaryPage(false);
+    setShowControlledNodes(false);
+    setShowDownloadsModal(false);
+    setShowDiscussionsPage(false);
+    setShowRepoPage(false);
+    setShowCronManager(false);
+    setShowMobileFileBrowser(false);
+    setShowSharedContextManagement(false);
+    setShowSharedContextDiagnostics(false);
+    setShowCloudDocs(false);
+    setShowMobileServerMenu(false);
+  }, []);
 
   // Helper: navigate to a session (main or sub) without reload.
   // For sub-sessions, if sub-session data isn't loaded yet, queues a pending nav.
-  const navigateToSession = useCallback((session: string, quote?: string) => {
-    const subMatch = session.match(/^deck_sub_(.+)$/);
-    if (subMatch) {
-      const subId = subMatch[1];
-      const sub = subSessionsRef.current.find((s) => s.id === subId);
+  const navigateToSession = useCallback((
+    session: string,
+    quote?: string,
+    options?: { scrollToBottom?: boolean; taskQuote?: PendingTaskQuotePayload },
+  ) => {
+    const target = resolveNavigationSubSession(session, subSessionsRef.current);
+    if (target.isSubSession) {
+      const sub = target.sub;
       if (!sub) {
         // Sub-sessions not loaded yet — queue for retry when they arrive
-        setPendingNav({ session, quote });
+        updatePendingNav({
+          serverId: selectedServerIdRef.current ?? undefined,
+          session,
+          quote,
+          ...(options?.taskQuote ? { taskQuote: options.taskQuote } : {}),
+        });
+        setPendingTaskQuote(null);
         return;
       }
       // Activate parent main session first
       if (sub.parentSession) {
         safeLocalStorageSetItem('rcc_session', sub.parentSession);
-        setActiveSession(sub.parentSession, { keepSubWindows: true });
+        setActiveSession(sub.parentSession, {
+          keepSubWindows: true,
+          scrollToBottom: options?.scrollToBottom,
+        });
       }
-      setOpenSubIds((prev) => new Set([...prev, subId]));
-      bringSubToFront(subId);
+      // Use the same authoritative open path as the mobile sub-session bar.
+      // On desktop it preserves the other floating windows and raises this
+      // one. On mobile exactly one full-screen sub-session can be visible, so
+      // it replaces the previously-open overlay. The old inline add-to-set
+      // logic left both mobile windows mounted at the same z-index; whichever
+      // happened to render last covered the notification target.
+      openSubSessionWindow(sub.id, { scrollToBottom: options?.scrollToBottom });
     } else {
       safeLocalStorageSetItem('rcc_session', session);
-      setActiveSession(session);
+      setActiveSession(session, { scrollToBottom: options?.scrollToBottom });
+      // A mobile sub-session is a full-screen overlay. Merely selecting its
+      // already-active parent session restores the persisted overlay, leaving
+      // the notification's main-session target hidden underneath it.
+      if (isMobileRef.current) closeAllSubSessionWindows();
     }
     if (quote) {
       const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
       setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
-  }, [setActiveSession, bringSubToFront]);
+    if (options?.taskQuote) {
+      setPendingTaskQuote({
+        serverId: selectedServerIdRef.current ?? '',
+        sessionName: session,
+        quote: options.taskQuote.quote,
+        nonce: options.taskQuote.nonce,
+      });
+    } else {
+      setPendingTaskQuote(null);
+    }
+  }, [closeAllSubSessionWindows, openSubSessionWindow, resolveNavigationSubSession, setActiveSession, updatePendingNav]);
 
   const navigateToSessionRef = useRef(navigateToSession);
   navigateToSessionRef.current = navigateToSession;
 
-  // Reactive: when sub-sessions load and we have a pending nav, retry navigation
+  // Message pins use the exact same activation path as notification clicks.
+  // This keeps parent activation, already-open window fronting, and the
+  // not-yet-loaded sub-session retry queue in one authoritative workflow.
+  useEffect(() => {
+    const navigateToPinnedMessage = (pin: MessagePin, sourceSessionName: string | null) => {
+      if (pin.serverId !== selectedServerId) return;
+      const target = resolveNavigationSubSession(pin.sessionName, subSessionsRef.current);
+      navigateToSession(pin.sessionName, undefined, { scrollToBottom: false });
+
+      // A pin selected from a floating sub-session can target its parent main
+      // chat. Hide only that source window so the newly activated main chat is
+      // actually visible; other open sub-session windows remain untouched.
+      if (!target.isSubSession && sourceSessionName) {
+        const sourceSub = subSessionsRef.current.find((candidate) => (
+          candidate.sessionName === sourceSessionName
+        ));
+        if (sourceSub) minimizeSubSessionWindow(sourceSub.id);
+      }
+    };
+    const unsubscribe = subscribeMessagePinNavigation(navigateToPinnedMessage);
+    const pending = peekPendingMessagePinNavigation();
+    if (pending) navigateToPinnedMessage(pending.pin, pending.sourceSessionName);
+    return unsubscribe;
+  }, [minimizeSubSessionWindow, navigateToSession, resolveNavigationSubSession, selectedServerId]);
+
+  // Reactive: once destination server + sessions (and sub-sessions if needed) hydrate, apply pendingNav.
   useEffect(() => {
     if (!pendingNav) return;
-    const subMatch = pendingNav.session.match(/^deck_sub_(.+)$/);
-    if (!subMatch) {
-      navigateToSession(pendingNav.session, pendingNav.quote);
-      setPendingNav(null);
+    if (pendingNav.serverId && selectedServerId !== pendingNav.serverId) return;
+    if (!sessionsLoaded) return;
+    const target = resolveNavigationSubSession(pendingNav.session, subSessions);
+    const navOptions = pendingNav.taskQuote ? { taskQuote: pendingNav.taskQuote } : undefined;
+    if (target.isSubSession) {
+      if (!target.sub) return;
+      navigateToSession(pendingNav.session, pendingNav.quote, navOptions);
+      updatePendingNav(null);
       return;
     }
-    const sub = subSessions.find((s) => s.id === subMatch[1]);
-    if (sub) {
-      navigateToSession(pendingNav.session, pendingNav.quote);
-      setPendingNav(null);
+    const existsInMain = sessions.some((s) => s.name === pendingNav.session);
+    if (existsInMain) {
+      navigateToSession(pendingNav.session, pendingNav.quote, navOptions);
+      updatePendingNav(null);
+      return;
     }
-  }, [pendingNav, subSessions, navigateToSession]);
+    // Non-existent / deleted main session once destination server sessions loaded:
+    // clear pendingNav and fall back cleanly to the server's normal tab.
+    updatePendingNav(null);
+    if (selectedServerId && !activeSessionRef.current) {
+      restoreLastTabRef.current(selectedServerId, navigableMainSessions.map((s) => s.name));
+    }
+  }, [
+    navigableMainSessions,
+    navigateToSession,
+    pendingNav,
+    resolveNavigationSubSession,
+    selectedServerId,
+    sessions,
+    sessionsLoaded,
+    subSessions,
+    updatePendingNav,
+  ]);
 
-  // Safety timeout: if pending nav isn't resolved within 8s, clear it
+  // Safety timeout: if pending nav isn't resolved within 8s, clear it and fall back cleanly.
   useEffect(() => {
     if (!pendingNav) return;
-    const timer = setTimeout(() => setPendingNav(null), 8000);
+    const timer = setTimeout(() => {
+      const expired = pendingNavRef.current;
+      updatePendingNav(null);
+      if (
+        expired
+        && (!expired.serverId || expired.serverId === selectedServerIdRef.current)
+        && !activeSessionRef.current
+        && selectedServerIdRef.current
+      ) {
+        restoreLastTabRef.current(
+          selectedServerIdRef.current,
+          navigableMainSessionsRef.current.map((s) => s.name),
+        );
+      }
+    }, 8000);
     return () => clearTimeout(timer);
-  }, [pendingNav]);
+  }, [pendingNav, updatePendingNav]);
+
+  const navigateToTargetServerAndSession = useCallback((
+    targetServerId?: string | null,
+    targetSession?: string | null,
+    quote?: string,
+    taskQuote?: PendingTaskQuotePayload,
+  ) => {
+    const sid = typeof targetServerId === 'string' && targetServerId.trim() ? targetServerId : null;
+    const session = typeof targetSession === 'string' && targetSession.trim() ? targetSession : null;
+    const needsServerSwitch = Boolean(sid) && (
+      sid !== selectedServerIdRef.current
+      || selectedSharedEntryId !== null
+      || selectedShareTarget !== null
+    );
+
+    dismissNotificationBlockingViews();
+
+    const scopedServerId = sid ?? selectedServerIdRef.current ?? undefined;
+    if (needsServerSwitch || (scopedServerId && !sessionsLoadedRef.current)) {
+      setPendingTaskQuote(null);
+      if (session) {
+        updatePendingNav({
+          serverId: scopedServerId,
+          session,
+          quote,
+          ...(taskQuote ? { taskQuote } : {}),
+        });
+      } else {
+        updatePendingNav(null);
+      }
+      if (needsServerSwitch && sid) {
+        void handleSelectServer(sid);
+      }
+      return;
+    }
+
+    updatePendingNav(null);
+    if (session) {
+      navigateToSession(session, quote, taskQuote ? { taskQuote } : undefined);
+    } else {
+      setPendingTaskQuote(null);
+    }
+  }, [
+    dismissNotificationBlockingViews,
+    handleSelectServer,
+    navigateToSession,
+    selectedShareTarget,
+    selectedSharedEntryId,
+    updatePendingNav,
+  ]);
 
   // Push notification tap → navigate to the right server + session.
   useEffect(() => {
     const handler = (e: Event) => {
       const { serverId: sid, session, quote } = (e as CustomEvent).detail ?? {};
-      const currentServer = localStorage.getItem('rcc_server');
-      const needsServerSwitch = sid && sid !== currentServer;
-
-      if (needsServerSwitch) {
-        if (session) localStorage.setItem('rcc_push_target', session as string);
-        if (quote) localStorage.setItem('rcc_push_quote', quote as string);
-        handleSelectServer(sid!);
-        return;
-      }
-
-      if (session) {
-        navigateToSession(session as string, quote as string | undefined);
-      }
+      navigateToTargetServerAndSession(
+        sid as string | undefined,
+        session as string | undefined,
+        quote as string | undefined,
+      );
     };
     window.addEventListener('deck:navigate', handler);
 
@@ -4113,23 +8067,256 @@ export function App() {
     window.addEventListener('deck:view-discussion', discussionHandler);
 
     return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
-  }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
+  }, [
+    navigateToTargetServerAndSession,
+    runVersionSensitiveAction,
+    trans,
+  ]);
+
+  const handleJumpToGlobalTaskSession = useCallback((
+    targetServerId: string,
+    targetSessionName: string,
+    taskContext?: GlobalTaskJumpContext,
+  ) => {
+    if (!targetServerId || !targetSessionName) {
+      dismissNotificationBlockingViews();
+      return;
+    }
+    const cleanTitle = taskContext?.title?.trim() ?? '';
+    const quote = cleanTitle
+      ? formatTaskJumpQuote(cleanTitle, i18n?.resolvedLanguage || i18n?.language)
+      : '';
+    let nextTaskQuote: PendingTaskQuotePayload | undefined;
+    if (quote) {
+      taskQuoteNonceRef.current += 1;
+      nextTaskQuote = {
+        quote,
+        nonce: taskQuoteNonceRef.current,
+      };
+    } else {
+      setPendingTaskQuote(null);
+    }
+    navigateToTargetServerAndSession(targetServerId, targetSessionName, undefined, nextTaskQuote);
+  }, [dismissNotificationBlockingViews, i18n?.language, i18n?.resolvedLanguage, navigateToTargetServerAndSession]);
+
+  const handlePairSplit = useCallback((detail: {
+    taskId: string;
+    title?: string;
+    executor: string;
+    auditor: string;
+    action?: 'open' | 'close' | 'toggle';
+  }) => {
+    if (isMobileRef.current) return;
+    const { taskId, executor, auditor, action = 'toggle' } = detail;
+    const title = typeof detail.title === 'string' && detail.title.trim() ? detail.title.trim() : taskId;
+    if (!taskId || !executor || !auditor || auditor === 'none') return;
+
+    const resolveSub = (nameOrId: string) => {
+      const match = nameOrId.match(/^deck_sub_(.+)$/);
+      const subIdCandidate = match ? match[1] : nameOrId;
+      const found = subSessionsRef.current.find((s) => s.id === subIdCandidate || s.sessionName === nameOrId || s.id === nameOrId);
+      return { id: found ? found.id : subIdCandidate, sub: found };
+    };
+
+    const resolvedExec = resolveSub(executor);
+    const resolvedAudit = resolveSub(auditor);
+    const executorSubId = resolvedExec.id;
+    const auditorSubId = resolvedAudit.id;
+
+    const isCurrentActive = activeSplitPairRef.current?.taskId === taskId
+      && openSubIdsRef.current.has(executorSubId)
+      && openSubIdsRef.current.has(auditorSubId);
+
+    const shouldClose = action === 'close' || (action === 'toggle' && isCurrentActive);
+
+    if (shouldClose) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+      minimizeSubSessionWindow(executorSubId);
+      minimizeSubSessionWindow(auditorSubId);
+      return;
+    }
+
+    // Minimizing the first pane clears activeSplitPairRef: capture both ids before that callback.
+    const previousSplit = activeSplitPairRef.current;
+    if (previousSplit && previousSplit.taskId !== taskId) {
+      minimizeSubSessionWindow(previousSplit.executorSubId);
+      minimizeSubSessionWindow(previousSplit.auditorSubId);
+    }
+
+    const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      minW: 600,
+      minH: 400,
+    }));
+    const halfW = Math.max(300, Math.floor(bounds.w / 2));
+    const leftGeom: WindowGeometry = {
+      x: bounds.x,
+      y: bounds.y,
+      w: halfW,
+      h: bounds.h,
+    };
+    const rightGeom: WindowGeometry = {
+      x: bounds.x + halfW,
+      y: bounds.y,
+      w: Math.max(300, bounds.w - halfW),
+      h: bounds.h,
+    };
+
+    const updateWindowGeom = (subId: string, geom: WindowGeometry) => {
+      const key = `rcc_subsession_${subId}`;
+      try {
+        const raw = localStorage.getItem(key);
+        const existing = raw ? JSON.parse(raw) : {};
+        localStorage.setItem(key, JSON.stringify({ ...existing, geom, isSplit: true }));
+      } catch {}
+      window.dispatchEvent(new CustomEvent('deck:subsession-geom', { detail: { subId, geom } }));
+    };
+
+    updateWindowGeom(executorSubId, leftGeom);
+    updateWindowGeom(auditorSubId, rightGeom);
+
+    clearSubSessionMaximized(executorSubId);
+    clearSubSessionMaximized(auditorSubId);
+    unpinSubSessionPanel(executorSubId);
+    unpinSubSessionPanel(auditorSubId);
+
+    const parent = resolvedExec.sub?.parentSession || resolvedAudit.sub?.parentSession;
+    if (parent && parent !== activeSessionRef.current) {
+      setActiveSession(parent, { keepSubWindows: true });
+    }
+
+    setOpenSubIds((prev) => {
+      const next = new Set(prev);
+      next.add(executorSubId);
+      next.add(auditorSubId);
+      return next;
+    });
+
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(auditorSubId), getSubSessionDesktopWindowMeta(auditorSubId), { bringToFront: true });
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(executorSubId), getSubSessionDesktopWindowMeta(executorSubId), { bringToFront: true });
+    activateSubId(executorSubId);
+    scheduleSubChatScrollToBottom(auditorSubId);
+    scheduleSubChatScrollToBottom(executorSubId);
+
+    activeSplitPairRef.current = { taskId, title, executorSubId, auditorSubId };
+    setActiveSplitPairTaskId(taskId);
+    (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = taskId;
+    window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: taskId } }));
+  }, [
+    activateSubId,
+    clearSubSessionMaximized,
+    ensureDesktopWindow,
+    getDesktopMaximizeBounds,
+    getSubSessionDesktopWindowMeta,
+    minimizeSubSessionWindow,
+    setActiveSession,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
+
+  useEffect(() => {
+    const pairSplitHandler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && typeof detail.taskId === 'string') {
+        handlePairSplit(detail);
+      }
+    };
+    window.addEventListener('deck:pair-split', pairSplitHandler);
+    return () => window.removeEventListener('deck:pair-split', pairSplitHandler);
+  }, [handlePairSplit]);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const onResize = () => {
+      if (!activeSplitPairRef.current) return;
+      const { executorSubId, auditorSubId } = activeSplitPairRef.current;
+      if (!openSubIdsRef.current.has(executorSubId) || !openSubIdsRef.current.has(auditorSubId)) {
+        activeSplitPairRef.current = null;
+        setActiveSplitPairTaskId(null);
+        (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+        return;
+      }
+      const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        minW: 600,
+        minH: 400,
+      }));
+      const halfW = Math.max(300, Math.floor(bounds.w / 2));
+      const leftGeom: WindowGeometry = { x: bounds.x, y: bounds.y, w: halfW, h: bounds.h };
+      const rightGeom: WindowGeometry = { x: bounds.x + halfW, y: bounds.y, w: Math.max(300, bounds.w - halfW), h: bounds.h };
+      const updateWindowGeom = (subId: string, geom: WindowGeometry) => {
+        const key = `rcc_subsession_${subId}`;
+        try {
+          const raw = localStorage.getItem(key);
+          const existing = raw ? JSON.parse(raw) : {};
+          localStorage.setItem(key, JSON.stringify({ ...existing, geom, isSplit: true }));
+        } catch {}
+        window.dispatchEvent(new CustomEvent('deck:subsession-geom', { detail: { subId, geom } }));
+      };
+      updateWindowGeom(executorSubId, leftGeom);
+      updateWindowGeom(auditorSubId, rightGeom);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [getDesktopMaximizeBounds, isMobile]);
 
   const handleBackToDashboard = useCallback(() => {
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
+    const prevServer = selectedServerIdRef.current;
+    const currentSession = activeSessionRef.current;
+    if (prevServer && currentSession) {
+      const isCurrentIncog = isIncognitoTimelineSession(prevServer, currentSession)
+        || sessionsRef.current.some((s) => s.name === currentSession && s.incognito === true);
+      if (isCurrentIncog) {
+        incognitoActiveSessionByServerRef.current.set(prevServer, currentSession);
+      } else if (rememberIntentRef.current === currentSession) {
+        writeServerSession(prevServer, currentSession);
+      }
+    }
+    resetServerScopedOverlaysAndTargets();
+    openSubPersistenceSessionRef.current = null;
+    openSubPersistenceServerRef.current = null;
+    openSubIdsRef.current = new Set();
+    setOpenSubIdsRaw(new Set());
+    setRetainedOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
     setManualDashboard(true);
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
+    selectedServerIdRef.current = null;
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
-    setActiveSession(null);
+    setSelectedSharedEntryId(null);
+    setActiveSession(null, { remember: false, keepSubWindows: true });
     setShowMobileServerMenu(false);
-  }, [setActiveSession]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
+
+  const canStopProjectForCurrentShare = !selectedShareTarget || (
+    selectedShareTarget.kind === 'server'
+    && sessions.find((session) => session.name === activeSession)?.sharedState?.effectiveRole === 'participant'
+  );
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
+    // A concrete tab share never owns the whole project lifecycle. Whole-
+    // server participants are the explicit owner-equivalent exception.
+    if (!canStopProjectForCurrentShare) return;
     // Pinned tabs are protected — refuse to stop a project that has any
     // pinned session. User must unpin first. Defense-in-depth so all stop
     // paths (tab context menu, session-controls menu) honor this.
@@ -4137,19 +8324,27 @@ export function App() {
       try { window.alert(trans('session.unpin_to_stop')); } catch { /* ignore */ }
       return;
     }
+    if (selectedServerId) {
+      for (const s of sessions) {
+        if (s.project === project) {
+          manualStoppedMainSessionsRef.current.add(`${selectedServerId}:${s.name}`);
+        }
+      }
+    }
     setSessions((prev) => prev.map((s) =>
       s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
     ));
     wsRef.current.sendSessionCommand('stop', { project });
-  }, [pinnedTabs, sessions, trans]);
+    requestActiveTimelineRefreshAfterUserAction();
+  }, [canStopProjectForCurrentShare, pinnedTabs, selectedServerId, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
   }, []);
 
-  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void) => {
-    diffApplyersRef.current.set(sessionName, apply);
-  }, []);
+  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void): (() => void) => (
+    diffApplyersRef.current.register(sessionName, apply)
+  ), []);
 
   const registerHistoryApplyer = useCallback((sessionName: string, apply: (content: string) => void) => {
     historyApplyersRef.current.set(sessionName, apply);
@@ -4161,6 +8356,66 @@ export function App() {
     return <NativeAuthBridge callbackUrl={nativeCallback} />;
   }
 
+  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  // Session list refreshes can replace the initially hydrated sharedState. Keep
+  // the share entry's role as the durable fallback so a whole-server
+  // participant does not briefly become a viewer (and lose cron controls).
+  const selectedSharedEntry = selectedSharedEntryId
+    ? sharedEntries.find((entry) => entry.id === selectedSharedEntryId)
+    : null;
+  const sharedAccessRole = selectedShareTarget
+    ? (selectedSharedEntry?.role ?? activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    : null;
+  const supervisionTaskConsoleVisibility = {
+    session: activeSessionInfo,
+    shareTargetKind: selectedShareTarget?.kind ?? null,
+    sharedAccessRole: selectedShareTarget
+      ? (activeSessionInfo?.sharedState?.effectiveRole ?? null)
+      : null,
+  };
+  const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);
+  useEffect(() => {
+    if (!auth || canViewTaskConsole || !selectedServerId || !activeSessionInfo) return;
+    clearSupervisionTaskConsoleCache({
+      userId: auth.userId,
+      serverId: selectedServerId,
+      projectName: activeSessionInfo.project,
+      coordinatorSessionName: activeSessionInfo.name,
+    });
+  }, [activeSessionInfo?.name, activeSessionInfo?.project, auth?.userId, canViewTaskConsole, selectedServerId]);
+
+  const handleAppLoginSuccess = (
+    userId: string,
+    url: string,
+    r2RelayEnabled?: boolean,
+    expectedGeneration?: number,
+  ) => {
+    if (!appMountedRef.current) return;
+    if (expectedGeneration !== undefined && authMutationGenerationRef.current !== expectedGeneration) {
+      return;
+    }
+    const activeServerUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current;
+    if (activeServerUrl && activeServerUrl !== url) {
+      return;
+    }
+    const authState: AuthState = { userId, baseUrl: url };
+    const nextGeneration = authMutationGenerationRef.current + 1;
+    authMutationGenerationRef.current = nextGeneration;
+    configureExpectedUserId(userId);
+    setFileRelayUser(userId);
+    setServerR2RelayEnabled(r2RelayEnabled === true);
+    localStorage.setItem('rcc_auth', JSON.stringify(authState));
+    setAuth((prev) => (
+      prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl ? prev : authState
+    ));
+    if (r2RelayEnabled === undefined) {
+      void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
+        if (!appMountedRef.current || authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
+        setServerR2RelayEnabled(me.r2RelayEnabled === true);
+      }).catch(() => { /* fail-closed false already set */ });
+    }
+  };
+
   if (!nativeReady || !splashDone) {
     return null; // Wait for startup readiness while the HTML splash remains visible
   }
@@ -4168,11 +8423,30 @@ export function App() {
   if (isNative() && !nativeServerUrl) {
     return (
       <ServerSetupPage
-        onConnect={(url) => {
-          setNativeServerUrl(url);
-          configureApi(url);
-        }}
+        onConnect={connectNativeServer}
       />
+    );
+  }
+
+  if (authCredentialCleanupPending) {
+    return (
+      <div
+        data-testid="auth-credential-cleanup-gate"
+        role="status"
+        aria-live="polite"
+        style={{
+          minHeight: 'var(--imcodes-ui-dvh, 100vh)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 12,
+          color: '#94a3b8',
+        }}
+      >
+        <div class="spinner" aria-hidden="true" />
+        <div>{trans('common.loading')}</div>
+      </div>
     );
   }
 
@@ -4180,17 +8454,29 @@ export function App() {
     return (
       <LoginPage
         serverUrl={nativeServerUrl}
-        onLoginSuccess={(userId, url) => {
-          const authState: AuthState = { userId, baseUrl: url };
-          localStorage.setItem('rcc_auth', JSON.stringify(authState));
-          setAuth(authState);
-        }}
-        onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
+        beginAuthAttempt={beginAuthAttempt}
+        sessionNotStuck={sessionNotStuck}
+        onLoginSuccess={handleAppLoginSuccess}
+        onChangeServer={isNative() ? handleChangeServer : undefined}
       />
     );
   }
 
-  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  if (isDocCollaborator) {
+    return <ExternalDocShareSpace token="" />;
+  }
+
+  if (desktopCallback && !isNative()) {
+    return <DesktopAuthBridge callbackUrl={desktopCallback} />;
+  }
+
+  const isSharedServerParticipant = selectedShareTarget?.kind === 'server'
+    && sharedAccessRole === 'participant';
+  const isTabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+  const canManageServerFileShares = !selectedServerIsSharedIn && !selectedShareTarget;
+  const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
+  const canCreateSubSession = !selectedShareTarget
+    || sharedAccessRole === 'participant';
 
   const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
     if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
@@ -4203,7 +8489,9 @@ export function App() {
   const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
     runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
       const sessionId = target?.sessionId ?? activeSession ?? null;
-      const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
+      const projectDir = isTabShare
+        ? FS_SESSION_ROOT_PATH
+        : target?.projectDir ?? resolveRepoProjectDir(sessionId);
       if (!projectDir) return;
       const subSessionTarget = sessionId ? subSessions.find((sub) => sub.sessionName === sessionId) : null;
       const parentSubId = target?.parentSubId ?? subSessionTarget?.id ?? null;
@@ -4241,10 +8529,12 @@ export function App() {
       }
       setShowRepoPage(true);
     });
-  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
+  }, [activeSession, ensureDesktopWindow, isTabShare, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
-  const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
+  const repoPanelProjectDir = isTabShare
+    ? FS_SESSION_ROOT_PATH
+    : repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
 
   // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
   // request-scope object so its identity stays stable across parent
@@ -4334,20 +8624,943 @@ export function App() {
       ],
     },
   ], []);
+  const hasBlockingNavigationOverlay = showNewUserGuidePrompt
+    || showNewUserGuide
+    || showNewSession
+    || showSubDialog
+    || showDiscussionDialog
+    || showDownloadsModal
+    || showSettingsPage
+    || showUsageSummaryPage
+    || showAdminPage
+    || showMobileFileBrowser
+    || settingsTarget !== null
+    || cloneSessionTarget !== null
+    || shareDialogTarget !== null
+    || deleteTarget !== null
+    || renameRequest !== null
+    || pendingQuestion !== null
+    || pendingSharedPayload !== null
+    || appUpdateNotice?.required === true;
+  const featureAnnouncementBlocked = showNewUserGuidePrompt
+    || showNewUserGuide
+    || showNewSession
+    || showSubDialog
+    || showRepoPage
+    || showDownloadsModal
+    || showSettingsPage
+    || showUsageSummaryPage
+    || showCronManager
+    || showAdminPage
+    || showSharedContextManagement
+    || showControlledNodes
+    || showCloudDocs
+    || showTaskMode
+    || showSharedContextDiagnostics
+    || showDiscussionsPage
+    || showDiscussionDialog
+    || settingsTarget !== null
+    || cloneSessionTarget !== null
+    || shareDialogTarget !== null
+    || deleteTarget !== null
+    || pendingQuestion !== null
+    || pendingSharedPayload !== null
+    || appUpdateNotice?.required === true;
+  const hasBlockingComposerOverlay = featureAnnouncementBlocked
+    || showDesktopFileBrowser
+    || showMobileFileBrowser
+    || previewFileRequest !== null
+    || renameRequest !== null
+    || (remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+    || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
+
+  const pinnedSidebarVisible = Boolean(selectedServerId) && (isMobile ? mobileSidebarOpen : !sidebarCollapsed);
+  const visiblePinnedSubSessions = pinnedSidebarVisible
+    ? pinnedPanels
+        .filter((panel) => panel.type === 'subsession' && isPinnedPanelForServer(panel, selectedServerId))
+        .map((panel) => {
+          const sessionName = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : '';
+          const liveSub = subSessions.find((s) => s.sessionName === sessionName);
+          if (!sessionName || !liveSub) return null;
+          const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
+          const isTransport = resolveSubSessionRuntimeType(liveSub) === 'transport';
+          const pinnedViewMode = panel.props?.viewMode === 'terminal' || panel.props?.viewMode === 'chat'
+            ? panel.props.viewMode
+            : undefined;
+          const mode: ViewMode = isTransport ? 'chat' : (pinnedViewMode ?? (isShell ? 'terminal' : 'chat'));
+          return { sessionName, viewMode: mode };
+        })
+        .filter((entry): entry is { sessionName: string; viewMode: ViewMode } => entry !== null)
+    : [];
+
+  const askQuestionChatObscured = manualDashboard
+    || !selectedServerId
+    || showTaskMode
+    || showRepoPage
+    || showDownloadsModal
+    || showSettingsPage
+    || showUsageSummaryPage
+    || showCronManager
+    || showAdminPage
+    || showSharedContextManagement
+    || showControlledNodes
+    || showCloudDocs
+    || showSharedContextDiagnostics
+    || showDiscussionsPage
+    || (remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+    || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
+
+  askQuestionUiStateRef.current = {
+    chatObscured: askQuestionChatObscured,
+    isMobile,
+    activeSession,
+    defaultViewMode: effectiveDefault,
+    activeSessionViewMode: viewMode,
+    viewModes,
+    openSubSessionIds: visibleOpenWindowIds,
+    pinnedSubSessions: visiblePinnedSubSessions,
+    hasMaximizedSubSession: maximizedSubIds.size > 0,
+    subSessions,
+    subSessionViewModes: subSessionViewModesRef.current,
+  };
+
+  // Auto-close the cross-tab AskQuestionDialog if the user switches to or
+  // reveals that session's chat timeline; leave dismissedQuestionsRef untouched
+  // so the inline timeline card stays interactive.
+  const visiblePinnedSubSessionsKey = visiblePinnedSubSessions
+    .map((entry) => `${entry.sessionName}:${entry.viewMode}`)
+    .join(',');
+  useEffect(() => {
+    if (!pendingQuestion) return;
+    if (isAskQuestionSessionVisible(pendingQuestion.sessionName, askQuestionUiStateRef.current)) {
+      setPendingQuestion((prev) => (
+        prev && prev.toolUseId === pendingQuestion.toolUseId ? null : prev
+      ));
+    }
+  }, [
+    pendingQuestion,
+    askQuestionChatObscured,
+    isMobile,
+    activeSession,
+    effectiveDefault,
+    viewMode,
+    viewModes,
+    visibleOpenWindowIds,
+    visiblePinnedSubSessionsKey,
+    maximizedSubIds,
+    subSessions,
+  ]);
+
+  // Global keyboard shortcuts & mobile 2-finger navigation gestures: switch servers & session tabs.
+  const mobileSwipeHudRef = useRef<MobileSwipeHudOverlayHandle | null>(null);
+  const handleMobileGestureProgress = useCallback((progress: MobileNavigationGestureProgress | null) => {
+    mobileSwipeHudRef.current?.setProgress(progress);
+  }, []);
+  const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
+    serverId: string;
+    serverName: string;
+    sessionName?: string | null;
+    sharedEntryId?: string | null;
+    switchKind: 'server' | 'session';
+    shortcutKeycaps: string[];
+    nonce: number;
+  } | null>(null);
+  const dismissServerSwitchWatermark = useCallback(() => {
+    setServerSwitchWatermark(null);
+  }, []);
+  const unifiedServersNavRef = useRef(unifiedServers);
+  unifiedServersNavRef.current = unifiedServers;
+  const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
+  orderedTabsNavRef.current = orderedVisibleMainSessions;
+  const resolvedShortcutSlotsRef = useRef(resolvedShortcutSlots);
+  resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
+  const resolvedSubSessionQuickModifiersRef = useRef(resolvedSubSessionQuickModifiers);
+  resolvedSubSessionQuickModifiersRef.current = resolvedSubSessionQuickModifiers;
+  const resolvedTaskPairSplitModifiersRef = useRef(resolvedTaskPairSplitModifiers);
+  resolvedTaskPairSplitModifiersRef.current = resolvedTaskPairSplitModifiers;
+  useEffect(() => {
+    (window as Window & { __imcodesTaskPairSplitModifiers?: ShortcutModifierKey[] }).__imcodesTaskPairSplitModifiers = resolvedTaskPairSplitModifiers;
+    window.dispatchEvent(new CustomEvent('deck:task-pair-split-modifiers'));
+  }, [resolvedTaskPairSplitModifiers]);
+  const handlePairSplitRef = useRef(handlePairSplit);
+  handlePairSplitRef.current = handlePairSplit;
+  const resolvedMacVoiceModifierRef = useRef(resolvedMacVoiceModifier);
+  resolvedMacVoiceModifierRef.current = resolvedMacVoiceModifier;
+  setFallbackMacVoiceModifier(resolvedMacVoiceModifier);
+  const orderedVisibleSubSessionsRef = useRef(visibleSubSessions);
+  const openSubSessionWindowRef = useRef(openSubSessionWindow);
+  openSubSessionWindowRef.current = openSubSessionWindow;
+  const minimizeSubSessionWindowRef = useRef(minimizeSubSessionWindow);
+  minimizeSubSessionWindowRef.current = minimizeSubSessionWindow;
+  const closeAllSubSessionWindowsRef = useRef(closeAllSubSessionWindows);
+  closeAllSubSessionWindowsRef.current = closeAllSubSessionWindows;
+  const remoteDesktopWorkspaceOpenRef = useRef(remoteDesktopWorkspace.open);
+  remoteDesktopWorkspaceOpenRef.current = remoteDesktopWorkspace.open;
+  const remoteDesktopWorkspaceMinimizedRef = useRef(remoteDesktopWorkspaceMinimized);
+  remoteDesktopWorkspaceMinimizedRef.current = remoteDesktopWorkspaceMinimized;
+  const remoteDesktopWallMinimizedRef = useRef(remoteDesktopWallMinimized);
+  remoteDesktopWallMinimizedRef.current = remoteDesktopWallMinimized;
+  const returnToMainWindow = useCallback(() => {
+    if (isMobileRef.current) return;
+    if (typeof document !== 'undefined' && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      void document.exitFullscreen().catch(() => {});
+    }
+    closeAllSubSessionWindowsRef.current();
+    if (remoteDesktopWorkspaceOpenRef.current && !remoteDesktopWorkspaceMinimizedRef.current) {
+      setRemoteDesktopWorkspaceMinimized(true);
+    }
+    if (remoteDesktopWallOpenRef.current && !remoteDesktopWallMinimizedRef.current) {
+      setRemoteDesktopWallMinimized(true);
+    }
+    setShowDesktopFileBrowser(false);
+    setShowDesktopLocalWebPreview(false);
+    setShowDiscussionsPage(false);
+    setDiscussionInitialId(null);
+    setDiscussionInitialTab('team');
+    setShowRepoPage(false);
+    setPreviewFileRequest(null);
+    setShowCronManager(false);
+    setShowSharedContextManagement(false);
+    setShowControlledNodes(false);
+    setShowCloudDocs(false);
+    setShowSharedContextDiagnostics(false);
+    setShowDownloadsModal(false);
+    setShowSettingsPage(false);
+    setShowUsageSummaryPage(false);
+    setShowAdminPage(false);
+    setRemoteDesktopGuestAccess(null);
+    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+      if (document.activeElement.closest('.remote-desktop-workspace-window, .remote-desktop-wall-window, .subsession-window')) {
+        document.activeElement.blur();
+      }
+    }
+    lastAutoFocusedRef.current = null;
+    if (activeSessionRef.current) {
+      scheduleMainChatScrollToBottom(activeSessionRef.current);
+    }
+    setSubQuickFocusTick((prev) => prev + 1);
+  }, [scheduleMainChatScrollToBottom]);
+  const returnToMainWindowRef = useRef(returnToMainWindow);
+  returnToMainWindowRef.current = returnToMainWindow;
+  const jumpToAskQuestionSession = useCallback((sessionName: string) => {
+    setManualDashboard(false);
+    setShowTaskMode(false);
+    setShowRepoPage(false);
+    setShowDownloadsModal(false);
+    setShowSettingsPage(false);
+    setShowUsageSummaryPage(false);
+    setShowCronManager(false);
+    setShowAdminPage(false);
+    setShowSharedContextManagement(false);
+    setShowControlledNodes(false);
+    setShowCloudDocs(false);
+    setShowSharedContextDiagnostics(false);
+    setShowDiscussionsPage(false);
+    if (remoteDesktopWorkspaceOpenRef.current && !remoteDesktopWorkspaceMinimizedRef.current) {
+      setRemoteDesktopWorkspaceMinimized(true);
+    }
+    if (remoteDesktopWallOpenRef.current && !remoteDesktopWallMinimizedRef.current) {
+      setRemoteDesktopWallMinimized(true);
+    }
+    if (isSubSessionName(sessionName)) {
+      const pinnedPanel = pinnedPanels.find((panel) => (
+        panel.type === 'subsession'
+        && panel.props?.sessionName === sessionName
+        && isPinnedPanelForServer(panel, selectedServerId)
+      ));
+      const sub = subSessionsRef.current.find((s) => s.sessionName === sessionName);
+      if (pinnedPanel && !isMobileRef.current) {
+        setSidebarCollapsed(false);
+        if (pinnedPanel.props?.viewMode === 'terminal') {
+          updatePinnedPanelProps(pinnedPanel.id, { viewMode: 'chat' });
+        }
+      } else if (sub) {
+        if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
+          setActiveSession(sub.parentSession, { keepSubWindows: true });
+        }
+        openSubSessionWindow(sub.id, { scrollToBottom: true });
+      } else {
+        navigateToSession(sessionName, undefined, { scrollToBottom: true });
+      }
+    } else {
+      const main = sessionsRef.current.find((s) => s.name === sessionName);
+      const isTransport = main ? resolveSessionInfoRuntimeType(main) === 'transport' : false;
+      if (!isTransport) {
+        setViewModes((prev) => {
+          if (prev[sessionName] === 'chat') return prev;
+          const updated: Record<string, ViewMode> = { ...prev, [sessionName]: 'chat' };
+          safeLocalStorageSetItem('rcc_viewModes', JSON.stringify(updated));
+          return updated;
+        });
+      }
+      selectMainSessionTab(sessionName);
+    }
+    setPendingQuestion(null);
+  }, [
+    isPinnedPanelForServer,
+    navigateToSession,
+    openSubSessionWindow,
+    pinnedPanels,
+    selectMainSessionTab,
+    selectedServerId,
+    setActiveSession,
+    updatePinnedPanelProps,
+  ]);
+  hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
+  hasBlockingNavigationOverlayRef.current = hasBlockingNavigationOverlay;
+  const hasBlockingMobileGestureOverlayRef = useRef(false);
+  hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
+    || mobileSidebarOpen
+    || mobileRemoteSurfaceActive;
+  const handleSelectServerNavRef = useRef(handleSelectServer);
+  handleSelectServerNavRef.current = handleSelectServer;
+  const handleOpenSharedEntryNavRef = useRef(handleOpenSharedEntry);
+  handleOpenSharedEntryNavRef.current = handleOpenSharedEntry;
+  const selectMainSessionTabNavRef = useRef(selectMainSessionTab);
+  selectMainSessionTabNavRef.current = selectMainSessionTab;
+  const manualDashboardRef = useRef(manualDashboard);
+  manualDashboardRef.current = manualDashboard;
+  const selectedShareTargetNavRef = useRef(selectedShareTarget);
+  selectedShareTargetNavRef.current = selectedShareTarget;
+  const resolvedSelectedServerNameNavRef = useRef(resolvedSelectedServerName);
+  resolvedSelectedServerNameNavRef.current = resolvedSelectedServerName;
+  const viewModeNavRef = useRef(viewMode);
+  viewModeNavRef.current = viewMode;
+
+  const serverSwitchFocusGuardRef = useRef<{ token: number; cleanup: () => void } | null>(null);
+  const serverSwitchFocusTokenRef = useRef(0);
+  const pendingAutoFocusTargetRef = useRef<{ key: string; sessionName: string; isSub: boolean } | null>(null);
+  const attemptAutoFocusForTargetRef = useRef<(target: { key: string; sessionName: string; isSub: boolean } | null) => boolean>(() => false);
+
+  const cancelServerSwitchFocusGuard = useCallback(() => {
+    serverSwitchFocusTokenRef.current += 1;
+    const active = serverSwitchFocusGuardRef.current;
+    serverSwitchFocusGuardRef.current = null;
+    active?.cleanup();
+  }, []);
+
+  const armServerSwitchFocusGuard = useCallback(() => {
+    cancelServerSwitchFocusGuard();
+    if (
+      isMobileRef.current
+      || hasBlockingComposerOverlayRef.current
+      || hasDomBlockingOverlay()
+      || manualDashboardRef.current
+    ) {
+      return;
+    }
+    const activeAtSwitch = typeof document !== 'undefined' ? document.activeElement : null;
+    if (activeAtSwitch?.closest?.('.floating-panel')) {
+      return;
+    }
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const token = serverSwitchFocusTokenRef.current;
+    let timerId: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (serverSwitchFocusTokenRef.current === token) {
+        cancelServerSwitchFocusGuard();
+      }
+    }, 2500);
+    let rafId: number | null = null;
+    let disposed = false;
+
+    const isNeutralActive = () => {
+      const el = document.activeElement;
+      return !el || el === document.body || el === document.documentElement;
+    };
+
+    const reassertIfEligible = () => {
+      if (disposed || serverSwitchFocusTokenRef.current !== token) return;
+      if (
+        isMobileRef.current
+        || hasBlockingComposerOverlayRef.current
+        || hasDomBlockingOverlay()
+        || manualDashboardRef.current
+      ) {
+        return;
+      }
+      const curActive = document.activeElement;
+      if (curActive?.closest?.('.floating-panel')) {
+        cancelServerSwitchFocusGuard();
+        return;
+      }
+      if (isNeutralActive() && pendingAutoFocusTargetRef.current) {
+        attemptAutoFocusForTargetRef.current(pendingAutoFocusTargetRef.current);
+      }
+    };
+
+    const scheduleCheck = () => {
+      if (disposed || serverSwitchFocusTokenRef.current !== token) return;
+      queueMicrotask(reassertIfEligible);
+      if (typeof requestAnimationFrame === 'function') {
+        if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(rafId);
+        }
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          reassertIfEligible();
+        });
+      }
+    };
+
+    const onPointerDown = (e: Event) => {
+      const targetEl = e.target as Element | null;
+      if (!targetEl?.closest?.('[contenteditable="true"], .session-input')) {
+        cancelServerSwitchFocusGuard();
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Tab') {
+        cancelServerSwitchFocusGuard();
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const targetEl = e.target as Element | null;
+      if (!targetEl || targetEl === document.body || targetEl === document.documentElement) return;
+      const pending = pendingAutoFocusTargetRef.current;
+      const expectedEl = pending ? inputRefsMap.current.get(pending.sessionName) : null;
+      if (expectedEl && (targetEl === expectedEl || expectedEl.contains(targetEl))) {
+        return;
+      }
+      cancelServerSwitchFocusGuard();
+    };
+
+    const onFocusOut = () => {
+      scheduleCheck();
+    };
+
+    const onSupervisionTaskPairs = () => {
+      scheduleCheck();
+    };
+
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('focusout', onFocusOut, true);
+    window.addEventListener('supervision:task-pairs', onSupervisionTaskPairs);
+
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', onFocusOut, true);
+      window.removeEventListener('supervision:task-pairs', onSupervisionTaskPairs);
+    };
+
+    serverSwitchFocusGuardRef.current = { token, cleanup };
+  }, [cancelServerSwitchFocusGuard]);
+
+  useEffect(() => () => cancelServerSwitchFocusGuard(), [cancelServerSwitchFocusGuard]);
+
+  const navigateServerByStep = useCallback((
+    stepDelta: number,
+    shortcutKeycaps: readonly string[],
+    minCount = 1,
+  ): boolean => {
+    const serversList = unifiedServersNavRef.current;
+    const normalizedStep = Number.isFinite(stepDelta) ? Math.trunc(stepDelta) : 0;
+    if (serversList.length < minCount || normalizedStep === 0) return false;
+    const currentServerId = sharedOpenIntentRef.current?.serverId ?? selectedServerIdRef.current;
+    const hasCurrent = currentServerId ? serversList.some((srv) => srv.id === currentServerId) : false;
+    const hasActiveShare = selectedShareTargetNavRef.current !== null;
+    const maxDistinct = hasCurrent
+      ? (hasActiveShare ? serversList.length : Math.max(0, serversList.length - 1))
+      : serversList.length;
+    if (maxDistinct === 0) return minCount <= 1;
+    const sign = normalizedStep >= 0 ? 1 : -1;
+    const clampedAbs = Math.min(Math.abs(normalizedStep), maxDistinct);
+    const nextId = cycleOrderedId(
+      serversList.map((srv) => srv.id),
+      currentServerId,
+      sign * clampedAbs,
+    );
+    const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
+    if (nextServer && (nextServer.id !== currentServerId || (hasActiveShare && !nextServer.isSharedIn))) {
+      const targetSharedEntry = nextServer.isSharedIn ? (nextServer.sharedEntry ?? null) : null;
+      setServerSwitchWatermark((prev) => ({
+        serverId: nextServer.id,
+        serverName: nextServer.name || nextServer.id,
+        sharedEntryId: targetSharedEntry?.id ?? null,
+        switchKind: 'server',
+        shortcutKeycaps: [...shortcutKeycaps],
+        nonce: (prev?.nonce ?? 0) + 1,
+      }));
+      if (targetSharedEntry) {
+        armServerSwitchFocusGuard();
+        pendingServerSwitchScrollRef.current = nextServer.id;
+        void handleOpenSharedEntryNavRef.current(targetSharedEntry);
+      } else {
+        armServerSwitchFocusGuard();
+        pendingServerSwitchScrollRef.current = nextServer.id;
+        void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+      }
+    }
+    return true;
+  }, [armServerSwitchFocusGuard]);
+
+  const navigateTabByStep = useCallback((
+    stepDelta: number,
+    watermarkKeycaps?: readonly string[],
+    minCount = 1,
+  ): boolean => {
+    const serverId = selectedServerIdRef.current;
+    if (!serverId || manualDashboardRef.current) return false;
+    const tabsList = orderedTabsNavRef.current;
+    const normalizedStep = Number.isFinite(stepDelta) ? Math.trunc(stepDelta) : 0;
+    if (tabsList.length < minCount || normalizedStep === 0) return false;
+    const activeName = activeSessionRef.current;
+    const hasCurrent = activeName ? tabsList.some((session) => session.name === activeName) : false;
+    const maxDistinct = hasCurrent ? Math.max(0, tabsList.length - 1) : tabsList.length;
+    if (maxDistinct === 0) return minCount <= 1;
+    const sign = normalizedStep >= 0 ? 1 : -1;
+    const clampedAbs = Math.min(Math.abs(normalizedStep), maxDistinct);
+    const nextName = cycleOrderedId(
+      tabsList.map((session) => session.name),
+      activeName,
+      sign * clampedAbs,
+    );
+    if (nextName && nextName !== activeName) {
+      const shareTarget = selectedShareTargetNavRef.current;
+      if (watermarkKeycaps && (!shareTarget || shareTarget.kind === 'server')) {
+        const nextSession = tabsList.find((session) => session.name === nextName);
+        const serverName = resolvedSelectedServerNameNavRef.current
+          || unifiedServersNavRef.current.find((srv) => srv.id === serverId)?.name
+          || serverId;
+        const sessionLabel = nextSession
+          ? (nextSession.label || nextSession.project || nextSession.name)
+          : nextName;
+        setServerSwitchWatermark((prev) => ({
+          serverId,
+          serverName,
+          sessionName: sessionLabel,
+          switchKind: 'session',
+          shortcutKeycaps: [...watermarkKeycaps],
+          nonce: (prev?.nonce ?? 0) + 1,
+        }));
+      }
+      selectMainSessionTabNavRef.current(nextName);
+    }
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isImeComposingKeyEvent(e)) return;
+      const matched = matchNavigationShortcutBinding(e, resolvedShortcutSlotsRef.current);
+      const quickSubMatch = matched
+        ? null
+        : matchSubSessionQuickShortcut(e, resolvedSubSessionQuickModifiersRef.current);
+      const pairSplitMatch = matched || quickSubMatch
+        ? null
+        : matchTaskPairSplitQuickShortcut(e, resolvedTaskPairSplitModifiersRef.current);
+      if (!matched && !quickSubMatch && !pairSplitMatch) return;
+
+      if (matched?.action === 'subSessionCloseAll') {
+        if (!canHandleReturnToMainWindowShortcut(e.target, document.activeElement, {
+          isMobile,
+          isComposing: isImeComposingKeyEvent(e),
+        })) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        returnToMainWindowRef.current();
+        return;
+      }
+
+      if (matched?.action === 'toggleTaskMode') {
+        if (!canHandleToggleTaskModeShortcut(e.target, document.activeElement, {
+          hasBlockingOverlay: hasBlockingNavigationOverlayRef.current,
+          isMobile,
+          isComposing: isImeComposingKeyEvent(e),
+        })) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        setShowTaskMode((prev) => !prev);
+        return;
+      }
+
+      const subId = focusedSubIdRef.current;
+      const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
+      const targetViewMode = resolveFocusedKeyboardViewMode({
+        target: e.target,
+        activeElement: document.activeElement,
+        focusedSubId: subId,
+        isFocusedSubOpen: Boolean(subId && openSubIdsRef.current.has(subId)),
+        focusedSubType: subRecord?.type ?? null,
+        focusedSubSessionName: subRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModeNavRef.current,
+      });
+
+      if (!canHandleGlobalNavigationShortcut(e.target, document.activeElement, {
+        hasBlockingOverlay: hasBlockingNavigationOverlayRef.current,
+        isMobile,
+        isComposing: isImeComposingKeyEvent(e),
+        viewMode: targetViewMode,
+      })) {
+        return;
+      }
+
+      if (quickSubMatch) {
+        if (!selectedServerIdRef.current || manualDashboardRef.current) return;
+        const targetSub = orderedVisibleSubSessionsRef.current[quickSubMatch.index];
+        if (!targetSub) return;
+        e.preventDefault();
+        e.stopPropagation();
+        lastAutoFocusedRef.current = null;
+        if (openSubIdsRef.current.has(targetSub.id)) {
+          minimizeSubSessionWindowRef.current(targetSub.id);
+          setSubQuickFocusTick((prev) => prev + 1);
+          return;
+        }
+        openSubSessionWindowRef.current(targetSub.id);
+        setSubQuickFocusTick((prev) => prev + 1);
+        if (targetSub.type === 'shell' || targetSub.type === 'script') {
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => {
+              const win = document.querySelector(`.subsession-window[data-subsession-id="${CSS.escape(targetSub.id)}"]`);
+              const xtermInput = win?.querySelector('.xterm-helper-textarea') as HTMLElement | null;
+              xtermInput?.focus({ preventScroll: true });
+            });
+          }
+        }
+        return;
+      }
+
+      if (pairSplitMatch) {
+        if (!selectedServerIdRef.current || manualDashboardRef.current) return;
+        const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+        const orderedRows = resolveOrderedTaskPairRows({
+          snapshot,
+          events: getCachedTimelineEvents(selectedServerIdRef.current, activeSessionRef.current),
+          serverId: selectedServerIdRef.current,
+        });
+        const targetRow = orderedRows[pairSplitMatch.index];
+        if (!targetRow || !isTaskPairSplittable(targetRow.payload)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const taskId = String(targetRow.payload.taskId);
+        const title = taskPairDisplayTitle(targetRow.payload.title, taskId, targetRow.payload.brief) ?? taskId;
+        handlePairSplitRef.current({
+          taskId,
+          title,
+          executor: String(targetRow.payload.executor),
+          auditor: String(targetRow.payload.auditor),
+          action: 'toggle',
+        });
+        return;
+      }
+
+      if (!matched) return;
+      const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
+      if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
+        if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
+        suppressHoverPreviewsUntilPointerMove();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
+      if (!navigateTabByStep(matched.action === 'tabNext' ? 1 : -1, shortcutKeycaps)) return;
+      suppressHoverPreviewsUntilPointerMove();
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [isMobile, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => {
+    const onOpenSettings = () => {
+      if (!authRef.current) return;
+      setShowSettingsPage(true);
+    };
+    const onOpenSettingsKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || !authRef.current) return;
+      const isComposing = isImeComposingKeyEvent(e);
+      if (!matchesOpenSettingsShortcut(e, isMacPlatform())) return;
+      if (!canHandleOpenSettingsShortcut(e.target, document.activeElement, { isComposing })) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setShowSettingsPage(true);
+    };
+    window.addEventListener('imcodes:open-settings', onOpenSettings);
+    window.addEventListener('keydown', onOpenSettingsKeyDown, true);
+    return () => {
+      window.removeEventListener('imcodes:open-settings', onOpenSettings);
+      window.removeEventListener('keydown', onOpenSettingsKeyDown, true);
+    };
+  }, []);
+
+  useEffect(() => installMacVoiceShortcutListener({
+    getTargetModifier: () => resolvedMacVoiceModifierRef.current,
+    isBlocked: () => hasBlockingComposerOverlayRef.current,
+    shouldEmitSingleTap: () => isAnyInlineVoiceComposerActive(),
+    onSingleTap: () => {
+      triggerMacVoiceComposerStopOnly();
+    },
+    onDoubleTap: () => {
+      triggerRegisteredMacVoiceComposer();
+    },
+  }), []);
+
+  useEffect(() => {
+    mobileSwipeHudRef.current?.setProgress(null);
+    return attachMobileNavigationGestures({
+      isMobile,
+      isBlocked: () => hasBlockingMobileGestureOverlayRef.current,
+      getAvailableSteps: (direction) => resolveMobileSwipeTargets({
+        servers: unifiedServersNavRef.current,
+        currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerIdRef.current,
+        hasActiveShareTarget: selectedShareTargetNavRef.current !== null,
+        tabs: orderedTabsNavRef.current,
+        activeSession: activeSessionRef.current,
+        selectedServerId: selectedServerIdRef.current,
+        manualDashboard: manualDashboardRef.current,
+        verticalMaxSteps: 5,
+        horizontalMaxSteps: 3,
+      })[direction].length,
+      onProgress: handleMobileGestureProgress,
+      onAction: (action, step) => {
+        const keycaps = getMobileNavigationGestureKeycaps(action, step);
+        if (action === 'serverPrev' || action === 'serverNext') {
+          navigateServerByStep(action === 'serverNext' ? step : -step, keycaps, 2);
+          return;
+        }
+        navigateTabByStep(action === 'tabNext' ? step : -step, keycaps, 2);
+      },
+    });
+  }, [isMobile, handleMobileGestureProgress, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => {
+    if (!isMobile || hasBlockingComposerOverlay || mobileSidebarOpen || mobileRemoteSurfaceActive) {
+      mobileSwipeHudRef.current?.setProgress(null);
+    }
+  }, [isMobile, hasBlockingComposerOverlay, mobileSidebarOpen, mobileRemoteSurfaceActive]);
+
+  useEffect(() => {
+    if (!serverSwitchWatermark) return;
+    const isRestrictedTabWatermark =
+      serverSwitchWatermark.switchKind !== 'server'
+      && selectedShareTarget !== null
+      && selectedShareTarget.kind !== 'server';
+    const isPendingSharedTarget =
+      serverSwitchWatermark.switchKind === 'server'
+      && Boolean(
+        serverSwitchWatermark.sharedEntryId
+        && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
+      );
+    if (
+      (manualDashboard && !isPendingSharedTarget)
+      || (isRestrictedTabWatermark && !isPendingSharedTarget)
+      || (!selectedServerId && !isPendingSharedTarget)
+      || (selectedServerId && selectedServerId !== serverSwitchWatermark.serverId && !isPendingSharedTarget)
+    ) {
+      setServerSwitchWatermark(null);
+    }
+  }, [manualDashboard, openingSharedEntryId, selectedServerId, selectedShareTarget, serverSwitchWatermark]);
+
+  // Desktop auto-focus composer input when switching servers, tabs, or sub-session windows.
+  // Track requested navigation intent independently of whether the target is currently
+  // focusable/blocked, so visiting a terminal, shell, dashboard, or blocked target
+  // invalidates prior dedup tokens and restores focus cleanly upon returning or unblocking.
+  const navigationIntentKey = useMemo(() => {
+    if (isMobile || !selectedServerId || manualDashboard) return null;
+    if (focusedSubId && openSubIds.has(focusedSubId)) {
+      return `srv:${selectedServerId}:sub:${focusedSubId}`;
+    }
+    if (activeSession) {
+      return `srv:${selectedServerId}:main:${activeSession}:view:${viewMode}`;
+    }
+    return null;
+  }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, activeSession, viewMode]);
+
+  const [subQuickFocusTick, setSubQuickFocusTick] = useState(0);
+  if (lastNavIntentKeyRef.current !== navigationIntentKey) {
+    lastNavIntentKeyRef.current = navigationIntentKey;
+    lastAutoFocusedRef.current = null;
+  }
+
+  const autoFocusTarget = useMemo(() => {
+    if (isMobile || !selectedServerId || manualDashboard) return null;
+    if (focusedSubId && openSubIds.has(focusedSubId)) {
+      const sub = subSessions.find((item) => item.id === focusedSubId);
+      if (sub && (sub.type === 'shell' || sub.type === 'script')) return null;
+      return {
+        key: `srv:${selectedServerId}:sub:${focusedSubId}`,
+        sessionName: sub ? sub.sessionName : `deck_sub_${focusedSubId}`,
+        isSub: true,
+      };
+    }
+    if (activeSession) {
+      const mainSession = sessions.find((item) => item.name === activeSession);
+      if (!mainSession) return null;
+      if (mainSession.agentType === 'shell' || mainSession.agentType === 'script') return null;
+      if (viewMode !== 'chat') return null;
+      return {
+        key: `srv:${selectedServerId}:main:${activeSession}:view:${viewMode}`,
+        sessionName: activeSession,
+        isSub: false,
+      };
+    }
+    return null;
+  }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, subSessions, activeSession, sessions, viewMode]);
+
+  pendingAutoFocusTargetRef.current = autoFocusTarget;
+
+  const attemptAutoFocusForTarget = useCallback((target: { key: string; sessionName: string; isSub: boolean } | null): boolean => {
+    if (!target || isMobileRef.current || hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) {
+      return false;
+    }
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    if (activeEl?.closest?.('.floating-panel')) {
+      return false;
+    }
+    const inputEl = inputRefsMap.current.get(target.sessionName);
+    if (!inputEl || !inputEl.isConnected) return false;
+    const neutralActive = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    const guardReassert = Boolean(serverSwitchFocusGuardRef.current && neutralActive);
+    const prev = lastAutoFocusedRef.current;
+    if (prev && prev.key === target.key && prev.element === inputEl && !guardReassert) {
+      return true;
+    }
+    if (target.isSub) {
+      const subWin = inputEl.closest?.('.subsession-window');
+      if (subWin?.getAttribute('data-view-mode') === 'terminal') return false;
+    }
+    if (document.activeElement === inputEl) {
+      lastAutoFocusedRef.current = { key: target.key, element: inputEl };
+      return true;
+    }
+    const focused = focusComposerElement(inputEl);
+    if (focused) {
+      lastAutoFocusedRef.current = { key: target.key, element: inputEl };
+    }
+    return focused;
+  }, []);
+  attemptAutoFocusForTargetRef.current = attemptAutoFocusForTarget;
+
+  const registerComposerInputRef = useCallback((sessionName: string, el: HTMLDivElement | null) => {
+    if (el) {
+      inputRefsMap.current.set(sessionName, el);
+      const subWin = el.closest?.('.subsession-window');
+      if (subWin?.getAttribute('data-view-mode') === 'terminal' && lastAutoFocusedRef.current?.element === el) {
+        lastAutoFocusedRef.current = null;
+      }
+      const pending = pendingAutoFocusTargetRef.current;
+      if (pending && pending.sessionName === sessionName) {
+        attemptAutoFocusForTarget(pending);
+      }
+    } else {
+      inputRefsMap.current.delete(sessionName);
+    }
+  }, [attemptAutoFocusForTarget]);
+
+  useEffect(() => {
+    if (!autoFocusTarget || hasBlockingComposerOverlay) return;
+    const currentEl = inputRefsMap.current.get(autoFocusTarget.sessionName);
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    const neutralActive = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    const guardReassert = Boolean(serverSwitchFocusGuardRef.current && neutralActive);
+    const prev = lastAutoFocusedRef.current;
+    if (prev && prev.key === autoFocusTarget.key && currentEl && prev.element === currentEl && currentEl.isConnected && !guardReassert) {
+      return;
+    }
+
+    let cancelled = false;
+    let rafId: number | null = null;
+    let overlayCheckRafId: number | null = null;
+    let observer: MutationObserver | null = null;
+
+    const cleanupObservers = () => {
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (overlayCheckRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(overlayCheckRafId);
+        overlayCheckRafId = null;
+      }
+      observer?.disconnect();
+      observer = null;
+    };
+
+    const attemptFocus = (): boolean => {
+      if (cancelled) return false;
+      const focused = attemptAutoFocusForTarget(autoFocusTarget);
+      if (focused) {
+        cleanupObservers();
+      }
+      return focused;
+    };
+
+    const watchDomOverlayIfBlocked = () => {
+      if (cancelled || observer || typeof MutationObserver === 'undefined' || !document.body) return;
+      if (!hasDomBlockingOverlay()) return;
+      const runOverlayCheck = () => {
+        overlayCheckRafId = null;
+        if (cancelled) return;
+        if (!hasDomBlockingOverlay()) {
+          attemptFocus();
+        }
+      };
+      observer = new MutationObserver(() => {
+        if (cancelled) return;
+        if (typeof requestAnimationFrame === 'function') {
+          if (overlayCheckRafId !== null) return;
+          overlayCheckRafId = requestAnimationFrame(runOverlayCheck);
+        } else {
+          runOverlayCheck();
+        }
+      });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-modal', 'role', 'class', 'data-shortcut-recording'],
+      });
+    };
+
+    if (!attemptFocus()) {
+      watchDomOverlayIfBlocked();
+      if (typeof requestAnimationFrame === 'function') {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          if (!attemptFocus()) {
+            watchDomOverlayIfBlocked();
+          }
+        });
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      cleanupObservers();
+    };
+  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay, subQuickFocusTick]);
+
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,
     sessionsLoaded,
     sessions.length,
-    showNewUserGuidePrompt
-      || showNewUserGuide
-      || showNewSession
-      || showSubDialog
-      || showRepoPage
-      || showSettingsPage
-      || showCronManager
-      || showAdminPage
-      || showDiscussionsPage
-      || showDiscussionDialog
+    featureAnnouncementsPending
+      || featureAnnouncementBlocked
       || !activeSession,
   );
 
@@ -4380,10 +9593,117 @@ export function App() {
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
-  const subSessionsSlim = useMemo(() =>
-    subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
-    [subSessions]
-  );
+  const quickDelegationSessions = useStructuralIdentity(useMemo(() => sessions.map((session) => {
+    const effectiveModel = resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.name),
+    );
+    return effectiveModel && effectiveModel !== session.activeModel
+      ? { ...session, activeModel: effectiveModel }
+      : session;
+  }), [detectedModels, sessions]));
+  const subSessionsSlim = useStructuralIdentity(useMemo(() => subSessions.map((session) => ({
+    sessionName: session.sessionName,
+    type: session.type,
+    label: session.label,
+    state: session.state,
+    parentSession: session.parentSession,
+    activeModel: resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.sessionName),
+      subUsages.get(session.sessionName)?.model,
+    ),
+  })), [detectedModels, subSessions, subUsages]));
+  const peerAuditSettingsSessions = useMemo<PeerAuditSettingsSession[]>(() => subSessions
+    .filter((session) => session.executionCloneKind !== EXECUTION_CLONE_KIND && typeof session.parentRunId !== 'string')
+    .map((session) => ({
+      sessionName: session.sessionName,
+      parentSession: session.parentSession,
+      type: session.type,
+      runtimeType: session.runtimeType,
+      label: session.label,
+      state: session.state,
+      sessionInstanceId: session.sessionInstanceId,
+      runtimeEpoch: session.runtimeEpoch,
+      activeModel: resolveQuickAgentDelegationModel(
+        session,
+        detectedModels.get(session.sessionName),
+        subUsages.get(session.sessionName)?.model,
+      ),
+      requestedModel: session.requestedModel,
+      modelDisplay: session.modelDisplay,
+      providerId: session.providerId,
+      closedAt: session.closedAt,
+      ccPresetId: session.ccPresetId,
+      executionCloneKind: session.executionCloneKind,
+      parentRunId: session.parentRunId,
+    })), [detectedModels, subSessions, subUsages]);
+  const cronProject = useMemo(() => {
+    const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+    const activeMain = sessions.find((s) => s.name === activeSession);
+    const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+    return activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
+  }, [activeSession, sessions, subSessionsSlim]);
+  const cronJobCount = useCronJobCount({
+    enabled: Boolean(nativeReady && auth && selectedServerId),
+    serverId: selectedServerId,
+    projectName: cronProject,
+    ws: wsRef.current,
+    connected,
+    sharedSessionName: canonicalSharedSessionName,
+    sharedScope: Boolean(selectedShareTarget),
+  });
+  const visibleOpenWindowIdsRef = useRef(visibleOpenWindowIds);
+  visibleOpenWindowIdsRef.current = visibleOpenWindowIds;
+
+  const handleQuoteCloudDoc = useCallback((target: CloudDocQuoteTarget) => {
+    executeCloudDocQuote({
+      target,
+      openSubIds: visibleOpenWindowIdsRef.current,
+      stack: stackRef.current,
+      focusedSubId: focusedSubIdRef.current,
+      subSessions: subSessionsRef.current,
+      activeSession: activeSessionRef.current,
+      isMobile: isMobileRef.current,
+      showCloudDocs: showCloudDocsRef.current,
+      getInputElement: (sessionName) => inputRefsMap.current.get(sessionName) ?? null,
+      getWorkspaceBounds: getDesktopMaximizeBounds,
+      bringSubToFront,
+      setShowCloudDocs,
+      setDesktopCloudDocsMaximized,
+      requestCloudDocsGeometry: (geometry) => {
+        setCloudDocsGeometryRequest((prev) => ({
+          version: (prev?.version ?? 0) + 1,
+          geometry,
+        }));
+      },
+      appendComposerText: appendContentEditableTextPreservingNewlines,
+      focusComposer: (el) => focusComposerElement(el, { moveCursorToEnd: true }),
+      appendPendingPrefill: (sessionName, quoteText) => {
+        setPendingPrefills((prev) => ({
+          ...prev,
+          [sessionName]: mergeCloudDocQuoteText(prev[sessionName] || '', quoteText),
+        }));
+      },
+    });
+  }, [bringSubToFront, getDesktopMaximizeBounds]);
+
+  useEffect(() => subscribeCloudDocQuotes(handleQuoteCloudDoc), [handleQuoteCloudDoc]);
+
+  const cloudDocsMainChatContext = useMemo<CloudDocsMainChatContext | null>(() => {
+    if (!activeSessionInfo || !selectedServerId) return null;
+    return {
+      session: activeSessionInfo,
+      sessions: quickDelegationSessions,
+      subSessions: subSessionsSlim,
+      ws: wsRef.current,
+      connected,
+      serverId: selectedServerId,
+      quickData,
+      detectedModel: detectedModels.get(activeSessionInfo.name),
+    };
+  }, [activeSessionInfo, connected, detectedModels, quickData, quickDelegationSessions, selectedServerId, subSessionsSlim]);
+
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -4410,34 +9730,124 @@ export function App() {
       return ids;
     });
   }, []);
+  const orderedVisibleSubSessions = useMemo(() => {
+    const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+    const seen = new Set<string>();
+    const ordered = subSessionVisualOrderIds
+      .map((id) => byId.get(id))
+      .filter((sub): sub is typeof visibleSubSessions[number] => {
+        if (!sub || seen.has(sub.id)) return false;
+        seen.add(sub.id);
+        return true;
+      });
+    const remaining = visibleSubSessions.filter((sub) => !seen.has(sub.id));
+    if (pinnedSubSessionIds.size > 0 && remaining.length > 1) {
+      const pinned = remaining.filter((sub) => pinnedSubSessionIds.has(sub.id) || pinnedSubSessionIds.has(sub.sessionName));
+      const unpinned = remaining.filter((sub) => !pinnedSubSessionIds.has(sub.id) && !pinnedSubSessionIds.has(sub.sessionName));
+      return [...ordered, ...pinned, ...unpinned];
+    }
+    return [...ordered, ...remaining];
+  }, [subSessionVisualOrderIds, visibleSubSessions, pinnedSubSessionIds]);
+  orderedVisibleSubSessionsRef.current = orderedVisibleSubSessions;
   const visibleSubSessionAccentColors = useMemo(
-    () => {
-      const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
-      const seen = new Set<string>();
-      const ordered = subSessionVisualOrderIds
-        .map((id) => byId.get(id))
-        .filter((sub): sub is typeof visibleSubSessions[number] => {
-          if (!sub || seen.has(sub.id)) return false;
-          seen.add(sub.id);
-          return true;
-        });
-      for (const sub of visibleSubSessions) {
-        if (!seen.has(sub.id)) ordered.push(sub);
-      }
-      return getSubSessionAccentColorMap(ordered);
-    },
-    [subSessionVisualOrderIds, visibleSubSessions],
+    () => getSubSessionAccentColorMap(orderedVisibleSubSessions),
+    [orderedVisibleSubSessions],
   );
 
   const visiblePinnedPanels = useMemo(() =>
-    pinnedPanels.filter((p) => (
-      p.id
-      && p.props
-      && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)
-      && (p.type !== LOCAL_WEB_PREVIEW_PANEL_TYPE || !p.props.serverId || p.props.serverId === selectedServerId)
-    )),
-    [pinnedPanels, selectedServerId]
+    pinnedPanels.filter((p) => {
+      if (!p.id || !p.props) return false;
+      if (
+        p.type === 'subsession'
+        || p.type === LOCAL_WEB_PREVIEW_PANEL_TYPE
+        || p.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE
+        || p.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE
+      ) {
+        return isPinnedPanelForServer(p, selectedServerId);
+      }
+      return true;
+    }),
+    [isPinnedPanelForServer, pinnedPanels, selectedServerId]
   );
+
+  const renderSidebarPinnedPanels = (onAfterPreview?: () => void) => {
+    const sessionsLoading = !sessionsLoaded && Boolean(selectedServerId);
+    const isTabShareScope = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+    const cachedSidebarScope = (!isTabShareScope && sessionsLoading && selectedServerId)
+      ? lastKnownSidebarScopeByServerRef.current.get(selectedServerId)
+      : undefined;
+    const sidebarActiveSession = activeSession ?? cachedSidebarScope?.activeSession ?? null;
+    const sidebarProjectDir = activeSessionInfo?.projectDir ?? cachedSidebarScope?.projectDir;
+    const sharedCtx: PanelRenderContext = {
+      ws: wsRef.current,
+      connected,
+      serverId: selectedServerId ?? '',
+      subSessions,
+      inputRefsMap,
+      onPreviewFile: (request) => {
+        handlePreviewFileRequest({ ...request, sourcePreviewLive: false });
+        onAfterPreview?.();
+      },
+      onOpenNodeGroups: openControlledNodes,
+      onOpenLocalWebPreview: openLocalWebPreviewFromChat,
+      onCloudDocClick: openCloudDocPreview,
+      onRemoteDesktopClick: handleOpenRemoteDesktopRef,
+      onPreviewStateChange: handlePreviewStateChange,
+      activeSession: sidebarActiveSession,
+      activeProjectDir: sidebarProjectDir,
+      sessionsLoading,
+      sharedAccessRole,
+      shareTargetKind: selectedShareTarget?.kind ?? null,
+      canManageFileShares: canManageServerFileShares,
+      sharedSessionName: canonicalSharedSessionName,
+      sessions,
+      servers: orderedServers.map((s) => ({ id: s.id, name: s.name })),
+      onQuote: (text) => {
+        const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
+        if (inputEl) {
+          const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
+          appendContentEditableTextPreservingNewlines(inputEl, quote);
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => {
+              if (inputEl.isConnected) {
+                focusComposerElement(inputEl, { moveCaretToEnd: true });
+              }
+            });
+          }
+        }
+      },
+      t: trans,
+      onAskAnswer: (sessionName, toolUseId, answer) => submitAskQuestionAnswer(sessionName, toolUseId, answer),
+      updatePanelProps: updatePinnedPanelProps,
+    };
+    return visiblePinnedPanels.map((panel) => (
+      <SidebarPinnedPanel
+        key={panel.id}
+        panel={panel}
+        height={pinnedPanelHeights[panel.id] ?? 240}
+        onUnpin={() => unpinPanel(panel)}
+        onResize={(h) => savePinnedPanelHeight(panel.id, h)}
+        ctx={sharedCtx}
+      />
+    ));
+  };
+
+  // Remember the last hydrated sidebar scope per owned server so switching back
+  // renders cached FileBrowser/RepoPage immediately instead of flashing loading.
+  useEffect(() => {
+    if (!sessionsLoaded || !selectedServerId || selectedShareTarget) return;
+    if (!activeSession || !activeSessionInfo?.projectDir) return;
+    lastKnownSidebarScopeByServerRef.current.delete(selectedServerId);
+    lastKnownSidebarScopeByServerRef.current.set(selectedServerId, {
+      activeSession,
+      projectDir: activeSessionInfo.projectDir,
+    });
+    while (lastKnownSidebarScopeByServerRef.current.size > 20) {
+      const oldestKey = lastKnownSidebarScopeByServerRef.current.keys().next().value;
+      if (oldestKey === undefined) break;
+      lastKnownSidebarScopeByServerRef.current.delete(oldestKey);
+    }
+  }, [sessionsLoaded, selectedServerId, selectedShareTarget, activeSession, activeSessionInfo?.projectDir]);
 
   // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
@@ -4447,18 +9857,24 @@ export function App() {
     if (pinnedPanels.length > 0) { autoPinnedRef.current = true; return; } // user already has panels
     autoPinnedRef.current = true;
     pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo.projectDir, serverId: selectedServerId });
-    const cronProject = sessions.find(s => s.name === activeSession)?.project;
+    const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+    const activeMain = sessions.find((s) => s.name === activeSession);
+    const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+    const cronProject = activeMain?.project ?? parentMain?.project ?? sessions[0]?.project;
     if (cronProject) {
       pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId });
     }
   }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
-  // Uses useSharedGitChanges — shares the cache with FileBrowser, SubSessionWindow,
-  // and any other consumer pointing at the same repo path. A single `fs.git_status`
-  // request feeds all of them; no duplicate requests when paths match.
-  const sharedGitFiles = useSharedGitChanges(wsRef.current, activeSessionInfo?.projectDir ?? null);
-  const gitChangesCount = sharedGitFiles.length;
+  // Uses useSharedGitChangesCount — sends lightweight summaryOnly requests when
+  // no FileBrowser list consumer is open, and shares/reuses the cache with
+  // FileBrowser and SubSessionWindow when paths match.
+  const cachedBadgeScope = (!selectedShareTarget && !sessionsLoaded && selectedServerId)
+    ? lastKnownSidebarScopeByServerRef.current.get(selectedServerId)
+    : undefined;
+  const badgeProjectDir = activeSessionInfo?.projectDir ?? cachedBadgeScope?.projectDir ?? null;
+  const gitChangesCount = useSharedGitChangesCount(wsRef.current, badgeProjectDir, { serverId: selectedServerId });
 
   // Nudge the shared cache when the agent finishes a tool call or goes idle,
   // so the badge reflects new/modified files without waiting for the 30s poll.
@@ -4471,7 +9887,7 @@ export function App() {
       if (msg.type !== 'timeline.event') return;
       const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
       if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
-        requestSharedChanges(ws, dir);
+        requestSharedChangesCount(ws, dir, false, undefined, selectedServerIdRef.current);
       }
     });
     return () => { unsub(); };
@@ -4482,45 +9898,84 @@ export function App() {
   // React hooks ordering violation (hooks cannot be called conditionally).
   useEffect(() => {
     const ws = wsRef.current;
-    const dir = activeSessionInfo?.projectDir;
+    const isTab = selectedShareTarget && selectedShareTarget.kind !== 'server';
+    const rawDir = activeSessionInfo?.projectDir;
+    const dir = isTab ? FS_SESSION_ROOT_PATH : rawDir;
     if (!ws || !dir || !connected) return;
 
-    const existing = repoContextsRef.current.get(dir);
+    const existing = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
     // Already detected with a definitive status — no need to re-detect
     const TERMINAL_STATUSES = new Set(['ok', 'no_repo', 'cli_missing', 'cli_outdated', 'unauthorized', 'unknown_platform']);
     // Note: 'cli_error' is NOT terminal — it can be transient (rate limit, path mismatch, etc.)
     if (existing?.context?.status && TERMINAL_STATUSES.has(existing.context.status)) return;
 
+    const sessionName = activeSessionInfo?.name;
+    const opts = sessionName ? { sessionName } : undefined;
+
     // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)
-    const initialTimer = setTimeout(() => ws.repoDetect(dir), 3_000);
+    const initialTimer = setTimeout(() => ws.repoDetect(dir, opts), 3_000);
 
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
-      const ctx = repoContextsRef.current.get(dir);
+      const ctx = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
       if (ctx?.context?.status && TERMINAL_STATUSES.has(ctx.context.status)) {
         clearInterval(interval);
         return;
       }
-      ws.repoDetect(dir);
+      ws.repoDetect(dir, opts);
     }, 15_000);
 
     return () => { clearTimeout(initialTimer); clearInterval(interval); };
-  }, [activeSessionInfo?.projectDir, connected]);
+  }, [activeSessionInfo?.name, activeSessionInfo?.projectDir, connected, selectedShareTarget]);
 
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
-  const showInitialConnectingGate = shouldShowInitialConnectingGate(
-    Boolean(auth),
-    selectedServerId,
-    connected,
-    sessionsLoaded,
-  );
-  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, navigableMainSessions);
+  const hasEnteredAppShellRef = useRef(false);
+  if (!auth) {
+    hasEnteredAppShellRef.current = false;
+  }
   const selectedServerInfo = selectedServerId
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
+  // A confirmed offline daemon cannot satisfy the initial connection gate.
+  // Keep server management (including deletion) available without waiting for WS.
+  const selectedServerKnownOffline = serversLoaded && selectedServerInfo !== null && !isServerOnline(selectedServerInfo);
+  // Once the app shell has mounted for this session, in-app server switches
+  // keep the shell (and ServerIconBar) interactive and show the content-area
+  // spinner instead of blanking the whole viewport behind the cold-boot gate.
+  const showInitialConnectingGate = initialAuthVerificationPending || (
+    !hasEnteredAppShellRef.current
+    && !selectedServerKnownOffline
+    && !pendingSharedPayload
+    && shouldShowInitialConnectingGate(
+      Boolean(auth),
+      selectedServerId,
+      connected,
+      sessionsLoaded,
+    )
+  );
+  if (auth && !showInitialConnectingGate) {
+    hasEnteredAppShellRef.current = true;
+  }
+  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, navigableMainSessions);
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
+  const latestDaemonVersionForDisplay = daemonStats?.latestDaemonVersion ?? selectedServerInfo?.latestDaemonVersion ?? null;
+  const daemonUpgradeRequest = selectedServerId
+    ? daemonUpgradeRequests[selectedServerId] ?? { phase: 'idle' as const }
+    : { phase: 'idle' as const };
+  // What a confirmed upgrade will interrupt: the daemon's most recent block
+  // receipt for this server (a manual attempt) or, failing that, the reason the
+  // automatic trigger is currently waiting on one of the daemon's busy gates.
+  const daemonUpgradeConfirmBlocked = {
+    reason: daemonUpgradeRequest.phase === 'failed' && daemonUpgradeRequest.blockedReason
+      ? daemonUpgradeRequest.blockedReason
+      : (daemonStats?.autoUpgrade?.reason && isDaemonUpgradeBusyBlockReason(daemonStats.autoUpgrade.reason)
+        ? daemonStats.autoUpgrade.reason
+        : null),
+    sessionNames: daemonUpgradeRequest.phase === 'failed' ? daemonUpgradeRequest.blockedSessionNames : undefined,
+  };
+  const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
@@ -4535,7 +9990,11 @@ export function App() {
     };
     const pulse = () => {
       if (!shouldPulse()) return;
-      wsRef.current?.reconnectNow(true);
+      const ws = wsRef.current;
+      // Do not abort a slow but still bounded ticket/open attempt every 5s.
+      // WsClient owns its 30s ticket and 15s open deadlines and retry backoff.
+      if (!ws || ws.connectionAttemptInFlight) return;
+      ws.reconnectNow(true);
     };
     const initial = setTimeout(pulse, DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS);
     const interval = setInterval(pulse, DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS);
@@ -4561,11 +10020,16 @@ export function App() {
   }, [showInitialConnectingGate]);
 
   if (showInitialConnectingGate) {
+    const sharedRestoreError = sharedHashRestorePending && initialHashStateRef.current.sharedEntryId
+      ? sharedEntriesError
+      : null;
     return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
+      <div style={{ position: 'fixed', inset: 0, width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
-        <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
-        {connectTimeout && (
+        <div style={{ color: sharedRestoreError ? '#fca5a5' : '#64748b', fontSize: 14 }}>
+          {sharedRestoreError ?? (connecting ? trans('common.reconnecting') : trans('common.loading'))}
+        </div>
+        {(connectTimeout || sharedRestoreError) && (
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={handleBackToDashboard}>
               ← Back
@@ -4579,23 +10043,96 @@ export function App() {
     );
   }
 
+  const showSubSessionVerticalRail = !isMobile
+    && Boolean(selectedServerId)
+    && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+    && subSessionsScopedToServer
+    && Boolean(activeScopedSession)
+    && visibleSubSessions.length > 0;
+  const renderSubSessionVerticalRailHost = (side: SubSessionDesktopDockSide) => (
+    showSubSessionVerticalRail
+      && subSessionDesktopDockSide === side
+      ? (
+        <aside
+          key={side}
+          ref={setSubSessionVerticalRailHost}
+          class={`subsession-vertical-rail-host subsession-vertical-rail-host-${side}`}
+          data-testid="subsession-vertical-rail-host"
+          data-dock-side={side}
+          aria-label={trans('subsessionBar.vertical_rail')}
+        />
+      )
+      : null
+  );
+
+  const renderTeamDiscussionRailHost = () => (
+    !isMobile
+      && selectedServerId
+      && visibleTeamDiscussions.length > 0
+      && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT
+      ? (
+        <aside
+          ref={setTeamDiscussionRailHost}
+          class="team-discussion-rail-host"
+          data-testid="team-discussion-rail-host"
+          aria-label={trans('subsessionBar.team_right_rail')}
+        />
+      )
+      : null
+  );
+
   return (
-    <div class="layout" key={selectedServerId ?? ''}>
-      {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
+    <NodeGroupsNavContext.Provider value={openControlledNodes}>
+    <div
+      class={`layout${isMobile ? ' layout-mobile' : ''}${isMobile && isExpandedMobile ? ' layout-mobile-expanded' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
+      key={selectedServerId ?? ''}
+    >
+      {showSharedReturnGuide && sharedReturnServer && selectedShareTarget && (
+        <aside
+          class="shared-return-guide"
+          role="dialog"
+          aria-modal="false"
+          aria-label={trans('share.sharedWithMe.title')}
+          data-testid="shared-return-guide"
+        >
+          <div class="shared-return-guide-actions">
+            <button
+              class="shared-return-guide-return"
+              type="button"
+              onClick={() => void handleSelectServer(sharedReturnServer.id, sharedReturnServer.name)}
+            >
+              ← {trans('share.sharedWithMe.guideReturn', { server: sharedReturnServer.name })}
+            </button>
+            <button
+              class="shared-return-guide-dismiss"
+              type="button"
+              onClick={() => setShowSharedReturnGuide(false)}
+            >
+              {trans('share.sharedWithMe.guideDismiss')}
+            </button>
+          </div>
+        </aside>
+      )}
+      {/* Desktop flow: the vertical rail is a real root flex child, docked on either side of MainContent. */}
       {!isMobile && (
         <>
           <ServerIconBar
-            servers={servers}
+            servers={unifiedServers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
-            onServerContextMenu={(server, x, y) => setServerCtxMenu({ server, x, y })}
+            onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+            onServerContextMenu={(server, x, y) => setServerCtxMenu({ server: server as ServerInfo, x, y })}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
+            onDownloads={() => setShowDownloadsModal(true)}
             onSettings={() => setShowSettingsPage(true)}
             onHome={handleBackToDashboard}
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
             sharedServerStates={managedSharedServerStateById}
+            returnHintServerId={showSharedReturnGuide ? sharedReturnServer?.id : null}
+            pinnedServerIds={pinnedServerIds}
+            pushEnabledServerIds={effectivePushEnabledServerIdSet}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -4608,7 +10145,7 @@ export function App() {
               }
             }}
           >
-            <div style={{ display: 'flex', gap: 8, padding: '8px 12px 0' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '8px 12px 0' }}>
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
@@ -4619,12 +10156,57 @@ export function App() {
               >
                 {trans('sharedContext.management.title')}
               </button>
+              <div class="controlled-nodes-shortcut-group">
+                <button
+                  class="btn controlled-nodes-shortcut-main"
+                  onClick={openControlledNodes}
+                >
+                  {trans('controlled_nodes.title')}
+                </button>
+                <ControlledNodeQuickMenu
+                  onOpenRemoteDesktop={openRemoteDesktop}
+                  onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                  onConnectById={openRemoteDesktopById}
+                />
+              </div>
+              {/* Owner: a remote-desktop button right of the AI Desk dropdown on
+                  desktop, the same control as the session toolbars. One
+                  button only: the login-screen setup stays in the toolbar. */}
+              <DaemonRemoteDesktopControl
+                compact
+                offerLoginScreenSetup={false}
+                ws={wsRef.current}
+                serverId={selectedServerId}
+                serverName={selectedServerInfo?.name}
+                daemonOnline={daemonOnline}
+                onOpen={openRemoteDesktop}
+                canSetUp={!selectedShareTarget}
+              />
               <button
-                class="btn"
-                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => setShowSharedContextDiagnostics(true)}
+                class="btn desktop-cloud-docs-marquee-btn"
+                data-testid="desktop-cloud-docs-btn"
+                onClick={() => setShowCloudDocs((prev) => !prev)}
+                title={trans('cloud_docs.title', 'Cloud Docs')}
+                aria-label={trans('cloud_docs.title', 'Cloud Docs')}
+                aria-pressed={showCloudDocs}
               >
-                {trans('sharedContext.diagnostics.title')}
+                <CloudDocsGlyphIcon size={17} />
+              </button>
+              <button
+                type="button"
+                class={`btn global-task-mode-entry-btn desktop-task-mode-btn${hasTaskModeAttention ? ' is-attention' : ''}`}
+                data-testid="desktop-task-mode-btn"
+                onClick={() => setShowTaskMode((prev) => !prev)}
+                title={trans('taskMode.title', 'Task Mode')}
+                aria-label={trans('taskMode.title', 'Task Mode')}
+                aria-pressed={showTaskMode}
+              >
+                <TaskModeGlyphIcon size={16} />
+                {taskModeBadgeCount > 0 && (
+                  <span class="global-task-mode-badge" data-testid="desktop-task-mode-badge">
+                    {taskModeBadgeCount}
+                  </span>
+                )}
               </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
@@ -4636,7 +10218,7 @@ export function App() {
               >⊞</button>
             </div>
             <SharedEntriesPanel
-              entries={sharedEntries}
+              entries={restrictedSharedEntries}
               loading={sharedEntriesLoading}
               error={sharedEntriesError}
               openingEntryId={openingSharedEntryId}
@@ -4654,14 +10236,13 @@ export function App() {
               idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
-                setActiveSession(name);
-                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                selectMainSessionTab(name);
               }}
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
               }}
-              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
-              onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
+              onNewSubSession={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
             />}
 
             {/* P2P ring progress — show active P2P runs */}
@@ -4680,44 +10261,8 @@ export function App() {
               />
             ))}
 
-            {/* Pinned panels — sub-session panels filtered by current server (WS/tmux bound); others always shown */}
-            {visiblePinnedPanels.map((panel) => {
-              const height = pinnedPanelHeights[panel.id] ?? 240;
-              const ctx: PanelRenderContext = {
-                ws: wsRef.current,
-                connected,
-                serverId: selectedServerId ?? '',
-                subSessions,
-                inputRefsMap,
-                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false }),
-                onPreviewStateChange: handlePreviewStateChange,
-                activeSession,
-                activeProjectDir: activeSessionInfo?.projectDir,
-                sessions,
-                servers: servers.map(s => ({ id: s.id, name: s.name })),
-                onQuote: (text) => {
-                  const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
-                  if (inputEl) {
-                    const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                    inputEl.textContent = (inputEl.textContent || '') + quote;
-                    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    inputEl.focus();
-                  }
-                },
-                t: trans,
-                updatePanelProps: updatePinnedPanelProps,
-              };
-              return (
-                <SidebarPinnedPanel
-                  key={panel.id}
-                  panel={panel}
-                  height={height}
-                  onUnpin={() => unpinPanel(panel)}
-                  onResize={(h) => savePinnedPanelHeight(panel.id, h)}
-                  ctx={ctx}
-                />
-              );
-            })}
+            {/* Pinned panels — server-bound panels filtered by current server; follow-current panels wait until target server hydrates */}
+            {renderSidebarPinnedPanels()}
           </Sidebar>
         </>
       )}
@@ -4742,19 +10287,41 @@ export function App() {
           </span>
         </div>
         <div class="server-list">
-          {servers.map((server) => {
-            const online = isServerOnline(server);
+          {orderedServers.map((server) => {
+            const presence = getServerPresence(server);
+            const online = presence === 'online';
+            const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+            const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+            const presenceLabel = online
+              ? trans('server.online', { defaultValue: 'Online' })
+              : presence === 'offline'
+                ? trans('server.offline', { defaultValue: 'Offline' })
+                : trans('server.status_unknown', { defaultValue: 'Status unknown' });
             return (
               <button
                 key={server.id}
-                class={`server-item${server.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
+                class={`server-item${server.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && server.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                 onClick={() => handleSelectServer(server.id, server.name)}
                 onContextMenu={(e) => { e.preventDefault(); setServerCtxMenu({ server, x: e.clientX, y: e.clientY }); }}
               >
-                <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
-                  {online ? '●' : '○'}
+                <span
+                  class={`server-item-dot server-item-dot-${presence}`}
+                  style={{ color: presenceColor }}
+                  title={presenceLabel}
+                  aria-label={presenceLabel}
+                >
+                  {presenceSymbol}
                 </span>
-                {server.name}
+                {pinnedServerIds.has(server.id) && (
+                  <span
+                    class="server-item-pin"
+                    aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                    title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                  >
+                    📌
+                  </span>
+                )}
+                <span class="server-item-name">{server.name}</span>
               </button>
             );
           })}
@@ -4763,33 +10330,54 @@ export function App() {
           )}
         </div>
         <div style={{ flex: 1 }} />
-        {connected && (daemonStats || daemonVersionForDisplay) && (
+        {selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
           <div class="sidebar-stats">
+            <DaemonStatusCard
+              currentVersion={daemonVersionForDisplay}
+              latestVersion={latestDaemonVersionForDisplay}
+              online={connected && daemonOnline}
+              busySessions={busyDaemonSessionCount}
+              upgrading={Boolean(daemonUpgrading)}
+              requestState={daemonUpgradeRequest}
+              autoUpgrade={daemonStats?.autoUpgrade ?? null}
+              onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+            />
             {daemonVersionForDisplay && (
               <div class="sidebar-stats-row">
                 {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
                 <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonVersionForDisplay}`}>
                   Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
+                {daemonUpgrading && (
+                  <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
+                    <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                    {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
+                  </span>
+                )}
               </div>
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
-                <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                  CPU {daemonStats.cpu}%
+                <span style={{ color: { danger: '#f87171', warn: '#fbbf24', ok: '#4ade80', unknown: '#94a3b8' }[cpuSeverity(daemonStats.cpu) ?? 'unknown'] }}>
+                  CPU {formatCpuPercent(daemonStats.cpu)}
                 </span>
                 <span style={{ color: '#a78bfa' }}>
-                  Load {daemonStats.load1}
+                  Load {formatStatNumber(daemonStats.load1)}
                 </span>
               </div>
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
                 <span style={{ color: '#60a5fa' }}>
-                  Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
+                  Mem {formatMemoryCompact(daemonStats.memUsed)}/{formatMemoryCompact(daemonStats.memTotal)}
                 </span>
+                {isDaemonMainLoopBusy(daemonStats) && (
+                  <span style={{ color: '#fb923c' }} title="Main daemon event loop is busy">
+                    Busy {Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms
+                  </span>
+                )}
                 <span style={{ color: '#94a3b8' }}>
-                  {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
+                  {formatDaemonUptime(daemonStats.uptime)}
                 </span>
               </div>
             )}
@@ -4799,8 +10387,8 @@ export function App() {
           <div style={{ fontSize: 10, color: '#475569', marginBottom: 8, textAlign: 'center' }}>
             {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
           </div>
-          <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-            <LanguageSwitcher />
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+            <LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle />
           </div>
           <button class="btn btn-secondary" style={{ width: '100%', fontSize: 11 }} onClick={handleLogout}>
             Log Out
@@ -4808,83 +10396,180 @@ export function App() {
         </div>
       </aside>
 
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+
       {/* Main */}
       <main class="main">
+        <PcAppUpdateBanner onOpenDownloads={() => setShowDownloadsModal(true)} />
         {!selectedServerId && !manualDashboard && (!serversLoaded || autoEnteringRecent || servers.length > 0) ? (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', flexDirection: 'column', gap: 12 }}>
             <div class="spinner" />
             <div>{trans('common.loading')}</div>
           </div>
         ) : !selectedServerId ? (
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+          <div style={{ position: 'relative', flex: 1, minHeight: 0, overflowY: 'auto' }}>
+            {isMobile && (
+              <button
+                type="button"
+                class="mobile-dashboard-menu-button"
+                aria-label={trans('sidebar.expand')}
+                aria-expanded={mobileSidebarOpen}
+                onClick={toggleMobileSidebar}
+              >≡</button>
+            )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
-              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />
+              <DashboardPage
+                servers={orderedServers}
+                onSelectServer={handleSelectServer}
+                onDeleteServer={(server) => setDeleteTarget(server)}
+                onLogout={handleLogout}
+                onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
+                onServersLoaded={applyServerInventory}
+                sharedEntries={restrictedSharedEntries}
+                sharedEntriesLoading={sharedEntriesLoading}
+                sharedEntriesLoaded={sharedEntriesLoaded}
+                sharedEntriesError={sharedEntriesError}
+                openingSharedEntryId={openingSharedEntryId}
+                onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+                onRefreshSharedEntries={() => void refreshSharedEntries()}
+              />
             </Suspense>
           </div>
         ) : (
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
-              <button class="mobile-sidebar-toggle" onClick={() => setMobileSidebarOpen(true)}>≡</button>
+              <button class="mobile-sidebar-toggle" aria-expanded={mobileSidebarOpen} onClick={toggleMobileSidebar}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
-                  onClick={() => setShowMobileServerMenu((o) => !o)}
+                  onClick={() => {
+                    setShowMobileServerMenu((o) => {
+                      const next = !o;
+                      if (next) setMobileServerMenuTab('servers');
+                      return next;
+                    });
+                  }}
                   title={resolvedSelectedServerName ?? 'Server'}
                 >
                   <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
                   <span class="mobile-server-btn-name">{resolvedSelectedServerName ?? 'Server'}</span>
-                  <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
+                  {selectedServerIsSharedIn ? (
+                    <SharedStateIndicator variant="shared-in" iconOnly />
+                  ) : (
+                    <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
+                  )}
                   <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <div class="mobile-server-menu">
-                    <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
-                      ← Home
-                    </button>
-                    {isNative() && (
-                      <button class="mobile-server-menu-item mobile-server-menu-change" onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}>
-                        ⇄ Switch Cloud Server
-                      </button>
+                  <MobileServerMenu footer={<><LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle /></>}>
+                    <MobileServerMenuToolbar
+                      onHome={() => {
+                        setShowMobileServerMenu(false);
+                        handleBackToDashboard();
+                      }}
+                      onChangeServer={() => {
+                        setShowMobileServerMenu(false);
+                        handleChangeServer();
+                      }}
+                      onOpenControlledNodes={() => {
+                        setShowMobileServerMenu(false);
+                        openControlledNodes();
+                      }}
+                      activeTab={mobileServerMenuTab}
+                      onTabChange={setMobileServerMenuTab}
+                    />
+                    {mobileServerMenuTab === 'remote' ? (
+                      <MobileRemoteDesktopMenuList
+                        onSelect={(machine) => {
+                          setShowMobileServerMenu(false);
+                          openRemoteDesktop(machine);
+                        }}
+                      />
+                    ) : (
+                      <>
+                        {unifiedServers.map((s) => {
+                          const presence = getServerPresence(s);
+                          const online = presence === 'online';
+                          const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                          const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+                          const presenceLabel = online
+                            ? trans('server.online', { defaultValue: 'Online' })
+                            : presence === 'offline'
+                              ? trans('server.offline', { defaultValue: 'Offline' })
+                              : trans('server.status_unknown', { defaultValue: 'Status unknown' });
+                          return (
+                            <button
+                              key={s.id}
+                              class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                              onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
+                              onContextMenu={(e) => {
+                                e.preventDefault();
+                                setShowMobileServerMenu(false);
+                                openUnifiedServerContextMenu(s, e.clientX, e.clientY);
+                              }}
+                            >
+                              <span
+                                class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`}
+                                style={{ color: presenceColor }}
+                                title={presenceLabel}
+                                aria-label={presenceLabel}
+                              >
+                                {presenceSymbol}
+                              </span>
+                              <span class="mobile-server-menu-name">{s.name}</span>
+                              {!s.isSharedIn && (
+                                <PushStatusBadge enabled={effectivePushEnabledServerIdSet.has(s.id)} variant="inline" />
+                              )}
+                              {s.isSharedIn ? (
+                                <SharedStateIndicator variant="shared-in" iconOnly />
+                              ) : (
+                                <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                              )}
+                            </button>
+                          );
+                        })}
+                        {(restrictedSharedEntries.length > 0 || sharedEntriesError !== null) && (
+                          <MobileSharedEntriesMenu
+                            entries={restrictedSharedEntries}
+                            loading={sharedEntriesLoading}
+                            error={sharedEntriesError}
+                            openingEntryId={openingSharedEntryId}
+                            onOpen={(entry) => {
+                              void handleOpenSharedEntry(entry);
+                              setShowMobileServerMenu(false);
+                            }}
+                            onRefresh={() => void refreshSharedEntries()}
+                          />
+                        )}
+                      </>
                     )}
-                    {servers.map((s) => {
-                      const online = isServerOnline(s);
-                      return (
-                        <button
-                          key={s.id}
-                          class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}`}
-                          onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
-                        >
-                          <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
-                          <span class="mobile-server-menu-name">{s.name}</span>
-                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
-                        </button>
-                      );
-                    })}
-                    {sharedEntries.length > 0 && (
-                      <div class="mobile-server-menu-shared">
-                        <div class="mobile-server-menu-shared-title">{trans('share.sharedWithMe.title')}</div>
-                        {sharedEntries.map((entry) => (
-                          <button
-                            key={entry.id}
-                            class="mobile-server-menu-item"
-                            onClick={() => { void handleOpenSharedEntry(entry); setShowMobileServerMenu(false); }}
-                          >
-                            <span>↗</span>
-                            {' '}{entry.targetLabel}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                    <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
-                      <LanguageSwitcher />
-                    </div>
-                  </div>
+                  </MobileServerMenu>
                   </>
                 )}
               </div>
               <div class="mobile-server-actions">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable + quick-node dropdown are the first actions in this row. */}
+                <div class="mobile-remote-desktop-group" data-testid="mobile-remote-desktop-group">
+                  <DaemonRemoteDesktopControl
+                    compact
+                    offerLoginScreenSetup={false}
+                    ws={wsRef.current}
+                    serverId={selectedServerId}
+                    serverName={selectedServerInfo?.name}
+                    daemonOnline={daemonOnline}
+                    onOpen={openRemoteDesktop}
+                    canSetUp={!selectedShareTarget}
+                  />
+                  <ControlledNodeQuickMenu
+                    onOpenRemoteDesktop={openRemoteDesktop}
+                    onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                    onConnectById={openRemoteDesktopById}
+                    allowStandaloneWindow={false}
+                  />
+                </div>
                 {activeSession && (
                   <button
                     class="view-toggle"
@@ -4902,23 +10587,37 @@ export function App() {
                 <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
                   🌐
                 </button>
+                <button
+                  type="button"
+                  class={`view-toggle global-task-mode-entry-btn mobile-task-mode-btn${hasTaskModeAttention ? ' is-attention' : ''}`}
+                  data-testid="mobile-task-mode-btn"
+                  title={trans('taskMode.title', 'Task Mode')}
+                  aria-label={trans('taskMode.title', 'Task Mode')}
+                  onClick={() => setShowTaskMode((prev) => !prev)}
+                  aria-pressed={showTaskMode}
+                >
+                  <TaskModeGlyphIcon size={16} />
+                  {taskModeBadgeCount > 0 && (
+                    <span class="global-task-mode-badge" data-testid="mobile-task-mode-badge">
+                      {taskModeBadgeCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  class="view-toggle mobile-cloud-docs-marquee-btn"
+                  data-testid="mobile-cloud-docs-btn"
+                  title={trans('cloud_docs.title', 'Cloud Docs')}
+                  aria-label={trans('cloud_docs.title', 'Cloud Docs')}
+                  onClick={() => setShowCloudDocs((prev) => !prev)}
+                  aria-pressed={showCloudDocs}
+                >
+                  <CloudDocsGlyphIcon size={17} />
+                </button>
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
-                  <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
-                    {daemonBadgeState === 'online'
-                      ? '● Online'
-                      : daemonBadgeState === 'connecting'
-                        ? (<><span class="connecting-dot" />{' Connecting'}</>)
-                        : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
-                  </span>
-                  <span style={{ fontSize: 9, color: '#475569' }}>
-                    {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
-                  </span>
-                </div>
               </div>
             </div>
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
@@ -4932,26 +10631,39 @@ export function App() {
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
               onSelect={selectMainSessionTab}
-              onNewSession={() => setShowNewSession(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
               onStopProject={handleStopProject}
+              canStopProject={!selectedShareTarget || isSharedServerParticipant}
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
                 sessionName: session.name,
+                sessionInstanceId: session.sessionInstanceId,
+                runtimeEpoch: session.runtimeEpoch,
+                activeModel: session.activeModel,
+                requestedModel: session.requestedModel,
+                modelDisplay: session.modelDisplay,
+                providerId: session.providerId,
                 label: session.label || '',
                 description: session.description || '',
                 cwd: session.projectDir || '',
                 type: session.agentType || '',
                 parentSession: null,
                 transportConfig: session.transportConfig ?? null,
+                supervisionMode: session.supervisionMode ?? null,
+                canControlAutomaticSupervision: canSharedActorControlSession(session.sharedState)
+                  && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
-              onShareSession={openShareDialogForSession}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
               sessionsLoaded={sessionsLoaded}
               pinned={pinnedTabs}
               setPinnedArr={setPinnedTabsArr}
+              tabOrder={tabOrder}
+              setTabOrder={setTabOrder}
+              tabOrderHydrated={tabOrderHydrated}
             />
 
             <div
@@ -4970,12 +10682,32 @@ export function App() {
                 >
                   🌐
                 </button>
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
+                />
               </div>
             )}
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable is the first action in this row. */}
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
+                />
                 <button
                   class="view-toggle"
                   title={trans('picker.files')}
@@ -5010,33 +10742,44 @@ export function App() {
               </div>
             )}
 
-            {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
-            {navigableMainSessions.map((s) => (
-              <ErrorBoundary key={`eb-${s.name}`}>
+            <div class="supervision-task-console-workspace">
+              <div class="supervision-task-console-primary">
+              {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
+              {visibleMainSessions.map((s) => (
+              <ErrorBoundary key={`eb-${selectedServerId ?? ''}:${s.name}`}>
               <SessionPane
-                key={s.name}
+                key={`${selectedServerId ?? ''}:${s.name}`}
                 serverId={selectedServerId ?? ''}
+                onPendingQuestion={surfaceAskQuestionFromHistory}
+                onAskAnswer={(toolUseId, answer) => submitAskQuestionAnswer(s.name, toolUseId, answer)}
                 session={s}
-                sessions={sessions}
+                canManageFileShares={canManageServerFileShares && !isShareScopedState(s.sharedState)}
+                sessions={quickDelegationSessions}
                 subSessions={subSessionsSlim}
                 ws={wsRef.current}
                 connected={connected}
-                isActive={s.name === activeSession}
-                keyboardActive={s.name === activeSession && openSubIds.size === 0}
+                isActive={!showTaskMode && s.name === activeSession}
+                keyboardActive={!showTaskMode && s.name === activeSession && openSubIds.size === 0}
                 viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
                 quickData={quickData}
                 detectedModel={detectedModels.get(s.name)}
                 onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
                 onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
                 onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
-                onChatScrollFn={(fn) => { chatScrollFnsRef.current.set(s.name, fn); }}
-                onInputRef={(el) => { if (el) inputRefsMap.current.set(s.name, el); else inputRefsMap.current.delete(s.name); }}
+                onChatScrollFn={(fn) => {
+                  chatScrollFnsRef.current.set(s.name, fn);
+                  if (pendingChatScrollSessionRef.current === s.name) {
+                    runRegisteredMainChatScroll(s.name, fn, true);
+                  }
+                }}
+                onInputRef={(el) => registerComposerInputRef(s.name, el)}
                 onDiff={(apply) => registerDiffApplyer(s.name, apply)}
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
+                onRestart={() => handleRestartProject(s.project)}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
-                onShareSession={openShareDialogForSession}
+                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, modelDisplay: s.modelDisplay, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role) })}
+                onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
@@ -5050,9 +10793,13 @@ export function App() {
                   )));
                 }}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
+                onOpenLocalWebPreview={openLocalWebPreviewFromChat}
+                onCloudDocClick={openCloudDocPreview}
+                onRemoteDesktopClick={handleOpenRemoteDesktopRef}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
+                onOpenNodeGroups={openControlledNodes}
                 pendingPrefillText={pendingPrefills[s.name] ?? null}
                 onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                   if (!(s.name in prev)) return prev;
@@ -5060,26 +10807,70 @@ export function App() {
                   delete next[s.name];
                   return next;
                 })}
+                pendingTaskQuote={matchesPendingTaskQuoteTarget(pendingTaskQuote, selectedServerId, s.name)
+                  ? { quote: pendingTaskQuote!.quote, nonce: pendingTaskQuote!.nonce }
+                  : null}
+                onPendingTaskQuoteConsumed={consumePendingTaskQuote}
+                pendingSharedUpload={
+                  pendingSharedUpload
+                  && pendingSharedUpload.serverId === selectedServerId
+                  && pendingSharedUpload.sessionName === s.name
+                    ? pendingSharedUpload
+                    : null
+                }
+                onPendingSharedUploadConsumed={handlePendingSharedUploadConsumed}
                 onVersionSensitiveAction={runVersionSensitiveAction}
               />
               </ErrorBoundary>
-            ))}
+              ))}
 
-            {!resolvedActiveSessionExists && !sessionsLoaded && (
+              {!resolvedActiveSessionExists && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
                 <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
-            )}
-            {!resolvedActiveSessionExists && sessionsLoaded && (
+              )}
+              {!resolvedActiveSessionExists && sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>
-                <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
-                  + New Session
-                </button>
+                {canCreateMainSession && (
+                  <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
+                    + New Session
+                  </button>
+                )}
               </div>
-            )}
+              )}
+              </div>
+              {auth?.userId && selectedServerId && activeSessionInfo && (
+                <SupervisionTaskPairSnapshotBridge
+                  ws={wsRef.current}
+                  connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                />
+              )}
+              {showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo && (
+                <SupervisionTaskConsole
+                  key={`${auth.userId}:${selectedServerId}:${activeSessionInfo.project}:${activeSessionInfo.name}`}
+                  ws={wsRef.current}
+                  connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId!}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                  mobile={isMobile}
+                  readOnly={sharedAccessRole === 'viewer'}
+                  onClose={closeSupervisionTaskConsole}
+                  onNavigateSession={(sessionName) => {
+                    navigateToSession(sessionName);
+                    if (isMobile) closeSupervisionTaskConsole();
+                  }}
+                />
+              )}
+            </div>
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
@@ -5106,6 +10897,9 @@ export function App() {
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   sessionName={activeSession ?? undefined}
+                  scopeToSessionRoot={isTabShare}
+                  readOnly={sharedAccessRole === 'viewer'}
+                  canShare={canManageServerFileShares}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -5118,12 +10912,11 @@ export function App() {
                       : paths.map((p) => '@' + p + ' ');
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
-                      inputEl.textContent = (inputEl.textContent || '') + rel.join('');
-                      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                      inputEl.focus();
+                      appendContentEditableTextPreservingNewlines(inputEl, rel.join(''));
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
+                  onOpenNodeGroups={openControlledNodes}
                 />
               </FloatingPanel>
             )}
@@ -5150,6 +10943,7 @@ export function App() {
                 onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId))}
               >
                 <LocalWebPreviewPanel
+                  key={`${selectedServerId}:${localWebPreviewLaunchToken}`}
                   serverId={selectedServerId}
                   port={localWebPreviewPort}
                   path={localWebPreviewPath}
@@ -5176,10 +10970,19 @@ export function App() {
             {selectedServerId && (
               <SubSessionBar
                 subSessions={visibleSubSessions}
+                daemonBadgeState={daemonBadgeState}
                 sharedSubSessionStates={managedSharedSubSessionStateById}
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
+                desktopLayout={subSessionDesktopLayout}
+                onDesktopLayoutChange={handleSubSessionDesktopLayoutChange}
+                desktopDockSide={subSessionDesktopDockSide}
+                onDesktopDockSideChange={handleSubSessionDesktopDockSideChange}
+                verticalRailHost={showSubSessionVerticalRail ? subSessionVerticalRailHost : null}
+                teamDiscussionLayout={teamDiscussionLayout}
+                onTeamDiscussionLayoutChange={handleTeamDiscussionLayoutChange}
+                teamDiscussionRailHost={teamDiscussionRailHost}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
@@ -5194,7 +10997,10 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
-                onNew={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+                onRenameSubSession={(id, label) => renameSubSession(id, label ?? '')}
+                pinnedSubSessionIds={pinnedSubSessionIds}
+                onToggleSubSessionPin={togglePinnedSubSession}
+                onNew={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
                 onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
                 openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
                 openSpecAutoStopPending={appOpenSpecAutoDeliver.stopPending}
@@ -5207,11 +11013,7 @@ export function App() {
                 }}
                 onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
                 onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
-                discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
-                  activeSession,
-                  activeRootSession,
-                  visibleSubSessionNames,
-                }))}
+                discussions={visibleTeamDiscussions}
                 // Daemon-wide running count (NOT scoped to this
                 // session) so the View Discussions (📋) button shows
                 // a badge even when the user is viewing a session
@@ -5241,13 +11043,15 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
+                quickClosePersistenceScope={activeRootSession ?? activeSession ?? undefined}
                 onViewRepo={() => openRepoPage()}
                 onViewCron={() => runVersionSensitiveAction(trans('cron.title'), () => setShowCronManager(true))}
+                cronJobCount={cronJobCount}
                 subUsages={subUsages}
                 detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
-                sessions={sessions}
+                sessions={quickDelegationSessions}
                 allSubSessions={subSessionsSlim}
                 p2pSessionLabels={p2pSessionLabels}
                 onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
@@ -5258,13 +11062,16 @@ export function App() {
         )}
       </main>
 
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+      {renderTeamDiscussionRailHost()}
+
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
-      {isMobile && selectedServerId && (
+      {isMobile && (
         <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onPointerDown={(e) => { if (e.target === e.currentTarget) closeSidebar(); }}>
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel">
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 }}>
                 <button
                   class="mobile-sidebar-hdr-btn"
                   onClick={() => { handleBackToDashboard(); closeSidebar(); }}
@@ -5272,61 +11079,115 @@ export function App() {
                 >🏠</button>
                 <button
                   class="mobile-sidebar-hdr-btn"
+                  data-testid="mobile-sidebar-downloads"
+                  onClick={() => { setShowDownloadsModal(true); closeSidebar(); }}
+                  title={trans('client_downloads.button_title')}
+                  aria-label={trans('client_downloads.button_title')}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style={{ display: 'block' }} aria-hidden="true">
+                    <path d="M12 3v12" />
+                    <path d="M7 10l5 5 5-5" />
+                    <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                  </svg>
+                </button>
+                <button
+                  class="mobile-sidebar-hdr-btn"
                   onClick={() => { setShowSettingsPage(true); closeSidebar(); }}
                   title="Settings"
                 >⚙</button>
-                <button
-                  class="mobile-sidebar-hdr-btn"
-                  onClick={() => {
-                    setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
-                    setShowSharedContextManagement(true);
-                    closeSidebar();
-                  }}
-                  title={trans('sharedContext.management.title')}
-                >CTX</button>
-                <button
-                  class="mobile-sidebar-hdr-btn"
-                  onClick={() => {
-                    setShowSharedContextDiagnostics(true);
-                    closeSidebar();
-                  }}
-                  title={trans('sharedContext.diagnostics.title')}
-                >DBG</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
-                  title="Server bar"
-                >≡</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
-                  title="Session tabs"
-                >⊞</button>
+                {isAdmin && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => { setShowAdminPage(true); closeSidebar(); }}
+                    title={trans('admin.title')}
+                  >🛡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => {
+                      setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
+                      setShowSharedContextManagement(true);
+                      closeSidebar();
+                    }}
+                    title={trans('sharedContext.management.title')}
+                  >CTX</button>
+                )}
+                {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideServerBar((p) => { const v = !p; saveMobileHideServerBar(v); return v; })}
+                    title="Server bar"
+                    aria-pressed={!mobileHideServerBar}
+                  >≡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                    title="Session tabs"
+                  >⊞</button>
+                )}
                 <button class="mobile-sidebar-close" onClick={() => closeSidebar()}>✕</button>
               </div>
             </div>
             <div class="mobile-sidebar-body">
               <ErrorBoundary>
               {/* Server switcher — collapsible via sidebar toggle */}
-              {!mobileHideServerBar && (
+              {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
-                  {servers.map((s) => {
-                    const online = isServerOnline(s);
+                  {unifiedServers.map((s) => {
+                    const presence = getServerPresence(s);
+                    const online = presence === 'online';
+                    const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                    const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+                    const presenceLabel = online
+                      ? trans('server.online', { defaultValue: 'Online' })
+                      : presence === 'offline'
+                        ? trans('server.offline', { defaultValue: 'Offline' })
+                        : trans('server.status_unknown', { defaultValue: 'Status unknown' });
                     return (
                       <button
                         key={s.id}
-                        class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
-                        onClick={() => { handleSelectServer(s.id, s.name); closeSidebar(); }}
+                        class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                        onClick={() => { handleUnifiedServerSelect(s); closeSidebar(); }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          closeSidebar();
+                          openUnifiedServerContextMenu(s, e.clientX, e.clientY);
+                        }}
                       >
-                        <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
-                          {online ? '●' : '○'}
+                        <span
+                          class={`server-item-dot server-item-dot-${presence}`}
+                          style={{ color: presenceColor }}
+                          title={presenceLabel}
+                          aria-label={presenceLabel}
+                        >
+                          {presenceSymbol}
                         </span>
-                        {s.name}
+                        {pinnedServerIds.has(s.id) && (
+                          <span
+                            class="server-item-pin"
+                            aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                            title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                          >
+                            📌
+                          </span>
+                        )}
+                        <span class="server-item-name">{s.name}</span>
+                        {!s.isSharedIn && (
+                          <PushStatusBadge enabled={effectivePushEnabledServerIdSet.has(s.id)} variant="inline" />
+                        )}
+                        {s.isSharedIn ? (
+                          <SharedStateIndicator variant="shared-in" iconOnly />
+                        ) : (
+                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                        )}
                       </button>
                     );
                   })}
                   <SharedEntriesPanel
-                    entries={sharedEntries}
+                    entries={restrictedSharedEntries}
                     loading={sharedEntriesLoading}
                     error={sharedEntriesError}
                     openingEntryId={openingSharedEntryId}
@@ -5336,7 +11197,7 @@ export function App() {
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}
-              {!mobileHideTabBar && <SessionTree
+              {selectedServerId && !mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
                 sessions={visibleMainSessions}
                 subSessions={subSessions}
@@ -5346,21 +11207,20 @@ export function App() {
                 idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
-                  setActiveSession(name);
-                  setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                  selectMainSessionTab(name);
                   closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
                   selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
-                onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
-                onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
+                onNewSession={canCreateMainSession ? () => { setShowNewSession(true); closeSidebar(); } : undefined}
+                onNewSubSession={canCreateSubSession ? () => { setShowSubDialog(true); closeSidebar(); } : undefined}
                 height={sessionTreeHeight}
                 onResizeHeight={saveSessionTreeHeight}
               />}
               {/* P2P ring progress */}
-              {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
+              {selectedServerId && discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
                 <P2pRingProgress
                   key={d.id}
                   completedRounds={Math.max(0, d.currentRound - 1)}
@@ -5375,54 +11235,36 @@ export function App() {
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
-              {visiblePinnedPanels.map((panel) => {
-                const height = pinnedPanelHeights[panel.id] ?? 240;
-                const ctx: PanelRenderContext = {
-                  ws: wsRef.current,
-                  connected,
-                  serverId: selectedServerId ?? '',
-                  subSessions,
-                  inputRefsMap,
-                  onPreviewFile: (request) => { handlePreviewFileRequest({ ...request, sourcePreviewLive: false }); closeSidebar(); },
-                  onPreviewStateChange: handlePreviewStateChange,
-                  activeSession,
-                  activeProjectDir: activeSessionInfo?.projectDir,
-                  sessions,
-                  servers: servers.map(s => ({ id: s.id, name: s.name })),
-                  onQuote: (text) => {
-                    const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
-                    if (inputEl) {
-                      const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                      inputEl.textContent = (inputEl.textContent || '') + quote;
-                      inputEl.focus();
-                    }
-                  },
-                  t: trans,
-                  updatePanelProps: updatePinnedPanelProps,
-                };
-                return (
-                  <SidebarPinnedPanel
-                    key={panel.id}
-                    panel={panel}
-                    height={height}
-                    onUnpin={() => unpinPanel(panel)}
-                    onResize={(h) => savePinnedPanelHeight(panel.id, h)}
-                    ctx={ctx}
-                  />
-                );
-              })}
+              {selectedServerId && renderSidebarPinnedPanels(closeSidebar)}
               </ErrorBoundary>
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {connected && (daemonStats || daemonVersionForDisplay) && (
-                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+              {selectedServerId && selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
+                <div class="mobile-sidebar-daemon-status">
+                  <DaemonStatusCard
+                    currentVersion={daemonVersionForDisplay}
+                    latestVersion={latestDaemonVersionForDisplay}
+                    online={connected && daemonOnline}
+                    busySessions={busyDaemonSessionCount}
+                    upgrading={Boolean(daemonUpgrading)}
+                    requestState={daemonUpgradeRequest}
+                    autoUpgrade={daemonStats?.autoUpgrade ?? null}
+                    onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+                    compact
+                  />
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
-                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
+                    {daemonStats && <span>CPU {formatCpuPercent(daemonStats.cpu)} · Load {formatStatNumber(daemonStats.load1)}{isDaemonMainLoopBusy(daemonStats) ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
                   </span>
+                  {daemonUpgrading && (
+                    <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
+                      <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                      {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
+                    </span>
+                  )}
                   <button
-                    style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
+                    class="mobile-sidebar-watch-sync"
                     onClick={async () => {
                       try {
                         const snapshot = watchProjectionStore.getSnapshot();
@@ -5443,8 +11285,8 @@ export function App() {
                   >⌚</button>
                 </div>
               )}
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <LanguageSwitcher />
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                <LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle />
                 <span style={{ fontSize: 10, color: '#475569' }}>
                   {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
                 </span>
@@ -5467,6 +11309,7 @@ export function App() {
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
+              serverId={selectedServerId}
               onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
               initialSelectedId={discussionInitialId}
               initialTab={discussionInitialTab}
@@ -5514,7 +11357,7 @@ export function App() {
           )}
           onFocus={() => bringDesktopWindowToFront(repoPanelDesktopWindowId)}
         >
-          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+          <RepoPage key={`${selectedServerId ?? ''}:${isTabShare ? (repoPanelSessionId ?? '') : ''}:${repoPanelProjectDir}`} ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} serverId={selectedServerId} callbackTargets={buildRepoCallbackTargetOptions(repoPanelProjectDir, sessions, subSessions)} scopeToSessionRoot={isTabShare} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
@@ -5563,6 +11406,9 @@ export function App() {
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             sessionName={previewFileRequest.sessionName ?? activeSession ?? undefined}
+            scopeToSessionRoot={isTabShare}
+            readOnly={sharedAccessRole === 'viewer'}
+            canShare={canManageServerFileShares}
             mode="file-single"
             layout="panel"
             initialPath={getFilePreviewInitialPath(previewFileRequest)}
@@ -5576,17 +11422,35 @@ export function App() {
             onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
             onClose={() => setPreviewFileRequest(null)}
+            onOpenNodeGroups={openControlledNodes}
           />
         </FloatingPanel>
       )}
 
+      {showDownloadsModal && (
+        <ClientDownloadsModal
+          open={showDownloadsModal}
+          onClose={() => setShowDownloadsModal(false)}
+        />
+      )}
+
       {showSettingsPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div
+          data-testid="settings-page-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))', minHeight: 0, boxSizing: 'border-box',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
+          }}
+        >
           <SettingsPage
             displayName={userDisplayName}
             username={username}
             hasPassword={userHasPassword}
+            isAdmin={isAdmin}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
+            shortcutOverrides={shortcutOverrides}
+            onChangeShortcutOverrides={setShortcutOverrides}
             onBack={() => setShowSettingsPage(false)}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
             onUserAuthUpdated={(next) => {
@@ -5597,9 +11461,22 @@ export function App() {
         </div>
       )}
 
-      {showCronManager && selectedServerId && (() => {
-        const cronProject = sessions.find(s => s.name === activeSession)?.project;
-        return cronProject ? (
+      {showUsageSummaryPage && (
+        <div
+          data-testid="usage-summary-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999,
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflowY: 'auto', boxSizing: 'border-box',
+          }}
+        >
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>{trans('common.loading')}</div>}>
+            <UsageSummaryPage onBack={() => setShowUsageSummaryPage(false)} />
+          </Suspense>
+        </div>
+      )}
+
+      {showCronManager && selectedServerId && cronProject && (
           <FloatingPanel
             id="cron"
             title={trans('cron.title')}
@@ -5614,21 +11491,25 @@ export function App() {
             <CronManager
               serverId={selectedServerId}
               projectName={cronProject}
+              windowZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cronManager, 5070)}
+              onWindowFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cronManager)}
               sessions={sessions}
               subSessions={subSessionsSlim}
               activeSession={activeSession}
+              sharedSessionName={canonicalSharedSessionName}
+              sharedScope={Boolean(selectedShareTarget)}
+              readOnly={sharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
               }}
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
-              servers={servers.map(s => ({ id: s.id, name: s.name }))}
+              servers={orderedServers.map(s => ({ id: s.id, name: s.name }))}
               ws={wsRef.current}
             />
           </FloatingPanel>
-        ) : null;
-      })()}
+      )}
 
       {showSharedContextManagement && (
         <FloatingPanel
@@ -5657,12 +11538,157 @@ export function App() {
               .filter((session) => Boolean(session.projectDir))
               .map((session) => ({
                 projectDir: session.projectDir,
+                canonicalRepoId: session.contextNamespace?.projectId,
                 displayName: session.label || session.project || session.name,
                 sessionName: session.name,
                 source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,
               }))}
           />
         </FloatingPanel>
+      )}
+      {showControlledNodes && !mobileRemoteSurfaceActive && (
+        <FloatingPanel
+          id="controlled-nodes"
+          title={trans('controlled_nodes.title')}
+          onClose={() => setShowControlledNodes(false)}
+          defaultW={860}
+          defaultH={680}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.controlledNodes, 5100)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
+          className="controlled-nodes-floating-panel"
+        >
+          <ControlledNodesPanel
+            onOpenRemoteDesktop={openRemoteDesktop}
+            onOpenRemoteDesktopWall={openRemoteDesktopWall}
+            onConnectById={openRemoteDesktopById}
+            projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
+            initialNodeId={aideskManagementNodeId ?? undefined}
+            initialAction={aideskManagementAction}
+            remoteDesktopManager={remoteDesktopConnectionManager}
+          />
+        </FloatingPanel>
+      )}
+      {showCloudDocs && !mobileRemoteSurfaceActive && (
+        <FloatingPanel
+          id={DESKTOP_WINDOW_IDS.cloudDocs}
+          title={trans('cloud_docs.title', 'Cloud Docs')}
+          onClose={() => setShowCloudDocs(false)}
+          defaultW={1080}
+          defaultH={760}
+          minW={420}
+          minH={360}
+          getDefaultGeometry={getDesktopMaximizeBounds}
+          defaultVersion={2}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, isMobile ? 6520 : 5102)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs)}
+          onOpenNewWindow={!isMobile ? () => {
+            if (openCloudDocsWindow()) setShowCloudDocs(false);
+          } : undefined}
+          openNewWindowTooltip={trans('cloud_docs.open_new_window', 'Open in new window')}
+          enableMaximize
+          isMaximized={desktopCloudDocsMaximized}
+          onToggleMaximized={() => setDesktopCloudDocsMaximized((current) => !current)}
+          getMaximizeBounds={getDesktopMaximizeBounds}
+          desktopLayoutCapable={desktopLayoutCapable}
+          geometryRequest={cloudDocsGeometryRequest}
+        >
+          <CloudDocsPanel
+            docRequest={cloudDocsRequest}
+            onQuoteDoc={handleQuoteCloudDoc}
+            mainChat={cloudDocsMainChatContext}
+            onRemoteDesktopClick={handleOpenRemoteDesktopRef}
+          />
+        </FloatingPanel>
+      )}
+
+      {remoteDesktopWorkspace.open && (
+        <RemoteDesktopWorkspace
+          state={remoteDesktopWorkspace}
+          manager={remoteDesktopConnectionManager}
+          quickData={quickData}
+          mainChat={cloudDocsMainChatContext}
+          onOpenDoc={openCloudDocPreview}
+          onRemoteDesktopClick={handleOpenRemoteDesktopRef}
+          ws={wsRef.current}
+          minimized={remoteDesktopWorkspaceMinimized}
+          zIndex={getDesktopWindowZIndex(
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+            isMobile ? 7000 : 5110,
+          )}
+          onFocus={() => bringDesktopWindowToFront(
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+          )}
+          // A popup on a phone either never opens or opens as a tab with no
+          // way back, so the tear-off action is desktop-only.
+          allowStandaloneWindow={!isMobile}
+          onOpenHost={openRemoteDesktop}
+          onActivateTab={(tabId) => setRemoteDesktopWorkspace((current) => (
+            activateRemoteDesktopWorkspaceTab(current, tabId)
+          ))}
+          onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => {
+            const next = closeRemoteDesktopWorkspaceHost(current, hostKey);
+            if (!next.open) {
+              setRemoteDesktopWorkspaceMinimized(false);
+              removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            }
+            return next;
+          })}
+          onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
+            reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
+          ))}
+          onMinimize={() => setRemoteDesktopWorkspaceMinimized(true)}
+          onRestore={() => setRemoteDesktopWorkspaceMinimized(false)}
+          onCloseWorkspace={() => {
+            removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
+            setRemoteDesktopWorkspaceMinimized(false);
+          }}
+          wallHostKeys={new Set(remoteDesktopWallHostKeys)}
+        />
+      )}
+
+      {remoteDesktopWallOpen && (
+        <RemoteDesktopWall
+          manager={remoteDesktopConnectionManager}
+          retainedHostKeys={new Set(remoteDesktopWorkspace.orderedHostKeys)}
+          minimized={remoteDesktopWallMinimized}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.remoteDesktopWall, isMobile ? 7000 : 5105)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.remoteDesktopWall)}
+          onMinimize={() => setRemoteDesktopWallMinimized(true)}
+          onRestore={() => setRemoteDesktopWallMinimized(false)}
+          onOpenStandalone={openRemoteDesktopWallStandalone}
+          onConnectById={() => openRemoteDesktopById()}
+          onOpenHost={openRemoteDesktop}
+          onHostKeysChange={setRemoteDesktopWallHostKeys}
+          onClose={closeRemoteDesktopWall}
+        />
+      )}
+
+      {remoteDesktopGuestAccess && (
+        <RemoteDesktopGuestAccess
+          standalone={false}
+          initialPublicNodeId={remoteDesktopGuestAccess.publicNodeId}
+          serverUrl={auth?.baseUrl ?? nativeServerUrl}
+          beginAuthAttempt={beginAuthAttempt}
+          onLoginSuccess={handleAppLoginSuccess}
+          onWebLogin={() => {
+            const expectedGeneration = authMutationGenerationRef.current;
+            const targetServerUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current ?? window.location.origin;
+            void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
+              const currentTargetUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current ?? window.location.origin;
+              if (
+                !appMountedRef.current
+                || authMutationGenerationRef.current !== expectedGeneration
+                || currentTargetUrl !== targetServerUrl
+              ) {
+                return;
+              }
+              handleAppLoginSuccess(me.id, targetServerUrl, me.r2RelayEnabled === true, expectedGeneration);
+            }).catch(() => {});
+          }}
+          zIndex={20000}
+          onExit={() => setRemoteDesktopGuestAccess(null)}
+        />
       )}
 
       {showSharedContextDiagnostics && (
@@ -5694,8 +11720,31 @@ export function App() {
       )}
 
       {showAdminPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div
+          data-testid="admin-page-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))', minHeight: 0, boxSizing: 'border-box',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
+          }}
+        >
           <AdminPage onBack={() => setShowAdminPage(false)} />
+        </div>
+      )}
+
+      {showTaskMode && (
+        <div
+          class="global-task-mode-overlay"
+          data-testid="global-task-mode-overlay"
+        >
+          <GlobalTaskModeView
+            onExit={() => setShowTaskMode(false)}
+            onJumpToSession={handleJumpToGlobalTaskSession}
+            pinnedServerIds={pinnedServerIds}
+            pinnedSessionNames={pinnedTabs}
+            serverOrder={serverOrder}
+            tabOrder={tabOrder}
+          />
         </div>
       )}
 
@@ -5756,6 +11805,15 @@ export function App() {
         }}
       />
 
+      <FeatureAnnouncementHost
+        key={auth.userId}
+        userId={auth.userId}
+        sessionsLoaded={sessionsLoaded}
+        hasActiveSession={!!activeSessionInfo}
+        blockedByModal={featureAnnouncementBlocked}
+        onPendingChange={setFeatureAnnouncementsPending}
+      />
+
       <TeamDiscussionGuide
         open={showTeamDiscussionGuide}
         onDismiss={() => setTeamDiscussionGuidePref((prev) => ({ ...prev, dismissed: true }))}
@@ -5764,6 +11822,7 @@ export function App() {
       {showNewSession && (
         <NewSessionDialog
           ws={wsRef.current}
+          serverId={selectedServerId ?? ''}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
@@ -5780,16 +11839,46 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
-        const isOpen = openSubIds.has(sub.id);
-        if (!isOpen) return null;
+      {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
+        const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive && !showTaskMode;
+        const activePair = activeSplitPairRef.current?.taskId === activeSplitPairTaskId ? activeSplitPairRef.current : null;
+        const pairRole = activePair?.executorSubId === sub.id ? 'executor' : activePair?.auditorSubId === sub.id ? 'auditor' : null;
         return (
-          <div key={sub.id} style={{ display: 'contents' }}>
+          <div
+            key={`${selectedServerId ?? ''}:${sub.id}`}
+            data-subsession-retained={sub.id}
+            style={{ display: windowVisible ? 'contents' : 'none' }}
+          >
             <SubSessionWindow
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active={isMobile || focusedSubId === sub.id}
+              daemonOnline={daemonOnline}
+              onOpenRemoteDesktop={openRemoteDesktop}
+              remoteDesktopCanSetUp={!selectedShareTarget}
+              canManageFileShares={canManageServerFileShares}
+              active={windowVisible && (isMobile || focusedSubId === sub.id)}
+              visible={windowVisible}
+              showTaskPairPanel={pairRole !== 'executor'}
+              pairTaskTitle={pairRole ? activePair?.title : null}
+              pairRole={pairRole}
+              taskPairPanelVisitKey={activeSplitPairRef.current?.executorSubId === sub.id ? activeSplitPairTaskId ?? undefined : undefined}
+              onClosePairSplit={activeSplitPairTaskId && (
+                activeSplitPairRef.current?.executorSubId === sub.id
+                || activeSplitPairRef.current?.auditorSubId === sub.id
+              ) ? () => {
+                const pair = activeSplitPairRef.current;
+                if (!pair || pair.taskId !== activeSplitPairTaskId) return;
+                handlePairSplit({
+                  taskId: pair.taskId,
+                  executor: pair.executorSubId,
+                  auditor: pair.auditorSubId,
+                  action: 'close',
+                });
+              } : undefined}
+              onPendingQuestion={surfaceAskQuestionFromHistory}
+              onAskAnswer={(toolUseId, answer) => submitAskQuestionAnswer(sub.sessionName, toolUseId, answer)}
+              onViewModeChange={handleSubSessionViewModeChange}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
@@ -5811,11 +11900,22 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
-              onShareSession={openShareDialogForSession}
+              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, modelDisplay: sub.modelDisplay, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false })}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onLiveSessionStateChange={(liveState) => updateSubLocal(sub.id, {
+                state: liveState,
+                ...(liveState === 'idle'
+                  ? { authoritativeIdleAt: Date.now() }
+                  : liveState === 'running'
+                    ? { authoritativeIdleAt: undefined }
+                    : {}),
+              })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
+              onOpenLocalWebPreview={openLocalWebPreviewFromChat}
+              onCloudDocClick={openCloudDocPreview}
+              onRemoteDesktopClick={handleOpenRemoteDesktopRef}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}
@@ -5836,12 +11936,20 @@ export function App() {
               }}
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
+              onInputRef={(el) => registerComposerInputRef(sub.sessionName, el)}
+              onChatScrollFn={(fn) => {
+                subChatScrollFnsRef.current.set(sub.id, fn);
+                if (pendingSubScrollIdsRef.current.has(sub.id)) {
+                  runRegisteredSubChatScroll(sub.id, fn, true);
+                }
+              }}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
-              sessions={sessions}
+              sessions={quickDelegationSessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
+              sharedState={managedSharedSubSessionStateById.get(sub.id) ?? managedSharedSubSessionStateById.get(sub.sessionName)}
               accentColor={visibleSubSessionAccentColors.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
@@ -5850,6 +11958,10 @@ export function App() {
                 delete next[sub.sessionName];
                 return next;
               })}
+              pendingTaskQuote={matchesPendingTaskQuoteTarget(pendingTaskQuote, selectedServerId, sub.sessionName, sub.id)
+                ? { quote: pendingTaskQuote!.quote, nonce: pendingTaskQuote!.nonce }
+                : null}
+              onPendingTaskQuoteConsumed={consumePendingTaskQuote}
               onVersionSensitiveAction={runVersionSensitiveAction}
             />
           </div>
@@ -5870,26 +11982,68 @@ export function App() {
         />
       )}
 
-      {pendingQuestion && wsRef.current && (
-        <AskQuestionDialog
-          pending={pendingQuestion}
-          onSubmit={(answer) => {
-            wsRef.current?.askAnswer(pendingQuestion.sessionName, answer);
-            setPendingQuestion(null);
+      {pendingQuestion && wsRef.current && (() => {
+        const source = resolveAskQuestionSource(pendingQuestion.sessionName, sessions, subSessions);
+        return (
+          <AskQuestionDialog
+            pending={pendingQuestion}
+            sourceLabel={source.label}
+            sourceParentLabel={source.parentLabel}
+            sourceKind={source.kind}
+            onJumpToSession={() => jumpToAskQuestionSession(pendingQuestion.sessionName)}
+            onSubmit={(answer) => {
+              submitAskQuestionAnswer(pendingQuestion.sessionName, pendingQuestion.toolUseId, answer);
+            }}
+            onDismiss={() => {
+              dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
+              setPendingQuestion(null);
+            }}
+          />
+        );
+      })()}
+
+      {askAnswerFailure && (
+        <AskAnswerFailedDialog
+          failure={askAnswerFailure}
+          onSendAsMessage={(answer) => {
+            wsRef.current?.sendSessionMessage(askAnswerFailure.sessionName, answer);
+            setAskAnswerFailure(null);
           }}
-          onDismiss={() => setPendingQuestion(null)}
+          onDismiss={() => setAskAnswerFailure(null)}
         />
       )}
 
-      {serverCtxMenu && (
-        <ServerContextMenu
-          x={serverCtxMenu.x}
-          y={serverCtxMenu.y}
-          onRename={() => handleRenameServer(serverCtxMenu.server)}
-          onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
-          onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}
-          onDelete={() => setDeleteTarget(serverCtxMenu.server)}
-          onClose={() => setServerCtxMenu(null)}
+      {serverCtxMenu && (() => {
+        const isOwned = ownedServerIdsRef.current.has(serverCtxMenu.server.id);
+        return (
+          <ServerContextMenu
+            x={serverCtxMenu.x}
+            y={serverCtxMenu.y}
+            pinned={pinnedServerIds.has(serverCtxMenu.server.id)}
+            pushMuted={!effectivePushEnabledServerIdSet.has(serverCtxMenu.server.id)}
+            onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
+            onTogglePushMute={
+              isOwned
+                ? () => void handleToggleServerPushMute(serverCtxMenu.server.id)
+                : undefined
+            }
+            onRename={isOwned ? () => handleRenameServer(serverCtxMenu.server) : undefined}
+            onUpgrade={isOwned ? () => handleUpgradeDaemon(serverCtxMenu.server) : undefined}
+            onUpgradeAll={isOwned && servers.length > 1 ? handleUpgradeAll : undefined}
+            onDelete={isOwned ? () => setDeleteTarget(serverCtxMenu.server) : undefined}
+            onClose={() => setServerCtxMenu(null)}
+          />
+        );
+      })()}
+
+      {daemonUpgradeConfirmTarget && (
+        <DaemonUpgradeConfirmDialog
+          busySessions={busyDaemonSessionCount}
+          targetCount={daemonUpgradeConfirmTarget === 'all' ? servers.length : 1}
+          blockedReason={daemonUpgradeConfirmTarget === 'all' ? null : daemonUpgradeConfirmBlocked.reason}
+          blockedSessionNames={daemonUpgradeConfirmBlocked.sessionNames}
+          onCancel={() => setDaemonUpgradeConfirmTarget(null)}
+          onConfirm={() => void confirmDaemonUpgrade()}
         />
       )}
 
@@ -5901,28 +12055,61 @@ export function App() {
         />
       )}
 
-      {showSubDialog && !selectedShareTarget && (
+      {showSubDialog && canCreateSubSession && (
         <StartSubSessionDialog
           ws={wsRef.current}
+          serverId={selectedServerId ?? undefined}
           defaultCwd={activeSessionInfo?.projectDir}
+          allowedAgentTypes={poolAddTarget ? getSupportedSupervisionBackendOptions() : undefined}
+          overlayClassName={poolAddTarget ? 'session-settings-child-overlay' : undefined}
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
           refreshSessions={refreshSessions}
           onToast={showSuccessToast}
           onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
-            const sub = await createSubSession(type, shellBin, cwd, label, extra);
-            if (sub) {
-              setOpenSubIds((prev) => new Set([...prev, sub.id]));
-              bringSubToFront(sub.id);
+            setPoolAddTarget(null);
+            const { launchCount, ...cleanExtra } = extra ?? {};
+            const count = typeof launchCount === 'number' && launchCount > 1 ? launchCount : 1;
+            const effectiveParent = (cleanExtra.parentSession as string | undefined)
+              ?? activeSession
+              ?? canonicalSharedSessionName
+              ?? undefined;
+            // A single launch keeps the existing auto-generated label exactly as
+            // before (create() derives it). A multi-launch pre-computes every
+            // label up front instead of relying on create()'s own duplicate-label
+            // suffixing, which reads subSessions from this closure and would see
+            // the SAME stale list (and mint the SAME suffix) for every iteration.
+            const siblings = subSessions.filter((s) => s.parentSession === (effectiveParent ?? null));
+            const iterationLabels = computeAutoLaunchLabels(siblings, type, label, count);
+            for (let i = 0; i < iterationLabels.length; i++) {
+              const iterationLabel = iterationLabels[i];
+              let iterationExtra = cleanExtra;
+              if (effectiveParent && iterationExtra.parentSession === undefined) {
+                iterationExtra = { ...iterationExtra, parentSession: effectiveParent };
+              }
+              if (count > 1 && typeof iterationExtra.ocSessionKey === 'string' && iterationExtra.ocSessionKey) {
+                iterationExtra = { ...iterationExtra, ocSessionKey: `${iterationExtra.ocSessionKey}-${i + 1}` };
+              }
+              const passedExtra = Object.keys(iterationExtra).length > 0 ? iterationExtra : undefined;
+              const sub = await createSubSession(type, shellBin, cwd, iterationLabel, passedExtra);
+              if (sub) {
+                setOpenSubIds((prev) => new Set([...prev, sub.id]));
+                bringSubToFront(sub.id);
+              }
             }
           }}
-          onClose={() => setShowSubDialog(false)}
+          onClose={() => {
+            setShowSubDialog(false);
+            setPoolAddTarget(null);
+          }}
         />
       )}
 
-      {settingsTarget && selectedServerId && (
+      {settingsTarget && selectedServerId && (() => {
+        return (
         <SessionSettingsDialog
+          surface={settingsTarget.openIntent?.surface === 'supervision' ? 'supervision' : 'session'}
           serverId={selectedServerId}
           sessionName={settingsTarget.sessionName}
           subSessionId={settingsTarget.subId}
@@ -5931,7 +12118,23 @@ export function App() {
           cwd={settingsTarget.cwd}
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
+          canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
           transportConfig={settingsTarget.transportConfig}
+          supervisionMode={settingsTarget.supervisionMode}
+          sessionInstanceId={settingsTarget.sessionInstanceId}
+          runtimeEpoch={settingsTarget.runtimeEpoch}
+          activeModel={settingsTarget.activeModel}
+          requestedModel={settingsTarget.requestedModel}
+          modelDisplay={settingsTarget.modelDisplay}
+          providerId={settingsTarget.providerId}
+          projectKey={settingsIdentityProjectKey(settingsTarget, sessions, subSessions)}
+          peerAuditSessions={peerAuditSettingsSessions}
+          poolSessionDialogOpen={poolAddTarget != null}
+          onAddPoolSession={canCreateSubSession ? (pool) => {
+            setPoolAddTarget(pool);
+            setShowSubDialog(true);
+          } : undefined}
+          openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {
@@ -5944,6 +12147,9 @@ export function App() {
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
                 transportConfig: fields.transportConfig !== undefined ? fields.transportConfig : undefined,
+                requestedModel: fields.requestedModel,
+                activeModel: fields.activeModel,
+                modelDisplay: fields.modelDisplay,
               });
             } else {
               // Main session: update sessions list with saved fields
@@ -5953,17 +12159,25 @@ export function App() {
                 if (fields.type !== undefined) {
                   updated.agentType = fields.type;
                   updated.runtimeType = getSessionRuntimeType(fields.type);
+                  if (fields.type !== s.agentType) delete updated.qwenModel;
                 }
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
                 if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 if (fields.transportConfig !== undefined) updated.transportConfig = fields.transportConfig;
+                if (fields.requestedModel === null) delete updated.requestedModel;
+                else if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
+                if (fields.activeModel === null) delete updated.activeModel;
+                else if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
+                if (fields.modelDisplay === null) delete updated.modelDisplay;
+                else if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
                 return updated;
               }));
             }
           }}
         />
-      )}
+        );
+      })()}
 
       {cloneSessionTarget && selectedServerId && (
         <CloneSessionGroupDialog
@@ -5976,6 +12190,20 @@ export function App() {
         />
       )}
 
+      {pendingSharedPayload && (
+        <ShareTargetModal
+          payload={pendingSharedPayload}
+          servers={orderedServers.map((s) => ({ id: s.id, name: s.name }))}
+          selectedServerId={selectedServerId}
+          sessions={visibleMainSessions}
+          activeSession={activeSession}
+          sessionsLoading={!sessionsLoaded && visibleMainSessions.length === 0 && Boolean(selectedServerId)}
+          onSelectServer={handleSelectServerForShare}
+          onSelectSession={handleConfirmShareTargetSession}
+          onClose={() => handleDismissSharedPayload(pendingSharedPayload.id)}
+        />
+      )}
+
       {appUpdateNotice?.required && !appUpdateNotice.blocking && !appUpdateNotice.dismissed && (
         <div
           role="status"
@@ -5985,7 +12213,7 @@ export function App() {
             right: 16,
             bottom: 16,
             zIndex: 10050,
-            width: 'min(360px, calc(100vw - 32px))',
+            width: 'min(360px, calc(var(--imcodes-ui-vw, 100vw) - 32px))',
             background: '#0f172a',
             border: '1px solid #38bdf8',
             borderRadius: 10,
@@ -6019,6 +12247,9 @@ export function App() {
           style={{
             position: 'fixed',
             inset: 0,
+            width: 'var(--imcodes-ui-vw, 100%)',
+            height: 'var(--vvh, var(--imcodes-ui-dvh))',
+            boxSizing: 'border-box',
             zIndex: 10060,
             background: 'rgba(2, 6, 23, 0.72)',
             display: 'flex',
@@ -6068,6 +12299,93 @@ export function App() {
         </div>
       )}
 
+      <DownloadTransferCenter />
+
+      <CapabilityOperationNotice serverId={selectedServerId} />
+
+      <RemoteDesktopWindowBlockedNotice />
+
+      <CloudDocsWindowBlockedNotice />
+
+      <NewDevicePushPrompt
+        server={activeNewDevicePushPrompt}
+        busy={newDevicePushSaving}
+        onEnable={() => void handleRespondToNewDevicePushPrompt('enable')}
+        onKeepMuted={() => void handleRespondToNewDevicePushPrompt('mute')}
+        onDismiss={() => void handleRespondToNewDevicePushPrompt('dismiss')}
+      />
+
+      {(() => {
+        const isAllowedWatermarkTarget =
+          serverSwitchWatermark?.switchKind === 'server'
+          || selectedShareTarget === null
+          || selectedShareTarget.kind === 'server';
+        const isPendingSharedTarget =
+          serverSwitchWatermark !== null
+          && serverSwitchWatermark.switchKind === 'server'
+          && Boolean(
+            serverSwitchWatermark.sharedEntryId
+            && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
+          );
+        const watermarkTargetMatches =
+          serverSwitchWatermark !== null
+          && !manualDashboard
+          && isAllowedWatermarkTarget
+          && selectedServerId === serverSwitchWatermark.serverId
+          && !isPendingSharedTarget;
+        const isPendingSharedWatermark =
+          isPendingSharedTarget
+          && (manualDashboard || selectedServerId !== serverSwitchWatermark.serverId);
+        const watermarkSessionName = watermarkTargetMatches
+          ? (serverSwitchWatermark.sessionName !== undefined
+            ? serverSwitchWatermark.sessionName
+            : (activeSessionInfo
+              ? (activeSessionInfo.label || activeSessionInfo.project || activeSessionInfo.name)
+              : null))
+          : null;
+        const watermarkFallbackLabel = watermarkTargetMatches && !watermarkSessionName && !activeSessionInfo
+          ? (sessionsLoaded
+            ? trans('session.no_session', { defaultValue: 'No session' })
+            : trans('common.loading', { defaultValue: 'Loading…' }))
+          : isPendingSharedWatermark
+            ? trans('common.loading', { defaultValue: 'Loading…' })
+            : null;
+        const mobileSwipeTargetInputRef = {
+          current: {
+            servers: unifiedServers,
+            currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerId,
+            hasActiveShareTarget: selectedShareTarget !== null,
+            tabs: orderedVisibleMainSessions,
+            activeSession,
+            selectedServerId,
+            manualDashboard,
+          },
+        };
+        return (
+          <>
+            {isMobile && (
+              <MobileSwipeHudOverlay
+                ref={mobileSwipeHudRef}
+                navInputRef={mobileSwipeTargetInputRef}
+              />
+            )}
+            <ServerSwitchWatermark
+              visible={serverSwitchWatermark !== null}
+              triggerKey={serverSwitchWatermark?.nonce ?? 0}
+              serverName={serverSwitchWatermark?.serverName ?? ''}
+              sessionName={watermarkSessionName}
+              switchKind={serverSwitchWatermark?.switchKind}
+              fallbackLabel={watermarkFallbackLabel}
+              shortcutKeycaps={serverSwitchWatermark?.shortcutKeycaps}
+              onDismiss={dismissServerSwitchWatermark}
+            />
+          </>
+        );
+      })()}
+
+      {/* First-install native UI scale onboarding card */}
+      <UiScaleOnboardingCard />
+
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (
         <div class="toast-container">
@@ -6101,7 +12419,7 @@ export function App() {
                 setToasts((prev) => prev.filter((x) => x.id !== t.id));
               }}
             >
-              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : '✓'}</span>
+              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : t.kind === 'error' ? '⚠' : '✓'}</span>
               <span class="toast-body">
                 {t.kind === 'idle' ? (
                   <><strong>{t.project}</strong> {trans('toast.finished')}</>
@@ -6117,5 +12435,6 @@ export function App() {
         </div>
       )}
     </div>
+    </NodeGroupsNavContext.Provider>
   );
 }

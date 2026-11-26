@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { markSessionRunningIfNeeded } from '../src/session-state-updates.js';
+import { markSessionRunningIfNeeded, replaceAtIfChanged, updateSessionIfChanged } from '../src/session-state-updates.js';
 import type { SessionInfo } from '../src/types.js';
 
 function makeSession(name: string, state: SessionInfo['state']): SessionInfo {
@@ -37,5 +37,47 @@ describe('session state update helpers', () => {
     expect(result).not.toBe(sessions);
     expect(result[0]).toEqual({ ...idle, state: 'running' });
     expect(result[1]).toBe(other);
+  });
+});
+
+
+describe('updateSessionIfChanged (frames that repeat the record must not re-render the app)', () => {
+  it('returns the SAME array when the rebuilt session equals the current one', () => {
+    const sessions = [makeSession('a', 'idle'), makeSession('b', 'running')];
+    expect(updateSessionIfChanged(sessions, 'a', (s) => ({ ...s, state: 'idle' }))).toBe(sessions);
+    expect(updateSessionIfChanged(sessions, 'missing', (s) => ({ ...s, state: 'idle' }))).toBe(sessions);
+  });
+
+  it('treats an equal-but-new queue snapshot (fresh arrays/objects) as unchanged', () => {
+    const sessions = [{ ...makeSession('a', 'running'), transportPendingMessages: ['x'], transportPendingMessageEntries: [{ clientMessageId: 'c1', text: 'x' }] } as SessionInfo];
+    const same = updateSessionIfChanged(sessions, 'a', (s) => ({
+      ...s, state: 'running',
+      transportPendingMessages: ['x'],
+      transportPendingMessageEntries: [{ clientMessageId: 'c1', text: 'x' }],
+    } as SessionInfo));
+    expect(same).toBe(sessions);
+  });
+
+  // Counterexample: a real change still produces a new array and a new record for ONLY that session.
+  it('a real change replaces only that session and leaves siblings identical', () => {
+    const sessions = [makeSession('a', 'idle'), makeSession('b', 'idle')];
+    const next = updateSessionIfChanged(sessions, 'a', (s) => ({ ...s, state: 'running' }));
+    expect(next).not.toBe(sessions);
+    expect(next[0]!.state).toBe('running');
+    expect(next[1]).toBe(sessions[1]);
+    const queued = updateSessionIfChanged(next, 'a', (s) => ({ ...s, transportPendingMessages: ['hello'] } as SessionInfo));
+    expect(queued).not.toBe(next);
+    expect((queued[0] as SessionInfo & { transportPendingMessages?: string[] }).transportPendingMessages).toEqual(['hello']);
+  });
+});
+
+describe('replaceAtIfChanged', () => {
+  it('keeps the list when the replacement is structurally equal, replaces one slot otherwise', () => {
+    const list = [{ id: 1, state: 'idle', queue: ['a'] }, { id: 2, state: 'idle', queue: [] as string[] }];
+    expect(replaceAtIfChanged(list, 0, { id: 1, state: 'idle', queue: ['a'] })).toBe(list);
+    const next = replaceAtIfChanged(list, 0, { id: 1, state: 'running', queue: ['a'] });
+    expect(next).not.toBe(list);
+    expect(next[0]!.state).toBe('running');
+    expect(next[1]).toBe(list[1]);
   });
 });

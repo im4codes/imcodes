@@ -1,0 +1,65 @@
+{
+  "conversation_id": "",
+  "status": "SUCCESS",
+  "response": "Gemini Models\tWeekly Limit Remaining\t98%\t2026-10-17T16:14:37Z\nGemini Models\tFive Hour Limit Remaining\t99%\t2026-10-11T07:51:00Z\nClaude and GPT models\tWeekly Limit Remaining\t84%\t2026-10-17T16:16:37Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-10-11T07:57:08Z\n",
+  "duration_seconds": 0,
+  "num_turns": 0,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "thinking_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_tokens": 0
+  },
+  "command": {
+    "name": "usage",
+    "data": {
+      "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens.",
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "description": "Models within this group: Gemini Flash, Gemini Pro",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "name": "Weekly Limit Remaining",
+              "description": "You have used some of your weekly limit, it will fully refresh in 6 days, 13 hours.",
+              "window": "weekly",
+              "remaining_fraction": 0.9770231246948242,
+              "reset_time": "2026-10-17T16:14:37Z"
+            },
+            {
+              "id": "gemini-5h",
+              "name": "Five Hour Limit Remaining",
+              "description": "You have used some of your 5-hour limit, it will fully refresh in 4 hours, 53 minutes.",
+              "window": "5h",
+              "remaining_fraction": 0.9898775219917297,
+              "reset_time": "2026-10-11T07:51:00Z"
+            }
+          ]
+        },
+        {
+          "name": "Claude and GPT models",
+          "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+          "buckets": [
+            {
+              "id": "3p-weekly",
+              "name": "Weekly Limit Remaining",
+              "description": "You have used some of your weekly limit, it will fully refresh in 6 days, 13 hours.",
+              "window": "weekly",
+              "remaining_fraction": 0.8424968123435974,
+              "reset_time": "2026-10-17T16:16:37Z"
+            },
+            {
+              "id": "3p-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 1,
+              "reset_time": "2026-10-11T07:57:08Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

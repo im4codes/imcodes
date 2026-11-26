@@ -7,7 +7,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
-import { CRON_STATUS } from '../../shared/cron-types.js';
+import { CRON_COMPLETION_POLICY, CRON_CONTROL_CONTRACT, CRON_STATUS } from '../../shared/cron-types.js';
+import { CLIENT_TIMEZONE_PREF_KEY } from '../../shared/client-timezone.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -15,6 +16,8 @@ import { CRON_STATUS } from '../../shared/cron-types.js';
 // Mock resolveServerRole to be controllable per-test.
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
+const mockResolveHttpShareAccessForCoveredSession = vi.fn();
+let mockServerOwnerUserId = 'user-1';
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (k: string, v: string) => void }, next: () => Promise<void>) => {
@@ -27,6 +30,7 @@ vi.mock('../src/security/authorization.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
 vi.mock('../src/security/audit.js', () => ({
@@ -50,7 +54,26 @@ interface MockRow {
 
 function makeMockDb() {
   const cronJobs = new Map<string, MockRow>();
+  const cronProvenance = new Map<string, MockRow>();
+  const users = new Map<string, MockRow>();
+  const sharedShares: MockRow[] = [];
   const cronExecutions: MockRow[] = [];
+  const userPrefs = new Map<string, string>();
+
+  function enrichCreatorMetadata<T extends MockRow>(row: T, jobRef?: MockRow): T {
+    const jobId = String(jobRef?.id ?? row.job_id ?? row.id ?? '');
+    const prov = cronProvenance.get(jobId);
+    const creatorUserId = String(prov?.creator_user_id ?? jobRef?.user_id ?? row.user_id ?? '');
+    const user = users.get(creatorUserId);
+    const displayName = typeof user?.display_name === 'string' && user.display_name.trim() ? user.display_name.trim() : null;
+    const username = typeof user?.username === 'string' && user.username.trim() ? user.username.trim() : null;
+    return {
+      ...row,
+      creator_user_id: creatorUserId || null,
+      creator_name: displayName ?? username ?? null,
+      creator_is_shared: Boolean(prov?.shared),
+    };
+  }
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -60,24 +83,70 @@ function makeMockDb() {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
       const s = normalize(sql);
 
-      if (s.includes('from cron_jobs where id') && s.includes('user_id')) {
+      if (s.includes('from cron_job_provenance where job_id')) {
+        return (cronProvenance.get(params[0] as string) ?? null) as T | null;
+      }
+
+      if (s.includes('from cron_jobs where id')) {
         const job = cronJobs.get(params[0] as string);
-        if (job && job.user_id === params[1]) return job as T;
+        if (job && (!s.includes('user_id') || job.user_id === params[1])) return job as T;
         return null;
+      }
+
+      if (s.includes('from servers where id')) {
+        return { user_id: mockServerOwnerUserId } as T;
+      }
+
+      if (s.includes('project_name') && s.includes('from sessions')) {
+        return { project_name: 'myapp', role: 'brain' } as T;
+      }
+
+      if (s.includes('from sub_sessions where id')) {
+        if (params[0] === 'nonexistent') return null;
+        return {
+          id: params[0],
+          server_id: params[1],
+          parent_session: 'deck_myapp_brain',
+          closed_at: null,
+          execution_clone_metadata: null,
+        } as T;
+      }
+
+      if (s.includes('from user_preferences where user_id')) {
+        const value = userPrefs.get(`${String(params[0])}:${String(params[1])}`);
+        return (value === undefined ? null : { value }) as T | null;
       }
 
       return null;
     },
 
-    query: async <T = unknown>(sql: string, _params: unknown[] = []): Promise<T[]> => {
+    query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
       const s = normalize(sql);
 
+      if (s.includes('from server_shares') || s.includes('from session_shares') || s.includes('from sub_session_shares')) {
+        const targetUserId = params[1];
+        return sharedShares.filter((share) => share.target_user_id === targetUserId) as T[];
+      }
+
       if (s.includes('from cron_jobs')) {
-        return Array.from(cronJobs.values()) as T[];
+        return Array.from(cronJobs.values())
+          .filter((job) => (
+            job.user_id === params[0]
+            && (params[1] == null || job.server_id === params[1])
+            && (params[2] == null || job.project_name === params[2])
+          ))
+          .map((job) => (s.includes('left join cron_job_provenance') ? enrichCreatorMetadata(job) : job)) as T[];
+      }
+
+      if (s.includes('from sub_sessions where server_id')) {
+        return [] as T[];
       }
 
       if (s.includes('from cron_executions')) {
-        return cronExecutions as T[];
+        return cronExecutions.map((exec) => {
+          const job = cronJobs.get(String(exec.job_id ?? ''));
+          return s.includes('left join cron_job_provenance') ? enrichCreatorMetadata(exec, job) : exec;
+        }) as T[];
       }
 
       return [] as T[];
@@ -101,26 +170,51 @@ function makeMockDb() {
           status: params[10],
           next_run_at: params[11],
           expires_at: params[12],
-          created_at: params[13],
-          updated_at: params[13],
+          completion_policy: params[13],
+          created_at: params[14],
+          updated_at: params[14],
           last_run_at: null,
         });
       }
 
       if (s.includes('update cron_jobs set')) {
-        // Find the job and update its fields (simplified — just updates status for the
-        // PATCH and marks updated_at)
         const idIdx = params.length - 1;
         const jobId = params[idIdx] as string;
         const job = cronJobs.get(jobId);
         if (job) {
-          // For PATCH status updates, status is $1 and updated_at is $2
           if (s.includes('set status =')) {
             job.status = params[0];
             job.updated_at = params[1];
+          } else {
+            const setMatch = s.match(/set (.*?) where/);
+            if (setMatch) {
+              const clauses = setMatch[1].split(',').map((c) => c.trim());
+              clauses.forEach((clause) => {
+                const m = clause.match(/^([a-z_]+)\s*=\s*\$(\d+)$/);
+                if (m) {
+                  const col = m[1];
+                  const pIdx = parseInt(m[2], 10) - 1;
+                  job[col] = params[pIdx];
+                }
+              });
+            }
           }
           cronJobs.set(jobId, job);
         }
+      }
+
+      if (s.includes('insert into cron_job_provenance')) {
+        cronProvenance.set(params[0] as string, {
+          job_id: params[0],
+          creator_user_id: params[1],
+          server_id: params[2],
+          project_name: params[3],
+          shared: s.includes('true') ? true : Boolean(params[4]),
+        });
+      }
+
+      if (s.includes('delete from cron_job_provenance')) {
+        cronProvenance.delete(params[0] as string);
       }
 
       if (s.includes('delete from cron_jobs')) {
@@ -131,6 +225,10 @@ function makeMockDb() {
         // no-op
       }
 
+      if (s.includes('insert into user_preferences')) {
+        userPrefs.set(`${String(params[0])}:${String(params[1])}`, String(params[2]));
+      }
+
       return { changes: 1 };
     },
 
@@ -138,7 +236,7 @@ function makeMockDb() {
     close: async () => {},
   } as unknown as Database;
 
-  return { db, cronJobs, cronExecutions };
+  return { db, cronJobs, cronProvenance, users, sharedShares, cronExecutions, userPrefs };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -175,16 +273,20 @@ async function buildTestApp(env: Env) {
   });
 
   app.route('/api/cron', cronApiRoutes);
+  app.route('/api/server/:serverId/cron', cronApiRoutes);
   return app;
 }
 
-function jsonReq(method: string, path: string, body?: unknown): RequestInit {
+function jsonReq(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): RequestInit {
   return {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   };
 }
+
+/** What the daemon presents: its server token plus the server it belongs to. (Auth itself is mocked in this file; cron-api-auth.test.ts runs the real middleware.) */
+const DAEMON_AUTH = { Authorization: 'Bearer server-token', 'X-Server-Id': 'srv-1' };
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -195,6 +297,11 @@ describe('Cron API routes', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockServerOwnerUserId = 'user-1';
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'none', effectiveActorRole: 'none' },
+    });
     mockResolveServerMemberAccessOrShareDeny.mockImplementation(async () => {
       const role = await mockResolveServerRole();
       return role === 'none'
@@ -225,7 +332,39 @@ describe('Cron API routes', () => {
       expect(body.name).toBe('Daily report');
       expect(body.status).toBe(CRON_STATUS.ACTIVE);
       expect(body.nextRunAt).toBeTypeOf('number');
-      expect(body.action).toEqual({ type: 'command', command: '/status' });
+      expect(body.action).toEqual({ type: 'command', command: '/status', onlyWhenIdle: true });
+      expect(body.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
+    });
+
+    it('preserves the self-managed command marker used by MCP lifecycle prompts', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        action: { type: 'command', command: 'check progress', selfManaged: true },
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.action).toEqual({
+        type: 'command', command: 'check progress', selfManaged: true, onlyWhenIdle: true,
+        cronControl: {
+          contractId: CRON_CONTROL_CONTRACT.contractId,
+          version: CRON_CONTROL_CONTRACT.version,
+          scheduleId: 'cron-id-2',
+          constraints: CRON_CONTROL_CONTRACT.constraints,
+        },
+      });
+    });
+
+    it('persists an explicit until-complete lifecycle policy', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.completionPolicy).toBe(CRON_COMPLETION_POLICY.UNTIL_COMPLETE);
+      expect(Array.from(mockDb.cronJobs.values())[0]?.completion_policy).toBe(
+        CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      );
     });
 
     it('rejects share-only server-scoped cron creation with the direct-surface reason', async () => {
@@ -239,6 +378,90 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(403);
       await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
       expect(mockDb.cronJobs.size).toBe(0);
+    });
+
+    it('lets a covered participant create only in the shared owner project', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+
+      const res = await app.request(
+        '/api/cron?sessionName=deck_myapp_brain',
+        jsonReq('POST', '', { ...validCommandBody, projectName: 'attacker-project' }),
+      );
+
+      expect(res.status).toBe(201);
+      const stored = Array.from(mockDb.cronJobs.values())[0];
+      expect(stored?.user_id).toBe('owner-1');
+      expect(stored?.project_name).toBe('myapp');
+    });
+
+    it('keeps covered viewers read-only', async () => {
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+
+      const res = await app.request(
+        '/api/cron?sessionName=deck_myapp_brain',
+        jsonReq('POST', '', validCommandBody),
+      );
+
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    });
+
+    it('does not let a direct sub-session share create a job for another sub-session or bare role', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+
+      const otherRes = await app.request(
+        '/api/cron?sessionName=deck_sub_shared',
+        jsonReq('POST', '', { ...validCommandBody, targetSessionName: 'deck_sub_other' }),
+      );
+      expect(otherRes.status).toBe(403);
+      await expect(otherRes.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+
+      const bareRoleRes = await app.request(
+        '/api/cron?sessionName=deck_sub_shared',
+        jsonReq('POST', '', { ...validCommandBody }),
+      );
+      expect(bareRoleRes.status).toBe(403);
+
+      const ownRes = await app.request(
+        '/api/cron?sessionName=deck_sub_shared',
+        jsonReq('POST', '', { ...validCommandBody, targetSessionName: 'deck_sub_shared' }),
+      );
+      expect(ownRes.status).toBe(201);
+      const stored = Array.from(mockDb.cronJobs.values())[0];
+      expect(stored?.user_id).toBe('owner-1');
+      expect(stored?.project_name).toBe('myapp');
+      expect(stored?.target_session_name).toBe('deck_sub_shared');
+    });
+
+    it('does not let a direct sub-session share create a job for a sub-session outside the project', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+
+      const res = await app.request(
+        '/api/cron?sessionName=deck_sub_shared',
+        jsonReq('POST', '', { ...validCommandBody, targetSessionName: 'deck_sub_nonexistent' }),
+      );
+
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
     });
 
     it('accepts a null targetSessionName for main-session cron jobs', async () => {
@@ -262,7 +485,7 @@ describe('Cron API routes', () => {
       }));
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, any>;
-      expect(body.action).toEqual({ type: 'command', command: longCommand });
+      expect(body.action).toEqual({ type: 'command', command: longCommand, onlyWhenIdle: true });
     });
 
     it('command action missing `command` field returns 400', async () => {
@@ -294,6 +517,67 @@ describe('Cron API routes', () => {
       const body = await res.json() as Record<string, unknown>;
       expect(body.error).toBe('cron_interval_too_short');
       expect(body.minIntervalMinutes).toBe(5);
+    });
+
+    it('enforces substantive shortIntervalReason for <20m agent crons while allowing justified <20m/<30m, >=20m, and human >=5m crons', async () => {
+      // < 5m stays hard-blocked even with a valid shortIntervalReason.
+      const subFiveWithReason = await app.request('/api/server/srv-1/cron', jsonReq('POST', '', {
+        ...validCommandBody,
+        cronExpr: '*/4 * * * *',
+        shortIntervalReason: 'User requested rapid 4m monitoring check during rollout',
+      }, DAEMON_AUTH));
+      expect(subFiveWithReason.status).toBe(400);
+      await expect(subFiveWithReason.json()).resolves.toMatchObject({
+        error: 'cron_interval_too_short',
+        minIntervalMinutes: 5,
+      });
+
+      // Agent <20m without reason or with blank/whitespace-only reason is rejected with 400 cron_short_interval_reason_required.
+      for (const expr of ['*/5 * * * *', '*/15 * * * *']) {
+        for (const badReason of [undefined, '', '   \n\t  ']) {
+          const rejected = await app.request('/api/server/srv-1/cron', jsonReq('POST', '', {
+            ...validCommandBody,
+            cronExpr: expr,
+            ...(badReason !== undefined ? { shortIntervalReason: badReason } : {}),
+          }, DAEMON_AUTH));
+          expect(rejected.status, `${expr} / ${String(badReason)}`).toBe(400);
+          await expect(rejected.json()).resolves.toMatchObject({
+            error: 'cron_short_interval_reason_required',
+            thresholdMinutes: 20,
+          });
+        }
+      }
+
+      // Any non-empty shortIntervalReason (including short text / CJK) is accepted without content/length heuristics.
+      for (const [justifiedExpr, reason] of [
+        ['*/5 * * * *', 'User requested 5m deployment health checks until rollout finishes'],
+        ['*/10 * * * *', '发布期盯盘'],
+      ] as const) {
+        const allowed = await app.request('/api/server/srv-1/cron', jsonReq('POST', '', {
+          ...validCommandBody,
+          cronExpr: justifiedExpr,
+          completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+          shortIntervalReason: reason,
+        }, DAEMON_AUTH));
+        expect(allowed.status, `${justifiedExpr} / ${reason}`).toBe(201);
+      }
+
+      // Agent >=20m (including */20, */25, */30) succeeds with NO shortIntervalReason.
+      for (const expr of ['*/20 * * * *', '*/25 * * * *', '*/30 * * * *']) {
+        const allowed = await app.request('/api/server/srv-1/cron', jsonReq('POST', '', {
+          ...validCommandBody,
+          cronExpr: expr,
+          completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+        }, DAEMON_AUTH));
+        expect(allowed.status, expr).toBe(201);
+      }
+
+      // Human Web UI 5m cron succeeds with NO shortIntervalReason.
+      const humanShort = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        cronExpr: '*/5 * * * *',
+      }));
+      expect(humanShort.status).toBe(201);
     });
 
     it('unauthorized server returns 403', async () => {
@@ -359,6 +643,7 @@ describe('Cron API routes', () => {
         status: CRON_STATUS.ACTIVE,
         next_run_at: Date.now() + 86400000,
         expires_at: null,
+        completion_policy: CRON_COMPLETION_POLICY.RECURRING,
         created_at: Date.now(),
         updated_at: Date.now(),
         last_run_at: null,
@@ -376,6 +661,106 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(403);
       const body = await res.json() as Record<string, unknown>;
       expect(body.error).toBe('forbidden');
+    });
+
+    it('lists only the owner project covered by a shared session', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      for (const [id, owner, project] of [
+        ['visible', 'owner-1', 'myapp'],
+        ['other-project', 'owner-1', 'elsewhere'],
+        ['other-user', 'user-2', 'myapp'],
+      ]) {
+        mockDb.cronJobs.set(id, {
+          id, server_id: 'srv-1', user_id: owner, project_name: project,
+          name: id, cron_expr: '0 9 * * *', target_role: 'brain', target_session_name: null,
+          action: JSON.stringify({ type: 'command', command: '/status' }), status: 'active',
+        });
+      }
+      mockDb.cronJobs.set('other-main-role', {
+        id: 'other-main-role', server_id: 'srv-1', user_id: 'owner-1', project_name: 'myapp',
+        name: 'other-main-role', cron_expr: '0 9 * * *', target_role: 'w1', target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: '/status' }), status: 'active',
+      });
+      mockDb.cronJobs.set('cross-role-action', {
+        id: 'cross-role-action', server_id: 'srv-1', user_id: 'owner-1', project_name: 'myapp',
+        name: 'cross-role-action', cron_expr: '0 9 * * *', target_role: 'brain', target_session_name: null,
+        action: JSON.stringify({ type: 'p2p', topic: 'escape', mode: 'discuss', participants: ['w1'] }), status: 'active',
+      });
+
+      const res = await app.request('/api/cron?serverId=srv-1&projectName=forged&sessionName=deck_myapp_brain');
+      expect(res.status).toBe(200);
+      const body = await res.json() as { jobs: Array<{ id: string }> };
+      expect(body.jobs.map((job) => job.id).sort()).toEqual(['cross-role-action', 'other-main-role', 'visible'].sort());
+    });
+
+    it('lets an explicit sub-session share see ONLY jobs targeting its own sub-session', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      for (const target of ['deck_sub_shared', 'deck_sub_other', null]) {
+        const id = target ?? 'main-role';
+        mockDb.cronJobs.set(id, {
+          id, server_id: 'srv-1', user_id: 'owner-1', project_name: 'myapp', target_session_name: target,
+          name: id, cron_expr: '0 9 * * *', target_role: 'brain',
+          action: JSON.stringify({ type: 'command', command: '/status' }), status: 'active',
+        });
+      }
+
+      const res = await app.request('/api/cron?serverId=srv-1&sessionName=deck_sub_shared');
+      expect(res.status).toBe(200);
+      const body = await res.json() as { jobs: Array<{ id: string }> };
+      expect(body.jobs.map((job) => job.id)).toEqual(['deck_sub_shared']);
+    });
+
+    it('prefers whole-server viewer coverage over an older session grant across projects', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      mockDb.sharedShares.push({
+        target_kind: 'main', server_id: 'srv-1', session_name: 'deck_myapp_brain',
+        target_user_id: 'user-1', role: 'viewer', id: 'older-session-share',
+      });
+      mockDb.sharedShares.push({
+        target_kind: 'server',
+        server_id: 'srv-1',
+        target_user_id: 'user-1',
+        role: 'viewer',
+        id: 'server-share',
+      });
+      for (const [id, project, owner] of [
+        ['server-project-a', 'myapp', 'owner-1'],
+        ['server-project-b', 'elsewhere', 'owner-1'],
+        ['other-user', 'myapp', 'user-2'],
+        ['malformed', 'myapp', 'owner-1'],
+      ]) {
+        mockDb.cronJobs.set(id, {
+          id, server_id: 'srv-1', user_id: owner, project_name: project,
+          name: id, cron_expr: '0 9 * * *', target_role: 'brain', target_session_name: null,
+          action: JSON.stringify({ type: 'command', command: '/status' }), status: 'active',
+        });
+      }
+      mockDb.cronJobs.get('malformed')!.action = '{not-json';
+
+      const res = await app.request('/api/cron?serverId=srv-1');
+      expect(res.status).toBe(200);
+      const body = await res.json() as { jobs: Array<{ id: string }> };
+      expect(body.jobs.map((job) => job.id).sort()).toEqual(['server-project-a', 'server-project-b'].sort());
+
+      const filtered = await app.request('/api/cron?serverId=srv-1&projectName=elsewhere');
+      expect(filtered.status).toBe(200);
+      const filteredBody = await filtered.json() as { jobs: Array<{ id: string }> };
+      expect(filteredBody.jobs.map((job) => job.id)).toEqual(['server-project-b']);
     });
   });
 
@@ -410,6 +795,47 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json() as Record<string, unknown>;
       expect(body.ok).toBe(true);
+    });
+
+    it('lets a shared main session mutate a shared job for another main role in the same project', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+      const job = mockDb.cronJobs.get('job-active')!;
+      job.user_id = 'owner-1';
+      job.target_role = 'w1';
+      mockDb.cronProvenance.set('job-active', { job_id: 'job-active', creator_user_id: 'user-1', server_id: 'srv-1', project_name: 'myapp', shared: true });
+
+      const res = await app.request(
+        '/api/cron/job-active/status?sessionName=deck_myapp_brain',
+        jsonReq('PATCH', '', { status: CRON_STATUS.PAUSED }),
+      );
+
+      expect(res.status).toBe(200);
+      expect(job.status).toBe(CRON_STATUS.PAUSED);
+    });
+
+    it('does not let a shared session mutate a job in another project', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+      const job = mockDb.cronJobs.get('job-active')!;
+      job.user_id = 'owner-1';
+      job.project_name = 'other-project';
+
+      const res = await app.request(
+        '/api/cron/job-active/status?sessionName=deck_myapp_brain',
+        jsonReq('PATCH', '', { status: CRON_STATUS.PAUSED }),
+      );
+
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
     });
 
     it('resume expired job returns 400 cannot_resume', async () => {
@@ -501,6 +927,82 @@ describe('Cron API routes', () => {
       expect(body.ok).toBe(true);
     });
 
+    it('does not let an agent bypass force by weakening recurring to until_complete first', async () => {
+      const res = await app.request(
+        '/api/server/srv-1/cron/job-update',
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }, DAEMON_AUTH),
+      );
+      expect(res.status).toBe(409);
+      await expect(res.json()).resolves.toMatchObject({
+        error: 'cron_force_required',
+        completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+      });
+
+      const forced = await app.request(
+        '/api/server/srv-1/cron/job-update?force=true',
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }, DAEMON_AUTH),
+      );
+      expect(forced.status).toBe(200);
+    });
+
+    it('requires substantive shortIntervalReason when agent PUT updates cronExpr to <20m, while allowing metadata edits and >=20m schedules', async () => {
+      mockDb.cronJobs.set('job-short-existing', {
+        id: 'job-short-existing',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'Existing Short Job',
+        cron_expr: '*/10 * * * *',
+        project_name: 'myapp',
+        target_role: 'brain',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: Date.now() + 60000,
+        expires_at: null,
+        completion_policy: CRON_COMPLETION_POLICY.RECURRING,
+        created_at: Date.now() - 100000,
+        updated_at: Date.now(),
+        last_run_at: null,
+      });
+
+      // Shortening job-update (0 9 * * *) to */10 without reason fails.
+      const noReason = await app.request(
+        '/api/server/srv-1/cron/job-update',
+        jsonReq('PUT', '', { cronExpr: '*/10 * * * *' }, DAEMON_AUTH),
+      );
+      expect(noReason.status).toBe(400);
+      await expect(noReason.json()).resolves.toMatchObject({
+        error: 'cron_short_interval_reason_required',
+        thresholdMinutes: 20,
+      });
+
+      // Shortening to */10 WITH substantive reason succeeds.
+      const withReason = await app.request(
+        '/api/server/srv-1/cron/job-update',
+        jsonReq('PUT', '', {
+          cronExpr: '*/10 * * * *',
+          shortIntervalReason: 'User requested 10m canary health polls during deploy',
+        }, DAEMON_AUTH),
+      );
+      expect(withReason.status).toBe(200);
+
+      // Editing only name/message on an existing <20m cron requires NO shortIntervalReason.
+      const metadataOnly = await app.request(
+        '/api/server/srv-1/cron/job-short-existing',
+        jsonReq('PUT', '', {
+          name: 'Updated Name Only',
+          action: { type: 'command', command: '/new-status' },
+        }, DAEMON_AUTH),
+      );
+      expect(metadataOnly.status).toBe(200);
+
+      // Setting cronExpr to >= 20m requires NO shortIntervalReason.
+      const twentyMin = await app.request(
+        '/api/server/srv-1/cron/job-short-existing',
+        jsonReq('PUT', '', { cronExpr: '*/20 * * * *' }, DAEMON_AUTH),
+      );
+      expect(twentyMin.status).toBe(200);
+    });
+
     it('resets expired job to paused', async () => {
       mockDb.cronJobs.set('job-expired-edit', {
         id: 'job-expired-edit',
@@ -526,6 +1028,119 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json() as Record<string, unknown>;
       expect(body.ok).toBe(true);
+    });
+
+    it('allows shared participant PUT on in-scope owner job with provenance recording last modifier (anti-escalation) and clears it when owner edits', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+      const job = mockDb.cronJobs.get('job-update')!;
+      job.user_id = 'owner-1';
+
+      const participantEdit = await app.request(
+        '/api/cron/job-update?sessionName=deck_myapp_brain',
+        jsonReq('PUT', '', { name: 'Participant Edited Owner Job' }),
+      );
+      expect(participantEdit.status).toBe(200);
+      expect(job.name).toBe('Participant Edited Owner Job');
+      expect(mockDb.cronProvenance.get('job-update')).toMatchObject({ creator_user_id: 'user-1', shared: true });
+
+      mockDb.cronProvenance.set('job-update', { job_id: 'job-update', creator_user_id: 'other-part', server_id: 'srv-1', project_name: 'myapp', shared: true });
+      const res = await app.request(
+        '/api/cron/job-update?sessionName=deck_myapp_brain',
+        jsonReq('PUT', '', { name: 'Shared Updated Name', targetRole: 'w1' }),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.ok).toBe(true);
+      expect(job.name).toBe('Shared Updated Name');
+      expect(job.target_role).toBe('w1');
+      expect(mockDb.cronProvenance.get('job-update')).toMatchObject({ creator_user_id: 'user-1', shared: true });
+
+      // When the real owner edits the job back, shared provenance resets so execution uses owner authority.
+      mockServerOwnerUserId = 'user-1';
+      job.user_id = 'user-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+      const ownerEdit = await app.request(
+        '/api/cron/job-update',
+        jsonReq('PUT', '', { name: 'Owner Reclaimed Job' }),
+      );
+      expect(ownerEdit.status).toBe(200);
+      expect(job.name).toBe('Owner Reclaimed Job');
+      expect(mockDb.cronProvenance.has('job-update')).toBe(false);
+    });
+
+    it('lets a whole-server participant update a shared-provenance job without a session filter', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+      mockDb.sharedShares.push({
+        target_kind: 'server',
+        server_id: 'srv-1',
+        target_user_id: 'user-1',
+        role: 'participant',
+        id: 'server-share',
+      });
+      const job = mockDb.cronJobs.get('job-update')!;
+      job.user_id = 'owner-1';
+      mockDb.cronProvenance.set('job-update', { job_id: 'job-update', creator_user_id: 'user-1', server_id: 'srv-1', project_name: 'myapp', shared: true });
+
+      const res = await app.request(
+        '/api/cron/job-update',
+        jsonReq('PUT', '', { name: 'Whole Server Updated Name' }),
+      );
+      expect(res.status).toBe(200);
+      expect(job.name).toBe('Whole Server Updated Name');
+    });
+
+    it('keeps covered viewers read-only on update', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      const job = mockDb.cronJobs.get('job-update')!;
+      job.user_id = 'owner-1';
+
+      const res = await app.request(
+        '/api/cron/job-update?sessionName=deck_myapp_brain',
+        jsonReq('PUT', '', { name: 'Viewer Renamed' }),
+      );
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    });
+
+    it('keeps whole-server viewers read-only on update', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      mockDb.sharedShares.push({
+        target_kind: 'server',
+        server_id: 'srv-1',
+        target_user_id: 'user-1',
+        role: 'viewer',
+        id: 'server-share',
+      });
+      const job = mockDb.cronJobs.get('job-update')!;
+      job.user_id = 'owner-1';
+
+      const res = await app.request(
+        '/api/cron/job-update',
+        jsonReq('PUT', '', { name: 'Viewer Whole Server Rename' }),
+      );
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+      expect(job.name).toBe('Original Name');
     });
   });
 
@@ -557,6 +1172,120 @@ describe('Cron API routes', () => {
       // Verify job was removed
       expect(mockDb.cronJobs.has('job-delete')).toBe(false);
     });
+
+    it('blocks daemon deletion of recurring and legacy jobs unless force=true', async () => {
+      for (const [id, completionPolicy] of [
+        ['recurring-job', CRON_COMPLETION_POLICY.RECURRING],
+        ['legacy-job', undefined],
+      ] as const) {
+        mockDb.cronJobs.set(id, {
+          id,
+          server_id: 'srv-1',
+          user_id: 'user-1',
+          completion_policy: completionPolicy,
+        });
+
+        const blocked = await app.request(`/api/server/srv-1/cron/${id}`, { method: 'DELETE', headers: DAEMON_AUTH });
+        expect(blocked.status).toBe(409);
+        await expect(blocked.json()).resolves.toMatchObject({
+          error: 'cron_force_required',
+          completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+        });
+        expect(mockDb.cronJobs.has(id)).toBe(true);
+
+        const forced = await app.request(`/api/server/srv-1/cron/${id}?force=true`, { method: 'DELETE', headers: DAEMON_AUTH });
+        expect(forced.status).toBe(200);
+        expect(mockDb.cronJobs.has(id)).toBe(false);
+      }
+    });
+
+    it('lets an until-complete job self-cancel without force', async () => {
+      mockDb.cronJobs.set('bounded-job', {
+        id: 'bounded-job',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        completion_policy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      });
+
+      const res = await app.request('/api/server/srv-1/cron/bounded-job', { method: 'DELETE' });
+      expect(res.status).toBe(200);
+      expect(mockDb.cronJobs.has('bounded-job')).toBe(false);
+    });
+
+    it('lets a shared participant delete any in-scope job (including owner-created) while blocking out-of-scope deletes', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant' },
+      });
+      mockDb.cronJobs.set('shared-job-delete', {
+        id: 'shared-job-delete',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'Owner In-Scope To Delete',
+        cron_expr: '0 9 * * *',
+        project_name: 'myapp',
+        target_role: 'w1',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: Date.now() + 86400000,
+        expires_at: null,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_run_at: null,
+      });
+      mockDb.cronJobs.set('out-of-scope-delete', {
+        id: 'out-of-scope-delete',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'Other Project To Keep',
+        cron_expr: '0 9 * * *',
+        project_name: 'other_proj',
+        target_role: 'brain',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: Date.now() + 86400000,
+        expires_at: null,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_run_at: null,
+      });
+
+      const denied = await app.request('/api/cron/out-of-scope-delete?sessionName=deck_myapp_brain', { method: 'DELETE' });
+      expect(denied.status).toBe(403);
+      await expect(denied.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+      expect(mockDb.cronJobs.has('out-of-scope-delete')).toBe(true);
+
+      const allowedOwnerJob = await app.request('/api/cron/shared-job-delete?sessionName=deck_myapp_brain', { method: 'DELETE' });
+      expect(allowedOwnerJob.status).toBe(200);
+      expect(mockDb.cronJobs.has('shared-job-delete')).toBe(false);
+    });
+
+    it('keeps covered viewers read-only on delete', async () => {
+      mockServerOwnerUserId = 'owner-1';
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      mockDb.cronJobs.set('shared-job-delete-viewer', {
+        id: 'shared-job-delete-viewer',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'Shared To Delete',
+        cron_expr: '0 9 * * *',
+        project_name: 'myapp',
+        target_role: 'w1',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+      });
+
+      const res = await app.request('/api/cron/shared-job-delete-viewer?sessionName=deck_myapp_brain', { method: 'DELETE' });
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+      expect(mockDb.cronJobs.has('shared-job-delete-viewer')).toBe(true);
+    });
   });
 
   // ── GET /api/cron/:id/executions ─────────────────────────────────────────
@@ -584,13 +1313,20 @@ describe('Cron API routes', () => {
       // Seed executions
       mockDb.cronExecutions.push(
         { id: 'exec-1', job_id: 'job-exec', status: 'ok', detail: null, created_at: Date.now() - 5000 },
-        { id: 'exec-2', job_id: 'job-exec', status: 'error', detail: 'timeout', created_at: Date.now() },
+        {
+          id: 'exec-2',
+          job_id: 'job-exec',
+          status: 'error',
+          detail: ['execution', 'execution result', 'execution result is', 'execution result is a', 'execution result is a timeout'].join('\n'),
+          created_at: Date.now(),
+        },
       );
 
       const res = await app.request('/api/cron/job-exec/executions', { method: 'GET' });
       expect(res.status).toBe(200);
-      const body = await res.json() as { executions: unknown[] };
+      const body = await res.json() as { executions: Array<{ id: string; detail: string | null }> };
       expect(body.executions).toHaveLength(2);
+      expect(body.executions.find((execution) => execution.id === 'exec-2')?.detail).toBe('execution result is a timeout');
     });
 
     it('returns 403 when resolveServerRole is none', async () => {
@@ -702,6 +1438,68 @@ describe('Cron API routes', () => {
   // ── Timezone support ──────────────────────────────────────────────────
 
   describe('POST /api/cron (timezone)', () => {
+    it('defaults new browser and app jobs to the client device timezone header', async () => {
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'device-tz-create',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-client-timezone': 'Asia/Tokyo',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('Asia/Tokyo');
+      expect(mockDb.userPrefs.get(`user-1:${CLIENT_TIMEZONE_PREF_KEY}`)).toBe(JSON.stringify('Asia/Tokyo'));
+    });
+
+    it('uses the last browser or app timezone for an agent MCP create before daemon device fallback', async () => {
+      mockDb.userPrefs.set(`user-1:${CLIENT_TIMEZONE_PREF_KEY}`, JSON.stringify('Europe/Berlin'));
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'agent-create',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-timezone': 'America/Los_Angeles',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('Europe/Berlin');
+    });
+
+    it('falls back to the daemon device timezone when no browser or app timezone is known', async () => {
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'agent-device-fallback',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-timezone': 'America/Los_Angeles',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('America/Los_Angeles');
+    });
+
     it('accepts timezone and stores it', async () => {
       const res = await app.request('/api/cron', jsonReq('POST', '', {
         name: 'tz-test',
@@ -743,7 +1541,7 @@ describe('Cron API routes', () => {
       expect(body1.nextRunAt).not.toBe(body2.nextRunAt);
     });
 
-    it('works without timezone (defaults to server time)', async () => {
+    it('keeps legacy and daemon callers without client timezone backward compatible', async () => {
       const res = await app.request('/api/cron', jsonReq('POST', '', {
         name: 'no-tz',
         cronExpr: '0 9 * * *',
@@ -755,6 +1553,123 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, unknown>;
       expect(body.timezone).toBeNull();
+    });
+
+    it('defaults updates to the current client device timezone and recalculates the schedule', async () => {
+      mockDb.cronJobs.set('job-device-tz-update', {
+        id: 'job-device-tz-update',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'device update',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'hello' }),
+        timezone: 'UTC',
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: 1,
+        expires_at: null,
+        created_at: 1,
+        updated_at: 1,
+      });
+      const executeSpy = vi.spyOn(mockDb.db, 'execute');
+
+      const res = await app.request('/api/cron/job-device-tz-update', {
+        ...jsonReq('PUT', '', { name: 'updated on device' }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-client-timezone': 'America/Los_Angeles',
+        },
+      });
+
+      expect(res.status).toBe(200);
+      const updateCall = executeSpy.mock.calls.find(([sql]) => String(sql).includes('UPDATE cron_jobs SET'));
+      expect(updateCall?.[0]).toContain('timezone =');
+      expect(updateCall?.[0]).toContain('next_run_at =');
+      expect(updateCall?.[1]).toContain('America/Los_Angeles');
+    });
+
+    it('returns creator provenance metadata in GET /api/cron and GET /api/cron/executions', async () => {
+      mockDb.users.set('user-1', { id: 'user-1', display_name: 'Alice Owner', username: 'alice' });
+      mockDb.users.set('user-2', { id: 'user-2', display_name: '   ', username: 'bob_part' });
+      mockDb.cronJobs.set('job-owner', {
+        id: 'job-owner',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'Owner job',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'hello' }),
+        timezone: 'UTC',
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: 1,
+        expires_at: null,
+        created_at: 1000,
+        updated_at: 1000,
+      });
+      mockDb.cronJobs.set('job-shared', {
+        id: 'job-shared',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'Participant job',
+        cron_expr: '*/30 * * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'check' }),
+        timezone: 'UTC',
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: 2,
+        expires_at: null,
+        created_at: 2000,
+        updated_at: 2000,
+      });
+      mockDb.cronProvenance.set('job-shared', {
+        job_id: 'job-shared',
+        creator_user_id: 'user-2',
+        server_id: 'srv-1',
+        project_name: 'proj',
+        shared: true,
+      });
+      mockDb.cronExecutions.push({
+        id: 'exec-shared-1',
+        job_id: 'job-shared',
+        status: 'dispatched',
+        detail: 'ok',
+        created_at: 2500,
+        job_name: 'Participant job',
+        server_id: 'srv-1',
+        project_name: 'proj',
+        cron_expr: '*/30 * * * *',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'check' }),
+      });
+
+      const listSpy = vi.spyOn(mockDb.db, 'query');
+      const listRes = await app.request('/api/cron?serverId=srv-1&projectName=proj');
+      expect(listRes.status).toBe(200);
+      const listBody = await listRes.json() as { jobs: Array<Record<string, unknown>> };
+      expect(listSpy.mock.calls.some(([sql]) => String(sql).includes('LEFT JOIN cron_job_provenance') && String(sql).includes('LEFT JOIN users'))).toBe(true);
+
+      const ownerJob = listBody.jobs.find((j) => j.id === 'job-owner');
+      const sharedJob = listBody.jobs.find((j) => j.id === 'job-shared');
+      expect(ownerJob?.creator_user_id).toBe('user-1');
+      expect(ownerJob?.creator_name).toBe('Alice Owner');
+      expect(ownerJob?.creator_is_shared).toBe(false);
+      expect(sharedJob?.creator_user_id).toBe('user-2');
+      expect(sharedJob?.creator_name).toBe('bob_part');
+      expect(sharedJob?.creator_is_shared).toBe(true);
+
+      const execRes = await app.request('/api/cron/executions?serverId=srv-1&projectName=proj&mode=all');
+      expect(execRes.status).toBe(200);
+      const execBody = await execRes.json() as { executions: Array<Record<string, unknown>> };
+      expect(execBody.executions[0]?.creator_user_id).toBe('user-2');
+      expect(execBody.executions[0]?.creator_name).toBe('bob_part');
+      expect(execBody.executions[0]?.creator_is_shared).toBe(true);
     });
   });
 });

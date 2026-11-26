@@ -1,0 +1,789 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+ ✓ |daemon| test/agent/qwen-provider.test.ts (46 tests) 1254ms
+   ✓ QwenProvider > retries a transient Premature close once before surfacing an error  357ms
+ ✓ |daemon| test/daemon/supervision-mcp-registration.test.ts (58 tests) 213ms
+ ✓ |daemon| test/daemon/supervision-worktree-inspector-fork-cost.test.ts (13 tests) 10895ms
+   ✓ supervision worktree inspection cost (production-shaped) > cold inspection spawns a bounded, constant number of git processes  1581ms
+   ✓ supervision worktree inspection cost (production-shaped) > never spawns one git process per changed path (no refs x files amplification)  956ms
+   ✓ supervision worktree inspection cost (production-shaped) > does not block the daemon event loop while inspecting  673ms
+   ✓ supervision worktree inspection cost (production-shaped) > re-inspects an unchanged worktree with a single bounded probe  719ms
+   ✓ supervision worktree inspection cost (production-shaped) > coalesces concurrent identical inspections into one underlying pass  1143ms
+   ✓ cached inspection invalidates precisely > re-reads when a reported file changes on disk  1047ms
+   ✓ cached inspection invalidates precisely > re-reads when a previously CLEAN tracked file becomes dirty  870ms
+   ✓ cached inspection invalidates precisely > re-reads when a NEW untracked file appears  730ms
+   ✓ cached inspection invalidates precisely > re-reads when staging changes  769ms
+   ✓ cached inspection invalidates precisely > re-reads when HEAD moves  741ms
+   ✓ cached inspection invalidates precisely > re-reads when a remote ref moves  818ms
+   ✓ cached inspection invalidates precisely > expires by TTL even when nothing observable changed  820ms
+ ✓ |daemon| test/daemon/supervision-worktree-inspector-authority.test.ts (11 tests) 16136ms
+   ✓ remote-delivery authority is never served stale > drops the positive match when a NEW untracked path appears  580ms
+   ✓ remote-delivery authority is never served stale > drops the positive match when a previously CLEAN tracked path becomes dirty  669ms
+   ✓ remote-delivery authority is never served stale > drops the positive match when a reported path changes content in place  803ms
+   ✓ remote-delivery authority is never served stale > still answers an unchanged worktree without re-reading it from scratch  380ms
+   ✓ deletion-only remote delivery parity > matches a remote commit that delivers exactly the deletion  512ms
+   ✓ deletion-only remote delivery parity > does not match a remote that still carries the deleted path  324ms
+   ✓ the git queue is bounded end to end > fails closed when a request cannot start before its total deadline  2753ms
+   ✓ the git queue is bounded end to end > rejects immediately once the queue hits its hard cap, and stays bounded  8263ms
+   ✓ git failure, deadline and output cap all fail closed > never claims a delivery it could not afford to read  985ms
+   ✓ git failure, deadline and output cap all fail closed > fails closed — and stays bounded — when a single git call outlives the deadline  785ms
+ ✓ |daemon| test/daemon/transport-session-runtime.test.ts (203 tests) 12641ms
+   ✓ TransportSessionRuntime > auto-retry redelivers a recoverable-failed message once the provider frees up  1009ms
+   ✓ TransportSessionRuntime > keeps a recoverable retry isolated from messages queued during backoff  1008ms
+   ✓ TransportSessionRuntime > auto-retry of a direct send does not duplicate timeline drain or runtime history  1001ms
+   ✓ TransportSessionRuntime > auto-retry of a drained queued turn emits its user event only once  1012ms
+   ✓ TransportSessionRuntime > uses a short retry budget for stale provider busy instead of the generic recoverable budget  7015ms
+ ✓ |daemon| test/daemon/jsonl-watcher.worker.test.ts (4 tests) 18040ms
+   ✓ jsonl-watcher parity: worker ON vs worker OFF > produces identical events for plain assistant/user turns  5461ms
+   ✓ jsonl-watcher parity: worker ON vs worker OFF > produces identical events for Edit tool_use + tool_result pair (file.change)  5023ms
+   ✓ jsonl-watcher parity: worker ON vs worker OFF > produces identical events when tool_use and tool_result arrive in separate drain cycles  5022ms
+   ✓ jsonl-watcher parity: worker ON vs worker OFF > falls back to main thread when worker is unavailable  2533ms
+ ✓ |daemon| test/daemon/p2p-orchestrator.test.ts (70 tests | 2 skipped) 22768ms
+   ✓ P2P orchestrator — parallel rounds > nudges stale active transport work when a P2P prompt is queued behind it  391ms
+   ✓ P2P orchestrator — parallel rounds > removes its queued transport prompt when a P2P hop times out before drain  350ms
+   ✓ P2P orchestrator — parallel rounds > does not cancel an active P2P transport turn just because discussion output has not appeared yet  368ms
+   ✓ P2P orchestrator — parallel rounds > drains a queued P2P prompt immediately when the transport runtime is already idle  367ms
+   ✓ P2P orchestrator — parallel rounds > restarts the full legacy combo pipeline for each selected cycle without advanced fields  561ms
+   ✓ P2P orchestrator — parallel rounds > inlines original-request execution into each complete legacy combo-cycle summary and follows up to confirm  595ms
+   ✓ P2P orchestrator — parallel rounds > includes the previous cycle output in the next cycle participant kickoff prompt  370ms
+   ✓ P2P orchestrator — parallel rounds > times out instead of hanging when the post-summary execution turn never returns idle  586ms
+   ✓ P2P orchestrator — parallel rounds > dispatches phase-2 hops in parallel and waits for the barrier before summary  334ms
+   ✓ P2P orchestrator — parallel rounds > does not fail the whole run when the initiator goes idle without writing  354ms
+   ✓ P2P orchestrator — parallel rounds > does not double the configured timeout for required initiator hops  2113ms
+   ✓ P2P orchestrator — parallel rounds > waits for final idle content instead of completing on the first streamed heading  4951ms
+   ✓ P2P orchestrator — parallel rounds > treats missing advanced audit verdicts as rework and records jump history  456ms
+   ✓ P2P orchestrator — parallel rounds > forces the minimum rework loops before handing off to smart-gate evaluation  402ms
+   ✓ P2P orchestrator — parallel rounds > hands off forced_rework rounds to smart-gate behavior after minTriggers is satisfied  369ms
+   ✓ P2P orchestrator — parallel rounds > continues forced_rework routing on REWORK after minTriggers until maxTriggers is exhausted  406ms
+   ✓ P2P orchestrator — parallel rounds > completes the openspec preset after proposal artifacts are created and audit eventually passes  633ms
+   ✓ P2P orchestrator — parallel rounds > cleans up loop-generated hop artifacts after repeated advanced attempts settle  619ms
+   ✓ P2P orchestrator — parallel rounds > keeps advanced loop bookkeeping deterministic while legacy projections remain compatibility-only  360ms
+   ✓ P2P orchestrator — parallel rounds > injects reducer summaries into later loop prompts and keeps the helper prompt focused on the latest attempt context  520ms
+   ✓ P2P orchestrator — parallel rounds > cleans worker-hop artifacts after repeated loop attempts  487ms
+ ✓ |daemon| test/daemon/supervision-automation.test.ts (236 tests) 6586ms
+ ✓ |daemon| test/daemon/memory-mcp-server.test.ts (28 tests) 23416ms
+   ✓ memory MCP stdio server > lists the registered shared tools over stdio and does not leak secret env  2687ms
+   ✓ memory MCP stdio server > keeps the real stdio child and initial catalog alive after the RSS watchdog samples overload  11646ms
+   ✓ memory MCP stdio server > lists tools over stdio without identity env  2189ms
+   ✓ memory MCP stdio server > activates only matching tools and replaces the previous lazy result set  1408ms
+   ✓ memory MCP stdio server > loads persisted sessions before serving scoped send targets over stdio  1392ms
+   ✓ memory MCP stdio server > dispatches send_message through the daemon hook server from stdio MCP  903ms
+   ✓ memory MCP stdio server > submits peer_audit_reply to dedicated ingress with the runtime-bound sender header  956ms
+   ✓ memory MCP stdio server > submits delegation_reply to dedicated ingress with the runtime-bound sender header  911ms
+   ✓ memory MCP stdio server > keeps listed send targets usable across a transient empty session-store refresh  799ms
+   ✓ createMemoryMcpServerFromEnv supervision wiring > forwards supervisionToolDeps to registerSupervisionMcpTools  361ms
+ ✓ |daemon| test/agent/codex-sdk-provider.test.ts (186 tests) 8989ms
+   ✓ CodexSdkProvider > polls the Codex rollout briefly for raw update_plan calls without waiting for token usage  2020ms
+   ✓ CodexSdkProvider > merges a task_name-only spawn with its child thread rollout instead of duplicating the UI row  2063ms
+   ✓ CodexSdkProvider > discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs  2027ms
+   ✓ CodexSdkProvider > settles a turn from rollout task_complete when the app-server sends only idle/completed hints  366ms
+   ✓ CodexSdkProvider > terminalizes a WebSearch started event when rollout settles a turn without turn/completed  357ms
+   ✓ CodexSdkProvider > settles from rollout task_complete when turn/start response never returns and ignores its late response  346ms
+   ✓ CodexSdkProvider > ignores a late id-less interrupted notification from a previous stop and still settles the newer turn  338ms
+ ✓ |daemon| test/daemon/hook-port.test.ts (74 tests) 11842ms
+   ✓ publication lock - never taken from a live or indeterminate holder > refuses while a LIVE holder owns the current epoch, leaving it untouched  1054ms
+   ✓ publication lock - never taken from a live or indeterminate holder > never takes over a live holder however old its acquisition is  1070ms
+   ✓ publication lock - never taken from a live or indeterminate holder > never treats a holder with the same {pid,startToken} as its own leftover  1091ms
+   ✓ publication lock - never taken from a live or indeterminate holder > never takes over a holder whose liveness is indeterminate  1064ms
+   ✓ legacy single-file lock - respected, never modified > a LIVE nonce-less legacy holder is never taken over, however long it waits  1085ms
+   ✓ legacy single-file lock - respected, never modified > an indeterminate legacy holder is never taken over  1062ms
+   ✓ publication lock - ownership-safe interleavings > CLAIM gap: a reclaimer suspended after final validation cannot displace a successor  1030ms
+   ✓ publication lock - ownership-safe interleavings > RELEASE gap: a stale holder's release cannot release or remove a successor's entry  1049ms
+   ✓ publication lock - ownership-safe interleavings > PRUNE gap: a high-epoch claimer resumed after a directory reset cannot prune the new generation  1050ms
+   ✓ publication lock - ownership-safe interleavings > CLAIM across a reset: a late old-generation claim is invisible to the new generation  1050ms
+   ✓ publication lock - ownership-safe interleavings > RELEASE after epoch reuse: a stale release names only its own acquisition  1054ms
+ ✓ |daemon| test/daemon/memory-mcp-stdio-lifecycle.test.ts (13 tests) 12608ms
+   ✓ memory MCP stdio lifecycle (subprocess) > exits when its parent dies even though stdin never reaches EOF  3548ms
+   ✓ memory MCP stdio lifecycle (subprocess) > exits when it was already reparented before it ever ran, stdin still held  2067ms
+   ✓ memory MCP stdio lifecycle (subprocess) > exits when its parent dies BEFORE the server is ready, stdin still held  1169ms
+   ✓ memory MCP stdio lifecycle (subprocess) > still exits on a clean stdin EOF  917ms
+   ✓ memory MCP stdio lifecycle (subprocess) > keeps running while its parent is alive and stdin is open  4899ms
+ ✓ |daemon| test/daemon/lifecycle-boot-supervision-sweep.test.ts (1 test) 3005ms
+   ✓ daemon boot enters the same bounded supervision convergence > repairs a stuck aggregate at boot, leaves unauthorized ones alone, and does not churn  3004ms
+ ✓ |daemon| test/daemon/gemini-idle-detection.test.ts (12 tests) 3781ms
+   ✓ Gemini Idle Detection (Direct pollTick test) > emits idle ONLY after JSON stops changing (new data always = running)  652ms
+   ✓ Gemini Idle Detection (Direct pollTick test) > emits idle after trailing info message once JSON settles  649ms
+   ✓ Gemini spinner detection (braille at col 0) > confirms working state when spinner seen in majority of burst reads  323ms
+   ✓ Gemini spinner detection (braille at col 0) > emits assistant.thinking with terminal-spinner source on confirmed spinner  324ms
+   ✓ Gemini spinner detection (braille at col 0) > does NOT transition to running on single-frame spinner (burst fails)  325ms
+   ✓ Gemini spinner detection (braille at col 0) > spinner overrides JSON idle status (ground truth)  328ms
+   ✓ Gemini spinner detection (braille at col 0) > returns to idle when spinner disappears  647ms
+   ✓ Gemini JSON change detection hardening > stays on unchanged path when both mtime and size match  323ms
+ ✓ |daemon| test/daemon/qwen-cancel.test.ts (4 tests) 6689ms
+   ✓ Qwen provider cancel > sends SIGTERM on cancel  2150ms
+   ✓ Qwen provider cancel > escalates a SIGTERM-ignoring process to SIGKILL before cancel resolves  2147ms
+   ✓ Qwen provider cancel > resets started flag after cancel so next send starts fresh  2308ms
+ ✓ |daemon| test/daemon/hook-authority-global-containment.test.ts (4 tests) 4700ms
+   ✓ machine hook-port containment > fences a spawned child that has no test-runner environment  2633ms
+   ✓ machine hook-port containment > lets the lock-owning process publish, so the fence is not simply "always refuse"  917ms
+   ✓ machine hook-port containment > keeps the production record untouched while a sandboxed hook server runs  844ms
+   ✓ machine hook-port containment > proves a sandbox home is genuinely not the machine record  305ms
+ ✓ |daemon| test/daemon/supervision-worktree-inspector-remote-match.test.ts (7 tests) 2351ms
+   ✓ remote delivery matching against real git > matches the remote ref whose committed bytes are exactly the worktree bytes  377ms
+   ✓ remote delivery matching against real git > requires every manifest row to match, not merely one of them  425ms
+   ✓ remote delivery matching against real git > treats a path the remote still carries as disproving a deletion  406ms
+   ✓ remote delivery matching against real git > still finds a non-preferred remote ref when origin/dev is not the match  331ms
+warning: in the working copy of 'web/android/gradlew.bat', LF will be replaced by CRLF the next time Git touches it
+ ✓ |daemon| test/daemon/sdk-transport-restore.test.ts (45 tests) 5253ms
+   ✓ sdk transport session restore > refuses to start a Brain codex turn when IM delegation is not authoritatively connected (control)  1522ms
+   ✓ sdk transport session restore > emits startup memory.context when the first transport turn carries the seeded memory  2543ms
+Preparing worktree (detached HEAD 9de7d0c)
+Preparing worktree (detached HEAD 9de7d0c)
+ ✓ |daemon| test/daemon/supervision-worktree-provision.test.ts (7 tests) 2149ms
+   ✓ supervision assignment worktree provisioning > creates the exact detached base and replays without rebuilding it  315ms
+   ✓ supervision assignment worktree provisioning > provisions the tracked Gradle batch file with CRLF bytes and a clean Git status  495ms
+   ✓ supervision assignment worktree provisioning > fails closed without changing dirty, wrong-base, or foreign existing paths  444ms
+ ✓ |daemon| test/daemon/materialization-coordinator.test.ts (20 tests) 2658ms
+   ✓ MaterializationCoordinator > materializes structured problem-resolution summaries from eligible events  350ms
+   ✓ MaterializationCoordinator > materializes end-to-end through a WARM context-store worker (reads + commit off the main thread)  499ms
+Preparing worktree (detached HEAD 270c00a)
+Preparing worktree (detached HEAD 270c00a)
+Preparing worktree (detached HEAD f99a776)
+Preparing worktree (detached HEAD f99a776)
+ ✓ |daemon| test/daemon/supervision-integration-bundle.test.ts (3 tests) 2513ms
+   ✓ immutable supervision integration bundle > preserves the exact tsk_f1x after bytes after the implementer worktree returns to base  1370ms
+   ✓ immutable supervision integration bundle > is content addressed, replay-safe, and fails closed on bundle or target conflicts  687ms
+   ✓ immutable supervision integration bundle > persists one exact bundle binding across store reopen and refuses a conflicting hash  456ms
+ ✓ |daemon| test/daemon/supervision-worktree-gc.test.ts (24 tests) 2883ms
+   ✓ bounded supervision worktree GC > hard-bounds a crowded assignment root before registry or Git work  1133ms
+   ✓ bounded supervision worktree GC > uses real Git status, registration, and remote reachability evidence  967ms
+ ✓ |daemon| test/daemon/file-preview-read-dist-daemon-smoke.test.ts (2 tests) 3800ms
+   ✓ dist default daemon preview-read smoke > uses real worker threads and emits visible success and sanitized errors through the default coordinator  360ms
+   ✓ dist default daemon preview-read smoke > keeps non-preview commands responsive while real dist preview workers are delayed  3439ms
+ ✓ |daemon| test/daemon/timeline-projection-busy.test.ts (2 tests) 2032ms
+   ✓ timeline projection client: saturation is not absence > raises TimelineProjectionBusyError instead of returning null when the worker stalls  2017ms
+ ✓ |daemon| test/daemon/supervision-task-registry.test.ts (249 tests) 4080ms
+   ✓ SupervisionTaskRegistry > keeps missing-pointer finalization fail-closed for ambiguous or mismatched authority  353ms
+   ✓ SupervisionTaskRegistry > creates and verifies the exact worktree before live-hook delivery for exact-target and autoProvision tasks  982ms
+   ✓ cancelled implementation evidence adoption > records late cancelled completion through the production task_finish ingress without reviving the worker  339ms
+ ✓ |daemon| test/daemon/gemini-watcher-tracking.test.ts (8 tests) 1966ms
+   ✓ Gemini watcher — inode change detection > skips read when mtime, size, AND inode are all unchanged  327ms
+   ✓ Gemini watcher — consecutive read failures trigger rescan > resets activeFile after 5 consecutive readConversation failures  1015ms
+   ✓ Gemini watcher — consecutive read failures trigger rescan > resets readFailCount on successful read  617ms
+ ✓ |daemon| test/daemon/direct-file-transfer-stall-proof.test.ts (1 test) 2019ms
+   ✓ direct file transfer survives a blocked daemon loop > R-1: the real worker keeps producing while the main loop is fully blocked  2018ms
+ ✓ |daemon| test/store/context-store-worker.test.ts (14 tests) 4219ms
+   ✓ context-store worker foundation > round-trips a write/read op through the worker  599ms
+   ✓ context-store worker foundation > structured-clones object rows and embedding buffers across the worker  343ms
+   ✓ context-store worker foundation > rejects an unknown op with a stable unsupported_operation code  457ms
+   ✓ context-store worker foundation > serializes a thrown op error as a plain code+message (no stack/path leak)  369ms
+   ✓ context-store worker foundation > times out a pending RPC and discards the late worker reply  513ms
+   ✓ context-store worker foundation > returns empty for an R1 read before the worker is warm, then serves after ready  314ms
+   ✓ context-store worker foundation > rejects awaited mutations past the awaited cap with context_store_overloaded  509ms
+   ✓ context-store worker foundation > callOrElse uses the worker when warm, and the local fallback when not warm  399ms
+   ✓ context-store worker foundation > callOrElse falls back to local when the worker op errors  363ms
+ ✓ |daemon| test/daemon/live-context-ingestion.test.ts (38 tests) 3597ms
+   ✓ LiveContextIngestion > stages live timeline events and materializes them when the session becomes idle  508ms
+   ✓ LiveContextIngestion > uses completed tool results as threshold evidence for post-response skill auto-creation without storing tool output  640ms
+   ✓ LiveContextIngestion > filters hidden and failed tool results from skill-review tool-iteration evidence  335ms
+ ✓ |daemon| test/daemon/session-list.test.ts (11 tests) 952ms
+ ✓ |daemon| test/daemon/supervision-worktree-inspector.test.ts (7 tests) 1532ms
+   ✓ authoritative supervision worktree inspection > continues to report conflicted paths for the registry gate  351ms
+ ✓ |daemon| test/daemon/hook-send.test.ts (49 tests | 3 skipped) 1444ms
+ ✓ |daemon| test/daemon/agent-process-startup-sweep.test.ts (5 tests) 2160ms
+   ✓ agent process group survives into the startup sweep > reaps the whole group of a crashed session, not just the leader  556ms
+   ✓ agent process group survives into the startup sweep > refuses to signal when the recorded fingerprint no longer matches  483ms
+   ✓ agent process group survives into the startup sweep > group-reaps survivors when the recorded leader is already gone  655ms
+ ✓ |daemon| test/daemon/p2p-parser.test.ts (42 tests) 1614ms
+ ✓ |daemon| test/daemon/env-injection.test.ts (6 tests) 3086ms
+   ✓ IMCODES_SESSION env injection > injects a selected-file identity into a process agent on its first launch  3053ms
+ ✓ |daemon| test/store/session-store.test.ts (19 tests) 1771ms
+   ✓ session-store > loadStore reconcile (runtimeType backfill + error recovery) > restores a filled three-scope multibyte identity byte-for-byte in a fresh process  363ms
+   ✓ session-store > loadStore reconcile (runtimeType backfill + error recovery) > reports child and disk evidence when a fresh process cannot find the requested session  341ms
+   ✓ session-store > loadStore reconcile (runtimeType backfill + error recovery) > migrates missing identities once and preserves them across daemon reload  763ms
+ ✓ |daemon| test/daemon/jsonl-parse-pool.test.ts (12 tests) 1940ms
+   ✓ jsonlParsePool — REAL Worker thread > returns null on timeout; pool stays available afterwards  381ms
+   ✓ jsonlParsePool — REAL Worker thread > shutdown() terminates worker cleanly and allows the pool to be reused  306ms
+ ✓ |daemon| test/daemon/file-transfer-handler.test.ts (23 tests) 1782ms
+   ✓ file-transfer local handle hardening > commits a relay upload into the selected existing directory without overwrite  859ms
+ ✓ |daemon| test/daemon/lifecycle-worker-session-sync.test.ts (4 tests) 3749ms
+   ✓ lifecycle worker session sync > treats legacy list responses as degraded and does not destructively prune local sessions  1666ms
+   ✓ lifecycle worker session sync > does not drop local sessions missing from a complete snapshot without an explicit tombstone  805ms
+   ✓ lifecycle worker session sync > treats remote stopped sessions as existing instead of deleting a local running session  655ms
+   ✓ lifecycle worker session sync > marks a bad complete snapshot as degraded before applying destructive side effects  622ms
+ ✓ |daemon| test/shared/timeline-protocol-magic-string.test.ts (2 tests) 5130ms
+   ✓ timeline protocol magic strings > keeps shared timeline protocol literals centralized outside compatibility fixtures  5128ms
+ ✓ |daemon| test/daemon/supervision-auto-audit.test.ts (122 tests) 1333ms
+ ✓ |daemon| test/daemon/jsonl-watcher-refresh.test.ts (6 tests) 724ms
+ ✓ |daemon| test/daemon/cron-p2p-integration.test.ts (5 tests) 1514ms
+   ✓ Cron → P2P integration > cron P2P with role participants creates discussion file and completes  786ms
+   ✓ Cron → P2P integration > cron P2P with sub-session participantEntries completes  359ms
+   ✓ Cron → P2P integration > cron P2P with mixed role + session participants deduplicates correctly  363ms
+ ✓ |daemon| test/daemon/direct-file-transfer-worker-boundary.test.ts (46 tests) 750ms
+ ✓ |daemon| test/daemon/context-store.test.ts (39 tests) 1127ms
+(node:3902) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/transport-history.test.ts (21 tests) 3862ms
+   ✓ transport-history > replay stays bounded on multi-megabyte JSONL files (tail-read only)  3377ms
+ ✓ |daemon| test/daemon/timeline-projection.test.ts (7 tests) 792ms
+ ✓ |daemon| test/daemon/codex-watcher-retrack.test.ts (4 tests) 638ms
+(node:4580) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/memory-get-sources-rpc.test.ts (7 tests) 2480ms
+   ✓ daemon WS handler: memory.get_sources_request > returns sources for a projection with matching archived events  444ms
+ ✓ |daemon| test/daemon/memory-mcp-search.test.ts (14 tests) 840ms
+ ✓ |daemon| test/daemon/transport-queue-store.test.ts (63 tests) 738ms
+ ✓ |daemon| test/daemon/supervision-repair-resume.test.ts (25 tests) 712ms
+ ✓ |daemon| test/daemon/command-handler-transport-queue.test.ts (171 tests) 1312ms
+ ✓ |daemon| test/daemon/gemini-watcher-refresh.test.ts (3 tests) 501ms
+   ✓ gemini watcher refresh() > refresh does not follow a different session id file  481ms
+ ✓ |daemon| test/daemon/machine-direct-transfer.test.ts (10 tests) 1930ms
+   ✓ machine direct encrypted TCP transfer > reuses the encrypted sender to stream from a controlled source into a Full receiver temp file  1032ms
+   ✓ machine direct encrypted TCP transfer > streams a file over a routed-private candidate and commits a normal attachment  760ms
+ ✓ |daemon| test/daemon/preview-ws-relay.test.ts (15 tests) 607ms
+ ✓ |daemon| test/daemon/timeline-store.async.test.ts (6 tests) 772ms
+   ✓ timeline-store async append (T1-T4) > T4b: flushAll(timeoutMs) logs warn when timeout fires while chain still in flight  461ms
+ ✓ |daemon| test/daemon/tmux-security.test.ts (16 tests) 480ms
+   ✓ tmux shell-injection prevention > tolerates repeated recoverable tmux server exits during one command  312ms
+ ✓ |daemon| test/daemon/p2p-workflow-runtime.test.ts (28 tests) 1938ms
+   ✓ ServerLink P2P workflow hello > exposes the current daemon workflow capabilities for launch binding  1095ms
+   ✓ ServerLink P2P workflow hello > sends daemon.hello after auth with current base capabilities  420ms
+   ✓ ServerLink P2P workflow hello > resends daemon.hello with sorted updated capabilities only when capabilities change  404ms
+ ✓ |daemon| test/daemon/command-handler-bad-input.test.ts (8 tests) 1561ms
+ ✓ |daemon| test/daemon/delegation-reply-ingress.test.ts (26 tests) 755ms
+   ✓ delegation reply ingress > persists progress without Brain chatter and reports a blocked final handoff once  710ms
+ ✓ |daemon| test/daemon/hook-authority-endpoint.test.ts (19 tests) 749ms
+ ✓ |daemon| test/daemon/command-handler-memory-context.test.ts (42 tests) 954ms
+   ✓ handleWebCommand memory context timeline > validates manual memory project directories before trusting canonical repo ids  536ms
+ ✓ |daemon| test/daemon/claude-no-text-refresh.test.ts (2 tests) 423ms
+ ✓ |daemon| test/daemon/direct-file-transfer-process-isolation.test.ts (4 tests | 1 skipped) 694ms
+   ✓ P0 direct transfer native crash containment > reaps the production child after an orderly shutdown  522ms
+ ✓ |daemon| test/daemon/session-resource-lifecycle.test.ts (10 tests) 1274ms
+ ✓ |daemon| test/daemon/send-tool.test.ts (35 tests) 449ms
+   ✓ send-tool > lets the persisted binding outrank a same-name live runtime that now reports otherwise  342ms
+ ✓ |daemon| test/shared/fs-read-error-codes.test.ts (6 tests) 1793ms
+   ✓ fs-read shared error constants > keeps fs-read production consumers importing shared wire error values instead of redefining them  1790ms
+ ✓ |daemon| test/daemon/gemini-file-change.test.ts (3 tests) 331ms
+   ✓ Gemini watcher — file.change emission > defers file-tool rows until terminal success and falls back to visible rows on error  328ms
+ ✓ |daemon| test/store/archive-sweeper.test.ts (6 tests) 1083ms
+   ✓ archive and sweeper safety > refreshes token_count on re-archive while preserving original content  358ms
+ ✓ |daemon| test/store/turn-usage.test.ts (19 tests) 617ms
+ ✓ |daemon| test/daemon/file-preview-read-dist-smoke.test.ts (1 test) 440ms
+   ✓ dist preview read worker smoke > starts default two real workers and completes concurrent preflight jobs plus sanitized errors  439ms
+ ✓ |daemon| test/store/fts-unavailable.test.ts (4 tests) 795ms
+   ✓ FTS5 unavailable host (regression: Node 23.11.0 SQLite without FTS5) > with fts_tokenizer="unavailable", archive writes succeed (no trigger crash)  351ms
+ ✓ |daemon| test/daemon/timeline-store.tail-truncate.test.ts (2 tests) 766ms
+   ✓ timeline-store truncate > keeps conversation records ahead of status noise without readFileSync  716ms
+ ✓ |daemon| test/daemon/cloud-sync-e2e.test.ts (15 tests) 469ms
+ ✓ |daemon| test/daemon/supervision-broker.test.ts (47 tests) 468ms
+   ✓ SupervisionBroker > falls back to the configured backup runtime when the primary provider fails  404ms
+ ✓ |daemon| test/store/context-store-production-owner.test.ts (4 tests) 822ms
+   ✓ context-store production-owner failure policy > does not advertise warm when the worker reports a warmup failure  677ms
+ ✓ |daemon| test/daemon/fs-list.test.ts (31 tests) 123ms
+(node:10998) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:11185) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/p2p-discussion-list.test.ts (12 tests) 493ms
+ ✓ |daemon| test/daemon/codex-watcher.test.ts (45 tests) 364ms
+ ✓ |daemon| test/daemon/supervision-zero-change-autoprogress.test.ts (13 tests) 453ms
+ ✓ |daemon| test/store/materialization-commit.test.ts (3 tests) 813ms
+   ✓ commitMaterialization (atomic bundle) > commits the whole bundle together (archive + projection + delete staged + replication + complete job)  306ms
+ ✓ |daemon| test/daemon/timeline-projection-drain.test.ts (4 tests) 170ms
+(node:11959) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/supervision-console-e2e.test.ts (15 tests) 227ms
+(node:12125) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/timeline-history-worker.test.ts (7 tests) 382ms
+ ✓ |daemon| test/daemon/timeline-store.retention.test.ts (4 tests) 262ms
+ ✓ |daemon| test/daemon/template-eligibility.test.ts (10 tests) 1166ms
+   ✓ computeExecutionTemplateEligibility > marks a normal non-main, non-stopped, non-clone sub as eligible  725ms
+   ✓ buildSessionList projects execution template eligibility > exposes executionTemplateEligible + reason per session  439ms
+ ✓ |daemon| test/store/pinned-notes.test.ts (1 test) 1115ms
+   ✓ pinned notes store integration > injects pinned notes byte-identically under the User-Pinned Notes heading  1114ms
+ ✓ |daemon| test/daemon/direct-file-transfer.test.ts (43 tests) 57811ms
+   ✓ daemon direct file transfer v2 lease broker > keeps the resume state and the bytes after a retryable transport loss (channel-error)  306ms
+   ✓ daemon direct file transfer v2 lease broker > keeps the resume state and the bytes after a retryable transport loss (peer-disconnected)  303ms
+   ✓ daemon direct file transfer v2 lease broker > never strips a live upload of its resume state under capacity pressure  26754ms
+   ✓ daemon direct file transfer v2 lease broker > keeps the number of partials on disk bounded by the resume ledger capacity  26845ms
+ ✓ |daemon| test/daemon/p2p-workflow-artifacts.test.ts (22 tests) 608ms
+ ✓ |daemon| test/daemon/p2p-artifact-identity-persistence.test.ts (6 tests) 195ms
+ ✓ |daemon| test/daemon/gemini-watcher-retrack.test.ts (3 tests) 219ms
+ ✓ |daemon| test/daemon/upgrade-native-quiesce.test.ts (2 tests) 282ms
+ ✓ |daemon| test/daemon/direct-file-transfer-commit-recovery.test.ts (7 tests) 360ms
+ ✓ |daemon| test/daemon/cursor-copilot-transport-restore.test.ts (4 tests) 324ms
+ ✓ |daemon| test/daemon/codex-watcher-refresh.test.ts (4 tests) 262ms
+ ✓ |daemon| test/shared/daemon-latency-summary.test.ts (1 test) 108ms
+ ✓ |daemon| test/daemon/codex-watcher-tail-history.test.ts (1 test) 238ms
+ ✓ |daemon| test/daemon/supervision-console-producer.test.ts (35 tests) 320ms
+(node:13833) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/store/archive-backfill.test.ts (2 tests) 79ms
+ ✓ |daemon| test/daemon/supervision-list-query-cost.test.ts (1 test) 96ms
+ ✓ |daemon| test/daemon/native-quiesce-contract.test.ts (8 tests) 385ms
+ ✓ |daemon| test/daemon/command-handler-delegation-regression.test.ts (6 tests) 189ms
+ ✓ |daemon| test/store/no-sync-context-store-guard.test.ts (6 tests) 926ms
+   ✓ context-store exact-path import guard > no daemon production module imports context-store.js outside the allowlist  675ms
+ ✓ |daemon| test/daemon/memory-recall-integration.test.ts (42 tests) 397ms
+ ✓ |daemon| test/daemon/provider-callback-lifecycle.test.ts (9 tests) 589ms
+   ✓ TransportSessionRuntime callback cleanup > keeps session info emitted synchronously while createSession is resolving  580ms
+ ✓ |daemon| test/daemon/memory-pruning.test.ts (6 tests) 330ms
+ ✓ |daemon| test/store/dedup-merge.test.ts (3 tests) 308ms
+ ✓ |daemon| test/store/turn-usage-idempotent.test.ts (5 tests) 165ms
+ ✓ |daemon| test/daemon/session-group-clone-engine.test.ts (4 tests) 458ms
+   ✓ daemon session group clone engine > launches a fresh role-compatible main clone and keeps transportConfig out of events  401ms
+(node:14216) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+P2P: skipping symlink run-state entry /var/folders/vg/dk0l8d2n6gj9r1lszrj2k4p80000gn/T/imcodes-test-p2p-workflow-runs-nITzse/symlink-entry
+P2P: dropping persisted identity bad-paths — invalid declared path
+ ✓ |daemon| test/daemon/p2p-artifact-persistence-hardening.test.ts (5 tests) 134ms
+ ✓ |daemon| test/daemon/lifecycle-truncate-background.test.ts (3 tests) 286ms
+ ✓ |daemon| test/daemon/supervision-store-migrations.test.ts (18 tests) 120ms
+ ✓ |daemon| test/daemon/peer-audit-service.test.ts (10 tests) 37ms
+ ✓ |daemon| test/daemon/server-link.test.ts (33 tests) 203ms
+ ✓ |daemon| test/daemon/fs-git-cache.test.ts (27 tests) 193ms
+ ✓ |daemon| test/daemon/timeline-store.projection-fallback.test.ts (6 tests) 201ms
+ ✓ |daemon| test/daemon/qwen-mcp-config.test.ts (6 tests) 63ms
+ ✓ |daemon| test/daemon/instance-lock.test.ts (23 tests) 194ms
+(node:14537) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/command-handler-timeline-history-projection.test.ts (16 tests) 60ms
+(node:14831) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/supervision-successor-finish-recovery.test.ts (14 tests) 299ms
+ ✓ |daemon| test/daemon/launch-session-codex.test.ts (3 tests) 1295ms
+   ✓ launchSession — Codex ID handling > assigns an explicit codexSessionId before first launch and persists it  1210ms
+ ✓ |daemon| test/daemon/cron-executor.test.ts (44 tests) 50ms
+ ✓ |daemon| test/daemon/supervision-idle-integration.test.ts (9 tests) 127ms
+(node:16077) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/fs-write.test.ts (32 tests) 248ms
+ ✓ |daemon| test/daemon/hook-server-validation.test.ts (15 tests) 127ms
+ ✓ |daemon| test/daemon/session-group-clone.test.ts (27 tests) 152ms
+(node:16220) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:16221) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/supervision-identity-convergence.test.ts (26 tests) 333ms
+ ✓ |daemon| test/daemon/memory-mcp-tools-schema-firewall.test.ts (47 tests) 339ms
+ ✓ |daemon| test/daemon/supervision-registry-minting.test.ts (10 tests) 93ms
+ ✓ |daemon| test/daemon/supervision-lifecycle-convergence.test.ts (17 tests) 166ms
+stdout | test/daemon/supervision-console-production-chain.test.ts > browser -> server bridge -> daemon registry -> browser task-console chain > returns the authoritative project snapshot to shared MAIN viewers and participants
+{"level":"info","time":1789321176985,"msg":"Daemon authenticated","serverId":"server-console-chain","daemonVersion":null}
+
+ ✓ |daemon| test/daemon/machine-file-client.test.ts (12 tests) 215ms
+ ✓ |daemon| test/daemon/supervision-console-production-chain.test.ts (1 test) 93ms
+ ✓ |daemon| test/daemon/transport-resend-queue.test.ts (26 tests) 183ms
+ ✓ |daemon| test/daemon/processed-context-replication.test.ts (3 tests) 68ms
+ ✓ |daemon| test/daemon/terminal-streamer-snapshot.test.ts (31 tests) 207ms
+ ✓ |daemon| test/daemon/delegation-reply-store.test.ts (21 tests) 136ms
+ ✓ |daemon| test/daemon/supervision-prompts-custom-instructions.test.ts (39 tests) 84ms
+ ✓ |daemon| test/daemon/machine-mcp-registration.test.ts (17 tests) 273ms
+ ✓ |daemon| test/shared/session-identity.test.ts (20 tests) 317ms
+ ✓ |daemon| test/daemon/command-handler-clear.test.ts (3 tests) 26ms
+ ✓ |daemon| test/daemon/openclaw-provider.test.ts (44 tests) 126ms
+(node:16866) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/timeline-response-shaper.test.ts (4 tests) 146ms
+ ✓ |daemon| test/store/context-store-backoff-overflow.test.ts (6 tests) 236ms
+ ✓ |daemon| test/daemon/opencode-history.test.ts (14 tests) 59ms
+ ✓ |daemon| test/daemon/discussion-orchestrator.test.ts (3 tests) 58ms
+ ✓ |daemon| test/daemon/cc-presets.test.ts (18 tests) 170ms
+ ✓ |daemon| test/daemon/shared-context-send-surface.test.ts (1 test) 60ms
+ ✓ |daemon| test/daemon/supervision-registry-binding.test.ts (6 tests) 134ms
+ ✓ |daemon| test/daemon/supervision-audit-routing-authority.test.ts (4 tests) 80ms
+ ✓ |daemon| test/daemon/capability-mcp-tools.test.ts (7 tests) 307ms
+ ✓ |daemon| test/daemon/fs-list-worker-handler.test.ts (9 tests) 67ms
+ ✓ |daemon| test/daemon/preview-relay.test.ts (7 tests) 42ms
+ ✓ |daemon| test/daemon/supervision-prompts.test.ts (68 tests) 87ms
+ ✓ |daemon| test/daemon/transport-queue-projection.test.ts (8 tests) 34ms
+ ✓ |daemon| test/daemon/supervision-coordinator-authority.test.ts (12 tests) 33ms
+ ✓ |daemon| test/daemon/command-handler-timeline-history-parity.test.ts (1 test) 46ms
+ ✓ |daemon| test/store/context-store-worker-self-recovery.test.ts (11 tests) 141ms
+ ✓ |daemon| test/daemon/session-identity-refresh-command.test.ts (1 test) 55ms
+ ✓ |daemon| test/daemon/p2p-config-store.test.ts (6 tests) 51ms
+ ✓ |daemon| test/daemon/hook-server-session-restart.test.ts (3 tests) 21ms
+ ✓ |daemon| test/daemon/p2p-discussion-writer-queue.test.ts (6 tests) 100ms
+(node:17974) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/transport-message-queue-integration.test.ts (10 tests) 254ms
+ ✓ |daemon| test/daemon/supervision-console-session.test.ts (13 tests) 71ms
+ ✓ |daemon| test/store/temp-file-store.test.ts (4 tests) 108ms
+ ✓ |daemon| test/agent/transport-runtime-assembly.test.ts (41 tests) 67ms
+ ✓ |daemon| test/daemon/copilot-sdk-runtime.test.ts (1 test) 33ms
+ ✓ |daemon| test/daemon/supervision-state-store.test.ts (7 tests) 163ms
+ ✓ |daemon| test/daemon/transport-runtime-drain-error.test.ts (7 tests) 190ms
+ ✓ |daemon| test/daemon/transport-status-lifecycle.test.ts (20 tests) 188ms
+ ✓ |daemon| test/daemon/remote-desktop-login-screen.test.ts (7 tests) 22ms
+(node:18463) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/timeline-projection-worker-contract.test.ts (2 tests) 75ms
+ ✓ |daemon| test/store/project-store-contract.test.ts (2 tests) 69ms
+ ✓ |daemon| test/daemon/transport-resend-queue-emit.test.ts (9 tests) 137ms
+ ✓ |daemon| test/daemon/subsession-manager.test.ts (52 tests) 103ms
+ ✓ |daemon| test/daemon/pipe-pane-protocol.test.ts (15 tests) 46ms
+ ✓ |daemon| test/daemon/command-handler-test-session-guard.test.ts (2 tests) 9ms
+ ✓ |daemon| test/shared-remote-exec.test.ts (32 tests) 57ms
+ ✓ |daemon| test/daemon/file-preview-read-pool.test.ts (11 tests) 21ms
+ ✓ |daemon| test/daemon/alias-mcp-tools.test.ts (26 tests) 99ms
+ ✓ |daemon| test/store/context-meta.test.ts (2 tests) 46ms
+ ✓ |daemon| test/daemon/transport-relay.test.ts (87 tests) 69ms
+ ✓ |daemon| test/daemon/supervision-auto-provision.test.ts (22 tests) 87ms
+ ✓ |daemon| test/daemon/cron-mcp-client.test.ts (15 tests) 25ms
+ ✓ |daemon| test/daemon/execution-clone-mcp.test.ts (45 tests) 61ms
+ ✓ |daemon| test/daemon/mcp-tool-discovery.test.ts (4 tests) 11ms
+ ✓ |daemon| test/daemon/timeline-emitter.test.ts (38 tests) 112ms
+ ✓ |daemon| test/daemon/message-pin-mcp-tools.test.ts (8 tests) 23ms
+ ✓ |daemon| test/daemon/timeline-history-sanitize.test.ts (14 tests) 20ms
+ ✓ |daemon| test/daemon/hook-server-stop-text.test.ts (4 tests) 99ms
+ ✓ |daemon| test/daemon/hook-server-sessions-live.test.ts (4 tests) 86ms
+ ✓ |daemon| test/daemon/hook-server-send-id.test.ts (3 tests) 24ms
+ ✓ |daemon| test/daemon/timeline-emitter-tempfile-guard.test.ts (3 tests) 22ms
+ ✓ |daemon| test/store/context-store-single-owner.test.ts (5 tests) 86ms
+ ✓ |daemon| test/shared/memory-mcp-contracts.test.ts (16 tests) 131ms
+ ✓ |daemon| test/store/session-store-mock-isolation.test.ts (1 test) 28ms
+ ✓ |daemon| test/daemon/file-transfer-upload-registry-recovery.test.ts (1 test) 42ms
+ ✓ |daemon| test/shared/remote-desktop-access.test.ts (64 tests) 36ms
+ ✓ |daemon| test/daemon/codex-watcher-bootstrap.test.ts (3 tests) 23ms
+ ✓ |daemon| test/shared/metrics.test.ts (5 tests) 18ms
+ ✓ |daemon| test/store/context-store-worker-client.test.ts (13 tests) 48ms
+ ✓ |daemon| test/daemon/cursor-mcp-config.test.ts (2 tests) 152ms
+ ✓ |daemon| test/daemon/machine-mcp-deps.test.ts (27 tests) 21ms
+ ✓ |daemon| test/daemon/execution-clone.test.ts (76 tests) 14ms
+ ✓ |daemon| test/daemon/cron-executor-send.test.ts (3 tests) 49ms
+ ✓ |daemon| test/shared/p2p-workflow-compiler.test.ts (8 tests) 13ms
+ ✓ |daemon| test/daemon/command-handler-stop.test.ts (8 tests) 23ms
+ ✓ |daemon| test/daemon/transport-drain-awaited.test.ts (5 tests) 30ms
+ ✓ |daemon| test/daemon/p2p-workflow-discussion-offsets.test.ts (6 tests) 12ms
+ ✓ |daemon| test/daemon/transport-resend-preservation.test.ts (2 tests) 11ms
+ ✓ |daemon| test/daemon/oc-streaming-integration.test.ts (6 tests) 41ms
+ ✓ |daemon| test/daemon/peer-audit-result.test.ts (2 tests) 13ms
+ ✓ |daemon| test/daemon/timeline-replay.test.ts (8 tests) 37ms
+ ✓ |daemon| test/shared/transport-queue-reducer.test.ts (12 tests) 27ms
+ ✓ |daemon| test/daemon/peer-audit-candidates.test.ts (22 tests) 12ms
+ ✓ |daemon| test/daemon/session-identity-mcp.test.ts (6 tests) 75ms
+ ✓ |daemon| test/daemon/remote-desktop-consent-provider.test.ts (27 tests) 14ms
+ ✓ |daemon| test/shared/p2p-workflow-artifacts.test.ts (6 tests) 18ms
+ ✓ |daemon| test/daemon/supervision-audit-envelope-contract.test.ts (10 tests) 11ms
+ ✓ |daemon| test/daemon/subsession-manager-forced-fresh.test.ts (22 tests) 12ms
+ ✓ |daemon| test/daemon/memory-mcp-machine-handlers.test.ts (10 tests) 10ms
+ ✓ |daemon| test/daemon/launch-session-opencode.test.ts (1 test) 18ms
+ ✓ |daemon| test/daemon/session-manager-stop-project.test.ts (4 tests) 16ms
+ ✓ |daemon| test/daemon/verification-machine-mcp.test.ts (4 tests) 11ms
+(node:20715) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |daemon| test/daemon/supervision-intent-ops.test.ts (17 tests) 7ms
+ ✓ |daemon| test/daemon/supervision-compat-shims.test.ts (11 tests) 9ms
+ ✓ |daemon| test/daemon/remote-desktop-privacy-barrier.test.ts (30 tests) 26ms
+ ✓ |daemon| test/daemon/remote-desktop-daemon.test.ts (20 tests) 12ms
+ ✓ |daemon| test/daemon/memory-mcp-resource-budget.test.ts (4 tests) 8ms
+ ✓ |daemon| test/daemon/daemon-upgrade-guard.test.ts (21 tests) 16ms
+ ✓ |daemon| test/daemon/session-manager-restore.test.ts (10 tests) 44ms
+ ✓ |daemon| test/daemon/execution-clone-cap-integrity.test.ts (4 tests) 20ms
+ ✓ |daemon| test/daemon/transport-resend-delivery.test.ts (6 tests) 17ms
+ ✓ |daemon| test/daemon/peer-audit-reply-ingress.test.ts (11 tests) 13ms
+ ✓ |daemon| test/daemon/file-preview-read-coordinator.test.ts (13 tests) 23ms
+ ✓ |daemon| test/shared/p2p-workflow-library.test.ts (29 tests) 12ms
+ ✓ |daemon| test/shared/session-model.test.ts (2 tests) 2ms
+ ✓ |daemon| test/daemon/fs-list-pool.test.ts (6 tests) 7ms
+ ✓ |daemon| test/daemon/remote-desktop-consent-ipc.test.ts (21 tests) 8ms
+ ✓ |daemon| test/daemon/session-dispatch-peer-audit.test.ts (17 tests) 17ms
+ ✓ |daemon| test/daemon/supervisor-defaults-cache.test.ts (1 test) 4ms
+ ✓ |daemon| test/daemon/peer-audit-controller.test.ts (18 tests) 16ms
+ ✓ |daemon| test/daemon/execution-clone-orchestration.test.ts (17 tests) 16ms
+ ✓ |daemon| test/daemon/file-search.test.ts (13 tests) 51ms
+ ✓ |daemon| test/shared/template-prompt-patterns.test.ts (100 tests) 13ms
+ ✓ |daemon| test/shared/webrtc-connectivity.test.ts (9 tests) 12ms
+ ✓ |daemon| test/shared/remote-desktop.test.ts (27 tests) 9ms
+ ✓ |daemon| test/daemon/session-dispatch-delegation.test.ts (6 tests) 44ms
+ ✓ |daemon| test/shared/agent-delegation.test.ts (37 tests) 8ms
+ ✓ |daemon| test/daemon/memory-inject-startup.test.ts (1 test) 11ms
+ ✓ |daemon| test/daemon/terminal-streamer-pipe-grace.test.ts (5 tests) 27ms
+ ✓ |daemon| test/shared/supervision-task-console.test.ts (39 tests) 7ms
+ ✓ |daemon| test/daemon/usage-sync-worker.test.ts (10 tests) 68ms
+ ✓ |daemon| test/daemon/opencode-watcher.test.ts (7 tests) 18ms
+ ✓ |daemon| test/daemon/fs-git-status-pool.test.ts (6 tests) 19ms
+ ✓ |daemon| test/daemon/upgrade-blocked-outbox.test.ts (3 tests) 23ms
+ ✓ |daemon| test/daemon/memory-get-sources-orchestrator.test.ts (13 tests) 37ms
+ ✓ |daemon| test/shared-machine-direct-file-transfer.test.ts (5 tests) 17ms
+ ✓ |daemon| test/shared/supervision-execution-summary.test.ts (12 tests) 8ms
+ ✓ |daemon| test/shared/peer-audit.test.ts (33 tests) 7ms
+ ✓ |daemon| test/daemon/ordered-shutdown.test.ts (3 tests) 10ms
+ ✓ |daemon| test/daemon/file-preview-read-observability.test.ts (2 tests) 10ms
+ ✓ |daemon| test/daemon/file-preview-read-worker.test.ts (7 tests) 5ms
+ ✓ |daemon| test/shared/capability-management.test.ts (9 tests) 11ms
+ ✓ |daemon| test/daemon/peer-audit-reply-pipeline.test.ts (4 tests) 14ms
+ ✓ |daemon| test/daemon/send-list-targets-eligibility.test.ts (4 tests) 4ms
+ ✓ |daemon| test/shared/custom-provider-sdk-agent-types.test.ts (3 tests) 6ms
+ ✓ |daemon| test/daemon/session-restoration.test.ts (8 tests) 9ms
+ ✓ |daemon| test/daemon/verification-machine-client.test.ts (2 tests) 8ms
+ ✓ |daemon| test/shared/tab-sharing.test.ts (14 tests) 7ms
+ ✓ |daemon| test/daemon/well-known-directories.test.ts (41 tests) 6ms
+ ✓ |daemon| test/daemon/session-restart-mcp.test.ts (5 tests) 6ms
+ ✓ |daemon| test/shared/supervision-execution-pool.test.ts (28 tests) 7ms
+ ✓ |daemon| test/daemon/openspec-auto-deliver-orchestrator.test.ts (91 tests) 83279ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > sends launch ack before collecting the implementation product baseline  2625ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > queues a marker reminder and stale recovery when implementation stays busy without writing the marker  335ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > keeps one implementation prompt active while tasks remain unchecked and no completed marker exists  1413ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle  392ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > dispatches final acceptance scoring instead of stopping early when implementation prompt budget is spent  1656ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > escalates to needs_human after too many idle reminders without a completion marker  303ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > does not exhaust the marker reminder cap while a slow session has not answered the implementation prompt yet  1003ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in  2159ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > runs the Standard preset from spec audit through implementation audit PASS  2358ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > advances spec repair to final acceptance when the repair idle event is missed  1207ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > builds Team audit prompts from canonical OpenSpec templates and final acceptance prompts with authoritative metadata  2404ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > feeds final audit PASS safety failures back into implementation repair  1770ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > keeps spec audit REWORK in audit repair instead of advancing to implementation  1121ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > inlines the previous spec acceptance audit required_changes into the next spec repair prompt  1132ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > starts another Team audit only after final acceptance says previous spec repairs are complete but still insufficient  1175ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > does not start another Team audit after final implementation acceptance PASS with perfect scores  1288ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > does not start another spec Team round after final spec acceptance PASS with acceptable scores  1119ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > stops for human input when spec audit reports BLOCKED  1101ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > feeds implementation audit REWORK back into implementation repair before re-auditing  1260ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > feeds low implementation audit scores back into implementation repair  1416ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > queues final acceptance audit prompts for resend when transport runtime is not initialized  1228ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > nudges stale active transport turns when a final acceptance audit prompt is queued  1251ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > drops stale queued Auto Deliver implementation prompts once final acceptance passes  1543ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > does not continue implementation after final acceptance PASS when changed-file coverage is documented outside repairs_applied  2161ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > removes stale runtime-pending Auto Deliver implementation prompts once final acceptance passes  1375ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > feeds final acceptance REWORK back into implementation repair before extending audit rounds  1493ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > continues implementation repair on fixable work even when external blocked_items are also listed  1295ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > hands off to a human only when no fixable work remains and external blockers persist  1332ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > does not let an in-flight idle advance send into the next test after test cleanup  2328ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > delivers (passed) when the only unchecked tasks are accepted external/deferred gates  1449ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > starts another Team implementation audit only after final acceptance says previous repairs are complete but still low scoring  1691ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > keeps valid missing authoritative result files classified as missing JSON  1332ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > requests authoritative result file repair before consuming another audit-repair round  1557ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > continues after a final acceptance result-file repair even when the idle event is missed  1446ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > consumes a valid final acceptance result file even while the transport runtime still reports busy  1563ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > consumes one final acceptance result only once when duplicate idle events race  1630ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > requests authoritative result file repair for verdict payload format errors  1664ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > requires repair_completion before consuming a final acceptance result  1412ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > keeps result-file repair prompts stage-scoped for spec audit repair  1191ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > keeps retrying final acceptance result-file repair instead of prompting for human input  2692ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > ignores stale idle events while final acceptance result-file prompts are still running  1916ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > stops for human input when implementation audit reports BLOCKED  1556ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > rejects stale metadata and malformed or missing authoritative result files  5320ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > rejects authoritative result files that symlink outside .imc/discussions  1348ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > rejects .imc/discussions directory symlink escapes with the same invalid-path classification  1425ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > ignores discussion JSON when the authoritative result file is missing  1576ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > uses an authoritative result file larger than the generic P2P summary tail  1561ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > surfaces wrapper P2P failures instead of misreporting missing authoritative JSON  1312ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > proceeds to repair + scoring on a post-summary execution-gate failure instead of audit_p2p_failed  1258ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > proceeds to repair + scoring when the audit discussion times out (a hop ran out of its time box)  1270ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > ignores late audit results after stop terminalization and releases the P2P lock  1115ms
+   ✓ OpenSpec Auto Deliver daemon orchestrator > denies non-participant sibling stop and preserves terminal status on late stop  1807ms
+ ✓ |daemon| test/daemon/jsonl-parse-core.test.ts (15 tests) 6ms
+ ✓ |daemon| test/daemon/execution-clone-admission.test.ts (6 tests) 8ms
+ ✓ |daemon| test/daemon/service-recovery.test.ts (16 tests) 31ms
+ ✓ |daemon| test/daemon/terminal-streamer-stale-pane.test.ts (3 tests) 6ms
+ ✓ |daemon| test/shared/direct-file-transfer-v2.test.ts (17 tests) 8ms
+ ✓ |daemon| test/daemon/gemini-stable-id.test.ts (1 test) 4ms
+ ✓ |daemon| test/daemon/command-handler-ack-contract.test.ts (1 test) 8ms
+ ✓ |daemon| test/daemon/session-bootstrap.test.ts (6 tests) 7ms
+ ✓ |daemon| test/daemon/ack-outbox.test.ts (2 tests) 11ms
+ ✓ |daemon| test/agent/priority-preserving-context-cap.test.ts (23 tests) 6ms
+ ✓ |daemon| test/daemon/session-identity-client.test.ts (3 tests) 6ms
+ ✓ |daemon| test/daemon/memory-mcp-caller.test.ts (4 tests) 3ms
+ ✓ |daemon| test/daemon/fs-list-worker.test.ts (2 tests) 7ms
+ ✓ |daemon| test/shared/alias-expand.test.ts (29 tests) 32ms
+ ✓ |daemon| test/shared/openspec-auto-deliver.test.ts (15 tests) 43ms
+ ✓ |daemon| test/daemon/worker-session-sync-retrier.test.ts (3 tests) 6ms
+ ✓ |daemon| test/daemon/provider-sessions.test.ts (5 tests) 14ms
+ ✓ |daemon| test/daemon/terminal-parser.test.ts (26 tests) 7ms
+ ✓ |daemon| test/agent/provider-context-routing.test.ts (8 tests) 3ms
+ ✓ |daemon| test/daemon/p2p-behavioral.test.ts (29 tests) 41ms
+ ✓ |daemon| test/daemon/p2p-config-mode.test.ts (59 tests) 23ms
+ ✓ |daemon| test/shared/p2p-workflow-validators.test.ts (15 tests) 5ms
+ ✓ |daemon| test/daemon/file-change-normalizer.test.ts (12 tests) 94ms
+ ✓ |daemon| test/shared/sdk-subagent-status.test.ts (11 tests) 5ms
+ ✓ |daemon| test/daemon/memory-scoring.test.ts (21 tests) 10ms
+ ✓ |daemon| test/shared/direct-file-transfer-ipc-limits.test.ts (21 tests) 9ms
+ ✓ |daemon| test/shared/windows-authenticode-enrollment.test.ts (2 tests) 5ms
+ ✓ |daemon| test/shared/p2p-workflow-script.test.ts (10 tests) 4ms
+ ✓ |daemon| test/daemon/shared-machine-authority-client.test.ts (2 tests) 5ms
+ ✓ |daemon| test/daemon/master-compaction-registry.test.ts (6 tests) 5ms
+ ✓ |daemon| test/store/session-state-probe-events.test.ts (4 tests) 5ms
+ ✓ |daemon| test/daemon/file-preview-read-response.test.ts (5 tests) 4ms
+ ✓ |daemon| test/shared/p2p-workflow-protocol.test.ts (7 tests) 5ms
+ ✓ |daemon| test/daemon/disk-usage.test.ts (5 tests) 8ms
+ ✓ |daemon| test/shared/delegation-claim.test.ts (28 tests) 5ms
+ ✓ |daemon| test/daemon/backend-authored-context.test.ts (3 tests) 3ms
+ ✓ |daemon| test/daemon/file-preview-policy.test.ts (19 tests) 4ms
+ ✓ |daemon| test/daemon/peer-audit-process-injector.test.ts (12 tests) 5ms
+ ✓ |daemon| test/shared/transport-identity-scrub.test.ts (11 tests) 3ms
+ ✓ |daemon| test/shared/p2p-advanced.test.ts (14 tests) 4ms
+ ✓ |daemon| test/daemon/alias-audit.test.ts (13 tests) 11ms
+ ✓ |daemon| test/daemon/p2p-workflow-allowlist-loader.test.ts (12 tests) 7ms
+ ✓ |daemon| test/daemon/p2p-adapter-topology.test.ts (11 tests) 4ms
+ ✓ |daemon| test/shared-machine-reference.test.ts (12 tests) 6ms
+ ✓ |daemon| test/daemon/transport-types.test.ts (27 tests) 5ms
+ ✓ |daemon| test/daemon/session-identity-sync.test.ts (4 tests) 5ms
+ ✓ |daemon| test/daemon/memory-mcp-hook-authority-taxonomy.test.ts (6 tests) 16ms
+ ✓ |daemon| test/shared/alias-types.test.ts (13 tests) 6ms
+ ✓ |daemon| test/daemon/memory-mcp-daemon-worker-proxy.test.ts (1 test) 7ms
+ ✓ |daemon| test/shared/supervision-audit-handoff.test.ts (23 tests) 38ms
+ ✓ |daemon| test/daemon/lifecycle-display.test.ts (7 tests) 19ms
+ ✓ |daemon| test/shared/test-session-guard.test.ts (4 tests) 4ms
+ ✓ |daemon| test/daemon/subsession-sync.test.ts (1 test) 4ms
+ ✓ |daemon| test/daemon/file-preview-read-shutdown.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/controlled-node-identity.test.ts (17 tests) 5ms
+ ✓ |daemon| test/daemon/transport-queued-events-bug3.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/execution-clone.test.ts (20 tests) 4ms
+ ✓ |daemon| test/daemon/file-preview-classifier.test.ts (11 tests) 18ms
+ ✓ |daemon| test/shared/mcp-machine-tool-gate.test.ts (9 tests) 35ms
+ ✓ |daemon| test/shared/session-activity-types.test.ts (13 tests) 4ms
+ ✓ |daemon| test/shared/session-group-clone.test.ts (7 tests) 4ms
+ ✓ |daemon| test/daemon/lifecycle-startup-persist-failure.test.ts (2 tests) 22ms
+ ✓ |daemon| test/daemon/oc-session-sync.test.ts (25 tests) 4ms
+ ✓ |daemon| test/shared/preview-ws-types.test.ts (27 tests) 6ms
+ ✓ |daemon| test/daemon/p2p-script-runner-sandbox.test.ts (33 tests) 4ms
+ ✓ |daemon| test/daemon/peer-audit-baseline.test.ts (17 tests) 4ms
+ ✓ |daemon| test/daemon/systemd-unit-template.test.ts (19 tests) 8ms
+ ✓ |daemon| test/shared/timeline-merge.test.ts (15 tests) 4ms
+ ✓ |daemon| test/daemon/backend-context-namespace.test.ts (2 tests) 3ms
+ ✓ |daemon| test/shared/windows-release-publisher-trust.test.ts (16 tests) 3ms
+ ✓ |daemon| test/daemon/supervision-i18n.test.ts (8 tests) 2ms
+ ✓ |daemon| test/shared/computer-use.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/session-resource-service.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/supervision-id-minter.test.ts (10 tests) 4ms
+ ✓ |daemon| test/shared/remote-desktop-platform.test.ts (20 tests) 12ms
+ ✓ |daemon| test/daemon/execution-routing-injection.test.ts (10 tests) 29ms
+ ✓ |daemon| test/shared/transport-types-contract.test.ts (24 tests) 7ms
+ ✓ |daemon| test/shared/p2p-workflow-logic-evaluator.test.ts (17 tests) 4ms
+ ✓ |daemon| test/shared-computer-use.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/embedding-semantic.test.ts (9 tests) 4ms
+ ✓ |daemon| test/shared-context-runtime-config.test.ts (18 tests) 3ms
+ ✓ |daemon| test/shared/wire-protocol-contract.test.ts (4 tests) 4ms
+ ✓ |daemon| test/shared/sanitize-project-name.test.ts (7 tests) 4ms
+ ✓ |daemon| test/daemon/session-close.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/execution-clone-lifecycle.test.ts (3 tests) 7ms
+ ✓ |daemon| test/daemon/auto-upgrade-cooldown.test.ts (12 tests) 4ms
+ ✓ |daemon| test/daemon/service-recovery-runner.test.ts (9 tests) 4ms
+ ✓ |daemon| test/daemon/codex-quota-refresh.test.ts (2 tests) 3ms
+ ✓ |daemon| test/shared/recall-cap-rule.test.ts (15 tests) 40ms
+ ✓ |daemon| test/daemon/execution-clone-limits-resolver.test.ts (10 tests) 3ms
+ ✓ |daemon| test/daemon/execution-clone-launch-boundary.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/file-preview-read-fanout.test.ts (4 tests) 3ms
+ ✓ |daemon| test/daemon/structured-session-bootstrap.test.ts (4 tests) 5ms
+ ✓ |daemon| test/daemon/timeline-detail-store.test.ts (2 tests) 4ms
+ ✓ |daemon| test/shared-file-transfer-controlled.test.ts (5 tests) 3ms
+ ✓ |daemon| test/shared/audit-convergence.test.ts (4 tests) 3ms
+ ✓ |daemon| test/shared/session-control-commands.test.ts (5 tests) 6ms
+ ✓ |daemon| test/daemon/p2p-launch-admission.test.ts (5 tests) 5ms
+ ✓ |daemon| test/shared/p2p-workflow-redaction.test.ts (2 tests) 4ms
+ ✓ |daemon| test/daemon/fs-git-status-worker.test.ts (4 tests) 5ms
+ ✓ |daemon| test/shared/git-remote-url.test.ts (4 tests) 3ms
+ ✓ |daemon| test/shared/models-options.test.ts (8 tests) 3ms
+ ✓ |daemon| test/shared/remote-desktop-platform-adapters.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/cron-types.test.ts (12 tests) 3ms
+ ✓ |daemon| test/shared/daemon-upgrade.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/password-rules.test.ts (8 tests) 4ms
+ ✓ |daemon| test/daemon/transport-relay-usage-payload.test.ts (5 tests) 3ms
+ ✓ |daemon| test/daemon/file-preview-read-admission.test.ts (6 tests) 4ms
+ ✓ |daemon| test/daemon/context-model-config.test.ts (7 tests) 2ms
+ ✓ |daemon| test/store/source-id-merge.test.ts (1 test) 3ms
+ ✓ |daemon| test/daemon/execution-routing-appendix.test.ts (9 tests) 8ms
+ ✓ |daemon| test/daemon/backend-runtime-config.test.ts (1 test) 9ms
+ ✓ |daemon| test/daemon/file-preview-read-cache-facade.test.ts (7 tests) 3ms
+ ✓ |daemon| test/daemon/provider-routing.test.ts (6 tests) 2ms
+ ✓ |daemon| test/daemon/supervision-brain-authority.test.ts (3 tests) 2ms
+ ✓ |daemon| test/daemon/suppress-sqlite-warning.test.ts (2 tests) 3ms
+ ✓ |daemon| test/daemon/daemon-task-admission.test.ts (2 tests) 2ms
+ ✓ |daemon| test/shared/transport-queue-privacy.test.ts (3 tests) 3ms
+ ✓ |daemon| test/daemon/daemon-task-admission-record-only.test.ts (3 tests) 7ms
+ ✓ |daemon| test/shared/timeline-recoverable-errors.test.ts (5 tests) 2ms
+ ✓ |daemon| test/shared/p2p-workflow-validators-fieldpath.test.ts (6 tests) 6ms
+ ✓ |daemon| test/shared/p2p-execution-marker.test.ts (7 tests) 3ms
+ ✓ |daemon| test/shared/controlled-node-ticket-delivery.test.ts (4 tests) 5ms
+ ✓ |daemon| test/daemon/session-file-read-grants.test.ts (3 tests) 4ms
+ ✓ |daemon| test/daemon/upgrade-deferral-backstop.test.ts (6 tests) 2ms
+ ✓ |daemon| test/shared/html-preview.test.ts (19 tests) 5ms
+ ✓ |daemon| test/shared/p2p-workflow-prompt.test.ts (4 tests) 2ms
+ ✓ |daemon| test/shared/user-session-text-caps.test.ts (7 tests) 2ms
+ ✓ |daemon| test/daemon/direct-file-transfer-ice.test.ts (2 tests) 2ms
+ ✓ |daemon| test/daemon/watcher-claiming.test.ts (6 tests) 2ms
+ ✓ |daemon| test/daemon/project-path-key.test.ts (9 tests) 2ms
+ ✓ |daemon| test/shared/memory-noise-patterns.test.ts (2 tests) 2ms
+ ✓ |daemon| test/daemon/memory-projection-owner-cache.test.ts (6 tests) 2ms
+ ✓ |daemon| test/shared/memory-mcp-errors.test.ts (2 tests) 3ms
+ ✓ |daemon| test/daemon/p2p-workflow-launch-wiring.test.ts (3 tests) 2ms
+ ✓ |daemon| test/daemon/p2p-memory-filter.test.ts (5 tests) 3ms
+ ✓ |daemon| test/shared/imcodes-version-channel.test.ts (5 tests) 2ms
+ ✓ |daemon| test/shared/p2p-workflow-materialize.test.ts (2 tests) 6ms
+ ✓ |daemon| test/daemon/p2p-prototype-pollution.test.ts (7 tests) 4ms
+ ✓ |daemon| test/shared/clock-sync.test.ts (8 tests) 2ms
+ ✓ |daemon| test/shared/session-display.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/session-scope.test.ts (3 tests) 3ms
+ ✓ |daemon| test/shared/daemon-machine-list-contract.test.ts (4 tests) 4ms
+ ✓ |daemon| test/shared/memory-eligible-event.test.ts (11 tests) 7ms
+ ✓ |daemon| test/shared/timeline-delivery-telemetry.test.ts (5 tests) 2ms
+ ✓ |daemon| test/shared/request-failure.test.ts (3 tests) 4ms
+ ✓ |daemon| test/shared/send-message-id.test.ts (3 tests) 17ms
+ ✓ |daemon| test/daemon/shared-machine-authority-context.test.ts (3 tests) 2ms
+ ✓ |daemon| test/daemon/cgroup-validation-probes.test.ts (3 tests | 1 skipped) 2ms
+ ✓ |daemon| test/shared/openspec-prompt-templates.test.ts (2 tests) 2ms
+ ✓ |daemon| test/shared/memory-mcp-provenance.test.ts (2 tests) 8ms
+ ✓ |daemon| test/daemon/command-handler-opencode-history.test.ts (5 tests) 2ms
+ ✓ |daemon| test/shared/memory-mcp-env.test.ts (1 test) 3ms
+ ✓ |daemon| test/shared-agent-types.test.ts (2 tests) 2ms
+ ✓ |daemon| test/daemon/lifecycle-context-store-startup-order.test.ts (1 test) 4ms
+ ✓ |daemon| test/shared/fs-transport-contract.test.ts (2 tests) 2ms
+ ✓ |daemon| test/shared/platform-types-contract.test.ts (2 tests) 2ms
+ ✓ |daemon| test/shared/terminal-transport-contract.test.ts (2 tests) 2ms
+ ✓ |daemon| test/shared/alias-memory-isolation.test.ts (3 tests) 3ms
+ ↓ |daemon| test/daemon/p2p-workflow-script.test.ts (16 tests | 16 skipped)
+ ✓ |daemon| test/daemon/session-type-switch.test.ts (2 tests) 2ms
+ ✓ |daemon| test/daemon/upgrade-toolchain-check.test.ts (5 tests) 2ms
+ ✓ |daemon| test/daemon/jsonl-watcher.test.ts (49 tests) 111382ms
+   ✓ parseLine — event type coverage > emits assistant.text for text blocks  2714ms
+   ✓ parseLine — event type coverage > emits assistant.thinking for thinking blocks  2721ms
+   ✓ parseLine — event type coverage > emits tool.call for tool_use blocks  2721ms
+   ✓ parseLine — event type coverage > emits user.message for user text blocks  2733ms
+   ✓ parseLine — event type coverage > emits user.message for string-form user content used by real CC transcripts  2713ms
+   ✓ parseLine — event type coverage > emits tool.result for tool_result blocks  2704ms
+   ✓ parseLine — event type coverage > emits tool.result with error for error tool_results  2710ms
+   ✓ parseLine — event type coverage > emits usage.update for result events with cost  2711ms
+   ✓ parseLine — event type coverage > emits agent.status for compact_boundary system events  2705ms
+   ✓ parseLine — event type coverage > emits agent.status for bash_progress  2705ms
+   ✓ parseLine — event type coverage > emits ask.question for AskUserQuestion tool_use  2704ms
+   ✓ parseLine — event type coverage > handles multi-block assistant turns (text + tool_use)  2707ms
+   ✓ parseLine — event type coverage > emits usage.update with token counts from assistant messages  2706ms
+   ✓ parseLine — event type coverage > ignores invalid JSON lines gracefully  2708ms
+   ✓ parseLine — event type coverage > ignores empty/whitespace lines  2705ms
+   ✓ extractToolInput — tool-specific input extraction > extracts command from Bash tool  2712ms
+   ✓ extractToolInput — tool-specific input extraction > extracts file_path from Read tool  2706ms
+   ✓ extractToolInput — tool-specific input extraction > extracts pattern from Glob tool  2711ms
+   ✓ extractToolInput — tool-specific input extraction > extracts pattern+path from Grep tool  2707ms
+   ✓ extractToolInput — tool-specific input extraction > extracts description from Agent tool  2713ms
+   ✓ file.change emission > emits hidden raw tool events and a visible file.change for Claude Edit  2710ms
+   ✓ file.change emission > preserves repeated patches for the same file within a MultiEdit batch  2705ms
+   ✓ file.change emission > does not emit file.change when Claude file identity is missing  2709ms
+   ✓ file.change emission > keeps raw Claude tool rows visible when the deferred file tool errors  2713ms
+   ✓ drainNewLines — partial line handling > does NOT lose data when file write splits a JSON line across drains  4557ms
+   ✓ drainNewLines — partial line handling > handles multiple complete lines followed by a partial  4558ms
+   ✓ startWatchingFile — timeout cleanup > cleans up phantom watcher when file never appears  1002ms
+   ✓ startWatchingFile — timeout cleanup > succeeds when file appears within timeout  1006ms
+   ✓ watcher status tracking > transitions from waiting_for_file to active  304ms
+   ✓ watcher status tracking > returns stopped/null after stopWatching  304ms
+   ✓ claim management > preClaimFile prevents other sessions from claiming the same file  304ms
+   ✓ claim management > stopWatching releases claims  303ms
+   ✓ stable eventId generation > generates deterministic eventIds based on byte offset  617ms
+   ✓ stable eventId generation > produces same eventIds on re-read (daemon restart simulation)  635ms
+   ✓ progress event subtypes > emits agent.status for agent_progress  2727ms
+   ✓ progress event subtypes > emits agent.status for mcp_progress started  2718ms
+   ✓ progress event subtypes > emits agent.status for waiting_for_task  2714ms
+   ✓ system-injected message filtering > filters <task-notification> and emits agent.status processing instead  2717ms
+   ✓ system-injected message filtering > filters <system-reminder> and emits agent.status processing instead  2710ms
+   ✓ system-injected message filtering > filters <command-name> slash commands  2705ms
+   ✓ system-injected message filtering > filters <local-command-caveat> local commands  2705ms
+   ✓ system-injected message filtering > filters <bash-input> / <bash-stdout> / <bash-stderr>  2707ms
+   ✓ system-injected message filtering > filters <command-message> tags  2704ms
+   ✓ system-injected message filtering > filters string-form user content with system tags  2703ms
+   ✓ system-injected message filtering > does NOT filter normal user messages  2704ms
+   ✓ system-injected message filtering > does NOT filter user messages that mention XML tags in natural text  2704ms
+
+ Test Files  436 passed | 1 skipped (437)
+      Tests  6704 passed | 23 skipped (6727)
+   Start at  01:38:29
+   Duration  112.47s (transform 14.41s, setup 15.53s, collect 163.85s, tests 544.32s, environment 53ms, prepare 37.52s)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+exit=0

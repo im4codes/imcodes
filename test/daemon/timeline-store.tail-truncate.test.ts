@@ -6,6 +6,7 @@ import { tmpdir } from 'os';
 describe('timeline-store truncate', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalImcodesHome = process.env.IMCODES_HOME;
   let tempHome: string | null = null;
   let importedProjection: typeof import('../../src/daemon/timeline-projection.js').timelineProjection | null = null;
 
@@ -20,14 +21,17 @@ describe('timeline-store truncate', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
   });
 
-  it('keeps the newest lines without readFileSync on oversized history files', async () => {
+  it('keeps conversation records ahead of status noise without readFileSync', async () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-store-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
 
     vi.doMock('fs', async () => {
       const actual = await vi.importActual<typeof import('fs')>('fs');
@@ -47,8 +51,15 @@ describe('timeline-store truncate', () => {
     const filePath = join(tempHome, '.imcodes', 'timeline', 'oversized_session.jsonl');
     mkdirSync(join(tempHome, '.imcodes', 'timeline'), { recursive: true });
     const lines = Array.from({ length: 6002 }, (_, index) => JSON.stringify({
+      eventId: `oversized-${index}`,
+      sessionId: 'oversized_session',
+      ts: index,
       seq: index,
-      payload: 'x'.repeat(512),
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: index === 4 ? 'user.message' : index === 5 ? 'assistant.text' : 'agent.status',
+      payload: index === 4 || index === 5 ? { text: `conversation-${index}` } : 'x'.repeat(512),
     }));
     writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
 
@@ -56,14 +67,23 @@ describe('timeline-store truncate', () => {
 
     const kept = readFileSync(filePath, 'utf8').trimEnd().split('\n');
     expect(kept).toHaveLength(5000);
-    expect(JSON.parse(kept[0]!).seq).toBe(1002);
+    expect(kept.map((line) => JSON.parse(line).seq)).toEqual(expect.arrayContaining([4, 5]));
+    expect(kept.some((line) => JSON.parse(line).seq === 0)).toBe(false);
     expect(JSON.parse(kept[kept.length - 1]!).seq).toBe(6001);
+
+    const projectedConversation = await timelineStore.readByTypesPreferred(
+      'oversized_session',
+      ['user.message', 'assistant.text'],
+      { limit: 10 },
+    );
+    expect(projectedConversation.map((event) => event.seq)).toEqual([4, 5]);
   });
 
   it('reads the tail of oversized timeline history and reports the latest event from the tail', async () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-store-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
 
     const [{ timelineStore }, { timelineProjection }] = await Promise.all([
       import('../../src/daemon/timeline-store.js'),

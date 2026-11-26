@@ -1,5 +1,39 @@
 import type { ToolCallDetail } from './agent-message.js';
 import type { ToolCallEvent } from './agent-message.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+  type CodexLifecycleEvidenceSource,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from './session-activity-types.js';
+import {
+  boundNativeCollaborationRequestText,
+  classifyNativeCollaborationRequest,
+  formatNativeCollaborationSignals,
+  readNativeCollaborationClassification,
+  type NativeCollaborationParticipation,
+} from './native-collaboration-policy.js';
+
+const FULL_REQUEST_KEYS = ['full_request', 'fullRequest', 'prompt', 'description', 'instruction', 'instructions', 'message', 'task'] as const;
+
+/**
+ * The untruncated native agent request, for policy classification only.
+ *
+ * Provider display helpers cap prompts (Codex at 160 characters, the safe
+ * detail at 240), which would hide task wording that appears later in the
+ * request. An oversized request keeps its head AND tail and stays marked as
+ * truncated for the classifier, so a trailing directive is never cut off.
+ * Callers pass this as `input.fullRequest`; it is never persisted.
+ */
+export function readSdkSubagentFullRequest(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) return undefined;
+  for (const key of FULL_REQUEST_KEYS) {
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    return boundNativeCollaborationRequestText(value);
+  }
+  return undefined;
+}
 
 export const SDK_SUBAGENT_DETAIL_KIND = 'sdkSubagent' as const;
 export const SDK_SUBAGENT_SCHEMA_VERSION = 1 as const;
@@ -8,7 +42,9 @@ export const SDK_SUBAGENT_PROVIDERS = {
   CLAUDE_CODE_SDK: 'claude-code-sdk',
   CODEX_SDK: 'codex-sdk',
   QWEN: 'qwen',
-  GEMINI_SDK: 'gemini-sdk',
+  GROK_SDK: 'grok-sdk',
+  AGY_SDK: 'agy-sdk',
+  MUSE_CODE_SDK: 'muse-code-sdk',
 } as const;
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
@@ -16,8 +52,21 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CLAUDE_RUNTIME_AGENT: 'claudeRuntimeAgent',
   CODEX_COLLAB_AGENT: 'codexCollabAgent',
   CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
+  CODEX_RUNTIME_SHELL: 'codexRuntimeShell',
   QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
-  GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
+  GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
+  AGY_RUNTIME_AGENT: 'agyRuntimeAgent',
+  MUSE_RUNTIME_AGENT: 'museRuntimeAgent',
+} as const;
+
+export const SDK_SUBAGENT_TASK_TYPES = {
+  LOCAL_BASH: 'local_bash',
+  LOCAL_AGENT: 'local_agent',
+  AGENT: 'agent',
+} as const;
+
+export const SDK_SUBAGENT_ACTIONS = {
+  CODEX_BACKGROUND_SHELL: 'codex-background-shell',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {
@@ -38,6 +87,7 @@ export const SDK_SUBAGENT_DIAGNOSTIC = {
   UNKNOWN_STATE: 'unknownState',
   STALE_WITHOUT_TERMINAL: 'staleWithoutTerminal',
   SNAPSHOT_ONLY: 'snapshotOnly',
+  QODER_LIFECYCLE_UNPROVEN: 'qoderLifecycleUnproven',
 } as const;
 
 export const SDK_SUBAGENT_TERMINAL_RETENTION_MS = 300_000;
@@ -51,6 +101,10 @@ export const SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES = 4096;
 export const SDK_SUBAGENT_CANONICAL_KEY_MAX_LENGTH = 192;
 export const SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH = 48;
 export const SDK_SUBAGENT_MAX_CHILD_COUNT = 999;
+export const SDK_SUBAGENT_WAKE_BATCH_MAX_ITEMS = 16;
+export const SDK_SUBAGENT_WAKE_PROMPT_HEADER = '# IM.codes background subagent completion' as const;
+export const SDK_SUBAGENT_WAKE_CLIENT_MESSAGE_PREFIX = 'sdk-subagent-wake' as const;
+export const SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS = 4_102_444_800_000; // 2100-01-01T00:00:00.000Z
 export const SDK_SUBAGENT_REDACTED_VALUE = '[REDACTED]';
 export const SDK_RUNTIME_SUBAGENT_EVENT_NAMES = [
   'subagent_notification',
@@ -89,6 +143,8 @@ export interface SdkSubagentDetailMeta {
   agentName?: string;
   model?: string;
   taskId?: string;
+  /** Provider-native task category, such as Claude's local_bash/local_agent. */
+  taskType?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
   receiverCount?: number;
@@ -98,7 +154,17 @@ export interface SdkSubagentDetailMeta {
   usageTotalTokens?: number;
   usageToolUses?: number;
   usageDurationMs?: number;
+  /** Stable provider/daemon-observed start timestamp in epoch milliseconds. */
+  startedAtMs?: number;
   diagnosticCode?: SdkSubagentDiagnosticCode;
+  /**
+   * Brain task-participation classification of the native request, computed
+   * once from the FULL prompt before the display preview is truncated. Only
+   * the daemon's Brain enforcement acts on it; it never hides the agent.
+   */
+  taskParticipation?: NativeCollaborationParticipation;
+  /** Comma-separated NATIVE_COLLABORATION_TASK_SIGNALS for `taskParticipation`. */
+  taskParticipationSignals?: string;
 }
 
 export interface SdkSubagentDetail extends ToolCallDetail {
@@ -108,6 +174,8 @@ export interface SdkSubagentDetail extends ToolCallDetail {
     action?: string;
     receiverCount?: number;
     description?: string;
+    /** Untruncated request for policy classification; never kept in the safe projection. */
+    fullRequest?: string;
   };
   output?: string;
   meta: SdkSubagentDetailMeta;
@@ -121,6 +189,7 @@ export type SdkSubagentDetailParseResult =
 
 export interface SdkSubagentSafeDetailOptions {
   allowRaw?: boolean;
+  sessionId?: string;
 }
 
 const PROVIDER_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_PROVIDERS));
@@ -152,6 +221,7 @@ const SAFE_META_NUMBER_KEYS = new Set([
   'usageTotalTokens',
   'usageToolUses',
   'usageDurationMs',
+  'startedAtMs',
 ]);
 const SAFE_META_BOOLEAN_KEYS = new Set(['backgrounded']);
 
@@ -197,8 +267,12 @@ export function makeQwenSubagentCanonicalKey(sessionId: string, itemId: string):
   return normalizeSdkSubagentCanonicalKey(`qwen:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
 }
 
-export function makeGeminiSubagentCanonicalKey(sessionId: string, itemId: string): string {
-  return normalizeSdkSubagentCanonicalKey(`gemini:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+export function makeAgySubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`agy:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeMuseSubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`muse:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
 }
 
 const SDK_RUNTIME_SUBAGENT_TAG_START = '<subagent_notification>';
@@ -219,6 +293,199 @@ export function parseSdkRuntimeSubagentTag(value: string): Record<string, unknow
   }
 }
 
+export interface GenericRuntimeSubagentToolOptions {
+  sessionId: string;
+  provider: SdkSubagentProvider;
+  providerKind: SdkSubagentProviderKind;
+  providerLabel: string;
+  action: string;
+  payload: Record<string, unknown>;
+  fallbackModel?: string;
+}
+
+function nestedRuntimeSubagentRecord(value: Record<string, unknown>): Record<string, unknown> {
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const candidate = value[key];
+    if (!isRecord(candidate)) continue;
+    if (
+      candidate.agent_path !== undefined
+      || candidate.agentPath !== undefined
+      || candidate.agent_id !== undefined
+      || candidate.agentId !== undefined
+      || candidate.status !== undefined
+    ) return candidate;
+  }
+  return value;
+}
+
+/** Provider-neutral normalizer for ACP/runtime subagent notifications. */
+export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentToolOptions): ToolCallEvent | null {
+  const record = nestedRuntimeSubagentRecord(options.payload);
+  const agentPath = sanitizeSdkSubagentText(
+    record.agent_path ?? record.agentPath ?? record.agent_id ?? record.agentId ?? record.id,
+    SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH * 4,
+  );
+  if (!agentPath) return null;
+  const statusValue = record.status ?? options.payload.status;
+  const statusRecord = isRecord(statusValue) ? statusValue : undefined;
+  const rawStatus = sanitizeSdkSubagentText(
+    typeof statusValue === 'string'
+      ? statusValue
+      : statusRecord
+        ? Object.keys(statusRecord)[0]
+        : undefined,
+    80,
+  ) ?? 'unknown';
+  const normalizedRaw = rawStatus.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const output = sanitizeSdkSubagentText(
+    statusRecord ? Object.values(statusRecord)[0] : record.output ?? record.result ?? record.message,
+  );
+  const normalizedStatus: SdkSubagentNormalizedStatus =
+    /^(completed|complete|succeeded|success|done|idle)$/.test(normalizedRaw)
+      ? SDK_SUBAGENT_STATUS.COMPLETE
+      : /^(failed|error|errored)$/.test(normalizedRaw)
+        ? SDK_SUBAGENT_STATUS.ERROR
+        : /^(interrupted|cancelled|canceled|stopped|aborted)$/.test(normalizedRaw)
+          ? SDK_SUBAGENT_STATUS.INTERRUPTED
+          : /^(pending|queued|pending_init)$/.test(normalizedRaw)
+            ? SDK_SUBAGENT_STATUS.PENDING
+            : /^(running|active|in_progress|working)$/.test(normalizedRaw)
+              ? SDK_SUBAGENT_STATUS.RUNNING
+              : SDK_SUBAGENT_STATUS.UNKNOWN;
+  const terminal = normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    || normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
+    || normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED;
+  const active = !terminal && normalizedStatus !== SDK_SUBAGENT_STATUS.UNKNOWN;
+  const backgrounded = record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true;
+  const agentName = sanitizeSdkSubagentText(record.name ?? record.nickname, 80);
+  const model = resolveSdkSubagentModel([
+    record.model,
+    record.Model,
+    record.modelId,
+    record.model_id,
+    record.agentModel,
+    record.agent_model,
+    record.requestedModel,
+    record.requested_model,
+    record.activeModel,
+    record.active_model,
+  ], options.fallbackModel);
+  const prompt = sanitizeSdkSubagentText(record.prompt ?? record.description);
+  const fullRequest = readSdkSubagentFullRequest(record);
+  const canonicalKey = normalizeSdkSubagentCanonicalKey(
+    `${options.provider}:${normalizeSdkSubagentKeyComponent(options.sessionId)}:runtime:${normalizeSdkSubagentKeyComponent(agentPath)}`,
+  );
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: `${options.providerLabel} sub-agent${agentName ? ` ${agentName}` : ''}`,
+    input: {
+      action: options.action,
+      ...(prompt ? { description: prompt } : {}),
+      ...(fullRequest ? { fullRequest } : {}),
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: options.provider,
+      providerKind: options.providerKind,
+      canonicalKey,
+      normalizedStatus,
+      rawStatus,
+      active,
+      terminal,
+      parentSessionId: options.sessionId,
+      agentPath,
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
+      ...(normalizedStatus === SDK_SUBAGENT_STATUS.UNKNOWN ? { diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE } : {}),
+    },
+  });
+  return {
+    id: canonicalKey,
+    name: 'Agent',
+    status: terminal ? (normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+export interface SdkBackgroundShellToolEventOptions {
+  canonicalKey: string;
+  provider: SdkSubagentProvider;
+  providerKind: SdkSubagentProviderKind;
+  parentSessionId: string;
+  parentToolUseId?: string;
+  taskId: string;
+  description: string;
+  status: SdkSubagentNormalizedStatus;
+  startedAtMs?: number;
+  output?: string;
+  action?: string;
+}
+
+/** Provider-neutral builder for backgrounded shell/command subagent panel events. */
+export function buildSdkBackgroundShellToolEvent(options: SdkBackgroundShellToolEventOptions): ToolCallEvent {
+  const active = options.status === SDK_SUBAGENT_STATUS.RUNNING || options.status === SDK_SUBAGENT_STATUS.PENDING;
+  const rawStatus = options.status === SDK_SUBAGENT_STATUS.COMPLETE
+    ? 'completed'
+    : options.status === SDK_SUBAGENT_STATUS.INTERRUPTED
+      ? 'interrupted'
+      : options.status === SDK_SUBAGENT_STATUS.ERROR
+        ? 'error'
+        : options.status === SDK_SUBAGENT_STATUS.PENDING
+          ? 'pending'
+          : 'running';
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: options.description,
+    input: {
+      action: options.action ?? 'background-shell',
+      description: options.description,
+    },
+    ...(options.output !== undefined ? { output: options.output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: options.provider,
+      providerKind: options.providerKind,
+      canonicalKey: options.canonicalKey,
+      normalizedStatus: options.status,
+      rawStatus,
+      active,
+      terminal: !active,
+      parentSessionId: options.parentSessionId,
+      ...(options.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
+      taskId: options.taskId,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      backgrounded: true,
+      ...(options.startedAtMs !== undefined ? { startedAtMs: options.startedAtMs } : {}),
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+  return {
+    id: detail.meta.canonicalKey,
+    name: 'Bash',
+    status: active ? 'running' : options.status === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error',
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+export function isBackgroundedSdkSubagentDetail(value: unknown): boolean {
+  if (!isRecord(value) || value.kind !== SDK_SUBAGENT_DETAIL_KIND) return false;
+  const meta = isRecord(value.meta) ? value.meta : undefined;
+  return meta?.isSdkSubagent === true && meta.backgrounded === true;
+}
+
+export function isBackgroundedSdkSubagentTool(tool: Pick<ToolCallEvent, 'detail'>): boolean {
+  return isBackgroundedSdkSubagentDetail(tool.detail);
+}
+
 export function isSdkRuntimeSubagentEventName(value: unknown): boolean {
   return typeof value === 'string' && RUNTIME_SUBAGENT_EVENT_VALUES.has(value);
 }
@@ -235,9 +502,54 @@ export function sanitizeSdkSubagentText(value: unknown, maxLength = SDK_SUBAGENT
   return redacted.length <= maxLength ? redacted : `${redacted.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+const SUBAGENT_INHERIT_MODEL_RE = /^(?:inherit|default|auto)$/i;
+
+/** Resolves a concrete sub-agent model id from candidate fields, ignoring inherit/default placeholders. */
+export function resolveSdkSubagentModel(
+  candidates: readonly unknown[],
+  fallbackModel?: unknown,
+): string | undefined {
+  for (const candidate of candidates) {
+    const normalized = sanitizeSdkSubagentText(candidate, 120);
+    if (!normalized || SUBAGENT_INHERIT_MODEL_RE.test(normalized)) continue;
+    return normalized;
+  }
+  const fallback = sanitizeSdkSubagentText(fallbackModel, 120);
+  if (!fallback || SUBAGENT_INHERIT_MODEL_RE.test(fallback)) return undefined;
+  return fallback;
+}
+
 function safeFiniteNumber(value: unknown, max = Number.MAX_SAFE_INTEGER): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return Math.max(0, Math.min(Math.floor(value), max));
+}
+
+export function normalizeSdkSubagentStartedAtMs(value: unknown): number | undefined {
+  if (typeof value === 'number') return safeFiniteNumber(value, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS);
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return safeFiniteNumber(numeric, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS);
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? safeFiniteNumber(parsed, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS) : undefined;
+}
+
+export function readSdkSubagentStartedAtMs(record: Record<string, unknown>): number | undefined {
+  for (const key of [
+    'startedAtMs',
+    'started_at_ms',
+    'startedAt',
+    'started_at',
+    'createdAtMs',
+    'created_at_ms',
+    'createdAt',
+    'created_at',
+    'startTime',
+    'start_time',
+  ]) {
+    const value = normalizeSdkSubagentStartedAtMs(record[key]);
+    if (value !== undefined) return value;
+  }
+  return undefined;
 }
 
 function safeMeta(meta: SdkSubagentDetailMeta): SdkSubagentDetailMeta {
@@ -259,7 +571,9 @@ function safeMeta(meta: SdkSubagentDetailMeta): SdkSubagentDetailMeta {
   for (const key of SAFE_META_NUMBER_KEYS) {
     const max = key === 'receiverIndex' || key === 'receiverCount' || key === 'runningChildCount'
       ? SDK_SUBAGENT_MAX_CHILD_COUNT
-      : 1_000_000_000;
+      : key === 'startedAtMs'
+        ? SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS
+        : 1_000_000_000;
     const value = safeFiniteNumber(meta[key], max);
     if (value !== undefined) next[key] = value;
   }
@@ -329,6 +643,22 @@ export function buildSdkSubagentSafeDetail(
   const action = sanitizeSdkSubagentText(inputRecord?.action, 80);
   const receiverCount = safeFiniteNumber(inputRecord?.receiverCount, SDK_SUBAGENT_MAX_CHILD_COUNT);
   const description = sanitizeSdkSubagentText(inputRecord?.description, SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH);
+  // Classify from the untruncated request exactly once. A detail that already
+  // carries a valid classification (re-normalized on the relay, replayed from
+  // history) keeps it: the preview below is truncated, and re-classifying it
+  // could silently downgrade a task request to analysis.
+  const priorClassification = readNativeCollaborationClassification(
+    detail.meta?.taskParticipation,
+    detail.meta?.taskParticipationSignals,
+  );
+  // `fullRequest` is classification-only input and is deliberately dropped from
+  // the safe projection below; `description` is the fallback for callers whose
+  // description is already the whole request.
+  const fullRequest = typeof inputRecord?.fullRequest === 'string'
+    ? inputRecord.fullRequest
+    : typeof inputRecord?.description === 'string' ? inputRecord.description : undefined;
+  const classification = priorClassification
+    ?? (fullRequest && fullRequest.trim() ? classifyNativeCollaborationRequest(fullRequest) : undefined);
   const safeInput = action !== undefined || receiverCount !== undefined || description !== undefined
     ? {
         ...(action !== undefined ? { action } : {}),
@@ -341,7 +671,13 @@ export function buildSdkSubagentSafeDetail(
     ...(summary !== undefined ? { summary } : {}),
     ...(safeInput ? { input: safeInput } : {}),
     ...(output !== undefined ? { output } : {}),
-    meta: safeMeta(detail.meta),
+    meta: {
+      ...safeMeta(detail.meta),
+      ...(classification ? {
+        taskParticipation: classification.participation,
+        taskParticipationSignals: formatNativeCollaborationSignals(classification.signals),
+      } : {}),
+    },
     ...(options.allowRaw && detail.raw !== undefined ? { raw: sanitizeSdkSubagentRawValue(detail.raw) } : {}),
   };
 }
@@ -363,6 +699,9 @@ export function buildSdkSubagentMinimalReplayDetail(detail: SdkSubagentDetail): 
       ...(safe.meta.diagnosticCode ? { diagnosticCode: safe.meta.diagnosticCode } : {}),
       ...(typeof safe.meta.receiverCount === 'number' ? { receiverCount: safe.meta.receiverCount } : {}),
       ...(typeof safe.meta.runningChildCount === 'number' ? { runningChildCount: safe.meta.runningChildCount } : {}),
+      ...(typeof safe.meta.startedAtMs === 'number' ? { startedAtMs: safe.meta.startedAtMs } : {}),
+      ...(safe.meta.agentName ? { agentName: safe.meta.agentName } : {}),
+      ...(safe.meta.model ? { model: safe.meta.model } : {}),
       ...(safe.meta.rawStatus ? { rawStatus: safe.meta.rawStatus } : {}),
       ...(safe.meta.childStatusSummary ? { childStatusSummary: safe.meta.childStatusSummary } : {}),
     },
@@ -387,10 +726,36 @@ export function buildSdkSubagentTimelinePayload(
       },
     };
   }
+  const terminalStatus = (tool.terminalStatus ?? (tool.status === 'error' ? 'errored' : 'succeeded')) as ToolTerminalStatus;
+  const terminalReason = (tool.terminalReason ?? (tool.status === 'error' ? 'provider_error' : 'provider_result')) as ToolTerminalReason;
+  const lifecycleMetadata = options.sessionId
+    ? buildCodexLifecycleTerminalMetadata({
+      sessionId: options.sessionId,
+      terminalStatus,
+      terminalReason,
+      synthetic: tool.terminalSynthetic ?? false,
+      source: (tool.terminalSource ?? 'app_server_jsonrpc') as CodexLifecycleEvidenceSource,
+      decisionReason: tool.terminalDecisionReason ?? terminalReason,
+      ...(tool.terminalIdempotencyKey ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      toolCallId: tool.id,
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    })
+    : {
+      terminalStatus,
+      terminalReason,
+      ...(tool.terminalSynthetic !== undefined ? { synthetic: tool.terminalSynthetic } : {}),
+      ...(tool.terminalSource !== undefined ? { source: tool.terminalSource } : {}),
+      ...(tool.terminalDecisionReason !== undefined ? { decisionReason: tool.terminalDecisionReason } : {}),
+      ...(tool.terminalIdempotencyKey !== undefined ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    };
   const payload: Record<string, unknown> = {
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...lifecycleMetadata,
     detail,
   };
   if (tool.status === 'error') payload.error = detail.output ?? 'error';
@@ -437,4 +802,40 @@ export function isSdkSubagentDetail(detail: unknown): detail is SdkSubagentDetai
 
 export function isSdkSubagentToolDetail(detail: ToolCallDetail | undefined): detail is SdkSubagentDetail {
   return isSdkSubagentDetail(detail);
+}
+
+/**
+ * Build the hidden, provider-bound continuation prompt used when an idle parent
+ * receives a terminal event for a background subagent it observed running.
+ *
+ * Only schema-validated enum values and normalized canonical keys are included.
+ * Prompt/output/summary fields are deliberately excluded: a child result is an
+ * untrusted model/tool payload and must not become a second instruction channel.
+ */
+export function buildSdkSubagentWakePrompt(details: readonly SdkSubagentDetail[]): string {
+  const rows = new Map<string, {
+    canonicalKey: string;
+    provider: SdkSubagentProvider;
+    providerKind: SdkSubagentProviderKind;
+    status: SdkSubagentNormalizedStatus;
+  }>();
+  for (const detail of details) {
+    const parsed = parseSdkSubagentDetail(detail);
+    if (parsed.kind !== 'ok' || !parsed.detail.meta.terminal) continue;
+    const meta = parsed.detail.meta;
+    rows.set(meta.canonicalKey, {
+      canonicalKey: normalizeSdkSubagentCanonicalKey(meta.canonicalKey),
+      provider: meta.provider,
+      providerKind: meta.providerKind,
+      status: meta.normalizedStatus,
+    });
+    if (rows.size >= SDK_SUBAGENT_WAKE_BATCH_MAX_ITEMS) break;
+  }
+  return [
+    SDK_SUBAGENT_WAKE_PROMPT_HEADER,
+    'This is a trusted IM.codes runtime notification, not a user-authored instruction.',
+    'One or more background subagents started by this parent session reached a terminal state:',
+    JSON.stringify([...rows.values()]),
+    'Resume the parent task now. Inspect the provider-native child result/history using the identifiers above when available, then report the relevant outcome or failure. Do not merely say that you are still waiting for the notification.',
+  ].join('\n');
 }

@@ -1,0 +1,424 @@
+#include "third_party/imcodes_remote_desktop/input_injector.h"
+
+#include <algorithm>
+#include <cwchar>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "test/gtest.h"
+
+namespace imcodes::rd {
+namespace {
+
+bool SecureConsoleInputEnabled() {
+  wchar_t value[8] = {};
+  const DWORD length = GetEnvironmentVariableW(
+      L"IMCODES_RUN_SECURE_CONSOLE_INPUT", value, std::size(value));
+  return length > 0 && length < std::size(value) && value[0] == L'1';
+}
+
+std::wstring CurrentThreadDesktopName() {
+  wchar_t value[64] = {};
+  DWORD needed = 0;
+  const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+  if (!desktop || !GetUserObjectInformationW(
+                      desktop, UOI_NAME, value, sizeof(value), &needed)) {
+    return {};
+  }
+  return value;
+}
+
+class RecordingInput {
+ public:
+  UINT Send(UINT count, LPINPUT inputs, int size) {
+    if (size != sizeof(INPUT) || fail_next_) {
+      fail_next_ = false;
+      return 0;
+    }
+    events.insert(events.end(), inputs, inputs + count);
+    batch_sizes.push_back(count);
+    return count;
+  }
+
+  bool fail_next_ = false;
+  std::vector<INPUT> events;
+  std::vector<UINT> batch_sizes;
+};
+
+common::InputStamp Stamp(std::string controller,
+                         common::InputSequence sequence,
+                         common::TopologyRevision revision = 7,
+                         common::InputEpoch epoch = 1) {
+  return common::InputStamp{std::move(controller), epoch, sequence, revision};
+}
+
+// A session starts on a clean keyboard: a modifier whose key-up never
+// arrived -- a worker killed mid-press, a route lost between a modifier's
+// down and its up -- is held by Windows itself, and an arbiter that only
+// releases what it emitted knows nothing about it. Every click and keystroke
+// that follows is silently rewritten by it.
+TEST(InputArbiterTest, SessionStartReleasesModifiersLatchedByNobody) {
+  RecordingInput recording;
+  // Windows reports ControlRight and ShiftLeft held; only ShiftLeft is this
+  // arbiter's own.
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      {}, {},
+      [](int virtual_key) {
+        return virtual_key == VK_RCONTROL || virtual_key == VK_LSHIFT;
+      });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ShiftLeft", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 1u);
+
+  EXPECT_EQ(input.ReleaseLatchedModifiers(), 1u);
+  ASSERT_EQ(recording.events.size(), 2u);
+  const INPUT& released = recording.events.back();
+  EXPECT_EQ(released.type, static_cast<DWORD>(INPUT_KEYBOARD));
+  EXPECT_NE(released.ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_EQ(released.ki.wScan,
+            static_cast<WORD>(MapVirtualKeyW(VK_RCONTROL, MAPVK_VK_TO_VSC_EX)));
+
+  // The key the arbiter is holding stays with the path that tracks it.
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 2), 7, "ShiftLeft", false),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 3u);
+}
+
+TEST(InputArbiterTest, SessionStartReleasesNothingOnACleanKeyboard) {
+  RecordingInput recording;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      {}, {}, [](int) { return false; });
+
+  EXPECT_EQ(input.ReleaseLatchedModifiers(), 0u);
+  EXPECT_TRUE(recording.events.empty());
+}
+
+TEST(InputArbiterTest, CommonLedgerOwnsSharedControllersAndTargetedRelease) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ControlLeft",
+                                  true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-b", 1), 7, "ControlLeft",
+                                  true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2), 7, "left", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-b", 2), 7, "left", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 2u);
+
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-a"),
+            common::InputResult::kApplied);
+  EXPECT_EQ(recording.events.size(), 2u);
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-b"),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 4u);
+  EXPECT_NE(recording.events[2].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[3].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+}
+
+TEST(InputArbiterTest, CommonLedgerRejectsStaleEpochSequenceAndTopology) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "KeyA", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 1), 7, "left", true),
+            common::InputResult::kStaleSequence);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2, 6, 2), 7, "left",
+                                     true),
+            common::InputResult::kStaleTopology);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2, 7, 2), 7, "left",
+                                     true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 3, 7, 1), 7, "KeyB", true),
+            common::InputResult::kStaleEpoch);
+  ASSERT_EQ(recording.events.size(), 3u);
+  EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[2].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+}
+
+TEST(InputArbiterTest, BackendFailureFailsClosedAndTerminalReleaseIsIdempotent) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  recording.fail_next_ = true;
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("failed-peer", 1), 7, "KeyA", true),
+            common::InputResult::kAdapterFailure);
+  EXPECT_TRUE(recording.events.empty());
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "KeyA", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2), 7, "right", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 2u);
+
+  input.ReleaseAll();
+  ASSERT_EQ(recording.events.size(), 4u);
+  input.ReleaseAll();
+  EXPECT_EQ(recording.events.size(), 4u);
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-a"),
+            common::InputResult::kApplied);
+}
+
+TEST(InputArbiterTest, KeepsConcurrentControllerKeyOwnershipIndependent) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_TRUE(input.KeyDown("peer-a", "ControlLeft", false));
+  EXPECT_TRUE(input.KeyDown("peer-b", "ControlLeft", false));
+  ASSERT_EQ(recording.events.size(), 1u);
+  EXPECT_EQ(recording.events[0].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+
+  input.ReleaseOwner("peer-a");
+  EXPECT_EQ(recording.events.size(), 1u);
+  input.ReleaseOwner("peer-b");
+  ASSERT_EQ(recording.events.size(), 2u);
+  EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+}
+
+TEST(InputArbiterTest, ReportsInteractiveDesktopAvailability) {
+  RecordingInput recording;
+  bool available = false;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      [&] { return available; });
+
+  EXPECT_FALSE(input.Available());
+  available = true;
+  EXPECT_TRUE(input.Available());
+}
+
+TEST(InputArbiterTest, MovesPointerInExactSelectedDisplayPixels) {
+  RecordingInput recording;
+  std::vector<POINT> positions;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      [] { return true; },
+      [&](int x, int y) {
+        positions.push_back(POINT{x, y});
+        return true;
+      });
+  DisplayInfo display;
+  display.desktop_rect = RECT{-3840, 100, 0, 2260};
+  display.width = 3840;
+  display.height = 2160;
+
+  EXPECT_TRUE(input.Move(display, 0.5, 0.5));
+  EXPECT_TRUE(input.Move(display, 1.0, 1.0));
+  ASSERT_EQ(positions.size(), 2u);
+  EXPECT_EQ(positions[0].x, -1920);
+  EXPECT_EQ(positions[0].y, 1180);
+  EXPECT_EQ(positions[1].x, -1);
+  EXPECT_EQ(positions[1].y, 2259);
+  EXPECT_TRUE(recording.events.empty());
+}
+
+TEST(InputArbiterTest, MapsPointerThroughLogicalBoundsNotEncodedPixels) {
+  std::vector<POINT> positions;
+  InputArbiter input(
+      [](UINT count, LPINPUT, int) { return count; }, [] { return true; },
+      [&](int x, int y) {
+        positions.push_back(POINT{x, y});
+        return true;
+      });
+  DisplayInfo display;
+  display.id = "retina-like-windows-display";
+  display.desktop_rect = RECT{100, 200, 2020, 1280};
+  // Encoded pixels deliberately differ from the logical SendInput rectangle.
+  display.width = 3840;
+  display.height = 2160;
+
+  const common::InputStamp stamp{"controller", 1, 1, 7};
+  EXPECT_EQ(input.ApplyPointerStamped(stamp, 7, display, 1.0, 1.0),
+            common::InputResult::kApplied);
+  ASSERT_EQ(positions.size(), 1u);
+  EXPECT_EQ(positions[0].x, 2019);
+  EXPECT_EQ(positions[0].y, 1279);
+}
+
+TEST(InputArbiterTest, RetriesFailedFinalKeyReleaseDuringTeardown) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  ASSERT_TRUE(input.KeyDown("peer-a", "KeyA", false));
+  recording.fail_next_ = true;
+  EXPECT_FALSE(input.KeyUp("peer-a", "KeyA"));
+  EXPECT_EQ(recording.events.size(), 1u);
+  EXPECT_TRUE(input.ReleaseOwner("peer-a"));
+  ASSERT_EQ(recording.events.size(), 2u);
+  EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+}
+
+TEST(InputArbiterTest, RollsBackFailedFirstPressAndRejectsUnknownInput) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  recording.fail_next_ = true;
+  EXPECT_FALSE(input.ButtonDown("peer-a", "left"));
+  EXPECT_TRUE(input.ButtonDown("peer-b", "left"));
+  EXPECT_EQ(recording.events.size(), 1u);
+  EXPECT_FALSE(input.KeyDown("peer-a", "MetaLeft", false));
+  EXPECT_FALSE(input.KeyDown("peer-a", "F1garbage", false));
+  EXPECT_FALSE(input.ButtonDown("peer-a", "sixth"));
+  input.ReleaseOwner("peer-b");
+  EXPECT_EQ(recording.events.size(), 2u);
+}
+
+TEST(InputArbiterTest, RetainsAndRetriesReleaseThatFailsDuringTeardown) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  ASSERT_TRUE(input.ButtonDown("peer-a", "middle"));
+  recording.fail_next_ = true;
+  EXPECT_FALSE(input.ReleaseOwner("peer-a"));
+  ASSERT_EQ(recording.events.size(), 1u);
+  EXPECT_TRUE(input.RetryPendingReleases());
+  ASSERT_EQ(recording.events.size(), 2u);
+  EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_MIDDLEUP, 0u);
+}
+
+TEST(InputArbiterTest, CompletesClickAsOneNativeInputBatch) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  ASSERT_TRUE(input.Click("left"));
+  ASSERT_EQ(recording.events.size(), 2u);
+  ASSERT_EQ(recording.batch_sizes.size(), 1u);
+  EXPECT_EQ(recording.batch_sizes[0], 2u);
+  EXPECT_NE(recording.events[0].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+  EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+
+  ASSERT_TRUE(input.ButtonDown("peer-a", "left"));
+  EXPECT_FALSE(input.Click("left"));
+  EXPECT_TRUE(input.ButtonUp("peer-a", "left"));
+  EXPECT_FALSE(input.Click("sixth"));
+}
+
+TEST(InputArbiterTest, StampedClickUsesLedgerAndPreservesHeldModifier) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ControlLeft", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 2), 7, "left"),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 3u);
+  EXPECT_EQ(recording.events[0].type, static_cast<DWORD>(INPUT_KEYBOARD));
+  EXPECT_EQ(recording.events[0].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+  EXPECT_NE(recording.events[2].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 2), 7, "right"),
+            common::InputResult::kStaleSequence);
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 3, 6), 7, "right"),
+            common::InputResult::kStaleTopology);
+}
+
+TEST(InputArbiterTest, CrashRecoveryReleasesOnlySupportedKeysAndButtons) {
+  RecordingInput recording;
+  EXPECT_TRUE(ReleaseAllSupportedInput(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      }));
+  EXPECT_GT(recording.events.size(), 60u);
+  EXPECT_TRUE(std::all_of(recording.events.begin(), recording.events.end(),
+                          [](const INPUT& input) {
+    return input.type == INPUT_KEYBOARD
+               ? (input.ki.dwFlags & KEYEVENTF_KEYUP) != 0
+               : input.type == INPUT_MOUSE &&
+                     (input.mi.dwFlags & (MOUSEEVENTF_LEFTUP |
+                                          MOUSEEVENTF_MIDDLEUP |
+                                          MOUSEEVENTF_RIGHTUP |
+                                          MOUSEEVENTF_XUP)) != 0;
+  }));
+}
+
+TEST(InputArbiterTest, CopyShortcutAlwaysReleasesControlAndC) {
+  std::vector<INPUT> dispatched;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    EXPECT_EQ(size, static_cast<int>(sizeof(INPUT)));
+    dispatched.insert(dispatched.end(), values, values + count);
+    return count;
+  });
+  EXPECT_TRUE(input.CopyShortcut("clipboard-owner"));
+  ASSERT_EQ(dispatched.size(), 4u);
+  EXPECT_EQ(dispatched[0].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_EQ(dispatched[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(dispatched[2].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(dispatched[3].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+}
+
+TEST(InputArbiterTest, EncodesTextAsBoundedUnicodeInputPairs) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+  EXPECT_TRUE(input.Text(u"A"));
+  ASSERT_EQ(recording.events.size(), 2u);
+  EXPECT_EQ(recording.events[0].ki.wScan, static_cast<WORD>(u'A'));
+  EXPECT_EQ(recording.events[0].ki.dwFlags,
+            static_cast<DWORD>(KEYEVENTF_UNICODE));
+  EXPECT_EQ(recording.events[1].ki.wScan, static_cast<WORD>(u'A'));
+  EXPECT_EQ(recording.events[1].ki.dwFlags,
+            static_cast<DWORD>(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+}
+
+TEST(InputArbiterTest, SecureConsoleAcceptsNonTextInputWithoutChangingState) {
+  if (!SecureConsoleInputEnabled()) {
+    GTEST_SKIP() << "set IMCODES_RUN_SECURE_CONSOLE_INPUT=1 on Winlogon";
+  }
+  EXPECT_EQ(CurrentThreadDesktopName(), L"Winlogon");
+
+  POINT original{};
+  ASSERT_TRUE(GetCursorPos(&original));
+  DisplayInfo display;
+  display.desktop_rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  display.desktop_rect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  display.width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  display.height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  ASSERT_GT(display.width, 1);
+  ASSERT_GT(display.height, 1);
+
+  InputArbiter input;
+  EXPECT_TRUE(input.KeyDown("secure-console-probe", "ShiftLeft", false));
+  EXPECT_TRUE(input.KeyUp("secure-console-probe", "ShiftLeft"));
+  EXPECT_TRUE(input.Move(display, 0.5, 0.5));
+  EXPECT_TRUE(SetCursorPos(original.x, original.y));
+}
+
+}  // namespace
+}  // namespace imcodes::rd

@@ -1,0 +1,1613 @@
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { SDK_SUBAGENT_WAKE_PROMPT_HEADER } from '../../shared/sdk-subagent-status.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withMemoryMcpSessionEnv } from '../../src/agent/providers/getDefaultMcpServers.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
+import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import {
+  AgySdkProvider,
+  buildAgyArgs,
+  encodeAgyUserLine,
+  parseAgyModelList,
+} from '../../src/agent/providers/agy-sdk.js';
+import {
+  AGY_CLI_FLAG,
+  AGY_FALLBACK_MODEL_IDS,
+  AGY_SDK_PROVIDER_ID,
+  isAgyModelId,
+  normalizeAgyModelId,
+  resolveEffectiveAgyModelId,
+} from '../../shared/agy-agent.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
+import { AgyHistoryReader } from '../../src/agent/agy-native-history.js';
+import { AgySubagentTracker } from '../../src/agent/agy-subagents.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { ProviderError, ProviderUsageUpdate, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
+
+/**
+ * A fake `agy` that speaks the verified stream-json wire format. Behaviour is
+ * driven by keywords in the user message so one script covers every path.
+ */
+const FAKE_AGY = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('/usage')) process.exit(0);
+if (process.env.FAKE_AGY_ARGS_FILE) fs.appendFileSync(process.env.FAKE_AGY_ARGS_FILE, JSON.stringify(args) + '\\n');
+if (args[0] === 'models') {
+  process.stdout.write('Fetching available models...\\nclaude-sonnet-5-5-low\\tClaude Sonnet 5.5 (Low)\\ngemini-4-hydrogen-high\\tGemini 4 Hydrogen (High)\\n');
+  process.exit(0);
+}
+if (args[0] === '--help') { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
+const resumeIdx = args.indexOf('--conversation');
+if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify({ resumeId: resumeIdx >= 0 ? args[resumeIdx + 1] : null, ...Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]])) }) + '\\n');
+const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
+const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const init=()=>emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+if(process.env.FAKE_AGY_INIT_GATE) {
+ const gate=setInterval(()=>{if(fs.existsSync(process.env.FAKE_AGY_INIT_GATE)){clearInterval(gate);init();}},5);
+} else init();
+let step = 0;
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d.toString();
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    const text = msg.message.content;
+    if (process.env.FAKE_AGY_INPUT_FILE) fs.appendFileSync(process.env.FAKE_AGY_INPUT_FILE, JSON.stringify(text) + '\\n');
+    if (text.includes('CRASH_NOW')) process.exit(1);
+    if (text.includes('AUTH_EXIT')) {
+      process.stderr.write('You are not logged into Antigravity.\\n');
+      setTimeout(() => process.exit(1), 100);
+      return;
+    }
+    if (text.includes('HANG')) return;
+    const scenario = text.replace(/^(?:API_RETRY_|API_|STREAM_)/, 'QUOTA_');
+    if (text.includes('NATIVE_LOST')) {
+      const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
+      const error = text.includes('NATIVE_LOST_STREAM')
+        ? fixture.STREAM_ERROR
+        : text.includes('NATIVE_LOST_API_RETRY')
+          ? fixture.API_RETRY_ERROR
+          : text.includes('NATIVE_LOST_API')
+            ? fixture.API_ERROR
+            : fixture.ERROR;
+      const isAppendErrorStep = text.includes('NATIVE_LOST_API') || text.includes('NATIVE_LOST_STREAM');
+      fixture.persist(process.env.HOME, text, { currentError: text.includes('REAL_ERROR'), answer: text, error, ...(isAppendErrorStep ? { historicalStatus: 3 } : {}) });
+      emit({ event:'result', result:{ conversation_id:convId, status:'ERROR', response:'', error } });
+      continue;
+    }
+    if (scenario.includes('QUOTA_OLD_RESPONSE')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Hello\\n' } });
+    }
+    if (!scenario.includes('QUOTA_NO_BOUNDARY')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
+    }
+    if (scenario.includes('QUOTA_')) {
+      const quota = text.startsWith('STREAM_')
+        ? 'The stream was interrupted. Please continue the task you were working on.'
+        : text.startsWith('API_RETRY_')
+          ? 'API error (attempt 2): stream error: stream ID 1; INTERNAL_ERROR; received from peer'
+          : text.startsWith('API_')
+            ? 'API error (attempt 1): request failed: Post https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse: EOF'
+            : 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
+      const hasResponse = !scenario.includes('QUOTA_EMPTY') && !scenario.includes('QUOTA_OLD_RESPONSE');
+      if (scenario.includes('QUOTA_MULTISTEP')) {
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Before\\n' } });
+      }
+      if (scenario.includes('QUOTA_COMPLETED_TOOL') || scenario.includes('QUOTA_MULTISTEP')) {
+        const toolIdx = step++;
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {}, output: 'ok' } } });
+      }
+
+      const idx = step++;
+      if (hasResponse) {
+        const stepIndex = scenario.includes('QUOTA_NO_INDEX') ? undefined : idx;
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hello' } });
+        if (!scenario.includes('QUOTA_PARTIAL')) {
+          emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', ...(scenario.includes('QUOTA_DETAILS') ? { error_details: { message: quota } } : {}) } });
+        }
+      }
+      if (scenario.includes('QUOTA_TOOL')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
+      if (scenario.includes('QUOTA_CURRENT_ERROR')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: scenario.includes('NO_INDEX_ERROR') ? undefined : step++, state: 'DONE', step_type: 'system_error', text_delta: quota } });
+      if (scenario.includes('QUOTA_ACTIVE_AFTER_DONE')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: ' more' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: scenario.includes('QUOTA_MISMATCH') ? 'Other response' : scenario.includes('QUOTA_MULTISTEP') ? 'Before\\nHello\\n' : hasResponse ? 'Hello\\n' : '', error: scenario.includes('QUOTA_NEW_FAILURE') ? 'boom unauthorized' : quota, num_turns: 1, usage: {} } });
+      if (scenario.includes('QUOTA_EMPTY_EXIT')) process.exit(0);
+      continue;
+    }
+    if (text.includes('FAIL')) {
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
+      continue;
+    }
+    if (text.includes('CHILD_ASYNC')) {
+      const idx=step++;
+      for(const state of ['ACTIVE','DONE']) emit({event:'step_update',step_update:{conversation_id:convId,step_index:idx,state,step_type:'tool',tool_name:'invoke_subagent',tool_info:{name:'invoke_subagent',parameters:{Role:'Async child',Prompt:'do test'},...(state==='DONE'?{output:JSON.stringify({conversationId:'async-child',status:'running'})}:{})}}});
+      emit({event:'step_update',step_update:{conversation_id:convId,step_index:step++,state:'DONE',step_type:'agent_response',text_delta:'PARENT-STARTED'}});
+      emit({event:'result',result:{conversation_id:convId,status:'SUCCESS',response:'PARENT-STARTED',usage:{input_tokens:20,output_tokens:3}}});
+      setTimeout(()=>emit({event:'subagent_notification',data:{conversationId:'async-child',status:'completed',stateDetail:'CHILD-PONG'}}),100);
+      continue;
+    }
+    if (text.includes('CONTEXT_MISSING') || text.includes('CONTEXT_ZERO')) {
+      const idx = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'A nonempty answer' } });
+      const usage = text.includes('CONTEXT_ZERO') ? { input_tokens: 0, output_tokens: 0 } : {};
+      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'A nonempty answer', usage } });
+      continue;
+    }
+    if (text.includes('MULTI_STEP')) {
+      const idx1 = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Before' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', usage: { input_tokens: 100, output_tokens: 10 } } });
+      const idxTool = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' } } } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' }, output: 'mid\\r\\n' } } });
+      const idx2 = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'After' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', usage: { input_tokens: 120, output_tokens: 15 } } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Before\\nAfter\\n', num_turns: 1, usage: { input_tokens: 220, output_tokens: 25 } } });
+      continue;
+    }
+    if (text.includes('TOOL')) {
+      const idx = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' } } } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' }, output: 'hi\\r\\n' } } });
+    }
+    if (text.includes('CHILD_LIFECYCLE')) {
+      const ops = [
+        ['define_subagent', {name:'Researcher',prompt:'definition only'}, {}],
+        ['invoke_subagent', {Subagents:[{Role:'Researcher',Prompt:'find info',Model:'model-a'}]}, {conversationId:'child-a',status:'running'}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'child-a',status:'completed',role:'Researcher'}]}],
+        ['swarm', {action:'add',conversationId:'child-b',prompt:'work'}, {conversationId:'child-b',status:'running'}],
+        ['swarm', {action:'status'}, {agents:[{conversationId:'child-b',status:'error'}]}],
+        ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
+        ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
+        ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+        ['invoke_subagent', {Subagents:[{Role:'MultiOne',Prompt:'first member'},{Role:'MultiTwo',Prompt:'second member'}]}, {subagents:[{conversationId:'multi-one',status:'running',role:'MultiOne'},{conversationId:'multi-two',status:'running',role:'MultiTwo'}]}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'multi-one',status:'completed',role:'MultiOne'},{conversationId:'multi-two',status:'failed',role:'MultiTwo'}]}],
+
+      ];
+      for (const [name,parameters,output] of ops) {
+        const idx=step++;
+        for (const state of ['ACTIVE','DONE']) emit({event:'step_update',step_update:{conversation_id:convId,step_index:idx,state,step_type:'tool',tool_name:name,tool_info:{name,parameters,...(state==='DONE'?{output:JSON.stringify(output)}:{})}}});
+      }
+    }
+    if (text.includes('SUBAGENT')) {
+      const idx = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { name: 'invoke_subagent', parameters: { Subagents: [{ TypeName: 'research', Role: 'Researcher', Prompt: 'find info' }] } } } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { name: 'invoke_subagent', parameters: { Subagents: [{ TypeName: 'research', Role: 'Researcher', Prompt: 'find info' }] }, output: 'subagent task-1 launched' } } });
+    }
+    const idx = step++;
+    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hel' } });
+    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'lo' } });
+    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', usage: { input_tokens: 5, output_tokens: 2 } } });
+    emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Hello\\n', num_turns: 1, usage: { input_tokens: 5, output_tokens: 2, cache_read_tokens: 7 } } });
+  }
+});
+`;
+
+describe('agy-sdk helpers', () => {
+  it('builds stream-json argv that skips permissions and keeps --print= last', () => {
+    const args = buildAgyArgs({ conversationId: 'c1', model: 'm1' });
+    expect(args).toContain(AGY_CLI_FLAG.SKIP_PERMISSIONS);
+    expect(args.slice(args.indexOf(AGY_CLI_FLAG.CONVERSATION), args.indexOf(AGY_CLI_FLAG.CONVERSATION) + 2)).toEqual(['--conversation', 'c1']);
+    expect(args.slice(args.indexOf(AGY_CLI_FLAG.MODEL), args.indexOf(AGY_CLI_FLAG.MODEL) + 2)).toEqual(['--model', 'm1']);
+    expect(args).not.toContain(AGY_CLI_FLAG.EFFORT);
+    expect(args.slice(args.indexOf(AGY_CLI_FLAG.SETTINGS), args.indexOf(AGY_CLI_FLAG.SETTINGS) + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'm1' }),
+    ]);
+    expect(args[args.length - 1]).toBe(AGY_CLI_FLAG.PRINT_STDIN);
+    expect(buildAgyArgs({})).not.toContain(AGY_CLI_FLAG.CONVERSATION);
+  });
+
+  it('parses `agy models` output and ignores the banner', () => {
+    expect(parseAgyModelList('Fetching available models...\nid-a\tName A\nid-b\tName B (Low)\n')).toEqual([
+      { id: 'id-a', name: 'Name A' },
+      { id: 'id-b', name: 'Name B (Low)' },
+    ]);
+    expect(parseAgyModelList('Fetching available models...\n')).toEqual([]);
+  });
+
+  it('parses real `agy models` output with multiple spaces and spinner characters', () => {
+    const raw = [
+      '⠋ Fetching available models...',
+      '⠙ Fetching available models...',
+      'gemini-3.8-flash-high     Gemini 3.8 Flash (High)',
+      'gemini-3.8-flash-medium   Gemini 3.8 Flash (Medium)',
+      'claude-opus-5-5-low\tClaude Opus 5.5 (Low)',
+    ].join('\n');
+    expect(parseAgyModelList(raw)).toEqual([
+      { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+      { id: 'gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)' },
+      { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+    ]);
+  });
+
+  it('parses models when progress spinner overwrites the first line via carriage return', () => {
+    const raw = '⠋ Fetching available models...\r⠙ Fetching available models...\r⠦ Fetching available models...\rgemini-4-argon-medium     Gemini 4 Argon (Medium)\ngemini-4-argon-high       Gemini 4 Argon (High)\n';
+    expect(parseAgyModelList(raw)).toEqual([
+      { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+      { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+    ]);
+  });
+
+  it('defaults fresh and resumed launch argv to Hydrogen High and overrides settings.json in memory without overwriting explicit models', () => {
+    for (const opts of [{}, { model: '' }, { model: 'agy-sdk' }, { conversationId: 'persisted-1' }]) {
+      const args = buildAgyArgs(opts);
+      expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-high']);
+      expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'high']);
+      expect(args.slice(args.indexOf('--settings'), args.indexOf('--settings') + 2)).toEqual([
+        '--settings',
+        JSON.stringify({ model: 'gemini-4-hydrogen-high' }),
+      ]);
+      expect(JSON.parse(args[args.indexOf('--settings') + 1])).not.toHaveProperty('effort');
+      expect(args.at(-1)).toBe(AGY_CLI_FLAG.PRINT_STDIN);
+    }
+
+    const mediumArgs = buildAgyArgs({ model: 'Gemini 4 Hydrogen (Medium)' });
+    expect(mediumArgs.slice(mediumArgs.indexOf('--model'), mediumArgs.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-medium']);
+    expect(mediumArgs.slice(mediumArgs.indexOf('--effort'), mediumArgs.indexOf('--effort') + 2)).toEqual(['--effort', 'medium']);
+    expect(mediumArgs.slice(mediumArgs.indexOf('--settings'), mediumArgs.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-hydrogen-medium' }),
+    ]);
+    expect(JSON.parse(mediumArgs[mediumArgs.indexOf('--settings') + 1])).not.toHaveProperty('effort');
+
+    for (const tier of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      const modelId = `custom-model-${tier}`;
+      const args = buildAgyArgs({ model: modelId });
+      expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', tier]);
+      expect(args.slice(args.indexOf('--settings'), args.indexOf('--settings') + 2)).toEqual([
+        '--settings',
+        JSON.stringify({ model: modelId }),
+      ]);
+      expect(JSON.parse(args[args.indexOf('--settings') + 1])).not.toHaveProperty('effort');
+      expect(args.at(-1)).toBe(AGY_CLI_FLAG.PRINT_STDIN);
+    }
+  });
+
+  it('normalizes AGY display names, bare families, neon tiers, and backend placeholders without touching custom ids', () => {
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-high');
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-medium');
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-low');
+    expect(isAgyModelId('gemini-4-neon-high')).toBe(true);
+    expect(isAgyModelId('gemini-neon-medium')).toBe(true);
+
+    expect(normalizeAgyModelId(undefined)).toBeUndefined();
+    expect(normalizeAgyModelId('')).toBeUndefined();
+    expect(normalizeAgyModelId('agy')).toBeUndefined();
+    expect(normalizeAgyModelId('agy-sdk')).toBeUndefined();
+    expect(normalizeAgyModelId(' AGY-SDK ')).toBeUndefined();
+    expect(resolveEffectiveAgyModelId('agy-sdk')).toBe('gemini-4-hydrogen-high');
+
+    expect(normalizeAgyModelId('Gemini 4 Hydrogen (Medium)')).toBe('gemini-4-hydrogen-medium');
+    expect(normalizeAgyModelId('Gemini 4 Hydrogen')).toBe('gemini-4-hydrogen-high');
+    expect(normalizeAgyModelId('Gemini 4 Neon (Low)')).toBe('gemini-4-neon-low');
+    expect(normalizeAgyModelId('Gemini 3.8 Flash')).toBe('gemini-3.8-flash-high');
+    expect(normalizeAgyModelId('Claude Opus 5.5 (Medium)')).toBe('claude-opus-5-5-medium');
+    expect(normalizeAgyModelId('Claude Sonnet 5.5')).toBe('claude-sonnet-5-5-high');
+    expect(normalizeAgyModelId('GPT-OSS 120B (Medium)')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('GPT-OSS 120B')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('gpt-oss-120b')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('gemini-4-hydrogen')).toBe('gemini-4-hydrogen-high');
+    expect(normalizeAgyModelId('gemini-4-neon')).toBe('gemini-4-neon-high');
+    expect(normalizeAgyModelId('claude-opus-5-5')).toBe('claude-opus-5-5-high');
+
+    // Explicit lower tiers & test stubs pass through intact
+    expect(normalizeAgyModelId('gemini-4-hydrogen-medium')).toBe('gemini-4-hydrogen-medium');
+    expect(normalizeAgyModelId('gemini-4-carbon-medium')).toBe('gemini-4-carbon-medium');
+    expect(normalizeAgyModelId('model-a')).toBe('model-a');
+    expect(normalizeAgyModelId('invalid')).toBe('invalid');
+  });
+
+  it('encodes one NDJSON user line', () => {
+    const line = encodeAgyUserLine('hi\nthere');
+    expect(line.endsWith('\n')).toBe(true);
+    expect(line.slice(0, -1).includes('\n')).toBe(false);
+    expect(JSON.parse(line)).toEqual({ event: 'user', message: { content: 'hi\nthere' } });
+  });
+});
+
+describe('AgySdkProvider (fake agy process)', () => {
+  let dir: string;
+  let argsFile: string;
+  let inputFile: string;
+  let provider: AgySdkProvider;
+  const completes: Array<[string, AgentMessage]> = [];
+  const deltas: Array<[string, MessageDelta]> = [];
+  const errors: Array<[string, ProviderError]> = [];
+  const tools: Array<[string, ToolCallEvent]> = [];
+  const infos: Array<[string, SessionInfoUpdate]> = [];
+  const usages: Array<[string, ProviderUsageUpdate]> = [];
+
+  function waitFor(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const tick = () => {
+        if (predicate()) return resolve();
+        if (Date.now() - started > timeoutMs) return reject(new Error('timed out waiting for provider event'));
+        setTimeout(tick, 15);
+      };
+      tick();
+    });
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'imcodes-agy-test-'));
+    // The managed MCP env inherits the process home. Isolate it too, rather
+    // than letting different fake conversations reuse the suite's shared DB.
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('USERPROFILE', dir);
+    const bin = path.join(dir, 'agy');
+    writeFileSync(bin, FAKE_AGY);
+    chmodSync(bin, 0o755);
+    argsFile = path.join(dir, 'args.log');
+    inputFile = path.join(dir, 'inputs.log');
+    writeFileSync(argsFile, '');
+    writeFileSync(inputFile, '');
+    completes.length = 0; deltas.length = 0; errors.length = 0; tools.length = 0; infos.length = 0; usages.length = 0;
+    provider = new AgySdkProvider();
+    provider.onComplete((s, m) => completes.push([s, m]));
+    provider.onDelta((s, d) => deltas.push([s, d]));
+    provider.onError((s, e) => errors.push([s, e]));
+    provider.onToolCall((s, t) => tools.push([s, t]));
+    provider.onSessionInfo((s, i) => infos.push([s, i]));
+    provider.onUsage?.((s, u) => usages.push([s, u]));
+    await provider.connect({ binaryPath: bin, env: { FAKE_AGY_ARGS_FILE: argsFile, FAKE_AGY_INPUT_FILE: inputFile } });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await provider.disconnect();
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const launches = () => readFileSync(argsFile, 'utf8').trim().split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l) as string[]).filter((a) => a[0] !== '--help' && a[0] !== 'models');
+  const inputs = () => readFileSync(inputFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as string);
+
+  function contextPayload(sessionSystemText: string, userMessage = 'hello'): any {
+    return {
+      userMessage,
+      assembledMessage: userMessage,
+      sessionSystemText,
+      context: { sessionSystemText, requiredAuthoredContext: [], advisoryAuthoredContext: [], appliedDocumentVersionIds: [], diagnostics: [] },
+      authority: {},
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+  }
+
+  it('declares the provider identity and capabilities', () => {
+    expect(provider.id).toBe(AGY_SDK_PROVIDER_ID);
+    expect(provider.capabilities.streaming).toBe(true);
+    expect(provider.capabilities.sessionRestore).toBe(true);
+    expect(provider.capabilities.approval).toBe(false);
+  });
+
+  it.each([false, true])('passes isolated runtime identity to actual Antigravity child processes for new and resumed sessions (reverse startup=%s)', async (reverseStartup) => {
+    const output = path.join(dir, 'identity.jsonl');
+    const order = reverseStartup ? ['resume', 'fresh'] : ['fresh', 'resume'];
+    for (const [index, id] of order.entries()) {
+      const sid = await provider.createSession(withMemoryMcpSessionEnv({
+        sessionKey: id, sessionName: `deck_sub_agy_${id}`, sessionInstanceId: `instance-${id}`, runtimeEpoch: `epoch-${id}`,
+        providerId: provider.id, cwd: dir, resumeId: id === 'resume' ? 'persisted-identity-test' : undefined,
+        env: { FAKE_AGY_IDENTITY_FILE: output },
+      }));
+      await provider.send(sid, 'hello');
+      // Completion follows the fixture's identity write: reverse the observed
+      // order deterministically instead of depending on OS process scheduling.
+      if (reverseStartup) await waitFor(() => completes.length === index + 1);
+    }
+    await waitFor(() => completes.length === 2);
+    const actual = readFileSync(output, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(actual).toHaveLength(2);
+    // A fresh CLI and a resumed CLI start independently. Attribute captures
+    // using native resume argv, not arrival order or the identity being tested.
+    for (const id of ['fresh', 'resume']) {
+      const resumeId = id === 'resume' ? 'persisted-identity-test' : null;
+      expect(actual.find((record) => record.resumeId === resumeId)).toEqual({
+        resumeId,
+        [IMCODES_SESSION_ENV]: `deck_sub_agy_${id}`, [E.SESSION_NAME]: `deck_sub_agy_${id}`,
+        [E.SESSION_INSTANCE_ID]: `instance-${id}`, [E.RUNTIME_EPOCH]: `epoch-${id}`, [E.PROVIDER_ID]: provider.id,
+      });
+    }
+  });
+
+  it('reports memory MCP status ready or degraded', () => {
+    const status = provider.getMemoryMcpStatus();
+    expect(status.providerId).toBe(AGY_SDK_PROVIDER_ID);
+    expect(status.connected).toBe(true);
+    expect(['ready', 'degraded']).toContain(status.status);
+  });
+
+  it('re-seeds the current IM.codes contract on resume, version changes, clear, and process restart', async () => {
+    const sid = await provider.createSession({ sessionKey: 'contract-persistence', cwd: dir, resumeId: 'persisted-contract' });
+    const contractV1 = 'IM.codes system contract v1: prefer managed sub-sessions for delegation.';
+    const contractV2 = 'IM.codes system contract v2: prefer managed sub-sessions and preserve Brain rules.';
+
+    await provider.send(sid, contextPayload(contractV1, 'first'));
+    await waitFor(() => completes.length === 1);
+    await provider.send(sid, contextPayload(contractV1, 'second'));
+    await waitFor(() => completes.length === 2);
+    expect(inputs()).toHaveLength(2);
+    expect(inputs()[0]).toContain(contractV1);
+    expect(inputs()[1]).not.toContain(contractV1);
+
+    await provider.send(sid, contextPayload(contractV2, 'version changed'));
+    await waitFor(() => completes.length === 3);
+    expect(inputs()[2]).toContain(contractV2);
+
+    provider.refreshSessionSystemText(sid);
+    await provider.send(sid, contextPayload(contractV2, 'after clear reseed'));
+    await waitFor(() => completes.length === 4);
+    expect(inputs()[3]).toContain(contractV2);
+
+    await provider.send(sid, 'CRASH_NOW');
+    await waitFor(() => errors.length === 1);
+    await provider.send(sid, contextPayload(contractV2, 'after process restart'));
+    await waitFor(() => completes.length === 5);
+    expect(inputs()[5]).toContain(contractV2);
+  });
+
+  it('reasserts the complete uncompressed contract after opaque compaction and model changes', async () => {
+    const sid = await provider.createSession({ sessionKey: 'uncompressed-contract', cwd: dir });
+    const contract = 'Brain: delegate, never implement.\nIdentity user/project/pair/session intact.\nMCP managed services.\n完整原文 😀';
+    let count=0;
+    const send=async(label: string, injected: boolean) => {
+      await provider.send(sid,contextPayload(contract,`ordinary ${label}`));
+      count++; await waitFor(()=>completes.length===count);
+      const prompt=inputs().at(-1)!;
+      expect(prompt.split(contract).length-1).toBe(injected?1:0);
+      expect(Number((completes.at(-1)![1].metadata?.usage as any).input_tokens)).toBeGreaterThan(0);
+    };
+    await send('initial',true); await send('ordinary2',false); await send('ordinary3',false); await send('ordinary4',false);
+    const prefix=inputs()[0].slice(0,inputs()[0].indexOf('ordinary initial'));
+    const conv = infos.find(([, info]) => info.resumeId)?.[1].resumeId!;
+    const logs = path.join(dir, '.gemini', 'antigravity-cli', 'brain', conv, '.system_generated', 'logs');
+    mkdirSync(logs, { recursive: true });
+    appendFileSync(path.join(logs, 'transcript.jsonl'), JSON.stringify({step_index:10,source:'USER_EXPLICIT',type:'USER_INPUT',status:'DONE',created_at:'2026-11-12T00:00:00Z',content:'<CONTEXT_SUMMARY>summary</CONTEXT_SUMMARY>'})+'\n');
+    await send('after summary',true); expect(inputs().at(-1)!.slice(0,prefix.length)).toBe(prefix);
+    await send('post summary ordinary',false);
+    provider.setSessionAgentId(sid,'gemini-4-argon-high');
+    await send('after model',true); await send('post model ordinary',false);
+    provider.refreshSessionSystemText(sid);
+    await send('after clear refresh',true); await send('post clear ordinary',false);
+    await provider.createSession({sessionKey:'uncompressed-contract',cwd:dir,fresh:true});
+    await send('after initialize',true); await send('post initialize ordinary',false);
+  });
+
+  it.each(['CONTEXT_MISSING', 'CONTEXT_ZERO'])('estimates positive current context when native usage is absent/zero (%s)', async (scenario) => {
+    const sid = await provider.createSession({ sessionKey: 'estimated-context', cwd: dir });
+    await provider.send(sid, contextPayload('Full system identity and MCP contract '.repeat(30), scenario));
+    await waitFor(() => completes.length === 1);
+    const usage = completes[0][1].metadata?.usage as Record<string, number>;
+    expect(usage.input_tokens).toBeGreaterThan(50);
+    expect(usages.some(([, update]) => update.finalized === true && Number(update.usage?.input_tokens) > 0)).toBe(true);
+  });
+
+  it('never spawns before the start barrier commits, and a failed barrier cannot start a child', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'barrier', cwd: dir, beforeNativeSessionStart: barrier });
+    const send = provider.send(sid, 'hello');
+    await waitFor(() => barrier.mock.calls.length === 1);
+    expect(launches()).toEqual([]);
+    resolve(); await send; await waitFor(() => completes.length === 1);
+    expect(launches()).toHaveLength(1);
+    const failed = await provider.createSession({ sessionKey: 'failed-barrier', cwd: dir,
+      beforeNativeSessionStart: async () => { throw new Error('disk full'); } });
+    await expect(provider.send(failed, 'hello')).rejects.toThrow('disk full');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('shares a pending start commit across concurrent inputs without duplicate children', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'concurrent-start', cwd: dir, beforeNativeSessionStart: barrier });
+    const first = provider.send(sid, 'first'); const second = provider.send(sid, 'second');
+    await waitFor(() => barrier.mock.calls.length > 0);
+    expect(barrier).toHaveBeenCalledTimes(1); expect(launches()).toEqual([]);
+    resolve(); await Promise.all([first, second]); await waitFor(() => completes.length === 2);
+    expect(launches()).toHaveLength(1); expect(inputs()).toEqual(['first','second']);
+  });
+
+  it.each(['stop', 'stopAndWait', 'end', 'rebind', 'disconnect'])('does not spawn after %s supersedes a pending start commit', async action => {
+    let resolve!: () => void;
+    let entered = false;
+    const sid = await provider.createSession({ sessionKey: 'pending-start', cwd: dir,
+      beforeNativeSessionStart: () => new Promise<void>(r => { entered = true; resolve = r; }) });
+    const send = provider.send(sid, 'hello');
+    const rejected = expect(send).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    await waitFor(() => entered);
+    if (action === 'stop') await provider.cancel(sid);
+    else if (action === 'stopAndWait') await provider.cancelAndWait(sid);
+    else if (action === 'end') await provider.endSession(sid);
+    else if (action === 'rebind') await provider.createSession({ sessionKey: sid, cwd: dir, fresh: true });
+    else await provider.disconnect();
+    resolve(); await rejected;
+    expect(launches()).toEqual([]);
+    expect(inputs()).toEqual([]);
+  });
+
+  it.each(['stop','end','rebind','disconnect'])('does not publish a pending native init after %s',async action=>{
+    // Hold every native ID until cancellation: HANG must not emit a
+    // conversation-bearing user_input before this deliberately pending init.
+    const gate=path.join(dir,'release-init');
+    const sid=await provider.createSession({sessionKey:'delayed-init',cwd:dir,env:{FAKE_AGY_INIT_GATE:gate}});
+    await provider.send(sid,'HANG');await waitFor(()=>launches().length===1);
+    expect(infos).toEqual([]);
+    if(action==='stop')await provider.cancelAndWait(sid);
+    else if(action==='end')await provider.endSession(sid);
+    else if(action==='rebind')await provider.createSession({sessionKey:sid,cwd:dir,fresh:true});
+    else await provider.disconnect();
+    writeFileSync(gate,'release');
+    await new Promise(r=>setImmediate(r));
+    expect(infos).toEqual([]);expect(completes).toEqual([]);
+  });
+
+  it('streams deltas, completes the turn and reports the conversation id for resume', async () => {
+    const sid = await provider.createSession({ sessionKey: 's1', cwd: dir });
+    await provider.send(sid, 'say hello');
+    await waitFor(() => completes.length === 1);
+    expect(deltas.map(([, d]) => d.delta)).toEqual(['Hel', 'Hello']);
+    expect(new Set(deltas.map(([, d]) => d.messageId)).size).toBe(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(completes[0][1].id).toBe(deltas[0][1].messageId);
+    expect(infos.some(([, i]) => typeof i.resumeId === 'string' && i.resumeId.startsWith('conv-'))).toBe(true);
+    expect(launches()[0]).toContain('--dangerously-skip-permissions');
+    const args = launches()[0];
+    expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-high']);
+    expect(launches()[0]).not.toContain('--conversation');
+  });
+
+  it('appends messages to the same process and completes them in order', async () => {
+    const sid = await provider.createSession({ sessionKey: 's2', cwd: dir });
+    await provider.send(sid, 'first');
+    await provider.send(sid, 'second');
+    await waitFor(() => completes.length === 2);
+    expect(launches()).toHaveLength(1);
+    expect(completes[0][1].id).not.toBe(completes[1][1].id);
+  });
+
+  it('completes repeated successful turns despite AG historical quota result errors, without restarting or replaying', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-history', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    expect(completes[0][1].content).toBe('Hello');
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    expect(completes).toHaveLength(2);
+    expect(launches()).toHaveLength(1);
+    expect(launches()[0]).toContain('existing-conversation');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('recovers DB-only answers on repeated turns and a fresh CLI process, without replay or deleting history', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const key = 'native-lost';
+    const conversation = '11111111-1111-4111-8111-111111111111';
+    let sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
+    await provider.send(sid,'NATIVE_LOST first');
+    await waitFor(() => completes.length + errors.length === 1);
+    await provider.send(sid,'NATIVE_LOST second');
+    await waitFor(() => completes.length+errors.length===2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([,m])=>m.content)).toEqual(['NATIVE_LOST first','NATIVE_LOST second']);
+    expect(launches()).toHaveLength(1);
+    await provider.endSession(sid);
+    sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
+    await provider.send(sid,'NATIVE_LOST third');
+    await waitFor(() => completes.length+errors.length===3);
+    expect(errors).toHaveLength(0);
+    expect(completes[2][1].content).toBe('NATIVE_LOST third');
+    expect(launches()).toHaveLength(2); // only the EXPLICIT session end started a new CLI
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('completes repeated turns carrying a historical API EOF without replaying or restarting', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-history', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'API_STALE');
+    await provider.send(sid, 'API_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(inputs()).toHaveLength(2);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('requires an observed failure before treating an API error in a fresh conversation as historical', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-fresh', cwd: dir, fresh: true });
+    await provider.send(sid, 'API_STALE');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    await provider.send(sid, 'API_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recovers DB-only API answers with DONE system_error history, while preserving a new current error', async () => {
+    await provider.disconnect();
+    await provider.connect({ binaryPath:path.join(dir,'agy'), env:{ HOME:dir, FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs') } });
+    const sid = await provider.createSession({ sessionKey:'api-native', cwd:dir, resumeId:'11111111-1111-4111-8111-111111111111' });
+    // These cases require a stable native snapshot. Preparing the next fake
+    // SQLite turn concurrently may correctly make the fail-closed reader
+    // decline recovery; queued-turn binding is covered by the history suite.
+    await provider.send(sid, 'NATIVE_LOST_API first');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_API second');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_API_REAL_ERROR');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([,m]) => m.content)).toEqual(['NATIVE_LOST_API first', 'NATIVE_LOST_API second']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain('API error (attempt 1)');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it.each([
+    'API_EMPTY', 'API_PARTIAL', 'API_TOOL', 'API_CURRENT_ERROR', 'API_DETAILS',
+    'API_MISMATCH', 'API_ACTIVE_AFTER_DONE', 'API_NO_BOUNDARY', 'API_NO_INDEX',
+    'API_OLD_RESPONSE', 'API_NEW_FAILURE', 'API_CURRENT_ERROR_NO_INDEX_ERROR',
+  ])('does not conceal a real or unproven API failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey:prompt, cwd:dir, resumeId:'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(prompt === 'API_NEW_FAILURE' ? 'unauthorized' : 'API error (attempt 1)');
+  });
+
+  it('keeps genuine current native quota failures even when a completed answer precedes them', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const sid = await provider.createSession({sessionKey:'native-error',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'NATIVE_LOST_REAL_ERROR');
+    await waitFor(() => completes.length+errors.length===1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+  });
+
+  it('closes the 3-turn stream-interrupted replay class: Turn 1 real failure visible, Turn 2 and Turn 3 complete cleanly without replaying old error', async () => {
+    const sid = await provider.createSession({ sessionKey: 'stream-interrupted-3turn', cwd: dir, fresh: true });
+    // Turn 1: real mid-stream interruption after partial output
+    await provider.send(sid, 'STREAM_PARTIAL');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].message).toBe('The stream was interrupted. Please continue the task you were working on.');
+
+    // Turn 2: complete DONE response carrying historical stream-interrupted error in result.error
+    await provider.send(sid, 'STREAM_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+
+    // Turn 3: subsequent complete turn (with completed tool call) still carrying historical stream-interrupted error
+    await provider.send(sid, 'STREAM_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(errors).toHaveLength(1);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(inputs()).toHaveLength(3);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('closes the 3-turn non-request-failed API error replay class: Turn 1 real failure visible, Turn 2 and Turn 3 complete cleanly', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-retry-3turn', cwd: dir, fresh: true });
+    await provider.send(sid, 'API_RETRY_EMPTY');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].message).toContain('API error (attempt 2): stream error:');
+
+    await provider.send(sid, 'API_RETRY_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+
+    await provider.send(sid, 'API_RETRY_MULTISTEP');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(errors).toHaveLength(1);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recovers DB-only stream-interrupted and non-request-failed API answers with DONE system_error history while preserving genuine current failures', async () => {
+    await provider.disconnect();
+    await provider.connect({ binaryPath: path.join(dir, 'agy'), env: { HOME: dir, FAKE_AGY_ARGS_FILE: argsFile,
+      FAKE_AGY_NATIVE_FIXTURE: path.resolve('test/fixtures/agy-native-history/fixture.cjs') } });
+    const sid = await provider.createSession({ sessionKey: 'stream-native', cwd: dir, resumeId: '11111111-1111-4111-8111-111111111111' });
+    await provider.send(sid, 'NATIVE_LOST_STREAM first');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_STREAM second');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_STREAM_REAL_ERROR');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([, m]) => m.content)).toEqual(['NATIVE_LOST_STREAM first', 'NATIVE_LOST_STREAM second']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toBe('The stream was interrupted. Please continue the task you were working on.');
+  });
+
+  it.each([
+    'STREAM_EMPTY', 'STREAM_PARTIAL', 'STREAM_TOOL', 'STREAM_CURRENT_ERROR', 'STREAM_DETAILS',
+    'STREAM_MISMATCH', 'STREAM_ACTIVE_AFTER_DONE', 'STREAM_NO_BOUNDARY', 'STREAM_NO_INDEX',
+    'STREAM_OLD_RESPONSE', 'STREAM_NEW_FAILURE', 'STREAM_CURRENT_ERROR_NO_INDEX_ERROR',
+    'API_RETRY_EMPTY', 'API_RETRY_PARTIAL', 'API_RETRY_CURRENT_ERROR',
+  ])('does not conceal a real or unproven stream-interrupted or retry API failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey: prompt, cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(
+      prompt === 'STREAM_NEW_FAILURE'
+        ? 'unauthorized'
+        : prompt.startsWith('API_RETRY_')
+          ? 'API error (attempt 2)'
+          : 'The stream was interrupted.',
+    );
+  });
+
+  it('clears failed-process input bindings before the next user turn resumes the conversation', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const sid=await provider.createSession({sessionKey:'unexpected-exit',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'CRASH_NOW');
+    await waitFor(()=>errors.length===1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.CONNECTION_LOST);
+    await provider.send(sid,'NATIVE_LOST after unexpected exit');
+    await waitFor(()=>completes.length+errors.length===2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('NATIVE_LOST after unexpected exit');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('classifies authentication failures on child exit as non-recoverable', async () => {
+    const sid=await provider.createSession({sessionKey:'auth-exit',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'AUTH_EXIT');
+    await waitFor(()=>errors.length===1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+    expect(errors[0][1].recoverable).toBe(false);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(errors).toHaveLength(1);
+  });
+
+  it('serializes queued frames across a slow recovery without replaying or mixing answers', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read = vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(() => new Promise(resolve => { finish=resolve; }));
+    const sid=await provider.createSession({sessionKey:'slow-read',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(() => read.mock.calls.length===1);
+    await provider.send(sid,'next ordinary input');
+    expect(completes).toHaveLength(0);
+    finish({userStepIndex:0,responseStepIndex:1,text:'Recovered first'});
+    await waitFor(() => completes.length===2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([,m])=>m.content)).toEqual(['Recovered first','Hello']);
+    expect(launches()).toHaveLength(1);
+  });
+
+  it.each(['stop','end','fresh','disconnect'])('does not publish late recovery after %s', async action => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read = vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(() => new Promise(resolve => { finish=resolve; }));
+    const key='late-read';
+    const sid=await provider.createSession({sessionKey:key,cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(() => read.mock.calls.length===1);
+    if(action==='stop') await provider.cancelAndWait(sid);
+    else if(action==='end') await provider.endSession(sid);
+    else if(action==='fresh') await provider.createSession({sessionKey:key,cwd:dir,fresh:true});
+    else await provider.disconnect();
+    finish({userStepIndex:0,responseStepIndex:1,text:'MUST NOT APPEAR'});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(completes).toHaveLength(0);
+    expect(deltas).toHaveLength(0);
+    expect(errors.every(([,e])=>e.code===PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    if(action==='stop'||action==='fresh') {
+      await provider.send(sid,'new turn');
+      await waitFor(()=>completes.length===1);
+      expect(completes[0][1].content).toBe('Hello');
+    }
+  });
+
+  it('Stop wins over a late history read even after the CLI has already physically exited', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read=vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+    const sid=await provider.createSession({sessionKey:'exited-reader',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY_EXIT');
+    await waitFor(()=>read.mock.calls.length===1);
+    const states=(provider as unknown as {sessions:Map<string,{child:{exitCode:number|null}|null}>}).sessions;
+    await waitFor(()=>states.get(sid)?.child?.exitCode===0);
+    await provider.cancelAndWait(sid);
+    await provider.send(sid,'next turn after the confirmed physical exit');
+    await waitFor(()=>completes.length===1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+    finish({userStepIndex:0,responseStepIndex:1,text:'MUST NOT APPEAR'});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(completes).toHaveLength(1);
+    expect(deltas.every(([,delta])=>!delta.delta.includes('MUST NOT APPEAR'))).toBe(true);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('preserves the listener-bound state and input evidence when an existing session is rebound', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read=vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+    const config={sessionKey:'rebound',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'};
+    const sid=await provider.createSession(config);
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(()=>read.mock.calls.length===1);
+    expect(await provider.createSession(config)).toBe(sid);
+    finish({userStepIndex:0,responseStepIndex:1,text:'Recovered bound turn'});
+    await waitFor(()=>completes.length===1);
+    await provider.send(sid,'next');
+    await waitFor(()=>completes.length===2);
+    expect(completes.map(([,m])=>m.content)).toEqual(['Recovered bound turn','Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('does not infer historical quota on a fresh conversation, but can recover after an observed quota failure', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-fresh', cwd: dir, fresh: true });
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => errors.length + completes.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recognizes a completed tool turn when result.response includes earlier assistant steps', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-multistep', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_MULTISTEP');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(tools.map(([, tool]) => tool.status)).toEqual(['running', 'complete']);
+  });
+
+  it('keeps per-turn evidence isolated when queued inputs include a new quota failure between successes', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-queued', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_STALE');
+    await provider.send(sid, 'QUOTA_EMPTY');
+    await provider.send(sid, 'QUOTA_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+    expect(launches()).toHaveLength(1);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it.each([
+    'QUOTA_EMPTY', 'QUOTA_PARTIAL', 'QUOTA_TOOL', 'QUOTA_CURRENT_ERROR',
+    'QUOTA_DETAILS', 'QUOTA_MISMATCH', 'QUOTA_ACTIVE_AFTER_DONE',
+    'QUOTA_NO_BOUNDARY', 'QUOTA_NO_INDEX', 'QUOTA_OLD_RESPONSE', 'QUOTA_NEW_FAILURE',
+    'QUOTA_CURRENT_ERROR_NO_INDEX_ERROR',
+  ])('preserves a real or unproven current failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey: prompt, cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(prompt === 'QUOTA_NEW_FAILURE' ? 'unauthorized' : 'Individual quota reached');
+  });
+
+  it('emits tool call lifecycle events with parameters and output', async () => {
+    const sid = await provider.createSession({ sessionKey: 's3', cwd: dir });
+    await provider.send(sid, 'please TOOL');
+    await waitFor(() => completes.length === 1);
+    expect(tools.map(([, t]) => t.status)).toEqual(['running', 'complete']);
+    expect(tools[0][1].name).toBe('run_command');
+    expect(tools[0][1].input).toEqual({ CommandLine: 'echo hi' });
+    expect(tools[1][1].output).toBe('hi\r\n');
+    expect(tools[0][1].id).toBe(tools[1][1].id);
+  });
+
+  it('handles multi-step turns with tool calls separating agent responses without duplicating earlier steps', async () => {
+    const sid = await provider.createSession({ sessionKey: 's3-multi', cwd: dir });
+    await provider.send(sid, 'please MULTI_STEP');
+    await waitFor(() => completes.length === 1);
+    expect(deltas.map(([, d]) => d.delta)).toEqual(['Before', 'After']);
+    expect(deltas[0][1].messageId).not.toBe(deltas[1][1].messageId);
+    expect(tools.map(([, t]) => t.status)).toEqual(['running', 'complete']);
+    expect(completes[0][1].content).toBe('After');
+    expect(completes[0][1].id).toBe(deltas[1][1].messageId);
+    expect(completes[0][1].metadata?.usage).toEqual({
+      input_tokens: 120,
+      output_tokens: 25,
+      cache_read_input_tokens: undefined,
+    });
+  });
+
+  it('emits live step usage and finalized turn usage for context window syncing', async () => {
+    const sid = await provider.createSession({ sessionKey: 's-usage', cwd: dir, agentId: 'gemini-3.8-flash-high' });
+    await provider.send(sid, 'say hello');
+    await waitFor(() => completes.length === 1);
+
+    expect(usages.length).toBeGreaterThanOrEqual(2);
+    // Live step usage
+    const stepUsage = usages.find(([, u]) => u.finalized === false && u.usage?.input_tokens === 5 && u.usage?.output_tokens === 2);
+    expect(stepUsage).toBeDefined();
+    expect(stepUsage![1].usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+    });
+    expect(stepUsage![1].model).toBe('gemini-3.8-flash-high');
+
+    // Finalized result usage
+    const finalUsage = usages.find(([, u]) => u.finalized === true);
+    expect(finalUsage).toBeDefined();
+    expect(finalUsage![1].usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_read_input_tokens: 7,
+    });
+    expect(finalUsage![1].model).toBe('gemini-3.8-flash-high');
+
+    // Completion message metadata matches prompt context usage
+    expect(completes[0][1].metadata?.usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_read_input_tokens: 7,
+    });
+  });
+
+  it('maps a failed result to a provider error without completing', async () => {
+    const sid = await provider.createSession({ sessionKey: 's4', cwd: dir });
+    await provider.send(sid, 'FAIL');
+    await waitFor(() => errors.length === 1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+    expect(errors[0][1].recoverable).toBe(false);
+    expect(completes).toHaveLength(0);
+  });
+
+  it('cancel kills the process and the next send resumes the same conversation', async () => {
+    const sid = await provider.createSession({ sessionKey: 's5', cwd: dir });
+    await provider.send(sid, 'HANG');
+    await waitFor(() => infos.length > 0);
+    const convId = infos[0][1].resumeId!;
+    await provider.cancel(sid);
+    expect(errors.some(([, e]) => e.code === PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    await provider.send(sid, 'again');
+    await waitFor(() => completes.length === 1);
+    const resumed = launches()[1];
+    expect(resumed.slice(resumed.indexOf('--conversation'), resumed.indexOf('--conversation') + 2)).toEqual(['--conversation', convId]);
+    expect(completes[0][1].content).toBe('Hello');
+  });
+
+  it('cancelAndWait confirms child exit and next send resumes the conversation', async () => {
+    const sid = await provider.createSession({ sessionKey: 's5-wait', cwd: dir });
+    await provider.send(sid, 'HANG');
+    await waitFor(() => infos.length > 0);
+    const convId = infos[0][1].resumeId!;
+    await provider.cancelAndWait(sid);
+    expect(errors.some(([, e]) => e.code === PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    await provider.send(sid, 'resumed-after-cancel-and-wait');
+    await waitFor(() => completes.length === 1);
+    const resumed = launches()[1];
+    expect(resumed.slice(resumed.indexOf('--conversation'), resumed.indexOf('--conversation') + 2)).toEqual(['--conversation', convId]);
+    expect(completes[0][1].content).toBe('Hello');
+  });
+
+  it('resumes a persisted conversation id passed through createSession and applies the model', async () => {
+    const sid = await provider.createSession({ sessionKey: 's6', cwd: dir, resumeId: 'persisted-1', agentId: 'claude-sonnet-5-5-low' });
+    await provider.send(sid, 'hi');
+    await waitFor(() => completes.length === 1);
+    const args = launches()[0];
+    expect(args.slice(args.indexOf('--conversation'), args.indexOf('--conversation') + 2)).toEqual(['--conversation', 'persisted-1']);
+    expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'claude-sonnet-5-5-low']);
+  });
+
+  it('relaunches with the new model after setSessionAgentId on an idle session', async () => {
+    const sid = await provider.createSession({ sessionKey: 's7', cwd: dir, agentId: 'gemini-3.8-flash-high' });
+    await provider.send(sid, 'one');
+    await waitFor(() => completes.length === 1);
+    provider.setSessionAgentId(sid, 'claude-sonnet-5-5-low');
+    await provider.send(sid, 'two');
+    await waitFor(() => completes.length === 2);
+    const second = launches()[1];
+    expect(second.slice(second.indexOf('--model'), second.indexOf('--model') + 2)).toEqual(['--model', 'claude-sonnet-5-5-low']);
+    expect(second).toContain('--conversation');
+  });
+
+  it('normalizes agy-sdk / display names in createSession and setSessionAgentId and passes --settings to CLI without writing disk settings.json', async () => {
+    const agyConfigDir = path.join(dir, '.gemini', 'antigravity-cli');
+    mkdirSync(agyConfigDir, { recursive: true });
+    const settingsPath = path.join(agyConfigDir, 'settings.json');
+    const diskSettings = JSON.stringify({ model: 'Gemini 4 Hydrogen (Medium)', effort: 'medium' });
+    writeFileSync(settingsPath, diskSettings);
+
+    const sid = await provider.createSession({ sessionKey: 's-norm', cwd: dir, agentId: 'agy-sdk' });
+    await provider.send(sid, 'one');
+    await waitFor(() => completes.length === 1);
+
+    const first = launches()[0];
+    expect(first.slice(first.indexOf('--model'), first.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-high']);
+    expect(first.slice(first.indexOf('--effort'), first.indexOf('--effort') + 2)).toEqual(['--effort', 'high']);
+    expect(first.slice(first.indexOf('--settings'), first.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-hydrogen-high' }),
+    ]);
+
+    // Bare backend name in setSessionAgentId is ignored; display name normalizes cleanly
+    provider.setSessionAgentId(sid, 'agy-sdk');
+    provider.setSessionAgentId(sid, 'Gemini 4 Carbon (Medium)');
+    await provider.send(sid, 'two');
+    await waitFor(() => completes.length === 2);
+
+    const second = launches()[1];
+    expect(second.slice(second.indexOf('--model'), second.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-carbon-medium']);
+    expect(second.slice(second.indexOf('--effort'), second.indexOf('--effort') + 2)).toEqual(['--effort', 'medium']);
+    expect(second.slice(second.indexOf('--settings'), second.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-carbon-medium' }),
+    ]);
+    expect(readFileSync(settingsPath, 'utf8')).toBe(diskSettings);
+  });
+
+  it('lists models from `agy models` with caching', async () => {
+    const first = await provider.listModels();
+    expect(first.isAuthenticated).toBe(true);
+    expect(first.models.map((m) => m.id)).toEqual(['claude-sonnet-5-5-low', 'gemini-4-hydrogen-high']);
+    expect(first.defaultModel).toBe('gemini-4-hydrogen-high');
+    await provider.listModels();
+    const modelProbes = readFileSync(argsFile, 'utf8').trim().split('\n').filter((l) => l.includes('"models"'));
+    expect(modelProbes).toHaveLength(1);
+    await provider.listModels(true);
+    expect(readFileSync(argsFile, 'utf8').trim().split('\n').filter((l) => l.includes('"models"'))).toHaveLength(2);
+  });
+
+  it('uses an advertised model as the catalog fallback when the preferred model is unavailable', async () => {
+    writeFileSync(path.join(dir, 'agy'), FAKE_AGY.replaceAll('gemini-4-hydrogen-high', 'gemini-4-argon-medium'));
+    const list = await provider.listModels(true);
+    expect(list.defaultModel).toBe('claude-sonnet-5-5-low');
+    expect(list.models.map((model) => model.id)).toContain(list.defaultModel);
+  });
+
+  it('reports a config error when the binary is missing', async () => {
+    const broken = new AgySdkProvider();
+    await expect(broken.connect({ binaryPath: path.join(dir, 'does-not-exist') }))
+      .rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(await broken.listModels()).toMatchObject({ models: [], isAuthenticated: false });
+  });
+
+  it('wakes the real stream driver/runtime once for a late native child terminal without polling',async()=>{
+    const runtime=new TransportSessionRuntime(provider,'deck_ag_async_child');
+    try {
+      await runtime.initialize({sessionKey:'deck_ag_async_child',cwd:dir});
+      runtime.send('CHILD_ASYNC','child-first');
+      await waitFor(()=>completes.length===2,15000);
+      expect(inputs()).toHaveLength(2);expect(inputs()[1]).toContain(SDK_SUBAGENT_WAKE_PROMPT_HEADER);
+      expect(tools.some(([,t])=>t.name==='Agent'&&t.detail?.meta?.normalizedStatus==='complete')).toBe(true);
+      await new Promise(r=>setTimeout(r,150));expect(inputs()).toHaveLength(2);
+    } finally {await runtime.kill();}
+  });
+  it('synchronizes actual stream child launch/list/swarm/send/kill/browser/definition events', async () => {
+    const sid=await provider.createSession({sessionKey:'child-lifecycle',cwd:dir});
+    await provider.send(sid,'CHILD_LIFECYCLE'); await waitFor(()=>completes.length===1);
+    const events=tools.map(([,t])=>t).filter(t=>t.name==='Agent');
+    expect(events.length).toBeGreaterThan(8);
+    for(const state of [SDK_SUBAGENT_STATUS.RUNNING,SDK_SUBAGENT_STATUS.COMPLETE,SDK_SUBAGENT_STATUS.ERROR,SDK_SUBAGENT_STATUS.INTERRUPTED]) expect(events.some(t=>t.detail?.meta?.normalizedStatus===state)).toBe(true);
+    const child=events.filter(t=>t.detail?.meta?.agentPath==='child-a');
+    expect(new Set(child.map(t=>t.id)).size).toBe(1); expect(child.at(-1)?.detail?.meta?.terminal).toBe(true);
+    expect(events.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=events.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=events.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+
+  });
+  it('emits subagent tool call with normalized SdkSubagentDetail for invoke_subagent', async () => {
+    const sid = await provider.createSession({ sessionKey: 'subagent-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    await provider.send(sid, 'SUBAGENT run');
+    await waitFor(() => completes.length === 1);
+
+    const subagentCalls = toolEvents.filter((t) => t.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
+    expect(subagentCalls.length).toBeGreaterThanOrEqual(1);
+    const subagentCall = subagentCalls[subagentCalls.length - 1];
+    expect(subagentCall.name).toBe('Agent');
+    expect(subagentCall.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: 'Antigravity sub-agent Researcher',
+      meta: {
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        backgrounded: true,
+        model: 'gemini-4-hydrogen-high',
+      },
+    });
+  });
+
+  it('reuses synthetic identity for unindexed ACTIVE replays and separates parallel distinct inputs without leaving phantom running subagents', async () => {
+    const sid = await provider.createSession({ sessionKey: 'unindexed-replay-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    const state = (provider as any).sessions.get(sid);
+    state.conversationId = 'conv-unindexed-test';
+    const emitStep = (step: Record<string, unknown>) => {
+      (provider as any).handleLine(sid, state, JSON.stringify({ event: 'step_update', step_update: step }));
+    };
+
+    // 1. Repeat ACTIVE updates with no step_index and no tool_call_id for the same call must reuse one slot.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Alpha', Prompt: 'work alpha' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Prompt: 'work alpha', Role: 'Alpha' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+
+    // 2. Concurrent anonymous call with distinct parameters gets its own slot, and replays reuse it.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Beta', Prompt: 'work beta' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Beta', Prompt: 'work beta' } },
+    });
+    expect(state.toolSteps.size).toBe(2);
+
+    // 3. Out-of-order DONE for Beta, then DONE for Alpha.
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'Beta', Prompt: 'work beta' },
+        output: JSON.stringify({ conversationId: 'child-beta', status: 'running' }),
+      },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'Alpha', Prompt: 'work alpha' },
+        output: JSON.stringify({ conversationId: 'child-alpha', status: 'running' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+
+    // 4. Child completions leave zero active/orphan subagents.
+    const alphaDone = state.subagents.snapshot({ conversationId: 'child-alpha', status: 'completed' }, 'native_completion');
+    const betaDone = state.subagents.snapshot({ conversationId: 'child-beta', status: 'completed' }, 'native_completion');
+    expect(alphaDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(betaDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(state.subagents.interrupt()).toEqual([]);
+
+    // 5. Distinct wire call_id & step_index stay isolated alongside parameterless anonymous replay + late tool_call_id DONE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 50,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Indexed' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'call-explicit-1',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'CallId' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent' },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent' },
+    });
+    expect(state.toolSteps.size).toBe(3);
+
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'late-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-anon', status: 'completed' }) },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 50,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-indexed', status: 'completed' }) },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'call-explicit-1',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-callid', status: 'completed' }) },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-alpha')).toBe(true);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-beta')).toBe(true);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-anon')).toBe(true);
+  });
+
+  it('upgrades pending anonymous steps to late-revealed wire identity across ACTIVE and DONE without orphan running subagents', async () => {
+    const sid = await provider.createSession({ sessionKey: 'late-id-upgrade-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    const state = (provider as any).sessions.get(sid);
+    state.conversationId = 'audit-late-id-parent';
+    const emitStep = (step: Record<string, unknown>) => {
+      (provider as any).handleLine(sid, state, JSON.stringify({ event: 'step_update', step_update: step }));
+    };
+
+    // 1. R2 counterexample: anonymous ACTIVE -> ACTIVE with newly revealed tool_call_id -> replay -> DONE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateId', Prompt: 'work late id' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Prompt: 'work late id', Role: 'LateId' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateId', Prompt: 'work late id' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'LateId', Prompt: 'work late id' },
+        output: JSON.stringify({ conversationId: 'child-late-id', status: 'running' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    const lateIdDone = state.subagents.snapshot({ conversationId: 'child-late-id', status: 'completed' }, 'native_completion');
+    expect(lateIdDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(state.subagents.interrupt()).toEqual([]);
+    const lateIdEvents = toolEvents.filter((t) => t.detail?.meta?.agentName === 'LateId');
+    expect(lateIdEvents).toHaveLength(4);
+    expect(new Set(lateIdEvents.map((t) => t.id)).size).toBe(1);
+
+    // 2. Same class via step_index revealed mid-flight on ACTIVE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'LateIdx', Prompt: 'work late idx' },
+        output: JSON.stringify({ conversationId: 'child-late-idx', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+    const lateIdxEvents = toolEvents.filter((t) => t.detail?.meta?.agentName === 'LateIdx');
+    expect(new Set(lateIdxEvents.map((t) => t.id)).size).toBe(1);
+
+    // 3. Call-id -> step_index upgrade preserves slot and cleans up.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'call-to-index',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'CallToIdx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 72,
+      tool_call_id: 'call-to-index',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        output: JSON.stringify({ conversationId: 'child-call-to-idx', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+
+    // 4. Parallel distinct-input explicit call does NOT hijack an unrelated open anonymous call.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'AnonOpen', Prompt: 'a' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'explicit-other',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'ExplicitOther', Prompt: 'b' } },
+    });
+    expect(state.toolSteps.size).toBe(2);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'explicit-other',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'ExplicitOther', Prompt: 'b' },
+        output: JSON.stringify({ conversationId: 'child-explicit-other', status: 'completed' }),
+      },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'AnonOpen', Prompt: 'a' },
+        output: JSON.stringify({ conversationId: 'child-anon-open', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+  });
+
+  it('reports background_monitor only for active native subagents and clears it on completion', async () => {
+    const sid = await provider.createSession({ sessionKey: 'active-work-snapshot', cwd: dir });
+    const state = (provider as any).sessions.get(sid);
+    state.subagents = new AgySubagentTracker('agy-conversation');
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'running' }] });
+
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'completed' }] });
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('retries beforeNativeSessionStart once when AG start owner changed occurs', async () => {
+    let attempts = 0;
+    const sid = await provider.createSession({
+      sessionKey: 'retry-owner-changed',
+      cwd: dir,
+      beforeNativeSessionStart: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('AG start owner changed');
+      },
+    });
+    await provider.send(sid, 'hello');
+    await waitFor(() => completes.length === 1);
+    expect(attempts).toBe(2);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('interrupts active subagents, clears open tool steps, and clears status on child exit or cancel', async () => {
+    const sid = await provider.createSession({ sessionKey: 'child-exit-cleanup', cwd: dir });
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus((s, st) => { if (s === sid) statuses.push({ status: st.status, label: st.label }); });
+
+    await provider.send(sid, 'warm');
+    await waitFor(() => completes.length === 1);
+
+    const state = (provider as any).sessions.get(sid);
+    state.subagents = new AgySubagentTracker(state.conversationId ?? sid);
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-live', status: 'running' }] });
+    state.toolSteps.set('step:99', { id: 'tool-99', name: 'Bash' });
+    state.inflightTurns = 1;
+    (provider as any).emitStatus(sid, state, { status: 'tool_running', label: 'Running Bash...' });
+
+    const beforeTools = tools.length;
+    state.child.kill('SIGKILL');
+    await waitFor(() => statuses.at(-1)?.status === null && state.toolSteps.size === 0);
+
+    const newTools = tools.slice(beforeTools).map(([, evt]) => evt);
+    expect(newTools.some((evt) => evt.id === 'tool-99' && evt.status === 'complete')).toBe(true);
+    expect(newTools.some((evt) => evt.detail?.meta?.agentPath === 'child-live' && evt.detail?.meta?.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED)).toBe(true);
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+
+    // When child is already gone, cancel() still interrupts active subagents and emits null status.
+    state.child = null;
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-after-exit', status: 'running' }] });
+    (provider as any).emitStatus(sid, state, { status: 'thinking', label: 'Thinking...' });
+    await provider.cancel(sid);
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+    expect(state.subagents.activeCount()).toBe(0);
+    expect(tools.some(([, evt]) => evt.detail?.meta?.agentPath === 'child-after-exit' && evt.detail?.meta?.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED)).toBe(true);
+  });
+
+  it('keeps compaction summary fallback on legacy resume when no native baseline is loaded into contextUsage', async () => {
+    const logsDir = path.join(dir, '.gemini/antigravity-cli/brain/legacy-conv/.system_generated/logs');
+    mkdirSync(logsDir, { recursive: true });
+    writeFileSync(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 10, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:00Z', content: 'after compaction' }),
+      ].join('\n') + '\n',
+    );
+
+    const sid = await provider.createSession({
+      sessionKey: 'legacy-compaction-resume',
+      cwd: dir,
+    });
+    const state = (provider as any).sessions.get(sid);
+    state.conversationId = 'legacy-conv';
+
+    // Fresh restarted legacy provider has no native reading -> must still seed summaryTokens instead of dropping to 0.
+    expect(await provider.checkSessionCompaction(sid)).toBe(true);
+    const afterResume = state.contextUsage.normalize({});
+    expect(afterResume.context_usage_estimated).toBe(true);
+    expect(afterResume.input_tokens).toBeGreaterThan(500);
+
+    // Pre-compaction native reading + new compaction + tokenless post-compaction PLANNER_RESPONSE MUST still reset to summary estimate.
+    state.contextUsage.normalize({ input_tokens: 3324, cache_read_tokens: 209320 });
+    expect(state.contextUsage.hasNativeOccupancy).toBe(true);
+    writeFileSync(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 10, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:00Z', content: 'after compaction' }),
+        JSON.stringify({ step_index: 15, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:01:30Z', content: '# Resuming from a compaction\n' + 'compact '.repeat(300) }),
+        JSON.stringify({ step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:40Z', content: 'tokenless post compaction' }),
+      ].join('\n') + '\n',
+    );
+    expect(await provider.checkSessionCompaction(sid)).toBe(true);
+    const afterPreCompactionNative = state.contextUsage.normalize({});
+    expect(afterPreCompactionNative.context_usage_estimated).toBe(true);
+    expect(afterPreCompactionNative.cache_read_input_tokens).toBe(0);
+    expect(afterPreCompactionNative.input_tokens).toBeGreaterThan(300);
+    expect(afterPreCompactionNative.input_tokens).toBeLessThan(2000);
+
+    // Terminal compaction row with no subsequent PLANNER_RESPONSE also resets cleanly.
+    state.contextUsage.normalize({ input_tokens: 12000, cache_read_tokens: 80000 });
+    expect(state.contextUsage.hasNativeOccupancy).toBe(true);
+    writeFileSync(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 10, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 11, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:00Z', content: 'after compaction' }),
+        JSON.stringify({ step_index: 15, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:01:30Z', content: '# Resuming from a compaction\n' + 'compact '.repeat(300) }),
+        JSON.stringify({ step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T00:01:40Z', content: 'tokenless post compaction' }),
+        JSON.stringify({ step_index: 20, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T00:02:00Z', content: '# Resuming from a compaction\nfresh' }),
+      ].join('\n') + '\n',
+    );
+    expect(await provider.checkSessionCompaction(sid)).toBe(true);
+    const afterNewCompact = state.contextUsage.normalize({});
+    expect(afterNewCompact.context_usage_estimated).toBe(true);
+    expect(afterNewCompact.cache_read_input_tokens).toBe(0);
+    expect(afterNewCompact.input_tokens).toBeLessThan(1000);
+  });
+
+  it('clears provider_wait in getActiveWorkSnapshot immediately on cancel() before child termination completes', async () => {
+    const sid = await provider.createSession({ sessionKey: 'cancel-snapshot-clear', cwd: dir });
+    await provider.send(sid, 'warm');
+    await waitFor(() => completes.length === 1);
+
+    const state = (provider as any).sessions.get(sid);
+    state.inflightTurns = 1;
+    state.pendingInputs = [{ promptHash: 'h1', sentAt: Date.now() }];
+    state.toolSteps.set('step:5', { id: 'tool-5', name: 'Read' });
+
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 2,
+      activeToolCount: 1,
+      busyReasons: ['provider_wait', 'open_tool_call'],
+    });
+
+    let snapshotDuringTeardown: ReturnType<typeof provider.getActiveWorkSnapshot> = null;
+    const origTerminate = (provider as any).terminateChild.bind(provider);
+    (provider as any).terminateChild = async (st: unknown) => {
+      snapshotDuringTeardown = provider.getActiveWorkSnapshot(sid);
+      return origTerminate(st);
+    };
+
+    await provider.cancel(sid);
+    expect(snapshotDuringTeardown).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+});

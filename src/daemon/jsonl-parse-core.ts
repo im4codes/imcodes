@@ -18,6 +18,12 @@ import type { TimelineEventType, TimelineSource, TimelineConfidence } from '../s
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangeBatch } from '../../shared/file-change.js';
 import { normalizeClaudeFileChange } from './file-change-normalizer.js';
 import { resolveContextWindow } from '../shared/models/context.js';
+import { isClaudeSyntheticSeedAssistant } from '../shared/claude-synthetic-seed.js';
+import {
+  canonicalAskQuestionToolName,
+  extractAskQuestionsFromToolInput,
+  extractAskQuestionsFromToolName,
+} from '../../shared/ask-question-normalize.js';
 
 // ── Types reproduced locally (structurally identical to jsonl-watcher) ──────
 
@@ -109,7 +115,7 @@ function extractToolInput(name: string, input?: Record<string, unknown>): string
   if (name === 'Grep') {
     const pattern = input.pattern ?? input.query ?? input.text;
     const path = input.path ?? input.file_path ?? input.filePath;
-    if (pattern && path) return `${String(pattern).split('\n')[0]} in ${String(path).split('\n')[0]}`;
+    if (pattern && path) return `${String(pattern)} in ${String(path)}`;
   }
   const val = input.command
     ?? input.path
@@ -121,7 +127,7 @@ function extractToolInput(name: string, input?: Record<string, unknown>): string
     ?? input.text
     ?? '';
   const text = String(val);
-  return text.split('\n')[0] ?? '';
+  return text;
 }
 
 function extractToolResultOutput(block: ContentBlock): string | undefined {
@@ -135,9 +141,8 @@ function extractToolResultOutput(block: ContentBlock): string | undefined {
   } else {
     return undefined;
   }
-  text = text.trim();
-  if (!text) return undefined;
-  return text.length > 200 ? text.slice(0, 197) + '...' : text;
+  if (!text.trim()) return undefined;
+  return text;
 }
 
 function isClaudeFileChangeTool(name?: string): boolean {
@@ -246,18 +251,24 @@ function emitClaudeToolCallBlock(
   ts?: number,
 ): void {
   if (!block.name) return;
-  if (block.name === 'AskUserQuestion') {
-    const inp = block.input as Record<string, unknown> | undefined;
-    pushEmit(out, sessionName, 'ask.question', {
-      toolUseId: block.id,
-      questions: inp?.['questions'] ?? [],
-    }, {
-      source: 'daemon',
-      confidence: 'high',
-      ...(stableId ? { eventId: stableId('aq') } : {}),
-      ...(ts ? { ts } : {}),
-    });
-    return;
+  const canonicalAskTool = canonicalAskQuestionToolName(block.name);
+  if (canonicalAskTool) {
+    const questionsFromInput = extractAskQuestionsFromToolInput(block.input);
+    const questions = questionsFromInput.length > 0
+      ? questionsFromInput
+      : extractAskQuestionsFromToolName(block.name);
+    if (questions.length > 0 || canonicalAskTool === 'AskUserQuestion') {
+      pushEmit(out, sessionName, 'ask.question', {
+        toolUseId: block.id,
+        questions,
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        ...(stableId ? { eventId: stableId('aq') } : {}),
+        ...(ts ? { ts } : {}),
+      });
+      return;
+    }
   }
 
   const input = block.input as Record<string, unknown> | undefined;
@@ -279,6 +290,10 @@ function emitClaudeToolCallBlock(
   const summaryInput = extractToolInput(block.name, input);
   pushEmit(out, sessionName, 'tool.call', {
     tool: block.name,
+    // Correlation id for call/result pairing. The id was already known here
+    // (it builds the eventId) but stayed off the payload, so the web view had
+    // to guess by adjacency — which mispairs concurrent tools.
+    ...(toolUseId ? { toolCallId: toolUseId } : {}),
     ...(summaryInput ? { input: summaryInput } : (input ? { input } : {})),
   }, {
     source: 'daemon',
@@ -326,6 +341,7 @@ function emitClaudeToolResultBlock(
 
   if (normalized && pending) {
     pushEmit(out, sessionName, 'tool.result', {
+      toolCallId: pending.id,
       ...(block.is_error ? { error: String(block.content ?? 'error') } : {}),
       ...(toolUseResult?.content ? { output: toolUseResult.content } : {}),
     }, {
@@ -342,6 +358,7 @@ function emitClaudeToolResultBlock(
   const error = block.is_error ? String(block.content ?? 'error') : undefined;
   const output = !error ? extractToolResultOutput(block) : undefined;
   pushEmit(out, sessionName, 'tool.result', {
+    ...(toolUseId ? { toolCallId: toolUseId } : {}),
     ...(error ? { error } : {}),
     ...(output ? { output } : {}),
   }, {
@@ -370,6 +387,8 @@ function parseOneLine(
   } catch {
     return;
   }
+
+  if (isClaudeSyntheticSeedAssistant(raw)) return;
 
   const lineTs = raw['timestamp'] ? new Date(raw['timestamp'] as string).getTime() : undefined;
   const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;

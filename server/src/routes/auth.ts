@@ -2,28 +2,56 @@ import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
-import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
+import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
-import { checkIdempotency, recordIdempotency } from '../security/replay.js';
-import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { resolveServerRole } from '../security/authorization.js';
+import { checkAuthLockout, rateLimiter, recordAuthFailure } from '../security/lockout.js';
+import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import {
+  buildDesktopSetupCallbackRedirectUrl,
+  DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
+  parseDesktopSetupCallbackUrl,
+} from '../../../shared/desktop-setup-auth.js';
+import { alignedSessionIssuedAt, isUserActive, nextSessionValidAfter } from '../security/user-status.js';
+import { isUserStatusActive } from '../../../shared/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
+import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
+import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
+import { rememberClientTimezone } from '../util/client-timezone.js';
+import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
+import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 const AUTH_NONCE_TTL_MS = 60_000;
 const AUTH_NONCE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const OAUTH_RELAY_KEY_ID = 'oauth-relay';
+export const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
+export const DOC_RELAY_TICKET_ID_PREFIX = `${DOC_RELAY_TICKET_PURPOSE}:`;
 
 let authNonceCleanupDb: Database | null = null;
 let authNonceCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let authNonceStartupCleanupPromise: Promise<void> | null = null;
 
 // Task 5: Cache-Control: no-store on all auth endpoints
-authRoutes.use('/*', async (c, next) => {
+authRoutes.use('/*', async (c, next): Promise<Response | void> => {
   scheduleAuthNonceCleanup(c.env.DB);
+  const path = c.req.path;
+  const method = c.req.method;
+  const isDocCollabAllowedAuthPath =
+    (method === 'GET' && path.endsWith('/user/me')) ||
+    (method === 'POST' && (path.endsWith('/refresh') || path.endsWith('/logout') || path.endsWith('/relay/verify'))) ||
+    path.includes('/github') ||
+    path.includes('/google');
+  if (!isDocCollabAllowedAuthPath) {
+    const resolution = await resolveAuthOutcome(c);
+    if (resolution.auth?.scope === 'doc_collaborator') {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
+  }
   await next();
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
@@ -50,41 +78,10 @@ type AuthRequestMetadata = {
 };
 
 async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
-  // Task 1: Try rcc_session cookie first (parse manually to avoid Hono Context type constraint)
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
-  const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
-  if (cookieToken && c.env.JWT_SIGNING_KEY) {
-    const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user && user.status === 'active') return user.id;
-    }
-  }
-
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return null;
-  const bearerToken = auth.slice(7);
-
-  // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
-  const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket' && jwtBearer.type !== 'share-ws-ticket') {
-    const user = await getUserById(c.env.DB, jwtBearer.sub);
-    if (user && user.status === 'active') return user.id;
-  }
-
-  // Fall back to API key check
-  const keyHash = sha256Hex(bearerToken);
-  const row = await c.env.DB.queryOne<{ user_id: string }>(
-    'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL',
-    [keyHash],
-  );
-  if (row) {
-    const apiKeyUser = await getUserById(c.env.DB, row.user_id);
-    if (apiKeyUser && apiKeyUser.status === 'active') return row.user_id;
-  }
-
-  return null;
+  // The ONE credential resolver (security/authorization.ts): login cookie / bearer JWT / API key, each followed by the account check, so a
+  // disabled or pending user holds no identity here either. A daemon server-token is not an account credential for these routes.
+  const resolution = await resolveAuthOutcome(c as unknown as Parameters<typeof resolveAuthOutcome>[0]);
+  return resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
 }
 
 function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
@@ -145,7 +142,10 @@ export async function issueAuthNonce(
 }
 
 export async function cleanupExpiredAuthNonces(db: Database): Promise<number> {
-  const result = await db.execute('DELETE FROM auth_nonces WHERE expires_at < $1', [Date.now()]);
+  const result = await db.execute(
+    'DELETE FROM auth_nonces WHERE expires_at < $1 AND key_id != $2',
+    [Date.now(), OAUTH_RELAY_KEY_ID],
+  );
   return result.changes ?? 0;
 }
 
@@ -176,26 +176,26 @@ export async function initializeAuthNonceCleanup(db: Database): Promise<void> {
 
 // POST /api/auth/register — create a new user and issue initial API key
 authRoutes.post('/register', async (c) => {
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  if (!rateLimiter.check(`auth-register:${ip}`, 20, 60_000)) {
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfter: 60 }, 429);
+  }
+
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
-  }
-
-  // Idempotency: deduplicate retried registration requests
-  const idempotencyKey = c.req.header('Idempotency-Key');
-  if (idempotencyKey) {
-    const cached = await checkIdempotency(idempotencyKey, 'anon', c.env.DB);
-    if (cached) return c.body(cached.body, cached.status as never);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   const userId = randomHex(16);
   await createUser(c.env.DB, userId);
 
-  // Set status to pending if approval is required
+  // Set status to pending if approval is required; never issue an active API key while pending
   const requireApproval = await getSetting(c.env.DB, 'require_approval');
   if (requireApproval === 'true') {
     await updateUserStatus(c.env.DB, userId, 'pending');
+    await logAuthAudit(c, { userId, action: 'auth.register', ip }, c.env.DB);
+    return c.json({ ok: true, userId, pending: true }, 201);
   }
 
   const rawKey = `deck_${randomHex(32)}`;
@@ -206,14 +206,9 @@ authRoutes.post('/register', async (c) => {
     [randomHex(16), userId, keyHash, now],
   );
 
-  const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.register', ip }, c.env.DB);
 
-  const responseBody = JSON.stringify({ userId, apiKey: rawKey });
-  if (idempotencyKey) {
-    await recordIdempotency(idempotencyKey, 'anon', 201, responseBody, c.env.DB);
-  }
-  return c.body(responseBody, 201, { 'Content-Type': 'application/json' });
+  return c.json({ userId, apiKey: rawKey }, 201);
 });
 
 // Platform identity linking is handled exclusively through verified OAuth flows
@@ -222,11 +217,21 @@ authRoutes.post('/register', async (c) => {
 // GET /api/auth/user/me — get authenticated user (cookie, Bearer API key or JWT)
 // NOTE: must be registered before /user/:id to avoid Hono matching id='me'
 authRoutes.get('/user/me', async (c) => {
-  const userId = await resolveUserId(c);
+  const resolution = await resolveAuthOutcome(c);
+  const userId = resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'not_found' }, 404);
-  return c.json(toClientUser(user));
+  await rememberClientTimezone(c.env.DB, userId, c.req.header(CLIENT_TIMEZONE_HEADER)).catch((err) => {
+    logger.warn({ err, userId }, 'Failed to remember client timezone');
+  });
+  const clientUser = toClientUser(user);
+  const r2RelayEnabled = r2RelayConfig(c.env) !== null;
+  return c.json(
+    resolution.auth?.scope === 'doc_collaborator' && clientUser
+      ? { ...clientUser, scope: 'doc_collaborator' as const, r2RelayEnabled }
+      : { ...clientUser, r2RelayEnabled },
+  );
 });
 
 // GET /api/auth/user/:id — requires auth, only accessible for own user ID
@@ -389,8 +394,8 @@ authRoutes.post('/ws-ticket', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   // Check server access
-  const role = await resolveServerRole(c.env.DB, parsed.data.serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerWebSocketAccess(c.env.DB, parsed.data.serverId, userId);
+  if (!access) return c.json({ error: 'forbidden' }, 403);
 
   const jti = randomHex(16);
   const ticket = signJwt(
@@ -425,14 +430,14 @@ authRoutes.post('/token-exchange', async (c) => {
 
   const now = Date.now();
   const nonceRow = await c.env.DB.queryOne<{ api_key: string; user_id: string; key_id: string }>(
-    'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 RETURNING api_key, user_id, key_id',
-    [parsed.data.nonce, now],
+    'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 AND key_id != $3 RETURNING api_key, user_id, key_id',
+    [parsed.data.nonce, now, OAUTH_RELAY_KEY_ID],
   );
 
   if (!nonceRow) {
     const existing = await c.env.DB.queryOne<{ user_id: string; expires_at: number }>(
-      'SELECT user_id, expires_at FROM auth_nonces WHERE nonce = $1',
-      [parsed.data.nonce],
+      'SELECT user_id, expires_at FROM auth_nonces WHERE nonce = $1 AND key_id != $2',
+      [parsed.data.nonce, OAUTH_RELAY_KEY_ID],
     );
     await logAuthAudit(c, {
       userId: existing?.user_id,
@@ -442,6 +447,14 @@ authRoutes.post('/token-exchange', async (c) => {
       details: {
         reason: existing ? (existing.expires_at <= now ? 'expired' : 'replayed') : 'missing',
       },
+    }, c.env.DB);
+    return c.json({ error: 'invalid_or_expired_nonce' }, 400);
+  }
+
+  // The nonce carries a freshly minted API key: a disabled (or pending) user's nonce is consumed and refused, the key is never handed out.
+  if (!await isUserActive(c.env.DB, nonceRow.user_id)) {
+    await logAuthAudit(c, {
+      userId: nonceRow.user_id, action: 'auth.token_exchange', ip, outcomeCode: 'token_exchange_failed', details: { reason: 'account_not_active' },
     }, c.env.DB);
     return c.json({ error: 'invalid_or_expired_nonce' }, 400);
   }
@@ -461,6 +474,49 @@ authRoutes.post('/token-exchange', async (c) => {
   });
 });
 
+// POST /api/auth/desktop/nonce — mint a short-lived nonce for a validated loopback desktop callback
+const desktopNonceSchema = z.object({
+  callbackUrl: z.string().min(1).max(512),
+});
+
+authRoutes.post('/desktop/nonce', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = desktopNonceSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const validated = parseDesktopSetupCallbackUrl(parsed.data.callbackUrl);
+  if (!validated) return c.json({ error: 'invalid_desktop_callback' }, 400);
+
+  const userId = c.get('userId' as never) as string;
+  if (!await isUserActive(c.env.DB, userId)) {
+    return c.json({ error: 'account_not_active' }, 403);
+  }
+
+  const rawKey = `deck_${randomHex(32)}`;
+  const keyHash = sha256Hex(rawKey);
+  const keyId = randomHex(16);
+  const now = Date.now();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [keyId, userId, keyHash, 'Desktop app', now],
+  );
+
+  const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId, keyId });
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.desktop_nonce',
+    ip,
+    outcomeCode: 'success',
+    details: { keyId, callbackPort: validated.port },
+  }, c.env.DB);
+
+  return c.json({
+    nonce,
+    redirectUrl: buildDesktopSetupCallbackRedirectUrl(validated, nonce),
+  });
+});
+
 // POST /api/auth/refresh — refresh JWT access token (cookie or JSON body)
 const refreshSchema = z.object({ refreshToken: z.string().optional() });
 
@@ -471,58 +527,89 @@ authRoutes.post('/refresh', async (c) => {
   const refreshToken = cookieRefresh ?? parsed.data?.refreshToken;
   if (!refreshToken) {
     logger.warn({ hasCookieRefresh: !!cookieRefresh }, '[refresh] no refresh token provided');
-    return c.json({ error: 'invalid_body' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
   }
 
   const tokenHash = sha256Hex(refreshToken);
+  const now = Date.now();
 
-  // Only accept unused tokens (used_at IS NULL). Already-consumed tokens are simply
-  // rejected — no family revocation. This matches the pre-security-hardening behaviour
-  // that was stable. The replay-detection pattern (revoking entire families) caused
-  // cascading logouts whenever a Set-Cookie response was lost (network glitch, browser
-  // crash, race between tabs).
-  const row = await c.env.DB.queryOne<{ id: string; user_id: string; family_id: string }>(
-    'SELECT * FROM refresh_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2',
-    [tokenHash, Date.now()],
+  // Read-only lookup first so temporary account lockout never consumes the refresh token.
+  const peek = await c.env.DB.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM refresh_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2',
+    [tokenHash, now],
   );
-
-  if (!row) {
+  if (!peek) {
     logger.warn({ hashPrefix: tokenHash.slice(0, 8) }, '[refresh] token not found, already used, or expired');
     return c.json({ error: 'invalid_token' }, 401);
   }
 
-  // Reject disabled/pending users — prevents token refresh after admin disables account
-  const refreshUser = await getUserById(c.env.DB, row.user_id);
-  if (!refreshUser || refreshUser.status !== 'active') {
-    // Consume the token to prevent replay, but don't issue new ones
-    await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
-    return c.json({ error: 'account_disabled' }, 403);
+  // A valid refresh token is not a brute-force attempt. In particular, never
+  // consult a shared IP bucket here: one user's password failures must not
+  // invalidate refresh for every other logged-in user.
+  const preLockout = await checkAuthLockout(c.env.DB, `user:${peek.user_id}`);
+  if (preLockout.locked) {
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: preLockout.lockedUntil ? preLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  // Per-IP + per-user lockout check on refresh
-  const refreshIp = c.get('clientIp' as never) as string ?? 'unknown';
-  const refreshIpLockout = await checkAuthLockout(c.env.DB, `ip:${refreshIp}`);
-  if (refreshIpLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: refreshIpLockout.lockedUntil ? refreshIpLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
-  const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
-  if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
-
-  // Mark old token consumed (rotation)
-  await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
-  logger.info({ tokenId: row.id }, '[refresh] token consumed, issuing new pair');
-
-  // Issue new access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: row.user_id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const newRefresh = randomHex(32);
   const newRefreshHash = sha256Hex(newRefresh);
   const newRefreshId = randomHex(16);
-  await c.env.DB.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [newRefreshId, row.user_id, newRefreshHash, row.family_id, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
-  );
+
+  // Lock users row before updating refresh_tokens (same lock order as /password/change) so an
+  // in-flight refresh cannot race past a concurrent password change or disable and still mint a new pair.
+  const txResult = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ id: string; status: string; sessions_valid_after: string | number }>(
+      'SELECT id, status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [peek.user_id],
+    );
+    if (!lockedUser || lockedUser.status !== 'active') {
+      return { ok: false as const, status: 403 as const, error: AUTH_ERROR_CODES.ACCOUNT_DISABLED };
+    }
+
+    const userLockout = await checkAuthLockout(tx, `user:${lockedUser.id}`);
+    if (userLockout.locked) {
+      return {
+        ok: false as const,
+        status: 429 as const,
+        error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+        retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0,
+      };
+    }
+
+    const txNow = Date.now();
+    const row = await tx.queryOne<{ id: string; user_id: string; family_id: string }>(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, user_id, family_id',
+      [txNow, tokenHash],
+    );
+    if (!row) {
+      return { ok: false as const, status: 401 as const, error: 'invalid_token' };
+    }
+
+    const isDocCollabRefresh = typeof row.family_id === 'string' && row.family_id.startsWith('doc_collab:');
+    const iat = alignedSessionIssuedAt(Number(lockedUser.sessions_valid_after ?? 0) || 0, txNow);
+    const accessToken = signJwt(
+      isDocCollabRefresh
+        ? { sub: row.user_id, type: ACCOUNT_SESSION_JWT_TYPE, scope: 'doc_collaborator', iat }
+        : { sub: row.user_id, iat },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [newRefreshId, row.user_id, newRefreshHash, row.family_id, txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    return { ok: true as const, tokenId: row.id, accessToken };
+  });
+
+  if (!txResult.ok) {
+    if (txResult.status === 429) {
+      return c.json({ error: txResult.error, retryAfterMs: txResult.retryAfterMs }, 429);
+    }
+    return c.json({ error: txResult.error }, txResult.status);
+  }
+
+  logger.info({ tokenId: txResult.tokenId }, '[refresh] token consumed, issuing new pair');
+  const accessToken = txResult.accessToken;
 
   const isSecure = c.env.NODE_ENV === 'production';
 
@@ -574,8 +661,10 @@ authRoutes.delete('/user/me', async (c) => {
   await db.execute('DELETE FROM push_tokens WHERE user_id = $1', [userId]);
   // 6. Push subscriptions
   await db.execute('DELETE FROM push_subscriptions WHERE user_id = $1', [userId]);
+  // 7. Server-side usage analytics facts
+  await deleteTokenUsageFactsForUser(db, userId);
 
-  // 7. Get server IDs for cascade deleting server-scoped data
+  // 8. Get server IDs for cascade deleting server-scoped data
   const serverRows = await db.query<{ id: string }>('SELECT id FROM servers WHERE user_id = $1', [userId]);
   const serverIds = serverRows.map((r) => r.id);
 
@@ -595,13 +684,13 @@ authRoutes.delete('/user/me', async (c) => {
     }
   }
 
-  // 8. Platform bots
+  // 9. Platform bots
   await db.execute('DELETE FROM platform_bots WHERE user_id = $1', [userId]);
-  // 9. Servers
+  // 10. Servers
   await db.execute('DELETE FROM servers WHERE user_id = $1', [userId]);
-  // 10. Pending binds
+  // 11. Pending binds
   await db.execute('DELETE FROM pending_binds WHERE user_id = $1', [userId]);
-  // 11. Platform identities
+  // 12. Platform identities
   await db.execute('DELETE FROM platform_identities WHERE user_id = $1', [userId]);
   // 12. User preferences
   await db.execute('DELETE FROM user_preferences WHERE user_id = $1', [userId]);
@@ -630,6 +719,7 @@ authRoutes.delete('/user/me', async (c) => {
 // ── Password auth ─────────────────────────────────────────────────────────
 
 import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 
 // POST /api/auth/password/register — create a new user with username + password
 const passwordRegisterSchema = z.object({
@@ -643,12 +733,12 @@ authRoutes.post('/password/register', async (c) => {
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   const body = await c.req.json().catch(() => null);
   const parsed = passwordRegisterSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, displayName, native } = parsed.data;
 
@@ -661,13 +751,13 @@ authRoutes.post('/password/register', async (c) => {
   // Validate username format
   const normalizedUsername = username.trim().toLowerCase();
   if (!USERNAME_REGEX.test(normalizedUsername)) {
-    return c.json({ error: 'invalid_username_format' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
   // Check username availability
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser) {
-    return c.json({ error: 'username_taken' }, 409);
+    return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
 
   // Create user
@@ -699,7 +789,7 @@ authRoutes.post('/password/register', async (c) => {
 
   // Issue session
   const isSecure = (c.req.header('x-forwarded-proto') ?? c.req.url).includes('https');
-  const accessToken = signJwt({ sub: userId, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   await c.env.DB.execute(
@@ -747,64 +837,113 @@ const passwordLoginSchema = z.object({
 authRoutes.post('/password/login', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = passwordLoginSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, native } = parsed.data;
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   const normalizedUsername = username.trim().toLowerCase();
 
-  // Triple-dimension lockout checks (OWASP/NIST compliant):
-  // 1. IP — prevents single-source brute force
-  // 2. Username (normalized) — prevents distributed credential stuffing
-  // Both checked BEFORE user lookup to avoid timing side-channels.
-  const ipLockout = await checkAuthLockout(c.env.DB, `ip:${ip}`);
-  if (ipLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: ipLockout.lockedUntil ? ipLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
-
+  // Account-only lockout checks. IP dimensions are deliberately not used:
+  // a reverse proxy can collapse all users onto one socket address.
+  // Check BEFORE user lookup to avoid timing side-channels.
   const usernameLockout = await checkAuthLockout(c.env.DB, `username:${normalizedUsername}`);
   if (usernameLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const user = await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
-    // Unified failure: record against BOTH ip and username even for non-existent users
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
-    return c.json({ error: 'invalid_credentials' }, 401);
+    // Unified failure: record against the attempted username even when it does
+    // not exist. This cannot affect another account.
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
-  // 3. User ID — prevents abuse of specific known accounts
+  // User ID — prevents abuse of a specific known account.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
   if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
-    await recordAuthFailure(c.env.DB, `user:${user.id}`);
-    return c.json({ error: 'invalid_credentials' }, 401);
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
+    await recordAuthFailure(c.env.DB, `user:${user.id}`, 'password_login_invalid_credentials');
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
   // Reject disabled/pending users
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
-  // Issue access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: user.id, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  // Lock users row before issuing tokens and confirm the password hash is still the one verified above.
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);
   const refreshId = randomHex(16);
-  await c.env.DB.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
-  );
+  const rawKey = native ? `deck_${randomHex(32)}` : undefined;
+  const keyId = native ? randomHex(16) : undefined;
 
+  const loginTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{
+      id: string;
+      password_hash: string | null;
+      status: string;
+      password_must_change: boolean | null;
+      sessions_valid_after: string | number;
+    }>(
+      'SELECT id, password_hash, status, password_must_change, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [user.id],
+    );
+    if (!lockedUser || lockedUser.password_hash !== user.password_hash) {
+      return { ok: false as const, status: 401 as const, error: AUTH_ERROR_CODES.INVALID_CREDENTIALS };
+    }
+    if (lockedUser.status !== 'active') {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+    const txLockout = await checkAuthLockout(tx, `user:${user.id}`);
+    if (txLockout.locked) {
+      return {
+        ok: false as const,
+        status: 429 as const,
+        error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+        retryAfterMs: txLockout.lockedUntil ? txLockout.lockedUntil - Date.now() : 0,
+      };
+    }
+
+    const txNow = Date.now();
+    const iat = alignedSessionIssuedAt(Number(lockedUser.sessions_valid_after ?? 0) || 0, txNow);
+    const accessToken = signJwt(
+      { sub: user.id, type: ACCOUNT_SESSION_JWT_TYPE, iat },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [refreshId, user.id, refreshHash, familyId, txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    if (native && rawKey && keyId) {
+      await tx.execute(
+        'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+        [keyId, user.id, sha256Hex(rawKey), 'native-password-login', txNow],
+      );
+    }
+    return { ok: true as const, accessToken, passwordMustChange: !!lockedUser.password_must_change };
+  });
+
+  if (!loginTx.ok) {
+    if (loginTx.status === 429) {
+      return c.json({ error: loginTx.error, retryAfterMs: loginTx.retryAfterMs }, 429);
+    }
+    return c.json({ error: loginTx.error }, loginTx.status);
+  }
+
+  const { accessToken, passwordMustChange } = loginTx;
   const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, COOKIE_SESSION, accessToken, {
     httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
@@ -818,26 +957,12 @@ authRoutes.post('/password/login', async (c) => {
 
   await logAuthAudit(c, { userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
 
-  // Native apps need a long-lived API key (cookies don't work in Capacitor).
-  let apiKey: string | undefined;
-  let keyId: string | undefined;
-  if (native) {
-    const rawKey = `deck_${randomHex(32)}`;
-    keyId = randomHex(16);
-    const keyHash = sha256Hex(rawKey);
-    await c.env.DB.execute(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
-      [keyId, user.id, keyHash, 'native-password-login', Date.now()],
-    );
-    apiKey = rawKey;
-  }
-
   return c.json({
     ok: true,
-    passwordMustChange: !!user.password_must_change,
+    passwordMustChange,
     accessToken,
     refreshToken: refreshRaw,
-    ...(native ? { apiKey, keyId, userId: user.id } : {}),
+    ...(native ? { apiKey: rawKey, keyId, userId: user.id } : {}),
   });
 });
 
@@ -872,6 +997,14 @@ authRoutes.post('/password/change', async (c) => {
   const userId = await resolveUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
+  const userLockout = await checkAuthLockout(c.env.DB, `user:${userId}`);
+  if (userLockout.locked) {
+    return c.json({
+      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+      retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0,
+    }, 429);
+  }
+
   const body = await c.req.json().catch(() => null);
   const parsed = passwordChangeSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -888,13 +1021,76 @@ authRoutes.post('/password/change', async (c) => {
   if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);
 
   const valid = await verifyPassword(oldPassword, user.password_hash);
-  if (!valid) return c.json({ error: 'invalid_old_password' }, 401);
+  if (!valid) {
+    await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
+  }
 
   const newHash = await hashPassword(newPassword);
-  await c.env.DB.execute(
-    'UPDATE users SET password_hash = $1, password_must_change = false WHERE id = $2',
-    [newHash, userId],
-  );
+  const hadSessionCookie = !c.req.header('Authorization') && !!getCookie(c, COOKIE_SESSION);
+
+  const changeTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ id: string; password_hash: string | null; status: string; sessions_valid_after: string | number }>(
+      'SELECT id, password_hash, status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    if (!lockedUser || !lockedUser.password_hash) {
+      return { ok: false as const, status: 400 as const, error: 'no_password_set' };
+    }
+    if (lockedUser.password_hash !== user.password_hash) {
+      return { ok: false as const, status: 401 as const, error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD };
+    }
+    if (!isUserStatusActive(lockedUser.status)) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+
+    const txNow = Date.now();
+    const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
+    const newValidAfter = nextSessionValidAfter(prevValidAfter, txNow);
+
+    await tx.execute(
+      'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
+      [newHash, userId, newValidAfter],
+    );
+    await tx.execute(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
+      [txNow, userId],
+    );
+
+    if (hadSessionCookie && c.env.JWT_SIGNING_KEY) {
+      const nextIat = alignedSessionIssuedAt(newValidAfter, txNow);
+      const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: nextIat }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+      const refreshRaw = randomHex(32);
+      await tx.execute(
+        'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+      );
+      return { ok: true as const, accessToken, refreshRaw };
+    }
+    return { ok: true as const, accessToken: null, refreshRaw: null };
+  });
+
+  if (!changeTx.ok) {
+    return c.json({ error: changeTx.error }, changeTx.status);
+  }
+
+  if (changeTx.accessToken && changeTx.refreshRaw) {
+    const isSecure = c.env.NODE_ENV === 'production';
+    setCookie(c, COOKIE_SESSION, changeTx.accessToken, {
+      httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
+    });
+    setCookie(c, 'rcc_refresh', changeTx.refreshRaw, {
+      httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+    });
+    const existingCsrf = getCookie(c, COOKIE_CSRF);
+    setCookie(c, COOKIE_CSRF, existingCsrf || randomHex(32), {
+      httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+    });
+  }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.password_change', ip }, c.env.DB);
@@ -905,6 +1101,15 @@ authRoutes.post('/password/change', async (c) => {
 // POST /api/auth/logout — clear session cookies + invalidate refresh tokens
 authRoutes.post('/logout', async (c) => {
   const userId = await resolveUserId(c);
+
+  // The access JWT remains cryptographically valid after its cookie is removed.
+  // Persist exact-session revocation before clearing it so pending native codes
+  // and action-bound remote-desktop grants cannot survive logout.
+  await revokeBrowserAccountSession(
+    c.env.DB,
+    c.env.JWT_SIGNING_KEY,
+    c.req.header('cookie'),
+  );
 
   // Clear all auth cookies regardless of auth state
   deleteCookie(c, COOKIE_SESSION, { path: '/' });
@@ -920,4 +1125,314 @@ authRoutes.post('/logout', async (c) => {
   }
 
   return c.json({ ok: true });
+});
+
+// ── Keyless Central OAuth Relay for Document Collaborators (GitHub & Google) ──
+
+const DOC_SHARE_RELAY_CALLBACK_PATH = '/api/doc-shares/auth-relay/callback';
+
+function isAllowedDocRelayOrigin(
+  env: { SERVER_URL: string; ALLOWED_ORIGINS?: string },
+  rawOrigin: string,
+): string | null {
+  const trimmed = rawOrigin.trim().replace(/\/$/, '');
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (parsed.origin !== trimmed) return null;
+
+  const configured = (env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+  if (configured.length > 0) {
+    const allowed = new Set([env.SERVER_URL.replace(/\/$/, ''), ...configured]);
+    if (!allowed.has(trimmed)) return null;
+  }
+  return trimmed;
+}
+
+async function handleCentralDocRelayStart(
+  c: { req: { query(name: string): string | undefined }; env: Env; json(data: unknown, status?: number): Response; redirect(url: string): Response },
+  provider: 'github' | 'google',
+): Promise<Response> {
+  const rawOrigin = c.req.query('origin') ?? '';
+  const callbackPath = c.req.query('callback_path') ?? '';
+  const clientState = (c.req.query('state') ?? '').trim();
+
+  if (callbackPath !== DOC_SHARE_RELAY_CALLBACK_PATH) {
+    return c.json({ error: 'invalid_callback_path' }, 400);
+  }
+  const targetOrigin = isAllowedDocRelayOrigin(c.env, rawOrigin);
+  if (!targetOrigin) {
+    return c.json({ error: 'invalid_origin' }, 400);
+  }
+  if (!clientState) {
+    return c.json({ error: 'missing_state' }, 400);
+  }
+
+  const centralState = signJwt(
+    {
+      type: 'doc-auth-relay-central',
+      provider,
+      origin: targetOrigin,
+      callbackPath: DOC_SHARE_RELAY_CALLBACK_PATH,
+      clientState,
+      nonce: randomHex(16),
+    },
+    c.env.JWT_SIGNING_KEY,
+    600,
+  );
+
+  const centralRedirectUri = `${c.env.SERVER_URL.replace(/\/$/, '')}/api/auth/${provider}/callback`;
+  if (provider === 'github') {
+    const params = new URLSearchParams({
+      client_id: c.env.GITHUB_CLIENT_ID ?? '',
+      redirect_uri: centralRedirectUri,
+      scope: 'read:user user:email',
+      state: centralState,
+    });
+    return c.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
+  }
+
+  const params = new URLSearchParams({
+    client_id: c.env.GOOGLE_CLIENT_ID ?? '',
+    redirect_uri: centralRedirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: centralState,
+  });
+  return c.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+}
+
+async function handleCentralDocRelayCallback(
+  c: { req: { query(name: string): string | undefined }; env: Env; json(data: unknown, status?: number): Response; redirect(url: string): Response },
+  provider: 'github' | 'google',
+  centralStatePayload: Record<string, unknown>,
+): Promise<Response> {
+  const code = c.req.query('code') ?? '';
+  if (!code) return c.json({ error: 'missing_code' }, 400);
+
+  if (
+    centralStatePayload.provider !== provider ||
+    centralStatePayload.callbackPath !== DOC_SHARE_RELAY_CALLBACK_PATH
+  ) {
+    return c.json({ error: 'invalid_state' }, 400);
+  }
+  const targetOrigin = isAllowedDocRelayOrigin(c.env, String(centralStatePayload.origin ?? ''));
+  if (!targetOrigin) {
+    return c.json({ error: 'invalid_origin' }, 400);
+  }
+  const clientState = String(centralStatePayload.clientState ?? '');
+  if (!clientState) {
+    return c.json({ error: 'missing_client_state' }, 400);
+  }
+
+  let externalId = '';
+  let username = '';
+  let email: string | null = null;
+  let displayName = '';
+
+  if (provider === 'github') {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        client_id: c.env.GITHUB_CLIENT_ID,
+        client_secret: c.env.GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+    if (!tokenRes.ok) return c.json({ error: 'token_exchange_failed' }, 502);
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenData.access_token) return c.json({ error: 'no_access_token' }, 502);
+
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        'User-Agent': 'imcodes',
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (!userRes.ok) return c.json({ error: 'github_user_fetch_failed' }, 502);
+    const ghUser = (await userRes.json()) as { id?: number | string; login?: string; name?: string; email?: string };
+    if (!ghUser.id) return c.json({ error: 'invalid_github_user' }, 502);
+    externalId = String(ghUser.id);
+    username = ghUser.login ?? `gh_${externalId}`;
+    email = ghUser.email ?? null;
+    displayName = ghUser.name || username;
+  } else {
+    const centralRedirectUri = `${c.env.SERVER_URL.replace(/\/$/, '')}/api/auth/google/callback`;
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({
+        client_id: c.env.GOOGLE_CLIENT_ID ?? '',
+        client_secret: c.env.GOOGLE_CLIENT_SECRET ?? '',
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: centralRedirectUri,
+      }).toString(),
+    });
+    if (!tokenRes.ok) return c.json({ error: 'token_exchange_failed' }, 502);
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenData.access_token) return c.json({ error: 'no_access_token' }, 502);
+
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!userRes.ok) return c.json({ error: 'google_user_fetch_failed' }, 502);
+    const gUser = (await userRes.json()) as { id?: string; sub?: string; email?: string; name?: string };
+    const gid = gUser.id ?? gUser.sub;
+    if (!gid) return c.json({ error: 'invalid_google_user' }, 502);
+    externalId = String(gid);
+    email = gUser.email ?? null;
+    username = email ? email.split('@')[0] : `google_${externalId.slice(0, 8)}`;
+    displayName = gUser.name || email || username;
+  }
+
+  const jti = randomHex(16);
+  const relayToken = signJwt(
+    {
+      type: 'doc-auth-relay-ticket',
+      iss: c.env.SERVER_URL.replace(/\/$/, ''),
+      aud: targetOrigin,
+      jti,
+      provider,
+      sub: `${provider}:${externalId}`,
+      externalId,
+      username,
+      email,
+      displayName,
+      stateHash: sha256Hex(clientState),
+    },
+    c.env.JWT_SIGNING_KEY,
+    120,
+  );
+
+  const callbackUrl = new URL(`${targetOrigin}${DOC_SHARE_RELAY_CALLBACK_PATH}`);
+  callbackUrl.searchParams.set('relay_token', relayToken);
+  callbackUrl.searchParams.set('state', clientState);
+  callbackUrl.searchParams.set('provider', provider);
+  return c.redirect(callbackUrl.toString());
+}
+
+authRoutes.get('/github', async (c, next) => {
+  if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
+    return handleCentralDocRelayStart(c, 'github');
+  }
+  return next();
+});
+
+authRoutes.get('/github/callback', async (c, next) => {
+  const state = c.req.query('state');
+  if (state && c.env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
+    if (payload && payload.type === 'doc-auth-relay-central') {
+      return handleCentralDocRelayCallback(c, 'github', payload);
+    }
+  }
+  return next();
+});
+
+authRoutes.get('/google', async (c, next) => {
+  if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
+    return handleCentralDocRelayStart(c, 'google');
+  }
+  return next();
+});
+
+authRoutes.get('/google/callback', async (c, next) => {
+  const state = c.req.query('state');
+  if (state && c.env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
+    if (payload && payload.type === 'doc-auth-relay-central') {
+      return handleCentralDocRelayCallback(c, 'google', payload);
+    }
+  }
+  return next();
+});
+
+const verifyRelayTicketSchema = z.object({
+  relayToken: z.string().min(1),
+  expectedAudience: z.string().min(1),
+  expectedProvider: z.enum(['github', 'google']).optional(),
+  expectedStateHash: z.string().min(1).optional(),
+});
+
+authRoutes.post('/relay/verify', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = verifyRelayTicketSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const payload = verifyJwt(parsed.data.relayToken, c.env.JWT_SIGNING_KEY);
+  if (!payload || payload.type !== 'doc-auth-relay-ticket') {
+    return c.json({ error: 'invalid_relay_token' }, 401);
+  }
+
+  const expectedIssuer = c.env.SERVER_URL.replace(/\/$/, '');
+  if (payload.iss !== expectedIssuer) {
+    return c.json({ error: 'invalid_relay_issuer' }, 401);
+  }
+
+  const expectedAud = parsed.data.expectedAudience.trim().replace(/\/$/, '');
+  if (payload.aud !== expectedAud) {
+    return c.json({ error: 'invalid_relay_audience' }, 401);
+  }
+
+  if (parsed.data.expectedProvider && payload.provider !== parsed.data.expectedProvider) {
+    return c.json({ error: 'invalid_relay_provider' }, 401);
+  }
+
+  if (parsed.data.expectedStateHash && payload.stateHash !== parsed.data.expectedStateHash) {
+    return c.json({ error: 'invalid_relay_state_binding' }, 401);
+  }
+
+  const jti = typeof payload.jti === 'string' ? payload.jti : '';
+  if (!jti) {
+    return c.json({ error: 'relay_token_replayed' }, 401);
+  }
+
+  // Persist single-use JTI consumption across all replicas using a purpose-isolated, server-keyed
+  // passkey_challenges row (id prefixed by DOC_RELAY_TICKET_ID_PREFIX; passkey flows ignore that prefix).
+  // Retain the marker until (exp + 1) * 1000 because verifyJwt accepts tokens throughout their exp second.
+  const ticketChallengeId = `${DOC_RELAY_TICKET_ID_PREFIX}${sha256Hex(`${c.env.JWT_SIGNING_KEY}:${DOC_RELAY_TICKET_PURPOSE}:${jti}`)}`;
+  const now = Date.now();
+  const expiresAt = typeof payload.exp === 'number' ? (payload.exp + 1) * 1000 : now + 5 * 60 * 1000;
+  await c.env.DB.execute(
+    'DELETE FROM passkey_challenges WHERE id LIKE $1 AND expires_at < $2',
+    [`${DOC_RELAY_TICKET_ID_PREFIX}%`, now],
+  );
+  const insertedTicket = await c.env.DB.queryOne<{ id: string }>(
+    'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, NULL, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING id',
+    [ticketChallengeId, ticketChallengeId, DOC_RELAY_TICKET_PURPOSE, expiresAt, now],
+  );
+  if (!insertedTicket) {
+    return c.json({ error: 'relay_token_replayed' }, 401);
+  }
+
+  return c.json({
+    ok: true,
+    issuer: expectedIssuer,
+    profile: {
+      provider: payload.provider as 'github' | 'google',
+      externalId: String(payload.externalId ?? ''),
+      username: String(payload.username ?? ''),
+      email: typeof payload.email === 'string' ? payload.email : null,
+      displayName: String(payload.displayName ?? ''),
+    },
+  });
 });

@@ -2,19 +2,24 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
+import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
+import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
+import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
 import {
   createOrUpdateShare,
   deriveShareTransitionKey,
   listActiveSharesForUser,
   listManagedShares,
+  listServerShareExecGrants,
   normalizeExistingShareTarget,
   normalizeShareTargetInput,
   resolveEffectiveShareCoverage,
   revokeShare,
+  InvalidShareExecGrantError,
   shareTargetRef,
   shareTargetSessionName,
   updateShare,
@@ -24,6 +29,11 @@ import {
   type ShareTarget,
   type ShareTargetInput,
 } from '../db/tab-sharing.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import {
+  projectSharedSessionSupervisionMode,
+  SUPERVISION_MODE_PROJECTION_KEY,
+} from '../../../shared/supervision-config.js';
 
 export const tabSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -47,6 +57,8 @@ const createShareSchema = z.object({
   targetUser: z.string().min(1).optional(),
   role: shareRoleSchema,
   expiresAt: z.number().int().positive().nullable().optional(),
+  /** Per-device EXECUTE grant (controlled devices only; the owner is the only one who can manage these shares). Omitted = no grant. */
+  execGranted: z.boolean().optional(),
 }).refine((body) => body.targetUserId !== undefined || body.targetUser !== undefined, {
   message: 'missing_target_user',
 });
@@ -54,14 +66,19 @@ const createShareSchema = z.object({
 const updateShareSchema = z.object({
   role: shareRoleSchema.optional(),
   expiresAt: z.number().int().positive().nullable().optional(),
-}).refine((body) => body.role !== undefined || Object.prototype.hasOwnProperty.call(body, 'expiresAt'), {
+  execGranted: z.boolean().optional(),
+}).refine((body) => body.role !== undefined || body.execGranted !== undefined || Object.prototype.hasOwnProperty.call(body, 'expiresAt'), {
   message: 'empty_update',
 });
 
 const openShareSchema = z.object({ target: shareTargetInputSchema });
 const ticketSchema = z.object({ target: shareTargetInputSchema });
 
-function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[number], user?: { id: string; display_name: string | null; username: string | null } | null) {
+function managedShareView(
+  share: Awaited<ReturnType<typeof listManagedShares>>[number],
+  user?: { id: string; display_name: string | null; username: string | null } | null,
+  execGranted = false,
+) {
   const targetUserId = user?.id ?? share.targetUserId;
   const targetUserDisplayName = user ? (user.display_name ?? user.username ?? user.id) : share.targetUserId;
   return {
@@ -72,6 +89,8 @@ function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[n
     targetUserId,
     targetUserDisplayName,
     role: share.role,
+    /** The per-device execute grant (controlled devices; false everywhere else and for every pre-grant share). */
+    execGranted: share.role === 'participant' && execGranted,
     status: share.revokedAt !== null ? 'revoked' : 'active',
     expiresAt: share.expiresAt,
     createdBy: share.createdBy,
@@ -90,13 +109,23 @@ function fallbackTargetLabel(share: Awaited<ReturnType<typeof listActiveSharesFo
 async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]) {
   let serverName: string | null = null;
   let targetLabel: string | null = null;
+  let serverStatus: string | null = null;
+  let lastHeartbeatAt: number | null = null;
   if (share.target.kind === 'server') {
-    const row = await db.queryOne<{ name: string }>('SELECT name FROM servers WHERE id = $1', [share.serverId]);
+    const row = await db.queryOne<{ name: string; node_role: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      'SELECT name, node_role, status, last_heartbeat_at FROM servers WHERE id = $1',
+      [share.serverId],
+    );
+    // A controlled server uses the same FK-backed grant store, but is consumed
+    // only by /api/machines. Never turn it into a shared daemon/session entry.
+    if (row?.node_role === NODE_ROLE.CONTROLLED) return null;
     serverName = row?.name ?? null;
     targetLabel = row?.name ?? null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else if (share.target.kind === 'main') {
-    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null }>(
-      `SELECT sv.name AS server_name, s.label, s.project_name
+    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      `SELECT sv.name AS server_name, s.label, s.project_name, sv.status, sv.last_heartbeat_at
          FROM sessions s
          JOIN servers sv ON sv.id = s.server_id
         WHERE s.server_id = $1 AND s.name = $2`,
@@ -104,9 +133,11 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.project_name?.trim() || null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else {
-    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null }>(
-      `SELECT sv.name AS server_name, ss.label, ss.type
+    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      `SELECT sv.name AS server_name, ss.label, ss.type, sv.status, sv.last_heartbeat_at
          FROM sub_sessions ss
          JOIN servers sv ON sv.id = ss.server_id
         WHERE ss.server_id = $1 AND ss.id = $2`,
@@ -114,6 +145,8 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.type?.trim() || null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   }
   return {
     id: share.id,
@@ -128,26 +161,45 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     targetLabel: targetLabel ?? fallbackTargetLabel(share),
     historyCutoffAt: 0,
     expiresAt: share.expiresAt,
+    serverStatus: serverStatus ?? null,
+    lastHeartbeatAt: lastHeartbeatAt ?? null,
   };
 }
 
-async function requireServerManager(db: Env['DB'], serverId: string, userId: string): Promise<boolean> {
-  const role = await resolveServerRole(db, serverId, userId);
-  return role === 'owner' || role === 'admin';
+async function isControlledNodeShareTarget(db: Env['DB'], target: ShareTarget): Promise<boolean> {
+  const row = await db.queryOne<{ node_role: string | null }>(
+    'SELECT node_role FROM servers WHERE id = $1',
+    [target.serverId],
+  );
+  return row?.node_role === NODE_ROLE.CONTROLLED;
 }
 
-async function resolveTargetUser(db: Env['DB'], input: string): Promise<{ id: string; display_name: string | null; username: string | null } | null> {
-  const identifier = input.trim();
-  if (!identifier) return null;
-  const row = await db.queryOne<{ id: string; display_name: string | null; username: string | null }>(
-    `SELECT id, display_name, username
-       FROM users
-      WHERE id = $1 OR lower(username) = lower($1)
-      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END
-      LIMIT 1`,
-    [identifier],
+async function requireShareManager(db: Env['DB'], serverId: string, userId: string): Promise<boolean> {
+  const server = await db.queryOne<{ user_id: string; node_role: string | null }>(
+    'SELECT user_id, node_role FROM servers WHERE id = $1 AND revoked_at IS NULL',
+    [serverId],
   );
-  return row ?? null;
+  if (!server) return false;
+  // Team admins may manage ordinary Tab shares, but a controlled node is a
+  // personal root/SYSTEM-capable credential. Only its direct owner may grant,
+  // change or revoke access to it.
+  // A controlled node is a personal root/SYSTEM-capable credential, so only its
+  // direct owner manages grants. Sharing management stays OUTSIDE operator
+  // authority: a Participant must never be able to grant further access.
+  //
+  // There is deliberately no additional team test. It used to require the owner
+  // to still hold membership in the machine's team, which made a team admin
+  // able to take someone's machine hostage: remove the owner from the team and
+  // they can no longer grant, revoke, or move the machine out of it. A machine
+  // belongs to whoever installed it, and a team is a group they put it in.
+  if (server.node_role === NODE_ROLE.CONTROLLED) {
+    return server.user_id === userId;
+  }
+  // Re-share is the single deliberate exception to whole-server participant
+  // authority. Resolve durable membership only; an incoming share can never
+  // bootstrap another grant.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
+  return role === 'owner' || role === 'admin';
 }
 
 async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>, params: {
@@ -188,7 +240,8 @@ async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { user
 tabSharingRoutes.get('/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
-  return c.json({ shares: await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share))) });
+  const entries = await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share)));
+  return c.json({ shares: entries.filter((entry) => entry !== null) });
 });
 
 tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
@@ -198,6 +251,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  if (await isControlledNodeShareTarget(c.env.DB, target)) {
+    return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  }
   const coverage = await resolveEffectiveShareCoverage(c.env.DB, { userId, target, now: Date.now() });
   if (!coverage) return c.json({ error: 'forbidden', reason: 'share-revoked' }, 403);
 
@@ -211,16 +267,38 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
   // Tab-sharing shared sub-session list: execution clones must NEVER leak into a
   // share's sub-session list, so they are excluded (default).
   const subRows = await getSubSessionsByServer(c.env.DB, target.serverId, { includeExecutionClones: false });
-  const subSessions = target.kind === 'server'
-    ? subRows
-    : target.kind === 'main'
-      ? subRows.filter((subSession) => subSession.parent_session === target.sessionName)
-      : subRows.filter((subSession) => subSession.id === target.subSessionId);
+  const subSessions = (() => {
+    if (target.kind === 'server') return subRows;
+    const covered = new Set<string>([
+      target.kind === 'main' ? target.sessionName : `deck_sub_${target.subSessionId}`,
+    ]);
+    const includedIds = new Set<string>();
+    if (target.kind === 'subsession') {
+      includedIds.add(target.subSessionId);
+    }
+    let added = true;
+    while (added) {
+      added = false;
+      for (const subSession of subRows) {
+        if (includedIds.has(subSession.id)) continue;
+        const parent = subSession.parent_session;
+        if (!parent) continue;
+        if (covered.has(parent) || covered.has(`deck_sub_${parent}`)) {
+          includedIds.add(subSession.id);
+          covered.add(`deck_sub_${subSession.id}`);
+          added = true;
+        }
+      }
+    }
+    return subRows.filter((subSession) => includedIds.has(subSession.id));
+  })();
   const sessions = target.kind === 'server'
     ? mainRows
     : target.kind === 'main'
       ? mainRows.filter((session) => session.name === target.sessionName)
       : mainRows.filter((session) => subSessions.some((subSession) => subSession.parent_session === session.name));
+  const bridge = WsBridge.get(target.serverId);
+  const includeActiveDispatch = coverage.effectiveRole === 'participant';
 
   return c.json({
     server: {
@@ -236,14 +314,26 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: session.label?.trim() || session.project_name,
       state: session.state,
       agentType: session.agent_type,
+      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(session.transport_config),
+      ...(includeActiveDispatch
+        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
+        : {}),
     })),
-    subSessions: subSessions.map((subSession) => ({
-      subSessionId: subSession.id,
-      sessionName: `deck_sub_${subSession.id}`,
-      title: subSession.label?.trim() || subSession.type,
-      type: subSession.type,
-      parentSessionName: subSession.parent_session,
-    })),
+    subSessions: subSessions.map((subSession) => {
+      const subState = bridge.getActiveSubSessionState(`deck_sub_${subSession.id}`);
+      return {
+        subSessionId: subSession.id,
+        sessionName: `deck_sub_${subSession.id}`,
+        title: subSession.label?.trim() || subSession.type,
+        type: subSession.type,
+        parentSessionName: subSession.parent_session,
+        ...(subState ? { state: subState } : {}),
+        [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(subSession.transport_config),
+        ...(includeActiveDispatch
+          ? { activeDispatchId: bridge.getActiveDispatchIdForSession(`deck_sub_${subSession.id}`) }
+          : {}),
+      };
+    }),
   });
 });
 
@@ -254,6 +344,9 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  if (await isControlledNodeShareTarget(c.env.DB, target)) {
+    return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  }
   const issuedAt = Date.now();
   const snapshot = await resolveEffectiveShareCoverage(c.env.DB, { userId, target, now: issuedAt });
   if (!snapshot) return c.json({ error: 'forbidden', reason: 'share-revoked' }, 403);
@@ -281,7 +374,7 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
 tabSharingRoutes.get('/server/:serverId/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const targetKind = c.req.query('targetKind');
   const requestedTarget = targetKind === 'server'
     ? normalizeShareTargetInput({ kind: 'server', serverId })
@@ -300,7 +393,8 @@ tabSharingRoutes.get('/server/:serverId/shares', requireAuth(), async (c) => {
     [userIds],
   );
   const userById = new Map(users.map((user) => [user.id, user]));
-  return c.json({ shares: shares.map((share) => managedShareView(share, userById.get(share.targetUserId))) });
+  const execGrants = await listServerShareExecGrants(c.env.DB, serverId);
+  return c.json({ shares: shares.map((share) => managedShareView(share, userById.get(share.targetUserId), execGrants.get(share.id) === true)) });
 });
 
 tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
@@ -314,7 +408,7 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const normalizedTarget = normalizeShareTargetInput(parsed.data.target as ShareTargetInput);
   const now = Date.now();
   if (!normalizedTarget) return c.json({ error: 'invalid_body', reason: 'invalid_target' }, 400);
-  if (!await requireServerManager(c.env.DB, serverId, userId)) {
+  if (!await requireShareManager(c.env.DB, serverId, userId)) {
     await auditShareLifecycle(c, {
       actionType: 'share.create',
       decision: 'rejected',
@@ -326,22 +420,38 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     });
     return c.json({ error: 'forbidden' }, 403);
   }
-  const targetUser = await resolveTargetUser(c.env.DB, targetUserInput);
+  const targetUser = await resolveUserByIdentifier(c.env.DB as Database, targetUserInput);
   if (!targetUser) return c.json({ error: 'invalid_body', reason: 'target_user_unavailable' }, 400);
   const targetUserId = targetUser.id;
   if (targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
+
+  // No team is required to share one machine with one person. Sharing a group
+  // of machines with a team is the other mechanism, and the two are
+  // independent: making the first go through the second meant a machine could
+  // not be shared at all until it was put in a team, and then only with people
+  // already in that team.
+  //
+  // The write-time check this replaces reasoned correctly from a premise that
+  // no longer holds. It refused to store a grant admission would not honour, so
+  // that stored state and effective state stayed the same thing. Admission
+  // honours an individual grant on its own now, so that same principle points
+  // the other way.
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 
-  const share = await createOrUpdateShare(c.env.DB, {
-    id: randomHex(16),
-    target,
-    targetUserId,
-    role: parsed.data.role as ShareRole,
-    createdBy: userId,
-    expiresAt: parsed.data.expiresAt ?? null,
-    now,
-  });
+  let share: Awaited<ReturnType<typeof createOrUpdateShare>>;
+  try {
+    // One upsert changes role/expiry/grant together; POST omission revokes a prior grant.
+    share = await createOrUpdateShare(c.env.DB, {
+      id: randomHex(16), target, targetUserId, role: parsed.data.role as ShareRole,
+      createdBy: userId, expiresAt: parsed.data.expiresAt ?? null,
+      execGranted: parsed.data.execGranted, now,
+    });
+  } catch (error) {
+    if (error instanceof InvalidShareExecGrantError) return c.json({ error: 'invalid_body', reason: error.message }, 400);
+    throw error;
+  }
+  const wantsExecGrant = share.execGranted;
   await auditShareLifecycle(c, {
     actionType: share.createdAt === now ? 'share.create' : 'share.update',
     decision: share.createdAt === now ? 'accepted' : 'updated',
@@ -349,29 +459,33 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     targetUserId,
     target,
     shareId: share.id,
-    snapshot: { role: share.role, expiresAt: share.expiresAt },
+    snapshot: { role: share.role, expiresAt: share.expiresAt, ...(target.kind === 'server' ? { execGranted: wantsExecGrant } : {}) },
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, targetUser) }, share.createdAt === now ? 201 : 200);
+  return c.json({ share: managedShareView(share, targetUser, wantsExecGrant) }, share.createdAt === now ? 201 : 200);
 });
 
 tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const body = await c.req.json().catch(() => null);
   const parsed = updateShareSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const now = Date.now();
-  const share = await updateShare(c.env.DB, {
-    shareId: c.req.param('shareId') ?? '',
-    serverId,
-    role: parsed.data.role,
-    expiresAt: parsed.data.expiresAt,
-    now,
-  });
+  let share: Awaited<ReturnType<typeof updateShare>>;
+  try {
+    share = await updateShare(c.env.DB, {
+      shareId: c.req.param('shareId') ?? '', serverId, role: parsed.data.role,
+      expiresAt: parsed.data.expiresAt, execGranted: parsed.data.execGranted, now,
+    });
+  } catch (error) {
+    if (error instanceof InvalidShareExecGrantError) return c.json({ error: 'invalid_body', reason: error.message }, 400);
+    throw error;
+  }
   if (!share) return c.json({ error: 'not_found' }, 404);
+  const execGranted = share.execGranted;
   await auditShareLifecycle(c, {
     actionType: 'share.update',
     decision: 'updated',
@@ -379,17 +493,17 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
     targetUserId: share.targetUserId,
     target: share.target,
     shareId: share.id,
-    snapshot: { role: share.role, expiresAt: share.expiresAt },
+    snapshot: { role: share.role, expiresAt: share.expiresAt, ...(share.target.kind === 'server' ? { execGranted } : {}) },
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
+  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId), execGranted) });
 });
 
 tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const now = Date.now();
   const share = await revokeShare(c.env.DB, { shareId: c.req.param('shareId') ?? '', serverId, now });
   if (!share) return c.json({ error: 'not_found' }, 404);
@@ -404,13 +518,14 @@ tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), asyn
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
+  await pauseRevokedSharedCronJobs(c.env.DB, { serverId, userId: share.targetUserId, now });
+  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId)) });
 });
 
 tabSharingRoutes.get('/server/:serverId/share-audit', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100);
   const rows = await c.env.DB.query<Record<string, unknown>>(
     `SELECT id, server_id, actor_kind, actor_user_id, target_user_id, effective_actor_role,

@@ -1,13 +1,24 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { ASK_ANSWER_COMMAND } from '../../shared/ask-answer.js';
+import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import { EventEmitter } from 'node:events';
+import logger from '../src/util/logger.js';
 import { performance } from 'node:perf_hooks';
-import { WsBridge, __setIdlePushSettleMsForTests, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
+import { readFileSync } from 'node:fs';
+import {
+  WsBridge,
+  __setIdlePushSettleMsForTests,
+  __setLegacyUpgradePublisherSignerResolverForTests,
+  __setTimelineDataPlaneQueueConfigForTests,
+} from '../src/ws/bridge.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
   resetDaemonUpgradePublicationGateForTest,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
@@ -20,19 +31,97 @@ import {
   P2P_WORKFLOW_CAPABILITY_V1,
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
+import { DIRECT_FILE_TRANSFER_LEASE_CAPABILITY } from '../../shared/direct-file-transfer.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
 } from '../../shared/timeline-protocol.js';
+import { TIMELINE_HISTORY_LIMITS } from '../../shared/timeline-history-limits.js';
 import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_STATS_MSG } from '../../shared/daemon-stats.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+  CONTROLLED_NODE_WORKER_REFRESH_MSG,
+  CONTROLLED_NODE_WORKER_REFRESH_PHASE,
+} from '../../shared/controlled-node-worker-refresh.js';
+import { listControlledMachines } from '../src/routes/machines.js';
+import {
+  DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+  DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
+} from '../../shared/direct-file-transfer.js';
+import {
+  CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS,
+  controlledNodeUpgradeStaggerMs,
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+  CONTROLLED_NODE_UPGRADE_STATUS,
+  CONTROLLED_NODE_UPGRADE_WAIT_REASON,
+  DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
+  DAEMON_UPGRADE_DEFERRAL,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
+  DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS,
+  DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
+  DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
+} from '../../shared/daemon-upgrade.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
+import { DAEMON_AUTH_RECONCILE_BUDGET_MS, DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS } from '../../shared/daemon-auth.js';
+import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../shared/peer-audit.js';
+import {
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
+  REMOTE_EXEC_MAX_ERROR_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+} from '../../shared/remote-exec.js';
+import {
+  cancelPendingExec,
+  machineExecRegistryStats,
+  registerPendingExec,
+} from '../src/ws/machine-exec-registry.js';
+import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_WIN, type ControlledNodeOs } from '../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+} from '../../shared/remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  type RemoteDesktopConsentRequest,
+} from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_PROTOCOL_VERSION,
+} from '../../shared/remote-desktop.js';
+import {
+  LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
+  LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+} from '../src/ws/windows-controlled-node-upgrade-rescue.js';
+import {
+  SHARED_CONTEXT_RUNTIME_BACKENDS,
+  SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL,
+  SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
+  normalizeSharedContextRuntimeConfig,
+} from '../../shared/shared-context-runtime-config.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -72,6 +161,13 @@ class MockWs extends EventEmitter {
   closeCode: number | undefined;
   closeReason: string | undefined;
 
+  /** When true, `send` accepts the frame but NEVER invokes the completion
+   *  callback — the shape of a peer whose receive side has stopped draining, so
+   *  the bridge's in-flight accounting keeps climbing. Off by default. */
+  stallSend = false;
+  /** Pending completion callbacks captured while `stallSend` is on. */
+  stalledCallbacks: Array<(err?: Error) => void> = [];
+
   send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void) {
     if (this.closed) {
       const err = new Error('socket closed');
@@ -79,7 +175,17 @@ class MockWs extends EventEmitter {
       throw err;
     }
     this.sent.push(data);
+    if (this.stallSend) {
+      if (callback) this.stalledCallbacks.push(callback);
+      return;
+    }
     callback?.();
+  }
+
+  /** Release every stalled completion callback (peer started reading again). */
+  drainStalledSends() {
+    const pending = this.stalledCallbacks.splice(0, this.stalledCallbacks.length);
+    for (const cb of pending) cb();
   }
 
   close(code?: number, reason?: string) {
@@ -133,9 +239,30 @@ function packFrame(sessionName: string, payload: Buffer): Buffer {
 
 // ── Mock DB ────────────────────────────────────────────────────────────────────
 
-function makeDb(tokenHash: string) {
+function makeDb(
+  tokenHash: string,
+  nodeRole: 'full' | 'controlled' = 'full',
+  os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
+  ownerUserId?: string,
+  controlledUpgrade?: { status: string; target: string | null; reason?: string | null },
+  nodeId?: string | null,
+) {
   const db = {
-    queryOne: async () => ({ token_hash: tokenHash }),
+    queryOne: async () => ({
+      token_hash: tokenHash, owner_status: 'active',
+      node_role: nodeRole,
+      revoked_at: null,
+      os,
+      ...(nodeId !== undefined ? { node_id: nodeId } : {}),
+      ...(ownerUserId ? { user_id: ownerUserId } : {}),
+      ...(controlledUpgrade
+        ? {
+          controlled_upgrade_status: controlledUpgrade.status,
+          controlled_upgrade_target_version: controlledUpgrade.target,
+          controlled_upgrade_reason: controlledUpgrade.reason ?? null,
+        }
+        : {}),
+    }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -149,7 +276,7 @@ function makeOpenSpecAutoDeliverOwnershipDb(allowedSessionNames: string[] = []) 
   const allowed = new Set(allowedSessionNames);
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       if (sql.includes('FROM sessions WHERE')) {
         const sessionName = typeof params?.[1] === 'string' ? params[1] : '';
         return allowed.has(sessionName) ? { ok: 1 } : null;
@@ -177,7 +304,7 @@ function makeSubSessionOwnershipRaceDb(options: {
   const allowAfterChecks = options.allowAfterChecks ?? 2;
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       if (sql.includes('FROM sessions WHERE')) return null;
       if (sql.includes('FROM sub_sessions WHERE')) {
         subChecks += 1;
@@ -203,7 +330,7 @@ function makeRepoCheckoutDb(options: {
   const db = {
     queryOne: async (sql: string, params: unknown[]) => {
       if (sql.includes('SELECT token_hash')) {
-        return { token_hash: 'valid-hash', user_id: 'test-user' };
+        return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       }
       if (options.throwOnAuthorization && (sql.includes('FROM sessions s') || sql.includes('FROM sub_sessions ss'))) {
         throw new Error('authz unavailable');
@@ -245,7 +372,7 @@ function makeTimelineOwnershipDb(options: {
   const db = {
     queryOne: async (sql: string, params: unknown[]) => {
       if (sql.includes('SELECT token_hash')) {
-        return { token_hash: 'valid-hash', user_id: 'test-user' };
+        return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       }
       if (options.throwOnOwnership && (sql.includes('FROM sessions WHERE') || sql.includes('FROM sub_sessions WHERE'))) {
         throw new Error('ownership db down');
@@ -279,6 +406,18 @@ function makeTimelineOwnershipDb(options: {
 
 vi.mock('../src/security/crypto.js', () => ({
   sha256Hex: (_s: string) => 'valid-hash',
+  randomHex: (bytes: number) => 'a'.repeat(bytes * 2),
+  // The bridge fixture replaces crypto globally; keep its ticket seam
+  // structurally valid so the direct-file route tests the actual rebind flow.
+  signJwt: (payload: Record<string, unknown>) => `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`,
+  verifyJwt: (ticket: string) => {
+    try {
+      const payload = ticket.split('.')[1];
+      return payload ? JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  },
 }));
 
 vi.mock('../src/routes/push.js', () => ({
@@ -309,9 +448,13 @@ async function flushOneBridgeDataPlaneTurn() {
 
 describe('WsBridge', () => {
   let serverId: string;
+  let restoreUpgradePublisherSignerResolver: () => void;
 
   beforeEach(() => {
     serverId = `test-${Math.random().toString(36).slice(2)}`;
+    restoreUpgradePublisherSignerResolver = __setLegacyUpgradePublisherSignerResolverForTests(
+      async () => 'a'.repeat(64),
+    );
     resetDaemonUpgradePublicationGateForTest();
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
@@ -319,18 +462,213 @@ describe('WsBridge', () => {
   });
 
   afterEach(() => {
+    restoreUpgradePublisherSignerResolver();
+    WsBridge.setRemoteDesktopReconnectRevalidator(null);
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
     resetMetricsForTests();
     vi.clearAllMocks();
   });
 
+  it('closes when any second frame arrives before bootstrap redemption', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const redeemGuestBootstrap = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap,
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(redeemGuestBootstrap).not.toHaveBeenCalled();
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+  });
+
+  it('acknowledges bootstrap redemption before accepting START', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const handleGuestBrowser = vi.fn(async () => true);
+    const redeemGuestBootstrap = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap,
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'), '203.0.113.55');
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    await flushAsync();
+    expect(redeemGuestBootstrap).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({ ticket: 'A'.repeat(43) }),
+      '203.0.113.55',
+    );
+    expect(ws.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: 'remote_desktop.bootstrap_redeemed',
+    });
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(handleGuestBrowser).toHaveBeenCalledOnce();
+    expect(ws.closed).toBe(false);
+  });
+
+  it('admits an exact route resume as the sole first guest frame', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const resumeGuestBrowser = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser,
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+    const resume = {
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+
+    ws.emit('message', Buffer.from(JSON.stringify(resume)));
+    await flushAsync();
+
+    expect(resumeGuestBrowser).toHaveBeenCalledWith(ws, resume);
+    expect(ws.closed).toBe(false);
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+  });
+
+  it('closes a first-frame guest resume whose exact live authority is absent', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const dropSocket = vi.fn();
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser: vi.fn(async () => false),
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser: vi.fn(),
+        dropSocket,
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    })));
+    await flushAsync();
+
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+    expect(dropSocket).toHaveBeenCalledWith(ws);
+  });
+
+  it('closes an anonymous socket that never supplies its bounded first proof', async () => {
+    vi.useFakeTimers();
+    try {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(1008);
+      expect(ws.closeReason).toBe('unavailable');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispatches consent only on the authenticated authority-ready owning generation', () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    const internals = bridge as unknown as {
+      daemonWs: MockWs;
+      authenticated: boolean;
+      daemonGeneration: number;
+      remoteDesktopAuthorityReadyGeneration: number | null;
+      daemonNodeRole: 'controlled';
+      controlledNodeCapabilities: Set<string>;
+      trySendRemoteDesktopConsent(command: {
+        executionServerId: string;
+        daemonGeneration: number;
+        message: RemoteDesktopConsentRequest;
+      }): boolean;
+    };
+    internals.daemonWs = daemon;
+    internals.authenticated = true;
+    internals.daemonGeneration = 4;
+    internals.daemonNodeRole = 'controlled';
+    internals.controlledNodeCapabilities = new Set([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+    ]);
+    const message: RemoteDesktopConsentRequest = {
+      type: REMOTE_DESKTOP_CONSENT_MSG.REQUEST,
+      approvalId: 'approval-00000000-0000-4000-8000-000000000001',
+      hostId: 'host-00000000-0000-4000-8000-000000000001',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      requesterLabel: 'Remote guest',
+      createdAt: 1_800_000_000_000,
+      deadlineAt: 1_800_000_030_000,
+      daemonGeneration: 4,
+    };
+    const command = { executionServerId: serverId, daemonGeneration: 4, message };
+
+    internals.remoteDesktopAuthorityReadyGeneration = null;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(false);
+    expect(daemon.sent).toEqual([]);
+
+    internals.remoteDesktopAuthorityReadyGeneration = 4;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(true);
+    expect(daemon.sentStrings.map((value) => JSON.parse(value))).toEqual([message]);
+    expect(internals.trySendRemoteDesktopConsent({ ...command, daemonGeneration: 3 })).toBe(false);
+    expect(daemon.sent).toHaveLength(1);
+  });
+
   describe('daemon auth', () => {
     const originalAppVersion = process.env.APP_VERSION;
+    const originalAutoUpgradeDisable = process.env.IMCODES_DISABLE_AUTO_UPGRADE;
 
     afterEach(() => {
       if (originalAppVersion == null) delete process.env.APP_VERSION;
       else process.env.APP_VERSION = originalAppVersion;
+      if (originalAutoUpgradeDisable == null) delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+      else process.env.IMCODES_DISABLE_AUTO_UPGRADE = originalAutoUpgradeDisable;
       vi.useRealTimers();
     });
 
@@ -342,6 +680,221 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
       await flushAsync();
       expect(bridge.isAuthenticated).toBe(true);
+    });
+
+    it('keeps remote desktop unavailable until each reconnect revalidates durable authority', async () => {
+      const releases: Array<() => void> = [];
+      const revalidate = vi.fn(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+      WsBridge.setRemoteDesktopReconnectRevalidator(revalidate);
+      const bridge = WsBridge.get(serverId);
+
+      const first = new MockWs();
+      bridge.handleDaemonConnection(
+        first as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      first.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledWith(serverId);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
+
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(
+        replacement as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      replacement.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledTimes(2);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
+    });
+
+    describe('the public node ID in a controlled node\'s heartbeat ack', () => {
+      async function ackAfterHeartbeat(db: import('../src/db/client.js').Database) {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, db, {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', capabilities: [] }));
+        await flushAsync();
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        const acks = ws.sentStrings.map((value) => JSON.parse(value)).filter((frame) => frame.type === 'heartbeat_ack');
+        expect(acks.length).toBeGreaterThan(0);
+        return acks[acks.length - 1] as Record<string, unknown>;
+      }
+
+      it('carries the node\'s own public ID and the server ID it is for, so a node enrolled before IDs existed can adopt it', async () => {
+        const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, '9909368908'));
+        expect(ack).toMatchObject({ type: 'heartbeat_ack', nodeId: '9909368908', serverId });
+      });
+
+      it('carries nothing for a controlled node with no usable ID, and nothing for a full daemon (no change for either)', async () => {
+        for (const nodeId of [null, '', 'not-an-id', '99093689', '0909368908']) {
+          const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, nodeId));
+          expect(ack).not.toHaveProperty('nodeId');
+          expect(ack).not.toHaveProperty('serverId');
+        }
+        const full = await ackAfterHeartbeat(makeDb('valid-hash', 'full', null, undefined, undefined, '9909368908'));
+        expect(full).not.toHaveProperty('nodeId');
+        expect(full).not.toHaveProperty('serverId');
+      });
+
+      describe('the deployment\'s public origins (IMCODES_PUBLIC_URLS) for a controlled node\'s fallback', () => {
+        const original = process.env.IMCODES_PUBLIC_URLS;
+        afterEach(() => {
+          if (original === undefined) delete process.env.IMCODES_PUBLIC_URLS; else process.env.IMCODES_PUBLIC_URLS = original;
+        });
+
+        it('are advertised to an authenticated controlled node, validated and normalized', async () => {
+          process.env.IMCODES_PUBLIC_URLS = 'https://im.example, https://proxy.example http://plain.example https://u:p@x.example/p';
+          const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN));
+          expect(ack.serverUrls).toEqual(['https://im.example', 'https://proxy.example']);
+        });
+
+        it('advertise nothing by default (unset or empty = the old behaviour), and never to a full daemon', async () => {
+          delete process.env.IMCODES_PUBLIC_URLS;
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN))).not.toHaveProperty('serverUrls');
+          process.env.IMCODES_PUBLIC_URLS = '';
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN))).not.toHaveProperty('serverUrls');
+          process.env.IMCODES_PUBLIC_URLS = 'https://im.example';
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'full', null))).not.toHaveProperty('serverUrls');
+        });
+      });
+    });
+
+    it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+      }));
+      await flushAsync();
+
+      const result = bridge.tryInstallControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration(),
+      );
+      expect(result).toBe('sent');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST,
+      });
+      expect(bridge.tryInstallControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration() - 1,
+      )).toBe('generation_changed');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: bridge.daemonConnectionGeneration(),
+      });
+    });
+
+    it('sends an exact generation-bound independent worker refresh request', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [
+          REMOTE_DESKTOP_CAPABILITY,
+          CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+        ],
+      }));
+      await flushAsync();
+
+      expect(bridge.tryRefreshControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration(),
+      )).toBe('sent');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST,
+      });
+      expect(bridge.tryRefreshControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration() - 1,
+      )).toBe('generation_changed');
+    });
+
+    it('publishes the canonical host context and actively clears it when the mapping disappears', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      try {
+        let hostId: string | null = 'host-00000000000000000001';
+        let hostLookupCount = 0;
+        const db = {
+          queryOne: async (sql: string) => {
+            if (sql.includes('remote_desktop_host_endpoints')) {
+              hostLookupCount += 1;
+              return hostId ? { host_id: hostId } : null;
+            }
+            return {
+              token_hash: 'valid-hash', owner_status: 'active',
+              node_role: 'controlled',
+              revoked_at: null,
+              os: CONTROLLED_NODE_OS_WIN,
+            };
+          },
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => (
+            fn(db as unknown as import('../src/db/client.js').Database)
+          ),
+          close: () => {},
+        } as unknown as import('../src/db/client.js').Database;
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, db, {} as never);
+        ws.emit('message', JSON.stringify({
+          type: 'auth',
+          serverId,
+          token: 'my-token',
+          capabilities: [],
+        }));
+        await flushAsync();
+        const generation = bridge.daemonConnectionGeneration();
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+          hostId: 'host-00000000000000000001',
+          daemonGeneration: generation,
+        });
+        expect(hostLookupCount).toBe(1);
+
+        hostId = null;
+        // Immediate heartbeat within connection cache window skips redundant DB query & push.
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        expect(hostLookupCount).toBe(1);
+
+        // Fallback recheck after 60s sees the removed mapping and clears node context.
+        await vi.advanceTimersByTimeAsync(60_000);
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        expect(hostLookupCount).toBe(2);
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+          daemonGeneration: generation,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('closes on auth timeout', async () => {
@@ -367,6 +920,29 @@ describe('WsBridge', () => {
       expect(ws.closed).toBe(true);
     });
 
+    it.each([['disabled', 'account_disabled'], ['pending', 'account_pending'], [null, 'account_disabled']])(
+      'refuses a daemon whose owner account is %s: close 4003 with the account error code as the reason, never authenticated',
+      async (ownerStatus, reason) => {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        const db = {
+          queryOne: async () => ({ token_hash: 'valid-hash', user_id: 'owner-1', node_role: 'full', revoked_at: null, owner_status: ownerStatus }),
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(db),
+          close: () => {},
+        };
+        bridge.handleDaemonConnection(ws as never, db as never, {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'good-token' }));
+        await flushAsync();
+        expect(ws.closed).toBe(true);
+        expect(ws.closeCode).toBe(4003);
+        expect(ws.closeReason).toBe(reason);
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).not.toContainEqual(expect.objectContaining({ type: 'auth_ok' }));
+      },
+    );
+
     // Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
     // pinned regression for the auth-handshake race that produced
     // "Daemon authenticated" log entries every ~500 ms in production
@@ -380,8 +956,8 @@ describe('WsBridge', () => {
       // race window. Without the fix, daemon.hello hits
       // `if (msg.type !== 'auth') ws.close(4001, 'auth_required')`
       // because `this.authenticated` is still false at that moment.
-      let resolveQuery: (value: { token_hash: string } | null) => void = () => {};
-      const queryPromise = new Promise<{ token_hash: string } | null>((res) => { resolveQuery = res; });
+      let resolveQuery: (value: { token_hash: string, owner_status: 'active' } | null) => void = () => {};
+      const queryPromise = new Promise<{ token_hash: string, owner_status: 'active' } | null>((res) => { resolveQuery = res; });
       const db = {
         queryOne: () => queryPromise,
         query: async () => [],
@@ -392,6 +968,10 @@ describe('WsBridge', () => {
       } as unknown as import('../src/db/client.js').Database;
 
       const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      browserWs.sent = [];
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, db, {} as never);
 
@@ -417,30 +997,547 @@ describe('WsBridge', () => {
       expect(ws.closeCode).toBeUndefined();
 
       // Now resolve the DB query and let auth complete.
-      resolveQuery({ token_hash: 'valid-hash' });
+      resolveQuery({ token_hash: 'valid-hash', owner_status: 'active' });
       await flushAsync();
 
       expect(bridge.isAuthenticated).toBe(true);
       expect(ws.closed).toBe(false);
+      const browserTypes = browserWs.sentStrings.map((raw) => JSON.parse(raw).type as string);
+      const reconnectedIndex = browserTypes.indexOf(DAEMON_MSG.RECONNECTED);
+      const helloIndex = browserTypes.indexOf(P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(reconnectedIndex).toBeGreaterThanOrEqual(0);
+      expect(helloIndex).toBeGreaterThan(reconnectedIndex);
     });
 
-    it('sends daemon.upgrade when daemon is older than server version', async () => {
-      vi.useFakeTimers();
-      process.env.APP_VERSION = '2026.4.905-dev.877';
+    it('persists, broadcasts, restores, and projects controlled worker refresh status', async () => {
+      const persisted: Record<string, unknown> = {};
+      const writes: Array<{ sql: string; params: unknown[] }> = [];
+      const db = {
+        queryOne: async () => ({
+          token_hash: 'valid-hash', owner_status: 'active',
+          node_role: 'controlled',
+          revoked_at: null,
+          os: CONTROLLED_NODE_OS_LINUX,
+          ...persisted,
+        }),
+        query: async () => [],
+        execute: async (sql: string, params: unknown[] = []) => {
+          writes.push({ sql, params });
+          if (sql.includes('controlled_worker_refresh_attempt_id')) {
+            [
+              'controlled_worker_refresh_attempt_id',
+              'controlled_worker_refresh_phase',
+              'controlled_worker_refresh_installed_version',
+              'controlled_worker_refresh_target_version',
+              'controlled_worker_refresh_artifact_sha256',
+              'controlled_worker_refresh_reason',
+              'controlled_worker_refresh_recorded_at',
+            ].forEach((key, index) => { persisted[key] = params[index]; });
+          }
+          return { changes: 1 };
+        },
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const daemon = new MockWs();
+      const browser = new MockWs();
+      bridge.handleBrowserConnection(browser as never, 'test-user', db);
+      bridge.handleDaemonConnection(daemon as never, db, {} as never);
+      daemon.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.1', capabilities: [],
+      }));
+      await flushAsync();
 
+      const started = {
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        attemptId: 'attempt-refresh-1',
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED,
+        targetVersion: '2026.10.1',
+        recordedAt: 1_700_000_000_000,
+      };
+      daemon.emit('message', JSON.stringify(started));
+      await flushBridgeDataPlane();
+      const succeeded = {
+        ...started,
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+        artifactSha256: 'a'.repeat(64),
+        recordedAt: started.recordedAt + 1,
+      };
+      daemon.emit('message', JSON.stringify(succeeded));
+      await flushBridgeDataPlane();
+
+      expect(writes.filter(({ sql }) => sql.includes('controlled_worker_refresh_attempt_id'))).toHaveLength(2);
+      expect(browser.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === started.type)).toEqual([
+        expect.objectContaining({ phase: 'started', attemptId: started.attemptId }),
+        expect.objectContaining({ phase: 'succeeded', installedVersion: '2026.10.1', artifactSha256: 'a'.repeat(64) }),
+      ]);
+
+      const beforeInvalid = writes.length;
+      daemon.emit('message', JSON.stringify({ ...succeeded, unexpected: true }));
+      await flushAsync();
+      expect(writes).toHaveLength(beforeInvalid);
+
+      WsBridge.getAll().clear();
+      const restoredBridge = WsBridge.get(serverId);
+      const restoredDaemon = new MockWs();
+      restoredBridge.handleDaemonConnection(restoredDaemon as never, db, {} as never);
+      restoredDaemon.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.1', capabilities: [],
+      }));
+      await flushAsync();
+      expect(restoredBridge.getControlledNodeWorkerRefreshStatus()).toEqual(expect.objectContaining({
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+      }));
+      const reconnectedBrowser = new MockWs();
+      restoredBridge.handleBrowserConnection(reconnectedBrowser as never, 'test-user', db);
+      expect(reconnectedBrowser.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        artifactSha256: 'a'.repeat(64),
+      }));
+
+      const listDb = {
+        query: async () => [{
+          id: serverId,
+          node_id: '1234567890',
+          user_id: 'test-user',
+          ref_name: 'worker',
+          display_name: 'worker',
+          status: 'online',
+          last_heartbeat_at: Date.now(),
+          exec_enabled: true,
+          os: CONTROLLED_NODE_OS_LINUX,
+          daemon_version: '2026.9.1',
+          auto_unlock_configured: false,
+          revoked_at: null,
+          access_role: 'owner',
+          access_expires_at: null,
+          controlled_capabilities: [],
+          controlled_upgrade_status: null,
+          controlled_upgrade_target_version: null,
+          controlled_upgrade_reason: null,
+          ...persisted,
+          node_role: 'controlled',
+          host_server_id: null,
+          remote_desktop_host_id: null,
+          team_ids: [],
+          team_names: [],
+        }],
+      } as unknown as import('../src/db/client.js').Database;
+      const listed = await listControlledMachines(listDb, 'test-user', Date.now());
+      expect(listed.machines[0]?.workerRefresh).toEqual(expect.objectContaining({
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+      }));
+    });
+
+    const STAGGER_MS = CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS;
+    const upgradeFrames = (ws: MockWs) => ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'));
+    const authControlled = async (
+      ws: MockWs,
+      daemonVersion = '0.1.2',
+      db = makeDb('valid-hash', 'controlled'),
+    ) => {
+      WsBridge.get(serverId).handleDaemonConnection(ws as never, db, {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion,
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+    };
+
+    it('upgrades a controlled node at auth even though it never publishes a session snapshot', async () => {
+      // Regression (tsk_043b784d11): imcodes-node has no sessions and never sends
+      // `session_list`, but the idle gate demanded one, so every controlled node
+      // stayed `deferred` with no reason, forever.
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      expect(WsBridge.get(serverId).getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
+    });
+
+    it('holds a controlled-node upgrade while the node reports a busy session, says why, and sends at idle', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
       const ws = new MockWs();
-      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      // Queued behind auth: it is applied before the post-auth upgrade check runs.
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'running' }] }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(0);
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({
+        status: 'deferred',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      });
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
 
-      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+    it('does not let a persisted failure for an older target block a newer target', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+        status: 'failed',
+        target: '2026.7.1000-dev.1',
+        reason: 'install_failed',
+      }));
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
+
+    it('retries a persisted failure for the same target once a fresh server process sees it', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+        status: 'failed',
+        target: process.env.APP_VERSION,
+        reason: 'download_failed',
+      }));
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
+
+    it('records any node-reported failure reason and retries the same target after a backoff', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(ws)).toHaveLength(1);
+
+      // An arbitrary node reason used to change nothing: the lifecycle stayed
+      // `sent`, so every later request answered `already_in_progress`.
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'artifact_download_failed', targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'failed', reason: 'artifact_download_failed' });
+
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(2);
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
+    });
+
+    it.each([
+      DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_INTERRUPTED,
+      DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_FAILED,
+    ])('treats a node-reported %s as a failure of that target with the normal backoff', async (reason) => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason, targetVersion: process.env.APP_VERSION }));
+      await flushAsync();
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'failed', reason });
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(2);
+    });
+
+    it('offers the target again when a node that was sent an upgrade reconnects still on the old version', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const first = new MockWs();
+      await authControlled(first);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(first)).toHaveLength(1);
+
+      // Reconnect inside the backoff: the install may still be running.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const second = new MockWs();
+      await authControlled(second);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(second)).toHaveLength(0);
+
+      // Reconnect after the backoff, still old: the install did not complete.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const third = new MockWs();
+      await authControlled(third);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(third)).toHaveLength(1);
+    });
+
+    it('says why a controlled node is not upgraded on every early-return path', async () => {
+      vi.useFakeTimers();
+      const heldBack = () => infoSpy.mock.calls
+        .filter(([, message]) => message === 'daemon auto-upgrade is being held back')
+        .map(([fields]) => (fields as { reason?: string }).reason);
+      const infoSpy = vi.spyOn(logger, 'info');
+      try {
+        // (1) explicit operator opt-out
+        process.env.APP_VERSION = '2026.7.1234-dev.5';
+        process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+        const optedOut = new MockWs();
+        await authControlled(optedOut);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(optedOut)).toHaveLength(0);
+        expect(heldBack()).toContain('auto_upgrade_disabled_by_env');
+        delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+
+        // (2) the server has no usable target version
+        process.env.APP_VERSION = '0.0.0';
+        const noTarget = new MockWs();
+        await authControlled(noTarget);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(noTarget)).toHaveLength(0);
+        expect(heldBack()).toContain('server_version_unknown');
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+
+    it('says why a failed target is not retried yet', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const infoSpy = vi.spyOn(logger, 'info');
+      try {
+        const ws = new MockWs();
+        await authControlled(ws);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'artifact_download_failed', targetVersion: process.env.APP_VERSION,
+        }));
+        await flushAsync();
+        // Reconnect inside the backoff, with the failure persisted as production would have it:
+        // the node is not offered the target again yet, and the log says why.
+        const again = new MockWs();
+        await authControlled(again, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+          status: 'failed', target: process.env.APP_VERSION, reason: 'artifact_download_failed',
+        }));
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(again)).toHaveLength(0);
+        expect(infoSpy.mock.calls.some(([fields, message]) => message === 'daemon auto-upgrade is being held back'
+          && (fields as { reason?: string }).reason === 'retry_backoff')).toBe(true);
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+
+    it('does not auto-upgrade a controlled node when the explicit deployment opt-out is set', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
+    });
+
+    it('defers a controlled-node upgrade while a dispatch is active and flushes once at idle', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const activeDispatchIds = (bridge as unknown as { activeDispatchIds: Map<string, string> }).activeDispatchIds;
+      activeDispatchIds.set('main', 'turn-1');
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+      activeDispatchIds.delete('main');
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
+      activeDispatchIds.clear();
     });
 
-    it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
+    it('does not arm controlled-node rescue when the controlled node has safe self-upgrade', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.7.1233-dev.4', capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(true);
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
+    });
+
+    it('keeps a controlled node online when it advertises a bounded future capability', async () => {
+      const executed: Array<{ sql: string; params: unknown[] }> = [];
+      const db = {
+        queryOne: async () => ({
+          token_hash: 'valid-hash', owner_status: 'active',
+          node_role: 'controlled',
+          revoked_at: null,
+          os: CONTROLLED_NODE_OS_WIN,
+        }),
+        query: async () => [],
+        execute: async (sql: string, params: unknown[] = []) => {
+          executed.push({ sql, params });
+          return { changes: 1 };
+        },
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY, 'remote.desktop.windows.h264.v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(ws.closed).toBe(false);
+      expect(executed.some(({ sql, params }) => sql.includes('controlled_capabilities')
+        && params.includes(JSON.stringify([CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY])))).toBe(true);
+    });
+
+    it('rejects malformed future capability advertisements', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: ['remote desktop v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(false);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4002);
+      expect(ws.closeReason).toBe('invalid_capabilities');
+    });
+
+    it('prepares a legacy Windows rescue before automatic upgrade when no safe capability is advertised', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(true);
+    });
+
+    it('keeps legacy Windows rescue bounded while the rescue result is pending', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+      expect(ws.sentStrings.filter((message) => message.includes('\"type\":\"machine.exec\"'))).toHaveLength(1);
+      expect(ws.sentStrings.filter((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
+    });
+
+    it('defers a legacy Windows node after an automatic blocker without rescue', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
+    });
+
+    it('drops controlled-node upgrade blocker frames with extra keys', async () => {
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+      const before = WsBridge.controlledInboundDropped;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+      const machineExecCount = ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"')).length;
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+        extra: true,
+      }));
+      await flushAsync();
+
+      expect(WsBridge.controlledInboundDropped).toBe(before + 1);
+      expect(ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"'))).toHaveLength(machineExecCount);
+    });
+
+    it('surfaces daemon-newer mismatch without auto-upgrading', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -453,10 +1550,10 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(false);
     });
 
-    it('sends daemon.upgrade when server is dev and daemon is stable', async () => {
+    it('surfaces dev/stable mismatch without auto-upgrading', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -469,10 +1566,10 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(false);
     });
 
-    it('sends daemon.upgrade when server is stable and daemon is dev', async () => {
+    it('surfaces stable/dev mismatch without auto-upgrading', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905';
 
@@ -485,46 +1582,1221 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(true);
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(false);
     });
 
-    it('rate-limits auto daemon.upgrade to at most once every 15 minutes', async () => {
+    describe('full daemon automatic upgrade (the daemon decides when it is idle)', () => {
+      const TARGET = '2026.4.905-dev.877';
+      const OLD = '2026.4.904-dev.100';
+      const frames = (ws: MockWs) => upgradeFrames(ws).map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      const authFull = async (ws: MockWs, daemonVersion = OLD, extra: Record<string, unknown> = {}) => {
+        WsBridge.get(serverId).handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion, ...extra }));
+        await flushAsync();
+      };
+      const boot = () => {
+        vi.useFakeTimers();
+        process.env.APP_VERSION = TARGET;
+        markDaemonUpgradeTargetVersionPublishedForTest(TARGET);
+      };
+      const blocked = async (ws: MockWs, reason: string, extra: Record<string, unknown> = {}) => {
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason, ...extra }));
+        await flushAsync();
+      };
+      const advance = async (ms: number) => {
+        await vi.advanceTimersByTimeAsync(ms);
+        await flushAsync();
+      };
+      const sessions = async (ws: MockWs, state: string) => {
+        ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'deck_a_brain', state }] }));
+        await flushAsync();
+        await vi.advanceTimersByTimeAsync(0);
+      };
+      const autoView = () => WsBridge.get(serverId).daemonUpgradeStatus().autoUpgrade;
+      const FIRST_SEND = STAGGER_MS;
+
+      it('sends source:auto to a lagging full daemon and never gates it on the server\'s own view of busy', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        // The server sees a running session, yet still asks: the daemon's own
+        // gates are the only definition of "busy".
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toEqual([expect.objectContaining({ type: 'daemon.upgrade', source: 'auto', targetVersion: TARGET })]);
+        expect(frames(ws)[0]).not.toHaveProperty('force');
+        expect(autoView()).toMatchObject({ status: 'upgrading', targetVersion: TARGET });
+      });
+
+      it('does nothing for a current daemon', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws, TARGET);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(0);
+        expect(autoView()).toBeNull();
+      });
+
+      it('honors the deployment opt-out and says why, while manual stays available', async () => {
+        boot();
+        process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+        const infoSpy = vi.spyOn(logger, 'info');
+        try {
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          expect(frames(ws)).toHaveLength(0);
+          expect(infoSpy.mock.calls.some(([fields, message]) => message === 'daemon auto-upgrade is being held back'
+            && (fields as { reason?: string }).reason === 'auto_upgrade_disabled_by_env')).toBe(true);
+          expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }))
+            .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        } finally {
+          infoSpy.mockRestore();
+          delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+        }
+      });
+
+      it.each([
+        DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+        DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      ])('asks again after a bounded interval, not in a tight loop, when the daemon reports %s', async (reason) => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        await blocked(ws, reason);
+        expect(autoView()).toMatchObject({ status: 'deferred', reason });
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 1_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(2_000);
+        expect(frames(ws)).toHaveLength(2);
+        expect(frames(ws)[1]).toMatchObject({ source: 'auto', targetVersion: TARGET });
+      });
+
+      it('schedules the retry from the daemon\'s own cooldown remainder (bounded)', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE, { cooldownRemainingMs: 3 * 60_000 });
+        await advance(3 * 60_000 - 2_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(2);
+        // A tiny remainder is clamped up so it cannot become a tight loop.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE, { cooldownRemainingMs: 5 });
+        await advance(DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS - 2_000);
+        expect(frames(ws)).toHaveLength(2);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(3);
+      });
+
+      // A daemon that has just (re)started holds an automatic upgrade for its own reasons (settle window, restore,
+      // recovery after an unclean exit). On the wire it is a legacy busy reason plus the deferral fields.
+      describe.each([DAEMON_UPGRADE_DEFERRAL.STARTING_UP, DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY])('daemon deferral %s', (deferral) => {
+        const receipt = (ws: MockWs, retryAfterMs: unknown) => blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY, {
+          [DAEMON_UPGRADE_DEFERRAL_FIELD]: deferral,
+          [DAEMON_UPGRADE_RETRY_AFTER_FIELD]: retryAfterMs,
+        });
+
+        it('shows the precise reason and asks again right after the daemon\'s own hold lapses', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          expect(frames(ws)).toHaveLength(1);
+          await receipt(ws, 12 * 60_000);
+          expect(autoView()).toMatchObject({ status: 'deferred', reason: deferral });
+          await advance(12 * 60_000 + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS - 2_000);
+          expect(frames(ws)).toHaveLength(1);
+          await advance(4_000);
+          expect(frames(ws)).toHaveLength(2);
+          expect(frames(ws)[1]).toMatchObject({ source: 'auto', targetVersion: TARGET });
+        });
+
+        it('never retries faster than the shared floor (no storm from a tiny or bogus hint)', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          for (const [index, tiny] of [5, -1].entries()) {
+            await receipt(ws, tiny);
+            await advance(DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS - 2_000);
+            expect(frames(ws)).toHaveLength(1 + index);
+            await advance(4_000);
+            expect(frames(ws)).toHaveLength(2 + index);
+          }
+          // A hint that is not a number is no hint: the plain busy interval. (A negative number is a number: floored.)
+          for (const bogus of ['soon', null, Number.NaN]) {
+            await receipt(ws, bogus);
+            await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 2_000);
+            const before = frames(ws).length;
+            await advance(4_000);
+            expect(frames(ws)).toHaveLength(before + 1);
+          }
+        });
+
+        it('is not asked again at an idle edge meanwhile: the hold ends by the daemon\'s clock, not a session edge', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await sessions(ws, 'running');
+          await advance(FIRST_SEND);
+          await receipt(ws, 10 * 60_000);
+          for (let i = 0; i < 4; i += 1) {
+            await advance(2 * DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+            await sessions(ws, 'idle');
+            await sessions(ws, 'running');
+          }
+          expect(frames(ws)).toHaveLength(1);
+        });
+
+        it('does not consume the failure backoff, and an older server\'s view of the same receipt (no deferral fields) is the plain busy retry', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          await receipt(ws, 60_000);
+          await advance(60_000 + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS + 1_000);
+          expect(frames(ws)).toHaveLength(2);
+          // What a server without the deferral fields reads: a legacy busy reason, retried on the busy interval.
+          await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+          expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY });
+          await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+          expect(frames(ws)).toHaveLength(3);
+          await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+          await advance(9 * 60_000);
+          expect(frames(ws)).toHaveLength(3);
+          await advance(2 * 60_000);
+          expect(frames(ws)).toHaveLength(4);
+        });
+      });
+
+      it('ignores an unknown deferral value: the plain busy reason and interval stand', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY, { [DAEMON_UPGRADE_DEFERRAL_FIELD]: 'from_the_future', [DAEMON_UPGRADE_RETRY_AFTER_FIELD]: 30_000 });
+        expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY });
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 2_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(2);
+      });
+
+      it('retries at the next idle edge, spaced by the minimum interval, and only after a daemon receipt', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        // Edge inside the minimum interval: nothing (the timer still covers it).
+        await advance(10_000);
+        await sessions(ws, 'idle');
+        expect(frames(ws)).toHaveLength(1);
+        // A later edge, server view quiet: the daemon is asked again, long before the 5 minute timer.
+        await sessions(ws, 'running');
+        await advance(DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+        await sessions(ws, 'running');
+        expect(frames(ws)).toHaveLength(1);
+        await sessions(ws, 'idle');
+        expect(frames(ws)).toHaveLength(2);
+        expect(frames(ws)[1]).toMatchObject({ source: 'auto' });
+      });
+
+      it('an idle edge is a trigger, not a gate: with no daemon receipt it never sends', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        // The daemon accepted (no receipt) — sessions flapping idle/busy must not resend.
+        for (let i = 0; i < 3; i += 1) {
+          await advance(2 * DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+          await sessions(ws, 'idle');
+          await sessions(ws, 'running');
+        }
+        expect(frames(ws)).toHaveLength(1);
+      });
+
+      it('a gate receipt that answers nothing we delivered schedules nothing', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        // Before the stagger elapsed no command was delivered.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        expect(autoView()?.reason ?? null).not.toBe(DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        // Repeated receipts for the one delivered command arm one retry, not several.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        expect(frames(ws)).toHaveLength(2);
+      });
+
+      it('busy waits do not consume the failure backoff: the first failure still waits only 10 minutes', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        expect(frames(ws)).toHaveLength(3);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        expect(autoView()).toMatchObject({ status: 'failed', reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
+        await advance(9 * 60_000);
+        expect(frames(ws)).toHaveLength(3);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(4);
+      });
+
+      it('a failed target backs off 10m, then 30m, and only blocks that target', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        await advance(9 * 60_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(2);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        await advance(29 * 60_000);
+        expect(frames(ws)).toHaveLength(2);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(3);
+        // A different (newer) server target is a fresh lifecycle, never blocked by the old failure.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE);
+        process.env.APP_VERSION = '2026.4.906-dev.1';
+        markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+        const next = new MockWs();
+        await authFull(next);
+        await advance(FIRST_SEND);
+        expect(frames(next)).toEqual([expect.objectContaining({ targetVersion: '2026.4.906-dev.1' })]);
+      });
+
+      it('an old daemon that never answers is not asked on every reconnect (version unchanged after delivery)', async () => {
+        boot();
+        const first = new MockWs();
+        await authFull(first);
+        await advance(FIRST_SEND);
+        expect(frames(first)).toHaveLength(1);
+
+        await advance(60_000);
+        const second = new MockWs();
+        await authFull(second);
+        await advance(FIRST_SEND);
+        expect(frames(second)).toHaveLength(0);
+        expect(autoView()).toMatchObject({ status: 'failed', reason: 'version_unchanged_after_upgrade' });
+        expect(autoView()?.nextRetryAt).toEqual(expect.any(Number));
+
+        // Still connected when the backoff ends: it is asked once more, by the server's own timer.
+        await advance(10 * 60_000);
+        expect(frames(second)).toHaveLength(1);
+      });
+
+      it('the daemon\'s own opt-out receipt stops the automatic trigger without a failure backoff, manual still forced', async () => {
+        boot();
+        const browser = new MockWs();
+        WsBridge.get(serverId).handleBrowserConnection(browser as never, 'test-user', makeDb('valid-hash'));
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED, { disabledBy: 'config' });
+        expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED });
+        // Not an operator-facing failure.
+        expect(browser.sentStrings.some((raw) => raw.includes(DAEMON_MSG.UPGRADE_BLOCKED))).toBe(false);
+        // No further asks for as long as the connection lives, however long that is.
+        await advance(7 * 60 * 60_000);
+        expect(frames(ws)).toHaveLength(1);
+        // A manual forced upgrade is unaffected.
+        expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true }))
+          .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        expect(frames(ws)[1]).toMatchObject({ source: 'manual', force: true, targetVersion: TARGET });
+        // The daemon re-reads its config on reconnect, so the next connection is asked again.
+        const reconnected = new MockWs();
+        await authFull(reconnected);
+        await advance(FIRST_SEND);
+        expect(frames(reconnected).filter((frame) => frame.source === 'auto')).toHaveLength(1);
+      });
+
+      it('an automatic gate receipt is shown on the card, not toasted; a manual one is relayed', async () => {
+        boot();
+        const browser = new MockWs();
+        WsBridge.get(serverId).handleBrowserConnection(browser as never, 'test-user', makeDb('valid-hash'));
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY);
+        const relayed = () => browser.sentStrings.filter((raw) => raw.includes(DAEMON_MSG.UPGRADE_BLOCKED));
+        expect(relayed()).toHaveLength(0);
+
+        // The browser learns the wait from the daemon.stats frame.
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_STATS_MSG, cpu: 1, memUsed: 1, memTotal: 2, load1: 0, load5: 0, load15: 0, uptime: 1,
+        }));
+        await flushAsync();
+        const stats = browser.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+          .filter((frame) => frame.type === DAEMON_STATS_MSG);
+        expect(stats[stats.length - 1]).toMatchObject({
+          autoUpgrade: { status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY, targetVersion: TARGET },
+        });
+
+        // A manual request (an old daemon that predates `force`) answers with a visible block.
+        expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }))
+          .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY);
+        expect(relayed()).toHaveLength(1);
+      });
+
+      it('a blocked manual request can be confirmed again at once, and never moves the automatic failure counter', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        const bridge = WsBridge.get(serverId);
+        expect(bridge.requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }).deliveryStatus)
+          .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        // Not "already in progress": the daemon refused the first manual command.
+        expect(bridge.requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true }).deliveryStatus)
+          .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        const sent = frames(ws);
+        expect(sent[sent.length - 1]).toMatchObject({ source: 'manual', force: true });
+        expect(sent.filter((frame) => frame.source === 'manual' && !('force' in frame))).toHaveLength(1);
+      });
+
+      it('a forced manual request outranks an automatic command that is already out', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        const forced = WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true });
+        expect(forced.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        expect(frames(ws)[1]).toMatchObject({ source: 'manual', force: true });
+      });
+
+      it('a server restart forgets the counters: one fresh attempt, not a permanent block', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        WsBridge.getAll().clear();
+        const restarted = new MockWs();
+        await authFull(restarted);
+        await advance(FIRST_SEND);
+        expect(frames(restarted)).toHaveLength(1);
+      });
+
+      it('spreads the post-auth trigger: nothing is sent before the stagger window starts to elapse', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        expect(frames(ws)).toHaveLength(0);
+        const stagger = controlledNodeUpgradeStaggerMs(serverId);
+        if (stagger > 1) {
+          await advance(stagger - 1);
+          expect(frames(ws)).toHaveLength(0);
+        }
+        await advance(STAGGER_MS);
+        expect(frames(ws)).toHaveLength(1);
+      });
+
+      it('a controlled node never receives force, and a manual upgrade without force stays an ordinary manual one', async () => {
+        boot();
+        const ws = new MockWs();
+        await authControlled(ws);
+        await advance(FIRST_SEND);
+        WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' });
+        expect(frames(ws).length).toBeGreaterThan(0);
+        for (const frame of frames(ws)) expect(frame).not.toHaveProperty('force');
+      });
+    });
+
+    describe('controlled-node authentication latency (the fixed ~30 s before the first heartbeat_ack)', () => {
+      // 34f0bb11 (win-201): five restarts, process_start -> first heartbeat_ack 30.25-30.29 s every time. The node's
+      // silence watchdog gives a socket up after 30 s without ANY server frame; the server held its first heartbeat_ack
+      // behind the whole post-auth chain, whose remote-desktop route-replacement wait is up to 35 s (a restarted node
+      // with a live route has to cold-start its worker first).
+      const NODE_VERSION = '2026.10.5479-dev.5940';
+      const SLOW_RECONCILE_MS = 35_000;
+      const heartbeatAcks = (ws: MockWs) => ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((frame) => frame.type === 'heartbeat_ack');
+      const authFrame = { type: 'auth', serverId: '', token: 'my-token', daemonVersion: NODE_VERSION, capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY] };
+      const heartbeatFrame = { type: 'heartbeat', daemonVersion: NODE_VERSION, [CLOCK_SYNC_FIELD.SENT_AT]: 1234 };
+      /** A node that connects the way the real one does: auth, then a heartbeat in the same breath. */
+      const connectNode = async (bridge: WsBridge, options: { db?: ReturnType<typeof makeDb>; nodeId?: string } = {}) => {
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, options.db ?? makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, options.nodeId), {} as never);
+        ws.emit('message', JSON.stringify({ ...authFrame, serverId }));
+        ws.emit('message', JSON.stringify(heartbeatFrame));
+        return ws;
+      };
+      const blockRevalidatorFor = (ms: number) => {
+        const calls: number[] = [];
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+          calls.push(Date.now());
+          await new Promise((resolve) => setTimeout(resolve, ms));
+        });
+        return calls;
+      };
+
+      beforeEach(() => { vi.useFakeTimers(); });
+
+      it('acknowledges the first heartbeat within a second even when the remote-desktop reconcile takes 35 s', async () => {
+        const bridge = WsBridge.get(serverId);
+        const revalidations = blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const ws = await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(revalidations).toHaveLength(1);
+        expect(heartbeatAcks(ws), 'the ack must not wait for the reconcile tail (the node gives up after 30 s of silence)').toHaveLength(1);
+      });
+
+      it('keeps what the ack carries: the node id, the server id and the clock echo', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const nodeId = '9909368908';
+        const ws = await connectNode(bridge, { nodeId });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        const [ack] = heartbeatAcks(ws);
+        expect(ack).toMatchObject({ [CLOCK_SYNC_FIELD.SENT_AT]: 1234 });
+        expect(typeof ack![CLOCK_SYNC_FIELD.SERVER_TIME]).toBe('number');
+        expect(JSON.stringify(ack)).toContain(serverId);
+        expect(JSON.stringify(ack)).toContain(nodeId);
+      });
+
+      it('a connection replaced while its credentials are still being checked never acknowledges or authenticates', async () => {
+        const bridge = WsBridge.get(serverId);
+        // Only the credential lookup (the FIRST query of the connection) is held back; the connection's own close
+        // handler queries the same database later and must not be mistaken for it.
+        const heldLookups: Array<() => void> = [];
+        const slowDb = makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN) as unknown as {
+          queryOne: (...args: unknown[]) => Promise<unknown>;
+        };
+        const realQueryOne = slowDb.queryOne.bind(slowDb);
+        slowDb.queryOne = (...args: unknown[]) => (heldLookups.length === 0
+          ? new Promise((resolve) => { heldLookups.push(() => resolve(realQueryOne(...args))); })
+          : realQueryOne(...args));
+        const releaseLookup = () => heldLookups[0]!();
+        const first = await connectNode(bridge, { db: slowDb as never });
+        const firstSends = vi.spyOn(first, 'send');
+        const second = await connectNode(bridge);
+        await flushAsync();
+        releaseLookup();
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(first), 'the replaced connection must not be acknowledged').toHaveLength(0);
+        // not even an attempt: a closed socket swallows the send, so look at the attempts themselves
+        expect(firstSends.mock.calls.some(([data]) => String(data).includes('heartbeat_ack'))).toBe(false);
+        expect(heartbeatAcks(second)).toHaveLength(1);
+        expect(first.closed).toBe(true);
+        expect(bridge.isAuthenticated).toBe(true);
+      });
+
+      it('does not acknowledge a heartbeat whose credentials are wrong', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, makeDb('another-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+        ws.emit('message', JSON.stringify({ ...authFrame, serverId }));
+        ws.emit('message', JSON.stringify(heartbeatFrame));
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(ws)).toHaveLength(0);
+        expect(ws.closed).toBe(true);
+        expect(ws.closeCode).toBe(4001);
+      });
+
+      it('every other frame type still waits for the complete authentication chain', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const ws = await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const pending = registerPendingExec(serverId, 'exec-after-auth', generation, 120_000);
+        let resolved = false;
+        void pending.then(() => { resolved = true; });
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT, correlationId: 'exec-after-auth', ok: true, exitCode: 0, stdout: '', stderr: '', durationMs: 1,
+        }));
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(ws)).toHaveLength(1);
+        expect(resolved, 'an exec result is only accepted once authentication has completed').toBe(false);
+        // the chain is bounded: it completes at the reconcile budget, not at 35 s
+        await vi.advanceTimersByTimeAsync(DAEMON_AUTH_RECONCILE_BUDGET_MS);
+        await flushAsync();
+        expect(resolved).toBe(true);
+        expect(Date.now()).toBeLessThan(Date.now() + 1); // (clock sanity; budget asserted by the line above)
+      });
+
+      it('the bounded wait does not turn into a pass: remote desktop stays unavailable until the reconcile really finishes', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const readyGeneration = () => (bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration;
+        await vi.advanceTimersByTimeAsync(DAEMON_AUTH_RECONCILE_BUDGET_MS + 1_000);
+        await flushAsync();
+        expect(bridge.isAuthenticated).toBe(true);
+        expect(readyGeneration(), 'still reconciling: fail closed').not.toBe(generation);
+        expect(JSON.stringify(warn.mock.calls)).toContain('remote desktop reconcile is still running');
+        await vi.advanceTimersByTimeAsync(SLOW_RECONCILE_MS);
+        await flushAsync();
+        expect(readyGeneration()).toBe(generation);
+        warn.mockRestore();
+      });
+
+      it('a failing reconcile is retried in the background and then reported, never silently left half-done', async () => {
+        const bridge = WsBridge.get(serverId);
+        let attempts = 0;
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+          attempts += 1;
+          if (attempts <= 2) throw new Error('database unavailable');
+        });
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const readyGeneration = () => (bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration;
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(readyGeneration()).not.toBe(generation);
+        for (const delay of DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay + 100);
+        await flushAsync();
+        expect(attempts).toBe(3);
+        expect(readyGeneration(), 'the third attempt succeeded: authority is aligned').toBe(generation);
+        expect(JSON.stringify(warn.mock.calls)).toContain('will be retried');
+        warn.mockRestore();
+      });
+
+      it('gives up visibly after the bounded retries (error log + counter) and stays fail-closed', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => { throw new Error('database unavailable'); });
+        const error = vi.spyOn(logger, 'error');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        for (const delay of DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay + 100);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect((bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration).not.toBe(generation);
+        expect(JSON.stringify(error.mock.calls)).toContain('remote desktop reconcile gave up');
+        expect(getCounter('remote_desktop.reconcile_gave_up')).toBe(1);
+        error.mockRestore();
+      });
+
+      it('logs the per-phase timing of every authentication (and warns on a slow one) without ever logging the token', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(3_000);
+        const info = vi.spyOn(logger, 'info');
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await flushAsync();
+        const authenticated = info.mock.calls.find((call) => call[1] === 'Daemon authenticated');
+        expect(authenticated).toBeTruthy();
+        expect(authenticated![0]).toEqual(expect.objectContaining({
+          lookupMs: expect.any(Number), credentialMs: expect.any(Number), reconcileMs: expect.any(Number),
+          revalidateMs: expect.any(Number), contextMs: expect.any(Number), totalMs: expect.any(Number),
+        }));
+        expect((authenticated![0] as { revalidateMs: number }).revalidateMs).toBeGreaterThanOrEqual(3_000);
+        const slow = warn.mock.calls.find((call) => call[1] === 'slow daemon auth');
+        expect(slow, 'a phase above 2 s is a warning').toBeTruthy();
+        expect(JSON.stringify([...info.mock.calls, ...warn.mock.calls])).not.toContain('my-token');
+        info.mockRestore();
+        warn.mockRestore();
+      });
+
+      it('a normal fast authentication does not warn', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(warn.mock.calls.find((call) => call[1] === 'slow daemon auth')).toBeUndefined();
+        warn.mockRestore();
+      });
+
+      it('a reconnect storm (60 nodes at once, 200 ms revalidation each) is acknowledged in under a second each', async () => {
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => { await new Promise((resolve) => setTimeout(resolve, 200)); });
+        const sockets: MockWs[] = [];
+        for (let i = 0; i < 60; i += 1) {
+          const id = `${serverId}-storm-${i}`;
+          const bridge = WsBridge.get(id);
+          const ws = new MockWs();
+          bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+          ws.emit('message', JSON.stringify({ ...authFrame, serverId: id }));
+          ws.emit('message', JSON.stringify(heartbeatFrame));
+          sockets.push(ws);
+        }
+        await vi.advanceTimersByTimeAsync(900);
+        await flushAsync();
+        expect(sockets.filter((ws) => heartbeatAcks(ws).length === 1)).toHaveLength(60);
+      });
+
+      it('two processes using one credential are detected, not kicked silently in a loop', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        for (let i = 0; i < 4; i += 1) {
+          await connectNode(bridge);
+          await vi.advanceTimersByTimeAsync(600);
+          await flushAsync();
+        }
+        const duel = warn.mock.calls.find((call) => call[1] === 'daemon connection replaced repeatedly');
+        expect(duel, 'three authenticated connections replaced within a minute is a duel').toBeTruthy();
+        expect(duel![0]).toEqual(expect.objectContaining({ serverId, replacements: expect.any(Number) }));
+        warn.mockRestore();
+      });
+
+      it('an ordinary single reconnect does not look like a duel', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(600);
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(600);
+        await flushAsync();
+        expect(warn.mock.calls.find((call) => call[1] === 'daemon connection replaced repeatedly')).toBeUndefined();
+        warn.mockRestore();
+      });
+    });
+
+    describe('legacy Windows node whose old process still holds the upgrade-in-progress latch', () => {
+      // The 7064301582 incident: a node on 2026.9.4537 kept answering `already_in_progress` to every daemon.upgrade
+      // (a 9/22 attempt was killed after it set the process-local latch). The rescue restart must clear it.
+      const NODE_VERSION = '2026.9.4537-dev.5183';
+      const TARGET_VERSION = '2026.9.4544-dev.5197';
+      const MINUTE = 60_000;
+
+      const execFrames = (ws: MockWs, prefix: 'upgrade-rescue-' | 'upgrade-restart-') => ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((frame) => frame.type === 'machine.exec' && String(frame.correlationId).startsWith(prefix));
+      const upgradeFrames = (ws: MockWs) => ws.sentStrings.filter((message) => message.includes('"type":"daemon.upgrade"'));
+      const answerExec = async (ws: MockWs, frame: Record<string, unknown>, readyPrefix: string) => {
+        const id = String(frame.correlationId).replace(/^upgrade-(rescue|restart)-/, '');
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+          correlationId: frame.correlationId,
+          ok: true,
+          exitCode: 0,
+          stdout: `${readyPrefix}:${id}`,
+          stderr: '',
+          durationMs: 1,
+        }));
+        await flushAsync();
+      };
+      /** Controlled-upgrade state rows the bridge persisted (status, target, reason), in order. */
+      const persisted: Array<{ status: unknown; reason: unknown }> = [];
+      const recordingDb = () => {
+        const db = makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN) as unknown as {
+          execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }>;
+        };
+        const execute = db.execute.bind(db);
+        db.execute = async (sql, params = []) => {
+          if (sql.includes('controlled_upgrade_status')) persisted.push({ status: params[0], reason: params[2] });
+          return execute(sql, params);
+        };
+        return db as unknown as import('../src/db/client.js').Database;
+      };
+      const connectLegacyNode = async (bridge: WsBridge, capabilities: string[] = []) => {
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, recordingDb(), {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: NODE_VERSION, capabilities }));
+        await flushAsync();
+        ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+        await flushAsync();
+        // past the post-auth stagger, but NOT `runOnlyPendingTimers`: that would also fire the exec deadline
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS + 1_000);
+        await flushAsync();
+        return ws;
+      };
+      /** Connect, prepare the rescue, and let the server deliver the upgrade the latched node will refuse. */
+      const reachLatchedBlock = async (bridge: WsBridge) => {
+        const ws = await connectLegacyNode(bridge);
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        expect(rescue, 'the rescue is prepared before any upgrade is sent').toBeTruthy();
+        expect(upgradeFrames(ws)).toHaveLength(0);
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        return ws;
+      };
+      const reconnectLatchedNode = async (bridge: WsBridge, previous: MockWs) => {
+        previous.close();
+        await flushAsync();
+        return reachLatchedBlock(bridge);
+      };
+
+      beforeEach(() => {
+        vi.useFakeTimers();
+        process.env.APP_VERSION = TARGET_VERSION;
+        persisted.length = 0;
+      });
+
+      it('restarts the latched node process (once) instead of failing with legacy_upgrade_restart_lifecycle_not_sent', async () => {
+        const bridge = WsBridge.get(serverId);
+        const warn = vi.spyOn(logger, 'warn');
+        const ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        const restarts = execFrames(ws, 'upgrade-restart-');
+        expect(restarts, 'the rescue restart runs right after the latch is reported').toHaveLength(1);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('legacy_upgrade_restart_lifecycle_not_sent');
+        // the restart verifies, and the node process is gone (the SYSTEM task replaced it): the server asks again
+        await answerExec(ws, restarts[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+        ws.close();
+        await flushAsync();
+        const replacement = await connectLegacyNode(bridge);
+        const [secondRescue] = execFrames(replacement, 'upgrade-rescue-');
+        await answerExec(replacement, secondRescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(replacement), 'the replacement generation is offered the upgrade at once').toHaveLength(1);
+        warn.mockRestore();
+      });
+
+      it('never restarts the same node more than the shared 10m/30m/2h/6h schedule allows, and says why it is waiting', async () => {
+        const bridge = WsBridge.get(serverId);
+        let ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(1);
+        await answerExec(ws, execFrames(ws, 'upgrade-restart-')[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+
+        // The restart did not clear the latch: the node comes back and refuses again, every time.
+        const startedAt = Date.now();
+        const restartTimes: number[] = [startedAt];
+        for (const waitMinutes of [10, 30, 120, 360, 360]) {
+          ws = await reconnectLatchedNode(bridge, ws);
+          // not before the scheduled delay ...
+          await vi.advanceTimersByTimeAsync(waitMinutes * MINUTE - 20_000);
+          await flushAsync();
+          expect(execFrames(ws, 'upgrade-restart-'), `no restart before ${waitMinutes} minutes`).toHaveLength(0);
+          // ... and then exactly one
+          await vi.advanceTimersByTimeAsync(40_000);
+          await flushAsync();
+          const restarts = execFrames(ws, 'upgrade-restart-');
+          expect(restarts, `one restart at ${waitMinutes} minutes`).toHaveLength(1);
+          restartTimes.push(Date.now());
+          await answerExec(ws, restarts[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+        }
+        // while the schedule holds the next restart back, the node's persisted state says so (not a silent no-op)
+        expect(persisted.some((row) => row.reason === CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF
+          && row.status === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED)).toBe(true);
+        expect(restartTimes).toHaveLength(6);
+      });
+
+      it('a restart that cannot be verified is reported as legacy_restart_failed and retried on the same schedule, not every minute', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        const [first] = execFrames(ws, 'upgrade-restart-');
+        expect(first).toBeTruthy();
+        // the SYSTEM task ran but its verification output is wrong
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT, correlationId: first!.correlationId, ok: true, exitCode: 1,
+          stdout: '', stderr: 'access denied', durationMs: 1,
+        }));
+        await flushAsync();
+        expect(persisted.some((row) => row.reason === CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED)).toBe(true);
+        await vi.advanceTimersByTimeAsync(10 * MINUTE - 30_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'the old 1/2/4/5-minute cadence is gone').toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'the second attempt follows the shared schedule').toHaveLength(2);
+      });
+
+      it('also reaches the restart for a latched node that advertises safe self-upgrade (rescue prepared after the receipt)', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge, [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY]);
+        expect(execFrames(ws, 'upgrade-rescue-'), 'no rescue before the first upgrade: the node says it is safe').toHaveLength(0);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        expect(rescue, 'the latch arms the rescue').toBeTruthy();
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'and the restart follows the prepared rescue').toHaveLength(1);
+      });
+
+      it('keeps offering nothing to a node that is not latched: a healthy legacy upgrade never triggers a restart', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge);
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(30 * MINUTE);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(0);
+      });
+
+      it('allows a modern Windows node that hit legacy_restart_failed to recover cleanly on manual retry', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge, [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY]);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        expect(rescue).toBeTruthy();
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        const [restart] = execFrames(ws, 'upgrade-restart-');
+        expect(restart).toBeTruthy();
+        // No staged upgrade-result.json -> restart verification fails with legacy_restart_failed.
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+          correlationId: restart!.correlationId,
+          ok: true,
+          exitCode: 1,
+          stdout: '',
+          stderr: 'legacy upgrade signed staging evidence missing',
+          durationMs: 1,
+        }));
+        await flushAsync();
+        expect(persisted.at(-1)).toEqual({
+          status: CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+          reason: CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED,
+        });
+
+        // Operator clicks manual retry ("重试更新"): clears latch-rescue state & timer and sends a fresh daemon.upgrade.
+        const manual = bridge.requestDaemonUpgrade({ targetVersion: TARGET_VERSION, source: 'manual' });
+        await flushAsync();
+        expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        expect(upgradeFrames(ws)).toHaveLength(2);
+        expect(persisted.at(-1)).toEqual({
+          status: CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
+          reason: null,
+        });
+
+        // Old 10-minute restart backoff timer was cancelled and does not fire later.
+        await vi.advanceTimersByTimeAsync(11 * MINUTE);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(1);
+      });
+
+      it('does not arm latch rescue when a modern Windows node reports already_in_progress shortly after manual supersede during an active download', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge, [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY]);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(5_000);
+        const manual = bridge.requestDaemonUpgrade({ targetVersion: TARGET_VERSION, source: 'manual' });
+        expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        expect(upgradeFrames(ws)).toHaveLength(2);
+
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-rescue-')).toHaveLength(0);
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(0);
+        expect(persisted.some((row) => row.reason === CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED)).toBe(false);
+      });
+    });
+
+    it('fences an exact rolled-back controlled-node target instead of retrying the destructive upgrade loop', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.9.4544-dev.5197';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.4537-dev.5183', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'manual' }))
+        .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE });
+    });
+
+    it.each([
+      'toolchain_unavailable',
+      DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+    ])('does not schedule an automatic upgrade after blocker %s', async (reason) => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
+    });
 
+    it('cancels the auth-scheduled auto upgrade when a persisted install failure replays', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-after-link-down',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: '2026.7.3192-dev.3593',
+        retryReason: 'stale-staging-dir',
+        exitCode: 217,
+        log: '/tmp/imcodes-upgrade-test/upgrade.log',
+        ts: Date.now(),
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(ws.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-after-link-down'
+          && message.disposition === 'accepted';
+      })).toBe(true);
+
+      const autoRetry = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      });
+      expect(autoRetry).toMatchObject({
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+      });
+    });
+
+    it('does not arm auto upgrade while slow auth replay keeps a persisted blocker waiting', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_slow_auth_brain' } as const;
+      const liveCoverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-slow-auth'],
+        primaryShareId: 'share-slow-auth',
+        authorizedAt: Date.now(),
+      } as const;
+      bridge.setShareCoverageResolverForTests(async () => liveCoverage);
+
+      const sharedBrowser = new MockWs();
+      bridge.handleShareBrowserConnection(sharedBrowser as never, 'shared-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-slow-auth',
+        target,
+        snapshot: liveCoverage,
+      });
+      sharedBrowser.emit('message', JSON.stringify({
+        type: 'session.send',
+        commandId: 'slow-auth-command',
+        sessionName: target.sessionName,
+        text: 'hold auth replay',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      let resolveCoverage!: (value: typeof liveCoverage) => void;
+      const coveragePending = new Promise<typeof liveCoverage>((resolve) => {
+        resolveCoverage = resolve;
+      });
+      bridge.setShareCoverageResolverForTests(async () => coveragePending);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-during-slow-auth',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      resolveCoverage(liveCoverage);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(daemonWs.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-during-slow-auth'
+          && message.disposition === 'accepted';
+      })).toBe(true);
+    });
+
+    it('waits for daemon outbox sync even when auth finishes more than five seconds earlier', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-after-delayed-outbox-read',
+        upgradeId: 'old-auto-upgrade',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(daemonWs.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-after-delayed-outbox-read',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      });
+    });
+
+    it('does not start an automatic upgrade after an empty outbox sync', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.7.3157-dev.3556', [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC, revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION }));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
+    });
+
+    it('replays an explicitly requested manual upgrade after reconnect', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
       const bridge = WsBridge.get(serverId);
       const firstWs = new MockWs();
       bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
-
-      firstWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      firstWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.7.3157-dev.3556' }));
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
+      firstWs.emit('close');
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+      const manual = bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'manual' });
+      expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+      const reconnectWs = new MockWs();
+      bridge.handleDaemonConnection(reconnectWs as never, makeDb('valid-hash'), {} as never);
+      reconnectWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.7.3157-dev.3556' }));
       await flushAsync();
-
-      expect(firstWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
-
-      const secondWs = new MockWs();
-      bridge.handleDaemonConnection(secondWs as never, makeDb('valid-hash'), {} as never);
-      secondWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await vi.advanceTimersByTimeAsync(0);
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
-      await flushAsync();
-
-      expect(secondWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
-
-      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
-
-      const thirdWs = new MockWs();
-      bridge.handleDaemonConnection(thirdWs as never, makeDb('valid-hash'), {} as never);
-      thirdWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
-      await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
-      await flushAsync();
-
-      expect(thirdWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+      expect(reconnectWs.sentStrings.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE)).toEqual([{
+        type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+        upgradeId: manual.upgradeId,
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      }]);
     });
 
-    it('does not send a stale scheduled daemon.upgrade after the daemon socket is replaced', async () => {
+    it('acks an old-target install failure as obsolete without blocking the new target', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3193-dev.3594';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-for-old-target',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: '2026.7.3192-dev.3593',
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS);
+      await flushAsync();
+
+      // The failure belonged to an older target: it is acked as obsolete and the
+      // NEW target is still offered (a failure only ever blocks its own target).
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+      expect(ws.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-for-old-target'
+          && message.disposition === 'obsolete';
+      })).toBe(true);
+    });
+
+    it('sends a deferred daemon.upgrade only to the replacement socket and ignores stale frames', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -533,6 +2805,10 @@ describe('WsBridge', () => {
       bridge.handleDaemonConnection(staleWs as never, makeDb('valid-hash'), {} as never);
       staleWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
       await flushAsync();
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+      staleWs.emit('close');
+      const manual = bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'manual' });
+      expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
 
       const replacementWs = new MockWs();
       bridge.handleDaemonConnection(replacementWs as never, makeDb('valid-hash'), {} as never);
@@ -542,7 +2818,385 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(staleWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      const rawBrowser = new MockWs();
+      bridge.handleBrowserConnection(rawBrowser as never, 'raw-user', makeDb('valid-hash'));
+      rawBrowser.emit('message', JSON.stringify({
+        type: 'terminal.subscribe',
+        session: 'deck_stale_socket_binary',
+        raw: true,
+      }));
+      await flushAsync();
+      rawBrowser.sent.length = 0;
+
+      // ws can emit already-buffered frames while the replaced socket is still
+      // CLOSING. Neither binary data nor a terminal blocker from generation 1
+      // may borrow generation 2's authenticated bridge state.
+      staleWs.emit('message', packFrame('deck_stale_socket_binary', Buffer.from('stale')), true);
+      staleWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-from-replaced-socket',
+        fromVersion: '2026.4.904-dev.100',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect.soft(rawBrowser.sent.filter((item) => Buffer.isBuffer(item))).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000 + 1);
+      const nextAuto = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'auto',
+      });
+      expect.soft(nextAuto.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    });
+
+    it('tells a cancel-capable daemon to drop the reply when an HTTP history request times out', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [TIMELINE_HISTORY_CANCEL_CAPABILITY],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_slow_uplink', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        const outbound = daemonWs.sentStrings.find((raw) => raw.includes(`"type":"${TIMELINE_MESSAGES.HISTORY_REQUEST}"`));
+        const requestId = JSON.parse(outbound!).requestId as string;
+
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        const cancels = daemonWs.sentStrings
+          .map((raw) => { try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; } })
+          .filter((msg) => msg?.type === TIMELINE_MESSAGES.HISTORY_CANCEL);
+        expect(cancels).toEqual([{ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never sends a history cancel to a daemon that does not advertise support', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_old_daemon', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        expect(daemonWs.sentStrings.some((raw) => raw.includes(TIMELINE_MESSAGES.HISTORY_CANCEL))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('tracks each session\'s identity project key exactly as the daemon derives it', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_repo_brain', project: 'repo', state: 'idle', contextNamespace: { projectId: 'github-org/repo' } },
+          { name: 'deck_plain_brain', project: 'plain', state: 'idle' },
+        ],
+      }));
+      await flushAsync();
+      expect(bridge.resolveSessionIdentityProjectKey('deck_repo_brain')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_plain_brain')).toBe('plain');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_unknown_brain')).toBeNull();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid1', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/repo',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid2', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/other',
+        contextNamespace: { projectId: 'github-org/other' },
+      }));
+      await flushAsync();
+      // Without its own namespace a sub-session shares its parent's project.
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid1')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid2')).toBe('github-org/other');
+    });
+
+    it('does not let an error from a replaced socket reject current-generation requests', async () => {
+      const bridge = WsBridge.get(serverId);
+      const staleWs = new MockWs();
+      bridge.handleDaemonConnection(staleWs as never, makeDb('valid-hash'), {} as never);
+      staleWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, makeDb('valid-hash'), {} as never);
+      replacementWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      const pending = bridge.requestTimelineHistory({
+        sessionName: 'deck_replacement_request',
+        timeoutMs: 10_000,
+      });
+      const outbound = replacementWs.sentStrings.find((raw) => raw.includes('"type":"timeline.history_request"'));
+      expect(outbound).toBeTruthy();
+      const requestId = JSON.parse(outbound!).requestId as string;
+      let settled = false;
+      const observed = pending.then(
+        (value) => {
+          settled = true;
+          return { status: 'resolved' as const, value };
+        },
+        (error: unknown) => {
+          settled = true;
+          return { status: 'rejected' as const, error };
+        },
+      );
+
+      staleWs.emit('error', new Error('stale socket error'));
+      await flushAsync();
+      expect(settled).toBe(false);
+
+      replacementWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_replacement_request',
+        requestId,
+        events: [],
+        epoch: 1,
+      }));
+      await expect(observed).resolves.toMatchObject({
+        status: 'resolved',
+        value: {
+          type: 'timeline.history',
+          requestId,
+          epoch: 1,
+        },
+      });
+    });
+
+    it('does not let a stale in-flight auth certify or dispatch through its replacement connection', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      type AuthRow = {
+        token_hash: string;
+        owner_status?: string;
+        node_role: 'full';
+        revoked_at: null;
+      };
+      const makeDeferredAuthDb = () => {
+        let resolveQuery!: (value: AuthRow) => void;
+        const queryPromise = new Promise<AuthRow>((resolve) => {
+          resolveQuery = resolve;
+        });
+        const db = {
+          queryOne: () => queryPromise,
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) =>
+            fn(db as unknown as import('../src/db/client.js').Database),
+          close: () => {},
+        } as unknown as import('../src/db/client.js').Database;
+        return { db, resolveQuery };
+      };
+
+      const bridge = WsBridge.get(serverId);
+      const manual = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      });
+      expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+
+      const firstAuth = makeDeferredAuthDb();
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, firstAuth.db, {} as never);
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      const replacementAuth = makeDeferredAuthDb();
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, replacementAuth.db, {} as never);
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      // Finish generation 1 after generation 2 has installed its own socket
+      // and auth promise. The stale continuation must not authenticate gen 2,
+      // clear its promise, or rewrite its blocker-sync generation.
+      firstAuth.resolveQuery({
+        token_hash: 'valid-hash', owner_status: 'active',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(false);
       expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      // Generation 2 may authenticate, but remains unable to dispatch the
+      // pending manual upgrade until its own persisted-blocker sync arrives.
+      replacementAuth.resolveQuery({
+        token_hash: 'valid-hash', owner_status: 'active',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushAsync();
+      expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      replacementWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+
+      const upgrades = replacementWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE);
+      expect(upgrades).toEqual([{
+        type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+        upgradeId: manual.upgradeId,
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      }]);
+      expect(firstWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+    });
+
+    it('does not replay an inflight command through a replacement while stale auth revalidation settles', async () => {
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_stale_auth_replay_brain' } as const;
+      const liveCoverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-stale-auth-replay'],
+        primaryShareId: 'share-stale-auth-replay',
+        authorizedAt: Date.now(),
+      } as const;
+      bridge.setShareCoverageResolverForTests(async () => liveCoverage);
+      const sharedBrowser = new MockWs();
+      bridge.handleShareBrowserConnection(sharedBrowser as never, 'shared-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-stale-auth-replay',
+        target,
+        snapshot: liveCoverage,
+      });
+      sharedBrowser.emit('message', JSON.stringify({
+        type: 'session.send',
+        commandId: 'stale-auth-replay-command',
+        sessionName: target.sessionName,
+        text: 'must reach only the authenticated replacement',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      let resolveCoverage!: (value: typeof liveCoverage) => void;
+      const coveragePending = new Promise<typeof liveCoverage>((resolve) => {
+        resolveCoverage = resolve;
+      });
+      bridge.setShareCoverageResolverForTests(async () => coveragePending);
+
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+      }));
+      await flushAsync();
+
+      let resolveReplacementAuth!: (value: {
+        token_hash: string;
+        owner_status?: string;
+        node_role: 'full';
+        revoked_at: null;
+      }) => void;
+      const replacementQuery = new Promise<{
+        token_hash: string;
+        owner_status?: string;
+        node_role: 'full';
+        revoked_at: null;
+      }>((resolve) => {
+        resolveReplacementAuth = resolve;
+      });
+      const replacementDb = {
+        queryOne: () => replacementQuery,
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) =>
+          fn(replacementDb as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, replacementDb, {} as never);
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+      }));
+      await flushAsync();
+
+      // Let generation 1's share revalidation finish after generation 2 owns
+      // the bridge. Its auth flow must leave the entry buffered, not send it
+      // through generation 2 before that socket authenticates.
+      resolveCoverage(liveCoverage);
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(false);
+      expect(replacementWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(0);
+
+      resolveReplacementAuth({
+        token_hash: 'valid-hash', owner_status: 'active',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(replacementWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(1);
+      expect(firstWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(0);
     });
   });
 
@@ -569,6 +3223,33 @@ describe('WsBridge', () => {
       daemonWs.emit('message', JSON.stringify({ type: 'terminal_update', diff: { sessionName: 'sess-tu', a: 1 } }));
       await flushAsync();
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('terminal.diff');
+    });
+
+    it('routes a daemon terminal.stream_reset only to browsers subscribed to that session', async () => {
+      // A daemon-originated reset (raw_buffer_overflow) previously fell through
+      // to the default-allow broadcast, so every connected tab reset a terminal
+      // it never subscribed to and that never congested.
+      const { bridge, daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const otherWs = new MockWs();
+      bridge.handleBrowserConnection(otherWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-congested' }));
+      otherWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-quiet' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      otherWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal.stream_reset', session: 'sess-congested', reason: 'raw_buffer_overflow',
+      }));
+      await flushAsync();
+
+      const resets = (ws: typeof browserWs) => ws.sentStrings
+        .filter((x) => x.includes('"terminal.stream_reset"'));
+      expect(resets(browserWs).length, 'the subscribed tab must receive the reset').toBe(1);
+      expect(
+        resets(otherWs).length,
+        'a tab subscribed to a different session must not be reset',
+      ).toBe(0);
     });
 
     it('relays additive p2p.run_update payload fields without stripping legacy fields', async () => {
@@ -606,6 +3287,141 @@ describe('WsBridge', () => {
       expect(update.run.run_phase).toBe('round_execution');
       expect(update.run.hop_states).toHaveLength(2);
       expect(update.run.hop_counts.completed).toBe(1);
+    });
+
+    it('relays daemon disk capacity stats to desktop browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const disks = [
+        {
+          mount: '/',
+          totalBytes: 500 * 1024 ** 3,
+          usedBytes: 225 * 1024 ** 3,
+          usedPercent: 45,
+        },
+      ];
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        daemonVersion: '1.2.3',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        disks,
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toMatchObject({ type: 'daemon.stats', disks });
+    });
+
+    it('omits malformed daemon disk stats instead of forwarding a non-array value', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        disks: 'not-an-array',
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toBeDefined();
+      expect(stats).not.toHaveProperty('disks');
+    });
+
+    it('relays daemon embedding status to browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const embedding = { state: 'ready', reason: null };
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding,
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toMatchObject({ type: 'daemon.stats', embedding });
+    });
+
+    it('drops malformed daemon embedding status instead of forwarding junk', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding: { state: 'ready', reason: 42 },
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toBeDefined();
+      expect(stats).not.toHaveProperty('embedding');
+    });
+
+    it('relays validated direct-connectivity runtime diagnostics and drops malformed values', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'available', targetIp: '192.168.2.145' },
+      }));
+      await flushAsync();
+
+      const rows = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .filter((message) => message.type === 'daemon.stats');
+      expect(rows.at(-2)).toMatchObject({
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      });
+      expect(rows.at(-1)).not.toHaveProperty('directConnectivity');
     });
 
     it('translates session_event → session.event', async () => {
@@ -656,10 +3472,105 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.some((s) => s.includes('terminal.subscribe'))).toBe(true);
     });
 
+    it('forwards installs on the daemon\'s own computer, and only from its owner', async () => {
+      // The remote-desktop router used to answer these `invalid_request`, so the
+      // install buttons never reached the daemon. The controlled-node install
+      // runs as root there; someone the daemon is shared with must not be able
+      // to enrol a node on it to their own account.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const participant = new MockWs();
+      bridge.handleBrowserConnection(participant as never, 'participant-user', db);
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const requests = [
+        JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: 'ABCDEFGHJKMN' }),
+        JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }),
+      ];
+      const forwarded = () => daemonWs.sentStrings.filter((s) => (
+        s.includes(REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) || s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST)
+      ));
+
+      for (const request of requests) participant.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual([]);
+
+      for (const request of requests) owner.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual(requests);
+      expect(owner.sentStrings.some((s) => s.includes('invalid_request'))).toBe(false);
+    });
+
+    it('relays the daemon\'s install progress to its browsers', async () => {
+      // The router dropped these as malformed signalling, so a browser never
+      // learned how an install it asked for went.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const reports = [
+        { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'failed', error: 'admin_required' },
+        { type: REMOTE_DESKTOP_INSTALL_MSG.STATE, state: 'downloading' },
+      ];
+      for (const report of reports) daemonWs.emit('message', JSON.stringify(report));
+      daemonWs.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'made_up' }));
+      await flushAsync();
+      const relayed = owner.sentStrings
+        .map((frame) => JSON.parse(frame) as { type?: string })
+        .filter((frame) => frame.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE
+          || frame.type === REMOTE_DESKTOP_INSTALL_MSG.STATE);
+      expect(relayed).toEqual(reports);
+    });
+
+    it('never queues an install for a daemon that is not connected', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      daemonWs.close();
+      await flushAsync();
+
+      owner.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+      await flushAsync();
+      const reconnected = new MockWs();
+      bridge.handleDaemonConnection(reconnected as never, db, {} as never);
+      reconnected.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(reconnected.sentStrings.some((s) => s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST))).toBe(false);
+    });
+
     it('forwards any valid message type to daemon (no whitelist)', async () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
       expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
+    });
+
+    it('rejects browser-origin legacy transport queue evidence instead of forwarding or offline replaying it', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.state',
+        sessionName: 'deck_test_brain',
+        pendingMessages: ['legacy text'],
+        transportPendingMessages: ['legacy text'],
+        pendingCount: 1,
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings).toHaveLength(0);
     });
 
     it('authorizes repo.checkout_branch against the browser user session/project binding before forwarding', async () => {
@@ -797,6 +3708,18 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r2'))).toBe(true);
     });
 
+    it('never lets a browser run the skills CLI on the machine directly', async () => {
+      // Only the owner-checked /api/agent-skills route may send these.
+      const { daemonWs, browserWs } = await setupBridge();
+      for (const type of [AGENT_SKILLS_MSG.RUN_REQUEST, AGENT_SKILLS_MSG.LIST_REQUEST, AGENT_MCP_MSG.RUN_REQUEST, AGENT_MCP_MSG.LIST_REQUEST]) {
+        browserWs.emit('message', JSON.stringify({ type, requestId: 'r3', action: 'add', source: 'owner/repo' }));
+      }
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes(AGENT_SKILLS_MESSAGE_PREFIX) || s.includes(AGENT_MCP_MESSAGE_PREFIX))).toBe(false);
+      expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r3'))).toBe(true);
+    });
+
     it('drops oversized payload', async () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT + 1) }));
@@ -851,6 +3774,55 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.some((s) => s.includes('get_sessions'))).toBe(true);
     });
 
+    it('rejects offline peer-audit RPCs immediately and never replays them after reconnect', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START,
+        commandId: 'peer_cmd_offline_1234567890',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: PEER_AUDIT_MESSAGES.QUICK_RESULT,
+        commandId: 'peer_cmd_offline_1234567890',
+        ok: false,
+        error: PEER_AUDIT_COMMAND_ERRORS.DAEMON_UNAVAILABLE,
+      });
+
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((value) => value.includes('peer_cmd_offline_1234567890'))).toBe(false);
+    });
+
+    it('forwards live peer-audit RPCs directly without the generic replay queue', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES,
+        commandId: 'peer_cmd_live_1234567890',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES,
+        commandId: 'peer_cmd_live_1234567890',
+      });
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
     it('keeps offline daemon.upgrade out of the ordinary queue and flushes it once on auth', async () => {
       const bridge = WsBridge.get(serverId);
 
@@ -860,7 +3832,7 @@ describe('WsBridge', () => {
       const daemonWs = new MockWs();
       bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
       daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
-      await flushAsync();
+      await flushOneBridgeDataPlaneTurn();
 
       const upgradeMessages = daemonWs.sentStrings.filter((s) => s.includes('"type":"daemon.upgrade"'));
       expect(upgradeMessages).toHaveLength(1);
@@ -878,6 +3850,217 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(daemonWs.sentStrings.some((s) => s.includes('daemon.upgrade'))).toBe(false);
+    });
+
+    it('drops MACHINE_EXEC sent via generic sendToDaemon even when the daemon is connected (no bypass of trySendMachineExec)', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      // Generic path must NEVER carry a one-shot exec — connected or not.
+      bridge.sendToDaemon(JSON.stringify({ type: 'machine.exec', correlationId: 'c1', command: 'id' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes('machine.exec'))).toBe(false);
+
+      // The generation-bound send DOES deliver it on the current generation…
+      const gen = bridge.daemonConnectionGeneration();
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c2', command: 'id' }), gen)).toBe('sent');
+      expect(daemonWs.sentStrings.some((s) => s.includes('"correlationId":"c2"'))).toBe(true);
+
+      // …but refuses a stale generation (would be a late cross-generation exec).
+      daemonWs.sent.length = 0;
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c3', command: 'id' }), gen + 1)).toBe('generation_changed');
+      expect(daemonWs.sentStrings.some((s) => s.includes('"correlationId":"c3"'))).toBe(false);
+    });
+
+    it('trySendMachineExec reports offline (never queues) when the daemon is not connected', () => {
+      const bridge = WsBridge.get(serverId);
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c4', command: 'id' }), 0)).toBe('offline');
+    });
+  });
+
+  describe('machine exec result trust boundary', () => {
+    async function setupResultBridge(nodeRole: 'full' | 'controlled') {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash', nodeRole), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(true);
+      return { bridge, daemonWs, generation: bridge.daemonConnectionGeneration() };
+    }
+
+    const validResult = (correlationId: string, overrides: Record<string, unknown> = {}) => ({
+      type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+      correlationId,
+      ok: true,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      durationMs: 1,
+      ...overrides,
+    });
+
+    const validChunk = (correlationId: string, overrides: Record<string, unknown> = {}) => ({
+      type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+      correlationId,
+      seq: 0,
+      stream: 'stdout',
+      chunk: 'hello',
+      ...overrides,
+    });
+
+    it('delivers valid CONTROLLED chunks in order before the terminal result', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const correlationId = 'valid-live-output';
+      const chunks: Array<{ seq: number; stream: string; chunk: string }> = [];
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000, (chunk) => chunks.push(chunk));
+
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { chunk: 'first' })));
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { seq: 1, stream: 'stderr', chunk: 'warn' })));
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, { stdout: 'first', stderr: 'warn' })));
+
+      await expect(pending).resolves.toMatchObject({ ok: true, stdout: 'first', stderr: 'warn' });
+      expect(chunks).toEqual([
+        { seq: 0, stream: 'stdout', chunk: 'first' },
+        { seq: 1, stream: 'stderr', chunk: 'warn' },
+      ]);
+    });
+
+    it('drops malformed and oversized CONTROLLED chunks without settling the pending exec', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const invalidFrames = [
+        validChunk('bad-seq', { seq: -1 }),
+        validChunk('bad-stream', { stream: 'combined' }),
+        validChunk('empty-chunk', { chunk: '' }),
+        validChunk('large-chunk', { chunk: 'x'.repeat(REMOTE_EXEC_MAX_CHUNK_BYTES + 1) }),
+        validChunk('identity-field', { userId: 'forged-user' }),
+      ];
+      const invalidBefore = WsBridge.invalidMachineExecChunksDropped;
+      const controlledBefore = WsBridge.controlledInboundDropped;
+
+      for (const frame of invalidFrames) {
+        const correlationId = frame.correlationId;
+        const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+        daemonWs.emit('message', JSON.stringify(frame));
+        await flushAsync();
+        expect(cancelPendingExec(correlationId)).toBe(true);
+        await expect(pending).resolves.toBeNull();
+      }
+
+      expect(WsBridge.invalidMachineExecChunksDropped - invalidBefore).toBe(invalidFrames.length);
+      expect(WsBridge.controlledInboundDropped - controlledBefore).toBe(invalidFrames.length);
+    });
+
+    it('drops malformed, oversized, and identity-injecting CONTROLLED results before pending resolution', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const invalidFrames = [
+        validResult('bad-types', { ok: 'true' }),
+        validResult('bad-exit-code', { exitCode: 0.5 }),
+        validResult('bad-stdout-type', { stdout: 7 }),
+        validResult('bad-duration', { durationMs: -1 }),
+        validResult('bad-timeout-flag', { timedOut: 'false' }),
+        validResult('large-stdout', { stdout: 'x'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES + 1) }),
+        validResult('large-stderr', { stderr: 'x'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES + 1) }),
+        validResult('large-error', { ok: false, exitCode: null, error: 'x'.repeat(REMOTE_EXEC_MAX_ERROR_BYTES + 1) }),
+        validResult('identity-field', { serverId: 'attacker-selected-target' }),
+      ];
+      const invalidBefore = WsBridge.invalidMachineExecResultsDropped;
+      const controlledBefore = WsBridge.controlledInboundDropped;
+
+      for (const frame of invalidFrames) {
+        const correlationId = frame.correlationId;
+        const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+        const inFlightBefore = machineExecRegistryStats().inFlight;
+        daemonWs.emit('message', JSON.stringify(frame));
+        await flushAsync();
+
+        // Invalid bytes never settle/remove the HTTP pending RPC. Clean it up
+        // explicitly so the test does not leak a minute-long timer.
+        expect(machineExecRegistryStats().inFlight).toBe(inFlightBefore);
+        expect(cancelPendingExec(correlationId)).toBe(true);
+        await expect(pending).resolves.toBeNull();
+      }
+
+      expect(WsBridge.invalidMachineExecResultsDropped - invalidBefore).toBe(invalidFrames.length);
+      expect(WsBridge.controlledInboundDropped - controlledBefore).toBe(invalidFrames.length);
+    });
+
+    it('accepts a valid CONTROLLED result at the exact stdout/stderr byte boundary', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const correlationId = 'valid-byte-boundary';
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, {
+        stdout: 'a'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+        stderr: 'b'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+        truncated: true,
+      })));
+
+      const result = await pending;
+      expect(Buffer.byteLength(result?.stdout ?? '', 'utf8')).toBe(REMOTE_EXEC_MAX_OUTPUT_BYTES);
+      expect(Buffer.byteLength(result?.stderr ?? '', 'utf8')).toBe(REMOTE_EXEC_MAX_OUTPUT_BYTES);
+      expect(result?.truncated).toBe(true);
+    });
+
+    it('applies the same validator to FULL-node compatibility results', async () => {
+      const { daemonWs, generation } = await setupResultBridge('full');
+      const correlationId = 'full-invalid-result';
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+      const invalidBefore = WsBridge.invalidMachineExecResultsDropped;
+
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, { userId: 'forged-user' })));
+      await flushAsync();
+
+      expect(WsBridge.invalidMachineExecResultsDropped).toBe(invalidBefore + 1);
+      expect(cancelPendingExec(correlationId)).toBe(true);
+      await expect(pending).resolves.toBeNull();
+    });
+  });
+
+  // ── PP4: alias value secrecy on the browser→daemon session.send relay ───────
+  //
+  // The browser attaches an out-of-band `resolvedAliases` (alias name → alias
+  // plaintext, i.e. user secrets) map to a session.send. The bridge MUST forward
+  // that payload to the daemon INTACT (agent expansion depends on it) while never
+  // letting an alias value reach a server log/metric/diagnostic.
+  describe('alias resolvedAliases relay secrecy (PP4)', () => {
+    it('forwards resolvedAliases to the daemon intact but never logs the alias value', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      const secretValue = 'ssh secret-host';
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: 'deck_proj_brain',
+        commandId: 'send-1',
+        text: 'deploy now ;;(prod)',
+        resolvedAliases: { prod: secretValue },
+      }));
+      await flushAsync();
+
+      // (a) daemon received the payload with the alias value intact.
+      const forwarded = daemonWs.sentStrings.find((s) => s.includes('"type":"session.send"'));
+      expect(forwarded).toBeDefined();
+      const parsed = JSON.parse(forwarded!) as { resolvedAliases?: Record<string, string> };
+      expect(parsed.resolvedAliases).toEqual({ prod: secretValue });
+
+      // (b) the alias value never appears in ANY server log line.
+      const allLogs = [...logSpy.mock.calls, ...errSpy.mock.calls]
+        .map((call) => String(call[0]))
+        .join('\n');
+      expect(allLogs).not.toContain(secretValue);
     });
   });
 
@@ -1080,7 +4263,7 @@ describe('WsBridge', () => {
       });
       const delayedDb = {
         queryOne: async (sql: string) => {
-          if (sql.includes('FROM servers')) return { token_hash: 'valid-hash' };
+          if (sql.includes('FROM servers')) return { token_hash: 'valid-hash', owner_status: 'active' };
           if (sql.includes('FROM sessions')) return ownershipPending;
           return null;
         },
@@ -1272,6 +4455,198 @@ describe('WsBridge', () => {
       // The huge frame was DROPPED at overflow detection (never sent), but
       // the normal-sized one MUST flow because subscription is still alive.
       expect(binarySent.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('an oversize single frame does not swallow the stream_reset of a LATER real overflow', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      // A browser that never acknowledges: its ws.send callbacks stay pending,
+      // so in-flight bytes accumulate and a real congestion episode can form.
+      const browserWs = new MockWs();
+      browserWs.stallSend = true;
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessNoticeLatch' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      const resetCount = () => browserWs.sentStrings.filter((x) => x.includes('"terminal.stream_reset"')).length;
+
+      // 1. A single frame bigger than the whole budget, with nothing in flight.
+      //    This is not congestion — there is no backlog — so it must not open
+      //    (or consume) an overflow episode.
+      daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(4 * 1024 * 1024 + 100, 0x51)), true);
+      await flushAsync();
+      const afterOversize = resetCount();
+      expect(afterOversize).toBeGreaterThanOrEqual(1);
+
+      // 2. Now build REAL congestion: normal frames the stalled browser never
+      //    acknowledges, until the high-water mark is crossed.
+      for (let i = 0; i < 6; i++) {
+        daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(1024 * 1024, 0x52)), true);
+        await flushAsync();
+      }
+
+      // If the oversize drop had consumed the one-shot notice, nothing would
+      // ever clear it again (that path never pauses), and the browser would be
+      // left with a silent gap it is never told about.
+      expect(resetCount()).toBeGreaterThan(afterOversize);
+    });
+
+    it('a late callback from a forgiven generation cannot hand the socket extra budget', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserWs = new MockWs();
+        browserWs.stallSend = true;
+        bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+        browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessEpoch' }));
+        await vi.advanceTimersByTimeAsync(50);
+        browserWs.sent.length = 0;
+
+        const binaryCount = () => browserWs.sent.filter((x) => Buffer.isBuffer(x)).length;
+
+        // Fill the budget with frames the peer never acknowledges.
+        for (let i = 0; i < 5; i++) {
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x61)), true);
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        const acceptedBeforeGrace = binaryCount();
+
+        // Paused now: further frames are dropped, not sent.
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(512 * 1024, 0x62)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(binaryCount()).toBe(acceptedBeforeGrace);
+
+        // Wait past the grace window so the budget is forgiven once, then let
+        // the OLD, still-unacknowledged callbacks land.
+        await vi.advanceTimersByTimeAsync(2_500);
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024, 0x63)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        const afterForgiveness = binaryCount();
+        expect(afterForgiveness).toBeGreaterThan(acceptedBeforeGrace);
+
+        // The forgiven generation's callbacks arrive late. They refer to bytes
+        // already written off; if they decremented the fresh counter it would go
+        // negative and the socket would silently regain multi-MB of credit.
+        browserWs.drainStalledSends();
+        await vi.advanceTimersByTimeAsync(1);
+
+        // Re-fill: the post-forgiveness budget must be the SAME 4MB, not 4MB
+        // plus whatever the stale callbacks refunded.
+        browserWs.stallSend = true;
+        let accepted = 0;
+        for (let i = 0; i < 12; i++) {
+          const before = binaryCount();
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x64)), true);
+          await vi.advanceTimersByTimeAsync(1);
+          if (binaryCount() > before) accepted += 1;
+        }
+        // 4MB budget / 1MB frames => at most 4 accepted before pausing again.
+        expect(accepted).toBeLessThanOrEqual(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // ── Slow-socket recovery: the resync must be asked for when it CAN be delivered ──
+  //
+  // tsk_f2a967730b. A paused queue drops everything, including the snapshot the
+  // browser requests in reaction to the (single) reset sent when the drop began.
+  // Nothing was ever sent again, so the browser - which discards every byte until
+  // a snapshot arrives - sat on its last picture after the socket had drained.
+
+  describe('backpressure recovery: the browser is told again once frames flow', () => {
+    const resetsOf = (ws: MockWs, session: string) => ws.sentStrings
+      .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+      .filter((m): m is Record<string, unknown> => m?.type === 'terminal.stream_reset' && m.session === session);
+
+    async function congest(session: string) {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      browserWs.stallSend = true;
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      // Fill the 4 MB budget with frames the peer never acknowledges, then drop.
+      for (let i = 0; i < 6; i++) {
+        daemonWs.emit('message', packFrame(session, Buffer.alloc(1024 * 1024, 0x61)), true);
+        await flushAsync();
+      }
+      return { daemonWs, browserWs };
+    }
+
+    it('sends a second stream_reset (backpressure_resume) when the socket drains after drops', async () => {
+      const { browserWs } = await congest('sessResume');
+      expect(resetsOf(browserWs, 'sessResume').map((m) => m.reason)).toEqual(['backpressure']);
+
+      browserWs.drainStalledSends();
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessResume').map((m) => m.reason)).toEqual(['backpressure', 'backpressure_resume']);
+    });
+
+    it('does not repeat the resume notice for later drains, and sends none when nothing was dropped', async () => {
+      const { daemonWs, browserWs } = await congest('sessResumeOnce');
+      browserWs.drainStalledSends();
+      await flushAsync();
+      const afterFirst = resetsOf(browserWs, 'sessResumeOnce').length;
+      // Healthy traffic and further drains: no more resets.
+      browserWs.stallSend = true;
+      daemonWs.emit('message', packFrame('sessResumeOnce', Buffer.alloc(1024, 0x62)), true);
+      await flushAsync();
+      browserWs.drainStalledSends();
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessResumeOnce')).toHaveLength(afterFirst);
+
+      // A socket that never congested never gets one.
+      const { bridge, daemonWs: daemon2 } = await setupAuth();
+      const calm = new MockWs();
+      bridge.handleBrowserConnection(calm as never, 'test-user', makeDb('valid-hash'));
+      calm.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessCalm' }));
+      await flushAsync();
+      for (let i = 0; i < 10; i++) daemon2.emit('message', packFrame('sessCalm', Buffer.alloc(512, 0x63)), true);
+      await flushAsync();
+      expect(resetsOf(calm, 'sessCalm')).toHaveLength(0);
+    });
+
+    it('also notifies when the grace valve forgives a socket that never drained', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserWs = new MockWs();
+        browserWs.stallSend = true;
+        bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+        browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessGrace' }));
+        await vi.advanceTimersByTimeAsync(50);
+        browserWs.sent.length = 0;
+        for (let i = 0; i < 6; i++) {
+          daemonWs.emit('message', packFrame('sessGrace', Buffer.alloc(1024 * 1024, 0x61)), true);
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        expect(resetsOf(browserWs, 'sessGrace').map((m) => m.reason)).toEqual(['backpressure']);
+
+        await vi.advanceTimersByTimeAsync(2_500);
+        daemonWs.emit('message', packFrame('sessGrace', Buffer.alloc(1024, 0x63)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(resetsOf(browserWs, 'sessGrace').map((m) => m.reason)).toEqual(['backpressure', 'backpressure_resume']);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('an oversize single frame with nothing in flight needs no resume (nothing is paused)', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessOversize' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', packFrame('sessOversize', Buffer.alloc(4 * 1024 * 1024 + 100, 0x44)), true);
+      await flushAsync();
+      daemonWs.emit('message', packFrame('sessOversize', Buffer.alloc(64, 0x45)), true);
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessOversize').map((m) => m.reason)).toEqual(['backpressure']);
     });
   });
 
@@ -1642,6 +5017,39 @@ describe('WsBridge', () => {
       })]);
     });
 
+    it('bounds legacy browser bulk-read storms without rate-limiting control commands', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      for (let index = 0; index < 65; index += 1) {
+        browserWs.emit('message', JSON.stringify({
+          type: 'fs.ls',
+          requestId: `bulk-${index}`,
+          path: `/tmp/${index}`,
+        }));
+      }
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send', session: 'sessStorm', text: 'control survives', commandId: 'cmd-survives',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(forwarded.filter((message) => message.type === 'fs.ls')).toHaveLength(64);
+      expect(forwarded).toContainEqual(expect.objectContaining({ type: 'session.send', commandId: 'cmd-survives' }));
+      expect(browserWs.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+        type: 'fs.ls_response',
+        requestId: 'bulk-64',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      expect(getCounter('ws_bridge_browser_data_read_rate_limited', { type: 'fs.ls' })).toBe(1);
+    });
+
     it('rapid replace without auth does not crash or leak', async () => {
       const bridge = WsBridge.get(serverId);
       const browserWs = new MockWs();
@@ -1692,6 +5100,41 @@ describe('WsBridge', () => {
       await flushAsync();
       expect(daemonWs.sentStrings.some((s) => s.includes('ask.answer'))).toBe(true);
     });
+
+    it('tracks an ask.answer that carries a commandId until the daemon acks it', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      const bridge = WsBridge.get(serverId);
+      browserWs.emit('message', JSON.stringify({
+        type: ASK_ANSWER_COMMAND, sessionName: 's', answer: 'yes', commandId: 'ans-1', toolUseId: 'toolu_1',
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes(ASK_ANSWER_COMMAND) && s.includes('ans-1'))).toBe(true);
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'command.ack', commandId: 'ans-1', status: 'accepted', session: 's', delivery: 'in_place',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(0);
+      const acks = browserWs.sent
+        .map((raw) => { try { return JSON.parse(raw as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((msg) => msg?.type === 'command.ack' && msg.commandId === 'ans-1');
+      expect(acks).toEqual([expect.objectContaining({ status: 'accepted', delivery: 'in_place' })]);
+    });
+
+    it('tells the browser at once when an ask.answer cannot reach an offline daemon', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({
+        type: ASK_ANSWER_COMMAND, sessionName: 's', answer: 'yes', commandId: 'ans-offline',
+      }));
+      await flushAsync();
+      const failed = browserWs.sent
+        .map((raw) => { try { return JSON.parse(raw as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((msg) => msg?.type === 'command.failed' && msg.commandId === 'ans-offline');
+      expect(failed).toEqual([expect.objectContaining({ reason: 'daemon_offline' })]);
+    });
   });
 
   // ── P0: session-scoped privacy routing ────────────────────────────────────
@@ -1728,6 +5171,51 @@ describe('WsBridge', () => {
       [TIMELINE_MESSAGES.HISTORY, { type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
       [TIMELINE_MESSAGES.REPLAY, { type: TIMELINE_MESSAGES.REPLAY, sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
       [TIMELINE_MESSAGES.EVENT, { type: TIMELINE_MESSAGES.EVENT, event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
+      ['transport.queue.snapshot', {
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-1',
+          text: 'line one\nline two',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        failedMessageEntries: [],
+        source: 'server-test',
+      }, 'session-a'],
+      ['transport.queue.delivery', {
+        type: 'transport.queue.delivery',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 2,
+        clientMessageId: 'msg-1',
+        deliveryFrameId: 'frame-1',
+        deliveryFrameVersion: 2,
+      }, 'session-a'],
+      ['transport.queue.failure', {
+        type: 'transport.queue.failure',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 3,
+        clientMessageId: 'msg-2',
+        dropReason: 'user_stopped',
+      }, 'session-a'],
+      ['transport.queue.reset', {
+        type: 'transport.queue.reset',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-2',
+        queueAuthorityId: 'authority-2',
+        pendingMessageVersion: 1,
+        resetReason: 'user_clear',
+      }, 'session-a'],
       ['command.ack', { type: 'command.ack', session: 'session-a', commandId: 'c1', status: 'ok' }, 'session-a'],
       ['subsession.response', { type: 'subsession.response', sessionName: 'session-a', status: 'idle' }, 'session-a'],
       ['session.idle', { type: 'session.idle', session: 'session-a', project: 'p', agentType: 'claude-code' }, 'session-a'],
@@ -1763,6 +5251,54 @@ describe('WsBridge', () => {
 
       expect(browserA.sentStrings.length).toBe(0); // session-a browser must be silent
       expect(browserB.sentStrings.length).toBeGreaterThan(0);
+    });
+
+    it('invalid transport queue wire events are rejected instead of default-broadcast', async () => {
+      const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'server-test',
+        pendingCount: 1,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-1',
+          text: 'safe',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+          messagePreamble: 'private',
+        }],
+        failedMessageEntries: [],
+        source: 'server-test',
+      }));
+      await flushAsync();
+
+      expect(browserA.sentStrings).toHaveLength(0);
+      expect(browserB.sentStrings).toHaveLength(0);
+    });
+
+    it('server bridge remains relay-only and does not import queue SQLite authority', () => {
+      const bridgeSource = readFileSync(new URL('../src/ws/bridge.ts', import.meta.url), 'utf8');
+
+      expect(bridgeSource).not.toContain('transport-queue-store');
+      expect(bridgeSource).not.toContain('transport-queue-projection');
+      expect(bridgeSource).not.toContain('node:sqlite');
+      expect(bridgeSource).not.toContain('transport-queue.sqlite');
     });
 
     it('session_event (lifecycle) is broadcast to all browsers', async () => {
@@ -2171,9 +5707,41 @@ describe('WsBridge', () => {
         activeModel: 'sonnet',
         effort: 'high',
         transportConfig: { provider: { mode: 'safe' } },
+        queueSnapshot: {
+          type: 'transport.queue.snapshot',
+          sessionName: 'deck_sub_sub-123',
+          queueEpoch: 'epoch-sub',
+          queueAuthorityId: 'authority-sub',
+          pendingMessageVersion: 7,
+          pendingMessageEntries: [{
+            clientMessageId: 'msg-sub',
+            text: 'queued',
+            status: 'queued',
+            placement: 'normal',
+            ordinal: 0,
+            createdAt: 100,
+            updatedAt: 100,
+          }],
+          failedMessageEntries: [],
+          source: 'subsession_sync',
+        },
+        queueEpoch: 'epoch-sub',
+        queueAuthorityId: 'authority-sub',
+        pendingMessageVersion: 7,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-sub',
+          text: 'queued',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        failedMessageEntries: [],
         transportPendingMessages: [],
         transportPendingMessageEntries: [],
         transportPendingMessageVersion: 7,
+        pendingCount: 1,
       }));
       await flushAsync();
 
@@ -2191,9 +5759,22 @@ describe('WsBridge', () => {
       expect(msg.activeModel).toBe('sonnet');
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
-      expect(msg.transportPendingMessages).toEqual([]);
-      expect(msg.transportPendingMessageEntries).toEqual([]);
-      expect(msg.transportPendingMessageVersion).toBe(7);
+      expect(msg.queueSnapshot).toMatchObject({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_sub_sub-123',
+        queueEpoch: 'epoch-sub',
+        queueAuthorityId: 'authority-sub',
+        pendingMessageVersion: 7,
+      });
+      expect(msg.queueEpoch).toBe('epoch-sub');
+      expect(msg.queueAuthorityId).toBe('authority-sub');
+      expect(msg.pendingMessageVersion).toBe(7);
+      expect(msg.pendingMessageEntries).toEqual([expect.objectContaining({ clientMessageId: 'msg-sub', text: 'queued' })]);
+      expect(msg.failedMessageEntries).toEqual([]);
+      expect(msg.transportPendingMessages).toBeUndefined();
+      expect(msg.transportPendingMessageEntries).toBeUndefined();
+      expect(msg.transportPendingMessageVersion).toBeUndefined();
+      expect(msg.pendingCount).toBeUndefined();
       expect(msg.state).toBe('idle');
     });
 
@@ -2804,6 +6385,138 @@ describe('WsBridge', () => {
         timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
         helloEpoch: 1,
         sentAt: 555,
+      });
+    });
+
+    it('R3 v2 PR-σ — also replays cached daemon.hello to a participant who joins a shared session late', async () => {
+      // Same bug as the owner case above (a browser that opens after the
+      // daemon's hello never receives one), but for a participant share
+      // connection: capabilities carries file.transfer.direct.lease.v2,
+      // which a participant's own upload/download and the client's "WebRTC
+      // runtime" diagnostic both gate on. Excluding every share connection
+      // from the replay (meant to withhold owner-only P2P workflow-launch
+      // state) left a participant permanently without a capability
+      // snapshot, direct transfer never attempted, and the diagnostic
+      // panel stuck on "unavailable" -- reported live: "参与者...卡在100%"
+      // and "WebRTC 运行时不可用 完全不恢复".
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_participant_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-participant'],
+        primaryShareId: 'share-late-participant',
+        authorizedAt: Date.now(),
+      } as const;
+      const participant = new MockWs();
+      bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-participant',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      const helloMessages = participant.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(1);
+      expect(helloMessages[0]).toMatchObject({
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY].sort(),
+      });
+    });
+
+    it('still withholds the replay from a read-only viewer of a shared session', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_viewer_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'viewer',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-viewer'],
+        primaryShareId: 'share-late-viewer',
+        authorizedAt: Date.now(),
+      } as const;
+      const viewer = new MockWs();
+      bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-viewer',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      expect(viewer.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.DAEMON_HELLO)).toBe(false);
+    });
+
+    it('accepts a replacement daemon process whose hello epoch restarts while the old socket closes asynchronously', async () => {
+      const bridge = WsBridge.get(serverId);
+      const firstDaemon = new MockWs();
+      bridge.handleDaemonConnection(firstDaemon as never, makeDb('valid-hash'), {} as never);
+      firstDaemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      firstDaemon.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['old-capability'],
+        helloEpoch: 9,
+        sentAt: 900,
+      }));
+      await flushAsync();
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.helloEpoch).toBe(9);
+
+      // Production ws.close() is asynchronous.  Pin the replacement window in
+      // which the old identity-guarded close handler cannot clear bridge state.
+      vi.spyOn(firstDaemon, 'close').mockImplementation(() => {
+        firstDaemon.closed = true;
+        firstDaemon.readyState = 3;
+      });
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(replacement as never, makeDb('valid-hash'), {} as never);
+      replacement.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      replacement.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
+      }));
+      await flushAsync();
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()).toMatchObject({
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
       });
     });
 
@@ -3523,7 +7236,7 @@ describe('WsBridge', () => {
     function makePushDb(tokenHash: string) {
       return {
         queryOne: async (sql: string, params?: unknown[]) => {
-          if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
+          if (sql.includes('FROM servers')) return { token_hash: tokenHash, owner_status: 'active', user_id: 'user-1', name: 'my-server' };
           if (sql.includes('FROM sessions') && params?.[1] === 'deck_cd_brain') {
             return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
           }
@@ -3952,6 +7665,66 @@ describe('WsBridge', () => {
       expect(payload.body).toContain('ready for input');
     });
 
+    it('does not send ordinary session.notification events to mobile push', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.notification', session: 'deck_cd_brain', message: 'streaming chunk',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('deduplicates timeline and hook idle events for one assistant completion', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain', eventId: 'assistant-final-1', ts: Date.now(),
+          type: 'assistant.text', payload: { text: 'Completed once.', streaming: false },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain', eventId: 'idle-timeline-1', ts: Date.now(),
+          type: 'session.state', payload: { state: 'idle' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Completed once.',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(dispatchPush).mock.calls[0][0].body).toBe('Completed once.');
+    });
+
+    it('allows identical text from distinct assistant event ids in different turns', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      for (const [eventId, ts] of [['assistant-turn-1', 1], ['assistant-turn-2', 2]] as const) {
+        daemonWs.emit('message', JSON.stringify({
+          type: 'timeline.event',
+          event: {
+            sessionId: 'deck_cd_brain', eventId, ts,
+            type: 'assistant.text', payload: { text: 'No changes needed.', streaming: false },
+          },
+        }));
+        daemonWs.emit('message', JSON.stringify({
+          type: 'session.idle', session: 'deck_cd_brain', lastText: 'No changes needed.',
+        }));
+        await flushAsync();
+      }
+
+      expect(dispatchPush).toHaveBeenCalledTimes(2);
+    });
+
     it('suppresses push when a mobile client is connected', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { bridge, daemonWs } = await setupPushBridge();
@@ -4176,6 +7949,60 @@ describe('WsBridge', () => {
         .filter((msg) => msg.type === 'timeline.event');
       expect(timelineEvents).toHaveLength(1);
       expect(timelineEvents[0].event.payload.text).toBe('live repair works');
+    });
+
+    it('streams the same assistant timeline updates to mobile and desktop even if only mobile has subscribed', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const desktop = new MockWs();
+      const mobile = new MockWs();
+      bridge.handleBrowserConnection(desktop as never, 'same-user', db, false);
+      bridge.handleBrowserConnection(mobile as never, 'same-user', db, true);
+      mobile.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'multi-device-stream',
+        forceHistory: false,
+      }));
+      await flushAsync();
+      desktop.sent.length = 0;
+      mobile.sent.length = 0;
+
+      for (const [seq, text, streaming] of [
+        [1, 'one', true],
+        [2, 'one two', true],
+        [3, 'one two three', false],
+      ] as const) {
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.EVENT,
+          event: {
+            eventId: 'transport:multi-device-stream:message-1',
+            sessionId: 'multi-device-stream',
+            ts: 1_000,
+            seq,
+            epoch: 1,
+            type: 'assistant.text',
+            payload: { text, streaming },
+          },
+        }));
+      }
+      await flushAsync();
+
+      for (const browser of [mobile, desktop]) {
+        const updates = browser.sentStrings
+          .map((raw) => JSON.parse(raw))
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+          .map((msg) => msg.event.payload);
+        expect(updates).toEqual([
+          { text: 'one', streaming: true },
+          { text: 'one two', streaming: true },
+          { text: 'one two three', streaming: false },
+        ]);
+      }
     });
 
     it('retries live transport subscription ownership for newly created sub-sessions', async () => {
@@ -4693,7 +8520,7 @@ describe('WsBridge', () => {
     it('updates the exact execution row when executionId is provided', async () => {
       const execSpy = vi.fn(async () => ({ changes: 1 }));
       const db = {
-        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active' }),
         query: async () => [],
         execute: execSpy,
         exec: async () => {},
@@ -4716,8 +8543,38 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(execSpy).toHaveBeenCalledWith(
-        'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3',
-        ['busy', 'skipped_busy', 'exec-1'],
+        'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $4 AND job_id = $5 AND job_id IN (SELECT id FROM cron_jobs WHERE server_id = $3)',
+        ['busy', 'skipped_busy', serverId, 'exec-1', 'job-1'],
+      );
+    });
+
+    it('collapses cumulative streaming snapshots sent by an older daemon before persistence', async () => {
+      const execSpy = vi.fn(async () => ({ changes: 1 }));
+      const db = {
+        queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active' }),
+        query: async () => [],
+        execute: execSpy,
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'cron.command_result',
+        jobId: 'job-stream',
+        executionId: 'exec-stream',
+        detail: ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'].join('\n'),
+      }));
+      await flushAsync();
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'UPDATE cron_executions SET detail = $1 WHERE id = $3 AND job_id = $4 AND job_id IN (SELECT id FROM cron_jobs WHERE server_id = $2)',
+        ['主人开始今日任务执行并检查结果完成。', serverId, 'exec-stream', 'job-stream'],
       );
     });
   });
@@ -4910,6 +8767,80 @@ describe('WsBridge', () => {
           .filter((msg) => msg.type === responseType && msg.requestId === requestId);
         expect(received).toHaveLength(1);
       }
+    });
+
+    it('deduplicates identical in-flight history requests across browser sockets', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      const request = (requestId: string) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId,
+        limit: 200,
+        budgetBytes: TIMELINE_HISTORY_LIMITS.MAX_BYTES,
+        cursor: { epoch: 2, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 10_000 },
+      });
+      browserA.emit('message', JSON.stringify(request('dedup-a')));
+      browserB.emit('message', JSON.stringify(request('dedup-b')));
+      await flushAsync();
+      const outbound = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      expect(outbound).toHaveLength(1);
+      expect(outbound[0]?.requestId).toBe('dedup-a');
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'dedup-a',
+        events: [{ eventId: 'dedup-e1', sessionId: 'deck_sub_qwen', ts: 1, type: 'assistant.text', payload: { text: 'ok' } }],
+        epoch: 2,
+        actualPayloadBytes: 512,
+      }));
+      await flushBridgeDataPlane();
+      for (const [socket, requestId] of [[browserA, 'dedup-a'], [browserB, 'dedup-b']] as const) {
+        const responses = socket.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(responses).toHaveLength(1);
+        expect(responses[0]?.requestId).toBe(requestId);
+      }
+    });
+
+    it('relays contentFilter to the daemon and never merges a text-only window with an unfiltered one', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      const request = (requestId: string, contentFilter?: string) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId,
+        limit: 30,
+        ...(contentFilter ? { contentFilter } : {}),
+      });
+      browserA.emit('message', JSON.stringify(request('peek-a', 'text')));
+      browserB.emit('message', JSON.stringify(request('window-b')));
+      await flushAsync();
+      const outbound = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      // Same session/limit/bounds, different content: two daemon reads, and the filter reached the daemon.
+      expect(outbound).toHaveLength(2);
+      expect(outbound.find((msg) => msg.requestId === 'peek-a')?.contentFilter).toBe('text');
+      expect(outbound.find((msg) => msg.requestId === 'window-b')?.contentFilter).toBeUndefined();
+
+      // Identical peeks (same filter and bounds) still join the read already in flight instead of adding more.
+      browserA.emit('message', JSON.stringify(request('peek-c', 'text')));
+      browserB.emit('message', JSON.stringify(request('peek-d', 'text')));
+      await flushAsync();
+      const after = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      expect(after).toHaveLength(2);
     });
 
     it('cleans up pending request after 30s timeout', async () => {
@@ -5316,11 +9247,13 @@ describe('WsBridge', () => {
           type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: 'deck_sub_qwen',
           requestId: 'queue-ok',
+          limit: 50,
         }));
         browserQueueFull.emit('message', JSON.stringify({
           type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: 'deck_sub_qwen',
           requestId: 'queue-full',
+          limit: 51,
         }));
         await flushAsync();
 
@@ -5368,6 +9301,69 @@ describe('WsBridge', () => {
           type: TIMELINE_MESSAGES.HISTORY,
           route: 'browser_request',
         })).toBe(1);
+      } finally {
+        resetQueueConfig();
+      }
+    });
+
+    it('rejects queued history by byte budget and releases bytes when a socket closes', async () => {
+      const resetQueueConfig = __setTimelineDataPlaneQueueConfigForTests({
+        queueCap: 10,
+        maxBytes: 100,
+        socketMaxBytes: 100,
+        userMaxBytes: 100,
+      });
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const slowBrowser = new SlowMockWs();
+        const queuedBrowser = new MockWs();
+        bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+        bridge.handleBrowserConnection(queuedBrowser as never, 'other-user', makeDb('valid-hash'));
+        slowBrowser.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-first',
+          limit: 100,
+        }));
+        await flushAsync();
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-first',
+          events: [{ eventId: 'bytes-first-e1', sessionId: 'deck_sub_qwen', ts: 1, type: 'assistant.text', payload: { text: 'hold' } }],
+          epoch: 1,
+          actualPayloadBytes: 80,
+        }));
+        await flushOneBridgeDataPlaneTurn();
+
+        queuedBrowser.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-second',
+          limit: 101,
+        }));
+        await flushAsync();
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-second',
+          events: [{ eventId: 'bytes-second-e1', sessionId: 'deck_sub_qwen', ts: 2, type: 'assistant.text', payload: { text: 'reject' } }],
+          epoch: 1,
+          actualPayloadBytes: 80,
+        }));
+        await flushAsync();
+        expect(queuedBrowser.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)).toContainEqual(expect.objectContaining({
+          requestId: 'bytes-second',
+          status: TIMELINE_RESPONSE_STATUS.ERROR,
+          errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+        }));
+
+        slowBrowser.close();
+        await flushAsync();
+        expect(getCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+        })).toBeGreaterThan(0);
       } finally {
         resetQueueConfig();
       }
@@ -5654,8 +9650,12 @@ describe('WsBridge', () => {
     it('fails open when session_text_tail_cache update throws', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
-      const db = makeDb('valid-hash') as import('../src/db/client.js').Database & { transaction: ReturnType<typeof vi.fn> };
-      db.transaction = vi.fn(async () => { throw new Error('write failed'); }) as never;
+      const db = makeDb('valid-hash') as import('../src/db/client.js').Database & { execute: ReturnType<typeof vi.fn> };
+      const origExecute = db.execute.bind(db);
+      db.execute = vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('session_text_tail_cache')) throw new Error('write failed');
+        return origExecute(sql, params);
+      }) as never;
       const browserWs = new MockWs();
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -5682,6 +9682,220 @@ describe('WsBridge', () => {
 
       expect(browserWs.sentStrings.some((msg) => msg.includes('"type":"timeline.event"'))).toBe(true);
       expect(errorSpy).toHaveBeenCalled();
+    });
+
+    it('wires direct-file signaling through generation-bound daemon and browser unicast routes', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      const db = makeDb('valid-hash');
+      bridge.handleDaemonConnection(daemonWs as never, db, { JWT_SIGNING_KEY: 'test-direct-file-resume-signing-key' } as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES],
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }));
+      await flushAsync();
+      bridge.handleBrowserConnection(browserA as never, 'user-a', db);
+      bridge.handleBrowserConnection(browserB as never, 'user-b', db);
+      browserA.sent.length = 0;
+      browserB.sent.length = 0;
+      daemonWs.sent.length = 0;
+
+      const requestId = '123e4567-e89b-12d3-a456-426614174000';
+      const clientUploadId = '123e4567-e89b-12d3-a456-426614174001';
+      const browserTabId = 'browser-tab-a1';
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId,
+        browserTabId,
+      }));
+      await flushAsync();
+      const leasePrepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE);
+      expect(leasePrepare).toMatchObject({ requestId, serverId, browserTabId });
+      expect(browserA.sentStrings.some((row) => row.includes(DIRECT_FILE_TRANSFER_MSG.LEASE_READY))).toBe(false);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId,
+        browserTabId,
+        leaseId: leasePrepare.leaseId,
+        leaseGeneration: leasePrepare.leaseGeneration,
+        daemonGeneration: leasePrepare.daemonGeneration,
+      }));
+      await flushAsync();
+      const ready = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY);
+      expect(ready).toMatchObject({ requestId, serverId, leaseId: leasePrepare.leaseId });
+
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId: '123e4567-e89b-12d3-a456-426614174003',
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        sdp: 'browser-offer',
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((row) => row.includes('browser-offer'))).toBe(true);
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId: '123e4567-e89b-12d3-a456-426614174004',
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        sdp: 'daemon-answer',
+      }));
+      await flushAsync();
+      expect(browserA.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(true);
+      expect(browserB.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(false);
+
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        requestId: '123e4567-e89b-12d3-a456-426614174005',
+        attemptId: '123e4567-e89b-12d3-a456-426614174006',
+        attempt: 1,
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        operationId: clientUploadId,
+        clientUploadId,
+        filename: 'large.bin',
+        size: 5 * 1024 * 1024 * 1024,
+      }));
+      await flushAsync();
+      const prepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.PREPARE);
+      const authorized = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED);
+      expect(prepare).toMatchObject({ clientUploadId, size: 5 * 1024 * 1024 * 1024 });
+      expect(authorized).toMatchObject({ clientUploadId });
+    });
+  });
+
+  describe('browser ping/pong correlation & safeSend', () => {
+    it('echoes valid ping id, preserves legacy plain pong when omitted, and ignores closed socket safely', async () => {
+      const bridge = new WsBridge('srv-ping-test');
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never);
+
+      browserWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping', id: 7 })));
+      browserWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping', id: 'probe-1' })));
+      browserWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping' })));
+      await flushAsync();
+
+      const pongs = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === 'pong');
+      expect(pongs).toEqual([
+        { type: 'pong', id: 7 },
+        { type: 'pong', id: 'probe-1' },
+        { type: 'pong' },
+      ]);
+
+      // Closing the socket must not throw on a subsequent ping.
+      browserWs.readyState = 3; // CLOSED
+      expect(() => {
+        browserWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping', id: 8 })));
+      }).not.toThrow();
+    });
+  });
+
+  describe('shared-context runtime config queue replay & capability negotiation', () => {
+    it('adapts offline-queued and online APPLY frames per reconnecting daemon generation capabilities', async () => {
+      const canonicalConfig = normalizeSharedContextRuntimeConfig({
+        primaryContextBackend: 'opencode-sdk',
+        primaryContextModel: 'anthropic/claude-sonnet-4-6',
+        backupContextBackend: 'agy-sdk',
+        backupContextModel: 'gemini-3.8-flash-low',
+        enablePersonalMemorySync: true,
+      });
+      const applyFrame = JSON.stringify({
+        type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
+        config: canonicalConfig,
+      });
+
+      // 1) Offline enqueue -> upgraded daemon connects with capability advertisement:
+      // replay preserves canonical opencode-sdk/agy-sdk instead of overwriting startup HTTP pull with Luna.
+      const bridge = WsBridge.get('srv-runtime-replay-new');
+      bridge.sendToDaemon(applyFrame);
+
+      const newDaemonWs = new MockWs();
+      bridge.handleDaemonConnection(newDaemonWs as never, makeDb('valid-hash'), { JWT_SIGNING_KEY: 'test-runtime-replay-key' } as never);
+      newDaemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId: 'srv-runtime-replay-new',
+        token: 't',
+        [SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.AUTH_BACKENDS_FIELD]: [...SHARED_CONTEXT_RUNTIME_BACKENDS],
+      }));
+      await flushAsync();
+
+      const newReplayFrames = newDaemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as { type?: string; config?: Record<string, unknown> })
+        .filter((msg) => msg.type === SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY);
+      expect(newReplayFrames).toHaveLength(1);
+      expect(newReplayFrames[0].config).toMatchObject({
+        primaryContextBackend: 'opencode-sdk',
+        primaryContextModel: 'anthropic/claude-sonnet-4-6',
+        backupContextBackend: 'agy-sdk',
+        backupContextModel: 'gemini-3.8-flash-low',
+      });
+
+      // Disconnect upgraded daemon, enqueue offline again, and reconnect a legacy daemon without capability field:
+      // bridge must reset generation capability and adapt both replay and online APPLY to codex-sdk gpt-6-luna.
+      newDaemonWs.close();
+      await flushAsync();
+      bridge.sendToDaemon(applyFrame);
+
+      const legacyDaemonWs = new MockWs();
+      bridge.handleDaemonConnection(legacyDaemonWs as never, makeDb('valid-hash'), { JWT_SIGNING_KEY: 'test-runtime-replay-key' } as never);
+      legacyDaemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId: 'srv-runtime-replay-new',
+        token: 't',
+      }));
+      await flushAsync();
+
+      const legacyReplayFrames = legacyDaemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as { type?: string; config?: Record<string, unknown> })
+        .filter((msg) => msg.type === SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY);
+      expect(legacyReplayFrames).toHaveLength(1);
+      expect(legacyReplayFrames[0].config).toMatchObject({
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-6-luna',
+      });
+
+      // Online send on legacy socket also adapts to codex-sdk gpt-6-luna.
+      legacyDaemonWs.sent.length = 0;
+      bridge.sendToDaemon(applyFrame);
+      const legacyOnlineFrames = legacyDaemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as { type?: string; config?: Record<string, unknown> })
+        .filter((msg) => msg.type === SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY);
+      expect(legacyOnlineFrames).toHaveLength(1);
+      expect(legacyOnlineFrames[0].config).toMatchObject({
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-6-luna',
+      });
     });
   });
 });

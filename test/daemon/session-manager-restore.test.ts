@@ -12,15 +12,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── All mocks hoisted so factories can reference them ─────────────────────────
 
 const {
-  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
+  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock, reserveSessionFileMock, removeSessionMock,
   isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, updateSessionStateMock,
   discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
-  newSessionMock, timelineEmitMock,
+  newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
+  releaseSessionChildResourcesMock, registerTmuxSessionResourceMock,
+  initializeSessionResourceLifecycleMock,
+  sessionExistsMock, existsSyncMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
   startWatchingFileMock: vi.fn().mockResolvedValue(undefined),
+  reserveSessionFileMock: vi.fn(),
   isWatchingMock: vi.fn().mockReturnValue(false),
   restartSessionMock: vi.fn().mockResolvedValue(undefined),
   getPaneStartCommandMock: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
@@ -31,14 +35,28 @@ const {
   opencodeIsWatchingMock: vi.fn().mockReturnValue(false),
   newSessionMock: vi.fn().mockResolvedValue(undefined),
   timelineEmitMock: vi.fn(),
+  getSessionMock: vi.fn(() => null),
+  respawnPaneMock: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResourcesMock: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
+  initializeSessionResourceLifecycleMock: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
+  sessionExistsMock: vi.fn().mockResolvedValue(true),
+  existsSyncMock: vi.fn(),
+  removeSessionMock: vi.fn(),
+}));
+
+
+vi.mock('node:fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:fs')>()),
+  existsSync: existsSyncMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: storeMock,   // session-manager imports `listSessions as storeSessions`
   upsertSession: upsertSessionMock,
   updateSessionState: updateSessionStateMock,
-  getSession: vi.fn(() => null),
-  removeSession: vi.fn(),
+  getSession: getSessionMock,
+  removeSession: removeSessionMock,
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -46,9 +64,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: tmuxListMock,
   newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),
-  sessionExists: vi.fn().mockResolvedValue(true),
+  sessionExists: sessionExistsMock,
   isPaneAlive: vi.fn().mockResolvedValue(true),
-  respawnPane: vi.fn().mockResolvedValue(undefined),
+  respawnPane: respawnPaneMock,
   capturePane: vi.fn().mockResolvedValue([]),
   sendKey: vi.fn(),
   sendKeys: vi.fn(),
@@ -63,6 +81,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: reserveSessionFileMock,
   startWatching: startWatchingMock,
   startWatchingFile: startWatchingFileMock,
   stopWatching: vi.fn(),
@@ -109,7 +128,18 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
   BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })),
 }));
 
-import { restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: initializeSessionResourceLifecycleMock,
+  registerTmuxSessionResource: registerTmuxSessionResourceMock,
+  releaseSessionChildResources: releaseSessionChildResourcesMock,
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
+}));
+
+import { initOnStartup, restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -125,6 +155,57 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     opencodeStartWatchingMock.mockResolvedValue(undefined);
     opencodeIsWatchingMock.mockReturnValue(false);
     newSessionMock.mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue(null);
+    respawnPaneMock.mockResolvedValue(undefined);
+    releaseSessionChildResourcesMock.mockResolvedValue({ released: 0, failed: 0 });
+    initializeSessionResourceLifecycleMock.mockResolvedValue({ released: 0, failed: 0, preserved: 0 });
+    sessionExistsMock.mockResolvedValue(true);
+    existsSyncMock.mockImplementation((path: unknown) => {
+      const value = String(path);
+      return !value.includes('missing') && !value.includes('definitely-missing');
+    });
+  });
+
+  it('gives the daemon startup sweep a live session-store provider for orphan authority', async () => {
+    const initial = [{
+      name: 'deck_resource_brain',
+      agentType: 'shell',
+      runtimeType: 'process',
+      projectName: 'resource',
+      projectDir: '/proj',
+      role: 'brain',
+      state: 'running',
+    }];
+    const refreshed = [{ ...initial[0], state: 'stopped' }];
+    storeMock.mockReturnValue(initial);
+
+    await initOnStartup();
+
+    expect(initializeSessionResourceLifecycleMock).toHaveBeenCalledOnce();
+    const [, options] = initializeSessionResourceLifecycleMock.mock.calls[0]!;
+    expect(options).toEqual(expect.objectContaining({
+      listSessionsForOrphanSweep: expect.any(Function),
+    }));
+    storeMock.mockReturnValue(refreshed);
+    expect(options.listSessionsForOrphanSweep()).toBe(refreshed);
+  });
+
+  it('purges leaked test records from the persistent store before startup reconciliation', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_existing_brain', projectName: 'existing', projectDir: '/tmp/existing-project',
+        agentType: 'claude-code', runtimeType: 'process', role: 'brain', state: 'idle',
+      },
+      {
+        name: 'deck_real_brain', projectName: 'real', projectDir: '/Users/me/project',
+        agentType: 'claude-code', runtimeType: 'process', role: 'brain', state: 'idle',
+      },
+    ]);
+
+    await initOnStartup();
+
+    expect(removeSessionMock).toHaveBeenCalledWith('deck_existing_brain');
+    expect(removeSessionMock).not.toHaveBeenCalledWith('deck_real_brain');
   });
 
   it('does NOT call startWatching for deck_sub_* sessions (prevents JSONL file stealing)', async () => {
@@ -152,6 +233,45 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     const dirWatchCalls = vi.mocked(startWatching).mock.calls;
     const subSessionDirCalls = dirWatchCalls.filter(([session]) => session === 'deck_sub_5907196l');
     expect(subSessionDirCalls).toHaveLength(0);
+  });
+
+  it('never restarts the watcher for a sub-session already marked state=stopped, even if tmux still reports it live', async () => {
+    // Reproduces the real bug: a sub-session was explicitly retired (state
+    // persisted as 'stopped'), but its tmux artifact (remain-on-exit) still
+    // exists, so tmuxListSessions() reports it as live. Tmux liveness alone
+    // must never override a persisted 'stopped' state.
+    tmuxListMock.mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']);
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_Cd_brain', agentType: 'claude-code-sdk',
+        projectDir: '/proj', ccSessionId: 'brain-sdk-uuid', state: 'running',
+      },
+      {
+        name: 'deck_sub_5907196l', agentType: 'claude-code',
+        projectDir: '/proj', ccSessionId: 'stale-sub-uuid', state: 'stopped',
+      },
+    ]);
+
+    await restoreFromStore();
+
+    const fileWatchCalls = vi.mocked(startWatchingFile).mock.calls;
+    expect(fileWatchCalls.filter(([session]) => session === 'deck_sub_5907196l')).toHaveLength(0);
+    const dirWatchCalls = vi.mocked(startWatching).mock.calls;
+    expect(dirWatchCalls.filter(([session]) => session === 'deck_sub_5907196l')).toHaveLength(0);
+  });
+
+  it('reserves the ccSessionId of a claude-code-sdk session up front, before any watcher polling starts', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_Cd_brain', agentType: 'claude-code-sdk',
+        projectDir: '/proj', ccSessionId: 'brain-sdk-uuid', state: 'running',
+      },
+    ]);
+    tmuxListMock.mockResolvedValue([]);
+
+    await restoreFromStore();
+
+    expect(reserveSessionFileMock).toHaveBeenCalledWith('deck_Cd_brain', 'brain-sdk-uuid');
   });
 
   it('still starts startWatchingFile for the main brain session', async () => {
@@ -303,6 +423,108 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     }));
   });
 
+  it('marks a missing cwd as an error and never launches it again', async () => {
+    newSessionMock.mockRejectedValueOnce(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    sessionExistsMock.mockResolvedValueOnce(false);
+    const callback = vi.fn();
+    setSessionEventCallback(callback);
+    const record = {
+      name: 'deck_missing_cwd_brain', projectName: 'missing', role: 'brain', agentType: 'shell',
+      projectDir: '/missing/project', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+
+    await expect(restartSession(record)).rejects.toThrow(/Working directory not found/);
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      record.name, 'error', expect.stringContaining('Working directory not found'),
+    );
+    expect(callback).toHaveBeenCalledWith('error', record.name, expect.stringContaining('Working directory not found'));
+    expect(newSessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('converts a ConPTY spawn failure into a stable cwd error and stops retry work', async () => {
+    newSessionMock.mockRejectedValueOnce(new Error('Cannot create process, error code: 267'));
+    sessionExistsMock.mockResolvedValueOnce(false);
+    const callback = vi.fn();
+    setSessionEventCallback(callback);
+    const record = {
+      name: 'deck_spawn_267_brain', projectName: 'spawn', role: 'brain', agentType: 'shell',
+      projectDir: '/proj', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+
+    await expect(restartSession(record)).rejects.toThrow('Working directory not found: /proj');
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      record.name, 'error', 'Working directory not found: /proj',
+    );
+    expect(callback).toHaveBeenCalledWith('error', record.name, expect.stringContaining('Working directory not found: /proj'));
+  });
+
+  it('restores the rest of the store when one invalid cwd fails, marking only that session error', async () => {
+    const bad = {
+      name: 'deck_sync_brain', projectName: 'sync', role: 'brain', agentType: 'shell',
+      projectDir: '/missing/sync-project', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    const good = {
+      name: 'deck_sync_w1', projectName: 'sync', role: 'w1', agentType: 'shell',
+      projectDir: process.env.HOME!, state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockImplementation(() => [bad, good]);
+    tmuxListMock.mockResolvedValue([]);
+    sessionExistsMock.mockResolvedValue(false);
+    newSessionMock.mockRejectedValueOnce(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    // This fixture models an existing valid project; cwd existence is covered
+    // by the dedicated missing-path cases below.
+    existsSyncMock.mockReturnValue(true);
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      bad.name, 'error', expect.stringContaining('Working directory not found'),
+    );
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith(
+      good.name, 'error', expect.anything(),
+    );
+    expect(newSessionMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a cwd-missing session already persisted as an error', async () => {
+    const bad = {
+      name: 'deck_missing_cwd_persisted', projectName: 'missing', role: 'brain', agentType: 'shell',
+      projectDir: 'C:\\work\\deleted', state: 'error',
+      error: 'Working directory not found: C:\\work\\deleted', restarts: 1, restartTimestamps: [Date.now()],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockReturnValue([bad]);
+    tmuxListMock.mockResolvedValue([]);
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(newSessionMock).not.toHaveBeenCalled();
+    expect(updateSessionStateMock).not.toHaveBeenCalled();
+  });
+
+  it('marks a transport session with a missing cwd before provider launch', async () => {
+    const bad = {
+      name: 'verify_transport_missing_cwd', projectName: 'verify', role: 'brain',
+      agentType: 'claude-code-sdk', runtimeType: 'transport',
+      projectDir: 'C:\\definitely-missing-imcodes-cwd', state: 'idle',
+      restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockReturnValue([bad]);
+    tmuxListMock.mockResolvedValue([]);
+    sessionExistsMock.mockResolvedValue(false);
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      bad.name, 'error', 'Working directory not found: C:\\definitely-missing-imcodes-cwd',
+    );
+    expect(restartSessionMock).not.toHaveBeenCalled();
+  });
+
   it('persists idle before respawning a dead pane', async () => {
     const now = Date.now();
 
@@ -322,6 +544,32 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_respawn_w1',
       state: 'idle',
+    }));
+  });
+
+  it('releases prior child resources and gives a respawned process a successor runtime owner', async () => {
+    const now = Date.now();
+    const record = {
+      name: 'deck_respawn_owner_w1', projectName: 'respawn', role: 'w1', agentType: 'shell',
+      projectDir: '/proj', state: 'running', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old',
+      restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now,
+    } as const;
+    let persisted: typeof record | Record<string, unknown> | null = null;
+    upsertSessionMock.mockImplementation((value) => { persisted = value; });
+    getSessionMock.mockImplementation(() => persisted as never);
+
+    await respawnSession(record);
+
+    expect(releaseSessionChildResourcesMock).toHaveBeenCalledWith(record, { providerThreadContinues: false });
+    expect(respawnPaneMock).toHaveBeenCalledWith(
+      record.name,
+      expect.stringContaining("IMCODES_RESOURCE_SESSION_INSTANCE_ID='instance-1'"),
+    );
+    const update = upsertSessionMock.mock.calls.at(-1)?.[0] as { runtimeEpoch?: string };
+    expect(update.runtimeEpoch).toEqual(expect.any(String));
+    expect(update.runtimeEpoch).not.toBe('epoch-old');
+    expect(registerTmuxSessionResourceMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionInstanceId: 'instance-1', runtimeEpoch: update.runtimeEpoch,
     }));
   });
 

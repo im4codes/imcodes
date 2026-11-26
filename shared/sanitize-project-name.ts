@@ -45,3 +45,12 @@ export function sanitizeProjectName(raw: string): string {
   const slug = parts.join('').replace(/^_+|_+$/g, '').replace(/_+/g, '_');
   return slug || 'proj';
 }
+
+export const DEFAULT_PROJECTS_DIR_PREFIX = '~/.imcodes/projects/';
+
+/** Build the default working directory path `~/.imcodes/projects/<slug>` matching the brain session's project slug. */
+export function buildDefaultProjectDir(rawProject: string): string {
+  const trimmed = rawProject.trim();
+  if (!trimmed) return DEFAULT_PROJECTS_DIR_PREFIX;
+  return `${DEFAULT_PROJECTS_DIR_PREFIX}${sanitizeProjectName(trimmed)}`;
+}

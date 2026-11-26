@@ -3,17 +3,28 @@
 [English](../README.md) | [簡體中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。**
+**給 AI agent 的 IM。AI 遠端桌面、共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。**
 
 > 三個臭皮匠，頂個諸葛亮。<br>
 > 三個諸葛亮，談笑定陰陽。<br>
 > — IM.codes
 
-IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層和託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入或召回到後續 session，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，同時提供終端存取、檔案瀏覽、Git 視圖、localhost 預覽、通知、多 agent 工作流，以及 transport 型 agent 的原生串流輸出。OpenSpec 自動交付可以把一個變更從提案/規格審計推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。Session 分享也支援圍繞即時 agent session 的雙人或多人協作編程。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。內建團隊討論功能，讓多個模型互相審閱對方的方案和實作，能有效減少單模型的遺漏、盲點和偏差。
+IM.codes 不只連接 AI agent 的 coding session，也把 agent 連接到真正執行工作的電腦。把支援的機器註冊成受限的**受控節點（Controlled Nodes）**，一個 AI 或一組 AI 就能透過有作用域的命令、檔案傳輸和 Computer Use 直接操作一台或多台電腦；需要人工查看或接管時，具備條件的 Windows 節點還能直接從桌面瀏覽器或手機開啟遠端桌面。
+
+在機器控制之外，IM.codes 也為 coding agent 提供跨 provider 共享的記憶層和託管 MCP 工具面，把已完成工作沉澱成可重用上下文，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等。終端、檔案與 Git 視圖、localhost 預覽、通知、多 agent 工作流、OpenSpec 自動交付、Auto supervision 和跨模型 Team 審計，讓人與 AI 的工作保持可見、可控、可銜接。
 
 > **說明：** 本文件是繁體中文翻譯版。**英文 README（`../README.md`）是規範版本。** 若內容有出入，以英文版為準。
 
 支援多個 agent 透過 CLI 和 SDK 兩種方式接入。
+
+## 受控節點：AI 遠端桌面
+
+不必把每台電腦都設成完整的 IM.codes source server，就能把支援的機器接入為 AI 可操作的受控節點。
+
+- **一個 AI，控制多台電腦。** 註冊多台機器，讓一個 agent 或一組 agent 直接操作這些電腦完成工作。
+- **執行真實電腦操作。** 執行有作用域的命令、傳輸單一檔案，並透過型別化 Computer Use 工具操作桌面應用程式。
+- **需要人工時隨時遠端接管。** 從瀏覽器或手機開啟具備條件的 Windows 節點，直接查看畫面或進行遠端控制。
+- **權限明確，隨時可撤銷。** 每台節點使用獨立憑證，不混入一般 server/session 清單，擁有者可關閉執行權限或直接撤銷節點。
 
 ## 截圖
 
@@ -123,6 +134,26 @@ IM.codes 可用你自己的 supervisor 提示詞對支援的 agent session 做�
 - **理解 IM.codes 原生工作流。** Auto supervision 會把 OpenSpec 工作流、團隊討論/評審流程，以及 `imcodes send` 式的 agent 協作視為正常下一步，而不是立即停下來要求人工介入。
 
 ## 功能
+
+### 私有別名
+
+儲存目前使用者專屬的可重用文字片段，在輸入框鍵入 `;` 搜尋，或直接插入 `;;(name)` 標記。訊息會保留可見標記，IM.codes 則在帶外解析並把實際值交給 agent。Agent 也能透過託管 MCP 工具建立、搜尋、編輯與解析別名；批次清單只公開中繼資料，避免一次呼叫把所有別名值送進模型上下文。
+
+### 受控節點
+
+註冊一台或多台電腦，輸入 `^` 選擇目標（或直接插入 `^^(name)`），獲授權的 agent 就能在選定的機器上執行任務。它可以執行有作用域的命令、傳輸單一檔案，並呼叫型別化 Computer Use 工具，適合在同一段對話中操作與協調一組電腦。執行能力由擁有者啟用並可隨時撤銷，每台節點使用獨立憑證，也不會混入一般 server/session 清單。下載連結會過期，但已下載的安裝套件可以保留並重複用來註冊多台機器。
+
+### 遠端桌面控制
+
+具備條件的 Windows 受控節點可向獲授權的擁有者與參與者提供瀏覽器遠端桌面。支援控制/觀看模式、顯示器與清晰度切換，也允許多個獲授權使用者共同查看或控制；手機端提供觸控導覽與虛擬滑鼠，方便從手機或平板完整操作桌面。
+
+遠端桌面會自動選擇可用連線，權限可隨時撤銷。**目前遠端桌面支援 Windows；macOS 與 Linux 受控節點仍可使用其他節點能力，遠端桌面支援正在規劃中。**
+
+### Computer Use 與瀏覽器自動化
+
+受支援的 SDK agent 可透過型別化 Computer Use 工具控制桌面應用程式。跨平台桌面應用程式控制整合了 Leo（[iFurySt](https://github.com/iFurySt)）開發、採用 [MIT 授權](https://github.com/iFurySt/open-codex-computer-use/blob/main/LICENSE)的 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)；在此明確感謝該專案提供的這項整合能力。
+
+瀏覽器自動化則是 IM.codes 獨立實作的功能，直接使用 Chrome DevTools Protocol（CDP）：agent 可開啟、檢查、導覽、點擊、填寫及執行頁面指令碼，預設回傳結構化文字，只在要求時附上螢幕截圖。託管瀏覽器也會公開僅限本機回環存取的 CDP 端點，讓本機 Python 或 Node 指令碼重用同一個瀏覽器實例處理複雜工作，不必再啟動另一個瀏覽器。
 
 ### 遠端終端
 
@@ -269,7 +300,8 @@ Daemon 运行在你的开发机上，通过 tmux 管理进程型 agent，并通�
 ## 安裝
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash
+# fallback: npm install -g imcodes
 ```
 
 ## 快速開始
@@ -321,7 +353,7 @@ imcodes connect openclaw --url wss://gateway.example.com
 在同一台机器上部署 server + daemon。需要 Docker，以及一个 DNS 已指向服务器的域名。
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
@@ -331,7 +363,7 @@ imcodes setup --domain imc.example.com
 如果要连接更多机器：
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 imcodes bind https://imc.example.com/bind/<api-key>
 ```
 
@@ -355,8 +387,9 @@ Windows 通过 [ConPTY](https://devblogs.microsoft.com/commandline/windows-comma
 
 ### 安裝与绑定（Windows）
 
-```cmd
-npm install -g imcodes
+```powershell
+irm https://im.codes/install.ps1 | iex
+# fallback: npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
@@ -401,7 +434,7 @@ setx PATH "<npm-prefix-path>;%PATH%"
 ## 需求
 
 - macOS 或 Linux（都已验证）
-- **Windows（实验性）**：通过 ConPTY 原生支持（Windows 10+ 内置）。直接 `npm install -g imcodes` 即可，不需要额外软件。WSL 也可用。
+- **Windows（实验性）**：通过 ConPTY 原生支持（Windows 10+ 内置）。运行 `irm https://im.codes/install.ps1 | iex`（兜底 `npm install -g imcodes`）即可，不需要额外软件。WSL 也可用。
 - Node.js >= 22
 - 终端复用器：[tmux](https://github.com/tmux/tmux)（Linux/macOS）。Windows 使用 ConPTY（自动检测，系统内置）。
 - 至少安裝一个 AI coding agent：[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com) 或 [Qwen](https://github.com/QwenLM/qwen-agent)
@@ -412,10 +445,15 @@ setx PATH "<npm-prefix-path>;%PATH%"
 
 ## 免责声明
 
-IM.codes 是一个独立开源项目，与 Anthropic、OpenAI、Google、Alibaba、OpenClaw 以及本文提到的其他公司不存在附属、背书或赞助关系。所有产品名、商标和注册商标均归其各自所有者所有。
+IM.codes 是一個獨立源碼可用（source-available）專案，與 Anthropic、OpenAI、Google、Alibaba、OpenClaw 以及本文提到的其他公司不存在附屬、背書或贊助關係。所有產品名、商標和註冊商標均歸其各自所有者所有。
 
 ## 授權條款
 
-[MIT](../LICENSE)
+[Business Source License 1.1 (BSL 1.1)](../LICENSE) — [商業授權說明](../COMMERCIAL-LICENSE.md) | [第三方元件聲明](../THIRD_PARTY_NOTICES.md)
+
+- **非生產使用與個人生產使用：** 在保留版權/授權聲明並遵守商標限制的前提下，非生產環境評估/測試、複製、修改與合規再分發對任意規模組織均免費；自然人在個人裝置/伺服器上用於個人開發、學習、研究或個人自託管的個人使用永久免費（非組織集中部署或跨團隊共享，且不用於第三方託管/SaaS/白標商業服務），不受雇主規模限制。
+- **小型團隊內部生產使用：** 僅當按法律實體、所有關聯企業/子公司及所有部署實例**合併計算**同時滿足活躍使用者/席位 **<= 5 人**且組織總人數 **<= 50 人**時，內部生產使用才屬於附加使用授權的免費範圍。
+- **超出附加授權範圍（需商業授權）：** 在開源轉換日前，合計超過任一門檻（如 `6/50` 或 `5/51`）的內部生產使用，或向第三方提供託管服務、多租戶 SaaS、白標轉售的生產使用（即使僅有 1 人），均**不屬於**附加生產使用授權範圍，請聯繫 `support@im.codes` 取得商業授權。
+- **開源轉換：** 每個版本公開發布滿 4 年後自動轉為 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)（本版本轉換日期為 `2030-11-26`）。
 
 © 2026 [IM.codes](https://im.codes)

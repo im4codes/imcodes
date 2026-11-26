@@ -59,6 +59,7 @@ function makeMockDb() {
     origin: 'chat_compacted' | 'user_note';
     content_json: Record<string, unknown>;
     content_hash?: string | null;
+    server_id?: string;
   }>([
     ['shared-1', {
       id: 'shared-1',
@@ -70,6 +71,7 @@ function makeMockDb() {
       origin: 'chat_compacted',
       content_json: { note: 'raw source must not be returned' },
       content_hash: null,
+      server_id: 'server-shared-1',
     }],
   ]);
   const citations = new Map<string, {
@@ -122,6 +124,7 @@ function makeMockDb() {
         return [...projections.values()]
           .filter((projection) => projection.scope !== 'personal' || projection.user_id === userId)
           .filter((projection) => projection.scope === 'personal' || projection.enterprise_id === 'ent-1')
+          .filter((projection) => !params[7] || projection.content_json.sessionName !== params[7])
           .map((projection) => ({
             id: projection.id,
             scope: projection.scope,
@@ -132,6 +135,7 @@ function makeMockDb() {
             updated_at: projection.id === 'shared-1' ? 10 : 1,
             hit_count: 0,
             cite_count: citeCounts.get(projection.id) ?? 0,
+            origin_server_id: projection.server_id ?? 'server-test',
           })) as T[];
       }
       if (s.includes('from owner_private_memories')) return [] as T[];
@@ -208,7 +212,10 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<Record<string, unknown>> };
     expect(json.results).toEqual([
-      expect.objectContaining({ id: 'shared-1', scope: 'org_shared', preview: 'Authorized summary', origin: 'chat_compacted' }),
+      expect.objectContaining({
+        id: 'shared-1', scope: 'org_shared', preview: 'Authorized summary',
+        origin: 'chat_compacted', originServerId: 'server-shared-1',
+      }),
     ]);
     expect(JSON.stringify(json)).not.toContain('raw source');
     expect(JSON.stringify(json)).not.toContain('ent-1');
@@ -217,6 +224,48 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     expect(searchSql).toContain("p.scope <> 'personal'");
     expect(searchSql).not.toContain("p.scope in ('project_shared', 'workspace_shared', 'org_shared')");
     expect(searchSql).toContain('order by (p.updated_at + case when $7::boolean then least(coalesce(cc.cite_count, 0), 100) else 0 end) desc');
+  });
+
+  it('returns an empty envelope without querying for an empty search', async () => {
+    const { db, queryLog, projections } = makeMockDb();
+    projections.set('own-summary', {
+      id: 'own-summary',
+      scope: 'org_shared',
+      enterprise_id: 'ent-1',
+      user_id: null,
+      project_id: 'github.com/acme/repo',
+      summary: 'Current conversation summary',
+      origin: 'chat_compacted',
+      content_json: { sessionName: 'deck_proj_brain' },
+    });
+    projections.set('sibling-summary', {
+      id: 'sibling-summary',
+      scope: 'org_shared',
+      enterprise_id: 'ent-1',
+      user_id: null,
+      project_id: 'github.com/acme/repo',
+      summary: 'Sibling conversation summary',
+      origin: 'chat_compacted',
+      content_json: { sessionName: 'deck_sub_worker' },
+    });
+    const { app, env } = await buildApp(db);
+
+    const res = await app.request('/api/shared-context/memory/search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-user': 'user-member' },
+      body: JSON.stringify({
+        query: '',
+        scope: 'all_authorized',
+        projectId: 'github.com/acme/repo',
+        excludeSourceSessionName: 'deck_proj_brain',
+        limit: 20,
+      }),
+    }, env);
+
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results).toEqual([]);
+    expect(queryLog.some((entry) => normalize(entry.sql).includes('shared_context_projection_cite_counts'))).toBe(false);
   });
 
   it('does not query owner-private memories from generic search when user-private sync is disabled', async () => {

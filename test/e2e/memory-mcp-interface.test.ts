@@ -1,3 +1,9 @@
+import {
+  MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+  MCP_TOOL_DISCOVERY_NAME,
+  MCP_TOOL_GROUP_QUERY_PREFIX,
+  MCP_TOOL_GROUPS,
+} from '../../shared/mcp-tool-discovery.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,15 +16,22 @@ import {
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
+import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
+import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import { resolveMemoryMcpMaxRssBytes } from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   archiveEventsForMaterialization,
+  ensureContextNamespace,
   listContextObservations,
   recordContextEvent,
   resetContextStoreForTests,
+  upsertMemoryShortRefs,
+  writeContextObservation,
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -56,13 +69,29 @@ async function withStdioClient(
   }
 }
 
+async function activateToolGroup(client: Client, toolName: string): Promise<Record<string, unknown>> {
+  const group = MCP_TOOL_GROUPS.find((candidate) => candidate.tools.includes(toolName));
+  if (!group) throw new Error(`no MCP tool group contains ${toolName}`);
+  return structured(await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: `${MCP_TOOL_GROUP_QUERY_PREFIX}${group.id}` },
+  }));
+}
+
 describe('memory MCP interface e2e', () => {
   let tempDbDir: string;
   let projectRoot: string;
   let serverConfigDir: string;
   let serverConfigPath: string;
 
+  let testHome: string;
+  const previousHome = process.env.HOME;
+
   beforeEach(async () => {
+    // The session store and the MCP child resolve ~/.imcodes from HOME; never
+    // let them reach the real one (the store refuses it under vitest).
+    testHome = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-home-'));
+    process.env.HOME = testHome;
     tempDbDir = await createIsolatedSharedContextDb('memory-mcp-interface-e2e');
     projectRoot = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-project-'));
     serverConfigDir = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-server-'));
@@ -77,6 +106,9 @@ describe('memory MCP interface e2e', () => {
     await cleanupIsolatedSharedContextDb(tempDbDir);
     await rm(projectRoot, { recursive: true, force: true });
     await rm(serverConfigDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(testHome, { recursive: true, force: true });
   });
 
   function childEnv(): Record<string, string> {
@@ -102,10 +134,50 @@ describe('memory MCP interface e2e', () => {
     };
   }
 
-  it('runs the real stdio server, exposes exactly eleven tools, and persists runtime-derived preference provenance', async () => {
+  it('budgets semantic-search RSS growth relative to the stdio process baseline', () => {
+    const mib = 1024 * 1024;
+    expect(resolveMemoryMcpMaxRssBytes({}, 300 * mib)).toBe(1580 * mib);
+  });
+
+  it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
-      expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+      const listedNames = listed.tools.map((tool) => tool.name);
+      // The MCP process hosts memory plus exact server-backed alias and pin
+      // stores; assert each independent surface is present
+      // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
+      // Core tools are listed without a discovery round-trip; only the heavy
+      // pins, controlled-machine, file-transfer and computer-use surfaces stay lazy, so
+      // assert both directions rather than the whole catalog.
+      expect(listedNames).toEqual(expect.arrayContaining([...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
+      expect(listedNames).not.toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
+
+      const activated = await activateToolGroup(client, MESSAGE_PIN_MCP_TOOLS.LIST);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([
+          MESSAGE_PIN_MCP_TOOLS.LIST,
+          MESSAGE_PIN_MCP_TOOLS.GET,
+          MESSAGE_PIN_MCP_TOOLS.SAVE,
+          MESSAGE_PIN_MCP_TOOLS.DELETE,
+        ]),
+      });
+      const expandedNames = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(expandedNames).toEqual(expect.arrayContaining([
+        ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+        MESSAGE_PIN_MCP_TOOLS.LIST,
+        MESSAGE_PIN_MCP_TOOLS.GET,
+        MESSAGE_PIN_MCP_TOOLS.SAVE,
+        MESSAGE_PIN_MCP_TOOLS.DELETE,
+      ]));
 
       const saved = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
@@ -187,7 +259,7 @@ describe('memory MCP interface e2e', () => {
       }));
       expect(search).toMatchObject({ status: 'ok' });
       const items = search.items as Array<Record<string, unknown>>;
-      const expectedRef = `obs:${observationId.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      const expectedRef = makeMemoryShortRef('observation', observationId);
       expect(items[0]).toMatchObject({
         observationId,
         ref: expectedRef,
@@ -240,6 +312,120 @@ describe('memory MCP interface e2e', () => {
     });
   });
 
+  it('redeems and mutates refs persisted after the independent MCP process starts', async () => {
+    // The MCP project scoping layer intentionally maps user_private to the
+    // project-local personal namespace before resolving refs.
+    const lateRefNamespace = {
+      scope: 'personal' as const,
+      userId: USER_ID,
+      projectId: PROJECT_NAME,
+    };
+    const readable = writeProcessedProjection({
+      namespace: lateRefNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-late-ref-readable'],
+      summary: 'projection persisted after MCP startup remains directly redeemable',
+      content: { ownerUserId: USER_ID, eventCount: 1 },
+      origin: 'chat_compacted',
+      createdAt: 1_100,
+      updatedAt: 1_100,
+    });
+    const manageable = writeProcessedProjection({
+      namespace: lateRefNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-late-ref-manageable'],
+      summary: 'projection persisted after MCP startup remains manageable by ref',
+      content: { ownerUserId: USER_ID, eventCount: 1 },
+      origin: 'chat_compacted',
+      createdAt: 1_200,
+      updatedAt: 1_200,
+    });
+    const observationNamespace = ensureContextNamespace(lateRefNamespace, 1_250);
+    const observation = writeContextObservation({
+      namespaceId: observationNamespace.id,
+      scope: lateRefNamespace.scope,
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'late-cross-process-observation-ref',
+      content: { text: 'observation persisted after MCP startup remains directly redeemable' },
+      text: 'observation persisted after MCP startup remains directly redeemable',
+      sourceEventIds: ['evt-late-ref-observation'],
+      state: 'active',
+      now: 1_250,
+    });
+    const readableRef = makeMemoryShortRef('projection', readable.id);
+    const manageableRef = makeMemoryShortRef('projection', manageable.id);
+    const observationRef = makeMemoryShortRef('observation', observation.id);
+
+    await withStdioClient(childEnv(), async (client) => {
+      // Ensure the child is fully started before another process writes these
+      // rows. No search/list call is allowed to register them in the child Map.
+      await client.listTools();
+      upsertMemoryShortRefs([
+        { ref: readableRef, kind: 'projection', id: readable.id },
+        { ref: manageableRef, kind: 'projection', id: manageable.id },
+        { ref: observationRef, kind: 'observation', id: observation.id },
+      ].map((entry, index) => ({
+        ...entry,
+        namespaceKey: JSON.stringify([
+          lateRefNamespace.scope,
+          lateRefNamespace.userId,
+          lateRefNamespace.projectId,
+          '',
+          '',
+        ]),
+        namespaceJson: JSON.stringify(lateRefNamespace),
+        lastSeenAt: Date.now() + index,
+      })));
+
+      const sources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: { ref: readableRef, kind: 'projection' },
+      }));
+      expect(sources).toMatchObject({
+        status: 'ok',
+        projectionId: readable.id,
+        sourceEventCount: 1,
+        projectionSource: expect.objectContaining({
+          eventId: 'evt-late-ref-readable',
+          content: readable.summary,
+        }),
+      });
+
+      const observationSources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: { ref: observationRef, kind: 'observation' },
+      }));
+      expect(observationSources).toMatchObject({
+        status: 'ok',
+        observationId: observation.id,
+        sourceEventCount: 1,
+        sources: [
+          expect.objectContaining({
+            eventId: 'evt-late-ref-observation',
+            status: 'observation',
+            content: 'observation persisted after MCP startup remains directly redeemable',
+          }),
+        ],
+      });
+
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]),
+      });
+      const archived = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+        arguments: { ref: manageableRef },
+      }));
+      expect(archived).toMatchObject({
+        status: 'ok',
+        projectionId: manageable.id,
+        changed: true,
+      });
+    });
+  });
+
   it('finds a projection by MCP search and expands summary fallback by projectionId or short ref', async () => {
     const projection = writeProcessedProjection({
       namespace,
@@ -253,6 +439,11 @@ describe('memory MCP interface e2e', () => {
     });
 
     await withStdioClient(childEnv(), async (client) => {
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]),
+      });
       const listed = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
         arguments: {
@@ -263,7 +454,7 @@ describe('memory MCP interface e2e', () => {
       const listedItems = listed.items as Array<Record<string, unknown>>;
       expect(listedItems.find((item) => item.projectionId === projection.id)).toMatchObject({
         projectionId: projection.id,
-        ref: `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`,
+        ref: makeMemoryShortRef('projection', projection.id),
         recordKind: 'projection',
         projectionClass: 'recent_summary',
         sourceLookup: {
@@ -293,7 +484,7 @@ describe('memory MCP interface e2e', () => {
         },
       });
       expect(['exact', 'semantic', 'trigram']).toContain(hit?.matchKind);
-      const expectedRef = `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      const expectedRef = makeMemoryShortRef('projection', projection.id);
       expect(hit?.ref).toBe(expectedRef);
 
       const sources = structured(await client.callTool({
@@ -462,6 +653,7 @@ describe('memory MCP interface e2e', () => {
         endpoint: {
           serverId: SERVER_ID,
           workerUrl: 'https://worker.invalid/root/',
+          token: 'daemon-server-token',
         },
         fetchImpl,
         nowMs: () => Date.now(),
@@ -516,7 +708,7 @@ describe('memory MCP interface e2e', () => {
 
     const cronCreated = await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE]({
       name: 'MCP e2e scheduled send',
-      cronExpr: '* * * * *',
+      cronExpr: '*/30 * * * *',
       projectName: PROJECT_NAME,
       targetSessionName: targetOne,
       action: {
@@ -533,8 +725,9 @@ describe('memory MCP interface e2e', () => {
     });
     expect(cronCreated).toMatchObject({ status: 'ok' });
     expect(fetches.at(-1)?.url).toBe(`https://worker.invalid/root/api/server/${SERVER_ID}/cron`);
-    expect(fetches.at(-1)?.init.headers).toMatchObject({ 'X-Server-Id': SERVER_ID });
-    expect(fetches.at(-1)?.init.headers).not.toHaveProperty('Authorization');
+    // The cron API acts as the server owner: it needs the daemon's own server token, never the caller-supplied one.
+    expect(fetches.at(-1)?.init.headers).toMatchObject({ 'X-Server-Id': SERVER_ID, Authorization: 'Bearer daemon-server-token' });
+    expect(JSON.stringify(fetches.at(-1)?.init.headers)).not.toContain('evil-token');
     expect(fetches.at(-1)?.body).toMatchObject({
       serverId: SERVER_ID,
       projectName: PROJECT_NAME,
@@ -575,6 +768,8 @@ function sessionRecord(
 ) {
   return {
     name,
+    sessionInstanceId: `instance_${name}`,
+    runtimeEpoch: `epoch_${name}`,
     projectName,
     role,
     agentType: 'codex-sdk',

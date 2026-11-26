@@ -7,6 +7,8 @@ import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { hashPassword } from '../src/security/crypto.js';
+import { CLIENT_TIMEZONE_PREF_KEY } from '../../shared/client-timezone.js';
+import { CLIENT_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
@@ -24,10 +26,11 @@ interface MemUser {
 function makeMemDb(): Database {
   const users = new Map<string, MemUser>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; label: string | null; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
-  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; used_at: number | null; expires_at: number; created_at: number }>();
+  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; used_at: number | null; expires_at: number; created_at: number, owner_status: 'active' }>();
   const servers = new Map<string, { id: string; user_id: string; name: string }>();
   const auditLog: unknown[] = [];
   const lockouts = new Map<string, { identity: string; failed_attempts: number; locked_until: number | null; last_attempt_at: number }>();
+  const userPrefs = new Map<string, string>();
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -48,7 +51,7 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash') && s.includes('revoked_at is null')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }
@@ -58,8 +61,33 @@ function makeMemDb(): Database {
         }
         return null;
       }
+      if (s.includes('update refresh_tokens set used_at = $1 where token_hash = $2') && s.includes('returning')) {
+        const now = Number(params[0]);
+        for (const token of refreshTokens.values()) {
+          if (token.token_hash === params[1] && token.used_at === null && token.expires_at > now) {
+            token.used_at = now;
+            return token as T;
+          }
+        }
+        return null;
+      }
+      if (s.includes('from refresh_tokens where token_hash')) {
+        for (const token of refreshTokens.values()) {
+          if (token.token_hash === params[0] && token.used_at === null && token.expires_at > Number(params[1])) return token as T;
+        }
+        return null;
+      }
       if (s.includes('from auth_lockout')) {
         return (lockouts.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('insert into auth_lockout')) {
+        const identity = String(params[0]);
+        const previous = lockouts.get(identity);
+        const failedAttempts = (previous?.failed_attempts ?? 0) + 1;
+        const locked_until = failedAttempts >= 5 ? Date.now() + 15 * 60_000 : null;
+        const row = { identity, failed_attempts: failedAttempts, locked_until, last_attempt_at: Date.now() };
+        lockouts.set(identity, row);
+        return { fail_count: failedAttempts, locked_until } as T;
       }
       if (s.includes('count(*) as cnt from users')) {
         return { cnt: users.size } as T;
@@ -70,6 +98,10 @@ function makeMemDb(): Database {
         if (key === 'registration_enabled') return { value: 'true' } as T;
         if (key === 'require_approval') return { value: 'false' } as T;
         return null;
+      }
+      if (s.includes('from user_preferences where user_id')) {
+        const value = userPrefs.get(`${String(params[0])}:${String(params[1])}`);
+        return (value === undefined ? null : { value }) as T | null;
       }
       return null;
     },
@@ -121,7 +153,7 @@ function makeMemDb(): Database {
         refreshTokens.set(params[0] as string, {
           id: params[0] as string,
           user_id: params[1] as string,
-          token_hash: params[2] as string,
+          token_hash: params[2] as string, owner_status: 'active',
           family_id: params[3] as string,
           used_at: null,
           expires_at: params[4] as number,
@@ -133,6 +165,12 @@ function makeMemDb(): Database {
         if (user) {
           user.password_hash = params[0] as string;
           user.password_must_change = false;
+        }
+      }
+      if (s.includes('update refresh_tokens set used_at = $1 where user_id = $2')) {
+        const now = Number(params[0]);
+        for (const rt of refreshTokens.values()) {
+          if (rt.user_id === params[1] && rt.used_at === null) rt.used_at = now;
         }
       }
       if (s.includes('update users set username') && s.includes('password_hash') && s.includes('display_name')) {
@@ -160,8 +198,15 @@ function makeMemDb(): Database {
           if (v.user_id === params[0]) refreshTokens.delete(k);
         }
       }
+      if (s.includes('update refresh_tokens set used_at')) {
+        const token = refreshTokens.get(params[1] as string);
+        if (token) token.used_at = params[0] as number;
+      }
       if (s.includes('insert into audit_log')) {
         auditLog.push(params);
+      }
+      if (s.includes('insert into user_preferences')) {
+        userPrefs.set(`${String(params[0])}:${String(params[1])}`, String(params[2]));
       }
       if (s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
         // simplified lockout handling
@@ -232,6 +277,29 @@ describe('Password authentication', () => {
     expect(body.accessToken).toBeTruthy();
   });
 
+  it('remembers the authenticated browser or app timezone for later agent cron creation', async () => {
+    const loginRes = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'imcodes' }),
+    });
+    const { accessToken } = await loginRes.json() as { accessToken: string };
+
+    const meRes = await app.request('/api/auth/user/me', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        [CLIENT_TIMEZONE_HEADER]: 'Asia/Shanghai',
+      },
+    });
+    expect(meRes.status).toBe(200);
+
+    const prefRes = await app.request(`/api/preferences/${CLIENT_TIMEZONE_PREF_KEY}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    expect(prefRes.status).toBe(200);
+    await expect(prefRes.json()).resolves.toEqual({ value: 'Asia/Shanghai' });
+  });
+
   it('rejects incorrect password', async () => {
     const res = await app.request('/api/auth/password/login', {
       method: 'POST',
@@ -241,6 +309,47 @@ describe('Password authentication', () => {
     expect(res.status).toBe(401);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('invalid_credentials');
+  });
+
+  it('locks only the failed account and never a shared IP bucket', async () => {
+    await seedPasswordUser(db, 'user2', 'second', 'secret', false);
+    for (let i = 0; i < 5; i++) {
+      const failed = await app.request('/api/auth/password/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'wrong' }),
+      });
+      expect([401, 429]).toContain(failed.status);
+    }
+
+    const locked = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'imcodes' }),
+    });
+    expect(locked.status).toBe(429);
+
+    const other = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'second', password: 'secret' }),
+    });
+    expect(other.status).toBe(200);
+    const otherBody = await other.json() as { refreshToken: string };
+
+    const refresh = await app.request('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: otherBody.refreshToken }),
+    });
+    expect(refresh.status).toBe(200);
+
+    const fresh = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'fresh-user', password: 'secret' }),
+    });
+    expect(fresh.status).toBe(401);
   });
 
   it('rejects non-existent username', async () => {

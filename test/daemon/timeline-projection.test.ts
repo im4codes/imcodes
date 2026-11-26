@@ -11,6 +11,7 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
+const originalImcodesHome = process.env.IMCODES_HOME;
 const originalDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
 const PROJECTION_SETTLE_TIMEOUT_MS = 10_000;
 const PROJECTION_SETTLE_INTERVAL_MS = 50;
@@ -57,6 +58,8 @@ describe('timeline projection', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (originalDbPath === undefined) delete process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
     else process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = originalDbPath;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
@@ -69,6 +72,7 @@ describe('timeline projection', () => {
     dbPath = join(tempHome, '.imcodes', 'timeline-projection.sqlite');
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
     process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = dbPath;
     prepareDb?.(dbPath);
     const [{ timelineProjection }, { timelineStore }] = await Promise.all([
@@ -240,6 +244,21 @@ describe('timeline projection', () => {
 
     const typed = await timelineStore.readByTypesPreferred(sessionId, ['tool.call', 'assistant.text'], { limit: 10 });
     expect(typed.map((event) => event.seq)).toEqual([2, 3, 4, 5]);
+  });
+
+  it('freezes visible completed texts inclusively by append cursor, despite tool floods and equal timestamps', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'history-boundary';
+    timelineStore.append(makeEvent(sessionId, 1, 'user.message', { text: 'original request' }, 100));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'completed answer' }, 100));
+    for (let seq = 3; seq < 203; seq++) timelineStore.append(makeEvent(sessionId, seq, 'tool.result', { text: 'tool noise' }, 100));
+    timelineStore.append(makeEvent(sessionId, 203, 'user.message', { text: 'after snapshot' }, 100));
+    timelineStore.append({ ...makeEvent(sessionId, 204, 'assistant.text', { text: 'private init' }, 100), hidden: true });
+    timelineStore.append(makeEvent(sessionId, 205, 'assistant.text', { text: 'stream delta', streaming: true }, 100));
+    await timelineStore.flushSession(sessionId); await timelineProjection.rebuildSession(sessionId);
+    expect((await timelineStore.readCompletedTextTail(sessionId, 20, { visibleOnly: true, through: { epoch: 1, seq: 2, ts: 100 } })).map((event) => event.payload.text)).toEqual(['original request', 'completed answer']);
+    expect((await timelineStore.readCompletedTextTail(sessionId, 2, { visibleOnly: true })).map((event) => event.payload.text)).toEqual(['completed answer', 'after snapshot']);
+    expect(await timelineStore.readCompletedTextTail('different-session', 20, { through: { epoch: 1, seq: 2, ts: 100 } })).toEqual([]);
   });
 
   it('serves stale SQLite rows quickly and prunes to authoritative truncation', async () => {

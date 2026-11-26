@@ -1,0 +1,293 @@
+import type { QueueDeliveryPolicy } from './session-send-delivery.js';
+export type QueueEntryStatus =
+  | 'queued'
+  | 'handoff_inflight'
+  | 'dispatching'
+  | 'failed'
+  | 'expired'
+  | 'capacity_evicted'
+  | 'cancelled'
+  | 'sent'
+  | 'deleted'
+  | 'dismissed'
+  | 'session_removed';
+
+export type QueuePlacement = 'normal' | 'front';
+
+/**
+ * Daemon-authored lifecycle identity for supervision control traffic.
+ *
+ * This is persisted independently from the human-readable message. Queue
+ * authority must never be reconstructed by parsing that message.
+ */
+export type QueueSupervisionReference =
+  | {
+      kind: 'exact_integration';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+    }
+  | {
+      kind: 'implementation_blocker';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+      exactError: string;
+    };
+
+/** Final daemon authority decision for a supervision queue row. */
+export type QueueSupervisionAdmission = 'authorized' | 'stale' | 'retry';
+
+export type QueueDropReason =
+  | 'expired'
+  | 'stale_expired'
+  | 'superseded'
+  | 'capacity_evicted'
+  | 'user_cleared'
+  | 'user_stopped'
+  | 'session_removed'
+  | 'private_material_missing';
+
+export type QueueResetReason =
+  | 'sqlite_restore'
+  | 'runtime_recreated'
+  | 'user_clear'
+  | 'authority_corrupt_reinitialized';
+
+export type QueueFailureReason =
+  | 'dispatch_failed'
+  | 'expired'
+  | 'capacity_evicted'
+  | 'cancelled'
+  | 'private_material_missing'
+  | 'sqlite_degraded';
+
+export interface QueueSharedActorProjection {
+  actorId?: string;
+  displayName?: string;
+  role?: string;
+  type?: string;
+  avatarUrl?: string;
+  color?: string;
+}
+
+export interface QueueAttachmentProjection {
+  attachmentId: string;
+  filename?: string;
+  mimeType?: string;
+  size?: number;
+}
+
+export interface QueuePrivateDispatchMaterial {
+  clientMessageId: string;
+  text: string;
+  messagePreamble?: string;
+  attachmentRefs?: unknown[];
+  sharedActorEnvelope?: unknown;
+  providerRouting?: Record<string, unknown>;
+  timelineCommitted?: boolean;
+  historyCommitted?: boolean;
+  /** Daemon-owned lifecycle authority revalidated at every delivery edge. */
+  supervisionReference?: QueueSupervisionReference;
+  /** Runtime-private active-turn routing; never inferred from visible text. */
+  activeTurnDeliveryKind?: 'delegation_reply' | 'queued_message' | 'mcp_message';
+  /** Private delegation completion ownership retained across relaunch/restart. */
+  delegationReply?: {
+    delegationId: string;
+  };
+  /** Command-mode send (shared/send-command-mode.ts): delivered verbatim, no per-turn enrichment. */
+  commandMode?: true;
+  /** Private peer-audit ownership marker. Never expose through queue projections. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
+}
+
+export interface QueueDispatchMaterial {
+  clientMessageId: string;
+  text: string;
+  messagePreamble?: string;
+  attachments?: unknown[];
+  sharedActor?: unknown;
+}
+
+export interface QueueStoredEntry extends QueueDeliveryPolicy {
+  sessionName: string;
+  queueEpoch: string;
+  queueAuthorityId: string;
+  clientMessageId: string;
+  commandId?: string;
+  text: string;
+  status: QueueEntryStatus;
+  placement: QueuePlacement;
+  ordinal: number;
+  createdAt: number;
+  updatedAt: number;
+  pendingMessageVersion: number;
+  activityGeneration?: number | string;
+  replacesClientMessageId?: string;
+  failureReason?: QueueFailureReason;
+  dropReason?: QueueDropReason;
+  resetReason?: QueueResetReason;
+  attachments?: QueueAttachmentProjection[];
+  sharedActor?: QueueSharedActorProjection;
+  handoffId?: string;
+  handoffStartedAt?: number;
+  handoffExpiresAt?: number;
+  handoffAttempt?: number;
+  privateMaterialRef?: string;
+  supervisionReference?: QueueSupervisionReference;
+}
+
+export interface QueueProjectionEntry extends QueueDeliveryPolicy {
+  clientMessageId: string;
+  text: string;
+  status: QueueEntryStatus;
+  placement: QueuePlacement;
+  ordinal: number;
+  createdAt: number;
+  updatedAt: number;
+  commandId?: string;
+  activityGeneration?: number | string;
+  replacesClientMessageId?: string;
+  failureReason?: QueueFailureReason;
+  dropReason?: QueueDropReason;
+  attachments?: QueueAttachmentProjection[];
+  sharedActor?: QueueSharedActorProjection;
+  supervisionReference?: QueueSupervisionReference;
+}
+
+export interface QueueSnapshot {
+  type: 'transport.queue.snapshot';
+  sessionName: string;
+  queueEpoch: string;
+  queueAuthorityId: string;
+  pendingMessageVersion: number;
+  pendingMessageEntries: QueueProjectionEntry[];
+  failedMessageEntries: QueueProjectionEntry[];
+  source: string;
+  resetReason?: QueueResetReason;
+  dropReason?: QueueDropReason;
+  activityGeneration?: number | string;
+  degraded?: boolean;
+  degradedReason?: string;
+}
+
+export interface QueueDeliveryFact {
+  type: 'transport.queue.delivery';
+  sessionName: string;
+  clientMessageId: string;
+  queueEpoch: string;
+  queueAuthorityId: string;
+  pendingMessageVersion: number;
+  deliveryFrameId: string;
+  deliveryFrameVersion: number;
+  activityGeneration?: number | string;
+  providerEventId?: string;
+}
+
+export interface QueueMutationReceipt {
+  type: 'transport.queue.receipt';
+  sessionName: string;
+  commandId: string;
+  status: 'accepted' | 'error';
+  reason?: string;
+}
+
+export interface QueueFailureDropEvent {
+  type: 'transport.queue.failure';
+  sessionName: string;
+  queueEpoch: string;
+  queueAuthorityId: string;
+  pendingMessageVersion: number;
+  clientMessageId: string;
+  failureReason?: QueueFailureReason;
+  dropReason?: QueueDropReason;
+}
+
+export interface QueueResetEvent {
+  type: 'transport.queue.reset';
+  sessionName: string;
+  queueEpoch: string;
+  queueAuthorityId: string;
+  pendingMessageVersion: number;
+  resetReason: QueueResetReason;
+}
+
+export type QueueEvent =
+  | QueueSnapshot
+  | QueueDeliveryFact
+  | QueueMutationReceipt
+  | QueueFailureDropEvent
+  | QueueResetEvent;
+
+/**
+ * Canonical value-position constant for the delivery-fact event type. Typed
+ * against the interface discriminator so it can never drift from
+ * `QueueDeliveryFact['type']`. Import this instead of hardcoding the string
+ * in daemon/server/web (zero-tolerance shared-constant rule).
+ */
+export const TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE: QueueDeliveryFact['type'] = 'transport.queue.delivery';
+
+/** Browser → daemon queue mutations shared by the UI, bridge policy, and runtime. */
+export const TRANSPORT_QUEUE_COMMANDS = {
+  APPEND_MESSAGES: 'session.append_queued_messages',
+} as const;
+
+/** Bound one append request even if a malformed client sends an oversized id list. */
+export const TRANSPORT_QUEUE_APPEND_MAX_ENTRIES = 200;
+
+/** Durable transport liveness backstops. Override the stale threshold in tests or deployments. */
+export const TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+export const TRANSPORT_QUEUE_SWEEP_INTERVAL_MS = 5_000;
+
+export function transportQueueStaleThresholdMs(env: { readonly [key: string]: string | undefined } = {}): number {
+  const configured = Number(env.IMCODES_TRANSPORT_QUEUE_STALE_THRESHOLD_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(1_000, Math.floor(configured))
+    : TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS;
+}
+
+export const LIVE_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
+  'queued',
+  'handoff_inflight',
+  'dispatching',
+]);
+
+export const FAILED_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
+  'failed',
+  'expired',
+  'capacity_evicted',
+  'cancelled',
+]);
+
+export const QUEUE_RESET_REASONS = new Set<QueueResetReason>([
+  'sqlite_restore',
+  'runtime_recreated',
+  'user_clear',
+  'authority_corrupt_reinitialized',
+]);
+
+export const QUEUE_DROP_REASONS = new Set<QueueDropReason>([
+  'expired',
+  'stale_expired',
+  'superseded',
+  'capacity_evicted',
+  'user_cleared',
+  'user_stopped',
+  'session_removed',
+  'private_material_missing',
+]);
+
+/** Optional fields on priority session.cancel. Old peers keep real Stop. */
+export const TRANSPORT_STOP_QUEUE_FIELDS = {
+  IDS: 'stopAndSendPendingMessageIds',
+  OUTCOME: 'stopQueueOutcome',
+} as const;
+export const TRANSPORT_STOP_QUEUE_OUTCOMES = {
+  APPENDED: 'appended',
+  STOPPED_AND_DISPATCHED: 'stopped_and_dispatched',
+  ALREADY_DELIVERED: 'already_delivered',
+} as const;
+export const TRANSPORT_STOP_QUEUE_TIMEOUT_MS = 5_000;

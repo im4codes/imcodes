@@ -177,7 +177,7 @@ process.exit(0);
       'install',
       '--no-save',
       '--ignore-scripts',
-      'sharp@0.34.5',
+      'sharp@0.35.5',
     ]);
     // macOS resolves /var/folders/... → /private/var/folders/... when the
     // child reads cwd, so compare on canonical realpaths.

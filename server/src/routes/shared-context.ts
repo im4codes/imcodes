@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { parseRemoteUrl } from '../../../src/repo/detector.js';
@@ -386,7 +387,9 @@ function buildSharedMemoryResponse(
 }
 
 sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const memoryId = c.req.param('memoryId');
   if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
   const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
@@ -396,7 +399,9 @@ sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
 });
 
 sharedContextRoutes.get('/personal-memory', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const projectId = c.req.query('projectId')?.trim();
   const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
     ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
@@ -490,20 +495,29 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
 });
 
 sharedContextRoutes.post('/memory/search', async (c) => {
-  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
-  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
-    return c.json(sameShapeSearchEnvelope());
-  }
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const body = await readJsonBody<{
     query?: string;
     scope?: SearchRequestScope;
     projectId?: string;
     limit?: number;
+    excludeSourceSessionName?: string;
   }>(c);
   const query = body?.query?.trim() ?? '';
+  if (!query) {
+    return c.json(sameShapeSearchEnvelope());
+  }
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
+    return c.json(sameShapeSearchEnvelope());
+  }
   const requestedScope = isSearchRequestScope(body?.scope) ? body.scope : 'all_authorized';
   const limit = Math.max(1, Math.min(50, typeof body?.limit === 'number' ? body.limit : 20));
+  const excludeSourceSessionName = typeof body?.excludeSourceSessionName === 'string'
+    ? body.excludeSourceSessionName.trim().slice(0, 512) || null
+    : null;
   const userPrivateSyncEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.userPrivateSync, featureFlags);
   const scopes = expandSearchRequestScope(requestedScope, { includeOwnerPrivate: userPrivateSyncEnabled });
   if (scopes.length === 0) return c.json(sameShapeSearchEnvelope());
@@ -518,6 +532,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     hit_count: number | null;
     cite_count: number | null;
     origin: MemoryOrigin | null;
+    origin_server_id: string;
   };
   type OwnerPrivateRow = {
     id: string;
@@ -535,6 +550,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     class: string;
     preview: string;
     origin?: MemoryOrigin;
+    originServerId?: string;
     projectId?: string;
     updatedAt: number;
     score: number;
@@ -567,12 +583,14 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     const citeCountEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeCount, featureFlags);
     const rows = await c.env.DB.query<SearchProjectionRow>(
       `SELECT p.id, p.scope, p.project_id, p.projection_class, p.summary, p.updated_at, p.origin,
+              p.server_id AS origin_server_id,
               p.hit_count, COALESCE(cc.cite_count, 0) AS cite_count
        FROM shared_context_projections p
        LEFT JOIN shared_context_projection_cite_counts cc ON cc.projection_id = p.id
        WHERE COALESCE(p.status, 'active') = 'active'
          AND ($1::text IS NULL OR p.project_id = $1)
          AND ($2::text = '' OR p.summary ILIKE $3)
+         AND ($8::text IS NULL OR COALESCE(p.content_json->>'sessionName', '') <> $8)
          AND (
            (p.scope = 'personal' AND p.user_id = $4 AND p.scope = ANY($5::text[]))
 	           OR (
@@ -586,7 +604,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
          )
        ORDER BY (p.updated_at + CASE WHEN $7::boolean THEN LEAST(COALESCE(cc.cite_count, 0), 100) ELSE 0 END) DESC
        LIMIT $6`,
-      [body?.projectId?.trim() || null, query, `%${query}%`, userId, sharedScopes, limit, citeCountEnabled],
+      [body?.projectId?.trim() || null, query, `%${query}%`, userId, sharedScopes, limit, citeCountEnabled, excludeSourceSessionName],
     );
     for (const row of rows.filter((entry) => !isMemoryNoiseSummary(entry.summary))) {
       results.push({
@@ -595,6 +613,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
         class: row.projection_class,
         preview: row.summary.slice(0, 240),
         origin: isMemoryOrigin(row.origin) ? row.origin : undefined,
+        originServerId: row.origin_server_id,
         projectId: row.project_id,
         updatedAt: row.updated_at,
         score: row.updated_at + (citeCountEnabled ? Math.min(row.cite_count ?? 0, 100) : 0),
@@ -608,12 +627,14 @@ sharedContextRoutes.post('/memory/search', async (c) => {
   });
 
   return c.json({
+    ...(excludeSourceSessionName ? { sourceSessionExclusionApplied: true } : {}),
     results: results.slice(0, limit).map((result) => ({
       id: result.id,
       scope: result.scope,
       class: result.class,
       preview: result.preview,
       origin: result.origin,
+      originServerId: result.originServerId,
       projectId: result.projectId,
       updatedAt: result.updatedAt,
     })),
@@ -684,7 +705,9 @@ async function getOrRepairProjectionContentHash(
 }
 
 sharedContextRoutes.post('/memory/citations', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const body = await readJsonBody<{ projectionId?: string; citingMessageId?: string }>(c);
@@ -748,7 +771,9 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
 });
 
 sharedContextRoutes.get('/memory/citations/:citationId', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const citationId = c.req.param('citationId');
@@ -983,6 +1008,7 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/runtime-authored-context', a
       v.content_md AS content
     FROM shared_context_document_bindings b
     JOIN shared_context_document_versions v ON v.id = b.version_id
+    JOIN shared_context_documents d ON d.id = v.document_id AND d.enterprise_id = b.enterprise_id AND d.id = b.document_id
     WHERE b.enterprise_id = $1 AND b.status = 'active' AND v.status = 'active'
     ORDER BY b.id ASC`,
     [enterpriseId],
@@ -1073,6 +1099,7 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/diagnostics', async (c) => {
       v.content_md AS content
     FROM shared_context_document_bindings b
     JOIN shared_context_document_versions v ON v.id = b.version_id
+    JOIN shared_context_documents d ON d.id = v.document_id AND d.enterprise_id = b.enterprise_id AND d.id = b.document_id
     WHERE b.enterprise_id = $1 AND b.status = 'active' AND v.status = 'active'
     ORDER BY b.id ASC`,
     [enterpriseId],
@@ -1170,6 +1197,17 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/projects/enroll', async (c)
   }>(c);
   const canonicalRepoId = body?.canonicalRepoId?.trim();
   if (!canonicalRepoId) return c.json({ error: 'canonical_repo_id_required' }, 400);
+  if (body?.workspaceId !== undefined && body?.workspaceId !== null && typeof body.workspaceId !== 'string') {
+    return c.json({ error: 'invalid_workspace_id' }, 400);
+  }
+  const workspaceId = typeof body?.workspaceId === 'string' ? body.workspaceId.trim() || null : null;
+  if (workspaceId) {
+    const ownedWorkspace = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_context_workspaces WHERE id = $1 AND enterprise_id = $2',
+      [workspaceId, enterpriseId],
+    );
+    if (!ownedWorkspace) return sameShapeNotFound(c);
+  }
   const scope = body?.scope ?? 'project_shared';
   if (!isAuthoredContextScope(scope)) return c.json({ error: 'invalid_scope' }, 400);
 
@@ -1177,13 +1215,13 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/projects/enroll', async (c)
   const now = Date.now();
   await c.env.DB.execute(
     'INSERT INTO shared_project_enrollments (id, enterprise_id, workspace_id, canonical_repo_id, display_name, scope, status, auto_enabled_for_members, member_opt_out_allowed, created_by, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, FALSE, $8, $9, $9)',
-    [enrollmentId, enterpriseId, body?.workspaceId ?? null, canonicalRepoId, body?.displayName?.trim() ?? null, scope, 'active', auth.userId, now],
+    [enrollmentId, enterpriseId, workspaceId, canonicalRepoId, body?.displayName?.trim() ?? null, scope, 'active', auth.userId, now],
   );
   await logAudit({ userId: auth.userId, action: 'shared_context.project_enrolled', details: { enterpriseId, enrollmentId, canonicalRepoId, scope } }, c.env.DB);
   return c.json({
     id: enrollmentId,
     enterpriseId,
-    workspaceId: body?.workspaceId ?? null,
+    workspaceId,
     canonicalRepoId,
     displayName: body?.displayName?.trim() ?? null,
     scope,
@@ -1468,29 +1506,60 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/document-bindings', async (
     applicabilityPathPattern?: string | null;
   }>(c);
   if (!body?.documentId || !body?.versionId || !isBindingMode(body?.mode)) return c.json({ error: 'invalid_binding' }, 400);
+  if (
+    (body.workspaceId !== undefined && body.workspaceId !== null && typeof body.workspaceId !== 'string')
+    || (body.enrollmentId !== undefined && body.enrollmentId !== null && typeof body.enrollmentId !== 'string')
+  ) {
+    return c.json({ error: 'invalid_binding' }, 400);
+  }
+  const documentId = body.documentId.trim();
+  const versionId = body.versionId.trim();
+  const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() || null : null;
+  const enrollmentId = typeof body.enrollmentId === 'string' ? body.enrollmentId.trim() || null : null;
+  if (!documentId || !versionId) return c.json({ error: 'invalid_binding' }, 400);
+
   const bindingScope = authoredContextScopeForBinding({
-    workspaceId: body.workspaceId,
-    enrollmentId: body.enrollmentId,
+    workspaceId,
+    enrollmentId,
   });
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (bindingScope === 'org_shared' && !isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags)) {
     return sameShapeNotFound(c);
   }
+  const ownedVersion = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT v.id FROM shared_context_document_versions v JOIN shared_context_documents d ON d.id = v.document_id WHERE v.id = $1 AND d.id = $2 AND d.enterprise_id = $3',
+    [versionId, documentId, enterpriseId],
+  );
+  if (!ownedVersion) return sameShapeNotFound(c);
+  if (workspaceId) {
+    const ownedWorkspace = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_context_workspaces WHERE id = $1 AND enterprise_id = $2',
+      [workspaceId, enterpriseId],
+    );
+    if (!ownedWorkspace) return sameShapeNotFound(c);
+  }
+  if (enrollmentId) {
+    const ownedEnrollment = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM shared_project_enrollments WHERE id = $1 AND enterprise_id = $2',
+      [enrollmentId, enterpriseId],
+    );
+    if (!ownedEnrollment) return sameShapeNotFound(c);
+  }
   const bindingId = randomHex(16);
   const now = Date.now();
   await c.env.DB.execute(
     "INSERT INTO shared_context_document_bindings (id, enterprise_id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12)",
-    [bindingId, enterpriseId, body.workspaceId ?? null, body.enrollmentId ?? null, body.documentId, body.versionId, body.mode, body.applicabilityRepoId ?? null, body.applicabilityLanguage ?? null, body.applicabilityPathPattern ?? null, auth.userId, now],
+    [bindingId, enterpriseId, workspaceId, enrollmentId, documentId, versionId, body.mode, body.applicabilityRepoId ?? null, body.applicabilityLanguage ?? null, body.applicabilityPathPattern ?? null, auth.userId, now],
   );
-  await logAudit({ userId: auth.userId, action: 'shared_context.document_binding_created', details: { enterpriseId, bindingId, documentId: body.documentId, versionId: body.versionId } }, c.env.DB);
+  await logAudit({ userId: auth.userId, action: 'shared_context.document_binding_created', details: { enterpriseId, bindingId, documentId, versionId } }, c.env.DB);
   return c.json({
     id: bindingId,
     enterpriseId,
-    workspaceId: body.workspaceId ?? null,
-    enrollmentId: body.enrollmentId ?? null,
+    workspaceId,
+    enrollmentId,
     scope: bindingScope,
-    documentId: body.documentId,
-    versionId: body.versionId,
+    documentId,
+    versionId,
     mode: body.mode,
     status: 'active',
   }, 201);
@@ -1537,10 +1606,15 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
  * Used by daemon send path to auto-inject relevant memories into agent prompts.
  */
 sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
-  const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: serverId,
+    allowOwnerCrossServer: false,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  if (role === 'none' && authority.kind !== 'participant_daemon') return c.json({ error: 'forbidden' }, 403);
   const runtimeConfigRow = await c.env.DB.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
     'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
     [serverId],

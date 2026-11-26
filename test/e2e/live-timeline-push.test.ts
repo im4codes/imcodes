@@ -41,7 +41,7 @@ function makeDb(): Database {
   const db = {
     queryOne: async (sql: string, params: unknown[]) => {
       if (sql.includes('SELECT token_hash')) {
-        return { token_hash: 'valid-hash', user_id: 'test-user' };
+        return { token_hash: 'valid-hash', user_id: 'test-user', owner_status: 'active' };
       }
       if (sql.includes('FROM sessions WHERE')) {
         return params[0] === SERVER_ID && params[1] === SESSION_ID ? { ok: 1 } : null;

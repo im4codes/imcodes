@@ -64,7 +64,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
   ['cron_jobs', [
     'id', 'server_id', 'user_id', 'name', 'cron_expr', 'action',
     'project_name', 'target_role', 'target_session_name', 'timezone', 'status', 'last_run_at', 'next_run_at',
-    'expires_at', 'created_at', 'updated_at',
+    'expires_at', 'completion_policy', 'created_at', 'updated_at',
   ]],
   ['cron_executions', [
     'id', 'job_id', 'status', 'detail', 'created_at',
@@ -136,4 +136,24 @@ describe('schema drift detection', () => {
       expect(true).toBe(true);
     });
   }
+
+  it('cron completion policy defaults legacy and new rows to recurring with a DB constraint', async () => {
+    const column = await db.queryOne<{ column_default: string | null; is_nullable: string }>(
+      `SELECT column_default, is_nullable
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'cron_jobs'
+         AND column_name = 'completion_policy'`,
+    );
+    expect(column?.column_default).toContain('recurring');
+    expect(column?.is_nullable).toBe('NO');
+
+    const constraint = await db.queryOne<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conname = 'cron_jobs_completion_policy_check'`,
+    );
+    expect(constraint?.definition).toContain('recurring');
+    expect(constraint?.definition).toContain('until_complete');
+  });
 });

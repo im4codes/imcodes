@@ -322,7 +322,7 @@ function sanitizeAllowedExecutables(input: unknown): string[] {
 }
 
 function getAgentFlavor(agentType: string): AgentFlavorFilter {
-  if (agentType === 'claude-code' || agentType === 'codex' || agentType === 'gemini' || agentType === 'opencode') return 'cli';
+  if (agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode') return 'cli';
   return 'sdk';
 }
 
@@ -1087,6 +1087,9 @@ export function P2pConfigPanel({
   const overlayStyle: Record<string, string | number> = {
     position: 'fixed',
     inset: 0,
+    width: 'var(--imcodes-ui-vw, 100%)',
+    height: 'var(--vvh, var(--imcodes-ui-dvh))',
+    boxSizing: 'border-box',
     background: 'rgba(0,0,0,0.6)',
     display: 'flex',
     alignItems: isMobile ? 'flex-start' : 'center',
@@ -1094,7 +1097,7 @@ export function P2pConfigPanel({
     zIndex: 9999,
     padding: isMobile ? 'calc(env(safe-area-inset-top, 0px) + 12px) 0 0' : 16,
   };
-  const mobilePanelHeight = 'calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px) - 12px)';
+  const mobilePanelHeight = 'calc(var(--vvh, var(--imcodes-ui-dvh)) - env(safe-area-inset-top, 0px) - 12px)';
   const mobileFooterStyle: Record<string, string | number> = {
     ...footerStyle,
     padding: '12px 20px calc(env(safe-area-inset-bottom, 0px) + 16px)',
@@ -1110,10 +1113,10 @@ export function P2pConfigPanel({
      * banners; at 780 px those sections were getting cramped. Mobile
      * stays at full viewport width.
      */
-    width: isMobile ? '100vw' : 'min(1400px, calc(100vw - 32px))',
-    maxWidth: isMobile ? '100vw' : 1400,
+    width: isMobile ? 'var(--imcodes-ui-vw, 100vw)' : 'min(1400px, calc(var(--imcodes-ui-vw, 100vw) - 32px))',
+    maxWidth: isMobile ? 'var(--imcodes-ui-vw, 100vw)' : 1400,
     height: isMobile ? mobilePanelHeight : 'auto',
-    maxHeight: isMobile ? mobilePanelHeight : '90vh',
+    maxHeight: isMobile ? mobilePanelHeight : 'calc(var(--imcodes-ui-vh, 100vh) * 0.9)',
     display: 'flex',
     flexDirection: 'column',
     minHeight: 0,

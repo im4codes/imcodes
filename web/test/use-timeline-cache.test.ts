@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
-import { h } from 'preact';
+import { h, render as preactRender, options as preactOptions } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
@@ -17,10 +17,17 @@ vi.mock('../src/api.js', () => ({
 }));
 import {
   __clearPersistedTimelineSnapshotsForTests,
+  __flushTimelineSnapshotsBeforeFreezeForTests,
+  __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
+  __getTimelineSnapshotBookkeepingKeysForTests,
+  __mergeTimelineEventsForTests,
   __getSharedTimelineBaseForTests,
+  __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
+  __setStaleWindowPeekMinAgeMsForTests,
   __setTimelineCacheForTests,
+  __shouldRequestNewerTimelineCursorForTests,
   ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
@@ -43,8 +50,49 @@ async function flushMicrotasks(count = 6): Promise<void> {
   for (let i = 0; i < count; i += 1) await Promise.resolve();
 }
 
-describe('useTimeline global cache bounds', () => {
+async function flushPrePaintUpdates(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+async function drainQueuedPassiveFrames(queuedPassiveFrames: Array<(timestamp: number) => void>): Promise<void> {
+  while (queuedPassiveFrames.length > 0) {
+    const pending = queuedPassiveFrames.splice(0);
+    for (const callback of pending) callback(performance.now());
+    await flushPrePaintUpdates();
+  }
+}
+
+type RawPreactHarness = {
+  container: HTMLDivElement;
+  queuedPassiveFrames: Array<(timestamp: number) => void>;
+  cleanup: () => void;
+};
+
+function createRawPreactHarness(): RawPreactHarness {
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const queuedPassiveFrames: Array<(timestamp: number) => void> = [];
+  const previousRequestAnimationFrame = preactOptions.requestAnimationFrame;
+  preactOptions.requestAnimationFrame = ((callback: (timestamp: number) => void) => {
+    queuedPassiveFrames.push(callback);
+    return queuedPassiveFrames.length;
+  }) as typeof preactOptions.requestAnimationFrame;
+  return {
+    container,
+    queuedPassiveFrames,
+    cleanup: () => {
+      preactRender(null, container);
+      container.remove();
+      preactOptions.requestAnimationFrame = previousRequestAnimationFrame;
+    },
+  };
+}
+
+describe('useTimeline window-isolated cache bounds', () => {
   beforeEach(() => {
+    // These fixtures seed ancient cache rows and count history requests; the stale-window tail peek has its own tests.
+    __setStaleWindowPeekMinAgeMsForTests(Infinity);
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
@@ -55,33 +103,218 @@ describe('useTimeline global cache bounds', () => {
   });
 
   afterEach(() => {
+    __setStaleWindowPeekMinAgeMsForTests(null);
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it('evicts least recently used sessions when session-count cap is exceeded', () => {
+  it('never evicts one chat window when many peer windows become active', () => {
     for (let i = 0; i < 13; i++) {
       __setTimelineCacheForTests(`server:s${i}`, makeEvents(`s${i}`, 100));
     }
 
     const keys = __getTimelineCacheKeysForTests();
-    expect(keys).toHaveLength(12);
-    expect(keys).not.toContain('server:s0');
+    expect(keys).toHaveLength(13);
+    expect(keys).toContain('server:s0');
     expect(keys).toContain('server:s12');
   });
 
-  it('evicts older sessions when total cached events exceed the global cap', () => {
+  it('never spends one chat window cache budget on another window', () => {
     __setTimelineCacheForTests('server:a', makeEvents('a', 4000));
     __setTimelineCacheForTests('server:b', makeEvents('b', 4000));
     __setTimelineCacheForTests('server:c', makeEvents('c', 4000));
     __setTimelineCacheForTests('server:d', makeEvents('d', 4000));
 
     const keys = __getTimelineCacheKeysForTests();
-    expect(keys).toHaveLength(3);
-    expect(keys).not.toContain('server:a');
+    expect(keys).toHaveLength(4);
+    expect(keys).toContain('server:a');
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
+    // Text and detail rows have independent bounded tails.  The cache keeps
+    // the 2,000-event detail window plus the 300-event text window and pin
+    // context, so tool bursts cannot evict conversation text.
+    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_361);
+    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_361);
+  });
+
+  it('keeps text visible when a 288-event tool burst shares the history window', () => {
+    const text: TimelineEvent = {
+      eventId: 'text-before-tools',
+      sessionId: 'mixed',
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'conversation text' },
+    };
+    const tools = Array.from({ length: 288 }, (_, index) => ({
+      eventId: `tool-${index}`,
+      sessionId: 'mixed',
+      ts: index + 2,
+      epoch: 1,
+      seq: index + 2,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: (index === 287 ? 'tool.call' : 'tool.result') as TimelineEvent['type'],
+      payload: {
+        toolCallId: `call-${index}`,
+        status: index === 287 ? 'running' : 'complete',
+        output: 'x'.repeat(1024),
+      },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(tools, [text], 300);
+    expect(merged.some((event) => event.eventId === text.eventId)).toBe(true);
+    expect(merged.filter((event) => event.type === 'tool.call' || event.type === 'tool.result')).toHaveLength(288);
+    expect(merged.find((event) => event.eventId === text.eventId)?.payload.text).toBe('conversation text');
+  });
+
+  it('keeps snapshot bookkeeping independent when peer-window count exceeds the old cap', () => {
+    for (let i = 0; i < 13; i++) {
+      __setTimelineCacheForTests(`server:s${i}`, makeEvents(`s${i}`, 100));
+    }
+
+    expect(__getTimelineCacheKeysForTests()).toContain('server:s0');
+    expect(__getTimelineSnapshotBookkeepingKeysForTests()).toContain('server:s0');
+    expect(__getTimelineSnapshotBookkeepingKeysForTests()).toContain('server:s12');
+  });
+
+  it('uses this tab/webview session cache before a conflicting durable snapshot', () => {
+    const sessionName = `deck_window_local_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const durable = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'other tab durable snapshot' },
+    }));
+    const thisWindow = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'this window snapshot' },
+    }));
+    localStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(durable));
+    sessionStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(thisWindow));
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'window-local-seed' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    expect(screen.getByTestId('window-local-seed').textContent).toBe('this window snapshot');
+  });
+
+  it.each(['session', 'local'])('heals stable send duplicates on the first offline %s snapshot paint, without collapsing intentional repeats', (tier) => {
+    const sessionName = `deck_cached_identity_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rows = makeEvents(sessionName, 4).map((event, index) => ({
+      ...event, type: 'user.message' as const,
+      payload: { text: 'Intentional same body', allowDuplicate: true, commandId: index < 3 ? 'one-send' : 'another-send' },
+    }));
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(rows));
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'cold-identity' }, String(timeline.events.length));
+    }
+    render(h(Probe));
+    // No socket, awaited request or effect flush may be needed to heal first paint.
+    expect(screen.getByTestId('cold-identity').textContent).toBe('2');
+  });
+
+  it('prefers this window raw-key seed over another window durable scoped seed', () => {
+    const sessionName = `deck_window_scope_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const peerScoped = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'peer scoped cache' },
+    }));
+    const ownRaw = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'own raw cache' },
+    }));
+    localStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(peerScoped));
+    sessionStorage.setItem(`rcc_timeline_snapshot:${sessionName}`, JSON.stringify(ownRaw));
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'window-local-raw-seed' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    expect(screen.getByTestId('window-local-raw-seed').textContent).toBe('own raw cache');
+  });
+
+  it('does not collapse paged history back to the initial window on a realtime event', () => {
+    const sessionName = `deck_paged_realtime_${Date.now()}`;
+    const history = makeEvents(sessionName, 600);
+    __setTimelineCacheForTests(sessionName, history);
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-live`,
+      sessionId: sessionName,
+      ts: 601,
+      epoch: 1,
+      seq: 601,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'new live turn' },
+    });
+
+    const retained = __getTimelineCacheForTests(sessionName);
+    expect(retained).toHaveLength(601);
+    expect(retained?.[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(retained?.at(-1)?.eventId).toBe(`${sessionName}-live`);
+  });
+
+  it('keeps every expanded text row when the realtime merge uses the wide detail window', () => {
+    const sessionName = `deck_expanded_text_realtime_${Date.now()}`;
+    const history = makeEvents(sessionName, 600);
+    const live = {
+      eventId: `${sessionName}-live`,
+      sessionId: sessionName,
+      ts: 601,
+      epoch: 1,
+      seq: 601,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'assistant.text' as const,
+      payload: { text: 'new live turn' },
+    } satisfies TimelineEvent;
+
+    // This is the direct counterexample for the P0 regression: a paged
+    // 600-row text window must not be reduced to MAX_TEXT_MEMORY_EVENTS (300)
+    // merely because one realtime row arrives.
+    const merged = __mergeTimelineEventsForTests(history, [live], 2000);
+    expect(merged).toHaveLength(601);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-live`);
+  });
+
+  it('keeps the text tail when expanded text and tool detail exceed one window budget', () => {
+    const sessionName = `deck_budgeted_text_priority_${Date.now()}`;
+    const text = makeEvents(sessionName, 2000);
+    const tools = Array.from({ length: 2000 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: 3000 + index,
+      epoch: 1,
+      seq: 3000 + index,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'tool.result' as const,
+      payload: { output: `tool-${index}` },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(text, tools, 2000);
+    expect(merged).toHaveLength(2361);
+    expect(merged.filter((event) => event.type === 'assistant.text')).toHaveLength(2000);
+    expect(merged.filter((event) => event.type === 'tool.result')).toHaveLength(361);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-tool-1999`);
   });
 
   it('pushes cache updates to already-mounted hooks for the same session', async () => {
@@ -254,6 +487,108 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('self-heals an unmatched running tool when the authoritative session is already idle', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_stale_tool_${Date.now()}`;
+    const serverId = `srv-stale-${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionName}`, [{
+      eventId: `${sessionName}-tool-call`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { toolCallId: 'delegation-reply-stuck', name: 'delegation_reply' },
+    }]);
+    fetchHistorySpy.mockResolvedValue({
+      events: [],
+      epoch: 1,
+      hasMore: false,
+      nextCursor: null,
+    });
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-stale-tool'),
+    } as unknown as WsClient;
+
+    function Probe({ state }: { state: string }) {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        authoritativeSessionState: state,
+      });
+      return h('div', { 'data-testid': 'stale-tool-probe' }, String(timeline.events.length));
+    }
+
+    const view = render(h(Probe, { state: 'running' }));
+    await act(async () => { await flushMicrotasks(); });
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+
+    view.rerender(h(Probe, { state: 'idle' }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks();
+    });
+
+    expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+    expect(fetchHistorySpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: undefined, limit: 200 }),
+    );
+  });
+
+  it('does not self-heal an idle timeline after the matching tool result arrived', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_settled_tool_${Date.now()}`;
+    const serverId = `srv-settled-${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionName}`, [
+      {
+        eventId: `${sessionName}-tool-call`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        payload: { toolCallId: 'delegation-reply-done', name: 'delegation_reply' },
+      },
+      {
+        eventId: `${sessionName}-tool-result`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.result',
+        payload: { toolCallId: 'delegation-reply-done', status: 'succeeded' },
+      },
+    ]);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-settled-tool'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        authoritativeSessionState: 'idle',
+      });
+      return h('div', { 'data-testid': 'settled-tool-probe' }, String(timeline.events.length));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks();
+    });
+
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+  });
+
   it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
     // Regression: SubSessionCard previews and hidden tabs went empty
     // after commit 90cd30ec gated path-3 behind isActiveSession.
@@ -311,6 +646,151 @@ describe('useTimeline global cache bounds', () => {
     });
 
     expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
+  });
+
+  function makeStoredEvent(sessionName: string, text: string): TimelineEvent {
+    return {
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text },
+    };
+  }
+
+  async function renderRestoredProbe(sessionName: string, serverId: string, testId: string) {
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': testId }, String(events.length));
+    }
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+      await flushMicrotasks();
+    });
+  }
+
+  it('trims the local store to the retention bound once a restore proves it readable', async () => {
+    // Nothing pruned this store before — pruneOldEvents existed but only tests
+    // called it — so IndexedDB grew for the life of the install and every open
+    // paid for the whole thing. Older history stays available from the daemon.
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_prune_${Date.now()}`;
+    const serverId = `srv-prune-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
+      .mockResolvedValue({ deleted: 0, done: true });
+
+    await renderRestoredProbe(sessionName, serverId, 'prune-probe');
+
+    // Nothing may be deleted while the app is still painting. The first version
+    // swept immediately after each restore, so a dozen sessions mounting
+    // together queued a dozen large readwrite transactions ahead of everyone's
+    // reads on the shared connection, and chats opened blank and hung on
+    // "local cache". Reclaiming space has no deadline; a paint does.
+    expect(pruneSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
+
+    expect(pruneSpy).toHaveBeenCalledWith(
+      `${serverId}:${sessionName}`,
+      1000,
+      expect.objectContaining({ maxDeletions: expect.any(Number) }),
+    );
+    // The retention must stay above the page the first paint reads, or every
+    // restore would come back truncated.
+    const [, keepCount, opts] = pruneSpy.mock.calls[0]!;
+    expect(keepCount).toBeGreaterThan(300);
+    // And each sweep must be bounded, so one transaction can never monopolise
+    // the connection the way the unbounded version did.
+    expect((opts as { maxDeletions: number }).maxDeletions).toBeLessThanOrEqual(2_000);
+  });
+
+  it('drains legacy last-value signals out of the conversation store, before trimming it', async () => {
+    // The v2 split routes NEW signals to their own store but rewrites no
+    // existing row, so everything recorded before the upgrade stays in
+    // `events`. `session.state` alone is ~67% of recorded events and the
+    // last-value group ~84%, which is enough to fill the bounded window the
+    // first paint reads and open the pane with no messages in it.
+    //
+    // Retention cannot fix that on its own: `pruneOldEvents` keeps the newest
+    // N by timestamp with no idea what a row IS, so it will happily retain
+    // 1000 unrenderable signals. The drain has to run, and has to run first.
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_drain_${Date.now()}`;
+    const serverId = `srv-drain-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    const drainSpy = vi.spyOn(TimelineDB.prototype, 'drainLegacySignals')
+      .mockResolvedValue({ deleted: 0, done: true });
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
+      .mockResolvedValue({ deleted: 0, done: true });
+
+    await renderRestoredProbe(sessionName, serverId, 'drain-probe');
+
+    // Same deadline rule as the trim: reclaiming space must never precede a paint.
+    expect(drainSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
+
+    expect(drainSpy).toHaveBeenCalledWith(
+      `${serverId}:${sessionName}`,
+      expect.objectContaining({ maxDeletions: expect.any(Number) }),
+    );
+    // Bounded, for the same reason the trim is: one shared connection.
+    const [, drainOpts] = drainSpy.mock.calls[0]!;
+    expect((drainOpts as { maxDeletions: number }).maxDeletions).toBeLessThanOrEqual(2_000);
+    // Order matters — trimming a window that is still 84% signals just retains
+    // the signals and leaves the pane blank.
+    expect(drainSpy.mock.invocationCallOrder[0]!)
+      .toBeLessThan(pruneSpy.mock.invocationCallOrder[0]!);
+  });
+
+  it('never deletes local history while the store is degraded to memory-only', async () => {
+    // A memory-only DB cannot report what is actually on disk, so a delete
+    // issued against it is a delete issued blind. This file has destroyed local
+    // history once already by deleting on an assumption (migrateRawToScoped).
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_prune_degraded_${Date.now()}`;
+    const serverId = `srv-prune-degraded-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(true);
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
+      .mockResolvedValue({ deleted: 0, done: true });
+
+    await renderRestoredProbe(sessionName, serverId, 'prune-degraded-probe');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
+
+    expect(pruneSpy).not.toHaveBeenCalled();
   });
 
   it('inactive load survives effect-cleanup dep churn', async () => {
@@ -444,8 +924,220 @@ describe('useTimeline global cache bounds', () => {
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     expect(fetchHistorySpy).toHaveBeenCalled();
+  });
+
+  it('bootstraps a cold visible chat window while it is not the focused window', async () => {
+    // Regression: after a browser reload, a visible floating chat could be
+    // unfocused. It was treated like a passive preview card, so both daemon and
+    // HTTP history were skipped. Sending a new message supplied the first live
+    // row, after which Load more finally became usable. Real chat surfaces must
+    // independently fetch their newest window; preview cards retain the
+    // no-fan-out behavior covered above.
+    vi.useFakeTimers();
+    const sessionName = `deck_visible_inactive_${Date.now()}`;
+    const serverId = `srv-visible-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-inactive');
+    let handler: ((message: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (message: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+        isVisible: true,
+        bootstrapWhenVisible: true,
+      });
+      return h('div', { 'data-testid': 'visible-inactive-probe' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
+    expect(fetchHistorySpy).toHaveBeenCalled();
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-visible-inactive',
+        epoch: 1,
+        events: makeEvents(sessionName, 1).map((event) => ({
+          ...event,
+          payload: { text: 'restored without sending a message' },
+        })),
+      } as ServerMessage);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('visible-inactive-probe').textContent)
+      .toContain('restored without sending a message');
+  });
+
+  it('does not walk older pages before first paint when the visible pane is cold', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_visible_cold_bound_${Date.now()}`;
+    const serverId = `srv-visible-cold-bound-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-cold-bound');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({
+      events: makeEvents(sessionName, 200),
+      epoch: 1,
+      hasMore: true,
+      nextCursor: { epoch: 1, beforeTs: 0, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+    });
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+        isVisible: true,
+        bootstrapWhenVisible: true,
+      });
+      return h('div', { 'data-testid': 'visible-cold-bound-probe' }, String(timeline.events.length));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
+      // A capped cold bootstrap must not chain historical pages in the
+      // background; one bounded tail is enough for first paint.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await flushMicrotasks();
+    });
+
+    expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('visible-cold-bound-probe').textContent).toBe('200');
+  });
+
+  it.each(['scoped', 'raw-fallback', 'split'].flatMap((segment) =>
+    ['cache-first', 'live-first'].map((order) => ({ segment, order })),
+  ))('restores $segment IDB send identity in $order order without changing disk scope', async ({ segment, order }) => {
+    const sessionName = `deck_restore_identity_${segment}_${order}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = {
+      eventId: 'transport-history:old-projection', sessionId: segment === 'scoped' ? cacheKey : sessionName,
+      ts: 100, epoch: 0, seq: 1, type: 'user.message', source: 'daemon', confidence: 'high',
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true,
+        attachments: [{ name: 'synthetic.png' }] },
+    };
+    const primary: TimelineEvent = { ...old, eventId: 'primary-live', sessionId: sessionName, epoch: 1, seq: 2,
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true } };
+    const header = makeEvents(cacheKey, 1);
+    let release!: (events: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    const heldKey = segment === 'scoped' ? cacheKey : sessionName;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ epoch: 0, seq: 1 });
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === heldKey) return held;
+      return key === cacheKey && segment === 'split' ? header : [];
+    });
+    const migrate = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+    let handler: ((msg: ServerMessage) => void) | undefined;
+    const ws = { connected: true, onMessage: (fn: typeof handler) => { handler = fn; return () => { handler = undefined; }; },
+      sendTimelineHistoryRequest: () => 'identity-history' } as unknown as WsClient;
+    let seen: TimelineEvent[] = [];
+    function Probe() { seen = useTimeline(sessionName, ws, 'srv').events; return null; }
+    render(h(Probe));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(heldKey, { limit: 300 }));
+    if (order === 'live-first') act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    await act(async () => { release([old]); await flushMicrotasks(); });
+    await waitFor(() => expect(seen.some((event) => event.payload.attachments)).toBe(true));
+    act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    expect(seen.filter((event) => event.type === 'user.message')).toHaveLength(1);
+    expect(seen.every((event) => event.sessionId === sessionName)).toBe(true);
+    expect(old.sessionId).toBe(segment === 'scoped' ? cacheKey : sessionName);
+    if (segment !== 'scoped') expect(migrate).toHaveBeenCalledWith(sessionName, cacheKey, [old]);
+  });
+
+  it.each(['session', 'local'] as const)('merges scoped %s snapshot with actual HTTP catchup and manual local reload', async (tier) => {
+    const sessionName = `deck_snapshot_http_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = { ...makeEvents(cacheKey, 1)[0], type: 'user.message',
+      eventId: 'transport-history:old-http', payload: { text: 'Synthetic HTTP send', commandId: 'http-command', allowDuplicate: true } };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify([old]));
+    const primary = { ...old, sessionId: sessionName, eventId: 'http-primary', epoch: 2, seq: 2 };
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([old]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({ events: [primary], epoch: 2, hasMore: false });
+    let seen: TimelineEvent[] = [];
+    let refresh = () => {};
+    function Probe() { const t = useTimeline(sessionName, null, 'srv'); seen = t.events; refresh = t.forceRefresh; return null; }
+    render(h(Probe));
+    act(() => refresh());
+    await waitFor(() => expect(fetchHistorySpy).toHaveBeenCalled());
+    await waitFor(() => expect(seen.some((event) => event.eventId === 'http-primary')).toBe(true));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sessionId).toBe(sessionName);
+  });
+
+  it('ignores a late old-owner IDB restore after switching server with the same raw session and command', async () => {
+    const sessionName = 'deck_restore_old_owner';
+    const row = (server: string): TimelineEvent => ({ ...makeEvents(`${server}:${sessionName}`, 1)[0],
+      type: 'user.message', payload: { text: server, commandId: 'same-command', allowDuplicate: true } });
+    let release!: (rows: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === `server-A:${sessionName}`) return held;
+      return key === `server-B:${sessionName}` ? [row('server-B')] : [];
+    });
+    let seen: TimelineEvent[] = [];
+    function Probe({ server }: { server: string }) { seen = useTimeline(sessionName, null, server).events; return null; }
+    const view = render(h(Probe, { server: 'server-A' }));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(`server-A:${sessionName}`, { limit: 300 }));
+    view.rerender(h(Probe, { server: 'server-B' }));
+    await waitFor(() => expect(seen[0]?.payload.text).toBe('server-B'));
+    await act(async () => { release([row('server-A')]); await flushMicrotasks(); });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].payload.text).toBe('server-B');
+    expect(seen[0].sessionId).toBe(sessionName);
+    expect(__getTimelineCacheForTests(`server-A:${sessionName}`)).toBeUndefined();
+  });
+
+  it.each(['deck_owner_identity', 'deck_owner:variant'])('restores only exact known owners and never joins command across servers (%s)', (sessionName) => {
+    for (const server of ['server-A', 'server-B']) {
+      const key = `${server}:${sessionName}`;
+      const own: TimelineEvent = { ...makeEvents(key, 1)[0], type: 'user.message',
+        payload: { text: server, commandId: 'same-command', allowDuplicate: true } };
+      const foreign = { ...own, eventId: `${server}-foreign`, sessionId: `other-server:${sessionName}` };
+      sessionStorage.setItem(`rcc_timeline_snapshot:${key}`, JSON.stringify([own, foreign]));
+    }
+    const seen = new Map<string, TimelineEvent[]>();
+    function Probe({ server }: { server: string }) { seen.set(server, useTimeline(sessionName, null, server).events); return null; }
+    render(h('div', null, h(Probe, { server: 'server-A' }), h(Probe, { server: 'server-B' })));
+    expect(seen.get('server-A')).toHaveLength(1);
+    expect(seen.get('server-B')).toHaveLength(1);
+    expect(seen.get('server-A')![0].payload.text).toBe('server-A');
+    expect(seen.get('server-B')![0].payload.text).toBe('server-B');
   });
 
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
@@ -554,6 +1246,194 @@ describe('useTimeline global cache bounds', () => {
     expect(migrateSpy).toHaveBeenCalledWith(sessionName, scopedKey, [bareEvent]);
   });
 
+  it('does not migrate from a cancelled bootstrap load on wsConnected flip (CI raw-idb phantom-miss counterexample)', async () => {
+    const sessionName = `deck_ws_flip_race_${Date.now()}`;
+    const serverId = `srv-ws-flip-${Date.now()}`;
+    const scopedKey = `${serverId}:${sessionName}`;
+    const rawUserMsg: TimelineEvent = {
+      eventId: 'transport-history:old-raw-idb',
+      sessionId: sessionName,
+      ts: 100,
+      epoch: 0,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'raw user message before ws connect' },
+    };
+
+    // Simulate real in-place migration semantics: calling migrateRawToScoped removes from raw and puts into scoped.
+    let migratedInPlace = false;
+    let releaseFirstCursor!: (v: { seq: number; epoch: number } | null) => void;
+    const firstCursorHeld = new Promise<{ seq: number; epoch: number } | null>((resolve) => {
+      releaseFirstCursor = resolve;
+    });
+    let scopedCursorCalls = 0;
+    let scopedReadCalls = 0;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    const migrateSpy = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockImplementation(async () => {
+      migratedInPlace = true;
+    });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key: string) => {
+      if (key === scopedKey) {
+        scopedReadCalls += 1;
+        return migratedInPlace ? [{ ...rawUserMsg, sessionId: scopedKey }] : [];
+      }
+      if (key === sessionName) {
+        return migratedInPlace ? [] : [rawUserMsg];
+      }
+      return [];
+    });
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockImplementation(async (key: string) => {
+      if (key === scopedKey) {
+        scopedCursorCalls += 1;
+        // Suspend load() #1 mid-read so wsConnected flips false -> true before load() #1 finishes.
+        if (scopedCursorCalls === 1) return firstCursorHeld;
+        return migratedInPlace ? { epoch: 0, seq: 1 } : null;
+      }
+      return migratedInPlace ? null : { epoch: 0, seq: 1 };
+    });
+
+    const disconnectedWs = { connected: false, onMessage: () => () => {}, sendTimelineHistoryRequest: vi.fn() } as unknown as WsClient;
+    const connectedWs = { connected: true, onMessage: () => () => {}, sendTimelineHistoryRequest: vi.fn() } as unknown as WsClient;
+
+    let seen: TimelineEvent[] = [];
+    function Probe({ ws }: { ws: WsClient }) {
+      seen = useTimeline(sessionName, ws, serverId, { isActiveSession: true }).events;
+      return h('div', { 'data-testid': 'probe-ws-flip' }, seen.map((e) => e.type).join(','));
+    }
+
+    const { rerender } = render(h(Probe, { ws: disconnectedWs }));
+    // Wait until load() #1 has read rawKey and is suspended on getLastSeqAndEpoch(scopedKey)
+    await waitFor(() => expect(scopedCursorCalls).toBe(1));
+    // Cancelled read #1 MUST NOT have fired migrateRawToScoped inside readLocalTimelineMerged!
+    expect(migrateSpy).not.toHaveBeenCalled();
+
+    // Flip wsConnected false -> true: cleanup marks load() #1 cancelled and kicks off load() #2
+    rerender(h(Probe, { ws: connectedWs }));
+    await waitFor(() => expect(screen.getByTestId('probe-ws-flip').textContent).toBe('user.message'));
+
+    // Release load() #1's suspended promise -> remains a no-op because load() #1 was cancelled
+    await act(async () => {
+      releaseFirstCursor(null);
+      await flushMicrotasks();
+    });
+    expect(seen.some((e) => e.type === 'user.message')).toBe(true);
+    expect(scopedReadCalls).toBeGreaterThanOrEqual(2);
+    expect(migrateSpy).toHaveBeenCalledTimes(1);
+    expect(migrateSpy).toHaveBeenCalledWith(sessionName, scopedKey, [rawUserMsg]);
+  });
+
+  it('recovers via migrationGeneration re-read when concurrent migration moves raw rows to scoped mid-read', async () => {
+    const sessionName = `deck_concurrent_mig_read_${Date.now()}`;
+    const serverId = `srv-concurrent-mig-${Date.now()}`;
+    const scopedKey = `${serverId}:${sessionName}`;
+    const rawUserMsg: TimelineEvent = {
+      eventId: 'concurrent-mig-user-1',
+      sessionId: sessionName,
+      ts: 50,
+      epoch: 0,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'migrated concurrently during read' },
+    };
+
+    // Model IDB's single-row primary-key (eventId) semantics in-memory so migrateRawToScoped
+    // removes rows from rawSessionId when moving them into scopedKey.
+    const byEventId = new Map<string, TimelineEvent>([[rawUserMsg.eventId, rawUserMsg]]);
+    const origMigrate = TimelineDB.prototype.migrateRawToScoped;
+    let triggeredConcurrentMigration = false;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockImplementation(async function (this: TimelineDB, rawId, targetKey, events) {
+      await origMigrate.call(this, rawId, targetKey, events);
+      for (const e of events) {
+        const cur = byEventId.get(e.eventId);
+        if (cur) byEventId.set(e.eventId, { ...cur, sessionId: targetKey });
+      }
+    });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async function (this: TimelineDB, key: string) {
+      const rows = [...byEventId.values()].filter((e) => e.sessionId === key).sort((a, b) => a.ts - b.ts);
+      if (key === sessionName && !triggeredConcurrentMigration) {
+        triggeredConcurrentMigration = true;
+        // Concurrent in-place migration commits right before the fallback rawKey read sees its data!
+        await this.migrateRawToScoped(sessionName, scopedKey, [rawUserMsg]);
+        return [...byEventId.values()].filter((e) => e.sessionId === key);
+      }
+      return rows;
+    });
+
+    const seenCacheSteps: string[] = [];
+    function Probe() {
+      const { events, historyStatus } = useTimeline(sessionName, null, serverId, { isActiveSession: true });
+      const cacheStep = historyStatus?.steps.cache ?? '';
+      if (cacheStep && seenCacheSteps.at(-1) !== cacheStep) seenCacheSteps.push(cacheStep);
+      return h('div', { 'data-testid': 'probe-concurrent-mig' }, events.map((e) => String(e.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-concurrent-mig').textContent).toBe('migrated concurrently during read');
+    });
+    expect(seenCacheSteps).toContain('done');
+    expect(seenCacheSteps).not.toContain('empty');
+  });
+
+  it('recovers bare split-key segment via mergeRawSegmentLater when concurrent migration moves bare row into scopedKey', async () => {
+    const sessionName = `deck_split_concurrent_${Date.now()}`;
+    const serverId = `srv-split-concurrent-${Date.now()}`;
+    const scopedKey = `${serverId}:${sessionName}`;
+    const scopedEvent: TimelineEvent = {
+      eventId: `${sessionName}-scoped`, sessionId: scopedKey, ts: 2, epoch: 1, seq: 2,
+      source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'scoped segment' },
+    };
+    const bareEvent: TimelineEvent = {
+      eventId: `${sessionName}-bare`, sessionId: sessionName, ts: 1, epoch: 1, seq: 1,
+      source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'bare segment' },
+    };
+
+    const byEventId = new Map<string, TimelineEvent>([
+      [scopedEvent.eventId, scopedEvent],
+      [bareEvent.eventId, bareEvent],
+    ]);
+    const origMigrate = TimelineDB.prototype.migrateRawToScoped;
+    let migratedBareDuringSplitRead = false;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 2, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockImplementation(async function (this: TimelineDB, rawId, targetKey, events) {
+      await origMigrate.call(this, rawId, targetKey, events);
+      for (const e of events) {
+        const cur = byEventId.get(e.eventId);
+        if (cur) byEventId.set(e.eventId, { ...cur, sessionId: targetKey });
+      }
+    });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async function (this: TimelineDB, key: string) {
+      if (key === sessionName && !migratedBareDuringSplitRead) {
+        migratedBareDuringSplitRead = true;
+        // Concurrent migrator moves bareEvent into scopedKey BEFORE Phase-2 raw read observes it!
+        await this.migrateRawToScoped(sessionName, scopedKey, [bareEvent]);
+      }
+      return [...byEventId.values()].filter((e) => e.sessionId === key).sort((a, b) => a.ts - b.ts);
+    });
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-split-concurrent' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-split-concurrent').textContent).toBe('bare segment|scoped segment');
+    });
+  });
+
   it('falls back to raw localStorage snapshot when scoped key is empty', () => {
     // Sibling regression. Snapshot was written under bare sessionId
     // because `selectedServerId` was null at the time. The synchronous
@@ -580,6 +1460,74 @@ describe('useTimeline global cache bounds', () => {
     // The fallback also migrates the snapshot to the scoped key.
     expect(localStorage.getItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`)).toBeTruthy();
     expect(localStorage.getItem(`rcc_timeline_snapshot:${sessionName}`)).toBeNull();
+  });
+
+  it('keeps the raw snapshot when the scoped rewrite cannot be stored', () => {
+    // Data-loss guard for the raw->scoped snapshot migration. It used to depend
+    // on setItem THROWING in order to skip the follow-up remove. Porting it to
+    // the quota-aware writer, which reports failure by RETURNING FALSE, would
+    // delete the only surviving copy of this session's local history.
+    //
+    // The failure injected here is a SecurityError, not QuotaExceededError, and
+    // that distinction is the whole reason this test is deterministic: only a
+    // quota failure triggers safeLocalStorageSetItem's eviction sweep, which
+    // clears every other volatile key -- this session's bare-key snapshot
+    // included -- and would mask what the migration itself did. A blocked or
+    // private-mode store fails without evicting, so the migration's own
+    // behaviour is the only thing that can remove the key.
+    // Fake timers are load-bearing here, not hygiene. This probe is inactive, so
+    // its IndexedDB load is staggered by setTimeout(80) and -- by design -- is
+    // NOT cancelled on cleanup. With real timers a slow machine fires that load
+    // after the injection below is restored, the migration then runs for real,
+    // and it legitimately deletes the raw key. That is what made this test pass
+    // locally and fail on CI: the assertion was observing an unstubbed run.
+    vi.useFakeTimers();
+    const sessionName = `deck_ls_denied_${Date.now()}`;
+    const serverId = `srv-ls-denied-${Date.now()}`;
+    const events = makeEvents(sessionName, 3);
+    const rawKey = `rcc_timeline_snapshot:${sessionName}`;
+    localStorage.setItem(rawKey, JSON.stringify(events));
+    localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
+
+    // Intercept BOTH shapes. Depending on the jsdom/vitest combination
+    // `localStorage` is either the memory shim installed by the setup file (an
+    // own-property object) or a real Storage whose methods live on the
+    // prototype, and stubbing only one of them silently does nothing.
+    const deny = (): never => { throw new DOMException('storage is blocked', 'SecurityError'); };
+    // Always stub the prototype when one exists, unconditionally: jsdom's real
+    // Storage is proxy-backed and an instance-level spy on it can be silently
+    // ignored, and once that happens `window.localStorage.setItem` still equals
+    // the prototype's function — so any check that compares the two to decide
+    // whether the prototype also needs stubbing concludes "no" exactly when the
+    // answer is "yes".
+    const spies = [vi.spyOn(window.localStorage, 'setItem').mockImplementation(deny)];
+    if (typeof Storage !== 'undefined' && typeof Storage.prototype?.setItem === 'function') {
+      spies.push(vi.spyOn(Storage.prototype, 'setItem').mockImplementation(deny));
+    }
+    // State the precondition instead of assuming it. An ineffective stub would
+    // otherwise make this test quietly assert nothing and fail later with a
+    // confusing "expected null to be truthy" somewhere else entirely.
+    expect(() => localStorage.setItem('rcc_timeline_snapshot:__probe__', 'x')).toThrow();
+    expect(spies.length).toBeGreaterThan(0);
+
+    function Probe() {
+      const { events: seen } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': 'ls-denied-probe' }, String(seen.length));
+    }
+    render(h(Probe));
+
+    // The user still sees their history on this open...
+    expect(screen.getByTestId('ls-denied-probe').textContent).toBe('3');
+    // ...and the only copy of it is still there for the next one.
+    expect(localStorage.getItem(rawKey)).toBeTruthy();
+
+    // Note there is deliberately no restore here. The suite's afterEach already
+    // calls vi.restoreAllMocks(), so the injection stays in force for the whole
+    // test. An earlier version restored in a finally block and asserted after
+    // it, which left a window where a write could succeed -- and then the test
+    // was reporting on a migration that had never been stubbed at all. Whether
+    // the migration runs synchronously in the seed or later is then irrelevant:
+    // every attempt inside this test is denied.
   });
 
   it('stays idle for shell/script sessions with history disabled', async () => {
@@ -913,6 +1861,192 @@ describe('useTimeline global cache bounds', () => {
     ]);
   });
 
+  it('keeps renderable conversation in the synchronous snapshot despite a signal-heavy cache', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_visible_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const conversation = makeEvents(sessionName, 4);
+    const signals: TimelineEvent[] = Array.from({ length: 300 }, (_, index) => ({
+      eventId: `${sessionName}-signal-${index}`,
+      sessionId: sessionName,
+      ts: 100 + index,
+      epoch: 1,
+      seq: 100 + index,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: { status: 'idle' },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, [...conversation, ...signals]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual(conversation.map((event) => event.eventId));
+  });
+
+  it('gives recent text priority over newer tool details within the synchronous snapshot budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_text_priority_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const textEvents = makeEvents(sessionName, 8).map((event, index) => ({
+      ...event,
+      payload: { text: `${index}:${'t'.repeat(40_000)}` },
+    }));
+    const toolEvents: TimelineEvent[] = Array.from({ length: 8 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: 100 + index,
+      epoch: 1,
+      seq: 100 + index,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { output: `${index}:${'x'.repeat(40_000)}` },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, [...textEvents, ...toolEvents]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const stored = localStorage.getItem(snapshotKey);
+    expect(stored).toBeTruthy();
+    const storedBytes = new TextEncoder().encode(stored!).byteLength;
+    expect(storedBytes).toBeGreaterThan(64 * 1024);
+    expect(storedBytes).toBeLessThanOrEqual(256 * 1024);
+    const snapshot = JSON.parse(stored!) as TimelineEvent[];
+    const retainedText = snapshot.filter((event) => event.type === 'assistant.text');
+    expect(retainedText.length).toBeGreaterThan(0);
+    expect(retainedText.at(-1)?.eventId).toBe(textEvents.at(-1)?.eventId);
+    expect(snapshot.filter((event) => event.type === 'tool.result')).toHaveLength(0);
+  });
+
+  it('keeps a renderable preview when one recent text row exceeds the whole snapshot budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_large_text_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const hugeText = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: `answer:${'中'.repeat(300_000)}` },
+    }));
+    const tool: TimelineEvent = {
+      eventId: `${sessionName}-tool`,
+      sessionId: sessionName,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { output: 'small tool row' },
+    };
+
+    __setTimelineCacheForTests(cacheKey, [...hugeText, tool]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const snapshot = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]') as TimelineEvent[];
+    const text = snapshot.find((event) => event.type === 'assistant.text');
+    expect(text, 'oversized conversation text was replaced by a tool-only first paint').toBeTruthy();
+    expect(String(text?.payload.text ?? '')).toContain('answer:');
+    expect(text?.payload.historyPayloadTruncated).toBe(true);
+  });
+
+  it('reads only the Unicode preview prefix of an oversized answer during snapshot persistence', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_prefix_cost_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rawText = '😀'.repeat(1_024) + '中'.repeat(300_000);
+    const [event] = makeEvents(sessionName, 1);
+    const original = String.prototype[Symbol.iterator];
+    let consumed = 0;
+    const spy = vi.spyOn(String.prototype, Symbol.iterator).mockImplementation(function* (this: string) {
+      for (const char of original.call(this)) {
+        if (String(this) === rawText) consumed++;
+        yield char;
+      }
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [{ ...event!, payload: { text: rawText } }]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(consumed).toBe(1_025);
+    const snapshot = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]') as TimelineEvent[];
+    expect(snapshot[0]?.payload.text).toBe('😀'.repeat(1_024) + '…');
+    expect(snapshot[0]?.payload.historyPayloadTruncated).toBe(true);
+  });
+
+  it('never stringifies an already oversized text body just to discard it for a preview', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_oversized_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const [event] = makeEvents(sessionName, 1);
+    const oversized = { ...event!, payload: { text: '中'.repeat(300_000) } };
+    const stringify = JSON.stringify;
+    let fullCopies = 0;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (value === oversized) fullCopies++;
+      return stringify(value, ...args);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [oversized]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { spy.mockRestore(); }
+    expect(fullCopies).toBe(0);
+    const stored = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]');
+    expect(stored[0].payload.text).toBe('中'.repeat(1_024) + '…');
+  });
+
+  it('serializes each source only once while shrinking its own quota budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_retry_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const events = makeEvents(sessionName, 2);
+    const stringify = JSON.stringify;
+    const setItem = Storage.prototype.setItem;
+    let fullCopies = 0;
+    const jsonSpy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (events.includes(value as TimelineEvent)) fullCopies++;
+      return stringify(value, ...args);
+    });
+    const storageSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (this === localStorage && key === `rcc_timeline_snapshot:${cacheKey}`) throw new DOMException('synthetic full store', 'QuotaExceededError');
+      return setItem.call(this, key, value);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, events);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { jsonSpy.mockRestore(); storageSpy.mockRestore(); }
+    expect(fullCopies).toBe(events.length);
+    expect(JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]')).toEqual(events);
+  });
+
+  it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_budget_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const events = makeEvents(sessionName, 40).map((event, index) => ({
+      ...event,
+      payload: { text: `${index}:${'x'.repeat(20_000)}` },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, events);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const stored = localStorage.getItem(snapshotKey);
+    expect(stored).toBeTruthy();
+    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(256 * 1024);
+    const snapshot = JSON.parse(stored!) as TimelineEvent[];
+    expect(snapshot.length).toBeGreaterThan(0);
+    expect(snapshot.at(-1)?.eventId).toBe(events.at(-1)?.eventId);
+  });
+
   it('preserves latest streaming text in the local pagehide snapshot without writing it to IDB', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_streaming_${Date.now()}`;
@@ -965,6 +2099,61 @@ describe('useTimeline global cache bounds', () => {
     ]);
     expect(snapshot[1]?.payload).toMatchObject({ text: 'streaming 29', streaming: true });
     expect(putEventsSpy).not.toHaveBeenCalled();
+  });
+
+  it('pagehide only reserializes caches with in-flight streaming text', async () => {
+    vi.useFakeTimers();
+    const serverId = `srv-freeze-${Date.now()}`;
+    const stableSession = `deck_freeze_stable_${Date.now()}`;
+    const streamingSession = `deck_freeze_streaming_${Date.now()}`;
+    const stableKey = `rcc_timeline_snapshot:${serverId}:${stableSession}`;
+    const streamingKey = `rcc_timeline_snapshot:${serverId}:${streamingSession}`;
+
+    for (const sessionName of [stableSession, streamingSession]) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-stable`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'stable' },
+      }, serverId);
+    }
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    expect(localStorage.getItem(stableKey)).toBeTruthy();
+    expect(localStorage.getItem(streamingKey)).toBeTruthy();
+
+    const streamingCacheKey = `${serverId}:${streamingSession}`;
+    const streamingEvent: TimelineEvent = {
+      eventId: `${streamingSession}-streaming`,
+      sessionId: streamingSession,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'partial', streaming: true },
+    };
+    __setTimelineCacheForTests(streamingCacheKey, [
+      ...(__getTimelineCacheForTests(streamingCacheKey) ?? []),
+      streamingEvent,
+    ]);
+
+    const stableSnapshotBeforeFreeze = localStorage.getItem(stableKey);
+    const streamingSnapshotBeforeFreeze = localStorage.getItem(streamingKey);
+    // Exercise the exact callback registered for pagehide/visibility freeze.
+    // Calling it directly keeps this scope assertion independent from jsdom's
+    // process-global event-listener lifecycle when the full suite reuses forks;
+    // the preceding test separately proves that pagehide invokes this callback.
+    expect(__flushTimelineSnapshotsBeforeFreezeForTests()).toBe(1);
+
+    expect(localStorage.getItem(stableKey)).toBe(stableSnapshotBeforeFreeze);
+    expect(localStorage.getItem(streamingKey)).not.toBe(streamingSnapshotBeforeFreeze);
+    expect(localStorage.getItem(streamingKey)).toContain('partial');
   });
 
   it('does not persist streaming-only global ingests to IndexedDB', async () => {
@@ -1065,7 +2254,7 @@ describe('useTimeline global cache bounds', () => {
     render(h(Probe));
 
     await waitFor(() => {
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
       expect(fetchTextTailSpy).not.toHaveBeenCalled();
       expect(screen.getByTestId('probe').getAttribute('data-text-tail')).toBe('skipped');
     });
@@ -1098,7 +2287,7 @@ describe('useTimeline global cache bounds', () => {
     view.rerender(h(Probe, { tick: 1 }));
 
     await waitFor(() => {
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     });
   });
 
@@ -1390,7 +2579,7 @@ describe('useTimeline global cache bounds', () => {
     render(h(Probe));
 
     await waitFor(() => {
-      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     });
 
     await act(async () => {
@@ -1568,6 +2757,383 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
       expect(screen.getByTestId('older').getAttribute('data-older')).toBe('false');
     });
+  });
+
+  it('bounds repeated newer cursors after a filtered summary page', async () => {
+    const sessionName = `deck_summary_cursor_guard_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestCount = 0;
+    const requestIds: string[] = [];
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      const requestId = `history-${++requestCount}`;
+      requestIds.push(requestId);
+      return requestId;
+    });
+    const cachedEvent: TimelineEvent = {
+      eventId: `${sessionName}-cached`,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.final',
+      payload: { text: 'cached final' },
+    };
+    __setTimelineCacheForTests(sessionName, [cachedEvent]);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { if (handler === next) handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, undefined, {
+        isActiveSession: true,
+        isVisible: false,
+        subscriptionMode: 'summary',
+      });
+      return h('div', { 'data-testid': 'summary-cursor-events' }, String(events.length));
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+        sessionName,
+        200,
+        undefined,
+        undefined,
+        expect.objectContaining({ epoch: 1, afterSeq: 10, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+        1024 * 1024,
+      );
+    });
+    const initialRequestCount = requestCount;
+
+    const repeatedCursor = { epoch: 1, afterSeq: 10, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER } as const;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: requestIds[0],
+        epoch: 1,
+        events: [],
+        hasMore: true,
+        nextCursor: repeatedCursor,
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+      } as ServerMessage);
+    });
+    await flushMicrotasks();
+
+    // A filtered page can be empty, but the same cursor must not cause a
+    // second request (the old behavior produced hundreds of thousands).
+    expect(requestCount).toBe(initialRequestCount);
+    expect(__shouldRequestNewerTimelineCursorForTests(null, repeatedCursor)).toBe(true);
+    expect(__shouldRequestNewerTimelineCursorForTests(
+      JSON.stringify(['newer', 1, 10, null, null]),
+      repeatedCursor,
+    )).toBe(false);
+  });
+
+  it('resets the newer cursor guard when switching sessions with an identical cursor', async () => {
+    const sessionA = `deck_cursor_switch_a_${Date.now()}`;
+    const sessionB = `deck_cursor_switch_b_${Date.now()}`;
+    const eventFor = (sessionId: string): TimelineEvent => ({
+      eventId: `${sessionId}-cached`,
+      sessionId,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.final',
+      payload: { text: `${sessionId} cached final` },
+    });
+    __setTimelineCacheForTests(sessionA, [eventFor(sessionA)]);
+    __setTimelineCacheForTests(sessionB, [eventFor(sessionB)]);
+
+    const sendTimelineHistoryRequest = vi.fn(() => `history-${sendTimelineHistoryRequest.mock.calls.length + 1}`);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe({ session }: { session: string }) {
+      useTimeline(session, ws, undefined, {
+        isActiveSession: true,
+        isVisible: false,
+        subscriptionMode: 'summary',
+      });
+      return h('div', { 'data-testid': 'cursor-switch' }, session);
+    }
+
+    const view = render(h(Probe, { session: sessionA }));
+    await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1));
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[4]).toMatchObject({
+      epoch: 1,
+      afterSeq: 10,
+      direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+    });
+
+    sendTimelineHistoryRequest.mockClear();
+    view.rerender(h(Probe, { session: sessionB }));
+    await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1));
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[0]).toBe(sessionB);
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[4]).toMatchObject({
+      epoch: 1,
+      afterSeq: 10,
+      direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+    });
+  });
+
+  it('never lets a late load-earlier response rewrite the window switched in afterward', async () => {
+    const serverId = `srv-window-switch-${Date.now()}`;
+    const sessionA = `deck_window_a_${Date.now()}`;
+    const sessionB = `deck_window_b_${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionA}`, makeEvents(sessionA, 2));
+    __setTimelineCacheForTests(`${serverId}:${sessionB}`, makeEvents(sessionB, 2));
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelinePageRequest = vi.fn(() => 'older-window-a');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { if (handler === next) handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-window'),
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe({ sessionName }: { sessionName: string }) {
+      const timeline = useTimeline(sessionName, ws, serverId);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'window-switch-older',
+        'data-text': timeline.events.map((event) => String(event.payload.text ?? '')).join('|'),
+        onClick: timeline.loadOlderEvents,
+      }, sessionName);
+    }
+
+    const view = render(h(Probe, { sessionName: sessionA }));
+    await act(async () => { screen.getByTestId('window-switch-older').click(); });
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionA,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER }),
+      300,
+    );
+
+    view.rerender(h(Probe, { sessionName: sessionB }));
+    await act(async () => { await flushMicrotasks(); });
+    const before = screen.getByTestId('window-switch-older').getAttribute('data-text');
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.PAGE,
+        sessionName: sessionA,
+        requestId: 'older-window-a',
+        epoch: 1,
+        events: [{
+          ...makeEvents(sessionA, 1)[0]!,
+          eventId: `${sessionA}-late-older`,
+          ts: -1,
+          seq: -1,
+          payload: { text: 'must stay in window A' },
+        }],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: false,
+      } as ServerMessage);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('window-switch-older').textContent).toBe(sessionB);
+    expect(screen.getByTestId('window-switch-older').getAttribute('data-text')).toBe(before);
+    expect(__getTimelineCacheForTests(`${serverId}:${sessionB}`)?.some(
+      (event) => event.eventId === `${sessionA}-late-older`,
+    )).toBe(false);
+  });
+
+  it('bootstrap self-heals a memory-only IndexedDB on open (no manual force-refresh needed)', async () => {
+    // Regression: on window open the pane showed EMPTY chat and only a manual
+    // ↻ (强制刷新) brought local history back. Root cause: a transient
+    // IndexedDB open failure strands `sharedDb` in memory-only mode; the ↻
+    // path (reloadLocalTimeline) calls resetAndReopen() to recover, but the
+    // bootstrap read did not — so it read empty and painted blank. In jsdom
+    // there is no IndexedDB, so sharedDb is memory-only: the exact degraded
+    // state. The bootstrap must now perform the same resetAndReopen() recovery.
+    const resetSpy = vi.spyOn(TimelineDB.prototype, 'resetAndReopen');
+    try {
+      const sessionName = `deck_membanky_${Date.now()}`;
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: vi.fn(() => 'h-1'),
+        sendTimelinePageRequest: vi.fn(() => 'p-1'),
+        supportsTimelineProtocolRevision: vi.fn(() => true),
+      } as unknown as WsClient;
+
+      function Probe() {
+        // Cold session: no module cache, no localStorage snapshot → bootstrap
+        // falls through to the IndexedDB read path (path 3).
+        useTimeline(sessionName, ws, 'srv');
+        return h('div', { 'data-testid': 'p' });
+      }
+      render(h(Probe));
+
+      await waitFor(() => {
+        expect(resetSpy).toHaveBeenCalled();
+      });
+    } finally {
+      resetSpy.mockRestore();
+    }
+  });
+
+  it('keeps scroll-top older loading enabled after forward history reports hasMore false', async () => {
+    const sessionName = `deck_forward_hasmore_false_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `history-${requestSeq}`;
+      return lastRequestId;
+    });
+    const sendTimelinePageRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `page-${requestSeq}`;
+      return lastRequestId;
+    });
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'older-forward-false',
+        'data-older': String(timeline.hasOlderHistory),
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalled();
+      expect(screen.getByTestId('older-forward-false').getAttribute('data-older')).toBe('true');
+    });
+    const initialRequestId = lastRequestId;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: initialRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: false,
+        nextCursor: null,
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('older-forward-false').getAttribute('data-older')).toBe('true');
+
+    await act(async () => {
+      screen.getByTestId('older-forward-false').click();
+    });
+
+    expect(sendTimelinePageRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 1000 }),
+      300,
+    );
+  });
+
+  it('loadOlder derives its cursor from on-screen events when the module cache is empty (localStorage seed + scroll-top)', async () => {
+    // Regression for the reported bug "刷新/打开对话时只有几行、下翻到顶加载旧记录失效":
+    // the localStorage first-paint seed path (rcc_timeline_snapshot) intentionally
+    // does NOT write the global module cache (avoids a path-1 short-circuit that
+    // would skip the fuller IDB read). loadOlderEvents used to hard-depend on that
+    // module cache and silently return when it was empty — so a pane showing seed
+    // events could never paginate older history. The fix falls back to the
+    // on-screen `eventsRef.current`. This test proves: seed on screen + empty
+    // module cache + loadOlder → a PAGE request IS issued with a cursor derived
+    // from the seed's earliest ts.
+    const sessionName = `deck_sub_seed_only_${Date.now()}`;
+    const serverId = 'srv';
+    // Seed ONLY localStorage (first-paint). Do NOT call __setTimelineCacheForTests —
+    // the module cache stays empty, reproducing the cold-refresh window.
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${serverId}:${sessionName}`,
+      JSON.stringify(makeEvents(sessionName, 4)), // ts 0..3, epoch 1
+    );
+
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => { requestSeq += 1; lastRequestId = `history-${requestSeq}`; return lastRequestId; });
+    const sendTimelinePageRequest = vi.fn(() => { requestSeq += 1; lastRequestId = `page-${requestSeq}`; return lastRequestId; });
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    let loadOlder: () => void = () => {};
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId);
+      loadOlder = timeline.loadOlderEvents;
+      return h('div', { 'data-testid': 'p', 'data-events': String(timeline.events.length) });
+    }
+
+    render(h(Probe));
+    // Seed is painted synchronously from localStorage on first paint.
+    await waitFor(() => {
+      expect(screen.getByTestId('p').getAttribute('data-events')).toBe('4');
+    });
+
+    // Trigger scroll-to-top load-older directly (bypasses ChatView's
+    // hasOlderHistory gate to isolate loadOlderEvents itself).
+    await act(async () => { loadOlder(); });
+
+    // BEFORE the fix this asserted nothing was sent (silent return on empty
+    // cache). AFTER the fix a PAGE request is issued with the seed-derived
+    // OLDER cursor (beforeTs = earliest seed ts = 0).
+    expect(sendTimelinePageRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 0 }),
+      expect.anything(),
+    );
   });
 
   it('does not close older pagination on terminal or deferred page outcomes', async () => {
@@ -1841,7 +3407,11 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 9);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+        sessionName, 200, undefined, undefined,
+        expect.objectContaining({ afterSeq: 10, epoch: 1, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+        1024 * 1024,
+      );
     });
 
     await act(async () => {
@@ -2210,7 +3780,11 @@ describe('useTimeline global cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('live cached text');
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 0);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName, 200, undefined, undefined,
+      expect.objectContaining({ afterSeq: 1, epoch: 7, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+      1024 * 1024,
+    );
 
     await act(async () => {
       handler?.({
@@ -2358,6 +3932,111 @@ describe('useTimeline global cache bounds', () => {
     expect(putEventsSpy).toHaveBeenCalledTimes(1);
     const persisted = putEventsSpy.mock.calls[0]?.[0] as TimelineEvent[];
     expect(persisted[0]?.payload).toMatchObject({ text: 'final', streaming: false });
+  });
+
+  it('keeps a late cancelled old turn before the newer user message', async () => {
+    const sessionName = `deck_transport_late_cancel_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-late-cancel',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-late-cancel' },
+        events
+          .filter((event) => event.type === 'assistant.text' || event.type === 'user.message')
+          .map((event) => String(event.payload.text ?? ''))
+          .join('|'),
+      );
+    }
+
+    render(h(Probe, {}));
+
+    const oldAssistantEventId = `${sessionName}-old-assistant`;
+    await act(async () => {
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: oldAssistantEventId,
+          sessionId: sessionName,
+          ts: 100,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'old partial', streaming: true },
+        },
+      } as ServerMessage);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-late-cancel').textContent).toBe('old partial');
+    });
+
+    // More than ten intervening events reproduces the production Stop path:
+    // queue state, synthetic tool terminals, delivery, running, and memory
+    // context all arrive before the provider's delayed CANCELLED settlement.
+    await act(async () => {
+      for (let seq = 2; seq <= 13; seq += 1) {
+        handler?.({
+          type: 'timeline.event',
+          event: {
+            eventId: `${sessionName}-tool-${seq}`,
+            sessionId: sessionName,
+            ts: 100 + seq,
+            epoch: 1,
+            seq,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'tool.result',
+            payload: { toolCallId: `tool-${seq}` },
+          },
+        } as ServerMessage);
+      }
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-new-user`,
+          sessionId: sessionName,
+          ts: 200,
+          epoch: 1,
+          seq: 14,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'new message after stop', allowDuplicate: true },
+        },
+      } as ServerMessage);
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: oldAssistantEventId,
+          sessionId: sessionName,
+          ts: 100,
+          epoch: 1,
+          seq: 15,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'old partial\n\n⚠️ Turn cancelled', streaming: false, memoryExcluded: true },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-late-cancel').textContent)
+        .toBe('old partial\n\n⚠️ Turn cancelled|new message after stop');
+    });
   });
 
   it('does not dedup confirmed user messages marked allowDuplicate', async () => {
@@ -2535,6 +4214,60 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('retains queue identity from transport history so a delivered row cannot reappear below the timeline', async () => {
+    const sessionName = `deck_transport_queue_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport-queue-identity',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, 'srv');
+      const event = events.find((candidate) => candidate.type === 'user.message');
+      return h('div', {
+        'data-testid': 'probe',
+        'data-command-id': String(event?.payload.commandId ?? ''),
+        'data-client-message-id': String(event?.payload.clientMessageId ?? ''),
+        'data-queue-appended': String(event?.payload.queueAppended ?? false),
+        'data-pending-version': String(event?.payload.pendingMessageVersion ?? ''),
+      }, String(event?.payload.text ?? ''));
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [{
+          type: 'user.message',
+          sessionId: sessionName,
+          text: 'already appended',
+          commandId: 'append-id-1',
+          clientMessageId: 'append-id-1',
+          queueAppended: true,
+          pendingMessageVersion: 12,
+          _ts: 10,
+        }],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      const probe = screen.getByTestId('probe');
+      expect(probe.textContent).toBe('already appended');
+      expect(probe.getAttribute('data-command-id')).toBe('append-id-1');
+      expect(probe.getAttribute('data-client-message-id')).toBe('append-id-1');
+      expect(probe.getAttribute('data-queue-appended')).toBe('true');
+      expect(probe.getAttribute('data-pending-version')).toBe('12');
+    });
+  });
+
   it('replaces provisional transport history with authoritative timeline.history instead of duplicating it', async () => {
     const sessionName = `deck_transport_history_replace_${Date.now()}`;
     let handler: ((msg: ServerMessage) => void) | null = null;
@@ -2655,7 +4388,11 @@ describe('useTimeline global cache bounds', () => {
 
     // Initial mount already has cached cursor state, so it asks only for the
     // missed tail instead of re-downloading a full recent-history snapshot.
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName, 200, undefined, undefined,
+      expect.objectContaining({ afterSeq: 2, epoch: 1, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+      1024 * 1024,
+    );
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
@@ -2666,6 +4403,594 @@ describe('useTimeline global cache bounds', () => {
 
     expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName, 200, undefined, undefined,
+      expect.objectContaining({ afterSeq: 2, epoch: 1, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+      1024 * 1024,
+    );
+  });
+  it('reports the cache step as empty, not done, when this device has no copy', async () => {
+    // A bare "done" rendered a ✓ next to a blank chat, which reads as "your
+    // history is cached but we refuse to show it" rather than "this device has
+    // no copy yet". `empty` is terminal but distinguishable.
+    const sessionName = `deck_cold_${Date.now()}`;
+    const serverId = `srv-cold-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    let seenCacheStep: string | undefined;
+    let seenCount = -1;
+    let seenCacheCount: number | undefined;
+    function Probe() {
+      const { historyStatus, events } = useTimeline(sessionName, null, serverId);
+      seenCacheStep = historyStatus?.steps.cache;
+      seenCount = events.length;
+      seenCacheCount = historyStatus?.counts.cache;
+      return h('div', { 'data-testid': 'probe-cold' }, String(historyStatus?.steps.cache ?? ''));
+    }
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-cold').textContent).toBe('empty');
+    });
+    // Nothing was restored, which is exactly why it must not claim success.
+    expect(seenCount).toBe(0);
+    expect(seenCacheStep).not.toBe('done');
+    // The count is what makes "nothing stored" distinguishable from "stored but
+    // not shown" without attaching a debugger.
+    expect(seenCacheCount).toBe(0);
+  });
+
+  it('reports how many events the local read actually produced', async () => {
+    const sessionName = `deck_counted_${Date.now()}`;
+    const serverId = `srv-counted-${Date.now()}`;
+    const stored: TimelineEvent[] = [1, 2, 3].map((n) => ({
+      eventId: `${sessionName}-${n}`,
+      sessionId: `${serverId}:${sessionName}`,
+      ts: n, epoch: 1, seq: n,
+      source: 'daemon', confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `local ${n}` },
+    }));
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 3, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key: string) => (
+      key === `${serverId}:${sessionName}` ? stored : []
+    ));
+
+    let cacheCount: number | undefined;
+    function Probe() {
+      const { historyStatus } = useTimeline(sessionName, null, serverId);
+      cacheCount = historyStatus?.counts.cache;
+      return h('div', { 'data-testid': 'probe-count' }, String(historyStatus?.counts.cache ?? ''));
+    }
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-count').textContent).toBe('3');
+    });
+    expect(cacheCount).toBe(3);
+  });
+  // Both regressions below come from deriving the local-cache verdict from the
+  // rendered timeline instead of from what the local sources actually returned.
+  it('keeps the localStorage count when IndexedDB then returns nothing', async () => {
+    // Previously the IDB completion overwrote the step with `stored.length`,
+    // rendering "✓ 本地缓存 0" while four locally restored messages were on
+    // screen — the number contradicting the view it was meant to explain.
+    const events = makeEvents('deck_sub_seed_then_empty', 4);
+    localStorage.setItem(
+      'rcc_timeline_snapshot:srv:deck_sub_seed_then_empty',
+      JSON.stringify(events),
+    );
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe() {
+      const { historyStatus } = useTimeline('deck_sub_seed_then_empty', null, 'srv');
+      return h(
+        'div',
+        { 'data-testid': 'probe-seed', 'data-state': historyStatus?.steps.cache ?? '' },
+        String(historyStatus?.counts.cache ?? ''),
+      );
+    }
+    render(h(Probe));
+
+    // The IDB read settles asynchronously; the point is what it must NOT do to
+    // the already-restored local count when it comes back empty.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-seed').getAttribute('data-state')).toBe('done');
+    });
+    const probe = screen.getByTestId('probe-seed');
+    expect(probe.textContent).toBe('4');
+    expect(probe.textContent).not.toBe('0');
+  });
+
+  it('does not let a live event promote an empty local store to a hit', async () => {
+    // The failure this number exists to expose is "nothing is stored on this
+    // device". A realtime event landing WHILE the IDB read is still in flight
+    // used to make that report as `done`, hiding the write-side bug.
+    const sessionName = `deck_live_${Date.now()}`;
+    const serverId = 'srv-live';
+    const cacheKey = `${serverId}:${sessionName}`;
+
+    // Hold the IDB read open so the live event provably lands first.
+    // The read is issued once per key (scoped + bare fallback), so every
+    // pending resolver has to be released, not just the first.
+    const pendingReads: Array<(value: TimelineEvent[]) => void> = [];
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(
+      () => new Promise<TimelineEvent[]>((resolve) => { pendingReads.push(resolve); }),
+    );
+
+    function Probe() {
+      const { historyStatus, events: seen } = useTimeline(sessionName, null, serverId);
+      return h('div', {
+        'data-testid': 'probe-live',
+        'data-state': historyStatus?.steps.cache ?? '',
+        'data-count': String(historyStatus?.counts.cache ?? ''),
+      }, String(seen.length));
+    }
+    render(h(Probe));
+    await waitFor(() => expect(pendingReads.length).toBeGreaterThan(0));
+
+    // A live event reaches the SAME `events` state the broken check inspected,
+    // via the module cache subscription — not through any local-restore path.
+    act(() => {
+      __setTimelineCacheForTests(cacheKey, [{
+        eventId: `${sessionName}-live-1`,
+        sessionId: cacheKey,
+        ts: 1, epoch: 1, seq: 1,
+        source: 'daemon', confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'live, not restored from disk' },
+      } as TimelineEvent]);
+    });
+    // Precondition: the event really is in the rendered timeline before the
+    // read settles — otherwise this test could not detect the regression.
+    await waitFor(() => expect(screen.getByTestId('probe-live').textContent).toBe('1'));
+
+    act(() => { for (const resolve of pendingReads.splice(0)) resolve([]); });
+    // A fallback read may be issued only after the first resolves.
+    await waitFor(() => {
+      if (pendingReads.length > 0) {
+        act(() => { for (const resolve of pendingReads.splice(0)) resolve([]); });
+      }
+      expect(screen.getByTestId('probe-live').getAttribute('data-state')).not.toBe('running');
+    });
+
+    // The event is real and on screen — but it did not come from the local
+    // store, so the local verdict must stay "nothing here".
+    expect(screen.getByTestId('probe-live').getAttribute('data-state')).toBe('empty');
+    expect(screen.getByTestId('probe-live').getAttribute('data-count')).toBe('0');
+  });
+  it('re-accounts the local snapshot when the hook switches sessions', async () => {
+    // On a session switch the mount-time seed no longer applies, so the
+    // localStorage path is the ONLY thing that can register a local hit for the
+    // new key. Without it an empty IDB read reports the new session as having
+    // no local copy when it does.
+    const seeded = makeEvents('deck_switch_target', 5);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_switch_target', JSON.stringify(seeded));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { historyStatus } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch',
+        'data-state': historyStatus?.steps.cache ?? '',
+      }, String(historyStatus?.counts.cache ?? ''));
+    }
+
+    // Start on a session with nothing stored, then switch to the seeded one.
+    const view = render(h(Probe, { session: 'deck_switch_origin' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('empty');
+    });
+
+    view.rerender(h(Probe, { session: 'deck_switch_target' }));
+
+    // Let the async IDB completion land too — asserting the FIRST 'done' would
+    // pass even if the empty read later degraded it back to 'empty'/0.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('done');
+    });
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+
+    expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('done');
+    expect(screen.getByTestId('probe-switch').textContent).toBe('5');
+  });
+  it('raw-render paints a switched module-cache session before passive effects run', async () => {
+    const target = makeEvents('deck_raw_switch_mem_target', 5);
+    __setTimelineCacheForTests('srv:deck_raw_switch_mem_target', target);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-mem',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_mem_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.textContent).toBe('0:');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_mem_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      // This intentionally avoids Testing Library's act(). Passive effects are
+      // parked in queuedPassiveFrames, so old useEffect-only bootstrapping stays
+      // invisible here. The selected session must be available before those
+      // passive effects (and before any async IDB/daemon history) run.
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.textContent).toBe('5:deck_raw_switch_mem_target-0');
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render paints a switched localStorage session before passive effects run', async () => {
+    const target = makeEvents('deck_raw_switch_snapshot_target', 6);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_raw_switch_snapshot_target', JSON.stringify(target));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-localstorage',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_snapshot_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.textContent).toBe('0:');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_snapshot_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.textContent).toBe('6:deck_raw_switch_snapshot_target-0');
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render clears stale events immediately when switching to a session without any synchronous seed', async () => {
+    const origin = makeEvents('deck_raw_switch_cold_origin', 3);
+    __setTimelineCacheForTests('srv:deck_raw_switch_cold_origin', origin);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-cold',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_cold_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.textContent).toBe('3:deck_raw_switch_cold_origin-0');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_cold_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      // The old session's bubbles must not survive until passive bootstrap gets
+      // around to clearing them. Showing a fast loading state is preferable to
+      // painting the wrong conversation.
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.textContent).toBe('0:');
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.getAttribute('data-loading')).toBe('true');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render paints a retained inactive session before passive effects run when it becomes active', async () => {
+    const sessionName = 'deck_raw_retained_activate_snapshot';
+    const target = makeEvents(sessionName, 4);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ active }: { active: boolean }) {
+      const { events: seen, loading } = useTimeline(sessionName, null, 'srv', {
+        isActiveSession: active,
+        isVisible: active,
+      });
+      return h('div', {
+        id: 'probe-raw-retained-activate',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { active: false }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.textContent).toBe('0:');
+
+      // Finish the inactive mount's passive bootstrap before writing the seed.
+      // Otherwise Preact may flush that old passive effect at the beginning of
+      // the next render and a useEffect-only implementation could read the
+      // newly written snapshot before the active render, falsely passing.
+      await drainQueuedPassiveFrames(harness.queuedPassiveFrames);
+      expect(harness.queuedPassiveFrames).toHaveLength(0);
+
+      localStorage.setItem(`rcc_timeline_snapshot:srv:${sessionName}`, JSON.stringify(target));
+      preactRender(h(Probe, { active: true }), harness.container);
+      await flushPrePaintUpdates();
+
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.textContent).toBe('4:deck_raw_retained_activate_snapshot-0');
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('paints a switched session from module cache immediately before async history loads', () => {
+    const target = makeEvents('deck_switch_mem_target', 7);
+    __setTimelineCacheForTests('srv:deck_switch_mem_target', target);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch-sync',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { session: 'deck_switch_mem_origin' }));
+    expect(screen.getByTestId('probe-switch-sync').textContent).toBe('0:');
+
+    view.rerender(h(Probe, { session: 'deck_switch_mem_target' }));
+
+    // No waitFor/async flush: the selected session's local cache must be
+    // visible in the same browser turn, before IDB/daemon history can answer.
+    expect(screen.getByTestId('probe-switch-sync').textContent).toBe('7:deck_switch_mem_target-0');
+    expect(screen.getByTestId('probe-switch-sync').getAttribute('data-loading')).toBe('false');
+  });
+  it('paints a switched session from localStorage immediately before IndexedDB loads', () => {
+    const target = makeEvents('deck_switch_snapshot_target', 6);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_switch_snapshot_target', JSON.stringify(target));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch-localstorage',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { session: 'deck_switch_snapshot_origin' }));
+    expect(screen.getByTestId('probe-switch-localstorage').textContent).toBe('0:');
+
+    view.rerender(h(Probe, { session: 'deck_switch_snapshot_target' }));
+
+    // Regression for mobile tab switches that showed an empty pane with only
+    // "load earlier messages": useState's mount initializer does not re-run
+    // on a session prop change, so the switch path must synchronously re-seed.
+    expect(screen.getByTestId('probe-switch-localstorage').textContent).toBe('6:deck_switch_snapshot_target-0');
+    expect(screen.getByTestId('probe-switch-localstorage').getAttribute('data-loading')).toBe('false');
+  });
+  it('paints a retained inactive session from localStorage immediately when it becomes active', () => {
+    const sessionName = 'deck_retained_activate_snapshot';
+    const target = makeEvents(sessionName, 4);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ active }: { active: boolean }) {
+      const { events: seen, loading } = useTimeline(sessionName, null, 'srv', {
+        isActiveSession: active,
+        isVisible: active,
+      });
+      return h('div', {
+        'data-testid': 'probe-retained-activate',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { active: false }));
+    expect(screen.getByTestId('probe-retained-activate').textContent).toBe('0:');
+
+    // Simulate the production retained-window case: the inactive hook instance
+    // survives, and another already-mounted presentation / pagehide writes the
+    // local tail before this retained window is focused. The session/cacheKey
+    // does NOT change, so only the active flip can synchronously re-seed it.
+    localStorage.setItem(`rcc_timeline_snapshot:srv:${sessionName}`, JSON.stringify(target));
+    view.rerender(h(Probe, { active: true }));
+
+    expect(screen.getByTestId('probe-retained-activate').textContent).toBe('4:deck_retained_activate_snapshot-0');
+    expect(screen.getByTestId('probe-retained-activate').getAttribute('data-loading')).toBe('false');
+  });
+  it('does not carry one session\'s local count into the next', async () => {
+    // Switching from a session WITH a local copy to one without must not
+    // inherit the previous ledger — that would report a cold session as a
+    // healthy local hit: the same false positive this ledger exists to stop,
+    // across sessions instead of across sources.
+    //
+    // A connected ws stub is required, not decoration: with `ws: null` the
+    // switched-to session settles into `idle`/`skipped` (no daemon path exists
+    // to drive it), so the cache verdict never resolves and nothing is assertable.
+    const seeded = makeEvents('deck_carry_from', 5);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_carry_from', JSON.stringify(seeded));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    const ws: WsClient = {
+      get connected() { return true; },
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: () => 'history-carry',
+    } as unknown as WsClient;
+
+    function Probe({ session }: { session: string }) {
+      const { historyStatus } = useTimeline(session, ws, 'srv');
+      return h('div', {
+        'data-testid': 'probe-carry',
+        'data-state': historyStatus?.steps.cache ?? '',
+      }, String(historyStatus?.counts.cache ?? ''));
+    }
+
+    const view = render(h(Probe, { session: 'deck_carry_from' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-carry').textContent).toBe('5');
+    });
+
+    view.rerender(h(Probe, { session: 'deck_carry_to' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-carry').getAttribute('data-state')).not.toBe('running');
+    });
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+
+    // The new session has nothing stored; the previous 5 must not follow it.
+    expect(screen.getByTestId('probe-carry').getAttribute('data-state')).toBe('empty');
+    expect(screen.getByTestId('probe-carry').textContent).toBe('0');
+  });
+  // Cold start: the status must say WHICH of "still coming" vs "nothing will be
+  // fetched" applies. Reporting a blanket idle made the pane render its
+  // empty-chat placeholder with no progress strip while history was on its way.
+  describe('cold-start daemon step', () => {
+    function mountProbe(opts: { connected: boolean; isActiveSession: boolean; sessionName: string }) {
+      vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+      vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+      const ws: WsClient = {
+        get connected() { return opts.connected; },
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: () => 'h1',
+      } as unknown as WsClient;
+
+      let daemon = '';
+      function Probe() {
+        // No serverId: the blank-pane HTTP self-heal would otherwise park an
+        // unrelated `http` step in pending and mask what `daemon` is doing.
+        const { historyStatus } = useTimeline(opts.sessionName, ws, undefined, {
+          isActiveSession: opts.isActiveSession,
+        });
+        daemon = historyStatus?.steps.daemon ?? '';
+        return h('div', { 'data-testid': 'probe-daemon' }, daemon);
+      }
+      render(h(Probe));
+      return () => daemon;
+    }
+
+    it('keeps the daemon step pending while an active timeline waits for the socket', async () => {
+      const read = mountProbe({ connected: false, isActiveSession: true, sessionName: `deck_cold_wait_${Date.now()}` });
+
+      // Assert the SETTLED state, not the transient one: the blanket idle reset
+      // used to wipe this the moment `loading` cleared.
+      await vi.waitFor(() => expect(read()).toBe('pending'), { timeout: 3_000 });
+      await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
+      expect(read()).toBe('pending');
+    });
+
+    it('starts daemon history before a cold IndexedDB read resolves', async () => {
+      const sessionName = `deck_cold_idb_stall_${Date.now()}`;
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(() => new Promise(() => {}));
+      const sendTimelineHistoryRequest = vi.fn(() => 'h-idb-stall');
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest,
+      } as unknown as WsClient;
+
+      function Probe() {
+        const timeline = useTimeline(sessionName, ws, 'srv', { isActiveSession: true });
+        return h('div', {
+          'data-testid': 'probe-idb-stall',
+          'data-cache': timeline.historyStatus?.steps.cache ?? '',
+          'data-daemon': timeline.historyStatus?.steps.daemon ?? '',
+        });
+      }
+      render(h(Probe));
+
+      await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200));
+      expect(screen.getByTestId('probe-idb-stall').getAttribute('data-cache')).toBe('running');
+      expect(screen.getByTestId('probe-idb-stall').getAttribute('data-daemon')).toBe('running');
+    });
+
+    it('ends the cache-only spinner and starts HTTP recovery when IndexedDB never settles', async () => {
+      vi.useFakeTimers();
+      const sessionName = `deck_cold_idb_deadline_${Date.now()}`;
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(() => new Promise(() => {}));
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: vi.fn(() => 'h-idb-deadline'),
+      } as unknown as WsClient;
+
+      function Probe() {
+        const timeline = useTimeline(sessionName, ws, 'srv', { isActiveSession: true });
+        return h('div', {
+          'data-testid': 'probe-idb-deadline',
+          'data-loading': String(timeline.loading),
+          'data-cache': timeline.historyStatus?.steps.cache ?? '',
+        });
+      }
+      render(h(Probe));
+      await act(async () => { await flushMicrotasks(); });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_200);
+        await vi.advanceTimersByTimeAsync(1);
+        await flushMicrotasks();
+      });
+
+      expect(screen.getByTestId('probe-idb-deadline').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('probe-idb-deadline').getAttribute('data-cache')).toBe('offline');
+      expect(fetchHistorySpy).toHaveBeenCalled();
+    });
+
+    it('marks the daemon step offline when an inactive timeline will never request', async () => {
+      const read = mountProbe({ connected: false, isActiveSession: false, sessionName: `deck_cold_inactive_${Date.now()}` });
+
+      // Inactive timelines deliberately never issue the request, so a spinner
+      // here would never resolve — this must be terminal, not pending.
+      await vi.waitFor(() => expect(read()).toBe('offline'), { timeout: 3_000 });
+    });
+
+    it('gives up waiting for the socket after a bound instead of spinning forever', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const read = mountProbe({ connected: false, isActiveSession: true, sessionName: `deck_cold_bound_${Date.now()}` });
+        await vi.waitFor(() => expect(read()).toBe('pending'), { timeout: 3_000 });
+
+        await act(async () => { await vi.advanceTimersByTimeAsync(15_000 + 500); });
+        expect(read()).toBe('offline');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });

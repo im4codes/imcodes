@@ -10,10 +10,12 @@
  */
 
 import { useTranslation } from 'react-i18next';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import type { PinnedPanel } from '../app.js';
 import { getPanelTitle, renderPanelContent } from './PinnedPanelRegistry.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface SidebarPinnedPanelProps {
   panel: PinnedPanel;
@@ -35,12 +37,15 @@ export function SidebarPinnedPanel({
 
   const title = getPanelTitle(panel, ctx);
   const content = renderPanelContent(panel, ctx);
+  const isIncognito = panel.type === 'subsession'
+    && typeof panel.props?.sessionName === 'string'
+    && !!ctx.subSessions?.find((s) => s.sessionName === panel.props?.sessionName)?.incognito;
 
   return (
-    <div class="sidebar-pinned-panel" style={{ height: localHeight, flexShrink: 0 }}>
+    <div class={`sidebar-pinned-panel${isIncognito ? ' incognito' : ''}`} style={{ height: localHeight, flexShrink: 0 }}>
       {/* Header */}
       <div class="sidebar-pinned-header">
-        <span class="sidebar-pinned-title">{title}</span>
+        <span class="sidebar-pinned-title">{panel.type === 'subsession' && typeof panel.props?.sessionName === 'string' ? <SubSessionTaskTitle sessionName={panel.props.sessionName} serverId={ctx.serverId} fallback={title} /> : title}</span>
         <button
           class="sidebar-pinned-unpin"
           onClick={onUnpin}
@@ -58,7 +63,8 @@ export function SidebarPinnedPanel({
 
       {/* Bottom resize handle */}
       <div
-        class="sidebar-pinned-resize-handle"
+        class="sidebar-pinned-resize-handle resize-hover-surface"
+        {...resizeHandleHoverEvents}
         onMouseDown={onMouseDown}
         onTouchStart={onTouchStart}
         aria-hidden="true"

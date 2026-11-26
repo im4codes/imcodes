@@ -7,8 +7,9 @@
  * discussing those failures.
  */
 
+import { isTransientRequestFailure } from './request-failure.js';
+
 const API_ERROR_PREFIX_RE = /^\[?api error:/i;
-const REQUEST_FAILURE_RE = /(\bconnection error\b|\bfetch failed\b|\bnetwork request failed\b|\b(?:econnreset|econnrefused|enotfound|etimedout)\b|\b(?:dns lookup failed|socket hang up)\b)/i;
 
 function normalizeLine(line: string): string {
   return line
@@ -28,7 +29,7 @@ function isPureRequestFailureText(text: string): boolean {
   if (lower.startsWith('fixed ') || lower.startsWith('fix ') || lower.startsWith('avoid ') || lower.startsWith('handle ')) {
     return false;
   }
-  return API_ERROR_PREFIX_RE.test(normalized) && REQUEST_FAILURE_RE.test(normalized);
+  return API_ERROR_PREFIX_RE.test(normalized) && isTransientRequestFailure(normalized);
 }
 
 function isMetaSummaryLine(line: string): boolean {

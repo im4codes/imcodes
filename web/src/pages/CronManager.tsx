@@ -1,21 +1,50 @@
-import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
+import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
-import { marked } from 'marked';
 import { apiFetch } from '../api.js';
-import type { CronAction, CronJobStatus } from '@shared/cron-types';
-import { CRON_STATUS } from '@shared/cron-types';
+import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cron-types';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_STATUS,
+  normalizeCronCompletionPolicy,
+  normalizeCronExecutionDetail,
+} from '@shared/cron-types';
 import { BUILT_IN_MODES } from '@shared/p2p-modes';
 import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
+import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { useResourceEvent } from '../hooks/useResourceEvent.js';
+import {
+  CRON_SCOPE_CHANGE_EVENT,
+  CRON_SHOW_ALL_STORAGE_KEY,
+  buildCronListUrl,
+  readCronShowAllPref,
+} from '../hooks/useCronJobCount.js';
 import { RESOURCE_TOPICS } from '@shared/resource-events.js';
 import type { WsClient } from '../ws-client.js';
 
+// A pinned CronManager lives below two overflow-clipping sidebar containers.
+// Its dialogs must leave that subtree or a successful edit click renders a
+// fully clipped FloatingPanel. Keep pinned dialogs above managed workspace
+// windows while remaining below the app's 9999+ system-dialog layer.
+const PINNED_CRON_SUBPANEL_Z_INDEX = 7900;
+
+function placeCronSubPanel(panel: ComponentChildren, portal: boolean): ComponentChildren {
+  return !portal || typeof document === 'undefined' ? panel : createPortal(panel, document.body);
+}
+
 // ── Types ────────────────────────────────────────────────────────────────
 
-interface CronJob {
+interface CronCreatorInfo {
+  creator_user_id?: string | null;
+  creator_name?: string | null;
+  creator_is_shared?: boolean | null;
+}
+
+interface CronJob extends CronCreatorInfo {
   id: string;
   server_id: string;
   name: string;
@@ -28,6 +57,7 @@ interface CronJob {
   last_run_at: number | null;
   next_run_at: number | null;
   expires_at: number | null;
+  completion_policy?: string | null;
   created_at: number;
 }
 
@@ -43,7 +73,7 @@ interface CronExecution {
   created_at: number;
 }
 
-interface CrossJobExecution extends CronExecution {
+interface CrossJobExecution extends CronExecution, CronCreatorInfo {
   job_id: string;
   job_name: string;
   server_id: string;
@@ -52,6 +82,12 @@ interface CrossJobExecution extends CronExecution {
   target_role: string;
   target_session_name?: string | null;
   action: string;
+}
+
+function normalizeExecution<T extends CronExecution>(execution: T): T {
+  if (typeof execution.detail !== 'string') return execution;
+  const detail = normalizeCronExecutionDetail(execution.detail);
+  return detail === execution.detail ? execution : { ...execution, detail };
 }
 
 interface SubSessionSlim {
@@ -74,18 +110,96 @@ interface Props {
   servers?: ServerSlim[];
   /** WS client used to subscribe to server-pushed cron `resource.changed` events. */
   ws?: WsClient | null;
+  /** Concrete covered session used to authorize a received share. */
+  sharedSessionName?: string;
+  /** Any incoming share (server-wide or session-scoped), used to keep list scope fixed. */
+  sharedScope?: boolean;
+  /** Viewer shares can inspect schedules and history but cannot mutate them. */
+  readOnly?: boolean;
+  /**
+   * Managed z-index of the owning cron window. The nested form/history/detail
+   * panels sit one band above it; without this they fell back to
+   * FloatingPanel's default 2000 and were trapped in the cron window's
+   * stacking context, so raising any other window buried the dialog you were
+   * editing.
+   */
+  windowZIndex?: number;
+  /** Raise the owning cron window, so clicking a nested dialog lifts both. */
+  onWindowFocus?: () => void;
+  /** Escape an overflow-clipping host such as the pinned sidebar panel. */
+  portalSubPanels?: boolean;
 }
 
 type CronSendActionView = Extract<CronAction, { type: 'send' }>;
 
-// ── Styles ───────────────────────────────────────────────────────────────
+// ── Shared Creator & Icon Helpers ────────────────────────────────────────
 
-const cardStyle = { background: '#1e293b', borderRadius: '12px', padding: '20px', marginBottom: '16px' };
-const inputStyle: Record<string, string> = { width: '100%', padding: '10px 12px', background: '#0f172a', border: '1px solid #334155', borderRadius: '8px', color: '#e2e8f0', fontSize: '14px', marginBottom: '10px', boxSizing: 'border-box' };
-const btnPrimary: Record<string, string> = { padding: '8px 16px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
-const btnSecondary: Record<string, string> = { padding: '8px 16px', background: '#334155', color: '#e2e8f0', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '14px' };
-const btnDanger: Record<string, string> = { ...btnSecondary, color: '#f87171' };
-const labelStyle = { display: 'block', color: '#94a3b8', fontSize: '13px', marginBottom: '4px', fontWeight: '500' as const };
+function resolveCronCreatorLabel(info: CronCreatorInfo | null | undefined): string | null {
+  const name = typeof info?.creator_name === 'string' ? info.creator_name.trim() : '';
+  if (name) return name;
+  const id = typeof info?.creator_user_id === 'string' ? info.creator_user_id.trim() : '';
+  return id || null;
+}
+
+function CronCreatorChip({
+  info,
+  t,
+  labelKey = 'cron.creator',
+  showPrefix = true,
+  className = '',
+}: {
+  info: CronCreatorInfo | null | undefined;
+  t: (key: string) => string;
+  labelKey?: string;
+  showPrefix?: boolean;
+  className?: string;
+}) {
+  const label = resolveCronCreatorLabel(info);
+  if (!label) return null;
+  const hasSharedFlag = typeof info?.creator_is_shared === 'boolean';
+  const isShared = info?.creator_is_shared === true;
+  const roleLabel = hasSharedFlag ? t(isShared ? 'cron.creator_participant' : 'cron.creator_owner') : null;
+  return (
+    <span
+      class={`cron-creator-chip${isShared ? ' cron-creator-chip--participant' : ' cron-creator-chip--owner'}${className ? ` ${className}` : ''}`}
+      title={roleLabel ? `${t(labelKey)}: ${label} (${roleLabel})` : `${t(labelKey)}: ${label}`}
+    >
+      <svg class="cron-creator-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+        <circle cx="8" cy="5.2" r="2.6" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <path d="M3 13.5c.6-2.4 2.5-3.7 5-3.7s4.4 1.3 5 3.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+      </svg>
+      {showPrefix && <span class="cron-creator-label">{t(labelKey)}:</span>}
+      <span class="cron-creator-name">{label}</span>
+      {roleLabel && (
+        <span class={`cron-creator-role${isShared ? ' is-participant' : ' is-owner'}`}>
+          {roleLabel}
+        </span>
+      )}
+    </span>
+  );
+}
+
+function CronActionSvg({ kind }: { kind: 'play' | 'edit' | 'delete' }) {
+  if (kind === 'play') {
+    return (
+      <svg class="cron-btn-svg" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path d="M5 3.4l7.5 4.6L5 12.6V3.4z" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === 'edit') {
+    return (
+      <svg class="cron-btn-svg" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path d="M11.3 2.5l2.2 2.2-7.8 7.8-2.7.5.5-2.7 7.8-7.8z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg class="cron-btn-svg" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+      <path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+    </svg>
+  );
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -97,26 +211,31 @@ function compactMessage(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+function truncateSummary(text: unknown, max = 96): string {
+  if (typeof text !== 'string') return '';
+  const compact = compactMessage(text);
+  return compact.length > max ? `${compact.slice(0, max).trimEnd()}…` : compact;
+}
+
 function sendTargetText(action: CronSendActionView, t: (key: string) => string): string {
-  return action.broadcast ? t('cron.send_broadcast') : action.target;
+  return action.broadcast
+    ? t('cron.send_broadcast')
+    : typeof action.target === 'string' && action.target.trim()
+      ? action.target
+      : '—';
 }
 
 function sendActionSummary(action: CronSendActionView, t: (key: string) => string): string {
-  const message = compactMessage(action.message);
+  const message = typeof action.message === 'string' ? compactMessage(action.message) : '';
   const target = sendTargetText(action, t);
   return message ? `${t('common.send')} → ${target}: ${message}` : `${t('common.send')} → ${target}`;
 }
 
-function SendActionDetails({ action, t }: { action: CronSendActionView; t: (key: string) => string }) {
-  return (
-    <div style={{ marginTop: '2px', display: 'grid', gap: '4px' }}>
-      <div>
-        <strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {sendTargetText(action, t)}
-        {action.reply && <span style={{ color: '#94a3b8' }}> · {t('cron.send_reply')}</span>}
-      </div>
-      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: '#e2e8f0', fontFamily: 'inherit' }}>{action.message}</pre>
-    </div>
-  );
+function executionActionSummary(action: CronAction | null, t: (key: string) => string): string | null {
+  if (!action) return null;
+  if (action.type === 'command') return truncateSummary(action.command) || null;
+  if (action.type === 'p2p') return truncateSummary(action.topic) || null;
+  return truncateSummary(sendActionSummary(action, t)) || null;
 }
 
 function fmtTime(ts: number | null): string {
@@ -184,14 +303,28 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
   return job.server_id === serverId && job.project_name === projectName;
 }
 
+function canManageCronJob(
+  job: Pick<CronJob, 'server_id' | 'project_name'>,
+  serverId: string,
+  projectName: string,
+  opts: { readOnly?: boolean; allowCrossProjectOnCurrentServer?: boolean },
+): boolean {
+  if (opts.readOnly) return false;
+  if (opts.allowCrossProjectOnCurrentServer) return job.server_id === serverId;
+  return isCurrentContextJob(job, serverId, projectName);
+}
+
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, sharedScope = false, readOnly = false, windowZIndex, onWindowFocus, portalSubPanels = false }: Props) {
+  const subPanelZIndex = windowZIndex !== undefined
+    ? windowZIndex + 1
+    : portalSubPanels ? PINNED_CRON_SUBPANEL_Z_INDEX : undefined;
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showAllServers, setShowAllServers] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
+  const [showAllServers, setShowAllServers] = useState(readCronShowAllPref);
   // Sub-panel state: 'form' for create/edit, 'history:jobId' for execution log
   const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
@@ -203,6 +336,13 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [crossExecsLoading, setCrossExecsLoading] = useState(false);
 
   const serverNameMap = new Map(servers.map(s => [s.id, s.name]));
+  const scopedUrl = useCallback((path: string) => {
+    if (!sharedSessionName) return path;
+    const join = path.includes('?') ? '&' : '?';
+    return `${path}${join}sessionName=${encodeURIComponent(sharedSessionName)}`;
+  }, [sharedSessionName]);
+  const effectiveShowAllServers = !sharedScope && !sharedSessionName && showAllServers;
+  const wholeServerSharedScope = sharedScope && !sharedSessionName;
 
   // Wrap onNavigateSession to close internal panels before navigating
   const handleNavigateSession = useMemo(() => {
@@ -214,14 +354,29 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   }, [onNavigateSession]);
 
   const toggleShowAll = () => {
-    setShowAllServers(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
+    setShowAllServers((prev) => {
+      const v = !prev;
+      localStorage.setItem(CRON_SHOW_ALL_STORAGE_KEY, v ? '1' : '');
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event(CRON_SCOPE_CHANGE_EVENT));
+      return v;
+    });
   };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async (silent = false) => {
     try {
-      const q = showAllServers ? '' : `serverId=${serverId}&projectName=${projectName}`;
-      const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?${q}`);
+      const url = buildCronListUrl({
+        serverId,
+        projectName,
+        sharedSessionName,
+        sharedScope,
+        showAllServers,
+      }) ?? scopedUrl(
+        effectiveShowAllServers || wholeServerSharedScope
+          ? (effectiveShowAllServers ? '/api/cron?' : `/api/cron?serverId=${encodeURIComponent(serverId)}`)
+          : `/api/cron?serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`,
+      );
+      const res = await apiFetch<{ jobs: CronJob[] }>(url);
       setJobs(res.jobs);
       setError(null);
     } catch (err) {
@@ -231,7 +386,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     } finally {
       setLoading(false);
     }
-  }, [serverId, projectName, showAllServers]);
+  }, [serverId, projectName, effectiveShowAllServers, wholeServerSharedScope, scopedUrl]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
@@ -260,15 +415,17 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const loadCrossExecs = useCallback(async () => {
     setCrossExecsLoading(true);
     try {
-      const q = showAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${serverId}`;
-      const res = await apiFetch<{ executions: CrossJobExecution[] }>(`/api/cron/executions?${q}`);
-      setCrossExecs(res.executions);
+      const q = effectiveShowAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${encodeURIComponent(serverId)}`;
+      const res = await apiFetch<{ executions: CrossJobExecution[] }>(scopedUrl(`/api/cron/executions?${q}`));
+      // Keep the browser compatible with an older server during rolling
+      // deploys, and immediately repair legacy rows already stored in history.
+      setCrossExecs(res.executions.map(normalizeExecution));
     } catch (err) {
       setError(String(err));
     } finally {
       setCrossExecsLoading(false);
     }
-  }, [serverId, showAllServers, execMode]);
+  }, [serverId, effectiveShowAllServers, execMode, scopedUrl]);
 
   useEffect(() => { if (tab === 'executions') loadCrossExecs(); }, [tab, loadCrossExecs]);
 
@@ -276,7 +433,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handlePauseResume = async (job: CronJob) => {
     const newStatus = job.status === CRON_STATUS.ACTIVE ? CRON_STATUS.PAUSED : CRON_STATUS.ACTIVE;
     try {
-      await apiFetch(`/api/cron/${job.id}/status`, { method: 'PATCH', body: JSON.stringify({ status: newStatus }) });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}/status`), { method: 'PATCH', body: JSON.stringify({ status: newStatus }) });
       await loadJobs();
     } catch (err) {
       setError(String(err));
@@ -286,7 +443,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handleDelete = async (job: CronJob) => {
     if (!window.confirm(t('cron.confirm_delete'))) return;
     try {
-      await apiFetch(`/api/cron/${job.id}`, { method: 'DELETE' });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}`), { method: 'DELETE' });
       setJobs(prev => prev.filter(j => j.id !== job.id));
     } catch (err) {
       setError(String(err));
@@ -296,7 +453,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handleTriggerNow = async (job: CronJob) => {
     if (!window.confirm(t('cron.confirm_trigger'))) return;
     try {
-      await apiFetch(`/api/cron/${job.id}/trigger`, { method: 'POST' });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}/trigger`), { method: 'POST' });
       await loadJobs();
     } catch (err) {
       setError(String(err));
@@ -318,17 +475,18 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     setSubPanel(`history:${jobId}`);
     if (!historyData[jobId]) {
       try {
-        const res = await apiFetch<{ executions: CronExecution[] }>(`/api/cron/${jobId}/executions?limit=20`);
-        setHistoryData(prev => ({ ...prev, [jobId]: res.executions }));
+        const res = await apiFetch<{ executions: CronExecution[] }>(scopedUrl(`/api/cron/${jobId}/executions?limit=20`));
+        setHistoryData(prev => ({ ...prev, [jobId]: res.executions.map(normalizeExecution) }));
       } catch { /* ignore */ }
     }
   };
 
   // ── Render ─────────────────────────────────────────────────────────────
-  const eligible = mainSessions(sessions, projectName);
-  // Sub-sessions scoped to this project's main sessions
-  const mainNames = new Set(eligible.map(s => s.name));
-  const scopedSubs = subSessions.filter(s => s.parentSession && mainNames.has(s.parentSession));
+  const formProjectName = editingJob?.project_name ?? projectName;
+  const formMainSessions = mainSessions(sessions, formProjectName);
+  // Sub-sessions scoped to the active/editing project's main sessions
+  const formMainNames = new Set(formMainSessions.map(s => s.name));
+  const formScopedSubs = subSessions.filter(s => s.parentSession && formMainNames.has(s.parentSession));
 
   const historyJobId = subPanel?.startsWith('history:') ? subPanel.slice(8) : null;
   const historyJob = historyJobId ? jobs.find(j => j.id === historyJobId) : null;
@@ -342,164 +500,240 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   };
 
   return (
-    <div style={{ width: '90%', maxWidth: '700px', margin: '0 auto', padding: '12px 0', height: '100%', overflow: 'auto' }}>
+    <div class={tab === 'executions' ? 'cron-manager cron-manager--history' : 'cron-manager'}>
       {/* Toolbar: tabs + show-all toggle + add button */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
-        <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
-          <button onClick={() => setTab('tasks')}
-            style={{ padding: '3px 10px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
-              background: tab === 'tasks' ? '#334155' : 'transparent', color: tab === 'tasks' ? '#e2e8f0' : '#64748b' }}>
+      <div class="cron-manager-toolbar">
+        <div class="cron-segmented">
+          <button type="button" onClick={() => setTab('tasks')}
+            class={`cron-segmented-btn${tab === 'tasks' ? ' is-active' : ''}`}>
             {t('cron.title')}
           </button>
-          <button onClick={() => setTab('executions')}
-            style={{ padding: '3px 10px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
-              background: tab === 'executions' ? '#334155' : 'transparent', color: tab === 'executions' ? '#e2e8f0' : '#64748b' }}>
+          <button type="button" onClick={() => setTab('executions')}
+            class={`cron-segmented-btn${tab === 'executions' ? ' is-active' : ''}`}>
             {t('cron.history')}
           </button>
         </div>
-        <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
-          {t('cron.show_all_servers')}
-        </label>
-        <div style={{ flex: 1 }} />
+        {!sharedScope && !sharedSessionName && (
+          <label class="cron-scope-toggle">
+            <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
+            <span>{t('cron.show_all_servers')}</span>
+          </label>
+        )}
+        <div class="cron-toolbar-spacer" />
         {tab === 'executions' && (
-          <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
-            <button onClick={() => setExecMode('latest')}
-              style={{ padding: '2px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '11px',
-                background: execMode === 'latest' ? '#334155' : 'transparent', color: execMode === 'latest' ? '#e2e8f0' : '#64748b' }}>
+          <div class="cron-segmented cron-segmented--compact">
+            <button type="button" onClick={() => setExecMode('latest')}
+              class={`cron-segmented-btn${execMode === 'latest' ? ' is-active' : ''}`}>
               {t('cron.exec_latest')}
             </button>
-            <button onClick={() => setExecMode('all')}
-              style={{ padding: '2px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '11px',
-                background: execMode === 'all' ? '#334155' : 'transparent', color: execMode === 'all' ? '#e2e8f0' : '#64748b' }}>
+            <button type="button" onClick={() => setExecMode('all')}
+              class={`cron-segmented-btn${execMode === 'all' ? ' is-active' : ''}`}>
               {t('cron.exec_all')}
             </button>
           </div>
         )}
-        {tab === 'tasks' && (
-          <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
-            style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}
+        {tab === 'tasks' && !readOnly && (
+          <button type="button" onClick={() => { setEditingJob(null); setSubPanel('form'); }}
+            class="cron-create-btn"
+            aria-label={t('cron.create')}
             title={t('cron.create')}>+</button>
         )}
       </div>
 
-      {error && <div style={{ color: '#f87171', marginBottom: '8px', fontSize: '13px' }}>{error}</div>}
+      {error && <div class="cron-error-banner">{error}</div>}
 
       {/* ── Executions tab ── */}
       {tab === 'executions' && (
         <CrossJobExecutionList
+          subPanelZIndex={subPanelZIndex}
+          onWindowFocus={onWindowFocus}
           executions={crossExecs}
           loading={crossExecsLoading}
           serverNameMap={serverNameMap}
-          showAllServers={showAllServers}
+          showAllServers={effectiveShowAllServers || wholeServerSharedScope}
           onViewDiscussion={onViewDiscussion}
           onNavigateSession={handleNavigateSession}
           t={t}
+          portalSubPanels={portalSubPanels}
         />
       )}
 
       {/* ── Tasks tab ── */}
-      {tab === 'tasks' && loading && <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>}
-
-      {tab === 'tasks' && !loading && jobs.length === 0 && (
-        <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_tasks')}</div>
+      {tab === 'tasks' && loading && (
+        <div class="cron-execution-empty cron-execution-empty--loading">
+          <span class="cron-execution-spinner" />
+          {t('common.loading')}
+        </div>
       )}
 
-      {tab === 'tasks' && jobs.map(job => {
-        const action = parseAction(job.action);
-        const isReadOnly = !isCurrentContextJob(job, serverId, projectName);
-        return (
-          <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
-              {showAllServers && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / {job.project_name}</span>}
-              {isReadOnly && (
-                <span title={t('cron.read_only_scope')} style={{ color: '#fbbf24', fontSize: '11px', fontWeight: 600, flexShrink: 0 }}>
-                  {t('cron.read_only')}
-                </span>
-              )}
-              <span style={{ color: statusColors[job.status] ?? '#94a3b8', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', flexShrink: 0 }}>
-                {t(`cron.${job.status}`)}
-              </span>
-            </div>
+      {tab === 'tasks' && !loading && jobs.length === 0 && (
+        <div class="cron-execution-empty">
+          <span class="cron-execution-empty-icon">◇</span>
+          {t('cron.no_tasks')}
+        </div>
+      )}
 
-            <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', flexWrap: 'wrap' }}>
-              <span style={{ fontFamily: 'monospace', color: '#cbd5e1' }}>{job.cron_expr}</span>
-              <span>→ {displayTarget(job)}</span>
-              {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
-              {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
-              {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ opacity: 0.6, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
-            </div>
+      {tab === 'tasks' && jobs.length > 0 && (
+        <div class="cron-task-list">
+          {jobs.map(job => {
+            const action = parseAction(job.action);
+            const isReadOnly = !canManageCronJob(job, serverId, projectName, {
+              readOnly,
+              allowCrossProjectOnCurrentServer: wholeServerSharedScope || effectiveShowAllServers,
+            });
+            const statusColor = statusColors[job.status] ?? '#94a3b8';
+            const policy = normalizeCronCompletionPolicy(job.completion_policy);
+            return (
+              <article key={job.id} class={`cron-task-card cron-task-card--${job.status}`}>
+                <div class="cron-task-header">
+                  <div class="cron-task-title-wrap">
+                    <span class="cron-task-status-dot" style={{ background: statusColor, color: statusColor }} aria-hidden="true" />
+                    <span class="cron-task-title" title={job.name}>{job.name}</span>
+                  </div>
+                  <div class="cron-task-badges">
+                    {(effectiveShowAllServers || wholeServerSharedScope) && (
+                      <span
+                        class="cron-task-scope-chip"
+                        title={effectiveShowAllServers
+                          ? `${serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / ${job.project_name}`
+                          : job.project_name}
+                      >
+                        {effectiveShowAllServers
+                          ? `${serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / ${job.project_name}`
+                          : job.project_name}
+                      </span>
+                    )}
+                    {isReadOnly && (
+                      <span title={t('cron.read_only_scope')} class="cron-task-readonly-pill">
+                        {t('cron.read_only')}
+                      </span>
+                    )}
+                    <span
+                      class="cron-task-status-pill"
+                      style={{ color: statusColor, borderColor: `${statusColor}44`, background: `${statusColor}14` }}
+                    >
+                      {t(`cron.${job.status}`)}
+                    </span>
+                  </div>
+                </div>
 
-            {isReadOnly && (
-              <div style={{ color: '#fbbf24', fontSize: '11px', marginBottom: '8px' }}>
-                {t('cron.read_only_scope')}
-              </div>
-            )}
+                <div class="cron-task-meta">
+                  <code class="cron-task-expr">{job.cron_expr}</code>
+                  <span class="cron-task-target">→ {displayTarget(job)}</span>
+                  <span class="cron-task-policy">
+                    {t(`cron.completion_${policy}`)}
+                  </span>
+                  {action && action.type !== 'p2p' && action.onlyWhenIdle !== false && (
+                    <span title={t('cron.send_only_when_idle_help')} class="cron-task-idle-pill">
+                      {t('cron.only_when_idle_badge')}
+                    </span>
+                  )}
+                  <CronCreatorChip info={job} t={t} />
+                </div>
 
-            <div style={{ display: 'flex', gap: '6px', fontSize: '12px' }}>
-              {(job.status === CRON_STATUS.ACTIVE || job.status === CRON_STATUS.PAUSED) && (
-                <button disabled={isReadOnly} onClick={() => handlePauseResume(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>
-                  {job.status === CRON_STATUS.ACTIVE ? t('cron.pause') : t('cron.resume')}
-                </button>
-              )}
-              <button disabled={isReadOnly} onClick={() => handleTriggerNow(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>▶</button>
-              <button disabled={isReadOnly} onClick={() => handleEdit(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>✎</button>
-              <button disabled={isReadOnly} onClick={() => handleDelete(job)} style={{ ...btnDanger, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>✕</button>
-              <button onClick={() => openHistory(job.id)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', marginLeft: 'auto' }}>
-                {t('cron.history')}
-              </button>
-            </div>
-          </div>
-        );
-      })}
+                {action?.type === 'p2p' && <div class="cron-task-action-summary">Team {action.mode}</div>}
+                {action?.type === 'command' && <div class="cron-task-action-summary" title={action.command}>{action.command}</div>}
+                {action?.type === 'send' && <div class="cron-task-action-summary" title={sendActionSummary(action, t)}>{sendActionSummary(action, t)}</div>}
+
+                {isReadOnly && (
+                  <div class="cron-task-readonly-note">
+                    {t('cron.read_only_scope')}
+                  </div>
+                )}
+
+                <div class="cron-task-actions">
+                  {(job.status === CRON_STATUS.ACTIVE || job.status === CRON_STATUS.PAUSED) && (
+                    <button type="button" disabled={isReadOnly} onClick={() => handlePauseResume(job)}
+                      class="cron-btn cron-btn--secondary cron-btn--sm">
+                      {job.status === CRON_STATUS.ACTIVE ? t('cron.pause') : t('cron.resume')}
+                    </button>
+                  )}
+                  <button type="button" disabled={isReadOnly} onClick={() => handleTriggerNow(job)}
+                    class="cron-btn cron-btn--secondary cron-btn--icon"
+                    title={t('cron.run_now')}
+                    aria-label={t('cron.run_now')}>
+                    <CronActionSvg kind="play" />▶
+                  </button>
+                  <button type="button" disabled={isReadOnly} onClick={() => handleEdit(job)}
+                    class="cron-btn cron-btn--secondary cron-btn--icon"
+                    title={t('cron.edit')}
+                    aria-label={t('cron.edit')}>
+                    <CronActionSvg kind="edit" />✎
+                  </button>
+                  <button type="button" disabled={isReadOnly} onClick={() => handleDelete(job)}
+                    class="cron-btn cron-btn--danger cron-btn--icon"
+                    title={t('cron.delete_task')}
+                    aria-label={t('cron.delete_task')}>
+                    <CronActionSvg kind="delete" />✕
+                  </button>
+                  <button type="button" onClick={() => openHistory(job.id)}
+                    class="cron-btn cron-btn--secondary cron-btn--sm cron-btn--history">
+                    {t('cron.history')}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
 
       {/* Sub-panel: Create/Edit form — FloatingPanel */}
-      {subPanel === 'form' && (
+      {subPanel === 'form' && placeCronSubPanel(
         <FloatingPanel
           id="cron-form"
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={editingJob ? t('cron.edit') : t('cron.create')}
           onClose={() => { setSubPanel(null); setEditingJob(null); }}
-          defaultW={500} defaultH={600}
+          defaultW={520} defaultH={620}
+          className="cron-floating-panel cron-form-panel"
         >
-          <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
+          <div class="cron-form-scroll">
             <CronForm
               serverId={editingJob?.server_id ?? serverId}
-              projectName={editingJob?.project_name ?? projectName}
-              sessions={eligible}
-              subSessions={scopedSubs}
+              projectName={formProjectName}
+              sessions={formMainSessions}
+              subSessions={formScopedSubs}
+              activeSession={activeSession}
+              sharedSessionName={sharedSessionName}
               job={editingJob}
               onDone={handleFormDone}
               onCancel={() => { setSubPanel(null); setEditingJob(null); }}
             />
           </div>
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
 
       {/* Sub-panel: Execution history — FloatingPanel */}
-      {historyJobId && historyJob && (
+      {historyJobId && historyJob && placeCronSubPanel(
         <FloatingPanel
           id={`cron-history-${historyJobId}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${t('cron.history')} · ${historyJob.name}`}
           onClose={() => setSubPanel(null)}
-          defaultW={520} defaultH={460}
+          defaultW={660} defaultH={580}
+          className="cron-floating-panel"
         >
           <CronHistoryPanel
+            subPanelZIndex={subPanelZIndex}
+            onWindowFocus={onWindowFocus}
             executions={historyData[historyJobId] ?? null}
             job={historyJob}
             onViewDiscussion={onViewDiscussion}
             onNavigateSession={handleNavigateSession}
             t={t}
+            portalSubPanels={portalSubPanels}
           />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
 
 // ── Cross-Job Execution List ─────────────────────────────────────────────
 
-function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t }: {
+function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus, portalSubPanels }: {
   executions: CrossJobExecution[] | null;
   loading: boolean;
   serverNameMap: Map<string, string>;
@@ -507,42 +741,71 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
   onViewDiscussion?: (fileId: string) => void;
   onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
+  subPanelZIndex?: number;
+  onWindowFocus?: () => void;
+  portalSubPanels: boolean;
 }) {
   const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
 
-  if (loading) return <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>;
-  if (!executions || executions.length === 0) return <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_history')}</div>;
+  if (loading) return <div class="cron-execution-empty cron-execution-empty--loading"><span class="cron-execution-spinner" />{t('common.loading')}</div>;
+  if (!executions || executions.length === 0) return <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_history')}</div>;
 
   return (
-    <div>
-      {executions.map(exec => {
+    <div class="cron-execution-page">
+      <div class="cron-execution-hero">
+        <div class="cron-execution-hero-icon" aria-hidden="true">⌁</div>
+        <div class="cron-execution-hero-copy">
+          <strong>{t('cron.history')}</strong>
+          <span>{t('cron.final_output_hint')}</span>
+        </div>
+        <span class="cron-execution-count"><b>{executions.length}</b> {t('cron.runs')}</span>
+      </div>
+      <div class="cron-execution-list">
+        {executions.map((exec, index) => {
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
         const action = parseAction(exec.action);
+        const actionSummary = executionActionSummary(action, t);
 
         return (
-          <div key={exec.id}
-            style={{ ...cardStyle, padding: '10px 14px', marginBottom: '6px', cursor: hasDetail ? 'pointer' : 'default' }}
+          <article key={exec.id}
+            class={`cron-execution-card${hasDetail ? ' cron-execution-card--interactive' : ''}`}
             onClick={() => hasDetail && setDetailExec(exec)}
+            onKeyDown={(event) => {
+              if (hasDetail && (event.key === 'Enter' || event.key === ' ')) {
+                event.preventDefault();
+                setDetailExec(exec);
+              }
+            }}
+            tabIndex={hasDetail ? 0 : undefined}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '13px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {exec.job_name}
-              </span>
-              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
-                {execStatusLabel(exec.status, t)}
-              </span>
+            <div class="cron-execution-rail" aria-hidden="true">
+              <span class="cron-execution-index">{String(index + 1).padStart(2, '0')}</span>
+              <span class="cron-execution-dot" style={{ background: execStatusColor(exec.status), boxShadow: `0 0 12px ${execStatusColor(exec.status)}` }} />
+              <span class="cron-execution-line" />
             </div>
-            <div style={{ display: 'flex', gap: '10px', fontSize: '11px', color: '#64748b', flexWrap: 'wrap' }}>
-              <span>{fmtTime(exec.created_at)}</span>
-              {showAllServers && <span>{serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
-              <span>→ {exec.target_role}</span>
-              {action?.type === 'p2p' && <span>Team {action.mode}</span>}
-              {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
-              {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
+            <div class="cron-execution-card-body">
+              <div class="cron-execution-card-title-row">
+                <span class="cron-execution-card-title">
+                {exec.job_name}
+                </span>
+                <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
+                {execStatusLabel(exec.status, t)}
+                </span>
+              </div>
+              <div class="cron-execution-meta">
+                <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+                {showAllServers && <span>◈ {serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
+                <span>⌁ {exec.target_session_name ?? exec.target_role}</span>
+                {action?.type === 'p2p' && <span>Team · {action.mode}</span>}
+                <CronCreatorChip info={exec} t={t} />
+              </div>
+              {actionSummary && <div class="cron-execution-prompt-summary"><span>›</span>{actionSummary}</div>}
+              {hasDetail && <div class="cron-execution-preview">{exec.detail!.slice(0, 240)}</div>}
+              <div class="cron-execution-actions">
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
+                  class="cron-execution-link">
                   {t('cron.view_discussion')}
                 </button>
               )}
@@ -552,33 +815,40 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
                   const session = resolveExecSession(exec);
                   onNavigateSession(session, hasDetail ? exec.detail!.slice(0, 500) : undefined);
                 }}
-                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  class="cron-execution-link cron-execution-link--primary"
                   title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
                   {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
+              {hasDetail && <span class="cron-execution-open-hint">{t('cron.view_output')} ↗</span>}
+              </div>
             </div>
-            {/* 3-5 line preview */}
-            {hasDetail && (
-              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
-                {exec.detail!.slice(0, 300)}
-              </pre>
-            )}
-          </div>
+          </article>
         );
       })}
+      </div>
 
       {/* Detail floating panel */}
-      {detailExec && (
+      {detailExec && placeCronSubPanel(
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${detailExec.job_name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={600} defaultH={500}
+          defaultW={960} defaultH={640}
+          minW={300}
+          className="cron-floating-panel cron-execution-detail-panel"
         >
-          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined} t={t} />
+          <ExecDetailView
+            jobName={detailExec.job_name}
+            exec={detailExec}
+            targetSession={resolveExecSession(detailExec)}
+            onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined}
+            t={t}
+          />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
@@ -592,55 +862,81 @@ const execStatusColor = (status: string): string => {
   return '#fbbf24';
 };
 
-function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t }: {
+function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus, portalSubPanels }: {
   executions: CronExecution[] | null;
   job: CronJob;
   onViewDiscussion?: (fileId: string) => void;
   onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
+  subPanelZIndex?: number;
+  onWindowFocus?: () => void;
+  portalSubPanels: boolean;
 }) {
   const jobSessionName = job.target_session_name ?? `deck_${job.project_name}_${job.target_role}`;
   const [detailExec, setDetailExec] = useState<CronExecution | null>(null);
   const action = parseAction(job.action);
 
+  const creatorLabel = resolveCronCreatorLabel(job);
+
   return (
-    <div style={{ padding: '12px', overflow: 'auto', height: '100%' }}>
+    <div class="cron-history-panel">
       {/* Job summary header */}
-      <div style={{ padding: '8px 10px', background: '#0f172a', borderRadius: '6px', marginBottom: '12px', fontSize: '12px', color: '#94a3b8' }}>
-        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '4px' }}>
-          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.schedule')}:</strong> <code style={{ color: '#e2e8f0' }}>{job.cron_expr}</code></span>
-          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.target')}:</strong> {job.target_session_name ?? job.target_role}</span>
+      <div class="cron-history-summary">
+        <div class="cron-history-summary-grid">
+          <span><small>{t('cron.schedule')}</small><code>{job.cron_expr}</code></span>
+          <span><small>{t('cron.target')}</small><b>{job.target_session_name ?? job.target_role}</b></span>
+          {creatorLabel && (
+            <span>
+              <small>{t('cron.creator')}</small>
+              <CronCreatorChip info={job} t={t} showPrefix={false} className="cron-creator-chip--inline" />
+            </span>
+          )}
+          {job.next_run_at && <span><small>{t('cron.next_run')}</small><b>{fmtTime(job.next_run_at)}</b></span>}
         </div>
-        {action?.type === 'command' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('cron.action_command')}:</strong> <code style={{ color: '#e2e8f0' }}>{action.command}</code></div>
+        {executionActionSummary(action, t) && (
+          <div class="cron-execution-prompt-summary cron-history-prompt-summary">
+            <span>›</span>{executionActionSummary(action, t)}
+          </div>
         )}
-        {action?.type === 'p2p' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>Team:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
-        )}
-        {action?.type === 'send' && <SendActionDetails action={action} t={t} />}
-        {job.next_run_at && <div style={{ marginTop: '4px', fontSize: '11px', color: '#64748b' }}>{t('cron.next_run')}: {fmtTime(job.next_run_at)}</div>}
       </div>
 
       {/* Execution list */}
-      {!executions && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('common.loading')}</div>}
-      {executions?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('cron.no_history')}</div>}
-      {executions?.map(exec => {
+      {!executions && <div class="cron-execution-empty cron-execution-empty--loading"><span class="cron-execution-spinner" />{t('common.loading')}</div>}
+      {executions?.length === 0 && <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_history')}</div>}
+      <div class="cron-history-list">
+      {executions?.map((exec, index) => {
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
 
         return (
-          <div key={exec.id}
-            style={{ fontSize: '12px', color: '#94a3b8', borderRadius: '6px', marginBottom: '4px', padding: '6px 8px', cursor: hasDetail ? 'pointer' : 'default' }}
+          <article key={exec.id}
+            class={`cron-execution-card cron-execution-card--compact${hasDetail ? ' cron-execution-card--interactive' : ''}`}
             onClick={() => hasDetail && setDetailExec(exec)}
+            onKeyDown={(event) => {
+              if (hasDetail && (event.key === 'Enter' || event.key === ' ')) {
+                event.preventDefault();
+                setDetailExec(exec);
+              }
+            }}
+            tabIndex={hasDetail ? 0 : undefined}
           >
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-              <span style={{ minWidth: '130px', fontSize: '11px' }}>{fmtTime(exec.created_at)}</span>
-              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
+            <div class="cron-execution-rail" aria-hidden="true">
+              <span class="cron-execution-index">{String(index + 1).padStart(2, '0')}</span>
+              <span class="cron-execution-dot" style={{ background: execStatusColor(exec.status), boxShadow: `0 0 12px ${execStatusColor(exec.status)}` }} />
+              <span class="cron-execution-line" />
+            </div>
+            <div class="cron-execution-card-body">
+              <div class="cron-execution-card-title-row">
+                <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+                <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
                 {execStatusLabel(exec.status, t)}
-              </span>
+                </span>
+              </div>
+              {hasDetail && <div class="cron-execution-preview">{exec.detail!.slice(0, 240)}</div>}
+              <div class="cron-execution-actions">
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
+                  class="cron-execution-link">
                   {t('cron.view_discussion')}
                 </button>
               )}
@@ -649,67 +945,296 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
                   e.stopPropagation();
                   onNavigateSession(jobSessionName, hasDetail ? exec.detail!.slice(0, 500) : undefined);
                 }}
-                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  class="cron-execution-link cron-execution-link--primary"
                   title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
                   {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
+              {hasDetail && <span class="cron-execution-open-hint">{t('cron.view_output')} ↗</span>}
+              </div>
             </div>
-            {/* 3-5 line preview */}
-            {hasDetail && (
-              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
-                {exec.detail!.slice(0, 300)}
-              </pre>
-            )}
-          </div>
+          </article>
         );
       })}
+      </div>
 
       {/* Detail floating panel */}
-      {detailExec && (
+      {detailExec && placeCronSubPanel(
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${job.name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={600} defaultH={500}
+          defaultW={960} defaultH={640}
+          minW={300}
+          className="cron-floating-panel cron-execution-detail-panel"
         >
-          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined} t={t} />
+          <ExecDetailView
+            jobName={job.name}
+            exec={detailExec}
+            targetSession={jobSessionName}
+            creatorName={job.creator_name}
+            creatorUserId={job.creator_user_id}
+            creatorIsShared={job.creator_is_shared}
+            onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined}
+            t={t}
+          />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
 
 // ── Execution Detail View (FloatingPanel content, renders markdown) ──────
 
-function ExecDetailView({ exec, onNavigateSession, t }: { exec: { status: string; detail: string | null; created_at: number }; onNavigateSession?: () => void; t: (key: string) => string }) {
-  const html = useMemo(() => {
-    if (!exec.detail) return '';
-    try { return marked(exec.detail, { breaks: true }) as string; } catch { return exec.detail; }
+export function ExecDetailView({
+  jobName,
+  exec,
+  targetSession,
+  creatorName,
+  creatorUserId,
+  creatorIsShared,
+  onNavigateSession,
+  t,
+}: {
+  jobName?: string;
+  exec: {
+    id?: string;
+    status: string;
+    detail: string | null;
+    created_at: number;
+    action?: any;
+    target_role?: string | null;
+    target_session_name?: string | null;
+    creator_user_id?: string | null;
+    creator_name?: string | null;
+    creator_is_shared?: boolean | null;
+  };
+  targetSession?: string;
+  creatorName?: string | null;
+  creatorUserId?: string | null;
+  creatorIsShared?: boolean | null;
+  onNavigateSession?: () => void;
+  t: (key: string) => string;
+}) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
+  const [copiedOutput, setCopiedOutput] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const effectiveCreator: CronCreatorInfo = {
+    creator_name: creatorName ?? exec.creator_name,
+    creator_user_id: creatorUserId ?? exec.creator_user_id,
+    creator_is_shared: creatorIsShared ?? exec.creator_is_shared,
+  };
+
+  useEffect(() => {
+    setIsExpanded(false);
+    setCopiedOutput(false);
+  }, [exec.id, exec.created_at]);
+
+  const lineCount = useMemo(() => {
+    if (!exec.detail) return 0;
+    return exec.detail.split('\n').length;
   }, [exec.detail]);
 
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !exec.detail) {
+      setCanExpand(false);
+      return;
+    }
+
+    const checkOverflow = () => {
+      const target = bodyRef.current;
+      if (!target) return;
+
+      // In jsdom without layout engine, clientHeight and scrollHeight are 0
+      const isZeroLayout = target.scrollHeight === 0 && target.clientHeight === 0;
+      if (isZeroLayout) {
+        setCanExpand(lineCount > 5);
+        return;
+      }
+
+      const style = window.getComputedStyle(target);
+      const fontSize = parseFloat(style.fontSize) || 13;
+      // 5 lines max height defined in CSS: calc(5 * 1.65em + 24px)
+      const collapsedMaxHeight = 5 * 1.65 * fontSize + 24;
+
+      // In collapsed mode, check if scrollHeight overflows visible clientHeight.
+      // In expanded mode, check if scrollHeight still overflows collapsedMaxHeight.
+      const threshold = isExpanded ? (collapsedMaxHeight + 1) : (target.clientHeight + 1);
+      const overflows = target.scrollHeight > threshold;
+
+      setCanExpand(overflows);
+
+      // If container resized wider such that content naturally fits in <= 5 lines, reset expanded
+      if (!overflows && isExpanded) {
+        setIsExpanded(false);
+      }
+    };
+
+    checkOverflow();
+    const rafId = requestAnimationFrame(checkOverflow);
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => {
+        checkOverflow();
+      });
+      observer.observe(el);
+    } else {
+      window.addEventListener('resize', checkOverflow);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (observer) {
+        observer.disconnect();
+      } else {
+        window.removeEventListener('resize', checkOverflow);
+      }
+    };
+  }, [exec.detail, exec.id, exec.created_at, isExpanded, lineCount]);
+
   return (
-    <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
-      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '12px', fontSize: '12px' }}>
-        <span style={{ color: '#94a3b8' }}>{fmtTime(exec.created_at)}</span>
-        <span style={{ color: execStatusColor(exec.status), fontWeight: 600 }}>{execStatusLabel(exec.status, t)}</span>
-        {onNavigateSession && exec.detail && (
-          <button type="button" onClick={onNavigateSession}
-            style={{ ...btnSecondary, marginLeft: 'auto', fontSize: '11px', padding: '4px 10px' }}>
-            {t('cron.go_and_quote')} →
-          </button>
-        )}
+    <div class="cron-execution-detail">
+      <div class="cron-execution-detail-header">
+        <div class="cron-execution-detail-title-row">
+          <span class="cron-execution-detail-job-name" title={jobName || t('cron.title')}>
+            <span class="cron-execution-hero-icon" style={{ fontSize: '13px', width: '20px', height: '20px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>⌁</span>
+            {jobName || t('cron.title')}
+          </span>
+          <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
+            <span class="cron-execution-status-dot" style={{ background: execStatusColor(exec.status) }} />
+            {execStatusLabel(exec.status, t)}
+          </span>
+        </div>
+        <div class="cron-execution-detail-toolbar">
+          <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+          {targetSession && (
+            <span class="cron-execution-target-badge" title={`${t('cron.target_session')}: ${targetSession}`}>
+              🎯 {targetSession}
+            </span>
+          )}
+          <CronCreatorChip info={effectiveCreator} t={t} />
+          {onNavigateSession && exec.detail && (
+            <button type="button" onClick={onNavigateSession}
+              class="cron-execution-detail-action">
+              {t('cron.go_and_quote')} →
+            </button>
+          )}
+        </div>
       </div>
       {exec.detail ? (
-        <div
-          class="discussions-markdown"
-          style={{ fontSize: '13px' }}
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
+        <section class={`cron-execution-output ${isExpanded ? 'cron-execution-output--expanded' : 'cron-execution-output--collapsed'}`}>
+          <div class="cron-execution-output-heading">
+            <span class="cron-execution-output-pulse" />
+            <span>{t('cron.final_output')}</span>
+            <small>
+              {exec.detail.length.toLocaleString()} {t('cron.characters')}
+              {lineCount > 1 ? ` · ${lineCount} ${t('cron.lines_count')}` : ''}
+            </small>
+            <button
+              type="button"
+              class="cron-execution-copy-btn"
+              onClick={() => {
+                if (!exec.detail) return;
+                void navigator.clipboard?.writeText(exec.detail);
+                setCopiedOutput(true);
+                window.setTimeout(() => setCopiedOutput(false), 1500);
+              }}
+            >
+              {copiedOutput ? t('cron.copied') : t('cron.copy_output')}
+            </button>
+          </div>
+          <div
+            ref={bodyRef}
+            class="cron-execution-output-body chat-markdown"
+            data-testid="cron-execution-output-body"
+            data-expanded={isExpanded ? 'true' : 'false'}
+            data-overflows={canExpand ? 'true' : 'false'}
+          >
+            <ChatMarkdown text={exec.detail} />
+          </div>
+          {canExpand && (
+            <div class="cron-execution-expand-bar">
+              <button
+                type="button"
+                class="cron-execution-expand-btn"
+                onClick={() => {
+                  const next = !isExpanded;
+                  setIsExpanded(next);
+                  if (!next && bodyRef.current) {
+                    bodyRef.current.scrollTop = 0;
+                  }
+                }}
+                aria-expanded={isExpanded}
+              >
+                <span class="cron-execution-expand-icon">{isExpanded ? '▴' : '▾'}</span>
+                <span class="cron-execution-expand-text">
+                  {isExpanded ? t('cron.collapse_view') : t('cron.expand_view')}
+                </span>
+                <span class="cron-execution-expand-hint">
+                  ({isExpanded ? t('cron.max_15_lines') : t('cron.default_5_lines')})
+                </span>
+              </button>
+            </div>
+          )}
+        </section>
       ) : (
-        <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_detail')}</div>
+        <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_detail')}</div>
       )}
     </div>
+  );
+}
+
+// ── Auto-resizing Textarea (Default 5 lines, max 15 lines) ─────────────────
+
+export function AutoResizeTextarea({
+  value,
+  onInput,
+  placeholder,
+  required,
+  style,
+  className,
+  ...props
+}: {
+  value: string;
+  onInput: (e: any) => void;
+  placeholder?: string;
+  required?: boolean;
+  style?: Record<string, any>;
+  className?: string;
+  [key: string]: any;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const adjustHeight = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
+
+  useEffect(() => {
+    adjustHeight();
+  }, [value, adjustHeight]);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      className={`cron-auto-textarea ${className || ''}`}
+      style={style}
+      value={value}
+      onInput={(e) => {
+        adjustHeight();
+        onInput(e);
+      }}
+      placeholder={placeholder}
+      required={required}
+      {...props}
+    />
   );
 }
 
@@ -777,13 +1302,6 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
   const withCurrent = (opts: string[], current: string) =>
     opts.includes(current) ? opts : [...opts, current];
 
-  const selectStyle: Record<string, string> = {
-    padding: '6px 8px', background: '#0f172a', border: '1px solid #334155',
-    borderRadius: '6px', color: '#e2e8f0', fontSize: '13px', appearance: 'auto',
-    flex: '1', minWidth: '0',
-  };
-  const fieldLabel: Record<string, string> = { fontSize: '11px', color: '#64748b', marginBottom: '2px' };
-
   const minuteLabel = (m: string) => m.startsWith('*/') ? m : (m === '0' ? ':00' : `:${m.padStart(2, '0')}`);
   const hourLabel = (h: string) => h === '*' ? t('cron.every_hour') : `${h.padStart(2, '0')}:00`;
 
@@ -791,18 +1309,18 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
   const currentDowInList = dowValues.includes(parts.dow);
 
   return (
-    <div style={{ marginBottom: '10px' }}>
+    <div class="cron-picker">
       {/* Mode toggle + presets */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+      <div class="cron-picker-toolbar">
         <button type="button" onClick={() => setMode(m => m === 'picker' ? 'advanced' : 'picker')}
-          style={{ padding: '3px 8px', background: '#334155', color: '#94a3b8', border: 'none', borderRadius: '4px', fontSize: '11px', cursor: 'pointer' }}>
+          class="cron-picker-mode-btn">
           {mode === 'picker' ? t('cron.mode_advanced') : t('cron.mode_picker')}
         </button>
         {mode === 'picker' && (
-          <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+          <div class="cron-preset-row">
             {PRESETS.map(p => (
               <button key={p.value} type="button" onClick={() => onChange(p.value)}
-                style={{ padding: '2px 6px', background: value === p.value ? '#3b82f6' : '#1e293b', color: value === p.value ? '#fff' : '#94a3b8', border: '1px solid #334155', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>
+                class={`cron-preset-btn${value === p.value ? ' is-selected' : ''}`}>
                 {p.label}
               </button>
             ))}
@@ -812,45 +1330,45 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
 
       {mode === 'advanced' ? (
         <>
-          <input style={inputStyle} value={value} onInput={e => onChange((e.target as HTMLInputElement).value)} placeholder="0 9 * * 1-5" required />
-          <div style={{ color: '#64748b', fontSize: '11px', marginTop: '-6px', marginBottom: '4px' }}>
+          <input class="cron-input cron-input--mono" value={value} onInput={e => onChange((e.target as HTMLInputElement).value)} placeholder="0 9 * * 1-5" required />
+          <div class="cron-field-help">
             {t('cron.advanced_help')}
           </div>
         </>
       ) : (
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div class="cron-picker-grid">
           {/* Minute */}
-          <div style={{ flex: 1 }}>
-            <div style={fieldLabel}>{t('cron.field_minute')}</div>
-            <select style={selectStyle} value={parts.minute} onChange={e => update('minute', (e.target as HTMLSelectElement).value)}>
+          <div class="cron-picker-col">
+            <div class="cron-picker-col-label">{t('cron.field_minute')}</div>
+            <select class="cron-select cron-select--compact" value={parts.minute} onChange={e => update('minute', (e.target as HTMLSelectElement).value)}>
               {withCurrent(MINUTE_OPTS, parts.minute).map(m => <option key={m} value={m}>{minuteLabel(m)}</option>)}
             </select>
           </div>
           {/* Hour */}
-          <div style={{ flex: 1 }}>
-            <div style={fieldLabel}>{t('cron.field_hour')}</div>
-            <select style={selectStyle} value={parts.hour} onChange={e => update('hour', (e.target as HTMLSelectElement).value)}>
+          <div class="cron-picker-col">
+            <div class="cron-picker-col-label">{t('cron.field_hour')}</div>
+            <select class="cron-select cron-select--compact" value={parts.hour} onChange={e => update('hour', (e.target as HTMLSelectElement).value)}>
               {withCurrent(HOUR_OPTS, parts.hour).map(h => <option key={h} value={h}>{hourLabel(h)}</option>)}
             </select>
           </div>
           {/* Day of month */}
-          <div style={{ flex: 1 }}>
-            <div style={fieldLabel}>{t('cron.field_day')}</div>
-            <select style={selectStyle} value={parts.dom} onChange={e => update('dom', (e.target as HTMLSelectElement).value)}>
+          <div class="cron-picker-col">
+            <div class="cron-picker-col-label">{t('cron.field_day')}</div>
+            <select class="cron-select cron-select--compact" value={parts.dom} onChange={e => update('dom', (e.target as HTMLSelectElement).value)}>
               {withCurrent(DOM_OPTS, parts.dom).map(d => <option key={d} value={d}>{d === '*' ? t('cron.any') : d}</option>)}
             </select>
           </div>
           {/* Month */}
-          <div style={{ flex: 1 }}>
-            <div style={fieldLabel}>{t('cron.field_month')}</div>
-            <select style={selectStyle} value={parts.month} onChange={e => update('month', (e.target as HTMLSelectElement).value)}>
+          <div class="cron-picker-col">
+            <div class="cron-picker-col-label">{t('cron.field_month')}</div>
+            <select class="cron-select cron-select--compact" value={parts.month} onChange={e => update('month', (e.target as HTMLSelectElement).value)}>
               {withCurrent(MONTH_OPTS, parts.month).map(m => <option key={m} value={m}>{m === '*' ? t('cron.any') : m}</option>)}
             </select>
           </div>
           {/* Day of week */}
-          <div style={{ flex: 1.3 }}>
-            <div style={fieldLabel}>{t('cron.field_weekday')}</div>
-            <select style={selectStyle} value={parts.dow} onChange={e => update('dow', (e.target as HTMLSelectElement).value)}>
+          <div class="cron-picker-col cron-picker-col--wide">
+            <div class="cron-picker-col-label">{t('cron.field_weekday')}</div>
+            <select class="cron-select cron-select--compact" value={parts.dow} onChange={e => update('dow', (e.target as HTMLSelectElement).value)}>
               {DOW_OPTS.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
               {!currentDowInList && <option value={parts.dow}>{parts.dow}</option>}
             </select>
@@ -860,8 +1378,8 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
 
       {/* Preview: show the raw expression */}
       {mode === 'picker' && (
-        <div style={{ color: '#64748b', fontSize: '11px', marginTop: '6px', fontFamily: 'monospace' }}>
-          {value || '—'}
+        <div class="cron-picker-preview">
+          <code>{value || '—'}</code>
         </div>
       )}
     </div>
@@ -875,14 +1393,16 @@ interface CronFormProps {
   projectName: string;
   sessions: SessionInfo[];
   subSessions?: SubSessionSlim[];
+  activeSession?: string | null;
+  sharedSessionName?: string;
   job: CronJob | null; // null = create, non-null = edit
   onDone: () => void;
   onCancel: () => void;
 }
 
-const CRON_COMMAND_INLINE_CHAR_LIMIT = 1500;
+const CRON_COMMAND_INLINE_CHAR_LIMIT = 5000;
 
-function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDone, onCancel }: CronFormProps) {
+function CronForm({ serverId, projectName, sessions, subSessions = [], activeSession, sharedSessionName, job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();
   const isEdit = !!job;
   const existingAction = job ? parseAction(job.action) : null;
@@ -890,9 +1410,15 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
   const [name, setName] = useState(job?.name ?? '');
   const [cronExpr, setCronExpr] = useState(job?.cron_expr ?? '');
-  const [targetRole, setTargetRole] = useState(job?.target_role ?? 'brain');
-  const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? null);
-  const [actionType, setActionType] = useState<'command' | 'p2p' | 'send'>(
+  const activeSubSession = !job && activeSession
+    ? subSessions.find((session) => session.sessionName === activeSession)
+    : undefined;
+  const activeMainSession = !job && activeSession
+    ? sessions.find((session) => session.name === activeSession)
+    : undefined;
+  const [targetRole, setTargetRole] = useState(job?.target_role ?? activeMainSession?.role ?? 'brain');
+  const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? activeSubSession?.sessionName ?? null);
+  const [actionType] = useState<'command' | 'p2p' | 'send'>(
     hasExistingP2pAction || existingAction?.type === 'send' ? existingAction.type : 'command',
   );
   const [command, setCommand] = useState(existingAction?.type === 'command' ? existingAction.command : '');
@@ -909,7 +1435,16 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   const [sendMessage, setSendMessage] = useState(existingAction?.type === 'send' ? existingAction.message : '');
   const [sendReply, setSendReply] = useState(existingAction?.type === 'send' ? existingAction.reply === true : false);
   const [sendBroadcast, setSendBroadcast] = useState(existingAction?.type === 'send' ? existingAction.broadcast === true : false);
+  const [onlyWhenIdle, setOnlyWhenIdle] = useState<boolean>(() => {
+    if (existingAction && existingAction.type !== 'p2p' && existingAction.onlyWhenIdle !== undefined) {
+      return existingAction.onlyWhenIdle;
+    }
+    return true;
+  });
   const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
+  const [completionPolicy, setCompletionPolicy] = useState<CronCompletionPolicy>(
+    normalizeCronCompletionPolicy(job?.completion_policy),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const commandCharCount = Array.from(command).length;
@@ -948,12 +1483,29 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
     const hasSessionEntries = entries.some(e => e.type === 'session');
 
     const action: CronAction = actionType === 'command'
-      ? { type: 'command', command }
+      ? {
+        type: 'command',
+        command,
+        onlyWhenIdle,
+        ...(
+          completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+          || (existingAction?.type === 'command' && existingAction.selfManaged)
+            ? { selfManaged: true }
+            : {}
+        ),
+        // cronControl is server-authored authority bound to this schedule.
+        // Editing user-visible fields must not silently strip the v2
+        // registration from an existing self-managed task.
+        ...(existingAction?.type === 'command' && existingAction.cronControl
+          ? { cronControl: existingAction.cronControl }
+          : {}),
+      }
       : actionType === 'send'
         ? {
           type: 'send',
           target: sendTarget.trim(),
           message: sendMessage,
+          onlyWhenIdle,
           ...(sendReply ? { reply: true } : {}),
           ...(sendBroadcast ? { broadcast: true } : {}),
           ...(existingAction?.type === 'send' && existingAction.idempotencyKey ? { idempotencyKey: existingAction.idempotencyKey } : {}),
@@ -980,13 +1532,15 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
       action,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       expiresAt: expiresAt ? new Date(expiresAt).getTime() : null,
+      completionPolicy,
     };
 
     try {
+      const sharedQuery = sharedSessionName ? `?sessionName=${encodeURIComponent(sharedSessionName)}` : '';
       if (isEdit) {
-        await apiFetch(`/api/cron/${job.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+        await apiFetch(`/api/cron/${job.id}${sharedQuery}`, { method: 'PUT', body: JSON.stringify(payload) });
       } else {
-        await apiFetch('/api/cron', { method: 'POST', body: JSON.stringify(payload) });
+        await apiFetch(`/api/cron${sharedQuery}`, { method: 'POST', body: JSON.stringify(payload) });
       }
       onDone();
     } catch (err: unknown) {
@@ -1013,80 +1567,91 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   const otherSubSessions = subSessions.filter(s => s.sessionName !== targetSessionName);
 
   return (
-    <div style={{ ...cardStyle, border: '1px solid #334155' }}>
-      <h3 style={{ color: '#e2e8f0', margin: '0 0 16px', fontSize: '16px' }}>
-        {isEdit ? t('cron.edit') : t('cron.create')}
-      </h3>
+    <div class="cron-form-card">
+      <div class="cron-form-header">
+        <h3 class="cron-form-title">
+          <span class="cron-form-title-accent" aria-hidden="true">⌁</span>
+          <span>{isEdit ? t('cron.edit') : t('cron.create')}</span>
+        </h3>
+        {isEdit && job && (
+          <CronCreatorChip info={job} t={t} labelKey="cron.last_modified_by" className="cron-form-provenance" />
+        )}
+      </div>
 
       <form onSubmit={handleSubmit}>
-        <label style={labelStyle}>{t('cron.name')}</label>
-        <input style={inputStyle} value={name} onInput={e => setName((e.target as HTMLInputElement).value)} placeholder={t('cron.name_placeholder')} required />
+        <label class="cron-field-label">{t('cron.name')}</label>
+        <input class="cron-input" value={name} onInput={e => setName((e.target as HTMLInputElement).value)} placeholder={t('cron.name_placeholder')} required />
 
-        <label style={labelStyle}>{t('cron.schedule')}</label>
+        <label class="cron-field-label">{t('cron.schedule')}</label>
         <CronSchedulePicker value={cronExpr} onChange={setCronExpr} t={t} />
 
-        <label style={labelStyle}>{t('cron.target')}</label>
-        <select style={{ ...inputStyle, appearance: 'auto' as string }} value={targetValue} onChange={e => handleTargetChange((e.target as HTMLSelectElement).value)}>
+        <label class="cron-field-label">{t('cron.target')}</label>
+        <select class="cron-select" value={targetValue} onChange={e => handleTargetChange((e.target as HTMLSelectElement).value)}>
           {sessions.length === 0 && subSessions.length === 0 && <option value="role:brain">brain</option>}
           {sessions.map(s => (
             <option key={s.name} value={`role:${s.role}`}>
               {sessionDisplayLabel(s)} ({agentBadge(s.agentType)})
             </option>
           ))}
+          {!sessions.some(s => s.role === 'brain') && (
+            <option value="role:brain">brain</option>
+          )}
+          {!sessions.some(s => s.role === 'w1') && (
+            <option value="role:w1">w1</option>
+          )}
+          {targetRole && targetRole !== 'brain' && targetRole !== 'w1' && !sessions.some(s => s.role === targetRole) && !targetSessionName && (
+            <option value={`role:${targetRole}`}>{targetRole}</option>
+          )}
           {subSessions.length > 0 && <option disabled>──────────</option>}
           {subSessions.map(s => (
             <option key={s.sessionName} value={`sub:${s.sessionName}`}>
               {s.label ? formatLabel(s.label) : s.type} ({agentBadge(s.type)})
             </option>
           ))}
+          {targetSessionName && !subSessions.some(s => s.sessionName === targetSessionName) && (
+            <option value={`sub:${targetSessionName}`}>{targetSessionName}</option>
+          )}
         </select>
 
-        <label style={labelStyle}>{t('cron.action_type')}</label>
-        <div style={{ display: 'flex', gap: '16px', marginBottom: '12px' }}>
+        <label class="cron-field-label">{t('cron.completion_policy')}</label>
+        <select
+          class="cron-select"
+          value={completionPolicy}
+          onInput={e => setCompletionPolicy((e.target as HTMLSelectElement).value as CronCompletionPolicy)}
+        >
+          <option value={CRON_COMPLETION_POLICY.RECURRING}>{t('cron.completion_recurring')}</option>
+          <option value={CRON_COMPLETION_POLICY.UNTIL_COMPLETE}>{t('cron.completion_until_complete')}</option>
+        </select>
+        <div class="cron-field-help">
+          {t(`cron.completion_${completionPolicy}_help`)}
+        </div>
+
+        {(hasExistingP2pAction || existingAction?.type === 'send') && (
+          <div class="cron-legacy-note">
           {hasExistingP2pAction ? (
-            <label style={{ color: '#94a3b8', fontSize: '14px', cursor: 'not-allowed' }}>
-              <input type="radio" name="actionType" checked={actionType === 'p2p'} disabled style={{ marginRight: '6px' }} />
-              {t('cron.action_p2p')}
+            <label class="cron-checkbox-row cron-checkbox-row--disabled">
+              <input type="radio" name="actionType" checked={actionType === 'p2p'} disabled />
+              <span>{t('cron.action_p2p')}</span>
             </label>
           ) : (
-            <>
-              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-                <input type="radio" name="actionType" checked={actionType === 'command'} onChange={() => setActionType('command')} style={{ marginRight: '6px' }} />
-                {t('cron.action_command')}
-              </label>
-              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-                <input type="radio" name="actionType" checked={actionType === 'send'} onChange={() => setActionType('send')} style={{ marginRight: '6px' }} />
-                {t('common.send')}
-              </label>
-            </>
+            <span class="cron-legacy-send">{t('cron.legacy_send')}</span>
           )}
-        </div>
+          </div>
+        )}
 
         {actionType === 'command' && (
           <>
-            <label style={labelStyle}>{t('cron.command')}</label>
-            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, lineHeight: 1.5 }}>
-              {t('cron.shell_hint')}
-            </div>
-            <textarea
-              style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
+            <label class="cron-field-label">{t('cron.send_message')}</label>
+            <AutoResizeTextarea
               value={command}
-              onInput={e => {
-                setCommand((e.target as HTMLTextAreaElement).value);
+              onInput={(e: any) => {
+                setCommand(e.target.value);
                 setError((prev) => prev?.startsWith('Command is too long') ? null : prev);
               }}
-              placeholder={t('cron.command_placeholder')}
+              placeholder={t('cron.send_message_placeholder')}
               required
             />
-            <div
-              style={{
-                marginTop: '6px',
-                marginBottom: '10px',
-                fontSize: '11px',
-                lineHeight: 1.5,
-                color: commandTooLong ? '#fbbf24' : '#64748b',
-              }}
-            >
+            <div class={`cron-char-counter${commandTooLong ? ' is-over' : ''}`}>
               {commandCharCount}/{CRON_COMMAND_INLINE_CHAR_LIMIT}
               {commandTooLong
                 ? ' · Too long for inline entry. Write it to a file and reference it with @/path/to/file.'
@@ -1097,60 +1662,62 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
         {actionType === 'p2p' && (
           <>
-            <label style={labelStyle}>{t('cron.p2p_topic')}</label>
-            <textarea
-              style={{ ...inputStyle, minHeight: '60px', resize: 'vertical', fontFamily: 'inherit' }}
+            <label class="cron-field-label">{t('cron.p2p_topic')}</label>
+            <AutoResizeTextarea
               value={p2pTopic}
-              onInput={e => setP2pTopic((e.target as HTMLTextAreaElement).value)}
+              onInput={(e: any) => setP2pTopic(e.target.value)}
               placeholder={t('cron.p2p_topic_placeholder')}
               required
             />
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+            <div class="cron-form-two-col">
               <div>
-                <label style={labelStyle}>{t('cron.p2p_mode')}</label>
-                <select style={{ ...inputStyle, appearance: 'auto' as string }} value={p2pMode} onChange={e => setP2pMode((e.target as HTMLSelectElement).value)}>
+                <label class="cron-field-label">{t('cron.p2p_mode')}</label>
+                <select class="cron-select" value={p2pMode} onChange={e => setP2pMode((e.target as HTMLSelectElement).value)}>
                   {p2pModes.map(m => <option key={m} value={m}>{m}</option>)}
                 </select>
               </div>
               <div>
-                <label style={labelStyle}>{t('cron.p2p_rounds')}</label>
-                <input type="number" min={1} max={6} style={inputStyle} value={p2pRounds} onInput={e => setP2pRounds(parseInt((e.target as HTMLInputElement).value) || 1)} />
+                <label class="cron-field-label">{t('cron.p2p_rounds')}</label>
+                <input type="number" min={1} max={6} class="cron-input" value={p2pRounds} onInput={e => setP2pRounds(parseInt((e.target as HTMLInputElement).value) || 1)} />
               </div>
             </div>
 
-            <label style={labelStyle}>{t('cron.p2p_participants')}</label>
-            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '10px' }}>
+            <label class="cron-field-label">{t('cron.p2p_participants')}</label>
+            <div class="cron-participants-grid">
               {otherMainSessions.map(s => (
-                <label key={s.name} style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <label key={s.name} class="cron-checkbox-row">
                   <input
                     type="checkbox"
                     checked={p2pParticipants.includes(s.role)}
                     onChange={() => setP2pParticipants(prev => prev.includes(s.role) ? prev.filter(x => x !== s.role) : [...prev, s.role])}
                   />
-                  {sessionDisplayLabel(s)} <span style={{ opacity: 0.5, fontSize: '11px' }}>({agentBadge(s.agentType)})</span>
+                  <span>{sessionDisplayLabel(s)}</span>
+                  <span class="cron-participant-badge">({agentBadge(s.agentType)})</span>
                 </label>
               ))}
               {otherSubSessions.map(s => (
-                <label key={s.sessionName} style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <label key={s.sessionName} class="cron-checkbox-row">
                   <input
                     type="checkbox"
                     checked={p2pParticipants.includes(s.sessionName)}
                     onChange={() => setP2pParticipants(prev => prev.includes(s.sessionName) ? prev.filter(x => x !== s.sessionName) : [...prev, s.sessionName])}
                   />
-                  {s.label ? formatLabel(s.label) : s.type} <span style={{ opacity: 0.5, fontSize: '11px' }}>({agentBadge(s.type)})</span>
+                  <span>{s.label ? formatLabel(s.label) : s.type}</span>
+                  <span class="cron-participant-badge">({agentBadge(s.type)})</span>
                 </label>
               ))}
-              {otherMainSessions.length === 0 && otherSubSessions.length === 0 && <span style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_participants')}</span>}
+              {otherMainSessions.length === 0 && otherSubSessions.length === 0 && <span class="cron-field-empty">{t('cron.no_participants')}</span>}
             </div>
           </>
         )}
 
         {actionType === 'send' && (
           <>
-            <label style={labelStyle}>{t('cron.send_target')}</label>
+            <label class="cron-field-label">{t('cron.send_target')}</label>
             <input
-              style={{ ...inputStyle, opacity: sendBroadcast ? '0.55' : '1' }}
+              class="cron-input"
+              style={{ opacity: sendBroadcast ? '0.55' : '1' }}
               value={sendTarget}
               onInput={e => setSendTarget((e.target as HTMLInputElement).value)}
               placeholder={t('cron.send_target_placeholder')}
@@ -1162,49 +1729,60 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
               {sendTargetOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </datalist>
 
-            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+            <label class="cron-checkbox-row">
               <input
                 type="checkbox"
                 checked={sendBroadcast}
                 onChange={e => setSendBroadcast((e.target as HTMLInputElement).checked)}
               />
-              {t('cron.send_broadcast')}
+              <span>{t('cron.send_broadcast')}</span>
             </label>
 
-            <label style={labelStyle}>{t('cron.send_message')}</label>
-            <textarea
-              style={{ ...inputStyle, minHeight: '90px', resize: 'vertical', fontFamily: 'inherit' }}
+            <label class="cron-field-label">{t('cron.send_message')}</label>
+            <AutoResizeTextarea
               value={sendMessage}
-              onInput={e => setSendMessage((e.target as HTMLTextAreaElement).value)}
+              onInput={(e: any) => setSendMessage(e.target.value)}
               placeholder={t('cron.send_message_placeholder')}
               required
             />
 
-            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+            <label class="cron-checkbox-row">
               <input
                 type="checkbox"
                 checked={sendReply}
                 onChange={e => setSendReply((e.target as HTMLInputElement).checked)}
               />
-              {t('cron.send_reply')}
+              <span>{t('cron.send_reply')}</span>
             </label>
           </>
         )}
 
-        <label style={labelStyle}>{t('cron.expires_at')}</label>
+        {actionType !== 'p2p' && (
+          <label class="cron-checkbox-row cron-checkbox-row--spaced">
+            <input
+              type="checkbox"
+              checked={onlyWhenIdle}
+              onChange={e => setOnlyWhenIdle((e.target as HTMLInputElement).checked)}
+            />
+            <span>{t('cron.send_only_when_idle')}</span>
+            <span class="cron-checkbox-help">({t('cron.send_only_when_idle_help')})</span>
+          </label>
+        )}
+
+        <label class="cron-field-label">{t('cron.expires_at')}</label>
         <input
           type="datetime-local"
-          style={inputStyle}
+          class="cron-input"
           value={expiresAt}
           onInput={e => setExpiresAt((e.target as HTMLInputElement).value)}
         />
-        <div style={{ color: '#64748b', fontSize: '11px', marginTop: '-6px', marginBottom: '10px' }}>{t('cron.expires_never')}</div>
+        <div class="cron-field-help">{t('cron.expires_never')}</div>
 
-        {error && <div style={{ color: '#f87171', fontSize: '13px', marginBottom: '10px' }}>{error}</div>}
+        {error && <div class="cron-error-banner">{error}</div>}
 
-        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-          <button type="button" onClick={onCancel} style={btnSecondary}>{t('cron.cancel')}</button>
-          <button type="submit" disabled={saving} style={{ ...btnPrimary, opacity: saving ? 0.6 : 1 }}>
+        <div class="cron-form-actions">
+          <button type="button" onClick={onCancel} class="cron-btn cron-btn--secondary">{t('cron.cancel')}</button>
+          <button type="submit" disabled={saving} class="cron-btn cron-btn--primary">
             {saving ? t('common.loading') : t('cron.save')}
           </button>
         </div>

@@ -1,0 +1,18 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+(node:60964) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+ ✓ |server| server/test/session-identities-routes.test.ts (6 tests) 53ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  01:58:24
+   Duration  2.17s (transform 1.19s, setup 0ms, collect 1.82s, tests 53ms, environment 0ms, prepare 38ms)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+exit=0

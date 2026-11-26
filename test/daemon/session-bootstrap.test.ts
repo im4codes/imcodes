@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   buildWorkerSessionPersistBody,
   mergeWorkerSessionSnapshot,
@@ -6,6 +8,17 @@ import {
 } from '../../src/daemon/session-bootstrap.js';
 
 describe('session bootstrap supervision persistence', () => {
+  it('wires restored transport snapshots into automation before automation init', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/daemon/lifecycle.ts'), 'utf8');
+    const restoreWire = source.indexOf('setTransportSessionRestoredCallback((sessionName) => {');
+    const applyWire = source.indexOf('supervisionAutomation.applyPersistedSnapshot(sessionName);', restoreWire);
+    const automationInit = source.indexOf('supervisionAutomation.init();');
+
+    expect(restoreWire).toBeGreaterThan(-1);
+    expect(applyWire).toBeGreaterThan(restoreWire);
+    expect(automationInit).toBeGreaterThan(applyWire);
+  });
+
   it('includes the resolved transportConfig supervision snapshot when persisting to the worker', () => {
     const body = buildWorkerSessionPersistBody({
       name: 'deck_proj_brain',

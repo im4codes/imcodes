@@ -1,7 +1,15 @@
+import { confirmChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -16,6 +24,7 @@ import type {
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
@@ -29,7 +38,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
-import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
@@ -38,6 +47,13 @@ import {
 import { ensureQwenMcpHasImcodesEntry, type QwenMcpEnsureResult } from '../../daemon/qwen-mcp-config.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { NativeAgentFenceSlot, QWEN_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import {
   MEMORY_MCP_PROVIDER_STATUS_REASON,
   MEMORY_MCP_STATUS,
@@ -54,11 +70,43 @@ import {
   isSdkRuntimeSubagentEventName,
   makeQwenSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentFullRequest,
+  readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
 } from '../../../shared/sdk-subagent-status.js';
+import { capContextPreservingPriority, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
+
+/**
+ * Linux caps each single argv string at MAX_ARG_STRLEN = 32 pages = 131072 bytes,
+ * including its terminating NUL. The qwen CLI only accepts the system prompt as
+ * the `--append-system-prompt` string argument (it has no file or stdin form), so
+ * an over-limit prompt makes spawn fail with E2BIG before qwen ever runs.
+ */
+export const LINUX_MAX_ARG_STRLEN_BYTES = 131_072;
+
+/**
+ * Byte budget for `--append-system-prompt`. Kept well under MAX_ARG_STRLEN so the
+ * argument stays spawnable on Linux and leaves headroom within macOS's combined
+ * argv+environment ARG_MAX alongside the prompt and the remaining arguments.
+ */
+export const QWEN_APPEND_SYSTEM_PROMPT_MAX_BYTES = 120_000;
+
+const QWEN_SYSTEM_PROMPT_CAP_MARKERS: PriorityPreservingCapMarkers = {
+  identityTruncated: (bodyBytes, maxBytes) => `\n[IM.codes: agent identity truncated from ${bodyBytes} bytes to fit the ${maxBytes}-byte qwen argument limit; IM.codes system and supervision instructions were preserved.]\n`,
+  contextTruncated: (bytes, maxBytes) => `\n\n[IM.codes: system prompt truncated from ${bytes} to ${maxBytes} bytes to fit the qwen argument limit.]`,
+};
+
+/**
+ * Deterministic, byte-safe, priority-preserving cap for the qwen system prompt.
+ * Overflow is spent on the user-authored identity block first, so IM.codes system,
+ * security and supervision instructions are never displaced by a large identity.
+ */
+export function capQwenAppendSystemPrompt(prompt: SpannedText | string): string {
+  return capContextPreservingPriority(prompt, QWEN_APPEND_SYSTEM_PROMPT_MAX_BYTES, 'utf8', QWEN_SYSTEM_PROMPT_CAP_MARKERS);
+}
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -166,6 +214,10 @@ interface QwenSessionState {
   qwenConversationId: string;
   runtimeActivityGeneration?: ActivityGeneration;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   currentMessageId: string | null;
   currentText: string;
   pendingFinalText?: string;
@@ -173,10 +225,15 @@ interface QwenSessionState {
   cancelled?: boolean;
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this Qwen conversation. */
   sessionSystemTextInjected?: string;
+  /** The IM.codes session this route serves, when known at creation. */
+  imcodesSessionName?: string;
+  /** The native-agent fence the running turn process was spawned with. */
+  turnNativeAgentFence?: NativeAgentFence;
 }
 
 function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
@@ -391,6 +448,13 @@ function readRuntimeSubagentPrompt(record: Record<string, unknown>): string | un
     ?? meaningfulString(record.request);
 }
 
+function readRuntimeSubagentBackgrounded(record: Record<string, unknown>): boolean {
+  return record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true
+    || record.detached === true;
+}
+
 function readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
   const value = record.status ?? record.state ?? record.phase ?? record.lifecycle;
   if (typeof value === 'string') return { status: value };
@@ -495,6 +559,14 @@ function qwenRuntimeSubagentToolFromPayload(
   const agentName = readRuntimeSubagentName(record);
   const model = readRuntimeSubagentModel(record, state.model);
   const prompt = readRuntimeSubagentPrompt(record);
+  const backgrounded = readRuntimeSubagentBackgrounded(record);
+  const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+  const startedAtMs = readSdkSubagentStartedAtMs(record)
+    ?? startedAtByKey.get(canonicalKey)
+    ?? Date.now();
+  if (statusMapping.active && !statusMapping.terminal) {
+    startedAtByKey.set(canonicalKey, startedAtMs);
+  }
   const summary = agentName ? `Qwen sub-agent ${agentName}` : rawAgentPath ? `Qwen sub-agent ${rawAgentPath}` : 'Qwen sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -503,6 +575,7 @@ function qwenRuntimeSubagentToolFromPayload(
     input: {
       action: 'qwen-runtime-subagent',
       description: prompt ?? summary,
+      ...(readSdkSubagentFullRequest(record) ? { fullRequest: readSdkSubagentFullRequest(record) } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -520,6 +593,8 @@ function qwenRuntimeSubagentToolFromPayload(
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
+      startedAtMs,
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -552,6 +627,10 @@ export class QwenProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: QWEN_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
+    // Every turn is its own CLI process; a managed session's turn is spawned
+    // with `--exclude-tools agent,task`.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'slash-command',
       providerCommand: QWEN_COMPACT_SLASH_COMMAND,
@@ -559,12 +638,15 @@ export class QwenProvider implements TransportProvider {
       completion: 'command-result',
       cancellation: 'provider-cancel',
       reason: 'Verified with Qwen Code 0.14.5: non-interactive CLI supports /compress, not /compact; adapter translates the IM.codes /compact control command.',
+      // Clears its injected-system-text marker on every compaction (refreshSessionSystemText), so the next turn re-sends it.
+      reassertsSessionSystemText: true,
     },
   };
 
   private config: ProviderConfig | null = null;
   private mcpRegistration: QwenMcpEnsureResult | null = null;
   private sessions = new Map<string, QwenSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('qwen');
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -635,8 +717,8 @@ export class QwenProvider implements TransportProvider {
   getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
-    const childActive = Boolean(state.child && !state.child.killed);
-    const activeToolCount = state.toolUseById.size;
+    const childActive = !state.cancelled && Boolean(state.child && !state.child.killed);
+    const activeToolCount = state.cancelled ? 0 : state.toolUseById.size;
     const terminalResultPending = typeof state.pendingFinalText === 'string' && state.pendingFinalText.length > 0;
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
@@ -657,7 +739,7 @@ export class QwenProvider implements TransportProvider {
       if (state.child && !state.child.killed) {
         // Tree-kill: qwen CLI forks children (web_search etc.) that survive
         // a wrapper-only SIGTERM. See killProcessTree for walk+SIGKILL logic.
-        void killProcessTree(state.child);
+        await killProcessTree(state.child, { ownsProcessGroup: true });
       }
       await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
@@ -687,6 +769,7 @@ export class QwenProvider implements TransportProvider {
       settingsPath: existing?.settingsPath,
       qwenConversationId,
       child: existing?.child ?? null,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
       pendingFinalText: existing?.pendingFinalText,
@@ -694,11 +777,31 @@ export class QwenProvider implements TransportProvider {
       cancelled: existing?.cancelled ?? false,
       toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
       toolUseById: existing?.toolUseById ?? new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
       lastStatusSignature: existing?.lastStatusSignature ?? null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
+      imcodesSessionName: config.sessionName ?? existing?.imcodesSessionName,
+      turnNativeAgentFence: existing?.turnNativeAgentFence,
     });
     return sessionId;
+  }
+
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * A running turn has exactly the fence its process was spawned with; Qwen
+   * has no native append, so later bytes always wait for the NEXT turn, which
+   * decides its own fence on this provider's spawn path.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (state?.child && !state.child.killed) {
+      return state.turnNativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    }
+    return this.nativeAgentFence.nextLaunchFence(providerSessionId, state?.imcodesSessionName);
   }
 
   async endSession(sessionId: string): Promise<void> {
@@ -706,7 +809,7 @@ export class QwenProvider implements TransportProvider {
     if (state?.child && !state.child.killed) {
       // Tree-kill so any child forked by the qwen CLI (web_search etc.) is
       // also terminated — see provider disconnect comment.
-      void killProcessTree(state.child);
+      await killProcessTree(state.child, { ownsProcessGroup: true });
     }
     if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
@@ -770,6 +873,13 @@ export class QwenProvider implements TransportProvider {
     await this.ensureSettingsPath(state);
   }
 
+  /** After any compaction the next turn carries the session system text again. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
+  }
+
   async send(
     sessionId: string,
     payloadOrMessage: string | ProviderContextPayload,
@@ -802,6 +912,7 @@ export class QwenProvider implements TransportProvider {
       cancelled: false,
       toolUseByIndex: new Map(),
       toolUseById: new Map(),
+      runtimeSubagentStartedAtByKey: new Map(),
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
     };
@@ -839,15 +950,17 @@ export class QwenProvider implements TransportProvider {
     const systemParts = getProviderSystemTextParts(providerPayload);
     const sessionSystemText = systemParts.sessionSystemText;
     const includeSessionSystemText = !isCompactControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
-    const effectivePrompt = isCompactControl
+    // The identity boundary travels structurally from assembly; it is never
+    // rediscovered in this string, which also carries authored turn context.
+    const effectivePrompt: SpannedText | string | undefined = isCompactControl
       ? undefined
       : (
           systemParts.hasSplitSystemText
-            ? composeProviderSystemText(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true })
-            : (composeProviderSystemText(providerPayload) || state.description?.trim())
+            ? composeProviderSystemTextSpanned(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true })
+            : (composeProviderSystemTextSpanned(providerPayload) || state.description?.trim())
         );
-    if (effectivePrompt) {
-      args.push('--append-system-prompt', effectivePrompt);
+    if (effectivePrompt && (typeof effectivePrompt === 'string' ? effectivePrompt : effectivePrompt.text)) {
+      args.push('--append-system-prompt', capQwenAppendSystemPrompt(effectivePrompt));
     }
     if (state.model) {
       args.push('--model', state.model);
@@ -871,22 +984,36 @@ export class QwenProvider implements TransportProvider {
       args.push('--session-id', state.qwenConversationId);
     }
 
+    const settingsPath = await this.ensureSettingsPath(state);
+    // Decided after the last await and immediately before the spawn, so the
+    // turn process carries exactly the fence recorded for it.
+    const nativeAgentsFenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
+    if (nativeAgentsFenced) args.push('--exclude-tools', QWEN_NATIVE_AGENT_TOOLS.join(','));
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
     const finalArgs = [...resolved.prependArgs, ...args];
     const child = spawn(resolved.executable, finalArgs, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
         ...(state.env ?? {}),
         ...(state.mcpEnv ?? {}),
-        QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
+        QWEN_CODE_SYSTEM_SETTINGS_PATH: settingsPath,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
       windowsHide: true,
     });
     state.child = child;
+    state.turnNativeAgentFence = fenceOf(nativeAgentsFenced);
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     this.sessions.set(sessionId, state);
     if (isCompactControl) {
       this.emitStatus(sessionId, state, {
@@ -918,17 +1045,22 @@ export class QwenProvider implements TransportProvider {
     const armResultCompletionFallback = (): void => {
       if (state.cancelled || !state.pendingFinalText) return;
       clearResultCompletionFallback();
-      resultCompletionTimer = setTimeout(() => {
+      resultCompletionTimer = setTimeout(async () => {
         resultCompletionTimer = null;
         if (completed || sawError || state.cancelled || !state.pendingFinalText) return;
         const finalText = state.pendingFinalText;
         const messageId = state.currentMessageId ?? undefined;
         const metadata = state.pendingFinalMetadata;
+        // A timer callback has no caller to await it, so the escalation is held
+        // in a local instead of discarded. Completion still emits on its
+        // original timing; only the reap outlives it.
+        let reaped: Promise<void> | null = null;
         if (state.child === child) {
           state.child = null;
-          void killProcessTree(child, { gracefulMs: 500 });
+          reaped = killProcessTree(child, { gracefulMs: 500, ownsProcessGroup: true });
         }
         emitComplete(finalText, messageId, metadata);
+        if (reaped) await reaped;
       }, QWEN_RESULT_COMPLETION_FALLBACK_MS);
       resultCompletionTimer.unref?.();
     };
@@ -1043,7 +1175,7 @@ export class QwenProvider implements TransportProvider {
       emitTool(qwenRuntimeSubagentToolFromPayload(sessionId, state, record));
     };
 
-    const rl = readline.createInterface({ input: child.stdout! });
+    const rl = readline.createInterface({ input: gateChildStream(child.stdout!) });
     rl.on('line', (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -1297,6 +1429,7 @@ export class QwenProvider implements TransportProvider {
     });
 
     child.once('close', (code, signal) => {
+      confirmCapturedChildExit(child);
       setTimeout(() => {
         clearResultCompletionFallback();
         rl.close();
@@ -1353,6 +1486,13 @@ export class QwenProvider implements TransportProvider {
     return this.sessions.has(sessionId) || !!sessionId;
   }
 
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const capturedChild = state?.child;
+    if (!state || !capturedChild) return Promise.reject(new Error('Provider has no captured child to confirm stop'));
+    return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state?.child || state.child.killed) return;
@@ -1362,7 +1502,7 @@ export class QwenProvider implements TransportProvider {
     // left Qwen CLI's grandchildren (web_search, bash helpers) alive.
     // killProcessTree walks the descendant tree via `ps` and sends SIGTERM
     // → SIGKILL to each pid explicitly (2s grace).
-    void killProcessTree(child, { gracefulMs: 2_000 });
+    await killProcessTree(child, { gracefulMs: 2_000, ownsProcessGroup: true });
     // Reset conversation so next send uses --session-id with a fresh ID
     // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;

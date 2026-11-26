@@ -28,6 +28,7 @@ import {
   isWorkerSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from '../src/session-list-merge.js';
 import type { SessionInfo } from '../src/types.js';
@@ -66,6 +67,30 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('does not resurrect the old provider model from a sparse restart projection', () => {
+    const merged = mergeSessionListEntry({ ...BASE_INCOMING, agentType: 'agy-sdk' }, makeExisting({
+      requestedModel: 'gpt-6.1-sol', activeModel: 'gpt-6.1-sol', modelDisplay: 'gpt-6.1-sol',
+    }));
+    expect(merged.requestedModel).toBeUndefined();
+    expect(merged.activeModel).toBeUndefined();
+    expect(merged.modelDisplay).toBeUndefined();
+  });
+  it('accepts a new authoritative shared mode and preserves it when an older sparse snapshot omits it', () => {
+    const projected = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }, makeExisting({ supervisionMode: SUPERVISION_MODE.OFF }));
+    expect(projected.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+
+    const sparse = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+    }, projected);
+    expect(sparse.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+  });
   it('keeps daemon-provided error reason for error session list entries and clears it on recovery', () => {
     const errored = mergeSessionListEntry({
       ...BASE_INCOMING,
@@ -214,6 +239,17 @@ describe('mergeSessionListEntry — supervision preservation', () => {
 });
 
 describe('mergeSessionListEntry — general field behavior', () => {
+  it('preserves an authoritative idle marker through the session-list refresh after a stale-turn ack', () => {
+    const observedAt = 1_790_504_500_000;
+    const existing = makeExisting({ authoritativeIdleAt: observedAt, state: 'idle' });
+
+    const refreshedIdle = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
+    expect(refreshedIdle.authoritativeIdleAt).toBe(observedAt);
+
+    const refreshedRunning = mergeSessionListEntry({ ...BASE_INCOMING, state: 'running' }, refreshedIdle);
+    expect(refreshedRunning.authoritativeIdleAt).toBeUndefined();
+  });
+
   it('copies incoming non-supervision fields across', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
@@ -225,6 +261,16 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.label).toBe('Main Brain');
     expect(merged.modelDisplay).toBe('gpt-5.4');
     expect(merged.planLabel).toBe('Pro');
+  });
+
+  it('applies shared thinking switches and retains the last known value across sparse broadcasts', () => {
+    let current=makeExisting({effort:'high',sharedState:{effectiveRole:'participant',status:'active'}});
+    for(const effort of ['max','xhigh','medium'] as const) {
+      current=mergeSessionListEntry({...BASE_INCOMING,effort},current);
+      expect(current.effort).toBe(effort);
+      current=mergeSessionListEntry(BASE_INCOMING,current);
+      expect(current.effort).toBe(effort);
+    }
   });
 
   it('falls back to existing for fields omitted by the broadcast', () => {
@@ -346,7 +392,7 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.runtimeType).toBe('transport');
   });
 
-  it('clears pending messages when daemon reports a terminal state', () => {
+  it('preserves pending messages when daemon reports a terminal state without structured queue evidence', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['pending one'],
@@ -355,8 +401,8 @@ describe('mergeSessionListEntry — general field behavior', () => {
 
     const merged = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
 
-    expect(merged.transportPendingMessages).toEqual([]);
-    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessages).toEqual(['pending one']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 
   it('keeps the existing pending queue on running state when broadcast omits it', () => {
@@ -372,7 +418,7 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 
-  it('keeps an explicit queued snapshot even when the daemon session state is idle', () => {
+  it('ignores legacy queued snapshots even when the daemon session state is idle', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['stale pending'],
@@ -386,11 +432,11 @@ describe('mergeSessionListEntry — general field behavior', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'id-1', text: 'pending one' }],
     }, existing);
 
-    expect(merged.transportPendingMessages).toEqual(['pending one']);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
+    expect(merged.transportPendingMessages).toEqual(['stale pending']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-stale', text: 'stale pending' }]);
   });
 
-  it('clears the existing queue when running snapshot carries explicit empty arrays', () => {
+  it('ignores legacy empty arrays instead of clearing the existing queue', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['pending one'],
@@ -404,8 +450,8 @@ describe('mergeSessionListEntry — general field behavior', () => {
       transportPendingMessageEntries: [],
     }, existing);
 
-    expect(merged.transportPendingMessages).toEqual([]);
-    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessages).toEqual(['pending one']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 });
 
@@ -419,6 +465,20 @@ describe('session navigation visibility', () => {
       project: 'my_proj',
       role: 'w12',
     });
+  });
+
+  it('resolves a shared session\'s real project from its name, not the display title, when the owner labeled the session', () => {
+    // A session-share's `title` is the session's own label when one is set —
+    // it must never be mistaken for the project identifier (e.g. used to scope
+    // cron-task visibility), or a labeled session's tasks silently disappear
+    // for participants while the owner (whose UI never derives project this
+    // way) still sees them fine.
+    expect(resolveSharedSessionProject('deck_soft_dev_rules_brain', 'My Custom Label')).toBe('soft_dev_rules');
+  });
+
+  it('falls back to the title only when the session name does not match the deck_{project}_{role} convention', () => {
+    expect(resolveSharedSessionProject('not-a-deck-session', 'Fallback Title')).toBe('Fallback Title');
+    expect(resolveSharedSessionProject('not-a-deck-session', '')).toBe('not-a-deck-session');
   });
 
   it('identifies sub-sessions and worker main sessions as hidden from top-level navigation', () => {
@@ -469,7 +529,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('applies a newer snapshot and advances the baseline', () => {
+  it('ignores a newer legacy snapshot without structured queue identity', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -477,11 +537,11 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'm9', text: 'fresh one' }],
       transportPendingMessageVersion: 9,
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm9', text: 'fresh one' }]);
-    expect(merged.transportPendingMessageVersion).toBe(9);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('accepts an equal-version snapshot (idempotent redelivery)', () => {
+  it('ignores an equal-version legacy snapshot without structured queue identity', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -489,7 +549,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'm7', text: 'v7 entry' }],
       transportPendingMessageVersion: 7,
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm7', text: 'v7 entry' }]);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
@@ -517,5 +577,169 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageEntries).toEqual(existing.transportPendingMessageEntries);
     // Baseline unchanged when the snapshot is unversioned.
     expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+});
+
+describe('mergeSessionListEntry — structured transport queue sync', () => {
+  const existing: SessionInfo = {
+    name: 'deck_proj_brain',
+    project: 'proj',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    state: 'running',
+    runtimeType: 'transport',
+    queueEpoch: 'epoch-1',
+    queueAuthorityId: 'authority-1',
+    transportPendingMessageVersion: 3,
+    transportPendingMessages: ['keep'],
+    transportPendingMessageEntries: [{ clientMessageId: 'keep', text: 'keep' }],
+    failedMessageEntries: [],
+  };
+
+  it('routes structured queue snapshots through the shared reducer and preserves multiline text', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 4,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: '  hello\n\nworld  ' }],
+      failedMessageEntries: [{ clientMessageId: 'failed-1', text: 'failed text' }],
+    }, existing);
+
+    expect(merged.queueEpoch).toBe('epoch-1');
+    expect(merged.queueAuthorityId).toBe('authority-1');
+    expect(merged.transportPendingMessages).toEqual(['  hello\n\nworld  ']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'msg-1', text: '  hello\n\nworld  ' }]);
+    expect(merged.failedMessageEntries).toEqual([{ clientMessageId: 'failed-1', text: 'failed text' }]);
+    expect(merged.transportPendingMessageVersion).toBe(4);
+  });
+
+  it('rejects same-epoch authority mismatch without falling back to legacy merge rules', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 4,
+      pendingMessageEntries: [{ clientMessageId: 'bad', text: 'must not apply' }],
+    }, existing);
+
+    expect(merged.queueAuthorityId).toBe('authority-1');
+    expect(merged.transportPendingMessages).toEqual(['keep']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'keep', text: 'keep' }]);
+    expect(merged.transportPendingMessageVersion).toBe(3);
+  });
+});
+
+describe('mergeSessionListEntry — activity generation fence', () => {
+  it('keeps newer state and queue when an older refresh arrives', () => {
+    const generation2 = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 2 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'new', text: 'new message' }],
+    }, makeExisting({
+      state: 'idle',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 1,
+      transportPendingMessageEntries: [],
+      transportPendingMessages: [],
+    }));
+
+    const stale = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 1 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+    }, generation2);
+
+    expect(stale.state).toBe('running');
+    expect(stale.activityGeneration).toEqual(generation2.activityGeneration);
+    expect(stale.transportPendingMessageEntries).toEqual([{ clientMessageId: 'new', text: 'new message' }]);
+    expect(stale.transportPendingMessageVersion).toBe(2);
+  });
+
+  it('preserves the generation fence when a refresh omits activityGeneration', () => {
+    const existing = makeExisting({
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 4 },
+    });
+    const refreshed = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
+    expect(refreshed.activityGeneration).toEqual(existing.activityGeneration);
+    // An omitted generation cannot prove that the row supersedes the newer
+    // runtime generation; the fence remains available for subsequent frames.
+    expect(refreshed.state).toBe('idle');
+  });
+
+  it('does not let opaque generation replace the fence before a later stale frame', () => {
+    const generation2 = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 2 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'new', text: 'new message' }],
+    }, makeExisting());
+    const legacy = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      activityGeneration: 'legacy-turn-id',
+    }, generation2);
+    expect(legacy.activityGeneration).toEqual(generation2.activityGeneration);
+
+    const stale = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 1 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+    }, legacy);
+    expect(stale.activityGeneration).toEqual(generation2.activityGeneration);
+    expect(stale.state).toBe('idle');
+    expect(stale.transportPendingMessageEntries).toEqual([{ clientMessageId: 'new', text: 'new message' }]);
+  });
+});
+
+describe('mergeSessionListEntry — supervision heartbeat projection', () => {
+  it('accepts a valid schedule, preserves it across sparse rows, and applies explicit clear', () => {
+    const armed = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }, undefined);
+    expect(armed.supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+    });
+
+    expect(mergeSessionListEntry(BASE_INCOMING, armed).supervisionHeartbeat)
+      .toEqual(armed.supervisionHeartbeat);
+    expect(mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: null,
+    }, armed).supervisionHeartbeat).toBeNull();
+  });
+
+  it('fails closed instead of exposing malformed daemon schedule data', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', updatedAt: 10_000,
+      },
+    }, makeExisting({
+      supervisionHeartbeat: { state: 'idle', updatedAt: 9_000 },
+    }));
+    expect(merged.supervisionHeartbeat).toBeNull();
   });
 });

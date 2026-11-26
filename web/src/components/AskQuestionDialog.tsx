@@ -1,18 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { ASK_QUESTION_WAIT_MS, ASK_QUESTION_RETENTION_MS } from '@shared/ask-question-timing.js';
+import type { AskOption, AskQuestionItem } from '@shared/ask-question-normalize.js';
+import { fallbackReadableSessionDisplay, isInternalSessionDisplayValue, pickReadableSessionDisplay } from '@shared/session-display.js';
+import { isSubSessionName } from '../session-list-merge.js';
 
-export interface AskOption {
-  label: string;
-  description?: string;
-}
-
-export interface AskQuestionItem {
-  question: string;
-  header?: string;
-  multiSelect?: boolean;
-  options?: AskOption[];
-}
+export type { AskOption, AskQuestionItem };
 
 export interface PendingQuestion {
   sessionName: string;
@@ -22,10 +15,55 @@ export interface PendingQuestion {
   waitMs?: number;
 }
 
+export interface AskQuestionSourceInfo {
+  kind: 'tab' | 'subsession';
+  label: string;
+  parentLabel?: string;
+}
+
+function readableSessionFallback(sessionName: string): string {
+  const trimmed = sessionName.trim();
+  if (!trimmed) return '';
+  return !isInternalSessionDisplayValue(trimmed)
+    ? trimmed
+    : fallbackReadableSessionDisplay(trimmed);
+}
+
+/** Resolve human-readable tab/sub-session source identity for AskQuestionDialog. */
+export function resolveAskQuestionSource(
+  sessionName: string,
+  sessions: ReadonlyArray<{ name: string; label?: string | null; project?: string | null }>,
+  subSessions: ReadonlyArray<{ sessionName: string; label?: string | null; parentSession?: string | null }>,
+): AskQuestionSourceInfo {
+  if (isSubSessionName(sessionName)) {
+    const sub = subSessions.find((s) => s.sessionName === sessionName);
+    const label = pickReadableSessionDisplay([sub?.label], sessionName)
+      ?? readableSessionFallback(sessionName);
+    const parent = sub?.parentSession
+      ? sessions.find((s) => s.name === sub.parentSession)
+      : undefined;
+    const parentLabel = parent
+      ? (pickReadableSessionDisplay([parent.label, parent.project], parent.name)
+        ?? readableSessionFallback(parent.name))
+      : undefined;
+    return parentLabel
+      ? { kind: 'subsession', label, parentLabel }
+      : { kind: 'subsession', label };
+  }
+  const main = sessions.find((s) => s.name === sessionName);
+  const label = pickReadableSessionDisplay([main?.label, main?.project], sessionName)
+    ?? readableSessionFallback(sessionName);
+  return { kind: 'tab', label };
+}
+
 interface Props {
   pending: PendingQuestion;
   onSubmit: (answer: string) => void;
   onDismiss: () => void;
+  sourceLabel?: string;
+  sourceParentLabel?: string;
+  sourceKind?: 'tab' | 'subsession';
+  onJumpToSession?: () => void;
 }
 
 const AUTO_DELIVER_HEADER = 'OpenSpec Auto Deliver';
@@ -35,7 +73,7 @@ function humanizeMachineReason(reason: string): string {
   return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function localizeAskQuestionItem(q: AskQuestionItem, t: (key: string, options?: Record<string, unknown>) => string): AskQuestionItem {
+export function localizeAskQuestionItem(q: AskQuestionItem, t: (key: string, options?: Record<string, unknown>) => string): AskQuestionItem {
   const match = q.question.match(AUTO_DELIVER_REASON_RE);
   const isAutoDeliverQuestion = q.header === AUTO_DELIVER_HEADER || match !== null;
   if (!isAutoDeliverQuestion) return q;
@@ -72,9 +110,88 @@ function localizeAskQuestionItem(q: AskQuestionItem, t: (key: string, options?: 
   };
 }
 
-export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
+export function buildAskQuestionAnswer(
+  questions: readonly AskQuestionItem[],
+  selections: readonly ReadonlySet<number>[],
+  texts: readonly string[],
+): string {
+  return questions.map((q, qi) => {
+    const parts: string[] = [];
+    const selectedSet = selections[qi];
+    if (q.options && q.options.length > 0 && selectedSet) {
+      const selected = [...selectedSet]
+        .sort((a, b) => a - b)
+        .map((i) => q.options![i]?.label)
+        .filter((label): label is string => Boolean(label));
+      if (selected.length > 0) parts.push(...selected);
+    }
+    const customText = texts[qi]?.trim() ?? '';
+    if (customText) parts.push(customText);
+    const ans = parts.length > 0 ? parts.join(', ') : 'skip';
+    return q.header ? `[${q.header}] ${ans}` : ans;
+  }).join('\n');
+}
+
+export interface AskQuestionOptionProps {
+  label: string;
+  description?: string;
+  multiSelect?: boolean;
+  name: string;
+  selected: boolean;
+  optionClassName?: string;
+  onChange: () => void;
+}
+
+/** Shared accessible option row for both modal dialogs and inline timeline cards. */
+export function AskQuestionOption({
+  label,
+  description,
+  multiSelect,
+  name,
+  selected,
+  optionClassName,
+  onChange,
+}: AskQuestionOptionProps) {
+  const classes = ['ask-option', optionClassName, selected ? 'ask-option-selected' : '']
+    .filter(Boolean)
+    .join(' ');
+  return (
+    <label class={classes}>
+      <input
+        type={multiSelect ? 'checkbox' : 'radio'}
+        name={name}
+        checked={selected}
+        onChange={onChange}
+      />
+      <span
+        class={`ask-option-indicator${multiSelect ? ' is-checkbox' : ' is-radio'}`}
+        aria-hidden="true"
+      />
+      <span class="ask-option-content">
+        <span class="ask-option-label">{label}</span>
+        {description && <span class="ask-option-desc">{description}</span>}
+      </span>
+    </label>
+  );
+}
+
+export function AskQuestionDialog({
+  pending,
+  onSubmit,
+  onDismiss,
+  sourceLabel,
+  sourceParentLabel,
+  sourceKind,
+  onJumpToSession,
+}: Props) {
   const { t } = useTranslation();
   const { questions } = pending;
+  const resolvedKind = sourceKind ?? (isSubSessionName(pending.sessionName) ? 'subsession' : 'tab');
+  const displaySourceLabel = sourceLabel?.trim() || readableSessionFallback(pending.sessionName) || undefined;
+  const displayParentLabel = sourceParentLabel?.trim() || undefined;
+  const fullSourceName = displaySourceLabel
+    ? (displayParentLabel ? `${displayParentLabel} › ${displaySourceLabel}` : displaySourceLabel)
+    : undefined;
   const displayQuestions = useMemo(
     () => questions.map((q) => localizeAskQuestionItem(q, t)),
     [questions, t]
@@ -127,21 +244,33 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
   }
 
   function buildAnswer(): string {
-    return displayQuestions.map((q, qi) => {
-      const parts: string[] = [];
-      if (q.options && q.options.length > 0) {
-        const selected = [...selections[qi]].sort().map((i) => q.options![i].label);
-        if (selected.length > 0) parts.push(...selected);
-      }
-      if (texts[qi].trim()) parts.push(texts[qi].trim());
-      const ans = parts.length > 0 ? parts.join(', ') : 'skip';
-      return q.header ? `[${q.header}] ${ans}` : ans;
-    }).join('\n');
+    return buildAskQuestionAnswer(displayQuestions, selections, texts);
   }
 
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onDismiss(); }}>
       <div class="ask-dialog">
+        {(fullSourceName || onJumpToSession) && (
+          <div class="ask-source-bar">
+            {fullSourceName && (
+              <div class="ask-source-info">
+                <span class={`ask-source-kind${resolvedKind === 'subsession' ? ' is-subsession' : ''}`}>
+                  {resolvedKind === 'subsession'
+                    ? t('askQuestion.fromSubSession', { defaultValue: 'From sub-session' })
+                    : t('askQuestion.fromTab', { defaultValue: 'From tab' })}
+                </span>
+                <span class="ask-source-name" title={fullSourceName}>
+                  {fullSourceName}
+                </span>
+              </div>
+            )}
+            {onJumpToSession && (
+              <button type="button" class="ask-btn-jump" onClick={onJumpToSession}>
+                {t('askQuestion.goToSession', { defaultValue: 'Go to chat' })}
+              </button>
+            )}
+          </div>
+        )}
         <div class={`ask-status ${inWaitPhase ? 'ask-status-waiting' : 'ask-status-retained'}`}>
           {inWaitPhase
             ? t('askQuestion.waiting', {
@@ -160,25 +289,25 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
             {q.options && q.options.length > 0 && (
               <div class="ask-options">
                 {q.options.map((opt, oi) => (
-                  <label key={oi} class={`ask-option ${selections[qi].has(oi) ? 'ask-option-selected' : ''}`}>
-                    <input
-                      type={q.multiSelect ? 'checkbox' : 'radio'}
-                      checked={selections[qi].has(oi)}
-                      onChange={() => {
-                        if (q.multiSelect) {
-                          toggleOption(qi, oi);
-                        } else {
-                          setSelections((prev) => {
-                            const next = prev.map((s) => new Set(s));
-                            next[qi] = new Set([oi]);
-                            return next;
-                          });
-                        }
-                      }}
-                    />
-                    <span class="ask-option-label">{opt.label}</span>
-                    {opt.description && <span class="ask-option-desc">{opt.description}</span>}
-                  </label>
+                  <AskQuestionOption
+                    key={oi}
+                    label={opt.label}
+                    description={opt.description}
+                    multiSelect={q.multiSelect}
+                    name={`ask-modal-${pending.toolUseId}-${qi}`}
+                    selected={selections[qi].has(oi)}
+                    onChange={() => {
+                      if (q.multiSelect) {
+                        toggleOption(qi, oi);
+                      } else {
+                        setSelections((prev) => {
+                          const next = prev.map((s) => new Set(s));
+                          next[qi] = new Set([oi]);
+                          return next;
+                        });
+                      }
+                    }}
+                  />
                 ))}
               </div>
             )}
@@ -193,7 +322,12 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
                 const v = (e.target as HTMLInputElement).value;
                 setTexts((prev) => prev.map((t, i) => i === qi ? v : t));
               }}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onSubmit(buildAnswer()); } }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+                  e.preventDefault();
+                  onSubmit(buildAnswer());
+                }
+              }}
             />
           </div>
         ))}

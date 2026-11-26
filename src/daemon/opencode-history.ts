@@ -1,12 +1,10 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { promisify } from 'node:util';
 import logger from '../util/logger.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeOpenCodeFileChange } from './file-change-normalizer.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 
@@ -361,13 +359,13 @@ export function buildTimelineEventsFromOpenCodeExport(
         if (batch) {
           push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`, true);
           if (state.status === 'completed' || state.status === 'error') {
-            const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
-            const truncOut = state.status !== 'error' && rawOut
-              ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+            const rawOut = typeof state.output === 'string' ? state.output : '';
+            const output = state.status !== 'error' && rawOut.trim()
+              ? rawOut
               : undefined;
             push('tool.result', {
               ...(state.status === 'error' && state.error ? { error: state.error } : {}),
-              ...(truncOut ? { output: truncOut } : {}),
+              ...(output ? { output } : {}),
             }, endTs, `${messageId}:${partId}:tool.result`, true);
           }
           push(TIMELINE_EVENT_FILE_CHANGE, { batch }, endTs, `${messageId}:${partId}:file.change`);
@@ -375,13 +373,13 @@ export function buildTimelineEventsFromOpenCodeExport(
         }
         push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`);
         if (state.status === 'completed' || state.status === 'error') {
-          const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
-          const truncOut = state.status !== 'error' && rawOut
-            ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+          const rawOut = typeof state.output === 'string' ? state.output : '';
+          const output = state.status !== 'error' && rawOut.trim()
+            ? rawOut
             : undefined;
           push('tool.result', {
             ...(state.status === 'error' && state.error ? { error: state.error } : {}),
-            ...(truncOut ? { output: truncOut } : {}),
+            ...(output ? { output } : {}),
           }, endTs, `${messageId}:${partId}:tool.result`);
         }
       }

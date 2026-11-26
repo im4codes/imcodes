@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { join, resolve, dirname } from 'path';
+import { pathToFileURL } from 'url';
 
 const ROOT = resolve(__dirname, '..');
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
@@ -31,6 +34,23 @@ describe('npm package integrity', () => {
     const pkgFromVersion = join(versionDir, '../../../package.json');
     expect(existsSync(pkgFromVersion), `package.json not reachable from version.js via ../../../package.json`).toBe(true);
     expect(JSON.parse(readFileSync(pkgFromVersion, 'utf8')).name).toBe('imcodes');
+  });
+
+  it('reports the package version when launched outside the package directory', () => {
+    const versionJs = join(ROOT, pkg.bin.imcodes, '../util/version.js');
+    const unrelatedCwd = mkdtempSync(join(tmpdir(), 'imcodes-version-cwd-'));
+    try {
+      const moduleUrl = pathToFileURL(versionJs).href;
+      const child = spawnSync(
+        process.execPath,
+        ['--input-type=module', '--eval', `import(${JSON.stringify(moduleUrl)}).then(({ DAEMON_VERSION }) => console.log(DAEMON_VERSION))`],
+        { cwd: unrelatedCwd, encoding: 'utf8' },
+      );
+      expect(child.status, child.stderr).toBe(0);
+      expect(child.stdout.trim()).toBe(pkg.version);
+    } finally {
+      rmSync(unrelatedCwd, { recursive: true, force: true });
+    }
   });
 
   it('config.ts can resolve default.yaml', () => {

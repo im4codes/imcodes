@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { readSource } from '../helpers/read-source.js';
 
 // Static reverse-regression guard for the smart-p2p-upgrade change.
 //
@@ -22,7 +23,7 @@ interface FileText {
 
 function read(rel: string): FileText {
   const abs = resolve(ROOT, rel);
-  const text = readFileSync(abs, 'utf8');
+  const text = readSource(abs);
   return { path: rel, text, lines: text.split('\n') };
 }
 
@@ -764,23 +765,30 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  // ── 26. (Task 10.4 closure) Supervision audit launches MUST honour the
-  //      daemon advanced-run admission cap with bounded retry — no silent
-  //      bypass of `P2P_WORKFLOW_MAX_ACTIVE_RUNS`.
-  it('supervision-automation bounds daemon_busy retries on audit launches (task 10.4)', () => {
-    const file = read('src/daemon/supervision-automation.ts');
-    expect(
-      /startSupervisionRunWithBusyRetry/.test(file.text),
-      'supervision-automation must use a bounded daemon_busy retry helper',
-    ).toBe(true);
-    expect(
-      file.text.includes('loadDaemonP2pStaticPolicy'),
-      'supervision-automation must read concurrency cap from loadDaemonP2pStaticPolicy',
-    ).toBe(true);
-    expect(
-      file.text.includes('listP2pRuns'),
-      'supervision-automation must inspect listP2pRuns to compute admission',
-    ).toBe(true);
+  // ── 26. Lightweight peer supervision audits deliberately no longer launch
+  //      Advanced/P2P runs. They therefore must not consume the advanced-run
+  //      admission budget or retain the old daemon_busy poller. Contention is
+  //      owned by PeerAuditController: an automatic audit waits behind Quick,
+  //      then PeerAuditService revalidates the waiter before retrying it.
+  it('supervision automation uses peer-audit slot contention instead of P2P daemon_busy retries', () => {
+    const automation = read('src/daemon/supervision-automation.ts');
+    expect(automation.text).not.toContain('startSupervisionRunWithBusyRetry');
+    expect(automation.text).not.toContain('loadDaemonP2pStaticPolicy');
+    expect(automation.text).not.toContain('listP2pRuns');
+    expect(automation.text).not.toContain('startP2pRun');
+
+    const controller = read('src/daemon/peer-audit-controller.ts');
+    expect(controller.text).toContain("status: 'awaiting_slot'");
+    expect(controller.text).toContain("type: 'automatic_slot_available'");
+
+    const service = read('src/daemon/peer-audit-service.ts');
+    expect(service.text).toContain("effect.type === 'automatic_slot_available'");
+    expect(service.text).toContain('automatic_waiter_invalidated');
+    expect(service.text).toContain('context?.baselineValid()');
+    expect(service.text).toContain('effect.waiter.request.auditedSessionInstanceId');
+    expect(service.text).toContain('effect.waiter.request.auditedRuntimeEpoch');
+    expect(service.text).toContain('effect.waiter.configRevision');
+    expect(service.text).toContain('effect.waiter.targetRevision');
   });
 
   // ── 27. (Task 10.5 closure) `pushState` in the orchestrator MUST debounce
@@ -2082,11 +2090,11 @@ describe('p2p-workflow reverse-regression', () => {
     // against either a `min(1400px, ...)` expression or a literal 1400
     // anywhere in the panelStyle block.
     expect(
-      /min\(1400px,\s*calc\(100vw\s*-\s*32px\)\)/.test(file.text),
-      'Panel desktop width must use min(1400px, calc(100vw - 32px))',
+      /min\(1400px,\s*calc\((?:var\(--imcodes-ui-vw,\s*100vw\)|100vw)\s*-\s*32px\)\)/.test(file.text),
+      'Panel desktop width must use min(1400px, calc(var(--imcodes-ui-vw, 100vw) - 32px))',
     ).toBe(true);
     expect(
-      /maxWidth:\s*isMobile\s*\?\s*['"]100vw['"]\s*:\s*1400/.test(file.text),
+      /maxWidth:\s*isMobile\s*\?\s*['"](?:var\(--imcodes-ui-vw,\s*100vw\)|100vw)['"]\s*:\s*1400/.test(file.text),
       'Panel desktop maxWidth must be 1400',
     ).toBe(true);
     // Footer must expose BOTH save buttons.
@@ -2481,14 +2489,21 @@ describe('p2p-workflow reverse-regression', () => {
       'Upload completion must append to the original composer draft key so switching windows does not drop the attachment',
     ).toBe(true);
 
-    // (4) Badge renders the seq via testid.
+    // (4) Badge renders the seq via testid. The chip lives in its own component
+    // (it also owns the image preview), which SessionControls must render with
+    // the composer's per-attachment seq.
+    const badge = read('web/src/components/ComposerAttachmentBadge.tsx');
     expect(
-      /data-testid=\{`attachment-tag-\$\{a\.seq\}`\}/.test(file.text),
-      'Attachment badge must render data-testid="attachment-tag-${a.seq}"',
+      /data-testid=\{`attachment-tag-\$\{seq\}`\}/.test(badge.text),
+      'Attachment badge must render data-testid="attachment-tag-${seq}"',
     ).toBe(true);
     expect(
-      /#\{a\.seq\}/.test(file.text),
-      'Attachment badge text must include #${a.seq}',
+      /#\{seq\}/.test(badge.text),
+      'Attachment badge text must include #${seq}',
+    ).toBe(true);
+    expect(
+      /<ComposerAttachmentBadge[\s\S]{0,120}seq=\{a\.seq\}/.test(file.text),
+      'SessionControls must pass each attachment\'s seq to the badge',
     ).toBe(true);
 
     // (5) Text-prepend uses the #N:(full path) format (not the legacy
@@ -2809,7 +2824,8 @@ describe('p2p-workflow reverse-regression', () => {
       'P2P must dispatch transport prompts through a queue-aware helper',
     ).toBe(true);
     expect(
-      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId)?\)/.test(orchestrator.text)
+      // The prompt may carry send metadata (e.g. its system message origin) after the commandId.
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId\b[^;]*)?\);/.test(orchestrator.text)
         && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
       'P2P must inspect transportRuntime.send() and handle queued results explicitly',
     ).toBe(true);

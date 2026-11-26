@@ -8,6 +8,7 @@ import type {
 import { createSkillSource } from './skill-store.js';
 
 export const SKILL_REGISTRY_SCHEMA_VERSION = 1 as const;
+export const SKILL_REGISTRY_DISCOVERY_VERSION = 2 as const;
 export const SKILL_REGISTRY_FILE_NAME = 'registry.json' as const;
 export const SKILL_URI_SCHEME = 'skill' as const;
 
@@ -32,6 +33,8 @@ export interface SkillRegistryEntry {
 
 export interface SkillRegistrySnapshot {
   schemaVersion: typeof SKILL_REGISTRY_SCHEMA_VERSION;
+  discoveryVersion?: number;
+  scanSignature?: string;
   generatedAt: number;
   entries: SkillRegistryEntry[];
   sourceCounts?: Record<string, number>;

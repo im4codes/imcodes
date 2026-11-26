@@ -1,27 +1,63 @@
+import { startR2RelayCleanup } from './services/r2-relay.js';
+import { taskPairTitleAuthorityRoutes } from './routes/task-pair-title-authority.js';
+import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-access.js';
+import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
+import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
+import { globalTaskHub } from './services/global-task-hub.js';
+import { globalTasksRoutes } from './routes/global-tasks.js';
+import { remoteVoiceHub } from './services/remote-voice-hub.js';
+import { remoteVoiceRoutes } from './routes/remote-voice.js';
+import {
+  REMOTE_VOICE_API_PREFIX,
+  REMOTE_VOICE_WS_PATH,
+  REMOTE_VOICE_WS_TICKET_TYPE,
+} from '../../shared/remote-voice.js';
+import {
+  GLOBAL_TASK_SNAPSHOT_PATH,
+  GLOBAL_TASK_WS_PATH,
+  GLOBAL_TASK_WS_TICKET_TYPE,
+} from '../../shared/global-task-mode.js';
 /**
  * IM.codes Node.js server entry point.
  * Replaces the Cloudflare Workers deployment.
  */
 
+import { startAccountConnectionWatch } from './ws/account-watch.js';
 import { serve } from '@hono/node-server';
 import { getConnInfo } from '@hono/node-server/conninfo';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { WebSocketServer } from 'ws';
 import proxyAddr from 'proxy-addr';
 import cron from 'node-cron';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stat, readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
+import { promisify } from 'node:util';
+import { gzip as gzipCallback } from 'node:zlib';
+
+const gzipAsync = promisify(gzipCallback);
 import type { IncomingMessage } from 'node:http';
 
 import { loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
+import { flushAllSessionTextTailCacheWrites } from './db/queries.js';
 import { runMigrations } from './db/migrate.js';
 import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes, initializeAuthNonceCleanup } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
+import { googleAuthRoutes } from './routes/google-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
+import { downloadsRoutes } from './routes/downloads.js';
+import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
+import { controlledNodeInstallCommandRoutes } from './routes/controlled-node-install.js';
+import { CONTROLLED_NODE_INSTALL_COMMAND_PATH } from './services/controlled-node-install-command.js';
+import { machinesRoutes } from './routes/machines.js';
+import { machineExecRoutes } from './routes/machine-exec.js';
+import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
 import { serverRoutes } from './routes/server.js';
 import { webhookRoutes } from './routes/webhook.js';
 import { outboundRoutes } from './routes/outbound.js';
@@ -32,16 +68,49 @@ import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
+import { messagePinRoutes } from './routes/message-pins.js';
+import { capabilityRoutes } from './routes/capabilities.js';
 import { memoryRoutes } from './routes/memory.js';
+import { agentSkillsRoutes } from './routes/agent-skills.js';
+import { agentMcpRoutes } from './routes/agent-mcp.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
+import { taskPairsRoutes } from './routes/task-pairs.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
+import { onlyofficeRoutes } from './routes/onlyoffice.js';
+import { createCloudDocsRoutes } from './routes/cloud-docs.js';
+import {
+  LocalCloudDocStorage,
+  resolveCloudDocsStorageDir,
+  type CloudDocStorage,
+} from './storage/cloud-doc-storage.js';
+import { documentSharingRoutes } from './routes/document-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
+import { ttsRoutes } from './routes/tts.js';
+import { aliasRoutes } from './routes/aliases.js';
+import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
+import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { TTS_API_BASE } from '../../shared/tts-config.js';
+import { sessionIdentityRoutes } from './routes/session-identities.js';
+import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
+import { verificationMachineRoutes } from './routes/verification-machines.js';
+import { VERIFICATION_MACHINE_API_PATH } from '../../shared/verification-machine.js';
+import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../shared/http-header-names.js';
+import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
+import { remoteDesktopAccountAuthRoutes } from './routes/remote-desktop-account-auth.js';
+import { remoteDesktopShellLaunchContextRoutes } from './routes/remote-desktop-shell-launch-context.js';
+import { setRemoteDesktopShellLaunchContextDispatcher } from './services/remote-desktop-shell-launch-context.js';
+import { remoteDesktopGuestAccessRoutes } from './routes/remote-desktop-guest-access.js';
+import {
+  createRemoteDesktopUnattendedPasswordPublicRoutes,
+  remoteDesktopUnattendedPasswordRoutes,
+} from './routes/remote-desktop-unattended-password.js';
+import { remoteDesktopWallRoutes } from './routes/remote-desktop-wall.js';
 import { localWebPreviewRoutes } from './routes/local-web-preview.js';
 import { resolveLocalPreviewAccess, commitAuthorizedAccess } from './preview/access.js';
 import { sanitizePreviewRequestHeaders, stripPreviewAccessTokenFromUpstreamPath } from '../../shared/preview-policy.js';
@@ -50,10 +119,18 @@ import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
-import { WsBridge } from './ws/bridge.js';
+import {
+  expireCapabilityPendingActivations,
+  sweepExpiredCapabilityHistory,
+  sweepExpiredCapabilityPreActivationOperations,
+} from './db/capabilities.js';
+import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from './ws/bridge.js';
+import {
+  REMOTE_DESKTOP_SERVER_ID_QUERY,
+  REMOTE_DESKTOP_SIGNALING_PATH,
+} from '../../shared/remote-desktop.js';
 import {
   SHARE_REASONS,
-  SHARE_WS_TICKET_TYPE,
   parseShareWsTicketClaims,
   resolveShareCoverageFromDb,
 } from './ws/share-policy.js';
@@ -62,8 +139,34 @@ import { rateLimiter } from './security/lockout.js';
 import { csrfMiddleware } from './security/csrf.js';
 import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
-import { resolveServerRole } from './security/authorization.js';
+import { evaluateUserAccess, loadUserAccess } from './security/user-status.js';
+import {
+  resolveAuth,
+  resolveServerWebSocketAccess,
+  isAllowedDocCollaboratorRoute,
+  DOC_COLLABORATOR_SCOPE_REFUSAL,
+  getCookieFromHeader,
+} from './security/authorization.js';
 import logger from './util/logger.js';
+import { getPodIdentity } from './util/pod-identity.js';
+import { REMOTE_DESKTOP_APP_MANIFEST_MIME, isRemoteDesktopAppAssetPath } from '../../shared/remote-desktop-app.js';
+import { RemoteDesktopGuestDueWorker } from './services/remote-desktop-guest-due-worker.js';
+import {
+  PostgresRemoteDesktopGuestOutboxDeliveryAdapter,
+  PostgresRemoteDesktopGuestOutboxListener,
+  RemoteDesktopGuestBackgroundRuntime,
+  RemoteDesktopGuestOutboxWorker,
+  reconcileRemoteDesktopEndpointOnReconnect,
+} from './services/remote-desktop-guest-outbox-worker.js';
+import { RemoteDesktopManagementPrivacyWorker } from './services/remote-desktop-management-privacy-worker.js';
+import { setRemoteDesktopManagementPrivacyDispatcher } from './services/remote-desktop-management-privacy.js';
+import {
+  createLazyPostgresUnattendedPasswordProofService,
+  selectUnattendedPasswordServerSecret,
+  type RemoteDesktopUnattendedPasswordProofService,
+} from './services/remote-desktop-unattended-password.js';
+import { createPostgresRemoteDesktopEndpointEligibility } from './services/remote-desktop-host-identity.js';
+import { isAccountSessionJwt } from './security/account-session-jwt.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Docker: /app/dist/index.js → /app/web/dist
@@ -74,13 +177,409 @@ const UPDATES_DIST = process.env.UPDATES_DIST_PATH ?? join(__dirname, '..', '..'
 
 // ── Daemon connection protection ──────────────────────────────────────────────
 const daemonConnectLimiter = new MemoryRateLimiter();
+const remoteDesktopGuestConnectLimiter = new MemoryRateLimiter();
 let unauthenticatedDaemonCount = 0;
 const MAX_UNAUTH_CONNECTIONS = 1000;
 
+// ── Static asset cache & path safety ──────────────────────────────────────────
+
+export const DEFAULT_STATIC_CACHE_MAX_ENTRIES = 512;
+export const DEFAULT_STATIC_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
+export const MAX_CACHEABLE_ASSET_BYTES = 8 * 1024 * 1024; // 8 MiB
+export const MIN_GZIP_BYTES = 1024;
+export const MAX_GZIP_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+const STATIC_MIME_TYPES: Record<string, string> = {
+  html: 'text/html',
+  js: 'application/javascript',
+  css: 'text/css',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  svg: 'image/svg+xml',
+  woff2: 'font/woff2',
+  ico: 'image/x-icon',
+  json: 'application/json',
+  webmanifest: REMOTE_DESKTOP_APP_MANIFEST_MIME,
+  // Install scripts served raw so `irm`/`curl` pipe clean UTF-8 text.
+  ps1: 'text/plain; charset=utf-8',
+  sh: 'text/plain; charset=utf-8',
+  txt: 'text/plain; charset=utf-8',
+};
+
+const COMPRESSIBLE_EXTENSIONS = new Set([
+  'html',
+  'js',
+  'css',
+  'svg',
+  'json',
+  'webmanifest',
+  'ps1',
+  'sh',
+  'txt',
+]);
+
+export interface StaticCacheEntry {
+  body: Buffer;
+  gzip: Buffer | null;
+  etag: string;
+  gzipEtag: string;
+  mtimeNs: bigint;
+  size: bigint;
+  memBytes: number;
+}
+
+export type StaticLookupResult =
+  | { kind: 'cached'; entry: StaticCacheEntry }
+  | { kind: 'stream'; size: bigint; etag: string; lastModified: string };
+
+export interface StaticStatResult {
+  isFile(): boolean;
+  size: bigint;
+  mtimeNs: bigint;
+  mtime: Date;
+}
+
+export interface StaticAssetCacheOptions {
+  maxEntries?: number;
+  maxTotalBytes?: number;
+  maxCacheableFileBytes?: number;
+  minGzipBytes?: number;
+  maxGzipBytes?: number;
+  /** Optional filesystem seam for deterministic concurrency tests. */
+  fs?: {
+    stat?: (filePath: string) => Promise<StaticStatResult>;
+    readFile?: (filePath: string) => Promise<Buffer>;
+  };
+}
+
+/**
+ * Resolve a URL pathname safely inside `rootDir`, returning `null` for malformed
+ * encodings, NUL bytes, backslashes, `..` segments, or paths escaping `rootDir`.
+ */
+export function resolveSafeAssetPath(rootDir: string, reqPath: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(reqPath);
+  } catch {
+    return null;
+  }
+  if (decoded.includes('\0') || decoded.includes('\\')) return null;
+  const segments = decoded.split('/');
+  if (segments.some((seg) => seg === '..')) return null;
+
+  const resolvedRoot = resolve(rootDir);
+  const relative = decoded.replace(/^\/+/, '');
+  const target = resolve(resolvedRoot, relative || 'index.html');
+  if (target !== resolvedRoot && !target.startsWith(resolvedRoot + sep)) return null;
+  return target;
+}
+
+function getFileExtension(filePath: string): string {
+  const lastSlash = filePath.lastIndexOf('/');
+  const dot = filePath.lastIndexOf('.');
+  return dot > lastSlash ? filePath.slice(dot + 1) : '';
+}
+
+function acceptsGzip(header: string | undefined): boolean {
+  if (!header) return false;
+  for (const part of header.split(',')) {
+    const [rawCoding, ...params] = part.trim().toLowerCase().split(';');
+    if (rawCoding?.trim() !== 'gzip') continue;
+    let q = 1;
+    for (const p of params) {
+      const trimmed = p.trim();
+      if (trimmed.startsWith('q=')) {
+        const parsed = Number.parseFloat(trimmed.slice(2));
+        if (!Number.isNaN(parsed)) q = parsed;
+      }
+    }
+    if (q > 0) return true;
+  }
+  return false;
+}
+
+function stripWeakPrefix(etag: string): string {
+  const trimmed = etag.trim();
+  return trimmed.startsWith('W/') ? trimmed.slice(2).trim() : trimmed;
+}
+
+function isIfNoneMatchHit(header: string | undefined, ...candidateEtags: string[]): boolean {
+  if (!header) return false;
+  const trimmed = header.trim();
+  if (!trimmed) return false;
+  if (trimmed === '*') return true;
+  const candidates = new Set(candidateEtags.map(stripWeakPrefix));
+  for (const part of trimmed.split(',')) {
+    const tag = stripWeakPrefix(part);
+    if (tag && candidates.has(tag)) return true;
+  }
+  return false;
+}
+
+function toBodyBytes(buf: Buffer): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(buf.buffer as ArrayBuffer, buf.byteOffset, buf.byteLength);
+}
+
+/**
+ * Bounded LRU in-memory static file cache with precomputed ETag + gzip buffers
+ * and `stat` mtime/size revalidation for mutable entry files.
+ */
+export class StaticAssetCache {
+  private readonly entries = new Map<string, StaticCacheEntry>();
+  private totalBytes = 0;
+  readonly maxEntries: number;
+  readonly maxTotalBytes: number;
+  readonly maxCacheableFileBytes: number;
+  readonly minGzipBytes: number;
+  readonly maxGzipBytes: number;
+  private readonly statFn: (filePath: string) => Promise<StaticStatResult>;
+  private readonly readFileFn: (filePath: string) => Promise<Buffer>;
+
+  constructor(options: StaticAssetCacheOptions = {}) {
+    this.maxEntries = Math.max(1, options.maxEntries ?? DEFAULT_STATIC_CACHE_MAX_ENTRIES);
+    this.maxTotalBytes = Math.max(1, options.maxTotalBytes ?? DEFAULT_STATIC_CACHE_MAX_BYTES);
+    this.maxCacheableFileBytes = Math.max(1, options.maxCacheableFileBytes ?? MAX_CACHEABLE_ASSET_BYTES);
+    this.minGzipBytes = Math.max(0, options.minGzipBytes ?? MIN_GZIP_BYTES);
+    this.maxGzipBytes = Math.max(this.minGzipBytes, options.maxGzipBytes ?? MAX_GZIP_BYTES);
+    this.statFn = options.fs?.stat ?? ((p) => stat(p, { bigint: true }));
+    this.readFileFn = options.fs?.readFile ?? ((p) => readFile(p));
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get byteSize(): number {
+    return this.totalBytes;
+  }
+
+  has(filePath: string): boolean {
+    return this.entries.has(filePath);
+  }
+
+  /** Exact byte sum computed directly from retained Map entries (invariant: === byteSize <= maxTotalBytes). */
+  retainedByteSum(): number {
+    let sum = 0;
+    for (const entry of this.entries.values()) {
+      sum += entry.memBytes;
+    }
+    return sum;
+  }
+
+  delete(filePath: string): boolean {
+    const existing = this.entries.get(filePath);
+    if (!existing) return false;
+    this.entries.delete(filePath);
+    this.totalBytes -= existing.memBytes;
+    return true;
+  }
+
+  clear(): void {
+    this.entries.clear();
+    this.totalBytes = 0;
+  }
+
+  private touchIfCurrent(filePath: string, expected: StaticCacheEntry): boolean {
+    // Only refresh LRU position if `expected` is still the live entry for `filePath`;
+    // never resurrect an entry that was evicted or replaced during an async `await`.
+    if (this.entries.get(filePath) !== expected) return false;
+    this.entries.delete(filePath);
+    this.entries.set(filePath, expected);
+    return true;
+  }
+
+  private set(filePath: string, entry: StaticCacheEntry): void {
+    const current = this.entries.get(filePath);
+    if (current && current.mtimeNs > entry.mtimeNs) {
+      // Do not overwrite a newer concurrently populated entry with an older read.
+      return;
+    }
+    this.delete(filePath);
+    if (entry.memBytes > this.maxTotalBytes) return;
+    while (
+      this.entries.size > 0
+      && (this.entries.size >= this.maxEntries || this.totalBytes + entry.memBytes > this.maxTotalBytes)
+    ) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.delete(oldestKey);
+    }
+    this.entries.set(filePath, entry);
+    this.totalBytes += entry.memBytes;
+  }
+
+  async resolve(filePath: string, opts: { immutable: boolean }): Promise<StaticLookupResult | null> {
+    const cached = this.entries.get(filePath);
+    if (opts.immutable && cached) {
+      this.touchIfCurrent(filePath, cached);
+      return { kind: 'cached', entry: cached };
+    }
+
+    let s: StaticStatResult;
+    try {
+      const rawStat = await this.statFn(filePath);
+      if (!rawStat.isFile()) {
+        if (!cached || this.entries.get(filePath) === cached) {
+          this.delete(filePath);
+        }
+        return null;
+      }
+      s = rawStat;
+    } catch {
+      if (!cached || this.entries.get(filePath) === cached) {
+        this.delete(filePath);
+      }
+      return null;
+    }
+
+    if (cached && cached.mtimeNs === s.mtimeNs && cached.size === s.size) {
+      this.touchIfCurrent(filePath, cached);
+      return { kind: 'cached', entry: cached };
+    }
+
+    // Re-check whether a concurrent request already loaded the exact same disk version while we waited on `stat`.
+    const afterStat = this.entries.get(filePath);
+    if (afterStat && afterStat !== cached && afterStat.mtimeNs === s.mtimeNs && afterStat.size === s.size) {
+      this.touchIfCurrent(filePath, afterStat);
+      return { kind: 'cached', entry: afterStat };
+    }
+
+    if (s.size > BigInt(this.maxCacheableFileBytes)) {
+      this.delete(filePath);
+      return {
+        kind: 'stream',
+        size: s.size,
+        etag: `"${s.size.toString(16)}-${s.mtimeNs.toString(16)}"`,
+        lastModified: s.mtime.toUTCString(),
+      };
+    }
+
+    let body: Buffer;
+    try {
+      body = await this.readFileFn(filePath);
+    } catch {
+      if (!afterStat || this.entries.get(filePath) === afterStat) {
+        this.delete(filePath);
+      }
+      return null;
+    }
+
+    const digest = createHash('sha256').update(body).digest('base64url').slice(0, 22);
+    const etag = `"${digest}"`;
+    const gzipEtag = `W/"${digest}"`;
+    const ext = getFileExtension(filePath);
+    let gzip: Buffer | null = null;
+    if (
+      COMPRESSIBLE_EXTENSIONS.has(ext)
+      && body.byteLength >= this.minGzipBytes
+      && body.byteLength <= this.maxGzipBytes
+    ) {
+      const compressed = await gzipAsync(body);
+      if (compressed.byteLength < body.byteLength) {
+        gzip = compressed;
+      }
+    }
+
+    const entry: StaticCacheEntry = {
+      body,
+      gzip,
+      etag,
+      gzipEtag,
+      mtimeNs: s.mtimeNs,
+      size: s.size,
+      memBytes: body.byteLength + (gzip?.byteLength ?? 0),
+    };
+    this.set(filePath, entry);
+    return { kind: 'cached', entry };
+  }
+}
+
+async function serveStaticFromCache(
+  c: Context<{ Bindings: Env }>,
+  cache: StaticAssetCache,
+  filePath: string,
+  options: {
+    immutable: boolean;
+    extraHeaders?: Record<string, string>;
+    cacheControlOverride?: string;
+  },
+): Promise<Response | null> {
+  const lookup = await cache.resolve(filePath, { immutable: options.immutable });
+  if (!lookup) return null;
+
+  const ext = getFileExtension(filePath);
+  const contentType = STATIC_MIME_TYPES[ext] ?? 'application/octet-stream';
+  const cacheControl = options.cacheControlOverride
+    ?? (options.immutable ? 'public, max-age=31536000, immutable' : 'no-cache');
+
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Cache-Control': cacheControl,
+  };
+  if (options.extraHeaders) {
+    Object.assign(headers, options.extraHeaders);
+  }
+
+  if (lookup.kind === 'stream') {
+    headers['ETag'] = lookup.etag;
+    headers['Last-Modified'] = lookup.lastModified;
+    if (isIfNoneMatchHit(c.req.header('if-none-match'), lookup.etag)) {
+      return new Response(null, { status: 304, headers });
+    }
+    headers['Content-Length'] = lookup.size.toString();
+    const stream = Readable.toWeb(createReadStream(filePath)) as unknown as ReadableStream<Uint8Array>;
+    return new Response(stream, { status: 200, headers });
+  }
+
+  const { entry } = lookup;
+  const useGzip = entry.gzip !== null && acceptsGzip(c.req.header('accept-encoding'));
+  const etag = useGzip ? entry.gzipEtag : entry.etag;
+  headers['ETag'] = etag;
+  if (entry.gzip !== null) {
+    headers['Vary'] = 'Accept-Encoding';
+  }
+
+  if (isIfNoneMatchHit(c.req.header('if-none-match'), entry.etag, entry.gzipEtag)) {
+    return new Response(null, { status: 304, headers });
+  }
+
+  if (useGzip && entry.gzip) {
+    headers['Content-Encoding'] = 'gzip';
+    headers['Content-Length'] = String(entry.gzip.byteLength);
+    return new Response(toBodyBytes(entry.gzip), { status: 200, headers });
+  }
+
+  headers['Content-Length'] = String(entry.body.byteLength);
+  return new Response(toBodyBytes(entry.body), { status: 200, headers });
+}
+
 // ── Hono app ──────────────────────────────────────────────────────────────────
 
-export function buildApp(env: Env) {
+export interface BuildAppOptions {
+  /** Focused-test seam; production always uses the lazy PostgreSQL stack. */
+  unattendedPasswordProofService?: Pick<RemoteDesktopUnattendedPasswordProofService, 'prove'>;
+  /** Test seam for Cloud Docs blob persistence (defaults to LocalCloudDocStorage). */
+  cloudDocStorage?: CloudDocStorage;
+  /** Optional static asset cache instance or limits (for focused tests). */
+  staticCache?: StaticAssetCache;
+}
+
+export function buildApp(env: Env, options: BuildAppOptions = {}) {
   const app = new Hono<{ Bindings: Env }>();
+  const staticCache = options.staticCache ?? new StaticAssetCache();
+  const durableRemoteDesktopEndpointEligible = createPostgresRemoteDesktopEndpointEligibility({ db: env.DB });
+  const unattendedPasswordProofService = options.unattendedPasswordProofService
+    ?? createLazyPostgresUnattendedPasswordProofService({
+      db: env.DB,
+      serverSecret: selectUnattendedPasswordServerSecret({
+        botEncryptionKey: env.BOT_ENCRYPTION_KEY,
+        jwtSigningKey: env.JWT_SIGNING_KEY,
+      }),
+      // Public proof occurs before serverId disclosure, so it cannot be
+      // pod-sticky. Use durable fleet-wide presence here; the owning pod
+      // revalidates the exact live generation when redeeming the bootstrap.
+      runtimeAuthorityAvailable: durableRemoteDesktopEndpointEligible,
+    });
 
   // Inject env into every request context
   app.use('*', async (c, next) => {
@@ -133,6 +632,13 @@ export function buildApp(env: Env) {
     await next();
   });
 
+  // Verify explicit daemon credentials even on public/account-only or unknown
+  // routes, before CORS can short-circuit OPTIONS. resolveAuth keeps the established cookie-first user-login flow.
+  app.use('/api/*', async (c, next) => {
+    if (c.req.header(SERVER_ID_HEADER)) await resolveAuth(c);
+    await next();
+  });
+
   // CORS: allow Capacitor native WebView (capacitor://localhost) to access the API.
   // Web same-origin requests never trigger preflight, so this only affects native clients.
   // Applied to both /api/* and /health so the native app can verify server reachability.
@@ -147,7 +653,7 @@ export function buildApp(env: Env) {
       // Non-whitelisted origins get no Access-Control-Allow-Origin header
       return all.includes(origin) ? origin : '';
     },
-    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version'],
+    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version', CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   });
@@ -157,9 +663,93 @@ export function buildApp(env: Env) {
   // CSRF protection for all API write operations (skips Bearer auth and safe methods)
   app.use('/api/*', csrfMiddleware());
 
+  // Central boundary for restricted doc_collaborator tokens (both Cookie and Bearer)
+  app.use('/api/*', async (c, next) => {
+    if (c.req.method.toUpperCase() === 'OPTIONS') {
+      return next();
+    }
+    const signingKey = c.env.JWT_SIGNING_KEY;
+    if (signingKey) {
+      let isDocCollaborator = false;
+      const cookieVal = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
+      if (cookieVal) {
+        const payload = verifyJwt(cookieVal, signingKey);
+        if (isAccountSessionJwt(payload) && (payload as Record<string, unknown>).scope === 'doc_collaborator') {
+          isDocCollaborator = true;
+        }
+      }
+      if (!isDocCollaborator) {
+        const authHeader = c.req.header('Authorization');
+        if (authHeader?.startsWith('Bearer ')) {
+          const bearerToken = authHeader.slice(7);
+          const payload = verifyJwt(bearerToken, signingKey);
+          if (payload && (payload as Record<string, unknown>).scope === 'doc_collaborator') {
+            isDocCollaborator = true;
+          }
+        }
+      }
+      if (isDocCollaborator && !isAllowedDocCollaboratorRoute(c.req.method, c.req.path)) {
+        return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+      }
+    }
+    await next();
+  });
+
+  // OTA update assets (manifest + bundle zip) — registered before `/api` sub-routers
+  // so wildcard sub-router middlewares (e.g. `Cache-Control: no-store`) do not overwrite `no-cache` + `ETag`.
+  app.get('/api/updates/:file', async (c) => {
+    const file = c.req.param('file');
+    if (file !== 'manifest.json' && file !== 'bundle.zip') {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    const filePath = join(UPDATES_DIST, file);
+    try {
+      const s = await stat(filePath, { bigint: true });
+      if (!s.isFile()) {
+        return c.json({ error: 'not_found' }, 404);
+      }
+      const etag = `"${s.size.toString(16)}-${s.mtimeNs.toString(16)}"`;
+      const lastModified = s.mtime.toUTCString();
+      const mime = file.endsWith('.json') ? 'application/json' : 'application/zip';
+      const headers: Record<string, string> = {
+        'Content-Type': mime,
+        'Cache-Control': 'no-cache',
+        ETag: etag,
+        'Last-Modified': lastModified,
+      };
+      const ifNoneMatch = c.req.header('if-none-match');
+      const ifModifiedSince = c.req.header('if-modified-since');
+      let notModified = isIfNoneMatchHit(ifNoneMatch, etag);
+      if (!notModified && !ifNoneMatch && ifModifiedSince) {
+        const parsed = Date.parse(ifModifiedSince);
+        if (!Number.isNaN(parsed) && parsed >= Math.floor(s.mtime.getTime() / 1000) * 1000) {
+          notModified = true;
+        }
+      }
+      if (notModified) {
+        return new Response(null, { status: 304, headers });
+      }
+      headers['Content-Length'] = s.size.toString();
+      const stream = Readable.toWeb(createReadStream(filePath)) as unknown as ReadableStream<Uint8Array>;
+      return new Response(stream, { status: 200, headers });
+    } catch {
+      return c.json({ error: 'not_found' }, 404);
+    }
+  });
+
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
+  app.route('/api/auth/google', googleAuthRoutes);
   app.route('/api/bind', bindRoutes);
+  app.route('/api/downloads', downloadsRoutes);
+  app.route('/api/enroll', enrollRoutes);
+  // Top-level and deliberately short: this URL is typed by hand, read off a
+  // phone screen and dictated over the phone. It serves a script, never data.
+  app.route(CONTROLLED_NODE_INSTALL_COMMAND_PATH, controlledNodeInstallCommandRoutes);
+  app.route('/api/machines', machinesRoutes);
+  app.route(TASK_PAIR_TITLE_AUTHORITY_PATH, taskPairTitleAuthorityRoutes);
+  app.route('/api/machine/exec', machineExecRoutes);
+  app.route('/api/machine/computer-use', machineComputerUseRoutes);
   app.route('/api/server', serverRoutes);
   app.route('/webhook', webhookRoutes);
   app.route('/api/outbound', outboundRoutes);
@@ -171,11 +761,30 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  app.route('/api', messagePinRoutes);
+  app.route('/api', capabilityRoutes);
+  app.route('/api', remoteDesktopUnattendedPasswordRoutes);
+  app.route('/api', createRemoteDesktopUnattendedPasswordPublicRoutes(
+    unattendedPasswordProofService,
+  ));
+  app.route('/api', remoteDesktopWallRoutes);
+  // Flat mount: the public half is reached before any `serverId` is known, so it
+  // must not sit under a pod-sticky `/api/server/:serverId/...` path.
+  app.route('/api', remoteDesktopGuestAccessRoutes);
   app.route('/api', tabSharingRoutes);
+  app.route('/api', onlyofficeRoutes);
+  const cloudDocStorage = options.cloudDocStorage ?? new LocalCloudDocStorage(
+    resolveCloudDocsStorageDir(env.IMCODES_CLOUD_DOCS_DIR, env.NODE_ENV),
+  );
+  app.route('/api', createCloudDocsRoutes(cloudDocStorage));
+  app.route('/api', documentSharingRoutes);
+  app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
   // string by the ingress for pod routing; the projection-owner resolver
   // ignores serverId entirely (cloud-only PG lookup).
   app.route('/api', memoryRoutes);
+  app.route('/api', agentSkillsRoutes);
+  app.route('/api', agentMcpRoutes);
   // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
   // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
   // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.
@@ -184,27 +793,33 @@ export function buildApp(env: Env) {
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
+  app.route('/api/server', taskPairsRoutes);
   app.route('/api/preferences', preferencesRoutes);
+  app.route(REMOTE_VOICE_API_PREFIX, remoteVoiceRoutes);
+  app.route(TTS_API_BASE, ttsRoutes);
+  // User-level alias store: flat, pod-independent (no serverId). Mounted under
+  // /api/* so it inherits the global CORS + CSRF middleware.
+  app.route(ALIAS_API_PATH, aliasRoutes);
+  app.route(SESSION_IDENTITY_API_PATH, sessionIdentityRoutes);
+  app.route(VERIFICATION_MACHINE_API_PATH, verificationMachineRoutes);
   app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
+  app.route('/api/auth/remote-desktop', remoteDesktopAccountAuthRoutes);
+  app.route('/api/auth/remote-desktop', remoteDesktopShellLaunchContextRoutes);
   app.route('/api/admin', adminRoutes);
+  app.route(GLOBAL_TASK_SNAPSHOT_PATH, globalTasksRoutes);
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
   app.get('/api/app-build', async (c) => {
-    try {
-      const content = await readFile(join(WEB_DIST, 'app-build.json'), 'utf8');
-      return new Response(content, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-store',
-        },
-      });
-    } catch {
-      return c.json({ error: 'not_found' }, 404, {
-        'Cache-Control': 'no-store',
-      });
-    }
+    const res = await serveStaticFromCache(c, staticCache, join(WEB_DIST, 'app-build.json'), {
+      immutable: false,
+      cacheControlOverride: 'no-store',
+    });
+    if (res) return res;
+    return c.json({ error: 'not_found' }, 404, {
+      'Cache-Control': 'no-store',
+    });
   });
 
   // Apple App Site Association — required for iOS Associated Domains (webcredentials) to work.
@@ -223,16 +838,7 @@ export function buildApp(env: Env) {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': [
-      "default-src 'self'",
-      "script-src 'self' 'unsafe-inline'",   // Vite bundles inline runtime; tighten with hashes in future
-      "style-src 'self' 'unsafe-inline'",
-      "connect-src 'self' wss: ws: https://api.github.com",
-      "worker-src 'self' blob:",
-      "img-src 'self' data: https:",
-      "font-src 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '),
+    'Content-Security-Policy': buildAppContentSecurityPolicy(),
   };
 
   // Landing page — served when request host matches LANDING_HOST env var
@@ -244,52 +850,24 @@ export function buildApp(env: Env) {
     if (bare !== landingHost) return next();
     // Skip landing for native auth callbacks and native passkey page
     const url = new URL(c.req.url);
-    if (url.searchParams.has('native_callback')) return next();
-    if (url.pathname === '/api/auth/passkey/native') return next();
+    if (url.searchParams.has('native_callback') || url.searchParams.has('desktop_callback')) return next();
+    if (url.pathname === '/api/auth/passkey/native' || url.pathname.startsWith('/api/downloads/')) return next();
 
-    const reqPath = new URL(c.req.url).pathname;
-    const filePath = join(LANDING_DIST, reqPath === '/' ? 'index.html' : reqPath);
-    try {
-      const s = await stat(filePath);
-      if (s.isFile()) {
-        const ext = filePath.split('.').pop() ?? '';
-        const mime: Record<string, string> = {
-          html: 'text/html', js: 'application/javascript', css: 'text/css',
-          png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
-          ico: 'image/x-icon',
-          // Install scripts served raw so `irm`/`curl` pipe clean UTF-8 text.
-          ps1: 'text/plain; charset=utf-8', sh: 'text/plain; charset=utf-8',
-          txt: 'text/plain; charset=utf-8',
-        };
-        const isInstallScript = ext === 'sh' || ext === 'ps1' || ext === 'txt';
-        const content = await readFile(filePath);
-        return new Response(content, {
-          headers: {
-            'Content-Type': mime[ext] ?? 'application/octet-stream',
-            ...SECURITY_HEADERS,
-            ...(isInstallScript ? { 'Cache-Control': 'no-cache' } : {}),
-          },
-        });
-      }
-    } catch { /* fall through to landing index */ }
-    const html = await readFile(join(LANDING_DIST, 'index.html'));
-    return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
-  });
+    const reqPath = url.pathname;
+    const filePath = resolveSafeAssetPath(LANDING_DIST, reqPath);
+    if (!filePath) return c.text('Not found', 404);
 
-  // OTA update assets (manifest + bundle zip)
-  app.get('/api/updates/:file', async (c) => {
-    const file = c.req.param('file');
-    if (file !== 'manifest.json' && file !== 'bundle.zip') {
-      return c.json({ error: 'not_found' }, 404);
-    }
-    const filePath = join(UPDATES_DIST, file);
-    try {
-      const content = await readFile(filePath);
-      const mime = file.endsWith('.json') ? 'application/json' : 'application/zip';
-      return new Response(content, { headers: { 'Content-Type': mime, 'Cache-Control': 'no-cache' } });
-    } catch {
-      return c.json({ error: 'not_found' }, 404);
-    }
+    const direct = await serveStaticFromCache(c, staticCache, filePath, {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    if (direct) return direct;
+
+    const fallback = await serveStaticFromCache(c, staticCache, join(LANDING_DIST, 'index.html'), {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    return fallback ?? c.text('Not found', 404);
   });
 
   // Static file serving + SPA fallback
@@ -299,30 +877,31 @@ export function buildApp(env: Env) {
       return c.json({ error: 'not_found' }, 404);
     }
 
-    const filePath = join(WEB_DIST, reqPath === '/' ? 'index.html' : reqPath);
-    try {
-      const s = await stat(filePath);
-      if (s.isFile()) {
-        const ext = filePath.split('.').pop() ?? '';
-        const mime: Record<string, string> = {
-          html: 'text/html', js: 'application/javascript', css: 'text/css',
-          png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
-          woff2: 'font/woff2', ico: 'image/x-icon', json: 'application/json',
-        };
-        const content = await readFile(filePath);
-        const headers: Record<string, string> = { 'Content-Type': mime[ext] ?? 'application/octet-stream' };
-        if (ext === 'html') Object.assign(headers, SECURITY_HEADERS);
-        return new Response(content, { headers });
-      }
-    } catch { /* fall through */ }
-
-    // SPA fallback
-    try {
-      const html = await readFile(join(WEB_DIST, 'index.html'));
-      return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
-    } catch {
+    const filePath = resolveSafeAssetPath(WEB_DIST, reqPath);
+    if (!filePath) {
       return c.text('Not found', 404);
     }
+
+    const ext = getFileExtension(filePath);
+    const headers: Record<string, string> = {};
+    if (ext === 'html') Object.assign(headers, SECURITY_HEADERS);
+    const isImmutable = reqPath.startsWith('/assets/');
+    const direct = await serveStaticFromCache(c, staticCache, filePath, {
+      immutable: isImmutable,
+      extraHeaders: headers,
+    });
+    if (direct) return direct;
+
+    // The remote-desktop app's manifest and icons: a missing file is a 404. Falling through to index.html would hand the browser an HTML
+    // page as a manifest or an icon (a silent install failure), so these paths never reach the SPA fallback.
+    if (isRemoteDesktopAppAssetPath(reqPath)) return c.text('Not found', 404);
+
+    // SPA fallback
+    const fallback = await serveStaticFromCache(c, staticCache, join(WEB_DIST, 'index.html'), {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    return fallback ?? c.text('Not found', 404);
   });
 
   return app;
@@ -330,8 +909,85 @@ export function buildApp(env: Env) {
 
 // ── WebSocket upgrade handler ─────────────────────────────────────────────────
 
+/** Build the shared WS server with the production inbound payload ceiling. */
+export function createServerWebSocketServer(): WebSocketServer {
+  return new WebSocketServer({
+    noServer: true,
+    maxPayload: SERVER_WS_MAX_PAYLOAD_BYTES,
+  });
+}
+
+/**
+ * Per-IP ceiling for daemon WebSocket upgrades, in the same 10s window as the
+ * per-daemon budget. Deliberately far above a real fleet's steady state: a
+ * daemon at its 5s reconnect ceiling costs 2 attempts per 10s, so this leaves
+ * room for ~50 co-located daemons before the ceiling is the binding constraint.
+ * It exists to bound abuse from one source, not to pace legitimate reconnects.
+ */
+const DAEMON_CONNECT_PER_IP_CEILING = 100;
+
+/**
+ * `Retry-After` is included because the client cannot otherwise distinguish a
+ * rate-limit refusal from a network fault: both surface as a non-101 upgrade
+ * failure, and the daemon then retries on its short reconnect backoff, which is
+ * what kept the budget exhausted.
+ */
+const DAEMON_CONNECT_RATE_LIMIT_RESPONSE =
+  'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 10\r\nContent-Length: 0\r\n\r\n';
+
+async function authenticateUserWsTicketUpgrade(
+  req: IncomingMessage,
+  socket: import('node:stream').Duplex,
+  url: URL,
+  env: Env,
+  expectedTicketType: string,
+): Promise<string | null> {
+  const origin = req.headers['origin'] ?? '';
+  if (!validateOrigin(origin, env)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  const ticket = url.searchParams.get('ticket');
+  if (!ticket) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  const payload = verifyJwt(ticket, env.JWT_SIGNING_KEY);
+  if (!payload || payload.type !== expectedTicketType || typeof payload.sub !== 'string' || !payload.sub) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  const jti = typeof payload.jti === 'string' ? payload.jti : '';
+  if (!jti || !rateLimiter.consumeJti(jti, 30_000)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  try {
+    const access = await loadUserAccess(env.DB, payload.sub);
+    const decision = evaluateUserAccess(
+      access,
+      typeof payload.iat === 'number' ? payload.iat : undefined,
+    );
+    const epochStale = typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
+    if (!decision.ok || epochStale) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return null;
+    }
+  } catch {
+    socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  return payload.sub;
+}
+
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = createServerWebSocketServer();
   // Compile trust function once — same proxy-addr library used by HTTP middleware
   const wsTrust = proxyAddr.compile(
     env.TRUSTED_PROXIES
@@ -349,17 +1005,109 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
       return;
     }
 
-    const match = url.pathname.match(/^\/api\/server\/([^/]+)\/ws$/);
-    if (!match) { socket.destroy(); return; }
+    if (url.pathname === GLOBAL_TASK_WS_PATH) {
+      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, GLOBAL_TASK_WS_TICKET_TYPE);
+      if (!userId) return;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        void globalTaskHub.handleConnection(ws, userId, env.DB);
+      });
+      return;
+    }
 
-    const [, serverId] = match;
+    if (url.pathname === REMOTE_VOICE_WS_PATH) {
+      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, REMOTE_VOICE_WS_TICKET_TYPE);
+      if (!userId) return;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        remoteVoiceHub.handleConnection(ws, userId, env.DB, env);
+      });
+      return;
+    }
+
+    const match = url.pathname.match(/^\/api\/server\/([^/]+)\/ws$/);
+    const remoteDesktopServerId = url.pathname === REMOTE_DESKTOP_SIGNALING_PATH
+      ? url.searchParams.get(REMOTE_DESKTOP_SERVER_ID_QUERY)
+      : null;
+    if (!match && !remoteDesktopServerId) { socket.destroy(); return; }
+
+    const serverId = remoteDesktopServerId ?? match![1]!;
     const hasBrowserTicket = url.searchParams.has('ticket');
 
-    if (!hasBrowserTicket) {
-      // Daemon connection — per-IP rate limit + global cap
+    if (remoteDesktopServerId && hasBrowserTicket) {
+      const keys = [...url.searchParams.keys()].sort();
+      if (keys.length !== 2
+        || keys[0] !== REMOTE_DESKTOP_SERVER_ID_QUERY
+        || keys[1] !== 'ticket') {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
+    // A ticket-less query-routed socket is the anonymous guest quarantine,
+    // never a daemon. Its URL contains only the post-proof routing key; raw
+    // bootstrap possession proof is accepted later as the bounded first frame.
+    if (remoteDesktopServerId && !hasBrowserTicket) {
+      const queryKeys = [...url.searchParams.keys()];
+      const origin = req.headers.origin ?? '';
       const ip = proxyAddr(req as never, wsTrust);
-      if (!daemonConnectLimiter.check(`daemon:${ip}`, 5, 10_000)) {
+      if (queryKeys.length !== 1 || queryKeys[0] !== REMOTE_DESKTOP_SERVER_ID_QUERY
+        || origin.length === 0
+        || !validateOrigin(origin, env)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      if (!remoteDesktopGuestConnectLimiter.check(`rd-guest:${ip}`, 20, 60_000)) {
         socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      if (unauthenticatedDaemonCount >= MAX_UNAUTH_CONNECTIONS) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      unauthenticatedDaemonCount++;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        let counted = true;
+        const decrement = () => {
+          if (!counted) return;
+          counted = false;
+          unauthenticatedDaemonCount = Math.max(0, unauthenticatedDaemonCount - 1);
+        };
+        WsBridge.get(serverId).handleGuestRemoteDesktopConnection(ws, env.DB, ip);
+        ws.once('close', decrement);
+        ws.once('error', decrement);
+      });
+      return;
+    }
+
+    if (!hasBrowserTicket) {
+      // Daemon connection — per-DAEMON rate limit, then a per-IP abuse ceiling.
+      //
+      // This budget used to be keyed on the client IP alone, which made it one
+      // shared bucket for every daemon behind the same address. Two things then
+      // compounded: `TRUSTED_PROXIES` is empty in production, so `proxyAddr`
+      // returns the reverse proxy's own address and EVERY daemon collapsed onto
+      // a single key; and a node whose token had been revoked retried roughly
+      // twice a second forever. One such node consumed ~17 attempts per 10s
+      // against a 5-per-10s budget and every other daemon was answered 429 —
+      // a non-101 status, which their WebSocket client reports as close 1002.
+      // A single machine could therefore take the entire fleet offline.
+      //
+      // `serverId` comes from the URL and is unauthenticated at this point,
+      // which is exactly why the per-IP ceiling below is kept: identity is not
+      // trusted yet, so isolation is keyed on the claimed id while abuse from
+      // one source is still bounded. The ceiling is set far above what any
+      // legitimate fleet reaches, so it never schedules normal reconnects.
+      const ip = proxyAddr(req as never, wsTrust);
+      if (!daemonConnectLimiter.check(`daemon:${serverId}`, 5, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
+        socket.destroy();
+        return;
+      }
+      if (!daemonConnectLimiter.check(`daemon-ip:${ip}`, DAEMON_CONNECT_PER_IP_CEILING, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
         socket.destroy();
         return;
       }
@@ -414,6 +1162,12 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
+        // Deliberately NOT single-use, unlike the member ticket below. A share
+        // recipient on a flaky connection must be able to reconnect without a
+        // round trip to mint a new ticket; `share-ws-ticket-upgrade.test.ts`
+        // pins that asymmetry. An audit read the missing `consumeJti` as a
+        // replay defect — it is a design decision, and the coverage re-read on
+        // every upgrade is what actually bounds a stale ticket.
         wss.handleUpgrade(req, socket, head, (ws) => {
           WsBridge.get(serverId).handleShareBrowserConnection(ws, shareTicket.sub, env.DB, {
             ticketId: shareTicket.jti,
@@ -434,16 +1188,23 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
       }
 
+      let websocketAccess: Awaited<ReturnType<typeof resolveServerWebSocketAccess>>;
       try {
-        const role = await resolveServerRole(env.DB, serverId, payload.sub as string);
-        if (role === 'none') { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
+        websocketAccess = await resolveServerWebSocketAccess(env.DB, serverId, payload.sub as string);
+        if (!websocketAccess) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
       } catch {
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); socket.destroy(); return;
       }
 
       const userId = payload.sub as string;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        WsBridge.get(serverId).handleBrowserConnection(ws, userId, env.DB, isMobile);
+        WsBridge.get(serverId).handleBrowserConnection(
+          ws,
+          userId,
+          env.DB,
+          isMobile,
+          websocketAccess?.kind === 'controlled',
+        );
       });
     }
   });
@@ -492,8 +1253,11 @@ async function handlePreviewWsUpgrade(
   const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== SHARE_WS_TICKET_TYPE) {
-      sessionUserId = payload.sub;
+    if (isAccountSessionJwt(payload) && (payload as Record<string, unknown>).scope !== 'doc_collaborator') {
+      // A disabled user's cookie is no identity (security/user-status.ts): the upgrade proceeds as an anonymous visitor, which the
+      // access resolver below then decides (a preview access token may still be valid on its own).
+      const decision = evaluateUserAccess(await loadUserAccess(env.DB, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
+      if (decision.ok) sessionUserId = payload.sub;
     }
   }
 
@@ -616,9 +1380,20 @@ function scheduleCrons(env: Env) {
       .catch((err) => logger.error({ err }, 'Auth lockout cleanup failed'));
     // Delete archived cloud memory projections older than 90 days
     memoryPruningCron(env).catch((err) => logger.error({ err }, 'Memory pruning cron failed'));
+    runEnrollmentRetention(env.DB)
+      .then(({ rows }) => {
+        if (rows > 0) logger.info({ rows }, 'Expired controlled-node enrollment rows removed');
+      })
+      .catch((err) => logger.error({ err }, 'Controlled-node enrollment retention failed'));
   });
   cron.schedule('* * * * *', () => {
     jobDispatchCron(env).catch((err) => logger.error({ err }, 'Job dispatch cron failed'));
+    sweepExpiredCapabilityPreActivationOperations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability pre-activation expiry sweep failed'));
+    expireCapabilityPendingActivations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability candidate expiry sweep failed'));
+    sweepExpiredCapabilityHistory(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability retention sweep failed'));
   });
   logger.info({}, 'Cron jobs scheduled');
 }
@@ -647,6 +1422,7 @@ async function ensureDefaultAdmin(db: Database, envConfig: EnvConfig): Promise<v
 async function main() {
   const envConfig = loadEnv();
 
+
   if (!envConfig.JWT_SIGNING_KEY || Buffer.byteLength(envConfig.JWT_SIGNING_KEY, 'utf8') < 32) {
     console.error('FATAL: JWT_SIGNING_KEY must be at least 32 bytes');
     process.exit(1);
@@ -661,6 +1437,9 @@ async function main() {
   if (bindHost === '0.0.0.0') {
     logger.warn({}, 'Server is listening on 0.0.0.0 — ensure TLS is terminated by a reverse proxy');
   }
+  if (!env.TRUSTED_PROXIES?.trim()) {
+    logger.warn({}, 'TRUSTED_PROXIES is empty; if this server is behind an ingress, set TRUSTED_PROXIES to the ingress CIDR (or configure REAL_IP_HEADER) so client IP handling is not collapsed to the proxy');
+  }
   if (!env.ALLOWED_ORIGINS && env.NODE_ENV !== 'development') {
     logger.error({}, 'ALLOWED_ORIGINS not set — all browser WebSocket connections will be rejected. Set ALLOWED_ORIGINS for production use.');
   } else if (!env.ALLOWED_ORIGINS) {
@@ -670,6 +1449,62 @@ async function main() {
   await runMigrations(db);
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
+  startR2RelayCleanup(envConfig);
+
+  const machineGroupInvalidation = new MachineGroupInvalidationRuntime(
+    db, (scope) => applyMachineGroupInvalidation(db, scope), failClosedMachineGroupConnections,
+    envConfig.DATABASE_URL, (error) => logger.error({ error }, 'Machine group invalidation failed closed'),
+  );
+  await machineGroupInvalidation.start();
+  await globalTaskHub.start(envConfig.DATABASE_URL, db);
+  await Promise.all([
+    remoteVoiceHub.refreshServerSharedProviders(db),
+    remoteVoiceHub.refreshServerAsrServices(db, env),
+  ]);
+
+  const podId = getPodIdentity();
+  const guestOutboxAdapter = new PostgresRemoteDesktopGuestOutboxDeliveryAdapter(
+    db,
+    (serverId) => WsBridge.remoteDesktopGuestOutboxTarget(serverId),
+  );
+  const guestDueWorker = new RemoteDesktopGuestDueWorker(
+    db,
+    `${podId}:remote-desktop-due`,
+    (error) => logger.error({ error, podId }, 'Remote desktop due worker failed'),
+  );
+  const guestOutboxWorker = new RemoteDesktopGuestOutboxWorker(
+    db,
+    podId,
+    guestOutboxAdapter,
+    new PostgresRemoteDesktopGuestOutboxListener(envConfig.DATABASE_URL),
+    (error) => logger.error({ error, podId }, 'Remote desktop outbox worker failed'),
+    (event, latencyMs) => logger.warn({
+      eventId: event.id,
+      effect: event.effect,
+      hostId: event.hostId,
+      latencyMs,
+    }, 'Remote desktop guest effect exceeded delivery SLO'),
+  );
+  const guestBackgroundRuntime = new RemoteDesktopGuestBackgroundRuntime(
+    guestDueWorker,
+    guestOutboxWorker,
+  );
+  const managementPrivacyWorker = new RemoteDesktopManagementPrivacyWorker(
+    db,
+    (error) => logger.error({ error, podId }, 'Remote desktop privacy worker failed'),
+  );
+  setRemoteDesktopManagementPrivacyDispatcher((command) => (
+    WsBridge.dispatchRemoteDesktopManagementPrivacy(command)
+  ));
+  setRemoteDesktopShellLaunchContextDispatcher(
+    WsBridge.remoteDesktopShellLaunchContextDispatcher(),
+  );
+  WsBridge.setRemoteDesktopReconnectRevalidator(async (serverId, preserveRoutes) => {
+    await reconcileRemoteDesktopEndpointOnReconnect(db, serverId, preserveRoutes);
+    guestOutboxWorker.wake();
+  });
+  await guestBackgroundRuntime.start();
+  managementPrivacyWorker.start();
 
   import('./util/memory-noise-cleanup.js').then(({ purgeRemoteMemoryNoiseProjections }) =>
     purgeRemoteMemoryNoiseProjections(db).catch((err) => logger.warn({ err }, 'Remote memory-noise cleanup failed (non-fatal)'))
@@ -689,15 +1524,44 @@ async function main() {
   });
 
   setupWebSocketUpgrade(httpServer as unknown as import('node:http').Server, env);
+  // Every replica closes the live connections of accounts that were disabled (on any replica) within a few seconds.
+  const stopAccountWatch = startAccountConnectionWatch(db);
 
   // Graceful shutdown — terminate the embedding worker so it doesn't keep
   // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutting down — closing embedding pool');
+    logger.info({ signal }, 'Shutting down — closing background workers');
+    // Keep reconnects fail-closed while pollers drain; a null hook means the
+    // embedded/test mode where no durable outbox runtime is configured.
+    WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+      throw new Error('remote_desktop_outbox_shutting_down');
+    });
+    setRemoteDesktopManagementPrivacyDispatcher(null);
+    setRemoteDesktopShellLaunchContextDispatcher(null);
+    stopAccountWatch();
+    await globalTaskHub.stop();
+    remoteVoiceHub.stop();
+    await machineGroupInvalidation.stop();
+    await managementPrivacyWorker.stop();
+    try {
+      await guestBackgroundRuntime.stop();
+    } catch (err) {
+      logger.warn({ err }, 'Remote desktop background worker shutdown failed (non-fatal)');
+    }
     try {
       await shutdownEmbeddingPool();
     } catch (err) {
       logger.warn({ err }, 'Embedding pool shutdown failed (non-fatal)');
+    }
+    try {
+      await flushAllSessionTextTailCacheWrites(db);
+    } catch (err) {
+      logger.warn({ err }, 'Session text tail cache flush failed (non-fatal)');
+    }
+    try {
+      await db.close();
+    } catch (err) {
+      logger.warn({ err }, 'Database shutdown failed (non-fatal)');
     }
     process.exit(0);
   };

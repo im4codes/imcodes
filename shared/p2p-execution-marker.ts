@@ -36,6 +36,11 @@ export interface P2pExecutionMarker extends P2pExecutionMarkerSpec {
   summary?: string;
   changedFiles?: string[];
   tests?: string[];
+  /**
+   * Number of unchecked OpenSpec tasks an implementation handoff explicitly
+   * declares safe to defer. Generic P2P markers omit this field.
+   */
+  skippableTaskCount?: number;
   error?: string;
   completedAt?: string;
 }
@@ -82,6 +87,7 @@ export function validateP2pExecutionMarkerContent(content: string, spec: P2pExec
   if (!isRecord(parsed)) return { ok: false, reason: 'not_object' };
 
   const status = parsed.status;
+  const skippableTaskCount = parsed.skippableTaskCount;
   const partial: Partial<P2pExecutionMarker> = {
     schemaVersion: parsed.schemaVersion as typeof P2P_EXECUTION_MARKER_SCHEMA_VERSION,
     runId: optionalString(parsed.runId) ?? '',
@@ -92,6 +98,7 @@ export function validateP2pExecutionMarkerContent(content: string, spec: P2pExec
     summary: optionalString(parsed.summary),
     changedFiles: optionalStringArray(parsed.changedFiles),
     tests: optionalStringArray(parsed.tests),
+    skippableTaskCount: typeof skippableTaskCount === 'number' ? skippableTaskCount : undefined,
     error: optionalString(parsed.error),
     completedAt: optionalString(parsed.completedAt),
   };
@@ -110,6 +117,13 @@ export function validateP2pExecutionMarkerContent(content: string, spec: P2pExec
   if (parsed.tests !== undefined && partial.tests === undefined) {
     return { ok: false, reason: 'tests_invalid', marker: partial };
   }
+  if (skippableTaskCount !== undefined && (
+    typeof skippableTaskCount !== 'number'
+    || !Number.isSafeInteger(skippableTaskCount)
+    || skippableTaskCount < 0
+  )) {
+    return { ok: false, reason: 'skippable_task_count_invalid', marker: partial };
+  }
 
   const marker: P2pExecutionMarker = {
     schemaVersion: P2P_EXECUTION_MARKER_SCHEMA_VERSION,
@@ -121,6 +135,7 @@ export function validateP2pExecutionMarkerContent(content: string, spec: P2pExec
     ...(partial.summary !== undefined ? { summary: partial.summary } : {}),
     ...(partial.changedFiles !== undefined ? { changedFiles: partial.changedFiles } : {}),
     ...(partial.tests !== undefined ? { tests: partial.tests } : {}),
+    ...(partial.skippableTaskCount !== undefined ? { skippableTaskCount: partial.skippableTaskCount } : {}),
     ...(partial.error !== undefined ? { error: partial.error } : {}),
     ...(partial.completedAt !== undefined ? { completedAt: partial.completedAt } : {}),
   };

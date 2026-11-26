@@ -182,9 +182,9 @@ describe('memory recall integration', () => {
     });
   });
 
-  // ── I.3: Session startup (Gemini) includes processed memory ───────────────
+  // ── I.3: Session startup includes processed memory ─────────────────────────
 
-  describe('I.3: session startup includes processed memory (Gemini path)', () => {
+  describe('I.3: session startup includes processed memory', () => {
 
     it('buildSessionBootstrapContext includes both important and recent startup memories', async () => {
       searchLocalMemoryMock.mockImplementation((query: { projectionClass?: string }) => {
@@ -201,8 +201,11 @@ describe('memory recall integration', () => {
       const { buildSessionBootstrapContext } = await import('../../src/daemon/memory-inject.js');
       const context = await buildSessionBootstrapContext('/tmp/fake-project', 'my-project');
 
-      expect(context).toContain('[important] Persist enterprise binding decisions as durable memory');
-      expect(context).toContain('[recent] Recent fix for transport memory recall cards');
+      // A redeemable handle sits between the label and the summary so the agent
+      // can call get_memory_sources when the summary alone isn't enough.
+      // base32 handle alphabet is a-z2-7.
+      expect(context).toMatch(/\[important\] \(proj:[a-z2-7]{13}\) Persist enterprise binding decisions as durable memory/);
+      expect(context).toMatch(/\[recent\] \(proj:[a-z2-7]{13}\) Recent fix for transport memory recall cards/);
     });
 
     it('buildSessionBootstrapContext includes "# Recent project memory" when memories exist', async () => {

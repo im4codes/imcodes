@@ -1,10 +1,13 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
-import { createServer, getServerById, updateServerToken } from '../db/queries.js';
+import { createServer, getServerById, updateServerToken, withTransaction } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
+import { rateLimiter } from '../security/lockout.js';
+import { activeUserExistsSql } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
+import { NODE_ROLE, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import { z } from 'zod';
 
 export const bindRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -32,36 +35,39 @@ bindRoutes.post('/initiate', requireAuth(), async (c) => {
 
 // POST /api/bind/confirm — daemon confirms the bind code and receives auth token
 bindRoutes.post('/confirm', async (c) => {
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  if (!rateLimiter.check(`bind-confirm:${ip}`, 20, 60_000)) {
+    return c.json({ error: 'rate_limited', retryAfter: 60 }, 429);
+  }
+
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ code: z.string() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { code } = parsed.data;
-  const pending = await c.env.DB.queryOne<{ code: string; user_id: string; server_name: string }>(
-    'SELECT * FROM pending_binds WHERE code = $1 AND expires_at > $2',
-    [code, Date.now()],
-  );
+  const rawToken = randomHex(32);
+  const tokenHash = sha256Hex(rawToken);
+  const serverId = randomHex(16);
+
+  const pending = await withTransaction(c.env.DB, async (tx) => {
+    const row = await tx.queryOne<{ code: string; user_id: string; server_name: string }>(
+      `DELETE FROM pending_binds WHERE code = $1 AND expires_at > $2 AND ${activeUserExistsSql('user_id')} RETURNING code, user_id, server_name`,
+      [code, Date.now()],
+    );
+    if (!row) return null;
+    await createServer(tx, serverId, row.user_id, row.server_name, tokenHash);
+    return row;
+  });
 
   if (!pending) return c.json({ error: 'invalid_code' }, 404);
 
-  // Generate daemon auth token
-  const rawToken = randomHex(32);
-  const tokenHash = sha256Hex(rawToken);
-
-  const serverId = randomHex(16);
-  await createServer(c.env.DB, serverId, pending.user_id, pending.server_name, tokenHash);
-
-  // Consume the bind code
-  await c.env.DB.execute('DELETE FROM pending_binds WHERE code = $1', [code]);
-
-  const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId: pending.user_id, action: 'bind.confirm', ip, details: { serverId } }, c.env.DB);
 
   return c.json({ serverId, token: rawToken });
 });
 
 // POST /api/bind/direct — single-step bind for web-authenticated users (API key already in hand)
-bindRoutes.post('/direct', requireAuth(), async (c) => {
+bindRoutes.post('/direct', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ serverName: z.string().min(1).max(64) }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -84,7 +90,7 @@ bindRoutes.post('/direct', requireAuth(), async (c) => {
 
 // POST /api/bind/rebind — replace token for an existing server (--force re-bind)
 // Authenticated via Bearer API key (same as /direct). Requires serverId to match the caller's user.
-bindRoutes.post('/rebind', requireAuth(), async (c) => {
+bindRoutes.post('/rebind', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ serverId: z.string(), serverName: z.string().min(1).max(64) }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -116,10 +122,24 @@ bindRoutes.post('/verify', async (c) => {
 
   const { serverId, token } = parsed.data;
   const server = await getServerById(c.env.DB, serverId);
-  if (!server) return c.json({ error: 'not_found' }, 404);
 
-  const tokenHash = sha256Hex(token);
-  if (tokenHash !== server.token_hash) return c.json({ error: 'invalid_token' }, 401);
+  // An unknown server, a wrong token and a revoked credential are one answer.
+  // Distinguishing them told an unauthenticated caller whether a serverId
+  // exists and whether its token was ever real; `not_found` did exactly that.
+  if (!server
+    || sha256Hex(token) !== server.token_hash
+    || server.revoked_at != null) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
 
-  return c.json({ ok: true, serverId, userId: server.user_id });
+  // Role is checked only after the token verifies, so this cannot be used to
+  // probe which serverIds are controlled nodes.
+  if (server.node_role === NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
+  }
+
+  // The sole caller (src/bind/bind-flow.ts) checks `response.ok` and never
+  // reads the body. Returning the owner's user id handed account identity to
+  // anyone holding a machine token.
+  return c.json({ ok: true });
 });

@@ -11,11 +11,16 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
+import {
+  resolveEffectiveSharedContextRuntimeConfig,
+  type SharedContextUsageContext,
+} from '../../shared/shared-context-runtime-config.js';
 import { CompressionAdmissionClosedError, compressWithSdk, computeTargetTokens, type CompressionResult } from './summary-compressor.js';
 import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import type {
   IngestContextEventResult,
   LatestRecentSummarySession,
+  ListProcessedProjectionsOptions,
   MaterializationCommitInput,
   MaterializationCommitResult,
   PinnedNote,
@@ -24,7 +29,7 @@ import type {
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
 import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
 import { computeFingerprint } from '../../shared/memory-fingerprint.js';
@@ -32,6 +37,7 @@ import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
 import { ensureProjectionEmbeddingForProjection } from './projection-embedding-maintenance.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
   decideSkillReviewSchedule,
@@ -93,6 +99,8 @@ export interface MaterializationCoordinatorOptions {
   skillReviewScheduler?: MaterializationSkillReviewScheduler;
   /** Gate self-learning durable extraction/classification; defaults to the shared feature flag (default off). */
   selfLearningEnabled?: boolean | (() => boolean);
+  /** Optional active-usage resolver for `'auto'` model adaptation on each materialization run. */
+  resolveUsageContext?: (target: ContextTargetRef) => SharedContextUsageContext | undefined;
 }
 
 export interface MaterializationResult {
@@ -101,6 +109,7 @@ export interface MaterializationResult {
   replicationQueued: boolean;
   compression?: CompressionResult;
   filteredOut?: boolean;
+  disabled?: boolean;
 }
 
 export interface MaterializationSkillReviewJob {
@@ -151,8 +160,8 @@ const MAX_SKILL_REVIEW_EVIDENCE_TARGETS = 256;
 
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
-  readonly modelConfig: ContextModelConfig;
   readonly memoryConfig: MemoryConfig;
+  private readonly explicitModelConfigOverride?: ContextModelConfig;
   private readonly resolveMemoryConfig: MemoryConfigResolver;
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
@@ -163,7 +172,12 @@ export class MaterializationCoordinator {
   private readonly _commitMaterializationIsOverride: boolean;
   private readonly _skillReviewScheduler?: MaterializationSkillReviewScheduler;
   private readonly _selfLearningEnabled?: boolean | (() => boolean);
+  private readonly _resolveUsageContext?: MaterializationCoordinatorOptions['resolveUsageContext'];
   private readonly skillReviewEvidenceByTarget = new Map<string, SkillReviewTriggerEvidence>();
+
+  get modelConfig(): ContextModelConfig {
+    return this.explicitModelConfigOverride ?? getContextModelConfig();
+  }
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
@@ -180,6 +194,7 @@ export class MaterializationCoordinator {
     this._commitMaterializationIsOverride = options?.commitMaterialization !== undefined;
     this._skillReviewScheduler = options?.skillReviewScheduler;
     this._selfLearningEnabled = options?.selfLearningEnabled;
+    this._resolveUsageContext = options?.resolveUsageContext;
     this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
       fixedConfig: options?.memoryConfig,
       fallbackCwd: options?.memoryConfigCwd,
@@ -188,7 +203,13 @@ export class MaterializationCoordinator {
       ?? (options?.memoryConfigCwd
         ? loadMemoryConfig(options.memoryConfigCwd)
         : resolveMemoryConfigForNamespace({ scope: 'personal', projectId: '__default__' }));
-    this.modelConfig = getContextModelConfig(options?.modelConfig);
+    if (options?.modelConfig) {
+      const normalized = getContextModelConfig(options.modelConfig);
+      this.explicitModelConfigOverride = {
+        ...normalized,
+        modelSelectionMode: options.modelConfig.modelSelectionMode ?? 'manual',
+      };
+    }
     // materializationMinIntervalMs from cloud config overrides the threshold default.
     // Project .imc/memory.yaml supplies memory-pipeline defaults underneath
     // explicit constructor overrides.
@@ -287,6 +308,7 @@ export class MaterializationCoordinator {
   }
 
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const memoryConfig = this.configForTarget(target);
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     // Run the whole job lifecycle (create → running → … → completed) on the
@@ -296,9 +318,14 @@ export class MaterializationCoordinator {
     const job = await client.run<ContextJobRecord>(
       'enqueueContextJob', [target, jobType, trigger, now],
     );
-    await client.run<void>(
-      'updateContextJob', [job.id, 'running', { attemptIncrement: true, now }],
-    );
+    const claimed = await client.run<boolean>('claimContextJob', [job.id, now]);
+    if (!claimed) {
+      // Another overlapping poll pass already owns this exact job. Returning
+      // before the staged-event read is essential: compressor inputs capture
+      // their event array when queued, so queue serialization alone cannot
+      // prevent the same batch from being processed repeatedly.
+      return { replicationQueued: false };
+    }
     // Heavy reads run in the worker when warm (staged events can be large), off
     // the daemon main thread; in-process fallback when not ready.
     const allEvents = await client.run<LocalContextEvent[]>(
@@ -331,9 +358,11 @@ export class MaterializationCoordinator {
     // Recent summaries are delta-only. Do not feed the previous recent summary
     // back into the compressor, or every small batch snowballs into another
     // full handoff and burns tokens when synced into sub-sessions.
-    const previousProjections = (await client.run<ProcessedContextProjection[]>(
-      'listProcessedProjections', [target.namespace, 'recent_summary'],
-    )).filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
+    // Only existence matters: ask for one non-archived row instead of pulling
+    // (and structured-cloning) every recent summary of the namespace.
+    const previousProjections = await client.run<ProcessedContextProjection[]>(
+      'listProcessedProjections', [target.namespace, 'recent_summary', { excludeArchived: true, limit: 1 } satisfies ListProcessedProjectionsOptions],
+    );
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -342,6 +371,10 @@ export class MaterializationCoordinator {
     // DISCARD that fallback text entirely. The coordinator never persists
     // non-SDK summaries, so the "⚠️ Structured summary unavailable" warning
     // can no longer leak into durable memory.
+    const effectiveModelConfig = resolveEffectiveSharedContextRuntimeConfig(
+      this.modelConfig,
+      this._resolveUsageContext?.(target),
+    );
     const compressFn = this._compressor ?? compressWithSdk;
     let compression: CompressionResult;
     try {
@@ -349,15 +382,25 @@ export class MaterializationCoordinator {
       compression = await compressFn({
         events,
         previousSummary: undefined,
-        modelConfig: this.modelConfig,
+        modelConfig: effectiveModelConfig,
         mode: 'auto',
-        targetTokens: memoryConfig.autoMaterializationTargetTokens > 0
-          ? memoryConfig.autoMaterializationTargetTokens
-          : computeTargetTokens(countTokens(events.map((event) => event.content ?? '').join('\n')), 'auto'),
+        // Let the compressor derive the exact provider-backed target when the
+        // memory config does not override it. Computing the same budget here
+        // first adds an avoidable worker round-trip before the post-response
+        // background path can finish (and can make skill-review scheduling
+        // appear blocked on a cold tokenizer worker).
+        ...(memoryConfig.autoMaterializationTargetTokens > 0
+          ? { targetTokens: memoryConfig.autoMaterializationTargetTokens }
+          : {}),
         maxEventChars: memoryConfig.maxEventChars,
         previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
         extraRedactPatterns: memoryConfig.extraRedactPatterns,
         pinnedNotes,
+        ...(target.sessionName ? {
+          watchdogSessionName: target.sessionName,
+          watchdogTrigger: trigger,
+          watchdogEventCount: events.length,
+        } : {}),
       });
     } catch (error) {
       if (error instanceof CompressionAdmissionClosedError) {
@@ -593,10 +636,10 @@ export class MaterializationCoordinator {
         trigger,
         targetKind: target.kind,
         sessionName: target.sessionName,
-        primaryContextBackend: this.modelConfig.primaryContextBackend,
-        primaryContextModel: this.modelConfig.primaryContextModel,
-        backupContextBackend: this.modelConfig.backupContextBackend,
-        backupContextModel: this.modelConfig.backupContextModel,
+        primaryContextBackend: effectiveModelConfig.primaryContextBackend,
+        primaryContextModel: effectiveModelConfig.primaryContextModel,
+        backupContextBackend: effectiveModelConfig.backupContextBackend,
+        backupContextModel: effectiveModelConfig.backupContextModel,
         compressionModel: compression.model,
         compressionBackend: compression.backend,
         compressionUsedBackup: compression.usedBackup,
@@ -684,6 +727,7 @@ export class MaterializationCoordinator {
   }
 
   async scheduleDueTargets(now = Date.now()): Promise<ContextJobRecord[]> {
+    if (!isMemoryDaemonEnabled()) return [];
     const client = getContextStoreClient();
     // Best-effort archive prune (a prune failure must never block scheduling).
     // Route via `run` (not `fireAndForget`) so we don't eagerly spawn/warm a
@@ -709,6 +753,7 @@ export class MaterializationCoordinator {
   }
 
   async materializeDueMasterSummaries(now = Date.now()): Promise<ProcessedContextProjection[]> {
+    if (!isMemoryDaemonEnabled()) return [];
     const client = getContextStoreClient();
     const due: ProcessedContextProjection[] = [];
     for (const item of await client.run<LatestRecentSummarySession[]>('listLatestRecentSummarySessions', [1000])) {
@@ -897,7 +942,7 @@ async function collectPinnedNotesForNamespace(namespace: ContextNamespace): Prom
   const notes: string[] = [];
   let tokenTotal = 0;
   for (const note of await getContextStoreClient().run<PinnedNote[]>('listPinnedNotes', [namespaceKey])) {
-    const noteTokens = countTokens(note.content);
+    const noteTokens = await countTokensAsync(note.content);
     if (tokenTotal + noteTokens > 1000) {
       incrementCounter('mem.pinned_notes_overflow', { namespace: namespaceKey });
       warnOncePerHour('pinned_notes_overflow', { namespace: namespaceKey });
@@ -957,11 +1002,11 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
       highSignalEventCount: archiveEvents.length,
       targetTokens: effectiveMemoryConfig.manualCompactTargetTokens > 0
         ? effectiveMemoryConfig.manualCompactTargetTokens
-        : computeTargetTokens(countTokens(summary), 'manual'),
+        : computeTargetTokens(await countTokensAsync(summary), 'manual'),
     },
     createdAt: previousMaster?.createdAt ?? now,
     updatedAt: now,
-  }]);
+  }], { priority: 'low' });
   // Best-effort, fire-and-forget write-time embedding (see materializeTarget).
   void ensureProjectionEmbeddingForProjection(masterProjection);
   return masterProjection;
@@ -980,15 +1025,13 @@ async function findNamespaceForSessionSummaries(sessionName: string): Promise<Co
 }
 
 async function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): Promise<ProcessedContextProjection | undefined> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .find((projection) => projection.content.sessionName === sessionName);
+  const options: ListProcessedProjectionsOptions = { sessionName, excludeArchived: true, limit: 1 };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary', options]))[0];
 }
 
 async function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): Promise<ProcessedContextProjection[]> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .filter((projection) => projection.content.sessionName === sessionName && projection.updatedAt > since)
+  const options: ListProcessedProjectionsOptions = { sessionName, updatedAfter: since, excludeArchived: true };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary', options]))
     .sort((a, b) => a.updatedAt - b.updatedAt);
 }
 

@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -10,9 +11,11 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderDelegationNotification,
   ToolCallEvent,
   ApprovalRequest,
   RemoteSessionInfo,
+  RemoteSessionListOptions,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -33,7 +36,25 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
 import { type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  collectNativeAgentRequestStrings,
+  type NativeCollaborationGate,
+} from '../../../shared/native-collaboration-policy.js';
+import { COPILOT_NATIVE_AGENT_TOOLS } from '../native-agent-fence.js';
+import { PendingQuestionRegistry, type InteractiveQuestionAnswerer } from '../pending-question-registry.js';
+import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
+import { isAskQuestionToolName } from '../../../shared/ask-question-normalize.js';
+import { INTERACTIVE_QUESTION_TOOL_NAME } from '../../../shared/codex-user-input.js';
 
+const COPILOT_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(COPILOT_NATIVE_AGENT_TOOLS);
+
+/** The Copilot SDK pre-tool-use hook output this provider returns. */
 const COPILOT_BIN = 'copilot';
 const MIN_PROTOCOL_VERSION = 3;
 const COMPATIBLE_CLI_RANGE = '^1.0.31';
@@ -49,13 +70,17 @@ export const copilotSdkRuntimeHooks: CopilotSdkRuntimeHooks = {
 
 type CopilotSessionLike = {
   sessionId: string;
-  send(options: Record<string, unknown>): Promise<void>;
+  send(options: Record<string, unknown>): Promise<string | void>;
   abort(): Promise<void>;
   setModel(model: string, options?: Record<string, unknown>): Promise<void>;
   on(handler: (event: Record<string, any>) => void): () => void;
   rpc?: {
     history?: {
-      compact?: () => Promise<CopilotCompactResultLike>;
+      compact?: (params?: {
+        customInstructions?: string;
+        trigger?: 'manual' | 'model_switch';
+        tokenLimit?: number;
+      }) => Promise<CopilotCompactResultLike>;
     };
   };
   disconnect?(): Promise<void>;
@@ -63,14 +88,25 @@ type CopilotSessionLike = {
 
 type CopilotClientLike = {
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(): Promise<Error[] | void>;
   getStatus(): Promise<{ version: string; protocolVersion: number }>;
   getAuthStatus(): Promise<{ isAuthenticated: boolean; statusMessage?: string }>;
   createSession(config: Record<string, unknown>): Promise<CopilotSessionLike>;
   resumeSession(sessionId: string, config: Record<string, unknown>): Promise<CopilotSessionLike>;
-  listSessions(filter?: Record<string, unknown>): Promise<Array<{ sessionId: string; summary?: string; modifiedTime?: Date | string | number }>>;
+  listSessions(filter?: Record<string, unknown>): Promise<Array<{
+    sessionId: string;
+    summary?: string;
+    modifiedTime?: Date | string | number;
+    context?: { cwd?: string };
+  }>>;
   deleteSession(sessionId: string): Promise<void>;
-  listModels(): Promise<Array<{ id: string; capabilities?: { supports?: { reasoningEffort?: boolean } } }>>;
+  listModels(): Promise<Array<{
+    id: string;
+    name?: string;
+    capabilities?: { supports?: { reasoningEffort?: boolean } };
+    supportedReasoningEfforts?: string[];
+    defaultReasoningEffort?: string;
+  }>>;
 };
 
 type CopilotOperation = 'idle' | 'turn' | 'compact' | 'cancelling';
@@ -131,6 +167,10 @@ interface CopilotSessionState {
   compactCompletionEmitted: boolean;
   rotationInProgress: boolean;
   generation: number;
+  activeTurnGeneration: number;
+  activeTurnReady: Promise<boolean> | null;
+  resolveActiveTurnReady: ((ready: boolean) => void) | null;
+  activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this Copilot chat history. */
   sessionSystemTextInjected?: string;
@@ -263,7 +303,7 @@ function toolFromEvent(event: Record<string, any>): ToolCallEvent | null {
   return null;
 }
 
-export class CopilotSdkProvider implements TransportProvider {
+export class CopilotSdkProvider implements TransportProvider, InteractiveQuestionAnswerer {
   readonly id = 'copilot-sdk';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
@@ -277,11 +317,17 @@ export class CopilotSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: ['low', 'medium', 'high', 'max'],
     contextSupport: 'degraded-message-side-context-mapping',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Native agent calls remain available; hooks.onPreToolUse only records
+    // non-blocking policy metadata.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
       completion: 'rpc-result-or-provider-event',
       cancellation: 'provider-cancel',
+      // Clears its injected-system-text marker on every compaction (refreshSessionSystemText), so the next turn re-sends it.
+      reassertsSessionSystemText: true,
     },
   };
 
@@ -290,6 +336,10 @@ export class CopilotSdkProvider implements TransportProvider {
   private sdk: typeof import('@github/copilot-sdk') | null = null;
   private client: CopilotClientLike | null = null;
   private sessions = new Map<string, CopilotSessionState>();
+  private readonly questions = new PendingQuestionRegistry<{ answer: string; wasFreeform: boolean }>();
+  private readonly pendingQuestionChoices = new Map<string, string[]>();
+  private userInputSeq = 0;
+  private nativeCollaborationGate?: NativeCollaborationGate;
   private poisonedSessionIds = new Set<string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -299,13 +349,26 @@ export class CopilotSdkProvider implements TransportProvider {
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private approvalCallbacks: Array<(sessionId: string, req: ApprovalRequest) => void> = [];
 
+  answerPendingQuestion(sessionName: string, answer: string): boolean {
+    const trimmed = answer.trim();
+    for (const [routeId, state] of this.sessions) {
+      if ((state.sessionName ?? routeId) !== sessionName) continue;
+      if (!this.questions.has(routeId)) return false;
+      const choices = this.pendingQuestionChoices.get(routeId) ?? [];
+      return this.questions.resolve(routeId, {
+        answer: trimmed,
+        wasFreeform: !choices.includes(trimmed),
+      });
+    }
+    return false;
+  }
+
   async connect(config: ProviderConfig): Promise<void> {
     const sdk = await copilotSdkRuntimeHooks.loadSdk();
     const resolvedBinary = this.resolveBinaryPath(config);
-    const client = new sdk.CopilotClient({
-      ...(resolvedBinary ? { cliPath: resolvedBinary } : {}),
-      autoStart: false,
-    }) as unknown as CopilotClientLike;
+    const client = new sdk.CopilotClient(
+      resolvedBinary ? { connection: { kind: 'stdio', path: resolvedBinary } } : undefined,
+    ) as unknown as CopilotClientLike;
     try {
       await client.start();
       const status = await client.getStatus();
@@ -395,7 +458,10 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.questions.releaseAll();
+    this.pendingQuestionChoices.clear();
     for (const state of this.sessions.values()) {
+      this.settleActiveTurnReady(state, false);
       state.unsubscribes.forEach((fn) => fn());
       try { await state.session.disconnect?.(); } catch {}
       for (const pending of state.pendingApprovals.values()) {
@@ -466,6 +532,10 @@ export class CopilotSdkProvider implements TransportProvider {
       compactCompletionEmitted: false,
       rotationInProgress: false,
       generation: 0,
+      activeTurnGeneration: 0,
+      activeTurnReady: null,
+      resolveActiveTurnReady: null,
+      activeNotificationAdmissions: new Map(),
       lastStatusSignature: null,
       sessionSystemTextInjected: undefined,
       sessionSystemTextPending: undefined,
@@ -485,6 +555,21 @@ export class CopilotSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
+    this.detachSessionState(state);
+    try { await state.session.disconnect?.(); } catch {}
+  }
+
+  async detachSession(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    if (!state) return;
+    this.detachSessionState(state);
+  }
+
+  private detachSessionState(state: CopilotSessionState): void {
+    this.settleActiveTurnReady(state, false);
+    this.questions.release(state.routeId);
+    this.pendingQuestionChoices.delete(state.routeId);
+    state.activeNotificationAdmissions.clear();
     state.unsubscribes.forEach((fn) => fn());
     state.unsubscribes = [];
     for (const pending of state.pendingApprovals.values()) {
@@ -492,7 +577,6 @@ export class CopilotSdkProvider implements TransportProvider {
       pending.resolve({ kind: 'denied-no-approval-rule-and-could-not-request-from-user' });
     }
     state.pendingApprovals.clear();
-    try { await state.session.disconnect?.(); } catch {}
     this.sessions.delete(state.routeId);
   }
 
@@ -586,6 +670,14 @@ export class CopilotSdkProvider implements TransportProvider {
     });
   }
 
+  /** After any compaction the next turn carries the session system text again. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.getSessionState(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
+    state.sessionSystemTextPending = undefined;
+  }
+
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) {
@@ -607,6 +699,11 @@ export class CopilotSdkProvider implements TransportProvider {
     const prompt = composeMessageSideProviderPrompt(payload, { includeSessionSystemText, labelContextInstructions: false });
     const sdkAttachments = toAttachmentPayload(payload.attachments);
     this.resetTurnState(state);
+    const turnGeneration = ++state.activeTurnGeneration;
+    state.activeNotificationAdmissions.clear();
+    state.activeTurnReady = new Promise<boolean>((resolve) => {
+      state.resolveActiveTurnReady = resolve;
+    });
     state.operation = 'turn';
     state.busy = true;
     state.sessionSystemTextPending = includeSessionSystemText ? sessionSystemText : undefined;
@@ -621,7 +718,13 @@ export class CopilotSdkProvider implements TransportProvider {
         ...(sdkAttachments ? { attachments: sdkAttachments } : {}),
         mode: 'immediate',
       });
+      if (this.isActiveTurn(state, turnGeneration)) {
+        this.settleActiveTurnReady(state, true);
+      } else {
+        this.settleActiveTurnReady(state, false);
+      }
     } catch (error) {
+      this.settleActiveTurnReady(state, false);
       state.sessionSystemTextPending = undefined;
       state.busy = false;
       state.operation = 'idle';
@@ -629,7 +732,78 @@ export class CopilotSdkProvider implements TransportProvider {
     }
   }
 
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.getSessionState(sessionId);
+    if (!state || !state.busy || state.operation !== 'turn' || state.cancelRequested) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    const existing = state.activeNotificationAdmissions.get(notification.notificationId);
+    if (existing) return existing;
+    const turnGeneration = state.activeTurnGeneration;
+    const admission = this.deliverActiveNotification(state, turnGeneration, notification);
+    state.activeNotificationAdmissions.set(notification.notificationId, admission);
+    try {
+      const result = await admission;
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        state.activeNotificationAdmissions.delete(notification.notificationId);
+      }
+      return result;
+    } catch (error) {
+      state.activeNotificationAdmissions.delete(notification.notificationId);
+      throw error;
+    }
+  }
+
+  private async deliverActiveNotification(
+    state: CopilotSessionState,
+    turnGeneration: number,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const ready = await state.activeTurnReady;
+    if (!ready || !this.isActiveTurn(state, turnGeneration)) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await state.session.send({
+        prompt: notification.text,
+        // Copilot SDK 0.2.2 exposes immediate delivery as its native live-turn
+        // admission path. Unlike the default enqueue mode, this enters the
+        // active interaction instead of waiting for the session to go idle.
+        mode: 'immediate',
+      });
+    } catch (error) {
+      if (!this.isActiveTurn(state, turnGeneration)) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      // Propagate a live-session admission error. TransportSessionRuntime keeps
+      // the durable pending row when admission throws, so the message is never
+      // acknowledged and lost.
+      throw error;
+    }
+    // The SDK RPC resolving is the irreversible admission ACK. A concurrent
+    // session.idle event after that point must not downgrade the result to
+    // STALE, otherwise the durable caller will replay an already accepted B.
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+  }
+
+  private isActiveTurn(state: CopilotSessionState, turnGeneration: number): boolean {
+    return state.activeTurnGeneration === turnGeneration
+      && state.busy
+      && state.operation === 'turn'
+      && !state.cancelRequested;
+  }
+
+  private settleActiveTurnReady(state: CopilotSessionState, ready: boolean): void {
+    const resolve = state.resolveActiveTurnReady;
+    state.resolveActiveTurnReady = null;
+    resolve?.(ready);
+  }
+
   private resetTurnState(state: CopilotSessionState): void {
+    this.settleActiveTurnReady(state, false);
     state.currentMessageId = null;
     state.currentText = '';
     state.completionEmittedForCurrentTurn = false;
@@ -665,7 +839,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.operation = 'compact';
     this.emitStatus(state.routeId, { status: 'compacting', label: 'Compacting conversation...' });
     try {
-      const result = await compact.call(history);
+      const result = await compact.call(history, { trigger: 'manual' });
       if (state.operation === 'compact' && !state.cancelRequested) {
         this.completeCompactOnce(state, 'session.history.compact', result ?? {});
       }
@@ -739,12 +913,27 @@ export class CopilotSdkProvider implements TransportProvider {
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `Copilot compact failed: ${message}`, false, error);
   }
 
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    if (!state) return Promise.reject(new Error('Copilot session unavailable for Stop'));
+    const session = state.session;
+    const generation = state.activeTurnGeneration;
+    return this.stopConfirmations.confirm(session, () => this.cancel(sessionId),
+      () => this.getSessionState(sessionId) === state && state.activeTurnGeneration === generation);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
     if (state.cancelSettlement) return state.cancelSettlement;
     const wasCompact = state.operation === 'compact';
     const settlement = (async () => {
+      this.settleActiveTurnReady(state, false);
+      this.questions.release(state.routeId);
+      this.pendingQuestionChoices.delete(state.routeId);
+      state.activeNotificationAdmissions.clear();
       state.cancelRequested = true;
       state.operation = 'cancelling';
       try {
@@ -792,6 +981,7 @@ export class CopilotSdkProvider implements TransportProvider {
           id: m.id,
           ...(m.name ? { name: m.name } : {}),
           ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+          ...(m.supportedEffortLevels ? { supportedEffortLevels: m.supportedEffortLevels } : {}),
         })),
         isAuthenticated: cfg.isAuthenticated,
         ...(cfg.probeError ? { error: cfg.probeError } : {}),
@@ -801,14 +991,18 @@ export class CopilotSdkProvider implements TransportProvider {
     }
   }
 
-  async listSessions(): Promise<RemoteSessionInfo[]> {
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
     const client = this.assertConnected();
-    const sessions = await client.listSessions();
+    const directory = typeof options.directory === 'string' ? options.directory.trim() : '';
+    const sessions = await client.listSessions(directory ? { cwd: directory } : undefined);
     return sessions
       .filter((session) => !this.poisonedSessionIds.has(session.sessionId))
       .map((session) => ({
         key: session.sessionId,
         ...(session.summary ? { displayName: session.summary } : {}),
+        ...(typeof session.context?.cwd === 'string' && session.context.cwd.trim()
+          ? { directory: session.context.cwd.trim() }
+          : {}),
         ...(session.modifiedTime ? { updatedAt: new Date(session.modifiedTime).getTime() } : {}),
       }));
   }
@@ -824,20 +1018,64 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private buildSessionConfig(config: SessionConfig, model?: string, effort?: TransportEffortLevel): Record<string, unknown> {
+    const routeId = config.bindExistingKey ?? config.sessionKey;
     return {
       workingDirectory: config.cwd,
       ...(model ? { model } : {}),
       ...(mapEffortToCopilot(effort) ? { reasoningEffort: mapEffortToCopilot(effort) } : {}),
       mcpServers: getDefaultMcpServers(config),
-      onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(config.bindExistingKey ?? config.sessionKey, request),
+      onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(routeId, request),
+      onUserInputRequest: (request: Record<string, unknown>) => this.handleUserInputRequest(routeId, request),
+      // Created and resumed sessions both carry it: the CLI asks before every
+      // tool, independently of the permission mode.
+      hooks: {
+        onPreToolUse: (input: unknown) => this.evaluateNativeAgentToolUse(routeId, input),
+      },
     };
+  }
+
+  setNativeCollaborationGate(gate: NativeCollaborationGate): void {
+    this.nativeCollaborationGate = gate;
+  }
+
+  /**
+   * Advisory callback for Copilot's native agent tools (`task` spawns an agent,
+   * `write_agent` hands a running one more work). The Copilot SDK swallows a
+   * throwing hook as "no decision", which is exactly the desired non-blocking
+   * behavior here.
+   */
+  private evaluateNativeAgentToolUse(routeId: string, input: unknown): undefined {
+    let toolName = '';
+    try {
+      const record = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : undefined;
+      toolName = typeof record?.toolName === 'string' ? record.toolName : '';
+      if (!COPILOT_NATIVE_AGENT_TOOL_NAMES.has(toolName)) return undefined;
+      const gate = this.nativeCollaborationGate;
+      if (!gate) return undefined;
+      let args: unknown = record?.toolArgs;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { /* keep the raw string as request text */ }
+      }
+      gate(routeId, {
+        provider: this.id,
+        toolName,
+        requestText: collectNativeAgentRequestStrings(args).join('\n'),
+      });
+    } catch (error) {
+      logger.warn({ provider: this.id, routeId, toolName, error }, 'Copilot native agent advisory failed');
+    }
+    return undefined;
   }
 
   private attachSession(state: CopilotSessionState): void {
     state.unsubscribes.forEach((fn) => fn());
     state.unsubscribes = [];
     const generation = ++state.generation;
-    const unsubscribe = state.session.on((event: Record<string, any>) => {
+    const session = state.session;
+    const unsubscribe = session.on((event: Record<string, any>) => {
+      // The captured SDK session owns this terminal, including a terminal
+      // arriving while cancellation rotates its poisoned routing state.
+      if (event.type === 'session.idle') this.stopConfirmations.complete(session);
       if (!this.isCurrentGeneration(state, generation)) return;
       this.handleSessionEvent(state, generation, event);
     });
@@ -920,7 +1158,7 @@ export class CopilotSdkProvider implements TransportProvider {
       }
       case 'tool.execution_start': {
         const tool = toolFromEvent(event);
-        if (tool) {
+        if (tool && !isAskQuestionToolName(tool.name)) {
           const args = event.data?.arguments;
           const toolName = String(event.data?.toolName ?? '').toLowerCase();
           if ((toolName === 'bash' || toolName === 'shell' || toolName === 'terminal') && this.looksBackgroundTainted(args)) {
@@ -932,7 +1170,7 @@ export class CopilotSdkProvider implements TransportProvider {
       }
       case 'tool.execution_complete': {
         const tool = toolFromEvent(event);
-        if (tool) {
+        if (tool && !isAskQuestionToolName(tool.name)) {
           for (const cb of this.toolCallCallbacks) cb(routeId, tool);
         }
         return;
@@ -966,6 +1204,8 @@ export class CopilotSdkProvider implements TransportProvider {
           return;
         }
         const wasTurn = state.operation === 'turn';
+        this.settleActiveTurnReady(state, false);
+        state.activeNotificationAdmissions.clear();
         state.busy = false;
         state.operation = 'idle';
         if (state.cancelRequested && !state.cancelErrorEmitted) {
@@ -1027,6 +1267,8 @@ export class CopilotSdkProvider implements TransportProvider {
         return;
       }
       case 'session.error': {
+        this.settleActiveTurnReady(state, false);
+        state.activeNotificationAdmissions.clear();
         state.busy = false;
         state.operation = 'idle';
         state.sessionSystemTextPending = undefined;
@@ -1080,9 +1322,50 @@ export class CopilotSdkProvider implements TransportProvider {
     });
   }
 
+  private async handleUserInputRequest(
+    routeId: string,
+    request: Record<string, unknown>,
+  ): Promise<{ answer: string; wasFreeform: boolean }> {
+    const state = this.getSessionState(routeId);
+    const question = typeof request.question === 'string' ? request.question.trim() : '';
+    if (!state || state.cancelRequested || !question) {
+      return { answer: '', wasFreeform: true };
+    }
+    const choices = Array.isArray(request.choices)
+      ? request.choices.filter((c): c is string => typeof c === 'string').map((c) => c.trim()).filter(Boolean)
+      : [];
+    const toolEvent: ToolCallEvent = {
+      id: `copilot-ask:${routeId}:${++this.userInputSeq}`,
+      name: INTERACTIVE_QUESTION_TOOL_NAME,
+      status: 'complete',
+      input: {
+        questions: [{
+          question,
+          ...(choices.length > 0 ? { options: choices } : {}),
+        }],
+      },
+    };
+    this.pendingQuestionChoices.set(routeId, choices);
+    const waiting = this.questions.wait(routeId, {
+      timeoutMs: ASK_QUESTION_WAIT_MS,
+      fallback: { answer: '', wasFreeform: true },
+    });
+    for (const cb of this.toolCallCallbacks) cb(routeId, toolEvent);
+    try {
+      return await waiting;
+    } finally {
+      if (this.pendingQuestionChoices.get(routeId) === choices) {
+        this.pendingQuestionChoices.delete(routeId);
+      }
+    }
+  }
+
   private async rotatePoisonedSession(state: CopilotSessionState): Promise<void> {
     if (state.rotationInProgress || this.poisonedSessionIds.has(state.sessionId)) return;
     state.rotationInProgress = true;
+    this.settleActiveTurnReady(state, false);
+    this.questions.release(state.routeId);
+    this.pendingQuestionChoices.delete(state.routeId);
     const oldSessionId = state.sessionId;
     const oldSession = state.session;
     this.poisonedSessionIds.add(oldSessionId);
@@ -1142,6 +1425,7 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private async replaceSession(state: CopilotSessionState, resumeId: string): Promise<void> {
+    this.settleActiveTurnReady(state, false);
     const oldSessionId = state.sessionId;
     const oldSession = state.session;
     const resumed = await this.resumeSdkSession(resumeId, {
@@ -1233,8 +1517,7 @@ export class CopilotSdkProvider implements TransportProvider {
     // We only override the SDK's bundled CLI when:
     //   1. The caller explicitly passed an absolute binaryPath that exists, OR
     //   2. On Windows, the PATH-resolved binary is an absolute existing file.
-    // Otherwise we return `undefined` so the SDK falls back to its bundled
-    // `@github/copilot/index.js` (installed as a dependency of the SDK).
+    // Otherwise we return `undefined` so the SDK falls back to its bundled CLI binary.
     if (isNonEmptyString(config.binaryPath)) {
       const candidate = config.binaryPath.trim();
       if (path.isAbsolute(candidate) && existsSync(candidate)) return candidate;

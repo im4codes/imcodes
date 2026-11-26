@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import {
-  getServersByUserId,
+  getFullServersByUserId,
   getDbSessionsByServer,
   getSubSessionsByServer,
   getUserPref,
@@ -12,12 +12,15 @@ import {
   SESSION_TEXT_TAIL_CACHE_LIMIT,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
-import { shareTargetFromSessionName, targetExists } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess } from './share-http-auth.js';
+import { authorizeTimelineSession, type TimelineSessionActorRole } from './timeline-session-access.js';
+import { redactPairTimelineEventForShareRole } from '../ws/share-policy.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
+import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
+import { isRecoverableTimelineRequestErrorReason } from '../../../shared/timeline-history-errors.js';
+import { WATCH_RECENT_TEXT_CONCURRENCY } from '../../../shared/scale-limits.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 // Shared so the daemon (command-handler.ts) and server emit the SAME log
@@ -31,6 +34,7 @@ const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
 const TEXT_TAIL_HISTORY_MAX_PAGES = 6;
 const TEXT_TAIL_HISTORY_TIMEOUT_MS = 1500;
 const TEXT_TAIL_MAX_ENCODED_BYTES = 64 * 1024;
+const WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT = 5;
 const textTailBackfills = new Map<string, Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>>>();
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
@@ -41,7 +45,6 @@ const BADGE_MAP: Record<string, string> = {
   'opencode': 'oc',
   'openclaw': 'oc',
   'qwen': 'qw',
-  'gemini': 'gm',
   'shell': 'sh',
   'script': 'sc',
 };
@@ -252,6 +255,13 @@ function textTailSignature(events: Array<{ eventId: string; ts: number; type?: s
   ].join(':');
 }
 
+function redactTimelineEventForCaller(event: unknown, actorRole?: TimelineSessionActorRole): unknown {
+  if (actorRole === 'viewer' || actorRole === 'participant') {
+    return redactPairTimelineEventForShareRole(event, actorRole);
+  }
+  return event;
+}
+
 function sanitizeWatchTimelineEvent(raw: unknown): {
   eventId: string;
   sessionId: string;
@@ -296,6 +306,14 @@ function timelineResponseMetadata(response: Record<string, unknown>, visibleEven
   for (const key of ['payloadTruncated', 'cursorReset'] as const) {
     if (typeof response[key] === 'boolean') metadata[key] = response[key];
   }
+  if (typeof response.recoverable === 'boolean') {
+    metadata.recoverable = response.recoverable;
+  } else if (
+    response.status === TIMELINE_RESPONSE_STATUS.ERROR
+    && isRecoverableTimelineRequestErrorReason(response.errorReason)
+  ) {
+    metadata.recoverable = true;
+  }
   if (Array.isArray(response.detailRefs)) {
     metadata.detailRefs = visibleEventIds
       ? response.detailRefs.filter((ref) => {
@@ -309,26 +327,6 @@ function timelineResponseMetadata(response: Record<string, unknown>, visibleEven
   return metadata;
 }
 
-async function authorizeWatchTimelineSession(
-  db: Env['DB'],
-  params: { serverId: string; userId: string; sessionName: string },
-): Promise<{ ok: true } | { ok: false; reason?: string }> {
-  const target = shareTargetFromSessionName(params.serverId, params.sessionName);
-  if (!target) return { ok: false, reason: 'share-target-unavailable' };
-  const access = await resolveHttpShareAccess(db, {
-    serverId: params.serverId,
-    userId: params.userId,
-    target,
-  });
-  if (access.actor.kind === 'server-member') {
-    return await targetExists(db, target)
-      ? { ok: true }
-      : { ok: false };
-  }
-  if (access.actor.kind === 'share') return { ok: true };
-  return { ok: false };
-}
-
 function structuredTimelineCursor(response: Record<string, unknown>): Record<string, unknown> | null {
   return response.nextCursor && typeof response.nextCursor === 'object' && !Array.isArray(response.nextCursor)
     ? response.nextCursor as Record<string, unknown>
@@ -336,10 +334,15 @@ function structuredTimelineCursor(response: Record<string, unknown>): Record<str
 }
 
 
-async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
+async function loadOrderedAndPinnedPrefs(
+  db: Env['DB'],
+  userId: string,
+  orderKey: string,
+  pinnedKey: string,
+): Promise<{ order: string[]; pinnedList: string[]; pinned: Set<string> }> {
   const [rawOrder, rawPinned] = await Promise.all([
-    getUserPref(db, userId, 'tab_order'),
-    getUserPref(db, userId, 'tab_pinned'),
+    getUserPref(db, userId, orderKey),
+    getUserPref(db, userId, pinnedKey),
   ]);
 
   const parseList = (raw: string | null): string[] => {
@@ -359,10 +362,42 @@ async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ orde
     }
   };
 
+  const pinnedList = parseList(rawPinned);
   return {
     order: parseList(rawOrder),
-    pinned: new Set(parseList(rawPinned)),
+    pinnedList,
+    pinned: new Set(pinnedList),
   };
+}
+
+async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
+  const { order, pinned } = await loadOrderedAndPinnedPrefs(db, userId, 'tab_order', 'tab_pinned');
+  return { order, pinned };
+}
+
+function orderWatchServers<T extends { id: string }>(
+  servers: readonly T[],
+  order: readonly string[],
+  pinnedList: readonly string[],
+  pinned: ReadonlySet<string>,
+): T[] {
+  const pinnedIndex = new Map(pinnedList.map((id, idx) => [id, idx]));
+  const orderIndex = new Map(order.map((id, idx) => [id, idx]));
+  const origIndex = new Map(servers.map((srv, idx) => [srv.id, idx]));
+  return [...servers].sort((a, b) => {
+    const aPinned = pinned.has(a.id);
+    const bPinned = pinned.has(b.id);
+    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    if (aPinned && bPinned) {
+      return (pinnedIndex.get(a.id) ?? 0) - (pinnedIndex.get(b.id) ?? 0);
+    }
+    const aOrder = orderIndex.get(a.id);
+    const bOrder = orderIndex.get(b.id);
+    if (aOrder != null && bOrder != null) return aOrder - bOrder;
+    if (aOrder != null) return -1;
+    if (bOrder != null) return 1;
+    return (origIndex.get(a.id) ?? 0) - (origIndex.get(b.id) ?? 0);
+  });
 }
 
 function orderMainSessions<T extends { sessionName: string; isPinned?: boolean | null }>(sessions: T[], order: string[], pinned: Set<string>): T[] {
@@ -382,16 +417,42 @@ function orderMainSessions<T extends { sessionName: string; isPinned?: boolean |
 
 watchRoutes.get('/watch/servers', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const servers = await getServersByUserId(c.env.DB, userId);
+  const [servers, serverPrefs] = await Promise.all([
+    getFullServersByUserId(c.env.DB, userId),
+    loadOrderedAndPinnedPrefs(c.env.DB, userId, 'server_order', 'server_pinned'),
+  ]);
+  const ordered = orderWatchServers(servers, serverPrefs.order, serverPrefs.pinnedList, serverPrefs.pinned);
   const baseUrl = resolveBaseUrl(c.req.url, c.env.SERVER_URL);
   return c.json({
-    servers: servers.map((server) => ({
+    servers: ordered.map((server) => ({
       id: server.id,
       name: server.name,
       baseUrl,
+      isPinned: serverPrefs.pinned.has(server.id),
     })),
   });
 });
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current]!);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
 
 watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -419,12 +480,34 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
       }))
     : null;
 
+  const parseSessionListParam = (paramName: string): string[] => {
+    const rawValues = typeof c.req.queries === 'function'
+      ? (c.req.queries(paramName) ?? [])
+      : (() => {
+          const single = c.req.query(paramName);
+          return single ? [single] : [];
+        })();
+    return rawValues
+      .flatMap((value) => value.split(','))
+      .map((name) => name.trim())
+      .filter(Boolean);
+  };
+  const explicitSessions = new Set<string>([
+    ...parseSessionListParam('includeSessions'),
+    ...parseSessionListParam('sessions'),
+  ]);
+
   const mainSessions = (liveMainSessions ?? dbMainSessions)
     .filter((session) => !session.name.startsWith('deck_sub_'));
+  const fetchAllRecentText = mainSessions.length <= WATCH_SNAPSHOT_AUTO_INCLUDE_MAIN_LIMIT;
+  const isIncludedMainSession = (sessionName: string): boolean =>
+    fetchAllRecentText || tabPrefs.pinned.has(sessionName) || explicitSessions.has(sessionName);
 
   const mainTitleBySession = new Map<string, string>();
-  const mainRows = await Promise.all(mainSessions.map(async (session) => {
-    const recentText = await bridge.getRecentTextForWatch(session.name);
+  const mainRows = await mapWithConcurrency(mainSessions, WATCH_RECENT_TEXT_CONCURRENCY, async (session) => {
+    const recentText = isIncludedMainSession(session.name)
+      ? await bridge.getRecentTextForWatch(session.name)
+      : [];
     const latest = recentText.at(-1);
     const row = {
       serverId,
@@ -442,30 +525,33 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
     };
     mainTitleBySession.set(session.name, row.title);
     return row;
-  }));
+  });
 
   const activeMainNames = new Set(mainRows.map((row) => row.sessionName));
-  const subRows = await Promise.all(subSessions
-    .filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session))
-    .map(async (sub) => {
-      const sessionName = `deck_sub_${sub.id}`;
-      const recentText = await bridge.getRecentTextForWatch(sessionName);
-      const latest = recentText.at(-1);
-      return {
-        serverId,
-        sessionName,
-        title: titleForSubSession(sub),
-        state: normalizeState(sub.closed_at ? 'stopped' : 'running'),
-        agentBadge: badgeForType(sub.type),
-        isSubSession: true,
-        parentTitle: sub.parent_session ? mainTitleBySession.get(sub.parent_session) : undefined,
-        parentSessionName: sub.parent_session ?? undefined,
-        isPinned: false,
-        previewText: latest?.text ?? undefined,
-        previewUpdatedAt: latest?.ts ?? undefined,
-        recentText,
-      };
-    }));
+  const activeSubs = subSessions.filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session));
+  const subRows = await mapWithConcurrency(activeSubs, WATCH_RECENT_TEXT_CONCURRENCY, async (sub) => {
+    const sessionName = `deck_sub_${sub.id}`;
+    const shouldFetchRecentText = (sub.parent_session ? isIncludedMainSession(sub.parent_session) : false)
+      || explicitSessions.has(sessionName);
+    const recentText = shouldFetchRecentText
+      ? await bridge.getRecentTextForWatch(sessionName)
+      : [];
+    const latest = recentText.at(-1);
+    return {
+      serverId,
+      sessionName,
+      title: titleForSubSession(sub),
+      state: normalizeState(sub.closed_at ? 'stopped' : 'running'),
+      agentBadge: badgeForType(sub.type),
+      isSubSession: true,
+      parentTitle: sub.parent_session ? mainTitleBySession.get(sub.parent_session) : undefined,
+      parentSessionName: sub.parent_session ?? undefined,
+      isPinned: false,
+      previewText: latest?.text ?? undefined,
+      previewUpdatedAt: latest?.ts ?? undefined,
+      recentText,
+    };
+  });
 
   const orderedMainRows = orderMainSessions(mainRows, tabPrefs.order, tabPrefs.pinned);
   const sessions = [...orderedMainRows, ...subRows];
@@ -478,7 +564,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
@@ -500,7 +586,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     c.header(IMCODES_POD_HEADER, getPodIdentity());
 
     const events = (Array.isArray(response.events) ? response.events : [])
-      .map((event) => sanitizeWatchTimelineEvent(event))
+      .map((event) => sanitizeWatchTimelineEvent(redactTimelineEventForCaller(event, authorization.actorRole)))
       .filter((event): event is NonNullable<typeof event> => event !== null);
     const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
       ? events[0].ts
@@ -556,11 +642,13 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? clampTimelineHistoryLimit(rawLimit, 50)
+    : 50;
   const rawBeforeTs = c.req.query('beforeTs');
   const beforeTs = rawBeforeTs !== undefined ? Number(rawBeforeTs) : undefined;
   const rawAfterTs = c.req.query('afterTs');
@@ -587,19 +675,27 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     const rawEvents = Array.isArray(response.events) ? response.events : [];
     // Only filter out obviously malformed records (missing eventId/ts/type).
     // Preserve every other field so the web merge path gets the full shape.
-    const events = rawEvents.filter((event): event is Record<string, unknown> => {
+    const filteredEvents = rawEvents.filter((event): event is Record<string, unknown> => {
       if (!event || typeof event !== 'object') return false;
       const e = event as Record<string, unknown>;
       return typeof e.eventId === 'string'
         && typeof e.sessionId === 'string'
         && typeof e.ts === 'number'
         && typeof e.type === 'string';
-    });
+    }).map((event) => redactTimelineEventForCaller(event, authorization.actorRole) as Record<string, unknown>);
+    // The daemon normally enforces this too, but keep the HTTP boundary safe
+    // for older daemons and protocol-faithful test daemons that may return an
+    // expanded content-aware page. Retain the newest tail and expose a cursor
+    // so callers can request the omitted older portion explicitly.
+    const events = filteredEvents.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS
+      ? filteredEvents.slice(-TIMELINE_HISTORY_LIMITS.MAX_EVENTS)
+      : filteredEvents;
+    const pageTrimmed = filteredEvents.length > events.length;
     const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
       ? events[0].ts as number
       : null;
-    const hasMore = earliestTs !== null && events.length >= limit;
-    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const hasMore = pageTrimmed || (earliestTs !== null && events.length >= limit);
+    const responseHasMore = pageTrimmed || (typeof response.hasMore === 'boolean' ? response.hasMore : hasMore);
     const nextCursor = structuredTimelineCursor(response);
 
     const totalMs = Date.now() - tStart;
@@ -637,7 +733,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   try {

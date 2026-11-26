@@ -1,0 +1,1438 @@
+// Per-OS boot-level autostart for the controlled node (tasks 4.1-4.3), with a
+// service identity DELIBERATELY DISTINCT from the full daemon (4.4) so both can
+// coexist on one machine. Autostart is BOOT-scoped (runs with no interactive
+// login) so the node is controllable after an unattended reboot:
+//   Windows: scheduled task, ONSTART, RU SYSTEM, RL HIGHEST
+//   macOS:   LaunchDaemon (/Library/LaunchDaemons, root) — NOT a user LaunchAgent
+//   Linux:   systemd SYSTEM unit (/etc/systemd/system) — NOT `--user`
+//
+// The pure artifact generators are unit-tested; the actual install (which needs
+// elevation + the real OS) runs from the install journal on first run.
+import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, win32 } from 'node:path';
+import type { ServiceReceipt } from './install-journal.js';
+import {
+  CONTROLLED_NODE_SERVICE,
+  CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER,
+  CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
+  CONTROLLED_NODE_LINUX_WATCHDOG_SEC,
+  CONTROLLED_NODE_LIVENESS_LEASE_FILE,
+} from '../../shared/controlled-node-service.js';
+import {
+  CONTROLLED_NODE_HEALTH_LEASE_FILE,
+  CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE,
+} from './health-lease.js';
+
+/** Controlled-node service identities — distinct from the full daemon's. */
+export { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
+
+export const MACOS_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}.plist`;
+export const MACOS_WATCHDOG_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`;
+export const LINUX_UNIT_PATH = `/etc/systemd/system/${CONTROLLED_NODE_SERVICE.LINUX_UNIT}`;
+
+export interface PrivilegeCheckOptions {
+  platform?: NodeJS.Platform;
+  getUid?: () => number;
+  runCommand?: (file: string, args: readonly string[]) => string | Buffer;
+}
+
+export interface ServiceInstallOptions {
+  platform?: NodeJS.Platform;
+  runCommand?: (file: string, args: readonly string[]) => unknown;
+  macosPlistPath?: string;
+  macosWatchdogPlistPath?: string;
+  linuxUnitPath?: string;
+  /** Test seam for the Windows watchdog trigger's local start boundary. */
+  now?: () => Date;
+  /** Test seam for the protected persistent watchdog script. */
+  writeWindowsWatchdogScript?: (path: string, content: string) => Promise<void>;
+  /** Test seam for side-effect-free watchdog script integrity inspection. */
+  readWindowsWatchdogScript?: (path: string) => Promise<string>;
+}
+
+const WINDOWS_ADMIN_CHECK = [
+  '-NoProfile',
+  '-NonInteractive',
+  '-Command',
+  '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+] as const;
+
+/** Testable current-process privilege probe; it never attempts a UAC relaunch. */
+export function isProcessElevated(options: PrivilegeCheckOptions = {}): boolean {
+  const platform = options.platform ?? process.platform;
+  if (platform === 'darwin' || platform === 'linux') {
+    const getUid = options.getUid
+      ?? (typeof process.getuid === 'function' ? () => process.getuid!() : undefined);
+    return getUid?.() === 0;
+  }
+  if (platform === 'win32') {
+    const runCommand = options.runCommand ?? ((file: string, args: readonly string[]) => (
+      execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    ));
+    // Absolute path, not a bare name: a downloaded installer can be started
+    // from Explorer with a PATH that does not contain System32, and resolving
+    // `powershell.exe` through PATH would then throw ENOENT. The catch below
+    // reports "not elevated", so a PATH problem would masquerade as the user
+    // having failed to run as administrator — the single most misleading
+    // outcome this check can produce.
+    const candidates = [windowsPowerShellExecutablePath(), 'powershell.exe'];
+    let lastError: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        return String(runCommand(candidate, WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    // Every probe failed to *run*, which is not evidence about privilege. Say
+    // so, rather than silently denying an administrator.
+    throw new Error(
+      'unable to determine Windows privilege level: PowerShell could not be executed '
+      + `(${lastError instanceof Error ? lastError.message : String(lastError)})`,
+    );
+  }
+  return false;
+}
+
+/** Fail before protected writes when the user did not run as Administrator/root. */
+export function assertProcessElevated(options: PrivilegeCheckOptions = {}): void {
+  if (!isProcessElevated(options)) {
+    throw new Error('controlled node installation requires Administrator/root; rerun this executable with elevated privileges');
+  }
+}
+
+function escapeXmlText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
+const WINDOWS_WATCHDOG_SCRIPT_NAME = 'imcodes-node-health-watchdog.ps1';
+const WINDOWS_HEALTH_LEASE_NAME = 'health-lease.json';
+const WINDOWS_HEALTH_STALE_SECONDS = 180;
+export const WINDOWS_UPGRADE_MARKER_NAME = CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE;
+const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
+
+function windowsSystemRoot(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  return env.SystemRoot?.trim() || env.WINDIR?.trim() || 'C:\\Windows';
+}
+
+export function windowsPowerShellExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  const windowsDirectory = windowsSystemRoot(env);
+  return win32.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+/**
+ * Resolve Task Scheduler from the trusted Windows system directory.
+ *
+ * The controlled-node executable is commonly launched by a downloaded
+ * PowerShell bootstrap whose PATH is not guaranteed to contain System32. A
+ * bare `schtasks` therefore fails during process creation (for example with
+ * spawnSync EPERM/ENOENT) before Task Scheduler can report a useful error.
+ */
+export function windowsSchtasksExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  return win32.join(windowsSystemRoot(env), 'System32', 'schtasks.exe');
+}
+
+function windowsWatchdogStartBoundary(now: Date): string {
+  const start = new Date(now.getTime());
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() + 1);
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`
+    + `T${pad(start.getHours())}:${pad(start.getMinutes())}:00`;
+}
+
+/**
+ * Task Scheduler artifact for boot-time SYSTEM autostart and process-exit
+ * recovery. Application health is supervised by a separate task below: the
+ * main task cannot distinguish an authenticated node from a live-but-detached
+ * process when MultipleInstancesPolicy is IgnoreNew.
+ */
+export function windowsScheduledTaskXml(exePath: string, now: Date = new Date()): string {
+  void now;
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>IM.codes controlled node</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="System">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval>
+      <Count>255</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="System">
+    <Exec>
+      <Command>${escapeXmlText(exePath)}</Command>
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
+function powershellSingleQuoted(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+export function windowsControlledNodeHealthPaths(exePath: string): {
+  scriptPath: string;
+  leasePath: string;
+  livenessPath: string;
+  statePath: string;
+  logPath: string;
+  upgradeMarkerPath: string;
+  keepDisabledMarkerPath: string;
+} {
+  const baseDir = win32.dirname(exePath);
+  return {
+    scriptPath: win32.join(baseDir, WINDOWS_WATCHDOG_SCRIPT_NAME),
+    leasePath: win32.join(baseDir, WINDOWS_HEALTH_LEASE_NAME),
+    livenessPath: win32.join(baseDir, CONTROLLED_NODE_LIVENESS_LEASE_FILE),
+    statePath: win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE),
+    logPath: win32.join(baseDir, 'health-watchdog.log'),
+    upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
+    keepDisabledMarkerPath: win32.join(baseDir, CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER),
+  };
+}
+
+/**
+ * External application-health supervisor for Windows controlled nodes.
+ *
+ * Task Scheduler's RestartOnFailure and IgnoreNew policy only prove that an
+ * EXE process exists. They cannot detect the observed failure mode where the
+ * process remains alive after its authenticated control channel has wedged.
+ * The runtime therefore publishes a PID-bound liveness lease while its
+ * connection machinery works (an acknowledgement, or a connection attempt /
+ * failure / retry -- an unreachable server is not a wedged node); this script
+ * restarts the node when that lease (or, for a node that predates it, the
+ * authenticated health lease) is absent or stale for three minutes.
+ */
+export function windowsControlledNodeHealthWatchdogScript(exePath: string): string {
+  const paths = windowsControlledNodeHealthPaths(exePath);
+  return `$ErrorActionPreference = 'Stop'\r\n`
+    + `$nodePath = ${powershellSingleQuoted(exePath)}\r\n`
+    + `$nodeTask = ${powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
+    + `$leasePath = ${powershellSingleQuoted(paths.leasePath)}\r\n`
+    + `$livenessPath = ${powershellSingleQuoted(paths.livenessPath)}\r\n`
+    + `$statePath = ${powershellSingleQuoted(paths.statePath)}\r\n`
+    + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
+    + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
+    + `$keepDisabledMarkerPath = ${powershellSingleQuoted(paths.keepDisabledMarkerPath)}\r\n`
+    + `$upgradeMarkerMaxAgeMs = ${WINDOWS_UPGRADE_MARKER_MAX_AGE_MS}\r\n`
+    + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
+    + `$minimumConfirmMs = 45000\r\n`
+    + `$resumeGapMs = 120000\r\n`
+    + `$reenableDisabledTask = ${CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK ? '$true' : '$false'}\r\n`
+    + `function Write-HealthLog([string]$message) {\r\n`
+    + `  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) { Move-Item -Force -LiteralPath $logPath -Destination ($logPath + '.1') }\r\n`
+    + `  Add-Content -LiteralPath $logPath -Encoding UTF8 -Value (('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message))\r\n`
+    + `}\r\n`
+    + `function Write-WatchdogState([string]$reason, [int]$processId, [int64]$observedAt) {\r\n`
+    + `  $stateTempPath = $statePath + '.' + $PID + '.tmp'\r\n`
+    + `  @{ version = 1; reason = $reason; pid = $processId; observedAt = $observedAt } | ConvertTo-Json -Compress | Set-Content -LiteralPath $stateTempPath -Encoding UTF8\r\n`
+    + `  Move-Item -Force -LiteralPath $stateTempPath -Destination $statePath\r\n`
+    + `}\r\n`
+    + `$nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
+    + `$previousState = $null\r\n`
+    + `if (Test-Path -LiteralPath $statePath) { try { $previousState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } catch { Remove-Item -Force -LiteralPath $statePath -ErrorAction SilentlyContinue } }\r\n`
+    + `$process = Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $nodePath -and $_.CommandLine -notmatch '--computer-use-helper' } | Select-Object -First 1\r\n`
+    + `if (Test-Path -LiteralPath $upgradeMarkerPath) {\r\n`
+    + `  try {\r\n`
+    + `    $upgradeMarker = Get-Content -LiteralPath $upgradeMarkerPath -Raw | ConvertFrom-Json\r\n`
+    + `    $upgradeAgeMs = $nowMs - [int64]$upgradeMarker.startedAt\r\n`
+    + `    if ([int]$upgradeMarker.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$upgradeMarker.product -ceq ${powershellSingleQuoted(CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT)} -and [string]$upgradeMarker.taskName -clike ${powershellSingleQuoted(`${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`)}) {\r\n`
+    + `      $upgradeTask = Get-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue\r\n`
+    + `      if ($upgradeTask) {\r\n`
+    + `        if ([int]$upgradeTask.State -notin @(2,4)) { Start-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue; Write-HealthLog ('upgrade_recovery_requested task={0}' -f [string]$upgradeMarker.taskName) }\r\n`
+    + `        exit 0\r\n`
+    + `      }\r\n`
+    + `    }\r\n`
+    + `    if ([int]$upgradeMarker.version -eq 1 -and $upgradeAgeMs -ge -60000 -and $upgradeAgeMs -le $upgradeMarkerMaxAgeMs) { exit 0 }\r\n`
+    + `  } catch { }\r\n`
+    + `  Remove-Item -Force -LiteralPath $upgradeMarkerPath -ErrorAction SilentlyContinue\r\n`
+    + `}\r\n`
+    + `$healthy = $false\r\n`
+    + `$reason = 'process_missing'\r\n`
+    + `if ($process) {\r\n`
+    + `  $reason = 'lease_missing'\r\n`
+    + `  $reasonFromLease = $false\r\n`
+    // The liveness lease (renewed while the node's connection machinery works, reachable server or not) first, then the
+    // authenticated health lease a node that predates it writes. Either fresh and bound to this process is healthy.
+    + `  foreach ($candidatePath in @($livenessPath, $leasePath)) {\r\n`
+    + `    if (-not (Test-Path -LiteralPath $candidatePath)) { continue }\r\n`
+    + `    $candidateReason = 'lease_invalid'\r\n`
+    + `    try {\r\n`
+    + `      $lease = Get-Content -LiteralPath $candidatePath -Raw | ConvertFrom-Json\r\n`
+    + `      $ageMs = $nowMs - [int64]$lease.updatedAt\r\n`
+    + `      if ([int]$lease.version -ne 1) { $candidateReason = 'lease_invalid' } elseif ([int]$lease.pid -ne [int]$process.ProcessId) { $candidateReason = 'lease_pid_mismatch' } elseif ($ageMs -lt -60000) { $candidateReason = 'lease_future' } elseif ($ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $candidateReason = 'lease_stale' }\r\n`
+    + `    } catch { $candidateReason = 'lease_invalid' }\r\n`
+    + `    if ($healthy) { break }\r\n`
+    + `    if (-not $reasonFromLease) { $reason = $candidateReason; $reasonFromLease = $true }\r\n`
+    + `  }\r\n`
+    + `  if (-not $healthy) {\r\n`
+    + `    $processAgeSeconds = ((Get-Date) - $process.CreationDate).TotalSeconds\r\n`
+    + `    if ($processAgeSeconds -lt $staleSeconds) { Write-WatchdogState 'process_start_grace' ([int]$process.ProcessId) $nowMs; exit 0 }\r\n`
+    + `  }\r\n`
+    + `}\r\n`
+    + `$previousValid = $previousState -and [int]$previousState.version -eq 1 -and $null -ne $previousState.observedAt\r\n`
+    + `$observationGapMs = $(if ($previousValid) { $nowMs - [int64]$previousState.observedAt } else { 0 })\r\n`
+    + `$clockDiscontinuity = $previousValid -and ($observationGapMs -lt -60000 -or $observationGapMs -gt $resumeGapMs)\r\n`
+    + `if ($clockDiscontinuity) { Write-HealthLog ('resume_or_clock_change gap_ms={0}' -f $observationGapMs) }\r\n`
+    + `if ($healthy) { Write-WatchdogState 'healthy' ([int]$process.ProcessId) $nowMs; exit 0 }\r\n`
+    + `if ($process) {\r\n`
+    + `  $sameFailureObservedLongEnough = $previousValid -and -not $clockDiscontinuity -and [string]$previousState.reason -eq $reason -and [int]$previousState.pid -eq [int]$process.ProcessId -and $observationGapMs -ge $minimumConfirmMs\r\n`
+    + `  if (-not $sameFailureObservedLongEnough) {\r\n`
+    + `    Write-WatchdogState $reason ([int]$process.ProcessId) $nowMs\r\n`
+    + `    Write-HealthLog ('grace_begin reason={0} pid={1}' -f $reason, $process.ProcessId)\r\n`
+    + `    exit 0\r\n`
+    + `  }\r\n`
+    + `}\r\n`
+    // A restart that cannot work must not be attempted every two minutes forever:
+    // a node task that something outside the product disabled (or removed) used to
+    // fail `Start-ScheduledTask` silently each time, filling the log with
+    // restart_begin lines while the node stayed offline for hours.
+    + `$nodeTaskInfo = Get-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
+    + `$taskBlock = $null\r\n`
+    + `if (-not $nodeTaskInfo) { $taskBlock = 'task_missing' } elseif ([int]$nodeTaskInfo.State -eq 1 -or $nodeTaskInfo.Settings.Enabled -eq $false) { $taskBlock = 'task_disabled' }\r\n`
+    // The owner's explicit opt-out wins over the default re-enable: say so once and leave the task alone.
+    + `if ($taskBlock -eq 'task_disabled' -and (Test-Path -LiteralPath $keepDisabledMarkerPath)) {\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq 'task_disabled_kept')) { Write-HealthLog 'task_disabled_kept' }\r\n`
+    + `  Write-WatchdogState 'task_disabled_kept' 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
+    + `if ($taskBlock -eq 'task_disabled' -and $reenableDisabledTask) {\r\n`
+    + `  try { Enable-ScheduledTask -TaskName $nodeTask -ErrorAction Stop | Out-Null; Write-HealthLog 'task_disabled_reenabled'; $taskBlock = $null } catch { $enableFailure = [string]$_.Exception.Message; if ($enableFailure.Length -gt 200) { $enableFailure = $enableFailure.Substring(0, 200) }; if (-not ($previousValid -and [string]$previousState.reason -ceq 'task_disabled')) { Write-HealthLog ('task_enable_failed {0}' -f $enableFailure) } }\r\n`
+    + `}\r\n`
+    + `if ($taskBlock) {\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq $taskBlock)) { Write-HealthLog ('restart_blocked reason={0}' -f $taskBlock) }\r\n`
+    + `  Write-WatchdogState $taskBlock 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
+    + `Write-HealthLog ('restart_begin reason={0} pid={1}' -f $reason, $(if ($process) { $process.ProcessId } else { 0 }))\r\n`
+    + `Stop-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
+    + `if ($process) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
+    + `Start-Sleep -Seconds 2\r\n`
+    + `try { Start-ScheduledTask -TaskName $nodeTask -ErrorAction Stop } catch {\r\n`
+    + `  $startFailure = [string]$_.Exception.Message\r\n`
+    + `  if ($startFailure.Length -gt 200) { $startFailure = $startFailure.Substring(0, 200) }\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq 'start_failed')) { Write-HealthLog ('restart_failed {0}' -f $startFailure) }\r\n`
+    + `  Write-WatchdogState 'start_failed' 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
+    + `Remove-Item -Force -LiteralPath $statePath -ErrorAction SilentlyContinue\r\n`
+    + `Write-HealthLog 'restart_requested'\r\n`;
+}
+
+export function windowsControlledNodeHealthWatchdogTaskXml(scriptPath: string, now: Date = new Date()): string {
+  const startBoundary = windowsWatchdogStartBoundary(now);
+  const argumentsText = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+  const powershellPath = windowsPowerShellExecutablePath();
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>IM.codes controlled node authenticated-health watchdog</Description></RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>${startBoundary}</StartBoundary>
+      <Repetition><Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval></Repetition>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="System"><Exec><Command>${escapeXmlText(powershellPath)}</Command><Arguments>${escapeXmlText(argumentsText)}</Arguments></Exec></Actions>
+</Task>
+`;
+}
+
+export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
+  // Task Scheduler's COM XML loader expects the declared UTF-16 encoding to
+  // match a BOM-prefixed UTF-16LE file. UTF-8 without a BOM is rejected on
+  // Windows PowerShell 5-era hosts with "cannot switch encoding".
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, 'utf16le')]);
+}
+
+/** Windows `schtasks /Create` args for an XML task definition. */
+export function windowsScheduledTaskArgs(taskXmlPath: string): string[] {
+  return [
+    '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+    '/XML', taskXmlPath, '/F',
+  ];
+}
+
+export function windowsHealthWatchdogTaskArgs(taskXmlPath: string): string[] {
+  return [
+    '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK,
+    '/XML', taskXmlPath, '/F',
+  ];
+}
+
+export function windowsStaleUpgradeTaskCleanupArgs(): string[] {
+  const pattern = `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`;
+  const prefix = CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX;
+  // The legacy-rescue infrastructure (rescue/restart tasks, registered and
+  // lifecycle-managed separately by windows-controlled-node-upgrade-rescue.ts)
+  // shares this same name prefix with the one-shot per-attempt upgrader tasks
+  // this sweep exists to clean up. Both are legitimately idle (no NextRunTime)
+  // between triggers, so without this exclusion a reinstall/upgrade deletes the
+  // rescue infrastructure itself, permanently breaking legacy restart recovery.
+  const preservedNames = [
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK,
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK,
+  ].map((name) => `'${name}'`).join(', ');
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `$ErrorActionPreference = 'Stop'; $now = Get-Date; $preserved = @(${preservedNames}); Get-ScheduledTask -TaskName '${pattern}' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) -and [int]$_.State -notin @(2,4) -and $preserved -notcontains $_.TaskName } | ForEach-Object { $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -ErrorAction Stop; if (-not $info.NextRunTime -or $info.NextRunTime -le $now) { Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction Stop } }`,
+  ];
+}
+
+export function windowsStopControlledNodeGenerationArgs(exePath: string): string[] {
+  const nodePath = powershellSingleQuoted(exePath);
+  const taskName = powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK);
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `$ErrorActionPreference = 'Stop'; $nodePath = ${nodePath}; Stop-ScheduledTask -TaskName ${taskName} -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "Name='imcodes-node.exe'" -ErrorAction Stop | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; for ($attempt = 0; $attempt -lt 20; $attempt++) { $remaining = @(Get-CimInstance Win32_Process -Filter "Name='imcodes-node.exe'" -ErrorAction Stop | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' }); if ($remaining.Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 }; throw 'controlled node previous generation did not stop'`,
+  ];
+}
+
+/**
+ * Default protected credential directory on Windows (SYSTEM-scoped service ⇒
+ * `%ProgramData%`, not a per-user path). Falls back to the conventional path when
+ * `ProgramData` is unset. Mirrors the POSIX `0700` credential dir on macOS/Linux.
+ */
+export function windowsCredentialDir(env: NodeJS.ProcessEnv = process.env): string {
+  const base = env.ProgramData && env.ProgramData.trim() ? env.ProgramData : 'C:\\ProgramData';
+  return `${base}\\imcodes-node`;
+}
+
+/**
+ * `icacls` args to lock the credential directory to SYSTEM + Administrators only
+ * (the Windows equivalent of POSIX dir `0700`, 10.10). Removes inherited ACEs
+ * (`/inheritance:r`) so no interactive/other user retains access, then grants
+ * SYSTEM and Administrators full control with object+container inheritance so the
+ * credential file underneath is covered. The actual `icacls` invocation is
+ * applied at install time (E2E on real Windows); this builder is unit-tested.
+ */
+const WINDOWS_SYSTEM_SID = '*S-1-5-18';
+const WINDOWS_ADMINISTRATORS_SID = '*S-1-5-32-544';
+const WINDOWS_AUTHENTICATED_USERS_SID = '*S-1-5-11';
+
+export type WindowsAclCommand = readonly [path: string, ...args: string[]];
+
+/**
+ * `icacls /setowner` is a separate command form and cannot be combined with
+ * `/grant` or `/inheritance`. Grant the durable principals first so the
+ * elevated installer never removes its own access between ACL operations,
+ * then strip inherited ACEs and transfer ownership to SYSTEM.
+ *
+ * Numeric well-known SIDs keep this locale-independent on non-English Windows.
+ */
+export function windowsCredentialAclCommands(dir: string): WindowsAclCommand[] {
+  return [
+    [dir, '/reset'],
+    [dir, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
+    [dir, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
+    [dir, '/inheritance:r'],
+    [dir, '/setowner', WINDOWS_SYSTEM_SID],
+  ];
+}
+
+/** Explicit protected DACL for each persisted secret file (no inheritance). */
+export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] {
+  return [
+    [path, '/reset'],
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID],
+  ];
+}
+
+/**
+ * The staged executable lives beside SYSTEM-only credentials, but Windows
+ * Computer Use launches a helper copy of this executable under the active
+ * interactive user token. Keep secrets sealed while allowing authenticated
+ * local users to read/execute only the binary.
+ */
+export function windowsExecutableFileAclCommands(path: string): WindowsAclCommand[] {
+  return [
+    [path, '/reset'],
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:RX`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID],
+  ];
+}
+
+export function windowsComputerUseHelperAclCommands(path: string): WindowsAclCommand[] {
+  return [
+    // Protect only the helper root. Its children must keep inheriting these
+    // explicit root ACEs; recursively stripping inheritance would leave the
+    // helper files unreadable even to the intended interactive controller.
+    [path, '/reset'],
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID, '/T'],
+  ];
+}
+
+export function applyWindowsAclCommands(
+  commands: readonly WindowsAclCommand[],
+  runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
+    execFileSync(file, args, { stdio: 'ignore' });
+  },
+): void {
+  for (const args of commands) runCommand('icacls', args);
+}
+
+/** macOS LaunchDaemon plist (boot-scoped, root, keep-alive). */
+export function macosLaunchDaemonPlist(exePath: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CONTROLLED_NODE_SERVICE.MACOS_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${escapeXmlText(exePath)}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node.out.log</string>
+</dict>
+</plist>
+`;
+}
+
+/**
+ * Periodic application-health supervisor. launchd's KeepAlive only detects a
+ * dead process; this companion checks the authenticated heartbeat lease and
+ * kickstarts the main daemon when its live process has lost server control.
+ */
+export function macosHealthWatchdogLaunchDaemonPlist(exePath: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${escapeXmlText(exePath)}</string>
+    <string>--health-watchdog</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node-watchdog.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node-watchdog.out.log</string>
+</dict>
+</plist>
+`;
+}
+
+/** Linux systemd SYSTEM unit (boot-scoped, restart-on-failure with backoff). */
+export function linuxSystemdUnit(exePath: string): string {
+  return `[Unit]
+Description=IM.codes controlled node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${exePath}
+NotifyAccess=all
+WatchdogSec=${CONTROLLED_NODE_LINUX_WATCHDOG_SEC}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`;
+}
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+async function fsyncParentDir(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const fh = await open(dirname(path), 'r');
+  try {
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+async function writeDurableTextFile(path: string, content: string, mode: number): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let fh: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    fh = await open(temp, 'wx', mode);
+    await fh.writeFile(content, 'utf8');
+    await fh.sync();
+    await fh.close();
+    fh = null;
+    if (process.platform !== 'win32') await chmod(temp, mode);
+    await rename(temp, path);
+    await fsyncParentDir(path);
+  } catch (error) {
+    await fh?.close().catch(() => {});
+    await unlink(temp).catch(() => {});
+    throw error;
+  }
+}
+
+function runCommandFromOptions(options: ServiceInstallOptions): (file: string, args: readonly string[]) => unknown {
+  return options.runCommand ?? ((file: string, args: readonly string[]) => (
+    execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  ));
+}
+
+async function installWindowsTaskDefinition(
+  exePath: string,
+  runCommand: (file: string, args: readonly string[]) => unknown,
+  now: Date,
+  writeWatchdogScript: (path: string, content: string) => Promise<void>,
+): Promise<ServiceReceipt> {
+  const xml = windowsScheduledTaskXml(exePath, now);
+  const healthPaths = windowsControlledNodeHealthPaths(exePath);
+  const watchdogScript = windowsControlledNodeHealthWatchdogScript(exePath);
+  const watchdogXml = windowsControlledNodeHealthWatchdogTaskXml(healthPaths.scriptPath, now);
+  const artifactDir = await mkdtemp(join(tmpdir(), 'imcodes-node-task-'));
+  const artifactPath = join(artifactDir, 'task.xml');
+  const watchdogArtifactPath = join(artifactDir, 'watchdog-task.xml');
+  try {
+    // A crashed/self-terminated one-shot upgrader can remain registered with a
+    // terminal LastTaskResult forever. Reinstallation is an explicit recovery
+    // boundary: stop and remove every product-owned helper before publishing
+    // the new main/watchdog definitions so none can later replay stale bytes.
+    runCommand(windowsPowerShellExecutablePath(), windowsStaleUpgradeTaskCleanupArgs());
+    await writeWatchdogScript(healthPaths.scriptPath, watchdogScript);
+    // An in-place reinstall is a new watchdog generation. Never let a stale
+    // pre-install failure observation authorize killing the fresh process.
+    await rm(healthPaths.statePath, { force: true });
+    await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
+    await writeFile(watchdogArtifactPath, encodeWindowsScheduledTaskXml(watchdogXml), { mode: 0o600 });
+    const schtasksPath = windowsSchtasksExecutablePath();
+    runCommand(schtasksPath, windowsScheduledTaskArgs(artifactPath));
+    runCommand(schtasksPath, windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+  return {
+    name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+    platform: 'win32',
+    definitionSha256: sha256Text(xml),
+    action: exePath,
+  };
+}
+
+/**
+ * Structured result of a side-effect-free service inspection. Returned by
+ * `inspectServiceState` for the stable runtime's `markServiceHealthy` gate
+ * AND for source-path repair decisions. The inspection MUST NOT mutate
+ * service-manager state (no enable/start/bootout) — only READ operations
+ * (`schtasks /Query`, `launchctl print`, `systemctl is-enabled/show/cat`)
+ * are permitted.
+ */
+export interface ServiceInspection {
+  installed: boolean;
+  /** Action value parsed from the on-disk service definition, when available. */
+  action: string | null;
+  /**
+   * Action the service MANAGER currently reports as loaded — parsed from live
+   * manager state (`launchctl print` program/arguments, systemd `ExecStart`,
+   * `schtasks /XML` Command), NOT the on-disk definition. A manager that never
+   * reloaded after a definition rewrite keeps the OLD action here even once
+   * `action` (disk) already shows the new one; that divergence is the signal a
+   * bare disk-hash check misses.
+   */
+  effectiveAction: string | null;
+  /** True iff the manager's `effectiveAction` matches the receipt's pinned action. */
+  loadedActionMatches: boolean;
+  /** True iff the service manager currently has this service loaded. */
+  loaded: boolean;
+  /** True iff the service is enabled to start at boot. */
+  bootEnabled: boolean;
+  /** Principal/user the manager runs the service as (root / SYSTEM SID / User=), when parseable. */
+  principal: string | null;
+  /** Restart / keep-alive policy the manager reports (on-failure / keepalive / RestartOnFailure), when parseable. */
+  restartPolicy: string | null;
+  /** Definition hash as observed on disk. Compared with the receipt's pinned hash. */
+  observedDefinitionSha256: string | null;
+  /** True iff the observed on-disk definition hash + action match the receipt's pinned values. */
+  definitionMatches: boolean;
+  /** OS-specific effective run state. */
+  runState: 'running' | 'stopped' | 'unknown';
+  /** Errors collected during inspection; not all must fail the verdict. */
+  errors: string[];
+  /** Raw inspection output retained for audit. */
+  raw: string;
+}
+
+interface DefinitionInspection {
+  present: boolean;
+  action: string | null;
+  sha256: string | null;
+  content: string | null;
+  matches: boolean;
+  errors: string[];
+}
+
+function decodeXmlText(value: string): string {
+  return value
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'");
+}
+
+async function inspectDefinitionFile(receipt: ServiceReceipt): Promise<DefinitionInspection> {
+  const errors: string[] = [];
+  if (!receipt.definitionPath || !receipt.definitionSha256) {
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_receipt_incomplete'] };
+  }
+  try {
+    const st = await lstat(receipt.definitionPath);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_not_regular'] };
+    }
+    const content = await readFile(receipt.definitionPath, 'utf8');
+    const sha256 = sha256Text(content);
+    let action: string | null = null;
+    if (receipt.platform === 'darwin') {
+      const match = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/i.exec(content);
+      action = match ? decodeXmlText(match[1]) : null;
+    } else if (receipt.platform === 'linux') {
+      const match = /^ExecStart=(.+)$/m.exec(content);
+      action = match?.[1]?.trim() ?? null;
+    }
+    return {
+      present: true,
+      action,
+      sha256,
+      content,
+      matches: sha256 === receipt.definitionSha256 && action === (receipt.action ?? null),
+      errors,
+    };
+  } catch (error) {
+    errors.push(`definition_read_failed:${(error as Error).message}`);
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors };
+  }
+}
+
+interface WindowsTaskInspection {
+  action: string | null;
+  matches: boolean;
+  bootEnabled: boolean;
+  principal: string | null;
+  restartPolicy: string | null;
+}
+
+/**
+ * Parse the authoritative task registration from `schtasks /Query /XML` — this
+ * is the manager's live view of the task store, not a file on disk. Extracts the
+ * loaded Command (effective action) plus boot-enablement, principal, and restart
+ * policy so the inspection can report the manager's real posture.
+ */
+function inspectWindowsTaskXml(xml: string, expectedAction: string | undefined): WindowsTaskInspection {
+  const commandMatch = /<Command>([^<]*)<\/Command>/i.exec(xml);
+  const action = commandMatch ? decodeXmlText(commandMatch[1].trim()) : null;
+  // Task Scheduler normalizes default-true settings away and exports an
+  // enabled boot trigger as `<BootTrigger />`. Treat an explicit false as the
+  // only disabled form instead of requiring tags the manager removes.
+  const bootBlock = /<BootTrigger\b[^>]*(?:\/>|>[\s\S]*?<\/BootTrigger>)/i.exec(xml)?.[0] ?? '';
+  const settingsBlock = /<Settings\b[^>]*>[\s\S]*?<\/Settings>/i.exec(xml)?.[0] ?? '';
+  const bootTrigger = bootBlock.length > 0 && !/<Enabled>\s*false\s*<\/Enabled>/i.test(bootBlock);
+  const settingsEnabled = settingsBlock.length > 0 && !/<Enabled>\s*false\s*<\/Enabled>/i.test(settingsBlock);
+  const systemPrincipal = /<UserId>\s*S-1-5-18\s*<\/UserId>/i.test(xml);
+  const highRunLevel = /<RunLevel>\s*HighestAvailable\s*<\/RunLevel>/i.test(xml);
+  const restartBlock = /<RestartOnFailure\b[^>]*>[\s\S]*?<\/RestartOnFailure>/i.exec(xml)?.[0] ?? '';
+  const restartOnFailure = /<Interval>\s*PT1M\s*<\/Interval>/i.test(restartBlock)
+    && /<Count>\s*255\s*<\/Count>/i.test(restartBlock);
+  const hasLegacyProcessOnlyWatchdog = /<TimeTrigger\b/i.test(xml);
+  const ignoresConcurrentTicks = /<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/i.test(settingsBlock);
+  const userIdMatch = /<UserId>\s*([^<]+?)\s*<\/UserId>/i.exec(xml);
+  return {
+    action,
+    matches: systemPrincipal && highRunLevel && settingsEnabled && restartOnFailure
+      && bootTrigger && !hasLegacyProcessOnlyWatchdog && ignoresConcurrentTicks
+      && action !== null && action === expectedAction,
+    bootEnabled: bootTrigger && settingsEnabled,
+    principal: userIdMatch ? userIdMatch[1].trim() : null,
+    restartPolicy: restartOnFailure ? 'on-failure' : null,
+  };
+}
+
+function inspectWindowsHealthWatchdogTaskXml(xml: string, expectedScriptPath: string): boolean {
+  const command = decodeXmlText(/<Command>([^<]*)<\/Command>/i.exec(xml)?.[1]?.trim() ?? '');
+  const args = decodeXmlText(/<Arguments>([^<]*)<\/Arguments>/i.exec(xml)?.[1]?.trim() ?? '');
+  const trigger = /<TimeTrigger\b[^>]*>[\s\S]*?<\/TimeTrigger>/i.exec(xml)?.[0] ?? '';
+  const repetition = /<Repetition\b[^>]*>[\s\S]*?<\/Repetition>/i.exec(trigger)?.[0] ?? '';
+  const settings = /<Settings\b[^>]*>[\s\S]*?<\/Settings>/i.exec(xml)?.[0] ?? '';
+  const expectedFileArg = `-File "${expectedScriptPath}"`;
+  return /(?:^|\\)powershell(?:\.exe)?$/i.test(command)
+    && args.includes('-NoProfile')
+    && args.includes('-NonInteractive')
+    && args.includes(expectedFileArg)
+    && /<UserId>\s*S-1-5-18\s*<\/UserId>/i.test(xml)
+    && /<RunLevel>\s*HighestAvailable\s*<\/RunLevel>/i.test(xml)
+    && trigger.length > 0
+    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(trigger)
+    && /<StartBoundary>\s*[^<]+\s*<\/StartBoundary>/i.test(trigger)
+    && /<Interval>\s*PT1M\s*<\/Interval>/i.test(repetition)
+    && !/<Duration>\s*[^<]+\s*<\/Duration>/i.test(repetition)
+    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(settings)
+    && /<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/i.test(settings)
+    && /<ExecutionTimeLimit>\s*PT2M\s*<\/ExecutionTimeLimit>/i.test(settings);
+}
+
+interface LaunchctlPrintInspection {
+  effectiveAction: string | null;
+  loaded: boolean;
+  bootEnabled: boolean;
+  principal: string | null;
+  restartPolicy: string | null;
+  loadedPath: string | null;
+}
+
+/**
+ * Parse `launchctl print system/<label>` — the authoritative loaded-daemon state,
+ * INDEPENDENT of the on-disk plist. `program = <path>` (or the first
+ * `arguments = { … }` entry) is the action launchd actually has resident, so a
+ * daemon that never rebootstrapped after a plist rewrite is caught here.
+ */
+function parseLaunchctlPrint(printOut: string): LaunchctlPrintInspection {
+  const loaded = printOut.trim().length > 0;
+  let effectiveAction: string | null = null;
+  const programMatch = /^\s*program\s*=\s*(.+)$/mi.exec(printOut);
+  if (programMatch) {
+    effectiveAction = programMatch[1].trim();
+  } else {
+    const argsBlock = /arguments\s*=\s*\{([\s\S]*?)\}/i.exec(printOut);
+    if (argsBlock) {
+      effectiveAction = argsBlock[1].split('\n').map((line) => line.trim()).filter(Boolean)[0] ?? null;
+    }
+  }
+  const pathMatch = /^\s*path\s*=\s*(.+)$/mi.exec(printOut);
+  const usernameMatch = /^\s*username\s*=\s*(\S+)/mi.exec(printOut);
+  const disabled = /\bdisabled\s*=\s*(?:1|true)\b/i.test(printOut);
+  return {
+    effectiveAction,
+    loaded,
+    bootEnabled: loaded && !disabled,
+    // A system-domain LaunchDaemon runs as root unless UserName pins another user.
+    principal: usernameMatch ? usernameMatch[1].trim() : (loaded ? 'root' : null),
+    restartPolicy: /\bkeepalive\b/i.test(printOut) ? 'keepalive' : null,
+    loadedPath: pathMatch ? pathMatch[1].trim() : null,
+  };
+}
+
+interface SystemctlShowInspection {
+  effectiveAction: string | null;
+  fragmentPath: string | null;
+  loadState: string | null;
+  unitFileState: string | null;
+  principal: string | null;
+  restartPolicy: string | null;
+  watchdogEnabled: boolean;
+}
+
+/**
+ * Parse `systemctl show` key=value output — the loaded unit's live properties.
+ * `ExecStart` is rendered as `{ path=… ; argv[]=… ; … }`, so the effective action
+ * is the resident `path=`. `FragmentPath` is the unit file systemd actually
+ * loaded (compared to the receipt's definition path to catch a stale fragment).
+ */
+function parseSystemctlShow(showOut: string): SystemctlShowInspection {
+  const prop = (key: string): string | null => {
+    const match = new RegExp(`^${key}=(.*)$`, 'm').exec(showOut);
+    return match ? match[1].trim() : null;
+  };
+  const execStart = prop('ExecStart');
+  let effectiveAction: string | null = null;
+  if (execStart) {
+    const pathMatch = /path=([^ ;]+)/.exec(execStart);
+    effectiveAction = pathMatch ? pathMatch[1].trim() : (execStart.startsWith('/') ? execStart.split(/\s+/)[0] : null);
+  }
+  const userRaw = prop('User');
+  const restartPolicy = prop('Restart');
+  const watchdogRaw = prop('WatchdogUSec');
+  const notifyAccess = prop('NotifyAccess');
+  return {
+    effectiveAction,
+    fragmentPath: prop('FragmentPath'),
+    loadState: prop('LoadState'),
+    unitFileState: prop('UnitFileState'),
+    // A systemd SYSTEM unit with no `User=` runs as root.
+    principal: userRaw && userRaw.length > 0 ? userRaw : (showOut.trim().length > 0 ? 'root' : null),
+    restartPolicy: restartPolicy && restartPolicy.length > 0 ? restartPolicy : null,
+    watchdogEnabled: notifyAccess === 'all'
+      && watchdogRaw !== null
+      && !/^(?:0|0us|infinity)$/i.test(watchdogRaw),
+  };
+}
+
+function macosWatchdogPath(options: ServiceInstallOptions, mainPlistPath: string): string {
+  return options.macosWatchdogPlistPath
+    ?? (mainPlistPath === MACOS_PLIST_PATH
+      ? MACOS_WATCHDOG_PLIST_PATH
+      : join(dirname(mainPlistPath), `${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`));
+}
+
+/** The manager's live loaded action must be present AND equal the receipt's pin. */
+function loadedActionMatchesReceipt(effectiveAction: string | null, receipt: ServiceReceipt): boolean {
+  return effectiveAction !== null && effectiveAction === (receipt.action ?? null);
+}
+
+export async function installDefinition(
+  exePath: string,
+  options: ServiceInstallOptions = {},
+): Promise<ServiceReceipt> {
+  const platform = options.platform ?? process.platform;
+  const runCommand = runCommandFromOptions(options);
+
+  if (platform === 'win32') {
+    return installWindowsTaskDefinition(
+      exePath,
+      runCommand,
+      options.now?.() ?? new Date(),
+      options.writeWindowsWatchdogScript ?? ((path, content) => writeDurableTextFile(path, content, 0o600)),
+    );
+  }
+  if (platform === 'darwin') {
+    const plistPath = options.macosPlistPath ?? MACOS_PLIST_PATH;
+    const watchdogPath = macosWatchdogPath(options, plistPath);
+    const plist = macosLaunchDaemonPlist(exePath);
+    const watchdogPlist = macosHealthWatchdogLaunchDaemonPlist(exePath);
+    await writeDurableTextFile(plistPath, plist, 0o644);
+    await writeDurableTextFile(watchdogPath, watchdogPlist, 0o644);
+    try {
+      runCommand('launchctl', ['bootout', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]);
+    } catch {
+      // Expected on first install; bootstrap below is authoritative.
+    }
+    runCommand('launchctl', ['bootstrap', 'system', watchdogPath]);
+    return {
+      name: CONTROLLED_NODE_SERVICE.MACOS_LABEL,
+      platform,
+      definitionPath: plistPath,
+      definitionSha256: sha256Text(plist),
+      watchdogDefinitionPath: watchdogPath,
+      watchdogDefinitionSha256: sha256Text(watchdogPlist),
+      action: exePath,
+    };
+  }
+  if (platform === 'linux') {
+    const unitPath = options.linuxUnitPath ?? LINUX_UNIT_PATH;
+    const unit = linuxSystemdUnit(exePath);
+    await writeDurableTextFile(unitPath, unit, 0o644);
+    runCommand('systemctl', ['daemon-reload']);
+    runCommand('systemctl', ['enable', CONTROLLED_NODE_SERVICE.LINUX_UNIT]);
+    return {
+      name: CONTROLLED_NODE_SERVICE.LINUX_UNIT,
+      platform,
+      definitionPath: unitPath,
+      definitionSha256: sha256Text(unit),
+      action: exePath,
+    };
+  }
+  throw new Error(`unsupported platform: ${platform}`);
+}
+
+interface WindowsDefinitionValidation {
+  queryOut: string;
+  watchdogQueryOut: string;
+  mainQueryError?: Error;
+  semantic: WindowsTaskInspection;
+  expectedWatchdogPath: string;
+  watchdogMatches: boolean;
+  watchdogScriptMatches: boolean;
+  errors: string[];
+}
+
+async function inspectWindowsDefinitionXmlAndWatchdog(
+  receipt: ServiceReceipt,
+  options: ServiceInstallOptions,
+  runCommand: (file: string, args: readonly string[]) => unknown,
+): Promise<WindowsDefinitionValidation> {
+  const errors: string[] = [];
+  let queryOut = '';
+  let watchdogQueryOut = '';
+  const schtasksPath = windowsSchtasksExecutablePath();
+  try {
+    queryOut = String(
+      runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
+    );
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    errors.push(`schtasks_query_failed:${error.message}`);
+    return {
+      queryOut,
+      watchdogQueryOut,
+      mainQueryError: error,
+      semantic: {
+        action: null,
+        matches: false,
+        bootEnabled: false,
+        principal: null,
+        restartPolicy: null,
+      },
+      expectedWatchdogPath: '',
+      watchdogMatches: false,
+      watchdogScriptMatches: false,
+      errors,
+    };
+  }
+  try {
+    watchdogQueryOut = String(
+      runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
+    );
+  } catch (err) {
+    errors.push(`watchdog_task_query_failed:${(err as Error).message}`);
+  }
+  const semantic = inspectWindowsTaskXml(queryOut, receipt.action);
+  const expectedWatchdogPath = receipt.action
+    ? windowsControlledNodeHealthPaths(receipt.action).scriptPath
+    : '';
+  const watchdogMatches = expectedWatchdogPath.length > 0
+    && inspectWindowsHealthWatchdogTaskXml(watchdogQueryOut, expectedWatchdogPath);
+  let watchdogScriptMatches = false;
+  if (receipt.action && expectedWatchdogPath) {
+    try {
+      const readWatchdog = options.readWindowsWatchdogScript
+        ?? ((path: string) => readFile(path, 'utf8'));
+      const watchdogScript = await readWatchdog(expectedWatchdogPath);
+      watchdogScriptMatches = watchdogScript === windowsControlledNodeHealthWatchdogScript(receipt.action);
+      if (!watchdogScriptMatches) errors.push('watchdog_script_mismatch');
+    } catch (err) {
+      errors.push(`watchdog_script_read_failed:${(err as Error).message}`);
+    }
+  }
+  return {
+    queryOut,
+    watchdogQueryOut,
+    semantic,
+    expectedWatchdogPath,
+    watchdogMatches,
+    watchdogScriptMatches,
+    errors,
+  };
+}
+
+export async function inspectDefinition(
+  receipt: ServiceReceipt,
+  options: ServiceInstallOptions = {},
+): Promise<ServiceReceipt> {
+  const platform = options.platform ?? receipt.platform;
+  const runCommand = runCommandFromOptions(options);
+  if (platform === 'win32') {
+    // SIDE-EFFECT-FREE: only query /XML and verify on-disk watchdog script; never re-install or run.
+    if (!receipt.action || receipt.action.trim().length === 0) {
+      throw new Error('controlled node Windows service receipt action is missing');
+    }
+    const validation = await inspectWindowsDefinitionXmlAndWatchdog(receipt, options, runCommand);
+    if (validation.mainQueryError) {
+      throw validation.mainQueryError;
+    }
+    if (!validation.semantic.matches) {
+      throw new Error(
+        `controlled node Windows task definition drifted: expected action=${receipt.action}, observed action=${validation.semantic.action ?? 'none'}, bootEnabled=${validation.semantic.bootEnabled}, principal=${validation.semantic.principal ?? 'none'}, restartPolicy=${validation.semantic.restartPolicy ?? 'none'}`,
+      );
+    }
+    if (!validation.watchdogMatches) {
+      const queryFailure = validation.errors.find((entry) => entry.startsWith('watchdog_task_query_failed:'));
+      throw new Error(
+        queryFailure
+          ? `controlled node Windows watchdog task query failed (${queryFailure})`
+          : `controlled node Windows watchdog task definition drifted (expected script=${validation.expectedWatchdogPath})`,
+      );
+    }
+    if (!validation.watchdogScriptMatches) {
+      const scriptError = validation.errors.find((entry) => entry.startsWith('watchdog_script_'));
+      throw new Error(
+        `controlled node Windows watchdog script drifted at ${validation.expectedWatchdogPath}${scriptError ? ` (${scriptError})` : ''}`,
+      );
+    }
+    return receipt;
+  }
+  if (receipt.definitionPath && receipt.definitionSha256) {
+    const content = await readFile(receipt.definitionPath, 'utf8');
+    if (sha256Text(content) !== receipt.definitionSha256) {
+      throw new Error('controlled node service definition hash mismatch');
+    }
+  }
+  if (platform === 'darwin') {
+    if (!receipt.watchdogDefinitionPath || !receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition receipt is incomplete');
+    }
+    const content = await readFile(receipt.watchdogDefinitionPath, 'utf8');
+    if (sha256Text(content) !== receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition hash mismatch');
+    }
+  }
+  return receipt;
+}
+
+/**
+ * SIDE-EFFECT-FREE structured service inspection. Permitted operations:
+ *   Windows: `schtasks /Query` (no /Create, no /Run, no /Delete)
+ *   macOS:   `launchctl print` (no bootout/bootstrap/kickstart)
+ *   Linux:   `systemctl cat` / `is-enabled` / `show` (no daemon-reload/restart)
+ *
+ * The stable runtime calls this on every heartbeat and BEFORE writing
+ * `service_healthy`. The source path also calls this to decide whether
+ * repair is required.
+ */
+export async function inspectServiceState(
+  receipt: ServiceReceipt,
+  options: ServiceInstallOptions = {},
+): Promise<ServiceInspection> {
+  const platform = options.platform ?? receipt.platform;
+  const runCommand = runCommandFromOptions(options);
+  const errors: string[] = [];
+  let raw = '';
+
+  if (platform === 'win32') {
+    // SIDE-EFFECT-FREE: /Query only. /XML is also non-mutating and gives the
+    // current task definition as XML — we parse out the <Command> for parity
+    // with the install-time action.
+    const validation = await inspectWindowsDefinitionXmlAndWatchdog(receipt, options, runCommand);
+    errors.push(...validation.errors);
+    if (validation.mainQueryError) {
+      return blankInspection(receipt.platform, errors, validation.queryOut);
+    }
+    const observedHash = sha256Text(validation.queryOut);
+    let stateOut = '';
+    let runState: ServiceInspection['runState'] = 'unknown';
+    try {
+      stateOut = String(runCommand('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `(Get-ScheduledTask -TaskName '${CONTROLLED_NODE_SERVICE.WINDOWS_TASK}').State.ToString()`,
+      ]) ?? '').trim();
+      if (/^running$/i.test(stateOut)) runState = 'running';
+      else if (/^(ready|disabled|queued)$/i.test(stateOut)) runState = 'stopped';
+    } catch (err) {
+      errors.push(`scheduled_task_state_failed:${(err as Error).message}`);
+    }
+    raw = `${validation.queryOut}\nwatchdog:\n${validation.watchdogQueryOut}\nstate:${stateOut}`;
+    return {
+      installed: validation.queryOut.length > 0,
+      // Task Scheduler's store IS the manager; the /XML query is its live view,
+      // so the on-disk and effective actions are the same authoritative source.
+      action: validation.semantic.action,
+      effectiveAction: validation.semantic.action,
+      loadedActionMatches: loadedActionMatchesReceipt(validation.semantic.action, receipt),
+      loaded: validation.queryOut.length > 0,
+      bootEnabled: validation.semantic.bootEnabled,
+      principal: validation.semantic.principal,
+      restartPolicy: validation.semantic.restartPolicy,
+      observedDefinitionSha256: observedHash,
+      // Task Scheduler normalizes exported XML, so compare required semantics
+      // rather than unstable whitespace/registration metadata.
+      definitionMatches: validation.semantic.matches && validation.watchdogMatches && validation.watchdogScriptMatches,
+      runState,
+      errors,
+      raw,
+    };
+  }
+
+  if (platform === 'darwin') {
+    // SIDE-EFFECT-FREE: `launchctl print` is purely read-only.
+    let printOut = '';
+    try {
+      printOut = String(runCommand('launchctl', ['print', `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}`]));
+    } catch (err) {
+      errors.push(`launchctl_print_failed:${(err as Error).message}`);
+      return blankInspection(receipt.platform, errors, printOut);
+    }
+    const managerState = parseLaunchctlPrint(printOut);
+    const definition = await inspectDefinitionFile(receipt);
+    errors.push(...definition.errors);
+    const watchdogPath = receipt.watchdogDefinitionPath
+      ?? macosWatchdogPath(options, receipt.definitionPath ?? options.macosPlistPath ?? MACOS_PLIST_PATH);
+    const watchdogReceipt: ServiceReceipt = {
+      name: CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL,
+      platform: 'darwin',
+      definitionPath: watchdogPath,
+      definitionSha256: receipt.watchdogDefinitionSha256
+        ?? sha256Text(macosHealthWatchdogLaunchDaemonPlist(receipt.action ?? '')),
+      action: receipt.action,
+    };
+    const watchdogDefinition = await inspectDefinitionFile(watchdogReceipt);
+    errors.push(...watchdogDefinition.errors.map((error) => `watchdog_${error}`));
+    let watchdogPrintOut = '';
+    try {
+      watchdogPrintOut = String(runCommand('launchctl', ['print', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]));
+    } catch (err) {
+      errors.push(`watchdog_launchctl_print_failed:${(err as Error).message}`);
+    }
+    const watchdogManagerState = parseLaunchctlPrint(watchdogPrintOut);
+    raw = `${printOut}\nwatchdog:\n${watchdogPrintOut}`;
+    const watchdogExpected = receipt.action ? macosHealthWatchdogLaunchDaemonPlist(receipt.action) : null;
+    const watchdogMatches = watchdogExpected !== null
+      && watchdogDefinition.content === watchdogExpected
+      && watchdogDefinition.matches
+      && watchdogManagerState.loaded
+      && watchdogManagerState.loadedPath === watchdogPath
+      && watchdogManagerState.effectiveAction === receipt.action
+      && watchdogPrintOut.includes('--health-watchdog');
+    const installed = printOut.length > 0 && definition.present
+      && watchdogPrintOut.length > 0 && watchdogDefinition.present;
+    // /LoadState is shown by `launchctl print` as "running" / "waiting" /
+    // "not running" — we accept any of those as the run state.
+    let runState: ServiceInspection['runState'] = 'unknown';
+    const stateMatch = /state\s*=\s*([a-z ]+)/i.exec(printOut);
+    if (stateMatch) {
+      const s = stateMatch[1].toLowerCase().trim();
+      if (s.includes('not running') || s.includes('waiting')) runState = 'stopped';
+      else if (s.includes('running')) runState = 'running';
+    }
+    const loadedPathMatches = !receipt.definitionPath || managerState.loadedPath === receipt.definitionPath;
+    return {
+      installed,
+      // `action` stays the ON-DISK plist action; `effectiveAction` is what
+      // launchd actually loaded. A plist rewrite without a rebootstrap (disk
+      // new, manager old) surfaces as action !== effectiveAction.
+      action: definition.action,
+      effectiveAction: managerState.effectiveAction,
+      loadedActionMatches: loadedPathMatches && loadedActionMatchesReceipt(managerState.effectiveAction, receipt),
+      loaded: managerState.loaded && loadedPathMatches,
+      bootEnabled: managerState.bootEnabled,
+      principal: managerState.principal,
+      restartPolicy: managerState.restartPolicy,
+      observedDefinitionSha256: definition.sha256,
+      definitionMatches: definition.matches && watchdogMatches,
+      runState,
+      errors,
+      raw,
+    };
+  }
+
+  if (platform === 'linux') {
+    // SIDE-EFFECT-FREE: `systemctl is-enabled` and `systemctl show` are
+    // read-only. `daemon-reload` is NOT used here; reload lives in the
+    // install path only.
+    let enabled = '';
+    let showOut = '';
+    try {
+      enabled = String(runCommand('systemctl', ['is-enabled', CONTROLLED_NODE_SERVICE.LINUX_UNIT]) ?? '').trim();
+    } catch (err) {
+      errors.push(`systemctl_is_enabled_failed:${(err as Error).message}`);
+    }
+    try {
+      showOut = String(runCommand('systemctl', ['show', CONTROLLED_NODE_SERVICE.LINUX_UNIT, '--property=ActiveState,SubState,LoadState,FragmentPath,ExecMainStartTimestamp,ExecStart,User,Restart,UnitFileState,WatchdogUSec,NotifyAccess']) ?? '');
+    } catch (err) {
+      errors.push(`systemctl_show_failed:${(err as Error).message}`);
+    }
+    const managerState = parseSystemctlShow(showOut);
+    const definition = await inspectDefinitionFile(receipt);
+    errors.push(...definition.errors);
+    raw = `is-enabled:${enabled}\n${showOut}`;
+    let runState: ServiceInspection['runState'] = 'unknown';
+    if (showOut.includes('ActiveState=active')) runState = 'running';
+    else if (/ActiveState=(inactive|failed|deactivating)/.test(showOut)) runState = 'stopped';
+    // systemd must have loaded OUR unit file: a FragmentPath that no longer
+    // points at the receipt's definition means the resident unit (and its
+    // ExecStart) came from a different/stale file than the one we pinned.
+    const fragmentMatches = !receipt.definitionPath || managerState.fragmentPath === receipt.definitionPath;
+    const bootEnabled = enabled === 'enabled' || managerState.unitFileState === 'enabled';
+    return {
+      installed: enabled === 'enabled' && showOut.length > 0 && definition.present,
+      // `action` is the ON-DISK unit's ExecStart; `effectiveAction` is the
+      // ExecStart of the unit systemd currently has resident. Rewriting the
+      // file does not reload the manager, so the two diverge until daemon-reload.
+      action: definition.action,
+      effectiveAction: managerState.effectiveAction,
+      loadedActionMatches: fragmentMatches && loadedActionMatchesReceipt(managerState.effectiveAction, receipt),
+      loaded: managerState.loadState === 'loaded' && fragmentMatches,
+      bootEnabled,
+      principal: managerState.principal,
+      restartPolicy: managerState.restartPolicy,
+      observedDefinitionSha256: definition.sha256,
+      definitionMatches: definition.matches
+        && definition.content === linuxSystemdUnit(receipt.action ?? '')
+        && managerState.watchdogEnabled,
+      runState,
+      errors,
+      raw,
+    };
+  }
+
+  return blankInspection(receipt.platform, errors, raw);
+}
+
+function blankInspection(platform: NodeJS.Platform, errors: string[], raw: string): ServiceInspection {
+  return {
+    installed: false,
+    action: null,
+    effectiveAction: null,
+    loadedActionMatches: false,
+    loaded: false,
+    bootEnabled: false,
+    principal: null,
+    restartPolicy: null,
+    observedDefinitionSha256: null,
+    definitionMatches: false,
+    runState: 'unknown',
+    errors,
+    raw,
+  };
+}
+
+export async function startService(
+  receipt: ServiceReceipt,
+  options: ServiceInstallOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? receipt.platform;
+  const runCommand = runCommandFromOptions(options);
+  if (platform === 'win32') {
+    const schtasks = windowsSchtasksExecutablePath();
+    if (!receipt.action) throw new Error('Windows controlled node service action is missing');
+    // `/Run` with MultipleInstancesPolicy=IgnoreNew reports success while an
+    // old, disconnected process keeps running. Stop both the scheduler owner
+    // and the exact installed executable generation, then verify it is gone.
+    // Unlike `schtasks /End`, an absent first-install process is success while
+    // permission/query/termination failures remain visible.
+    runCommand(
+      windowsPowerShellExecutablePath(),
+      windowsStopControlledNodeGenerationArgs(receipt.action),
+    );
+    if (receipt.action) {
+      const baseDir = win32.dirname(receipt.action);
+      // Online success must be proven by the new process generation. An old
+      // fresh-looking lease would otherwise make a reinstall claim success
+      // before `/Run` had started or authenticated anything.
+      await rm(win32.join(baseDir, CONTROLLED_NODE_HEALTH_LEASE_FILE), { force: true });
+      await rm(win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE), { force: true });
+    }
+    runCommand(schtasks, ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    return;
+  }
+  if (platform === 'darwin') {
+    const plistPath = receipt.definitionPath ?? options.macosPlistPath ?? MACOS_PLIST_PATH;
+    try {
+      runCommand('launchctl', ['bootout', `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}`]);
+    } catch {
+      // Missing service is expected before the first bootstrap; bootstrap below is authoritative.
+    }
+    runCommand('launchctl', ['bootstrap', 'system', plistPath]);
+    runCommand('launchctl', ['kickstart', '-k', `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}`]);
+    return;
+  }
+  if (platform === 'linux') {
+    runCommand('systemctl', ['restart', CONTROLLED_NODE_SERVICE.LINUX_UNIT]);
+    return;
+  }
+  throw new Error(`unsupported platform: ${platform}`);
+}
+
+/**
+ * Install the boot-level autostart for the current OS. Requires elevation (the
+ * install journal ensures elevation happens first). Returns the created service
+ * identity. Throws on unsupported platform or a failed OS command.
+ */
+export async function installControlledNodeService(
+  exePath: string,
+  options: ServiceInstallOptions = {},
+): Promise<string> {
+  const receipt = await installDefinition(exePath, options);
+  await inspectDefinition(receipt, options);
+  await startService(receipt, options);
+  return receipt.name;
+}
+
+/**
+ * Create + lock the Windows credential directory to SYSTEM + Administrators only
+ * — the Windows analog of the POSIX `0700` credential dir in `enrollment.ts`,
+ * applied during the `credential_prepared` install-journal phase (10.10, BEFORE
+ * redemption/persistence). No-op guard off Windows. Real `icacls` enforcement is
+ * E2E on Windows; the arg construction is unit-tested via `windowsCredentialAclArgs`.
+ */
+const WINDOWS_CREDENTIAL_SECRET_FILES = [
+  'credential.json',
+  'install-identity.json',
+  'pending-daemon-bind.json',
+] as const;
+
+export async function secureWindowsCredentialDir(
+  dir: string = windowsCredentialDir(),
+  options: {
+    platform?: NodeJS.Platform;
+    runCommand?: (file: string, args: readonly string[]) => void;
+    pathExists?: (filePath: string) => Promise<boolean>;
+  } = {},
+): Promise<string> {
+  if ((options.platform ?? process.platform) !== 'win32') throw new Error('secureWindowsCredentialDir is Windows-only');
+  await mkdir(dir, { recursive: true });
+  applyWindowsAclCommands(windowsCredentialAclCommands(dir), options.runCommand);
+  const checkRegularFile = options.pathExists ?? (async (filePath: string) => {
+    try {
+      const st = await lstat(filePath);
+      return st.isFile() && !st.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  });
+  for (const name of WINDOWS_CREDENTIAL_SECRET_FILES) {
+    const filePath = win32.join(dir, name);
+    if (await checkRegularFile(filePath)) {
+      applyWindowsAclCommands(windowsSecretFileAclCommands(filePath), options.runCommand);
+    }
+  }
+  return dir;
+}

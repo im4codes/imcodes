@@ -1,16 +1,40 @@
-import type { CronSendAction } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  type CronAction,
+  type CronCompletionPolicy,
+  type CronSendAction,
+} from '../../shared/cron-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
 import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags.js';
 import { validateMcpCronAction } from './cron-action-validator.js';
+import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
+import { normalizeClientTimezone } from '../../shared/client-timezone.js';
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
+import {
+  formatNetworkErrorMessage,
+  isPreConnectNetworkError,
+  withPreConnectRetry,
+  type PreConnectRetryOptions,
+} from '../util/pre-connect-retry.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
 const CRON_LIST_LIMIT_MAX = 100;
 const DEFAULT_TIMEOUT_MS = 15_000;
+const CRON_RETRY_MAX_ATTEMPTS = 3;
+const CRON_RETRY_BASE_DELAY_MS = 500;
+const CRON_RETRY_MAX_DELAY_MS = 2_000;
+const TRANSIENT_GET_SOCKET_CODES: ReadonlySet<string> = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
+const TRANSIENT_GET_SOCKET_MESSAGES = /other side closed|socket hang up|ECONNRESET/i;
+const TRANSIENT_GET_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
 
 export interface CronServerEndpoint {
   serverId: string;
   workerUrl: string;
+  /** The daemon's server token: the cron API refuses a request that does not present it. */
+  token: string;
 }
 
 export interface CronMcpClientOptions {
@@ -20,33 +44,68 @@ export interface CronMcpClientOptions {
   nowMs?: () => number;
   runtimeServerId?: string | null;
   timeoutMs?: number;
+  deviceTimezone?: string | null;
+  /** Optional retry policy override for transient network failures (test seam). */
+  preConnectRetry?: PreConnectRetryOptions;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 export interface CronCreateInput extends MemoryMcpSourceProvenance {
   name: string;
   cronExpr: string;
+  shortIntervalReason?: string;
   projectName: string;
   targetRole?: string;
   targetSessionName?: string | null;
   action: unknown;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
   userId?: string;
   serverId?: string;
   token?: string;
   actorId?: string;
 }
 
+export interface CronCreateSelfInput {
+  name: string;
+  cronExpr: string;
+  shortIntervalReason?: string;
+  projectName: string;
+  targetRole: string;
+  targetSessionName?: string | null;
+  message: string;
+  timezone?: string;
+  expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
+}
+
+export interface CronUpdateSelfInput {
+  id: string;
+  name?: string;
+  cronExpr?: string;
+  shortIntervalReason?: string;
+  projectName: string;
+  message?: string;
+  timezone?: string;
+  expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
+  force?: boolean;
+}
+
 export interface CronUpdateInput extends MemoryMcpSourceProvenance {
   id: string;
   name?: string;
   cronExpr?: string;
+  shortIntervalReason?: string;
   projectName?: string;
   targetRole?: string;
   targetSessionName?: string | null;
   action?: unknown;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
+  force?: boolean;
   userId?: string;
   serverId?: string;
   token?: string;
@@ -61,6 +120,7 @@ export interface CronListInput {
   token?: string;
   actorId?: string;
 }
+export type CronStatus = 'active' | 'paused';
 
 export type CronMcpFailure =
   { status: 'error'; reason: MCPErrorReason; message: string };
@@ -71,10 +131,11 @@ async function loadBoundEndpoint(): Promise<CronServerEndpoint | null> {
   try {
     const { loadCredentials } = await import('../bind/bind-flow.js');
     const creds = await loadCredentials();
-    if (!creds) return null;
+    if (!creds?.serverId || !creds.workerUrl || !creds.token) return null;
     return {
       serverId: creds.serverId,
       workerUrl: creds.workerUrl,
+      token: creds.token,
     };
   } catch {
     return null;
@@ -102,16 +163,16 @@ function cleanRuntimeServerId(serverId: string | null | undefined): string | nul
   return typeof serverId === 'string' && serverId.trim() ? serverId.trim() : null;
 }
 
-function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix = ''): string {
-  return `${cleanBaseUrl(endpoint.workerUrl)}/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`;
+function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix: string, method: DaemonHttpMethod): string {
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`);
 }
 
 async function getEndpoint(
   options: CronMcpClientOptions,
 ): Promise<{ endpoint: CronServerEndpoint; runtimeServerId: string } | CronMcpFailure> {
   const endpoint = options.endpoint !== undefined ? options.endpoint : await loadBoundEndpoint();
-  if (!endpoint?.serverId || !endpoint.workerUrl) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires a local daemon cron endpoint');
+  if (!endpoint?.serverId || !endpoint.workerUrl || !endpoint.token) {
+    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires a bound daemon server credential');
   }
   const runtimeServerId = cleanRuntimeServerId(options.runtimeServerId) ?? cleanRuntimeServerId(endpoint.serverId);
   if (!runtimeServerId) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires local server identity');
@@ -143,10 +204,42 @@ async function parseJsonResponse(res: Response): Promise<unknown> {
 function responseMessage(body: unknown, fallback: string): string {
   if (body && typeof body === 'object') {
     const record = body as Record<string, unknown>;
-    if (typeof record.error === 'string') return record.error;
+    if (
+      (record.error === 'cron_short_interval_reason_required' || record.error === 'cron_interval_too_short')
+      && typeof record.message === 'string'
+      && record.message.trim()
+    ) {
+      return record.message;
+    }
+    if (typeof record.error === 'string') {
+      const reason = typeof record.reason === 'string' && record.reason.trim() ? record.reason.trim() : '';
+      return reason && reason !== record.error ? `${record.error} (${reason})` : record.error;
+    }
     if (typeof record.message === 'string') return record.message;
   }
   return fallback;
+}
+
+class TransientCronHttpError extends Error {
+  constructor(readonly result: CronMcpFailure) {
+    super(result.message);
+  }
+}
+
+function isIdempotentGetTransientError(err: unknown): boolean {
+  if (err instanceof TransientCronHttpError) return true;
+  if (isPreConnectNetworkError(err)) return true;
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && TRANSIENT_GET_SOCKET_CODES.has(code)) return true;
+    if (TRANSIENT_GET_SOCKET_MESSAGES.test(current.message)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 async function requestCron(
@@ -157,34 +250,83 @@ async function requestCron(
   options: CronMcpClientOptions,
 ): Promise<CronMcpResult<{ body: unknown }>> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  try {
-    const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix), {
-      ...init,
-      headers: {
-        'X-Server-Id': runtimeServerId,
-        'Content-Type': 'application/json',
-        ...init.headers,
-      },
-      signal: controller.signal,
-    });
-    const body = await parseJsonResponse(res);
-    if (!res.ok) {
-      return error(MCP_ERROR_REASONS.INTERNAL_ERROR, responseMessage(body, `Cron request failed with status ${res.status}`));
+  const method = ((init.method ?? 'GET').toUpperCase()) as DaemonHttpMethod;
+  const url = cronUrl(endpoint, runtimeServerId, pathSuffix, method);
+  const deviceTimezone = normalizeClientTimezone(
+    options.deviceTimezone !== undefined
+      ? options.deviceTimezone
+      : Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
+  let sharedMachineAuthority: string | null = null;
+  if (options.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await options.loadSharedMachineAuthority();
+    } catch {
+      return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
     }
-    return { status: 'ok', body };
+  }
+  const headers = {
+    // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
+    ...daemonServerAuthHeaders(endpoint),
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+    'Content-Type': 'application/json',
+    ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
+    ...init.headers,
+  };
+  try {
+    return await withPreConnectRetry(async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        const res = await fetchImpl(url, {
+          ...init,
+          headers,
+          signal: controller.signal,
+        });
+        const body = await parseJsonResponse(res);
+        if (res.status === 401) {
+          // The server did not authenticate this daemon (revoked or re-bound server token, or a server that has not been
+          // updated to this daemon yet). Say so: it is not a transient failure and retrying will not help. A 403 is NOT this:
+          // the cron API answers 403 for a legitimate scope denial and its reason must reach the caller (handled below).
+          return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, "The server rejected this daemon's credential for the cron API (HTTP 401); re-bind the daemon (imcodes bind) or update the server");
+        }
+        if (!res.ok) {
+          const failureReason = res.status === 403
+            ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
+            : MCP_ERROR_REASONS.INTERNAL_ERROR;
+          const failure = error(failureReason, responseMessage(body, `Cron request failed with status ${res.status}`));
+          if (method === 'GET' && TRANSIENT_GET_STATUSES.has(res.status)) {
+            throw new TransientCronHttpError(failure);
+          }
+          return failure;
+        }
+        return { status: 'ok', body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }, {
+      maxAttempts: CRON_RETRY_MAX_ATTEMPTS,
+      baseDelayMs: CRON_RETRY_BASE_DELAY_MS,
+      maxDelayMs: CRON_RETRY_MAX_DELAY_MS,
+      shouldRetry: method === 'GET' ? isIdempotentGetTransientError : isPreConnectNetworkError,
+      ...options.preConnectRetry,
+    });
   } catch (err) {
-    return error(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
-  } finally {
-    clearTimeout(timer);
+    if (err instanceof TransientCronHttpError) return err.result;
+    return error(MCP_ERROR_REASONS.INTERNAL_ERROR, formatNetworkErrorMessage(err));
   }
 }
 
-function buildCreateBody(input: CronCreateInput, runtimeServerId: string, action: CronSendAction): Record<string, unknown> {
+function buildCreateBody(
+  input: Pick<CronCreateInput, 'name' | 'cronExpr' | 'shortIntervalReason' | 'projectName' | 'targetRole' | 'targetSessionName' | 'timezone' | 'expiresAt' | 'completionPolicy'>,
+  runtimeServerId: string,
+  action: CronAction,
+): Record<string, unknown> {
   return {
     name: input.name,
     cronExpr: input.cronExpr,
+    ...(input.shortIntervalReason !== undefined ? { shortIntervalReason: input.shortIntervalReason } : {}),
     serverId: runtimeServerId,
     projectName: input.projectName,
     targetRole: input.targetRole ?? 'brain',
@@ -192,20 +334,67 @@ function buildCreateBody(input: CronCreateInput, runtimeServerId: string, action
     action,
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+    completionPolicy: input.completionPolicy ?? CRON_COMPLETION_POLICY.RECURRING,
   };
 }
 
-function buildUpdateBody(input: CronUpdateInput, action: CronSendAction | undefined): Record<string, unknown> {
+export async function cronMcpCreateSelf(
+  input: CronCreateSelfInput,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (!input.message.trim()) {
+    return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message is required');
+  }
+  const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
+  if (expiresError) return expiresError;
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  return requestCron(identity.endpoint, identity.runtimeServerId, '', {
+    method: 'POST',
+    body: JSON.stringify(buildCreateBody(input, identity.runtimeServerId, {
+      type: 'command',
+      command: input.message,
+      selfManaged: true,
+    })),
+  }, options);
+}
+
+function buildUpdateBody(input: CronUpdateInput, action: CronAction | undefined): Record<string, unknown> {
   return {
     ...(input.name !== undefined ? { name: input.name } : {}),
     ...(input.cronExpr !== undefined ? { cronExpr: input.cronExpr } : {}),
+    ...(input.shortIntervalReason !== undefined ? { shortIntervalReason: input.shortIntervalReason } : {}),
     ...(input.projectName !== undefined ? { projectName: input.projectName } : {}),
     ...(input.targetRole !== undefined ? { targetRole: input.targetRole } : {}),
     ...(input.targetSessionName !== undefined ? { targetSessionName: input.targetSessionName } : {}),
     ...(action !== undefined ? { action } : {}),
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+    ...(input.completionPolicy !== undefined ? { completionPolicy: input.completionPolicy } : {}),
   };
+}
+
+export async function cronMcpUpdateSelf(
+  input: CronUpdateSelfInput,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (input.message !== undefined && !input.message.trim()) {
+    return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message must not be empty');
+  }
+  const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
+  if (expiresError) return expiresError;
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  const action: CronAction | undefined = input.message === undefined ? undefined : {
+    type: 'command',
+    command: input.message,
+    selfManaged: true,
+  };
+  const suffix = `/${encodeURIComponent(input.id)}${input.force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, {
+    method: 'PUT',
+    body: JSON.stringify(buildUpdateBody(input, action)),
+  }, options);
 }
 
 export async function cronMcpCreate(
@@ -246,7 +435,8 @@ export async function cronMcpUpdate(
   if (expiresError) return expiresError;
   const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
+  const suffix = `/${encodeURIComponent(input.id)}${input.force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, {
     method: 'PUT',
     body: JSON.stringify(buildUpdateBody(input, action)),
   }, options);
@@ -255,10 +445,12 @@ export async function cronMcpUpdate(
 export async function cronMcpDelete(
   id: string,
   options: CronMcpClientOptions = {},
+  force = false,
 ): Promise<CronMcpResult<{ body: unknown }>> {
   const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(id)}`, { method: 'DELETE' }, options);
+  const suffix = `/${encodeURIComponent(id)}${force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, { method: 'DELETE' }, options);
 }
 
 export async function cronMcpList(
@@ -274,3 +466,20 @@ export async function cronMcpList(
   if (result.status !== 'ok') return result;
   return { status: 'ok', body: result.body, limit };
 }
+
+export async function cronMcpSetStatus(
+  id: string,
+  status: CronStatus,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (!id.trim()) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(id)}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  }, options);
+}
+
+export const cronMcpPause = (id: string, options?: CronMcpClientOptions) => cronMcpSetStatus(id, 'paused', options);
+export const cronMcpResume = (id: string, options?: CronMcpClientOptions) => cronMcpSetStatus(id, 'active', options);

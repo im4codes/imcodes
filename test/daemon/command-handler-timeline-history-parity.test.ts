@@ -63,6 +63,7 @@ vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { 
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { TIMELINE_HISTORY_LIMITS } from '../../shared/timeline-history-limits.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -147,5 +148,120 @@ describe('command-handler timeline.history_request SQLite parity', () => {
         expect.objectContaining({ eventId: 'assistant-1' }),
       ]),
     }));
+  });
+
+  it('clamps oversized history pages before projection reads', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-clamped',
+      limit: 10_000,
+      budgetBytes: 50 * 1024 * 1024,
+    }, serverLink as never);
+    await flushAsync();
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: TIMELINE_HISTORY_LIMITS.MAX_EVENTS + 1, afterTs: undefined, beforeTs: undefined });
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'req-clamped',
+      actualPayloadBytes: expect.any(Number),
+    }));
+  });
+
+  it('honors a same-epoch seq cursor instead of replaying the full tail', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-cursor',
+      limit: 50,
+      afterTs: 100,
+      cursor: { epoch: 5, afterSeq: 42, direction: 'newer' },
+    }, serverLink as never);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({
+      limit: 51,
+      afterTs: undefined,
+      beforeTs: undefined,
+      afterSeq: 42,
+      epoch: 5,
+    });
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({
+      limit: 100,
+      afterTs: 99,
+      beforeTs: undefined,
+      afterSeq: 42,
+      epoch: 5,
+    });
+  });
+
+  it('fails safe to the bounded newest window for a cursor from an older daemon epoch', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-old-epoch',
+      limit: 50,
+      afterTs: 999_999,
+      cursor: { epoch: 4, afterSeq: 42, afterTs: 999_999, direction: 'newer' },
+    }, serverLink as never);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({
+      limit: 51,
+      afterTs: undefined,
+      beforeTs: undefined,
+    });
+  });
+
+  it('fetches and reserves 24 recent text messages on main thread when a tool burst fills the top 200 events', async () => {
+    const toolBurst = Array.from({ length: 201 }, (_, idx) => ({
+      eventId: `tool-${idx}`,
+      sessionId: 'deck_proj_brain',
+      ts: 10_000 + idx,
+      seq: 100 + idx,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: idx % 2 === 0 ? 'tool.call' : 'tool.result',
+      payload: { tool: 'Bash', output: `out-${idx}` },
+    }));
+    const textHistory = Array.from({ length: 24 }, (_, idx) => ({
+      eventId: `text-${idx + 1}`,
+      sessionId: 'deck_proj_brain',
+      ts: 100 + idx,
+      seq: idx + 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+      payload: { text: `msg-${idx + 1}` },
+    }));
+
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => {
+      if (types.includes('session.state')) return [];
+      if (!types.includes('tool.call')) return textHistory;
+      return toolBurst;
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-tool-flood',
+      limit: TIMELINE_HISTORY_LIMITS.MAX_EVENTS,
+    }, serverLink as never);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock).toHaveBeenCalledTimes(3);
+    expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['user.message', 'assistant.text']);
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 24, afterTs: undefined, beforeTs: undefined });
+    const reply = serverLink.send.mock.calls[0]?.[0] as {
+      events: Array<{ eventId: string; type: string; ts: number }>;
+      hasMore: boolean;
+      nextCursor?: { beforeTs?: number };
+    };
+    expect(reply.events).toHaveLength(200);
+    expect(reply.events.filter((e) => e.type === 'user.message' || e.type === 'assistant.text')).toHaveLength(24);
+    expect(reply.events.filter((e) => e.type === 'tool.call' || e.type === 'tool.result')).toHaveLength(176);
+    expect(reply.hasMore).toBe(true);
+    // nextCursor.beforeTs anchors to oldest retained contiguous tool (ts=10025), not spliced older text (ts=100)
+    expect(reply.nextCursor?.beforeTs).toBe(10_025);
   });
 });

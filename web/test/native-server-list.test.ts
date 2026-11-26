@@ -87,4 +87,58 @@ describe('native server URL list', () => {
       'https://new-relay.example',
     ]);
   });
+
+  it('merges compile-time locale defaults dynamically on matching locale without leaking into persisted deck_server_list', async () => {
+    vi.stubGlobal('__LOCALE_DEFAULT_SERVERS__', [
+      { url: 'https://cn.example.com', locales: ['zh'], label: 'CN Relay' },
+      { url: 'https://tw.example.com', locales: ['zh-tw'], label: 'TW Relay' },
+    ]);
+    try {
+      const { DEFAULT_SERVER_URL, addServerToList, getServerList, isDefaultServerUrl, removeServerFromList } = await import('../src/native.js');
+
+      // Matching Simplified Chinese shows zh rule dynamically without persisting it.
+      await expect(getServerList('zh-CN')).resolves.toEqual([
+        DEFAULT_SERVER_URL,
+        'https://cn.example.com',
+      ]);
+      expect(JSON.parse(preferenceState.store.get('deck_server_list') ?? '[]')).toEqual([]);
+      expect(JSON.parse(localStorage.getItem('deck_server_list') ?? '[]')).toEqual([DEFAULT_SERVER_URL]);
+
+      // Traditional Chinese matches both zh and zh-tw rules.
+      await expect(getServerList('zh-TW')).resolves.toEqual([
+        DEFAULT_SERVER_URL,
+        'https://cn.example.com',
+        'https://tw.example.com',
+      ]);
+
+      // Active defaults cannot be removed.
+      expect(isDefaultServerUrl('https://cn.example.com', 'zh-CN')).toBe(true);
+      await removeServerFromList('https://cn.example.com', 'zh-CN');
+      await expect(getServerList('zh-CN')).resolves.toEqual([
+        DEFAULT_SERVER_URL,
+        'https://cn.example.com',
+      ]);
+
+      // Switching to English immediately hides unvisited zh-only defaults.
+      expect(isDefaultServerUrl('https://cn.example.com', 'en')).toBe(false);
+      await expect(getServerList('en')).resolves.toEqual([DEFAULT_SERVER_URL]);
+
+      // Adding another user server while in zh-CN must NOT persist the unvisited zh-only default.
+      await addServerToList('https://user.example.com');
+      expect(JSON.parse(preferenceState.store.get('deck_server_list') ?? '[]')).toEqual([
+        DEFAULT_SERVER_URL,
+        'https://user.example.com',
+      ]);
+      await expect(getServerList('en')).resolves.toEqual([
+        DEFAULT_SERVER_URL,
+        'https://user.example.com',
+      ]);
+
+      // User-added servers remain removable.
+      await removeServerFromList('https://user.example.com', 'zh-CN');
+      await expect(getServerList('en')).resolves.toEqual([DEFAULT_SERVER_URL]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

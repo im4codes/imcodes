@@ -1,10 +1,14 @@
 import { Hono } from 'hono';
+import { authenticateDaemonServer, daemonAuthFailure } from '../security/daemon-auth.js';
 import type { Env } from '../env.js';
 import type { BotConfig, InboundMessage, OutboundMessage } from '../platform/types.js';
 import { getHandler } from '../platform/registry.js';
 import { findChannelBindingByPlatformChannel } from '../db/queries.js';
-import { sha256Hex, decryptBotConfig } from '../security/crypto.js';
+import { decryptBotConfig } from '../security/crypto.js';
 import { WsBridge } from '../ws/bridge.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
+import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import logger from '../util/logger.js';
 
 export const outboundRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -54,21 +58,26 @@ async function loadBotConfig(botId: string, env: Env): Promise<BotConfig | null>
  * Body must include botId to identify which user's bot credentials to use.
  */
 outboundRoutes.post('/', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) {
-    return c.json({ error: 'unauthorized' }, 401);
+  // Outbound messaging is an agent-side capability. A controlled node runs no
+  // agents, so it has nothing legitimate to send here.
+  const authed = await authenticateDaemonServer(c, null);
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
+  const authority = await resolveSharedMachineAuthority(c.env.DB, {
+    token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+    signingKey: c.env.JWT_SIGNING_KEY,
+    authenticatedSourceServerId: serverRow.serverId,
+    sourceOwnerUserId: serverRow.userId,
+    now: Date.now(),
+  });
+  if (authority.kind === 'invalid') {
+    return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
   }
-  const token = auth.slice(7);
-
-  // Validate server token
-  const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE token_hash = $1',
-    [tokenHash],
-  );
-
-  if (!serverRow) {
-    return c.json({ error: 'unauthorized' }, 401);
+  if (authority.kind === 'participant') {
+    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
+  }
+  if (authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
+    return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
   }
 
   const msg = await c.req.json<OutboundMessage>();
@@ -88,8 +97,8 @@ outboundRoutes.post('/', async (c) => {
     return c.json({ error: 'bot_not_found' }, 404);
   }
 
-  // Only allow sending via bots owned by the server's user
-  if (botConfig.userId !== serverRow.user_id) {
+  // Only allow sending via bots owned by the server's user and matching the requested platform
+  if (botConfig.userId !== serverRow.userId || botConfig.platform !== msg.platform) {
     return c.json({ error: 'forbidden' }, 403);
   }
 

@@ -1,11 +1,28 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createWorkerSessionSyncRetrier } from '../../src/daemon/worker-session-sync-retrier.js';
+import { advanceCappedWorkerSyncRetries, WORKER_SYNC_SCHEDULED_DELAYS } from '../helpers/capped-worker-sync-retries.js';
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe('worker session sync retrier', () => {
+  it('bounds an older caller that keeps retrying denied outcomes, then stops completely', async () => {
+    vi.useFakeTimers();
+    const sync = vi.fn(async () => ({ ok: false, retryable: true }));
+    const delays: number[] = [];
+    const retrier = createWorkerSessionSyncRetrier({ sync, jitterRatio: 0,
+      logger: { warn: context => delays.push(context.delayMs as number) } });
+    retrier.start('old_server_skew');
+    expect(sync).not.toHaveBeenCalled();
+    await advanceCappedWorkerSyncRetries(vi.advanceTimersByTimeAsync);
+    expect(sync).toHaveBeenCalledTimes(8);
+    expect(delays).toEqual(WORKER_SYNC_SCHEDULED_DELAYS);
+    retrier.stop();
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(sync).toHaveBeenCalledTimes(8);
+  });
+
   it('keeps retrying a failed startup sync until it recovers', async () => {
     vi.useFakeTimers();
     const sync = vi.fn()

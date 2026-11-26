@@ -13,6 +13,7 @@
  */
 
 import type { Context, Next } from 'hono';
+import { CONTROLLED_NODE_INSTALL_PAYLOAD_PATH } from '../../../shared/controlled-node-install.js';
 import { getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import logger from '../util/logger.js';
@@ -50,6 +51,15 @@ export function csrfMiddleware() {
     // cookie has expired. Refresh uses HttpOnly refresh_token cookie which
     // is not accessible to JS, providing equivalent CSRF protection.
     if (path === '/api/auth/refresh') { await next(); return; }
+
+    // Controlled-node downloads are authorized exclusively by a short-lived,
+    // high-entropy ticket in the request body (or Bearer header), never by the
+    // browser session cookie. The bootstrap bridge uses a plain HTML form so
+    // the browser can stream the executable without buffering it in the SPA;
+    // forms cannot attach the double-submit CSRF header and some isolated
+    // browser windows send `Origin: null`. The ticket remains the sole gate.
+    // The CLI one-liner payload exchange (`install-payload`) posts the same ticket without cookies.
+    if (path === '/api/enroll/v2/download' || path === CONTROLLED_NODE_INSTALL_PAYLOAD_PATH) { await next(); return; }
 
     // Bearer auth (API key, daemon, CLI) skips CSRF — not a browser session
     const authHeader = c.req.header('Authorization');

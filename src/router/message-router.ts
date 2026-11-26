@@ -6,7 +6,6 @@ import { parseCommand, fromPlatformCommand } from './command-parser.js';
 import type { ParseResult } from './command-parser.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import logger from '../util/logger.js';
-import { timelineEmitter } from '../daemon/timeline-emitter.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -247,8 +246,13 @@ async function handleCommand(
 
     case 'send': {
       if (command.rawArgs) {
-        await forwardTextToBrain(brainSessionName, command.rawArgs, ctx);
-        await ctx.sendOutbound(msg.channelId, msg.platform, msg.botId, 'Message sent to brain.');
+        const delivered = await forwardTextToBrain(brainSessionName, command.rawArgs, ctx);
+        await ctx.sendOutbound(
+          msg.channelId,
+          msg.platform,
+          msg.botId,
+          delivered ? 'Message sent to brain.' : 'Failed to deliver message to brain. Please try again.',
+        );
       } else {
         await ctx.sendOutbound(msg.channelId, msg.platform, msg.botId, 'Usage: /send <message>');
       }
@@ -274,12 +278,14 @@ async function handleCommand(
       } else {
         // Forward team management commands to brain as structured request
         const teamCommand = `/team ${command.rawArgs}`;
-        await forwardTextToBrain(brainSessionName, teamCommand, ctx);
+        const delivered = await forwardTextToBrain(brainSessionName, teamCommand, ctx);
         await ctx.sendOutbound(
           msg.channelId,
           msg.platform,
           msg.botId,
-          `Team command forwarded to brain: \`${teamCommand}\`. Check the web UI for results.`,
+          delivered
+            ? `Team command forwarded to brain: \`${teamCommand}\`. Check the web UI for results.`
+            : 'Failed to deliver team command to brain. Please try again.',
         );
       }
       return;
@@ -302,19 +308,28 @@ async function forwardToBrain(
   ctx: RouterContext,
 ): Promise<void> {
   const brainSessionName = `deck_${binding.projectName}_brain`;
-  await forwardTextToBrain(brainSessionName, msg.content, ctx);
+  const delivered = await forwardTextToBrain(brainSessionName, msg.content, ctx);
+  if (!delivered) {
+    await ctx.sendOutbound(
+      msg.channelId,
+      msg.platform,
+      msg.botId,
+      'Failed to deliver message to brain. Please try again.',
+    );
+  }
 }
 
 async function forwardTextToBrain(
   brainSessionName: string,
   text: string,
   ctx: RouterContext,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await ctx.sendToSession(brainSessionName, text);
-    timelineEmitter.emit(brainSessionName, 'user.message', { text });
+    return true;
   } catch (err) {
     logger.error({ brainSessionName, err }, 'Failed to forward text to brain session');
+    return false;
   }
 }
 

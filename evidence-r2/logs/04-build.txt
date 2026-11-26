@@ -1,0 +1,12 @@
+
+> imcodes@0.1.2 build
+> tsc
+
+
+> imcodes@0.1.2 postbuild
+> node scripts/copy-worker-bootstraps.mjs && node scripts/copy-computer-use-helper.mjs --dist && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs
+
+copy-worker-bootstraps: copied 13 .mjs file(s) to dist/src/ and wrote dist/builtin-skills/manifest.json
+copy-computer-use-helper: copied /Users/k/codes/codedeck/codedeck/node_modules/open-computer-use/dist/Open Computer Use.app -> /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo/dist/computer-use-helper/darwin-arm64
+Wrote dist/.build-manifest.json (a32af2c408b1)
+EXIT=0

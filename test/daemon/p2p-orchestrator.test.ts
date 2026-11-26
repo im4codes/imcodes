@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 
 const {
   sendKeysDelayedEnterMock,
+  processSessionSendMock,
   capturePaneMock,
   sendKeyMock,
   getSessionMock,
@@ -17,6 +18,7 @@ const {
   serverLinkMock,
 } = vi.hoisted(() => ({
   sendKeysDelayedEnterMock: vi.fn().mockResolvedValue(undefined),
+  processSessionSendMock: vi.fn().mockResolvedValue(undefined),
   capturePaneMock: vi.fn().mockResolvedValue(['$']),
   sendKeyMock: vi.fn().mockResolvedValue(undefined),
   getSessionMock: vi.fn(),
@@ -32,6 +34,10 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sendKeys: sendKeysDelayedEnterMock,
   capturePane: capturePaneMock,
   sendKey: sendKeyMock,
+}));
+
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  sendProcessSessionMessageForAutomation: processSessionSendMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -272,6 +278,9 @@ beforeEach(async () => {
       return;
     }
   });
+  processSessionSendMock.mockImplementation(async (session: string, prompt: string) => {
+    await sendKeysDelayedEnterMock(session, prompt);
+  });
 });
 
 afterEach(async () => {
@@ -354,6 +363,17 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+    expect(processSessionSendMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({
+        userMessageMetadata: expect.objectContaining({
+          memoryExcluded: true,
+          p2pRunId: done.id,
+          p2pDiscussionId: done.discussionId,
+        }),
+      }),
+    );
   });
 
   it('restores transport initiator runtime instead of falling back to tmux dispatch', async () => {
@@ -1561,6 +1581,17 @@ describe('P2P orchestrator — parallel rounds', () => {
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
+    // A too-tight hopTimeoutMs doesn't just fail deck_proj_w2's hop fast (the
+    // intent here) -- it also caps deck_proj_w1's post-summary execution
+    // confirmation gate at hopTimeoutMs * 3 (see runPostSummaryExecutionConfirmationGate
+    // in src/daemon/p2p-orchestrator.ts). At 120ms that gate's 360ms deadline
+    // is well inside normal scheduling/polling overhead on a loaded CI runner
+    // (observed up to ~0.5s, see the sibling "does not double the configured
+    // timeout" fix), so deck_proj_w1's own successful hop can spuriously time
+    // out the whole run before it ever reaches 'completed'. This test asserts
+    // only final outcome, not wall-clock, so there's no reason to keep it
+    // tight -- match the sibling test's contention-tolerant value.
+    const hopTimeoutMs = 2000;
     const run = await startP2pRun(
       'deck_proj_brain',
       [
@@ -1573,10 +1604,10 @@ describe('P2P orchestrator — parallel rounds', () => {
       1,
       undefined,
       undefined,
-      120,
+      hopTimeoutMs,
     );
 
-    const done = await waitForStatus(run.id, ['completed']);
+    const done = await waitForStatus(run.id, ['completed'], 15000);
     const content = await readFile(done.contextFilePath, 'utf8');
     expect(content).toContain('SUCCESS-deck_proj_w1');
     expect(content).not.toContain('SUCCESS-deck_proj_w2');
@@ -1642,6 +1673,16 @@ describe('P2P orchestrator — parallel rounds', () => {
       setTimeout(() => notifySessionIdle(session), 5);
     });
 
+    // Regression: a required initiator hop that never writes its marker must
+    // time out ONCE (hopTimeoutMs), not twice (an earlier bug doubled it). This
+    // can only be observed via wall-clock, so use a LARGE hop timeout: fixed
+    // scheduling/polling overhead on a loaded CI runner (observed up to ~0.5s,
+    // occasionally more) must stay well below the 1×/2× gap. At 2s the correct
+    // (1×) run lands near ~2s+overhead and the doubled (2×) bug near ~4s;
+    // asserting < 1.7× (3.4s) leaves wide margin on both sides and is
+    // contention-proof. The old 220ms/420ms bound flaked because fixed overhead
+    // alone (~0.5s) already exceeded the 200ms 1×/2× gap.
+    const hopTimeoutMs = 2000;
     const startedAt = Date.now();
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -1652,13 +1693,16 @@ describe('P2P orchestrator — parallel rounds', () => {
       1,
       undefined,
       undefined,
-      220,
+      hopTimeoutMs,
     );
 
-    const done = await waitForStatus(run.id, ['completed'], 3000);
+    // Cap comfortably above the doubled-timeout (buggy) duration so even a
+    // regression still completes and is measured here, instead of tripping
+    // this wait and masking the real assertion below.
+    const done = await waitForStatus(run.id, ['completed'], 9000);
     const elapsedMs = Date.now() - startedAt;
     expect(done.skippedHops).toContain('deck_proj_brain');
-    expect(elapsedMs).toBeLessThan(420);
+    expect(elapsedMs).toBeLessThan(hopTimeoutMs * 1.7);
   });
 
   it('uses isolated cross-project hop copies and copies completed artifacts back to the main project hop file', async () => {

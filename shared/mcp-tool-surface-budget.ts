@@ -1,0 +1,131 @@
+/**
+ * Dual budget for the published MCP tools/list surface.
+ *
+ * Two numbers, because they answer different questions:
+ *
+ * - AUTHORED: the bytes we actually write and control — every tool description,
+ *   schema, and enum. This is the number a reviewer can act on, and the one that
+ *   must not silently drift upward.
+ * - RAW: the literal tools/list payload on the wire, including framing that the
+ *   MCP SDK and the JSON Schema dialect inject for us and that `registerTool`
+ *   offers no supported way to suppress. It is bounded too, so protocol growth
+ *   cannot hide behind the authored figure.
+ *
+ * The authored projection excludes ONLY the two injected shapes named below.
+ * That exactness is the whole point: a projection allowed to drop arbitrary
+ * fields would let real authored bytes vanish from the budget, which is exactly
+ * the "make the number go down" failure this is meant to prevent. Callers get
+ * the removal log back so a test can assert nothing else was ever dropped.
+ */
+
+/** Emitted per-schema by zod-to-json-schema; a dialect declaration, not content. */
+export const MCP_INJECTED_SCHEMA_DIALECT = 'http://json-schema.org/draft-07/schema#';
+
+/** Injected per-tool by the MCP SDK. `forbidden` is already the protocol default. */
+export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbidden' });
+
+// The integration preflight adds one bounded contract to the synchronized
+// control-plane surface. Keep explicit headroom over the measured full catalog
+// rather than silently hiding it from STATIC_FULL hosts or trimming unrelated
+// safety descriptions merely to make the number go down.
+//
+// Measured at 42,407 authored bytes across 62 tools after adding the
+// pair_task_get/pair_task_update/pair_task_check checklist tools, on top of
+// the legacy supervision_task_*/supervision_integration_* retirement (those
+// schemas no longer exist on the wire at all, not merely withheld from the
+// active list). The ceiling moves deliberately with roughly the same ~700
+// bytes of reviewable headroom as before.
+// The pair-resource-claim contract brings the measured authored surface to
+// 43,126 bytes; retain a small bounded review headroom. send_message's
+// `command` parameter (exact-text delivery, see shared/send-command-mode.ts) is
+// one 97-character description plus its boolean property: +143 bytes. The
+// structured pair_create/pair_dispatch and pair lifecycle contracts add a
+// bounded ~4.3 KiB of authored schema; keep that growth explicit rather than
+// hiding it from the accounting projection.
+// pair_create's createExecutor/createAuditor/executionSelection contract and the "sub-session means an IM.codes sub-session, never a
+// provider built-in agent" terminology on pair_create and send_message add about 1 KiB of authored schema (owner request, 2026-10);
+// the ceiling moves with it deliberately.
+// session_close (exact sub-session soft close, see shared/session-close.ts) adds one ~0.9 KiB contract to the full catalog on top of that
+// (measured 49,209 bytes together); the ceilings move by another 1,000 bytes for it, deliberately and reviewably, rather than trimming
+// unrelated safety text.
+// pair_create's `workspace` parameter and the owner rule "a worktree only when necessary" (see shared/task-pair-workspace.ts) add about
+// 1.1 KiB of authored schema to the full catalog (measured 50,064 bytes together; owner request, 2026-10), and the on-demand
+// pair_workspace_gc tool another ~0.6 KiB (raw wire payload 57,340 bytes together); neither is part of the bootstrap set, so that
+// ceiling does not move.
+// The session_identity_set append flag, observationId, and replacesRef lifecycle contracts add ~1 KiB of authored schema;
+// the ceilings move deliberately and reviewably to accommodate them. The
+// pause/resume Cron controls add 503 measured authored bytes to the full
+// catalog, so retain bounded headroom above the resulting 53,503-byte surface.
+// Consolidating the 6 partial Cloud Docs MCP tools into the single unified
+// Adding `send_im_message` (host-collision-safe alias of `send_message`) adds
+// one full `send_message` schema (~4.1 KiB authored / ~6 KiB raw with SDK
+// framing on full stdio: 62,614 authored / 70,654 raw bytes measured).
+// Keep tight reviewable headroom above that measured surface.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 64_500;
+// Raw = authored + the MCP SDK framing (measured 70,654 bytes on full stdio).
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 72_500;
+/**
+ * Default model-visible surface: one discovery tool plus the stable minimal
+ * delegation, supervision-task, basic-memory/source-expansion, scheduling,
+ * runtime-identity, exact-alias, and verification-machine bootstrap in
+ * MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE. All other schemas are explicit-on-demand.
+ * The bound is intentionally tight so a new eager schema cannot quietly erase
+ * the lazy-loading reduction. Adding `send_im_message` (the host-collision-safe
+ * core alias sharing `send_message`'s schema, including required automatic-pool
+ * execution identity) raises the measured dynamic bootstrap surface from ~24.7 KiB
+ * to 28,564 bytes; keep tight reviewable headroom above that measured size.
+ * Full-surface authored/raw dual accounting above remains unchanged.
+ */
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 29_500;
+
+export interface McpSurfaceRemoval {
+  /** Dotted path of the containing object, for diagnosis when an assert fails. */
+  path: string;
+  key: string;
+  value: unknown;
+}
+
+export interface McpSurfaceProjection {
+  authored: unknown;
+  removed: McpSurfaceRemoval[];
+}
+
+function isInjectedExecutionBlock(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value as Record<string, unknown>);
+  if (keys.length !== 1 || keys[0] !== 'taskSupport') return false;
+  return (value as { taskSupport?: unknown }).taskSupport === MCP_INJECTED_EXECUTION_BLOCK.taskSupport;
+}
+
+/**
+ * Strip ONLY the two injected shapes, recording every removal.
+ *
+ * A `$schema` whose value is not the known dialect, or an `execution` block with
+ * any other shape, is deliberately KEPT — an unrecognised variant is authored
+ * content until proven otherwise.
+ */
+export function projectAuthoredMcpToolSurface(tools: unknown): McpSurfaceProjection {
+  const removed: McpSurfaceRemoval[] = [];
+  const walk = (node: unknown, path: string): unknown => {
+    if (Array.isArray(node)) return node.map((item, index) => walk(item, `${path}[${index}]`));
+    if (!node || typeof node !== 'object') return node;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === '$schema' && value === MCP_INJECTED_SCHEMA_DIALECT) {
+        removed.push({ path, key, value });
+        continue;
+      }
+      if (key === 'execution' && isInjectedExecutionBlock(value)) {
+        removed.push({ path, key, value });
+        continue;
+      }
+      out[key] = walk(value, path ? `${path}.${key}` : key);
+    }
+    return out;
+  };
+  return { authored: walk(tools, ''), removed };
+}
+
+export function mcpToolSurfaceBytes(value: unknown): number {
+  return JSON.stringify(value).length;
+}

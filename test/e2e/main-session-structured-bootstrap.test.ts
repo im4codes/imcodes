@@ -18,33 +18,19 @@ const RUN_ID = Math.random().toString(36).slice(2, 8);
 const PROJECT = `bootmain${RUN_ID}`;
 const CLAUDE_SESSION = `deck_${PROJECT}_brain`;
 const CODEX_SESSION = `deck_${PROJECT}_w1`;
-const GEMINI_SESSION = `deck_${PROJECT}_w2`;
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const mocks = vi.hoisted(() => {
   const sessions = new Map<string, Record<string, unknown>>();
-  const uuidQueue = ['cc-main-e2e-uuid', 'codex-main-e2e-uuid'];
   return {
     sessions,
     startWatchingFile: vi.fn().mockResolvedValue(undefined),
     startWatching: vi.fn().mockResolvedValue(undefined),
     startCodexWatching: vi.fn().mockResolvedValue(undefined),
     startCodexWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
-    startGeminiWatching: vi.fn().mockResolvedValue(undefined),
     ensureCodexSessionFile: vi.fn().mockResolvedValue('/mock/codex-rollout.jsonl'),
     findRolloutPathByUuid: vi.fn((uuid: string) => Promise.resolve(`/mock/${uuid}.jsonl`)),
-    resolveGeminiSessionId: vi.fn().mockResolvedValue('gemini-main-e2e-uuid'),
-    injectGeminiMemoryWithTimeline: vi.fn().mockResolvedValue(undefined),
-    nextUuid: vi.fn(() => uuidQueue.shift() ?? `uuid-${Math.random().toString(36).slice(2, 10)}`),
-  };
-});
-
-vi.mock('node:crypto', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:crypto')>();
-  return {
-    ...actual,
-    randomUUID: mocks.nextUuid,
   };
 });
 
@@ -79,6 +65,7 @@ vi.mock('../../src/repo/cache.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatching: mocks.startWatching,
   startWatchingFile: mocks.startWatchingFile,
   stopWatching: vi.fn(),
@@ -95,17 +82,6 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   isWatching: vi.fn().mockReturnValue(false),
   findRolloutPathByUuid: mocks.findRolloutPathByUuid,
   ensureSessionFile: mocks.ensureCodexSessionFile,
-}));
-
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({
-  startWatching: mocks.startGeminiWatching,
-  startWatchingLatest: vi.fn().mockResolvedValue(undefined),
-  stopWatching: vi.fn(),
-  isWatching: vi.fn().mockReturnValue(false),
-}));
-
-vi.mock('../../src/daemon/memory-inject.js', () => ({
-  injectGeminiMemoryWithTimeline: mocks.injectGeminiMemoryWithTimeline,
 }));
 
 vi.mock('../../src/agent/drivers/claude-code.js', () => ({
@@ -140,37 +116,17 @@ vi.mock('../../src/agent/drivers/codex.js', () => ({
   },
 }));
 
-vi.mock('../../src/agent/drivers/gemini.js', () => ({
-  GeminiDriver: class {
-    readonly type = 'gemini' as const;
-    readonly promptChar = '>';
-    readonly spinnerChars = ['⠋'];
-    async resolveSessionId() {
-      return mocks.resolveGeminiSessionId();
-    }
-    buildLaunchCommand(_sessionName: string, opts?: { geminiSessionId?: string }) {
-      return `bash -lc 'printf \"GEMINI:${opts?.geminiSessionId ?? "none"}\\n\"; sleep 15'`;
-    }
-    buildResumeCommand(_sessionName: string, opts?: { geminiSessionId?: string }) {
-      return `bash -lc 'printf \"GEMINI-RESUME:${opts?.geminiSessionId ?? "none"}\\n\"; sleep 15'`;
-    }
-    detectStatus() { return 'idle' as const; }
-    isOverlay() { return false; }
-  },
-}));
-
 import { launchSession } from '../../src/agent/session-manager.js';
 
 describe.skipIf(SKIP)('main-session structured bootstrap e2e', () => {
   afterEach(async () => {
     await killSession(CLAUDE_SESSION).catch(() => {});
     await killSession(CODEX_SESSION).catch(() => {});
-    await killSession(GEMINI_SESSION).catch(() => {});
     mocks.sessions.clear();
     vi.clearAllMocks();
   });
 
-  it('bootstraps explicit structured ids for main claude/codex/gemini sessions', async () => {
+  it('bootstraps explicit structured ids for main claude/codex sessions', async () => {
     await launchSession({
       name: CLAUDE_SESSION,
       projectName: PROJECT,
@@ -185,44 +141,31 @@ describe.skipIf(SKIP)('main-session structured bootstrap e2e', () => {
       agentType: 'codex',
       projectDir: '/tmp',
     });
-    await launchSession({
-      name: GEMINI_SESSION,
-      projectName: PROJECT,
-      role: 'w2',
-      agentType: 'gemini',
-      projectDir: '/tmp',
-    });
 
     await wait(400);
 
     const claudePane = (await capturePane(CLAUDE_SESSION)).join('\n');
     const codexPane = (await capturePane(CODEX_SESSION)).join('\n');
-    const geminiPane = (await capturePane(GEMINI_SESSION)).join('\n');
-
-    expect(claudePane).toContain('CLAUDE:cc-main-e2e-uuid');
-    expect(codexPane).toContain('CODEX:codex-main-e2e-uuid');
-    expect(geminiPane).toContain('GEMINI:gemini-main-e2e-uuid');
 
     const claudeRecord = mocks.sessions.get(CLAUDE_SESSION);
     const codexRecord = mocks.sessions.get(CODEX_SESSION);
-    const geminiRecord = mocks.sessions.get(GEMINI_SESSION);
+    const claudeId = String(claudeRecord?.ccSessionId ?? '');
+    const codexId = String(codexRecord?.codexSessionId ?? '');
 
-    expect(claudeRecord?.ccSessionId).toBe('cc-main-e2e-uuid');
-    expect(codexRecord?.codexSessionId).toBe('codex-main-e2e-uuid');
-    expect(geminiRecord?.geminiSessionId).toBe('gemini-main-e2e-uuid');
+    expect(claudeId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(codexId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(claudeId).not.toBe(codexId);
+    expect(claudePane).toContain(`CLAUDE:${claudeId}`);
+    expect(codexPane).toContain(`CODEX:${codexId}`);
 
     expect(mocks.startWatchingFile).toHaveBeenCalledWith(
       CLAUDE_SESSION,
-      expect.stringContaining('cc-main-e2e-uuid.jsonl'),
-      'cc-main-e2e-uuid',
+      expect.stringContaining(`${claudeId}.jsonl`),
+      claudeId,
     );
     expect(mocks.startCodexWatchingSpecificFile).toHaveBeenCalledWith(
       CODEX_SESSION,
-      '/mock/codex-main-e2e-uuid.jsonl',
-    );
-    expect(mocks.startGeminiWatching).toHaveBeenCalledWith(
-      GEMINI_SESSION,
-      'gemini-main-e2e-uuid',
+      `/mock/${codexId}.jsonl`,
     );
   }, 20_000);
 });

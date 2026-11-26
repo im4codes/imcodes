@@ -4,7 +4,7 @@
  * Tests for sub-session metadata propagation via subsession.created and subsession.sync.
  * Verifies that provider display metadata (model, plan, quota) survives the WS → hook → state pipeline.
  */
-import { render, cleanup, waitFor, act } from '@testing-library/preact';
+import { render, cleanup, waitFor, act, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SUPERVISION_MODE,
@@ -12,11 +12,18 @@ import {
 } from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
 import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
+import { SupervisionHeartbeatBadge } from '../src/components/SupervisionHeartbeatBadge.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
   createSubSession: vi.fn(),
   patchSubSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
 }));
 
 type MsgHandler = (msg: any) => void;
@@ -41,6 +48,24 @@ function createMockWs() {
 
 let captured: SubSession[] = [];
 
+const TEST_QUEUE_EPOCH = 'test-queue-epoch';
+const TEST_QUEUE_AUTHORITY_ID = 'test-queue-authority';
+
+function queuePayload(
+  state: 'queued' | 'running' | 'idle',
+  pendingMessageVersion: number,
+  pendingMessageEntries: Array<{ clientMessageId: string; text: string }>,
+) {
+  return {
+    state,
+    queueEpoch: TEST_QUEUE_EPOCH,
+    queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+    pendingMessageVersion,
+    pendingMessageEntries,
+    failedMessageEntries: [],
+  };
+}
+
 function Harness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions } = useSubSessions('srv1', ws, connected, null);
   captured = subSessions;
@@ -50,6 +75,14 @@ function Harness({ ws, connected }: { ws: any; connected: boolean }) {
 let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
 let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
 let createSubSessionHook: ((type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => Promise<SubSession | null>) | null = null;
+let hydrateSharedHook: ((serverId: string, items: Array<{
+  subSessionId: string;
+  sessionName: string;
+  title: string;
+  type: string;
+  parentSessionName: string | null;
+  supervisionMode?: SubSession['supervisionMode'];
+}>) => void) | null = null;
 
 function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
@@ -72,8 +105,40 @@ function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
   return null;
 }
 
+function SharedHarness({ ws }: { ws: any }) {
+  const { subSessions, hydrateShared } = useSubSessions('srv1', ws, true, null, true);
+  captured = subSessions;
+  hydrateSharedHook = hydrateShared;
+  return null;
+}
+
 describe('sub-session metadata via subsession.created', () => {
-  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; sentMessages.length = 0; });
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    captured = [];
+    sentMessages.length = 0;
+    hydrateSharedHook = null;
+  });
+
+  it('hydrates the authoritative shared supervision mode without a transport config', async () => {
+    const { ws } = createMockWs();
+    render(<SharedHarness ws={ws} />);
+    await waitFor(() => expect(hydrateSharedHook).not.toBeNull());
+
+    act(() => hydrateSharedHook?.('srv1', [{
+      subSessionId: 'shared-child',
+      sessionName: 'deck_sub_shared_child',
+      title: 'Shared child',
+      type: 'codex-sdk',
+      parentSessionName: 'deck_project_brain',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }]));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(captured[0].transportConfig).toBeUndefined();
+  });
 
   it('stores Qwen metadata fields from subsession.created', async () => {
     const { ws, send } = createMockWs();
@@ -207,6 +272,33 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].planLabel).toBe('Paid');
     expect(captured[0].quotaUsageLabel).toBe('today 10/5000');
     expect(captured[0].effort).toBe('high');
+  });
+
+  it('applies and preserves a typed heartbeat schedule through subsession sync into the badge, then clears it', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    act(() => send({
+      type: 'subsession.created', id: 'heartbeat', sessionName: 'deck_sub_heartbeat',
+      sessionType: 'codex-sdk', state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }));
+    expect(captured[0].supervisionHeartbeat).toMatchObject({
+      state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000,
+    });
+
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', modelDisplay: 'gpt-5.6-sol' }));
+    expect(captured[0].supervisionHeartbeat?.state).toBe('armed');
+    render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.SUPERVISED_AUDIT}
+      heartbeat={captured[0].supervisionHeartbeat}
+    />);
+    expect(screen.getByRole('timer').textContent).toContain('❤️00:10');
+    expect(screen.queryByText('⏸️')).toBeNull();
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', supervisionHeartbeat: null }));
+    expect(captured[0].supervisionHeartbeat).toBeNull();
   });
 
   it('ignores sync for unknown id', async () => {
@@ -435,6 +527,36 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
 
+  it('updates the original heartbeat badge projection on a subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'idle', updatedAt: 1_000 },
+    }));
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+      },
+    }));
+
+    expect(captured[0].supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+    });
+  });
+
   it('preserves queued transport messages while the drained send is still running and clears on authoritative idle', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
@@ -454,14 +576,10 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: {
-          state: 'queued',
-          pendingMessages: ['queued one', 'queued two'],
-          pendingMessageEntries: [
-            { clientMessageId: 'msg-1', text: 'queued one' },
-            { clientMessageId: 'msg-2', text: 'queued two' },
-          ],
-        },
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'msg-1', text: 'queued one' },
+          { clientMessageId: 'msg-2', text: 'queued two' },
+        ]),
       },
     }));
 
@@ -511,7 +629,7 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('idle', 2, []),
       },
     }));
 
@@ -538,9 +656,7 @@ describe('sub-session metadata via subsession.sync', () => {
         type: 'session.state',
         sessionId: 'deck_sub_q5',
         payload: {
-          state: 'queued',
-          pendingMessages: ['msg'],
-          pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'msg' }],
+          ...queuePayload('queued', 1, [{ clientMessageId: 'msg-1', text: 'msg' }]),
         },
       },
     }));
@@ -554,7 +670,7 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q5',
-        payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('running', 2, []),
       },
     }));
 
@@ -567,7 +683,7 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q5',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('idle', 3, []),
       },
     }));
 
@@ -593,13 +709,9 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: {
-          state: 'queued',
-          pendingMessages: ['queued one', 'queued two'],
-          pendingMessageEntries: [
-            { clientMessageId: 'msg-1', text: 'queued one' },
-          ],
-        },
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'msg-1', text: 'queued one' },
+        ]),
       },
     }));
 
@@ -987,6 +1099,84 @@ describe('sub-session realtime state sync', () => {
     }));
     expect(captured[0]?.state).toBe('error');
   });
+
+  it('reconciles a stale-turn acknowledgement to idle for minimized/reconnecting sub-sessions', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run-stale-ack',
+      sessionName: 'deck_sub_run-stale-ack',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    // The idle timeline frame can be lost while the window is hidden. The
+    // reliable stale-turn ack must still release the local queue gate.
+    act(() => send({
+      type: 'command.ack',
+      session: 'deck_sub_run-stale-ack',
+      commandId: 'stop-1',
+      status: 'error',
+      error: 'The active turn already finished',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+  });
+
+  it('does not let an older activity generation overwrite a newer terminal state', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'generation-fence',
+      sessionName: 'deck_sub_generation-fence',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 2 },
+    }));
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'generation-idle',
+        sessionId: 'deck_sub_generation-fence',
+        type: 'session.state',
+        payload: {
+          state: 'idle',
+          activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 2 },
+        },
+      },
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    // A delayed frame from the prior turn must not revive the spinner.
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'generation-stale-running',
+        sessionId: 'deck_sub_generation-fence',
+        type: 'session.state',
+        payload: {
+          state: 'running',
+          activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 1 },
+        },
+      },
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    // A current frame still advances normally.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'generation-fence',
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 3 },
+    }));
+    expect(captured[0]?.state).toBe('running');
+  });
 });
 
 describe('sub-session close behavior', () => {
@@ -1251,14 +1441,10 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
-        payload: {
-          state: 'queued',
-          pendingMessages: ['fix the bug', 'then add tests'],
-          pendingMessageEntries: [
-            { clientMessageId: 'q1', text: 'fix the bug' },
-            { clientMessageId: 'q2', text: 'then add tests' },
-          ],
-        },
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'q1', text: 'fix the bug' },
+          { clientMessageId: 'q2', text: 'then add tests' },
+        ]),
       },
     }));
   }
@@ -1294,7 +1480,7 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('idle', 2, []),
       },
     }));
     expectQueueCleared();
@@ -1326,12 +1512,10 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
         payload: {
-          state: 'idle',
-          pendingMessages: ['fix the bug', 'then add tests'],
-          pendingMessageEntries: [
+          ...queuePayload('idle', 1, [
             { clientMessageId: 'q1', text: 'fix the bug' },
             { clientMessageId: 'q2', text: 'then add tests' },
-          ],
+          ]),
         },
       },
     }));
@@ -1379,7 +1563,7 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('idle', 2, []),
       },
     }));
     expectQueueCleared();
@@ -1398,7 +1582,7 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
-        payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('running', 2, []),
       },
     }));
     expectQueueCleared();
@@ -1418,9 +1602,10 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       sessionName: 'deck_sub_eq1',
       sessionType: 'claude-code-sdk',
       state: 'running',
-      transportPendingMessages: [],
-      transportPendingMessageEntries: [],
-      transportPendingMessageVersion: 2,
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageEntries: [],
+      pendingMessageVersion: 2,
     }));
 
     expectQueueCleared();
@@ -1437,13 +1622,10 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
         payload: {
-          state: 'queued',
-          pendingMessages: ['fix the bug', 'then add tests'],
-          pendingMessageEntries: [
+          ...queuePayload('queued', 1, [
             { clientMessageId: 'q1', text: 'fix the bug' },
             { clientMessageId: 'q2', text: 'then add tests' },
-          ],
-          pendingMessageVersion: 1,
+          ]),
         },
       },
     }));
@@ -1465,12 +1647,13 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       type: 'subsession.sync',
       id: 'eq1',
       state: 'queued',
-      transportPendingMessages: ['fix the bug', 'then add tests'],
-      transportPendingMessageEntries: [
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageEntries: [
         { clientMessageId: 'q1', text: 'fix the bug' },
         { clientMessageId: 'q2', text: 'then add tests' },
       ],
-      transportPendingMessageVersion: 1,
+      pendingMessageVersion: 1,
     }));
 
     expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
@@ -1505,12 +1688,123 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'user.message',
         sessionId: 'deck_sub_eq1',
-        payload: { text: 'then   add tests' },
+        payload: { clientMessageId: 'q2', text: 'then   add tests' },
       },
     }));
 
     expectQueueCleared();
     expect(captured[0].state).toBe('running');
+  });
+
+  it('removes queued entries from delivery facts even before user.message or idle snapshots arrive', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'transport.queue.delivery',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          type: 'transport.queue.delivery',
+          sessionName: 'deck_sub_eq1',
+          clientMessageId: 'q1',
+          queueEpoch: TEST_QUEUE_EPOCH,
+          queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+          pendingMessageVersion: 2,
+          deliveryFrameId: 'frame-1',
+          deliveryFrameVersion: 1,
+        },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'transport.queue.delivery',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          type: 'transport.queue.delivery',
+          sessionName: 'deck_sub_eq1',
+          clientMessageId: 'q2',
+          queueEpoch: TEST_QUEUE_EPOCH,
+          queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+          pendingMessageVersion: 3,
+          deliveryFrameId: 'frame-2',
+          deliveryFrameVersion: 1,
+        },
+      },
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].transportPendingMessageVersion).toBe(3);
+  });
+
+  it('removes queued entries from top-level queue delivery facts without waiting for focus resync', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'transport.queue.delivery',
+      sessionName: 'deck_sub_eq1',
+      clientMessageId: 'q1',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 2,
+      deliveryFrameId: 'frame-1',
+      deliveryFrameVersion: 1,
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'transport.queue.delivery',
+      sessionName: 'deck_sub_eq1',
+      clientMessageId: 'q2',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 3,
+      deliveryFrameId: 'frame-2',
+      deliveryFrameVersion: 1,
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].transportPendingMessageVersion).toBe(3);
+  });
+
+  it('clears queued entries from top-level queue reset without waiting for window switch sync', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'transport.queue.reset',
+      sessionName: 'deck_sub_eq1',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 2,
+      resetReason: 'user_clear',
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
   });
 
   it('full lifecycle: queue → running → idle clears', async () => {
@@ -1546,7 +1840,7 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+        payload: queuePayload('idle', 2, []),
       },
     }));
     expectQueueCleared();
@@ -1572,9 +1866,7 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
         payload: {
-          state: 'queued',
-          pendingMessages: ['deploy to prod'],
-          pendingMessageEntries: [{ clientMessageId: 'q3', text: 'deploy to prod' }],
+          ...queuePayload('queued', 2, [{ clientMessageId: 'q3', text: 'deploy to prod' }]),
         },
       },
     }));

@@ -54,7 +54,24 @@ vi.mock('../../src/components/P2pProgressCard.js', () => ({
 }));
 
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  FilePreviewPane: ({ content }: { content: string }) => <div data-testid="discussion-preview">{content}</div>,
+  FilePreviewPane: ({
+    content,
+    path,
+    allowedRootPath,
+    onImagePreview,
+  }: {
+    content: string;
+    path: string;
+    allowedRootPath?: string;
+    onImagePreview?: (path: string) => Promise<unknown>;
+  }) => (
+    <div
+      data-testid="discussion-preview"
+      data-path={path}
+      data-allowed-root={allowedRootPath ?? ''}
+      data-image-preview={onImagePreview ? 'enabled' : 'disabled'}
+    >{content}</div>
+  ),
 }));
 
 describe('DiscussionsPage', () => {
@@ -144,6 +161,7 @@ describe('DiscussionsPage', () => {
     });
 
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Updated markdown');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-image-preview')).toBe('disabled');
     expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
     await waitFor(() => expect(scrollEl.scrollTop).toBe(640));
     expect(screen.getByTitle('p2p.discussions.scroll_top')).toBeTruthy();
@@ -233,13 +251,69 @@ describe('DiscussionsPage', () => {
     expect(scrollEl.scrollTop).toBe(720);
   });
 
-  it('copies discussion path from the list action menu', async () => {
-    render(<DiscussionsPage ws={ws} />);
+  it('disengages on user scroll-up and resumes follow after returning to the bottom', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} />);
 
     await act(async () => {
       handler?.({
         type: 'p2p.list_discussions_response',
-        discussions: [{ id: 'disc-3', fileName: 'disc-3.md', path: '/tmp/disc-3.md', preview: 'Topic 3', mtime: 100 }],
+        discussions: [{ id: 'disc-scroll', fileName: 'disc-scroll.md', preview: 'Scroll topic', mtime: 100 }],
+      } as ServerMessage);
+    });
+    fireEvent.click(screen.getByText('Scroll topic'));
+
+    const scrollEl = container.querySelector('.discussions-detail-scroll') as HTMLDivElement;
+    Object.defineProperties(scrollEl, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'Initial content',
+      } as ServerMessage);
+    });
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(600));
+
+    scrollEl.scrollTop = 0;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(false);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'New content while reading history',
+      } as ServerMessage);
+    });
+    expect(scrollEl.scrollTop).toBe(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    scrollEl.scrollTop = 600;
+    fireEvent.scroll(scrollEl);
+    expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'New content after returning to bottom',
+      } as ServerMessage);
+    });
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(600));
+  });
+
+  it('copies discussion path from the list action menu', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ projectDir: '/repo' }} />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'disc-3', fileName: 'disc-3.md', path: '/repo/docs/disc-3.md', preview: 'Topic 3', mtime: 100 }],
       } as ServerMessage);
     });
 
@@ -254,11 +328,15 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-path')).toBe('/repo/docs/disc-3.md');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-allowed-root')).toBe('/repo');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-image-preview')).toBe('enabled');
+
     fireEvent.click(screen.getByLabelText('common.copy'));
     fireEvent.click(screen.getByText('p2p.discussions.copy_path'));
 
     await waitFor(() => {
-      expect(clipboardWriteText).toHaveBeenCalledWith('/tmp/disc-3.md');
+      expect(clipboardWriteText).toHaveBeenCalledWith('/repo/docs/disc-3.md');
     });
   });
 

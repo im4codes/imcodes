@@ -1,7 +1,33 @@
+import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
+import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
+import { PendingQuestionRegistry } from '../pending-question-registry.js';
+import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
+import {
+  CODEX_USER_INPUT_METHOD,
+  CODEX_USER_INPUT_INVALID_PARAMS,
+  CODEX_USER_INPUT_GUIDANCE,
+  INTERACTIVE_QUESTION_TOOL_NAME,
+  codexUserInputResponse,
+  normalizeCodexAsyncQuestions,
+  type CodexUserInputQuestion,
+  type CodexUserInputResponse,
+  type NormalizedCodexAsyncQuestion,
+} from '../../../shared/codex-user-input.js';
+import { createHash } from 'node:crypto';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
+import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
+import {
+  readDelegationDispatchFact,
+  projectDelegationClaim,
+  DELEGATION_CLAIM_METADATA_FIELD,
+  type DelegationDispatchFact,
+} from '../../../shared/delegation-claim.js';
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
+import { getCodexHome, recentCodexSessionDirs, findCodexRolloutPathByUuid } from '../../util/codex-rollout-path.js';
+import { codexRolloutIndex } from '../../util/codex-rollout-index.js';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -11,46 +37,102 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderRolloutCompletionReconcileOptions,
   ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
   ProviderUsageUpdate,
   ToolCallEvent,
+  SdkTurnLostRecoveryMetadata,
+  ProviderDelegationNotification,
 } from '../transport-provider.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
+  SDK_TURN_LOST_REASON,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../../shared/imcodes-send.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
-import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
+import type {
+  ActivityGeneration,
+  CodexLifecycleItemKind,
+  ProviderActiveWorkSnapshot,
+  SessionActivityBusyReason,
+  ToolTerminalReason,
+  ToolTerminalStatus,
+} from '../../../shared/session-activity-types.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+} from '../../../shared/session-activity-types.js';
+import {
+  normalizeActivityGeneration,
+  sameActivityGeneration,
+  type ActivityGenerationLike,
+} from '../../../shared/session-activity-types.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
 } from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
-import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { CODEX_SDK_EFFORT_LEVELS, normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
-import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
+import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
+import {
+  collectCodexTomlMcpServerKeysForIncognito,
+  findEnabledImcodesMcpKeysFromConfig,
+  getCodexAppServerArgs,
+  getCodexIncognitoAppServerArgs,
+} from './getDefaultCodexMcpArgs.js';
+import {
+  NativeAgentFenceSlot,
+  fenceOf,
+  readCodexThreadNativeAgentFence,
+  withCodexNativeAgentFence,
+} from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import {
+  normalizeCodexBaseUrl,
+  normalizeCodexProviderId,
+} from '../../../shared/cc-presets.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { IMCODES_MCP_HOST_LIFETIME_ENV, SESSION_RESOURCE_LIFETIME } from '../../../shared/session-resource-lifecycle.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
+import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_ACTIONS,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   buildSdkSubagentSafeDetail,
+  isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
+  readSdkSubagentFullRequest,
+  readSdkSubagentStartedAtMs,
+  sanitizeSdkSubagentText,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
@@ -62,15 +144,62 @@ const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const TERMINATED_TURN_CACHE_LIMIT = 200;
-// Debounce before settling a turn purely from a thread-idle status (current
-// Codex app-server sometimes ends a turn without an explicit `turn/completed`).
-// Long enough that a transient mid-turn idle is cancelled by the activity that
-// follows it; short enough that a genuinely finished turn is never stuck.
-const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
+// `thread/status` and `thread/read` idle/completed states are app-server
+// liveness hints, not terminal proof. Healthy turns should end via explicit
+// `turn/completed`; app-server zombies may be settled only from Codex core's
+// durable rollout `task_complete` evidence.
 const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
-const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
+const CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS = 50_000;
+const CODEX_TURN_HEARTBEAT_INTERVAL_MS = 20_000;
+// Cross-check for an app-server zombie turn: codex core can finish a turn
+// (rollout records `task_complete`, needs_follow_up=false) while the
+// app-server's turn state never transitions — no `turn/completed` is sent,
+// `thread/read` keeps reporting the turn active, and `turn/interrupt` will
+// happily "cancel" the already-finished turn. Observed on deck_cd_brain:
+// task_complete written at 07:20:03, zero further thread activity, heartbeats
+// classified "active" for 34 minutes until the daemon's 30-min last-resort
+// force-settled the session. A `task_complete` for the running turn in the
+// rollout is AUTHORITATIVE completion evidence — verified live that the
+// app-server's `turn/started` id equals the core rollout `turn_id`, so the match
+// cannot mistake a different turn. Because it is authoritative we do NOT wait
+// long: this threshold only has to be large enough to let the normal
+// `turn/completed` path (which lands ~1s after task_complete on healthy turns)
+// settle first, so healthy turns go through it and only zombies fall through to
+// the rollout cross-check — settled at the next heartbeat rather than after a
+// minute of silence. (Detection is still bounded below by CODEX_TURN_HEARTBEAT_INTERVAL_MS.)
+// Env override for tuning: IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS.
+const CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS = (() => {
+  const raw = Number.parseInt(process.env.IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : 5_000;
+})();
+const CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES = 256 * 1024;
+const CODEX_TURN_HEARTBEAT_JITTER_MS = 5_000;
+const CODEX_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
+const CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD = 3;
+const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
+const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
+const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
+const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_MCP_RECOVERY_BACKOFF_MS = [0, 50, 100, 250, 500, 1_000, 2_000] as const;
+const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
+const CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT = 1;
+const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
+const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
-const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+/**
+ * Exported so the truncation test follows this number instead of restating it.
+ * A test that hardcodes the cap stops testing truncation the moment the cap is
+ * raised past its fixture: the input is no longer over the limit, nothing is
+ * cut, and the assertion quietly becomes about nothing.
+ */
+export const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 250_000;
+// Filled user + project + session identity contracts (SESSION_IDENTITY_COMBINED_MAX_CHARS)
+// deliberately exceed this ceiling, so reaching it is expected rather than
+// exceptional. The default stays at the ceiling, and capCodexSdkContextInjection
+// spends any overflow on the user-authored identity block first so that stable
+// IM.codes runtime rules, supervision contracts and image reporting survive.
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const CODEX_COLLAB_MAX_RECEIVERS = 100;
@@ -86,7 +215,22 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
   'runtime/subagent/status',
 ]);
 
-const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
+const CODEX_TOOL_LIKE_ITEM_TYPES = new Set([
+  'commandExecution',
+  'mcpToolCall',
+  'customToolCall',
+  'custom_tool_call',
+  'customTool',
+  'custom_tool',
+]);
+const CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT = 2_000;
+type CodexAppServerDisconnectClass =
+  | 'intentional_shutdown'
+  | 'auth_refresh_restart'
+  | 'unexpected_eof'
+  | 'unexpected_crash'
+  | 'no_current_work_disconnect';
+
 const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'subagentnotification',
   'subagentstatus',
@@ -94,6 +238,76 @@ const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'runtimesubagentnotification',
 ]);
 const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
+
+/**
+ * Native collaboration calls other than spawn. The adapter sees an item only
+ * after the tool already ran, so these are projected for observability. The
+ * enforcing boundary is the per-thread fence (`startNewThread`): a managed
+ * session's thread has no multi-agent tools at all. What the relay still
+ * observes in a managed session is evidence of an unproven fence, recorded and
+ * turn-stopped by src/daemon/native-collaboration-guard.ts.
+ *
+ * They were previously dropped on the floor, which is how a Brain could really
+ * call list_agents + followup_task and leave no tool.call in the timeline at
+ * all; the resulting blank window was then mistaken for a fabricated claim.
+ */
+const CODEX_NATIVE_COLLAB_FUNCTION_NAMES = new Set([
+  'list_agents', 'listAgents',
+  'followup_task', 'followupTask',
+  'send_message', 'sendMessage',
+  'wait_agent', 'waitAgent',
+  'interrupt_agent', 'interruptAgent',
+]);
+
+/** Native collaboration carries no IM.codes task authority. */
+const CODEX_NATIVE_COLLAB_DURABILITY = 'non_durable';
+
+/** Exact IM MCP server and the tools a Brain needs to delegate authoritatively. */
+const IMCODES_DELEGATION_MCP_SERVER = IMCODES_MEMORY_MCP_SERVER_NAME;
+const IMCODES_DELEGATION_REQUIRED_TOOLS = ['send_list_targets', 'send_message'] as const;
+
+/**
+ * Whether one `mcpServerStatus/list` entry proves the IM.codes server connected.
+ *
+ * An explicit `runtimeStatus` is authoritative in both directions: only
+ * `connected` passes, and `starting`, `failed` or anything else fails closed
+ * however healthy the other fields look. codex-cli 0.144.1 -- the version this
+ * repository's lockfile pins -- omits `runtimeStatus` entirely for
+ * `detail: toolsAndAuthOnly`; there the completed MCP initialize handshake
+ * (`serverInfo`) is the proof. Requiring the field unconditionally refused every
+ * restored Brain turn on that version while the server was up with both tools.
+ * The exact-tools rule is applied separately, whichever proof was used.
+ */
+function imcodesDelegationServerConnected(server: Record<string, unknown>): boolean {
+  if (server.runtimeStatus !== undefined) {
+    return meaningfulString(server.runtimeStatus) === 'connected';
+  }
+  return isRecord(server.serverInfo);
+}
+/** Bounded pagination: this is one authoritative snapshot per turn, not polling. */
+const MCP_STATUS_PAGE_LIMIT = 20;
+const CODEX_MCP_RPC_METHOD = {
+  RELOAD: 'config/mcpServer/reload',
+  TOOL_CALL: 'mcpServer/tool/call',
+  STATUS_LIST: 'mcpServerStatus/list',
+  STATUS_UPDATED: 'mcpServer/startupStatus/updated',
+} as const;
+const CODEX_MCP_TERMINAL_STARTUP_STATUS = new Set(['failed', 'cancelled']);
+/** Bound on the pre-turn IM transport probe; a slow answer is "alive", not "dead". */
+const CODEX_IM_MCP_PROBE_TIMEOUT_MS = 2_000;
+// Launch-path requests to the app-server that used to wait forever on a wedged child: a hung
+// `initialize` blocked every session launch on the shared app-server, and a hung
+// `thread/unsubscribe` blocked ending (and therefore relaunching) a session.
+export const CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS = 20_000;
+export const CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
+
+export class ImcodesDelegationUnavailableError extends Error {
+  constructor() {
+    // Deliberately opaque: never leak server errors or private MCP config.
+    super(IMCODES_DELEGATION_UNAVAILABLE_MESSAGE);
+    this.name = 'ImcodesDelegationUnavailableError';
+  }
+}
 const CODEX_RAW_CHECKLIST_FUNCTION_NAMES = new Set([
   'todowrite',
   'todo_write',
@@ -108,90 +322,445 @@ const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
 const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
 const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
 const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
-
-function readBoundedIntegerEnv(
-  envName: string,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  const raw = process.env[envName];
-  if (raw === undefined || raw.trim() === '') return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
-  if (parsed < min) return min;
-  if (parsed > max) return max;
-  return parsed;
-}
+// Lightweight per-turn rollout tail poll whose only job is to catch app-server
+// zombie turns fast (settle from core's `task_complete`). A tail read is far
+// cheaper than a `thread/read` RPC, so this runs on a short cadence for the whole
+// turn instead of piggybacking the ~20s heartbeat — bounding zombie recovery to
+// a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
+// (so healthy, actively-streaming turns never touch the file).
+const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
+// Store-driven health-poll BACKSTOP grace. The runtime also owns an independent
+// 2s poll with a 2s grace so a provider-side watcher teardown cannot leave a
+// false-working turn visible for a whole health cycle. This longer default is
+// retained for callers that do not carry the runtime's generation/ownership
+// evidence.
+const CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS = 90_000;
+// ROLLOUT-FIRST AUTHORITY: codex-core writes a terminal `task_complete{turn_id}`
+// to the thread's rollout the instant the model finishes a turn — empirically
+// ~2s BEFORE the process would even exit, and terminal in 2813/2813 sampled
+// turns. We attach a real-time `fs.watch` to that file so a dropped or absent
+// app-server `turn/completed` costs ~0ms instead of 60s+ (or forever on a hard
+// zombie). Unlike the legacy settle poll, this path has NO 60s silence gate and
+// does NOT depend on the heartbeat lease or any further app-server notification:
+// the kernel wakes us on the append, and the rollout record is authoritative
+// terminal evidence for that exact turn. The debounce only coalesces the burst
+// of change events that a single append can trigger.
+const CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS = 40;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
 
 interface CodexRawSpawnAgentCall {
   sessionId: string;
   callId: string;
   args: Record<string, any>;
+  startedAtMs: number;
+}
+
+interface CodexCustomToolLifecycle {
+  tool: ToolCallEvent;
+  terminal: boolean;
 }
 
 interface CodexTrackedSubagentThread {
   sessionId: string;
   callId: string;
   agentId: string;
+  /** Stable orchestration path (for example `/root/disk_deep_audit`). */
+  agentPath?: string;
   agentName?: string;
   prompt?: string;
   model?: string;
   lastStatus?: unknown;
   usageTotalTokens?: number;
+  rolloutPath?: string;
+  startedAtMs?: number;
+}
+
+interface CodexChildSubagentRolloutSnapshot {
+  agentId: string;
+  agentPath?: string;
+  parentThreadId: string;
+  rolloutPath: string;
+  cwd?: string;
+  imcodesSessionName?: string;
+  agentName?: string;
+  prompt?: string;
+  model?: string;
+  completed: boolean;
+  output?: string;
+  usageTotalTokens?: number;
+  startedAtMs?: number;
 }
 
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  if (err instanceof Error) return err.message;
+  if (isRecord(err) && typeof err.message === 'string') return err.message;
+  return String(err);
 }
 
-function getCodexHome(env: Record<string, string | undefined>): string {
-  return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
-    ? resolve(env.CODEX_HOME.trim())
-    : resolve(homedir(), '.codex');
-}
+// Rollout path helpers (getCodexHome, recentCodexSessionDirs, and the
+// age/timezone-robust findCodexRolloutPathByUuid) are shared via
+// ../../util/codex-rollout-path.ts — do not re-implement per-provider.
 
-function codexSessionDir(codexHome: string, date: Date): string {
-  const yyyy = date.getUTCFullYear();
-  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(date.getUTCDate()).padStart(2, '0');
-  return join(codexHome, 'sessions', String(yyyy), mm, dd);
-}
-
-function recentCodexSessionDirs(codexHome: string): string[] {
-  const dirs: string[] = [];
-  for (let i = 0; i < 30; i += 1) {
-    dirs.push(codexSessionDir(codexHome, new Date(Date.now() - i * 86_400_000)));
+function parseCodexRolloutJsonLine(line: string): Record<string, any> | null {
+  if (!line.trim()) return null;
+  try {
+    const parsed = JSON.parse(line);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
-  return dirs;
 }
 
-async function findCodexRolloutPathByUuid(env: Record<string, string | undefined>, uuid: string): Promise<string | null> {
-  const codexHome = getCodexHome(env);
-  let latestPath: string | null = null;
-  let latestMtime = -1;
-  for (const dir of recentCodexSessionDirs(codexHome)) {
-    let entries: string[];
-    try {
-      entries = await readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const name of entries) {
-      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl') || !name.includes(uuid)) continue;
-      const candidate = join(dir, name);
-      try {
-        const info = await stat(candidate);
-        if (info.mtimeMs > latestMtime) {
-          latestMtime = info.mtimeMs;
-          latestPath = candidate;
-        }
-      } catch {
+function codexRolloutPayload(record: Record<string, any>): Record<string, any> {
+  return isRecord(record.payload) ? record.payload : record;
+}
+
+function readCodexChildSubagentSpawn(payload: Record<string, any>): {
+  parentThreadId: string;
+  agentId?: string;
+  agentPath?: string;
+  agentName?: string;
+} | null {
+  const source = isRecord(payload.source) ? payload.source : undefined;
+  const subagent = isRecord(source?.subagent) ? source.subagent : undefined;
+  const spawn = isRecord(subagent?.thread_spawn) ? subagent.thread_spawn : undefined;
+  const parentThreadId = meaningfulString(spawn?.parent_thread_id)
+    ?? meaningfulString(spawn?.parentThreadId);
+  if (!parentThreadId) return null;
+  const agentId = meaningfulString(payload.id)
+    ?? meaningfulString(spawn?.agent_id)
+    ?? meaningfulString(spawn?.agentId)
+    ?? meaningfulString(spawn?.thread_id)
+    ?? meaningfulString(spawn?.threadId)
+    ?? meaningfulString(spawn?.agent_path)
+    ?? meaningfulString(spawn?.agentPath);
+  const agentPath = meaningfulString(spawn?.agent_path)
+    ?? meaningfulString(spawn?.agentPath);
+  const agentName = meaningfulString(payload.agent_nickname)
+    ?? meaningfulString(spawn?.agent_nickname)
+    ?? meaningfulString(spawn?.agentNickname)
+    ?? meaningfulString(payload.agent_role)
+    ?? meaningfulString(spawn?.agent_role)
+    ?? meaningfulString(spawn?.agentRole);
+  return {
+    parentThreadId,
+    ...(agentId ? { agentId } : {}),
+    ...(agentPath ? { agentPath } : {}),
+    ...(agentName ? { agentName } : {}),
+  };
+}
+
+function readCodexRolloutUserMessage(payload: Record<string, any>): string | undefined {
+  if (payload.type === 'user_message') return meaningfulString(payload.message);
+  if (payload.type !== 'message' || payload.role !== 'user') return undefined;
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!isRecord(item)) continue;
+    const text = meaningfulString(item.text);
+    if (text) parts.push(text);
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function readCodexRolloutUsageTotalTokens(payload: Record<string, any>): number | undefined {
+  if (payload.type !== 'token_count') return undefined;
+  const info = isRecord(payload.info) ? payload.info : undefined;
+  const total = isRecord(info?.total_token_usage) ? info.total_token_usage : undefined;
+  return finiteNumber(total?.total_tokens);
+}
+
+function readCodexRolloutBaseInstructionsText(payload: Record<string, any>): string | undefined {
+  const baseInstructions = payload.base_instructions;
+  if (typeof baseInstructions === 'string') return meaningfulString(baseInstructions);
+  if (isRecord(baseInstructions)) return meaningfulString(baseInstructions.text);
+  return meaningfulString(payload.instructions);
+}
+
+function readImcodesSessionNameFromBaseInstructions(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const match = /(?:^|\n)\s*-\s*Exact session name:\s*([^\n]+)/.exec(text)
+    ?? /(?:^|\n)\s*Exact session name:\s*([^\n]+)/.exec(text);
+  if (!match) return undefined;
+  return match[1]?.trim().replace(/^`|`$/g, '') || undefined;
+}
+
+function childSubagentIdFromRolloutPath(path: string): string | undefined {
+  const match = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
+  return match?.[1];
+}
+
+/**
+ * The fields one rollout scan accumulates.
+ *
+ * Every one of them folds over a PREFIX of the file: `cwd`, `prompt`, `model`,
+ * `imcodesSessionName` and `startedAtMs` keep their first value, `spawn` and
+ * `usageTotalTokens` keep their last, and `completed`/`output` latch once
+ * `task_complete` appears. Because no field can be un-set by a later line,
+ * folding bytes [0, n) then bytes [n, m) gives the same answer as folding
+ * [0, m) in one go -- which is what makes resuming from a byte offset sound.
+ */
+interface CodexRolloutFold {
+  spawn: ReturnType<typeof readCodexChildSubagentSpawn>;
+  prompt?: string;
+  model?: string;
+  cwd?: string;
+  imcodesSessionName?: string;
+  completed: boolean;
+  output?: string;
+  usageTotalTokens?: number;
+  startedAtMs?: number;
+}
+
+interface CodexRolloutScan {
+  /** File size the fold was last advanced to. */
+  size: number;
+  mtimeMs: number;
+  /** Bytes already consumed, including the carried `partial` below. */
+  offset: number;
+  /**
+   * Trailing bytes after the last newline, not yet folded.
+   *
+   * Kept as bytes rather than a string on purpose: a read can stop in the
+   * middle of a multi-byte character, and decoding that eagerly would bake a
+   * replacement character into the carried line.
+   */
+  partial: Buffer;
+  fold: CodexRolloutFold;
+}
+
+/**
+ * Resumable rollout scans, keyed by path.
+ *
+ * Before this, every poll re-read and re-`JSON.parse`d each admitted rollout
+ * from byte zero, and discovery ran twice per tick, so each file was folded
+ * twice. Replayed against one developer's real `~/.codex/sessions` (5.8 GB,
+ * ~4500 files), a poll admitting 6 files totalling 417 MB cost ~4630 ms of
+ * synchronous parsing per tick -- against a 2000 ms interval, per Codex
+ * session, on the daemon's main thread. The same replay with this cache costs
+ * ~1210 ms once to warm and ~9.5 ms per tick thereafter.
+ *
+ * The cost also grew without bound: it scales with rollout size, and rollouts
+ * only ever get longer.
+ *
+ * `codex-watcher.ts` already advances a `fileOffset` over these same files and
+ * `gemini-watcher.ts` already short-circuits on unchanged size/mtime; this
+ * brings the subagent snapshot in line with both.
+ */
+const codexRolloutScans = new Map<string, CodexRolloutScan>();
+const CODEX_ROLLOUT_SCAN_CACHE_MAX = 512;
+const CODEX_ROLLOUT_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+function emptyCodexRolloutFold(): CodexRolloutFold {
+  return { spawn: null, completed: false };
+}
+
+function foldCodexRolloutLine(fold: CodexRolloutFold, line: string): void {
+  const record = parseCodexRolloutJsonLine(line);
+  if (!record) return;
+  if (fold.startedAtMs === undefined) {
+    const timestamp = meaningfulString(record.timestamp);
+    const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
+    if (Number.isFinite(parsedTimestamp)) fold.startedAtMs = parsedTimestamp;
+  }
+  const payload = codexRolloutPayload(record);
+  const nextSpawn = readCodexChildSubagentSpawn(payload);
+  if (nextSpawn) fold.spawn = nextSpawn;
+  if (!fold.cwd) fold.cwd = meaningfulString(payload.cwd);
+  if (!fold.imcodesSessionName) {
+    fold.imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
+      readCodexRolloutBaseInstructionsText(payload),
+    );
+  }
+  if (!fold.prompt) fold.prompt = readCodexRolloutUserMessage(payload);
+  if (!fold.model) fold.model = meaningfulString(payload.model);
+  const totalTokens = readCodexRolloutUsageTotalTokens(payload);
+  if (totalTokens !== undefined) fold.usageTotalTokens = totalTokens;
+  if (payload.type === 'task_complete') {
+    fold.completed = true;
+    fold.output = meaningfulString(payload.last_agent_message)
+      ?? meaningfulString(payload.result)
+      ?? meaningfulString(payload.message)
+      ?? 'completed';
+  }
+}
+
+function rememberCodexRolloutScan(rolloutPath: string, scan: CodexRolloutScan): void {
+  // Re-insert to refresh recency, then evict oldest-first. Thousands of rollout
+  // files accumulate on a working machine, so this must not grow with the
+  // archive -- only with the rollouts actually being polled.
+  codexRolloutScans.delete(rolloutPath);
+  codexRolloutScans.set(rolloutPath, scan);
+  while (codexRolloutScans.size > CODEX_ROLLOUT_SCAN_CACHE_MAX) {
+    const oldest = codexRolloutScans.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    codexRolloutScans.delete(oldest);
+  }
+}
+
+/**
+ * Advance (or reuse) the fold for one rollout file.
+ *
+ * Unchanged size AND mtime means the previous fold is still exact and nothing
+ * is read at all. Growth reads only the appended bytes. Anything else -- a
+ * shrink, a replacement, a rewrite in place -- restarts from zero, because
+ * only append-only growth is safely resumable and rollouts are append-only.
+ *
+ * Reads are chunked, so peak allocation stays bounded by the chunk size plus
+ * one line no matter how large the rollout has grown. A first scan is still
+ * O(file); what disappears is paying that cost again on every tick.
+ */
+async function advanceCodexRolloutScan(rolloutPath: string): Promise<CodexRolloutFold | null> {
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const info = await stat(rolloutPath);
+    size = info.size;
+    mtimeMs = info.mtimeMs;
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+
+  const cached = codexRolloutScans.get(rolloutPath);
+  if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
+    rememberCodexRolloutScan(rolloutPath, cached);
+    return finishCodexRolloutFold(cached);
+  }
+
+  // Copy the fold rather than aliasing the cached one: two sessions can poll
+  // the same rollout concurrently, and each in-flight scan must own its
+  // accumulator instead of advancing a shared object at a different offset.
+  const scan: CodexRolloutScan = cached && size >= cached.size
+    ? { ...cached, size, mtimeMs, fold: { ...cached.fold } }
+    : { size, mtimeMs, offset: 0, partial: Buffer.alloc(0), fold: emptyCodexRolloutFold() };
+
+  let handle;
+  try {
+    handle = await open(rolloutPath, 'r');
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+  try {
+    const buffer = Buffer.allocUnsafe(CODEX_ROLLOUT_SCAN_CHUNK_BYTES);
+    while (scan.offset < size) {
+      const want = Math.min(CODEX_ROLLOUT_SCAN_CHUNK_BYTES, size - scan.offset);
+      const { bytesRead } = await handle.read(buffer, 0, want, scan.offset);
+      if (bytesRead <= 0) break;
+      scan.offset += bytesRead;
+      const pending = Buffer.concat([scan.partial, buffer.subarray(0, bytesRead)]);
+      const lastNewline = pending.lastIndexOf(0x0a);
+      if (lastNewline < 0) {
+        scan.partial = pending;
         continue;
       }
+      // Decode only up to the last newline: whatever follows may be half a
+      // character as well as half a line, and both must wait for more bytes.
+      const complete = pending.subarray(0, lastNewline).toString('utf8');
+      scan.partial = Buffer.from(pending.subarray(lastNewline + 1));
+      for (const line of complete.split('\n')) foldCodexRolloutLine(scan.fold, line);
     }
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
   }
-  return latestPath;
+
+  rememberCodexRolloutScan(rolloutPath, scan);
+  return finishCodexRolloutFold(scan);
+}
+
+/**
+ * The fold as of end-of-file, including any last line that has no newline yet.
+ *
+ * Codex appends a record and its newline separately, so the final line is
+ * routinely readable before it is terminated -- the previous whole-file read
+ * saw it, and dropping it would delay `task_complete` by a tick. It is folded
+ * into a copy so the persisted fold stays exactly "all complete lines", which
+ * is what the byte offset promises and what makes resuming safe.
+ */
+function finishCodexRolloutFold(scan: CodexRolloutScan): CodexRolloutFold {
+  if (scan.partial.length === 0) return scan.fold;
+  const withPartial: CodexRolloutFold = { ...scan.fold };
+  foldCodexRolloutLine(withPartial, scan.partial.toString('utf8'));
+  return withPartial;
+}
+
+async function readCodexChildSubagentRolloutSnapshot(
+  rolloutPath: string,
+  parentThreadId?: string,
+): Promise<CodexChildSubagentRolloutSnapshot | null> {
+  const fold = await advanceCodexRolloutScan(rolloutPath);
+  if (!fold) return null;
+  const {
+    spawn,
+    prompt,
+    model,
+    cwd,
+    imcodesSessionName,
+    completed,
+    output,
+    usageTotalTokens,
+    startedAtMs,
+  } = fold;
+  if (!spawn) return null;
+  if (parentThreadId && spawn.parentThreadId !== parentThreadId) return null;
+  const agentId = spawn.agentId ?? childSubagentIdFromRolloutPath(rolloutPath);
+  if (!agentId) return null;
+  return {
+    agentId,
+    ...(spawn.agentPath ? { agentPath: spawn.agentPath } : {}),
+    parentThreadId: spawn.parentThreadId,
+    rolloutPath,
+    ...(cwd ? { cwd } : {}),
+    ...(imcodesSessionName ? { imcodesSessionName } : {}),
+    ...(spawn.agentName ? { agentName: spawn.agentName } : {}),
+    ...(prompt ? { prompt } : {}),
+    ...(model ? { model } : {}),
+    completed,
+    ...(output ? { output } : {}),
+    ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+  };
+}
+
+/**
+ * Every child-subagent rollout touched since `minMtimeMs`, read once.
+ *
+ * This used to run twice per tick behind two predicates -- once matching the
+ * parent thread and once matching the session -- so every candidate file was
+ * walked, stat'd and folded twice to answer two questions about the same
+ * bytes. The predicates are pure functions of the snapshot, so they belong
+ * after the traversal, not around it.
+ */
+async function discoverCodexChildSubagentRolloutSnapshots(
+  env: Record<string, string | undefined>,
+  minMtimeMs: number,
+): Promise<CodexChildSubagentRolloutSnapshot[]> {
+  const codexHome = getCodexHome(env);
+  const snapshots: CodexChildSubagentRolloutSnapshot[] = [];
+  const minMtimeWithSkew = minMtimeMs - CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS;
+  const rolloutPaths = await codexRolloutIndex.listSince(codexHome, recentCodexSessionDirs(codexHome), minMtimeWithSkew);
+  for (const rolloutPath of rolloutPaths) {
+    const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
+    if (snapshot) snapshots.push(snapshot);
+  }
+  return snapshots;
+}
+
+function codexChildSubagentRolloutMatchesSession(
+  snapshot: CodexChildSubagentRolloutSnapshot,
+  sessionId: string,
+  ...cwds: Array<string | undefined>
+): boolean {
+  if (snapshot.imcodesSessionName !== sessionId) return false;
+  if (!snapshot.cwd) return true;
+  const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
+  return cwds.some((cwd) => !!cwd && (normalizeTransportCwd(cwd) ?? cwd) === snapshotCwd);
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -199,6 +768,13 @@ function isCodexAuthFailureMessage(message: string): boolean {
     || /Missing bearer or basic authentication/i.test(message)
     || /not authenticated/i.test(message)
     || /authentication required/i.test(message);
+}
+
+function appendCodexAuthRecoveryGuidance(message: string, guidance: string): string {
+  const trimmed = message.trim();
+  if (!trimmed) return guidance;
+  if (trimmed.includes(guidance)) return trimmed;
+  return `${trimmed}\n${guidance}`;
 }
 
 function getCodexAuthPath(env: Record<string, string | undefined>): string {
@@ -215,7 +791,42 @@ async function readCodexAuthFingerprint(env: Record<string, string | undefined>)
   }
 }
 
+/** A correlated JSON-RPC error proves refusal, unlike disconnect/timeout. */
+class CodexRpcResponseError extends Error {}
+
+class CodexMalformedRpcResponseError extends Error {
+  constructor(
+    readonly requestId: number,
+    readonly method: string,
+  ) {
+    super(`Codex app-server returned malformed JSON for request ${method} (id ${requestId})`);
+    this.name = 'CodexMalformedRpcResponseError';
+  }
+}
+
+/**
+ * Codex's `thread/resume` answer for a thread that was started but never ran a
+ * turn: the rollout is written lazily on the first turn, so no history exists.
+ *
+ * A thread id is recorded as soon as `thread/start` returns, so any failure
+ * before the first `turn/start` leaves exactly this behind. Field incident: an
+ * interrupted restore started a fresh thread whose first turn was refused
+ * before turn/start; every later resume then failed with this message and the
+ * session could not run again until its record was edited by hand. Replacing
+ * such a thread loses nothing -- there is no history to lose.
+ *
+ * Deliberately exact: a rollout that EXISTS but cannot be opened is a different
+ * failure, and replacing that thread would silently abandon real history.
+ */
+function isCodexThreadNeverMaterializedError(err: unknown): boolean {
+  const message = isRecord(err) && typeof err.message === 'string'
+    ? err.message
+    : errorMessage(err);
+  return /\bno rollout found for thread id\b/i.test(message);
+}
+
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
+  if (err instanceof CodexMalformedRpcResponseError && err.method === 'thread/resume') return true;
   const message = errorMessage(err).toLowerCase();
   return (
     message.includes('failed to read thread')
@@ -225,6 +836,19 @@ function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
       || message.includes('valid utf-8')
     )
   );
+}
+
+function extractMalformedJsonRpcRequestId(line: string): number | null {
+  const match = /^\{\s*"id"\s*:\s*(0|[1-9]\d*)\s*(?:,|\})/.exec(line);
+  if (!match) return null;
+  const requestId = Number(match[1]);
+  return Number.isSafeInteger(requestId) ? requestId : null;
+}
+
+function summarizeJsonParseError(err: unknown): string {
+  const name = err instanceof Error && err.name ? err.name : 'Error';
+  const position = /\bposition\s+(\d+)\b/i.exec(errorMessage(err))?.[1];
+  return position ? `${name} at position ${position}` : name;
 }
 
 function extractCodexJsonlPath(message: string): string | null {
@@ -272,46 +896,51 @@ function getCodexSdkContextInjectionMaxChars(): number {
   return parsed;
 }
 
-function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
-  if (text.length <= maxChars) return text;
-  const marker = `\n\n[IM.codes: injected context truncated from ${text.length} to ${maxChars} chars to prevent SDK auto-compaction.]`;
-  if (maxChars <= marker.length + 16) return text.slice(0, maxChars);
-  return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+const CODEX_CONTEXT_CAP_MARKERS: PriorityPreservingCapMarkers = {
+  identityTruncated: (bodyLength, maxChars) => `\n[IM.codes: agent identity truncated from ${bodyLength} to fit the ${maxChars}-char Codex context budget; IM.codes system and supervision instructions were preserved.]\n`,
+  contextTruncated: (length, maxChars) => `\n\n[IM.codes: injected context truncated from ${length} to ${maxChars} chars to prevent SDK auto-compaction.]`,
+};
+
+function capCodexSdkContextInjection(text: SpannedText | string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
+  // Codex measures its budget in UTF-16 units, matching the string length it receives.
+  return capContextPreservingPriority(text, maxChars, 'utf16', CODEX_CONTEXT_CAP_MARKERS);
 }
 
-function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: string): string {
-  const contextParts: string[] = [];
+function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: SpannedText): string {
   const split = getProviderSystemTextParts(payload);
-  const systemText = split.hasSplitSystemText
-    ? composeProviderSystemText(payload, { includeSession: false, includeTurn: true })
-    : payload.systemText?.trim();
+  // Turn text never carries the identity span: authored turn context is exactly
+  // the kind of content a forged identity delimiter would hide in. In the legacy
+  // combined view the span is honoured only after hash verification.
+  const systemText: SpannedText | undefined = split.hasSplitSystemText
+    ? joinSpanned([composeProviderSystemText(payload, { includeSession: false, includeTurn: true })], '')
+    : composeProviderSystemTextSpanned(payload);
   const messagePreamble = payload.messagePreamble?.trim();
-  const stableUpdate = sessionSystemTextUpdate?.trim();
-  if (stableUpdate) {
-    contextParts.push(`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n${stableUpdate}`);
-  }
-  if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
-  if (messagePreamble) contextParts.push(messagePreamble);
-  if (contextParts.length === 0) return payload.assembledMessage;
+  const stableUpdate = sessionSystemTextUpdate?.text.trim() ? sessionSystemTextUpdate : undefined;
+  const contextText = joinSpanned([
+    stableUpdate ? joinSpanned([`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n`, stableUpdate], '') : undefined,
+    systemText ? joinSpanned(['Context instructions:\n', systemText], '') : undefined,
+    messagePreamble,
+  ], '\n\n');
+  if (!contextText) return payload.assembledMessage;
 
-  const contextText = capCodexSdkContextInjection(contextParts.join('\n\n'));
+  const cappedContextText = capCodexSdkContextInjection(contextText);
   const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
   const trimmedUserMessage = userMessage.trim();
-  return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+  return trimmedUserMessage ? `${cappedContextText}\n\n${trimmedUserMessage}` : cappedContextText;
 }
 
 function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
-  const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+  const sessionSystemText = getProviderSessionSystemTextSpanned(payload);
   // Generated Image Reporting belongs in Codex's baseInstructions tail
   // (Codex is currently the only transport agent with native image-gen
   // tools). Living here means: sent once per thread/start|resume, picked
   // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
   // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
   const imageReporting = buildGeneratedImageReportingPrompt();
-  const tailParts = [sessionSystemText, imageReporting].filter((s): s is string => Boolean(s));
-  if (tailParts.length === 0) return baseInstructions;
+  const tail = joinSpanned([sessionSystemText, imageReporting, CODEX_USER_INPUT_GUIDANCE], '\n\n');
+  if (!tail) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
-  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tail)}`;
 }
 
 function appendDetectedGeneratedImagePaths(content: string, paths: string[]): string {
@@ -373,7 +1002,7 @@ async function resolveBaseInstructionsOverride(model: string | undefined): Promi
 }
 
 type JsonRpcResponse = {
-  id?: number;
+  id?: number | string;
   result?: Record<string, any>;
   error?: { code?: number; message?: string; data?: unknown };
   method?: string;
@@ -381,6 +1010,7 @@ type JsonRpcResponse = {
 };
 
 type PendingRequest = {
+  method: string;
   resolve: (value: any) => void;
   reject: (error: Error) => void;
 };
@@ -390,31 +1020,169 @@ type GeneratedImageTrackingSnapshot = {
   knownPaths: Set<string>;
 };
 
+type HeartbeatThreadStatus = 'active' | 'idle' | 'notLoaded' | 'systemError' | 'unknown';
+type HeartbeatTurnStatus = 'active' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+type HeartbeatClassifier =
+  | 'active'
+  | 'idle_completed'
+  | 'idle_failed'
+  | 'idle_interrupted'
+  | 'idle_missing_turn'
+  | 'not_loaded_with_active_lease'
+  | 'start_grace'
+  | 'start_grace_expired_no_current_turn'
+  | 'system_error'
+  | 'malformed'
+  | 'oversized'
+  | 'missing_turn_list'
+  | 'ambiguous_current_turn'
+  | 'unknown_status'
+  | 'timeout'
+  | 'stale'
+  | 'local_terminal';
+type HeartbeatClassification =
+  | { outcome: 'active'; classifier: HeartbeatClassifier }
+  | { outcome: 'terminal'; classifier: HeartbeatClassifier; status: 'completed' | 'failed' | 'interrupted'; turnId?: string }
+  | { outcome: 'lost'; classifier: 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn' }
+  | { outcome: 'provider_error'; classifier: 'system_error' }
+  | { outcome: 'inconclusive' | 'degraded' | 'stale'; classifier: HeartbeatClassifier };
+
+interface HeartbeatTurnSummary {
+  id?: string;
+  status: HeartbeatTurnStatus;
+  current: boolean;
+  startedAtMs?: number;
+  updatedAtMs?: number;
+  completedAtMs?: number;
+}
+
+interface HeartbeatThreadSummary {
+  valid: boolean;
+  malformedReason?: Extract<HeartbeatClassifier, 'malformed' | 'oversized' | 'missing_turn_list' | 'ambiguous_current_turn'>;
+  threadStatus: HeartbeatThreadStatus;
+  turns: HeartbeatTurnSummary[];
+  requestStartedAtMs: number;
+  requestEndedAtMs: number;
+  rawTurnCount: number;
+}
+
+interface CodexRolloutTaskCompleteEvidence {
+  turnId: string;
+  lastAgentMessage?: string;
+}
+
+interface CodexRolloutTerminalEvidence extends CodexRolloutTaskCompleteEvidence {
+  /** Wall-clock ms of the rollout `task_complete` wrapper timestamp, or null if unparseable. */
+  completedAtMs: number | null;
+}
+
+interface CodexActiveTurnLease {
+  id: string;
+  attemptId: number;
+  localSessionKey: string;
+  sessionName?: string;
+  providerSessionId: string;
+  threadId: string;
+  turnId?: string;
+  activityGeneration?: ActivityGenerationLike;
+  startedAtMs: number;
+  turnStartInFlightAtMs?: number;
+  lastStrongActivityAtMs: number;
+  lastWeakActivityAtMs?: number;
+  lastHeartbeatAtMs?: number;
+  lastHeartbeatResponseAtMs?: number;
+  lastAliveHeartbeatAtMs?: number;
+  nextHeartbeatAtMs?: number;
+  heartbeatFailureCount: number;
+  heartbeatInFlight: boolean;
+  heartbeatTimer?: ReturnType<typeof setTimeout>;
+}
+
 export interface CodexDiscoveredModel {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: TransportEffortLevel[];
   isDefault?: boolean;
+}
+
+export interface CodexModelProviderConfig {
+  providerId: string;
+  baseUrl: string;
+  apiKey?: string;
+  wireApi?: 'responses';
+  httpHeaders?: Record<string, string>;
 }
 
 interface CodexSdkSessionState {
   routeId: string;
+  incognito?: boolean;
+  /**
+   * Authorized IM.codes dispatch facts observed in the CURRENT turn. This is
+   * the only evidence a delegation claim is ever built from; it is reset at
+   * turn start so a prior turn's dispatch can never substantiate a later one.
+   */
+  turnDelegationDispatches?: DelegationDispatchFact[];
+  imcodesSessionName?: string;
   cwd: string;
+  /**
+   * The cwd the latest turn was started in when it was not `cwd` (an open pair's
+   * workspace). Codex records it as the cwd of everything that turn spawns, so
+   * child-rollout matching must accept it next to the session's own.
+   */
+  turnCwd?: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
+  /** Custom model provider (third-party / OpenAI-compatible endpoint) */
+  customModelProvider?: CodexModelProviderConfig;
+  /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
+  imcodesMcpRecoveryRequired: boolean;
+  imcodesMcpRecoveryPromise?: Promise<void>;
   model?: string;
   effort?: TransportEffortLevel;
+  /**
+   * Codex's service tier for this thread. It is read rather than assumed: the
+   * tier is thread state, so a thread switched to Fast elsewhere comes back
+   * Fast on every resume.
+   */
+  serviceTier?: string;
   threadId?: string;
+  /**
+   * The native-agent fence of `threadId`, as this provider started it or as
+   * the thread's own rollout proves it. Codex fixes the fence when a thread is
+   * created, so the record is valid exactly for that thread id.
+   */
+  nativeAgentFence?: { threadId: string; fence: NativeAgentFence };
+  /** The fence of a `thread/start` in flight (no thread id yet). */
+  pendingThreadFence?: NativeAgentFence;
   loaded: boolean;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
+  turnDispatchGeneration: number;
+  currentTurnPayload?: ProviderContextPayload;
+  authRecoveryPending: boolean;
+  authRecoveryRetriesRemaining: number;
+  authRecoveryReplayUnsafe: boolean;
+  activeTurnLease?: CodexActiveTurnLease;
   turnStartInFlight: boolean;
   runningCompact: boolean;
+  /** True only for a user-issued standalone `/compact` transport turn. */
+  compactCommandInFlight: boolean;
   currentMessageId: string | null;
   currentText: string;
+  pendingAgentMessageQuestions?: { id: string; questions: NormalizedCodexAsyncQuestion[] };
   activeItemIds: Set<string>;
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
+  openProviderToolCalls: Map<string, ToolCallEvent>;
+  /**
+   * Correlates custom tool lifecycle across both app-server surfaces:
+   * `item/started|completed` and `rawResponseItem/completed`. Newer Codex
+   * versions can expose either channel (and occasionally both), so call_id is
+   * the canonical identity and this map prevents duplicate timeline cards.
+   */
+  customToolLifecycleByCallId: Map<string, CodexCustomToolLifecycle>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -447,14 +1215,13 @@ interface CodexSdkSessionState {
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
   completedTurnIds: Set<string>;
+  terminalDuringTurnStartIds: Set<string>;
   completedCompactTurnIds: Set<string>;
   terminatedTurnIds: Set<string>;
   terminatedCompactTurnIds: Set<string>;
-  // Debounced turn-end settle, armed when the thread reports idle and cancelled
-  // by any subsequent turn activity. Current Codex sometimes ends a turn with
-  // only a thread-idle status (no `turn/completed`); this fires that completion
-  // once the thread has been quiet for CODEX_IDLE_SETTLE_DEBOUNCE_MS, while a
-  // transient mid-turn idle is cancelled by the activity that follows it.
+  // App-server idle/completed hints are only deferred until active provider
+  // tools close; final turn completion still requires explicit `turn/completed`
+  // or rollout `task_complete` evidence for the current turn.
   idleSettleTimer?: ReturnType<typeof setTimeout>;
   idleSettleTurnId?: string;
   deferredIdleSettleTurnId?: string;
@@ -464,26 +1231,78 @@ interface CodexSdkSessionState {
   rawChecklistStartedAt: number;
   rawChecklistRolloutPath?: string;
   rawChecklistRolloutOffset?: number;
+  /** Guards the async rollout task_complete cross-check (one in flight per session). */
+  rolloutTaskCompleteCheckInFlight?: boolean;
   rawChecklistSeenCallIds: Set<string>;
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
+  rolloutSettlePollTimer: ReturnType<typeof setTimeout> | null;
+  /** ROLLOUT-FIRST AUTHORITY: real-time fs.watch on the thread's rollout file. */
+  rolloutAuthorityWatcher?: FSWatcher;
+  rolloutAuthorityWatchPath?: string;
+  /** Turn id the authority watcher is currently settling; re-armed when it changes. */
+  rolloutAuthorityTurnId?: string;
+  rolloutAuthorityDebounce?: ReturnType<typeof setTimeout>;
+  /** Guards the async path-resolution while (re)arming the authority watcher. */
+  rolloutAuthorityArmInFlight?: boolean;
+  childSubagentRolloutStartedAt: number;
+  childSubagentRolloutSeenIds: Set<string>;
+  childSubagentRolloutCompletedIds: Set<string>;
+  childSubagentRolloutScanPromise?: Promise<void>;
+  childSubagentRolloutTimer: ReturnType<typeof setTimeout> | null;
+  childSubagentRolloutPollUntil: number;
   /** Set once a native codex>=0.139 `turn/plan/updated` event has rendered the
    *  plan, so the legacy rollout-file scan is suppressed (no double-render). */
   nativePlanEventSeen?: boolean;
 }
 
-function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
-  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
-  if (!server) return undefined;
+/**
+ * Per-session identity for the model's SHELL tool.
+ *
+ * All codex-sdk sessions share ONE app-server process, so the daemon cannot put
+ * `IMCODES_SESSION` in the app-server's process env — every session's
+ * `imcodes send` would then impersonate a single identity. The `turn/start`
+ * `env` param we also send is silently dropped by codex 0.144.1 (only the
+ * one-off `command/exec` RPC accepts `env`; `TurnStartParams`/`ThreadStartParams`
+ * do not).
+ *
+ * `shell_environment_policy.set` DOES reach the shell tool and MERGES on top of
+ * the inherited environment (verified: PATH/HOME survive), and thread/start's
+ * `config` is applied PER-THREAD — so this gives each session's shell its own
+ * `IMCODES_SESSION` with no cross-session impersonation, making `imcodes send`
+ * auto-detect identity without the agent hand-setting it.
+ */
+function buildCodexShellEnvironmentSet(config: SessionConfig): Record<string, string> | undefined {
+  const env = config.env ?? {};
+  const sessionName = env[IMCODES_SESSION_ENV] ?? config.sessionName;
+  if (!sessionName) return undefined;
   return {
-    mcp_servers: {
-      [IMCODES_MEMORY_MCP_SERVER_NAME]: {
-        command: server.command,
-        args: server.args,
-        env: server.env,
+    [IMCODES_SESSION_ENV]: sessionName,
+    [IMCODES_SESSION_LABEL_ENV]: env[IMCODES_SESSION_LABEL_ENV] ?? config.label ?? sessionName,
+  };
+}
+
+export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
+  const server = config.incognito ? undefined : getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+  const shellEnvSet = buildCodexShellEnvironmentSet(config);
+  if (!server && !shellEnvSet) return undefined;
+  return {
+    ...(server ? {
+      mcp_servers: {
+        [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+          command: server.command,
+          args: server.args,
+          // The server is a child of the SHARED app-server and lives with this
+          // thread, which Codex keeps loaded across our session relaunch (a
+          // resume of a loaded thread never respawns MCP servers). Declare that,
+          // so relaunch cleanup and the orphan sweep never reap it by owner
+          // epoch and strand the thread on "Transport closed".
+          env: { ...server.env, [IMCODES_MCP_HOST_LIFETIME_ENV]: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST },
+        },
       },
-    },
+    } : {}),
+    ...(shellEnvSet ? { shell_environment_policy: { set: shellEnvSet } } : {}),
   };
 }
 
@@ -592,8 +1411,61 @@ function isThreadIdleStatus(status: string | undefined): boolean {
   return normalized === 'idle'
     || normalized === 'ready'
     || normalized === 'complete'
+    || normalized === 'completed';
+}
+
+function normalizeHeartbeatThreadStatus(status: string | undefined): HeartbeatThreadStatus {
+  const normalized = normalizeStatusName(status);
+  if (normalized === 'systemerror' || normalized === 'error') return 'systemError';
+  if (normalized === 'notloaded' || normalized === 'notfound' || normalized === 'unloaded') return 'notLoaded';
+  if (
+    normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'compacting'
+    || normalized === 'inprogress'
+  ) return 'active';
+  if (
+    normalized === 'idle'
+    || normalized === 'ready'
+    || normalized === 'complete'
     || normalized === 'completed'
-    || normalized === 'notloaded';
+  ) return 'idle';
+  return 'unknown';
+}
+
+function normalizeHeartbeatTurnStatus(status: string | undefined): HeartbeatTurnStatus {
+  const normalized = normalizeStatusName(status);
+  if (
+    normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'inprogress'
+    || normalized === 'pending'
+  ) return 'active';
+  if (
+    normalized === 'completed'
+    || normalized === 'complete'
+    || normalized === 'succeeded'
+    || normalized === 'success'
+    || normalized === 'done'
+  ) return 'completed';
+  if (normalized === 'failed' || normalized === 'error' || normalized === 'errored') return 'failed';
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) return 'interrupted';
+  return 'unknown';
+}
+
+function boundedTimestampMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.trunc(value);
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function meaningfulString(value: unknown): string | undefined {
@@ -601,6 +1473,19 @@ function meaningfulString(value: unknown): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
+}
+
+/** Codex's wording for an MCP server whose stdio transport is gone. */
+function isClosedMcpTransportMessage(message: string): boolean {
+  return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
+    || /MCP client is not connected/i.test(message);
+}
+
+function isImcodesMcpTransportClosedItem(item: Record<string, any>): boolean {
+  if (item.type !== 'mcpToolCall'
+    || meaningfulString(item.server) !== IMCODES_DELEGATION_MCP_SERVER
+    || meaningfulString(item.status) !== 'failed') return false;
+  return isClosedMcpTransportMessage(meaningfulString(item.error?.message) ?? meaningfulString(item.error) ?? '');
 }
 
 function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
@@ -787,6 +1672,17 @@ function readAgentMessageText(value: unknown): string | undefined {
   return parts.length > 0 ? parts.join('') : undefined;
 }
 
+function readRolloutTaskCompleteMessage(payload: Record<string, any>): string | undefined {
+  for (const key of ['last_agent_message', 'lastAgentMessage', 'result', 'message']) {
+    const value = payload[key];
+    const text = typeof value === 'string'
+      ? value
+      : readAgentMessageText(value);
+    if (typeof text === 'string' && text.trim()) return text;
+  }
+  return undefined;
+}
+
 function readTurnCompletedAgentMessage(turn: Record<string, any>): { id: string; text: string } | undefined {
   const items = Array.isArray(turn.items) ? turn.items : [];
   for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -882,6 +1778,13 @@ function readRuntimeSubagentUsageTotalTokens(record: Record<string, any>): numbe
     ?? finiteNumber(record.usage_total_tokens)
     ?? finiteNumber(record.totalTokens)
     ?? finiteNumber(record.total_tokens);
+}
+
+function readRuntimeSubagentBackgrounded(record: Record<string, any>): boolean {
+  return record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true
+    || record.detached === true;
 }
 
 function mapCodexRuntimeSubagentStatus(
@@ -1008,14 +1911,18 @@ function runtimeSubagentToolFromPayload(
   const model = readRuntimeSubagentModel(record);
   const prompt = readRuntimeSubagentPrompt(record);
   const usageTotalTokens = readRuntimeSubagentUsageTotalTokens(record);
+  const backgrounded = readRuntimeSubagentBackgrounded(record);
+  const startedAtMs = readSdkSubagentStartedAtMs(record) ?? readSdkSubagentStartedAtMs(payload);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
+  const fullRequest = readSdkSubagentFullRequest(record);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
     input: {
       action: 'codex-runtime-subagent',
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -1033,8 +1940,9 @@ function runtimeSubagentToolFromPayload(
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
-      ...(record.backgrounded === true ? { backgrounded: true } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
       ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+      ...(startedAtMs !== undefined ? { startedAtMs } : {}),
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -1075,6 +1983,195 @@ function parseJsonRecord(value: unknown): Record<string, any> | undefined {
   } catch {
     return undefined;
   }
+}
+
+function customToolOutputText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (isRecord(parsed) || Array.isArray(parsed)) return customToolOutputText(parsed);
+      } catch {}
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => customToolOutputText(entry))
+      .filter((entry): entry is string => entry !== undefined);
+    return parts.length > 0 ? parts.join('\n') : undefined;
+  }
+  if (!isRecord(value)) return value === undefined || value === null ? undefined : String(value);
+
+  for (const key of ['text', 'output', 'content', 'value', 'message']) {
+    const text = customToolOutputText(value[key]);
+    if (text !== undefined) return text;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function customToolOutputRecords(value: unknown): Record<string, any>[] {
+  if (Array.isArray(value)) return value.flatMap((entry) => customToolOutputRecords(entry));
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return customToolOutputRecords(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!isRecord(value)) return [];
+  const nested = [value.output, value.content, value.result, value.metadata]
+    .flatMap((entry) => customToolOutputRecords(entry));
+  return [value, ...nested];
+}
+
+function customToolTerminalFromOutput(item: Record<string, any>): {
+  status: Exclude<ToolCallEvent['status'], 'running'>;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  output: string;
+} {
+  const rawOutput = item.output ?? item.result ?? item.content ?? item.error;
+  const output = customToolOutputText(rawOutput) ?? '';
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const records = [
+    item,
+    ...customToolOutputRecords(rawOutput),
+    ...customToolOutputRecords(item.metadata),
+  ];
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted'
+    || records.some((record) => record.cancelled === true || record.canceled === true || record.interrupted === true)
+    || /^script (?:cancelled|canceled|interrupted|aborted)\b/im.test(output);
+  if (cancelled) {
+    return {
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: normalizedStatus === 'interrupted' ? 'provider_interrupted' : 'provider_cancelled',
+      output,
+    };
+  }
+
+  const failed = normalizedStatus === 'failed'
+    || normalizedStatus === 'error'
+    || normalizedStatus === 'errored'
+    || (item.error !== undefined && item.error !== null)
+    || records.some((record) => {
+      const exitCode = finiteNumber(record.exit_code) ?? finiteNumber(record.exitCode);
+      return record.is_error === true
+        || record.isError === true
+        || record.success === false
+        || (exitCode !== undefined && exitCode !== 0)
+        || (record.error !== undefined && record.error !== null);
+    })
+    || /^script failed\b/im.test(output);
+  return failed
+    ? { status: 'error', terminalStatus: 'errored', terminalReason: 'provider_error', output }
+    : { status: 'complete', terminalStatus: 'succeeded', terminalReason: 'provider_result', output };
+}
+
+function codexCustomToolScript(tool: ToolCallEvent | undefined): string | undefined {
+  const input = isRecord(tool?.input) ? tool.input : undefined;
+  return meaningfulString(input?.command) ?? meaningfulString(input?.script);
+}
+
+function readCodexExecCommandDescription(script: string): string | undefined {
+  const match = script.match(/\bcmd\s*:\s*("(?:\\.|[^"\\])*")/s);
+  if (!match?.[1]) return undefined;
+  try {
+    return sanitizeSdkSubagentText(JSON.parse(match[1]), 180);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCodexBackgroundExecSessionId(value: unknown, depth = 0): string | undefined {
+  if (depth > 5 || value == null) return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
+    try {
+      return readCodexBackgroundExecSessionId(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const sessionId = readCodexBackgroundExecSessionId(entry, depth + 1);
+      if (sessionId) return sessionId;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+
+  const sessionId = finiteNumber(value.session_id) ?? meaningfulString(value.session_id);
+  const chunkId = meaningfulString(value.chunk_id);
+  if (sessionId !== undefined && chunkId) return String(sessionId);
+
+  for (const key of ['text', 'output', 'content', 'result']) {
+    const nestedSessionId = readCodexBackgroundExecSessionId(value[key], depth + 1);
+    if (nestedSessionId) return nestedSessionId;
+  }
+  return undefined;
+}
+
+function codexBackgroundShellToolFromCustomToolOutput(
+  sessionId: string,
+  prior: ToolCallEvent | undefined,
+  outputItem: Record<string, any>,
+): ToolCallEvent | null {
+  const script = codexCustomToolScript(prior);
+  if (!script || !/\btools\.exec_command\s*\(/.test(script)) return null;
+  const runtimeSessionId = readCodexBackgroundExecSessionId(
+    outputItem.output ?? outputItem.result ?? outputItem.content,
+  );
+  if (!runtimeSessionId) return null;
+
+  const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `shell:${runtimeSessionId}`);
+  const description = readCodexExecCommandDescription(script) ?? 'Bash';
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: description,
+    input: {
+      action: SDK_SUBAGENT_ACTIONS.CODEX_BACKGROUND_SHELL,
+      description,
+    },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+      canonicalKey,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      parentSessionId: sessionId,
+      parentItemId: meaningfulString(prior?.id),
+      taskId: runtimeSessionId,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      startedAtMs: Date.now(),
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: canonicalKey,
+    name: 'Bash',
+    status: 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    detail,
+  };
 }
 
 function rawChecklistText(item: Record<string, unknown>): string | undefined {
@@ -1187,11 +2284,34 @@ function readRawSpawnAgentId(record: Record<string, any>): string | undefined {
     ?? meaningfulString(record.id);
 }
 
+function readRawSpawnAgentPath(
+  call: CodexRawSpawnAgentCall,
+  output: Record<string, any>,
+): string | undefined {
+  // Codex collaboration v2 returns only `task_name: "/root/<name>"`; older
+  // builds returned a UUID in `agent_id`. Keep the orchestration path as the
+  // stable UI identity and use the UUID separately for runtime correlation.
+  const outputPath = meaningfulString(output.task_name)
+    ?? meaningfulString(output.taskName)
+    ?? meaningfulString(output.agent_path)
+    ?? meaningfulString(output.agentPath);
+  if (outputPath) return outputPath;
+  // An input task name is only a requested path. Treat it as accepted when an
+  // older successful response supplied a runtime id; otherwise a failed spawn
+  // would be misreported as a running child.
+  if (!readRawSpawnAgentId(output)) return undefined;
+  return meaningfulString(call.args.task_name)
+    ?? meaningfulString(call.args.taskName)
+    ?? meaningfulString(call.args.agent_path)
+    ?? meaningfulString(call.args.agentPath);
+}
+
 function buildRawSpawnAgentRuntimePayload(
   call: CodexRawSpawnAgentCall,
   output: Record<string, any>,
 ): Record<string, any> {
   const agentId = readRawSpawnAgentId(output);
+  const agentPath = readRawSpawnAgentPath(call, output);
   const agentName = meaningfulString(output.nickname)
     ?? meaningfulString(output.name)
     ?? meaningfulString(call.args.nickname)
@@ -1201,16 +2321,25 @@ function buildRawSpawnAgentRuntimePayload(
   const prompt = meaningfulString(call.args.message)
     ?? meaningfulString(call.args.prompt)
     ?? meaningfulString(call.args.instructions);
+  // The display prompt above is capped; classification needs the whole request.
+  const fullRequest = readSdkSubagentFullRequest({
+    message: call.args.message,
+    prompt: call.args.prompt,
+    instructions: call.args.instructions,
+  });
   const model = meaningfulString(call.args.model)
     ?? meaningfulString(call.args.agentId)
     ?? meaningfulString(call.args.agent_id);
   return {
     ...(agentId ? { agent_id: agentId } : {}),
+    ...(agentPath ? { agent_path: agentPath } : {}),
     status: 'running',
     ...(agentName ? { nickname: agentName } : {}),
     ...(prompt ? { prompt } : {}),
+    ...(fullRequest ? { full_request: fullRequest } : {}),
     ...(model ? { model } : {}),
     backgrounded: true,
+    startedAtMs: call.startedAtMs,
   };
 }
 
@@ -1247,6 +2376,7 @@ function collabAgentToolFromItem(
     : statusMapping.toolStatus === 'error'
       ? (statusMapping.diagnosticCode ? 'diagnostic' : 'failed')
       : undefined;
+  const fullRequest = readSdkSubagentFullRequest(item);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
@@ -1254,6 +2384,7 @@ function collabAgentToolFromItem(
       action: 'codex-collaboration',
       receiverCount,
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -1283,6 +2414,79 @@ function collabAgentToolFromItem(
     ...(detail.input ? { input: detail.input } : {}),
     ...(detail.output ? { output: detail.output } : {}),
     detail,
+  };
+}
+
+/**
+ * Surface a Codex CUSTOM tool call (e.g. the newer unified `exec` tool, whose
+ * rollout records are `custom_tool_call{name,input,call_id,status}`) as a
+ * timeline tool card. Older Codex shells arrived as `commandExecution`; the
+ * current binary drives shell/JS execution through a custom tool that lands in
+ * `toolFromItem`'s default branch and used to be dropped — so a turn doing all
+ * its work via `exec` showed NO tool updates in the UI. This maps any
+ * tool-call-shaped item (has an id, a name, and a call payload) to a tool card,
+ * so custom tools are visible regardless of the exact app-server item.type.
+ * Returns null for non-tool items (no name / no call payload), so structural
+ * items are never turned into spurious tool cards.
+ */
+function customToolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  void sessionId;
+  // call_id is shared by the raw-response and typed-item channels; item.id is
+  // channel-specific. Prefer call_id so both paths converge on one card.
+  const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+  const id = callId ?? meaningfulString(item.id);
+  const name = meaningfulString(item.name) ?? meaningfulString(item.tool);
+  if (!id || !name) return null;
+  const rawInput = item.input ?? item.arguments ?? item.command ?? item.script;
+  const hasCallShape = rawInput !== undefined
+    || meaningfulString(item.call_id) !== undefined
+    || meaningfulString(item.callId) !== undefined;
+  if (!hasCallShape) return null; // not a tool call — do not fabricate a card
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted';
+  const status: ToolCallEvent['status'] = item.status === 'inProgress' || item.status === 'running' || lifecycle === 'started'
+    ? 'running'
+    : item.status === 'failed' || item.status === 'error' || item.status === 'errored' || cancelled
+      ? 'error'
+      : 'complete';
+  const input = typeof rawInput === 'string'
+    ? { command: rawInput }
+    : isRecord(rawInput)
+      ? rawInput
+      : rawInput !== undefined
+        ? { input: rawInput }
+        : {};
+  const rawOutput = item.output ?? item.aggregatedOutput ?? item.result;
+  const output = rawOutput === undefined
+    ? undefined
+    : typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput);
+  return {
+    id,
+    name,
+    status,
+    input,
+    ...(status !== 'running' && output !== undefined ? { output } : {}),
+    ...(status !== 'running' ? {
+      terminalStatus: cancelled ? 'cancelled' : status === 'complete' ? 'succeeded' : 'errored',
+      terminalReason: cancelled ? 'provider_cancelled' : status === 'complete' ? 'provider_result' : 'provider_error',
+      terminalSynthetic: false,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: cancelled ? 'custom_tool_cancelled' : status === 'complete' ? 'custom_tool_result' : 'custom_tool_error',
+    } : {}),
+    detail: {
+      kind: 'customToolCall',
+      summary: name,
+      input,
+      ...(rawOutput !== undefined ? { output: rawOutput } : {}),
+      meta: {
+        status: item.status,
+        callId,
+      },
+      raw: item,
+    },
   };
 }
 
@@ -1452,9 +2656,65 @@ export function toolFromItem(sessionId: string, item: Record<string, any>, lifec
         detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
       };
     }
+    case 'customToolCall':
+    case 'custom_tool_call':
+    case 'customTool':
+    case 'custom_tool':
+    case 'localShellCall':
+    case 'local_shell_call':
+      return customToolFromItem(sessionId, item, lifecycle);
     default:
-      return null;
+      // Best-effort: surface any remaining tool-call-shaped item (id + name +
+      // call payload) so a not-yet-enumerated Codex tool type is still visible
+      // instead of silently dropped. Non-tool items return null here.
+      return customToolFromItem(sessionId, item, lifecycle);
   }
+}
+
+type CodexAppServerChannelKind = 'normal' | 'incognito';
+
+interface CodexAppServerChannel {
+  kind: CodexAppServerChannelKind;
+  child: ChildProcessWithoutNullStreams | null;
+  rl: ReadlineInterface | null;
+  nextRequestId: number;
+  pendingRequests: Map<number, PendingRequest>;
+  authFingerprint: string | null;
+  pendingAuthRefreshRestart: boolean;
+  deferredAuthRefreshLogKey: string | null;
+  authRefreshInFlight: Promise<void> | null;
+  restart: Promise<void> | null;
+  /**
+   * Teardown of a disconnected app-server generation may outlive its exit
+   * event: the Codex wrapper can leave MCP stdio descendants behind after the
+   * leader has already exited. Keep that cleanup promise visible so a new
+   * generation never starts before the old process group has been signalled.
+   */
+  cleanup: Promise<void> | null;
+  generation: number;
+  startInFlight: Promise<void> | null;
+  disabledMcpKeys: string[];
+  threadToSession: Map<string, string>;
+}
+
+function createAppServerChannel(kind: CodexAppServerChannelKind): CodexAppServerChannel {
+  return {
+    kind,
+    child: null,
+    rl: null,
+    nextRequestId: 1,
+    pendingRequests: new Map(),
+    authFingerprint: null,
+    pendingAuthRefreshRestart: false,
+    deferredAuthRefreshLogKey: null,
+    authRefreshInFlight: null,
+    restart: null,
+    cleanup: null,
+    generation: 0,
+    startInFlight: null,
+    disabledMcpKeys: [],
+    threadToSession: new Map(),
+  };
 }
 
 export class CodexSdkProvider implements TransportProvider {
@@ -1469,19 +2729,53 @@ export class CodexSdkProvider implements TransportProvider {
     multiTurn: true,
     attachments: false,
     reasoningEffort: true,
+    serviceTier: true,
+    // turn/start carries `cwd` on every turn (the pair workspace, else the session cwd).
+    turnCwd: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Native multi-agent is withheld per THREAD at creation for managed
+    // sessions (config.features); Codex keeps it for the thread's lifetime.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
       completion: 'provider-event',
       cancellation: 'local-cancel',
+      // Identity lives in baseInstructions (never part of compacted history)
+      // and every compaction completion forces thread/resume with freshly
+      // assembled baseInstructions (refreshSessionSystemText).
+      reassertsSessionSystemText: true,
     },
   };
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
-  private threadToSession = new Map<string, string>();
+  private readonly questions = new PendingQuestionRegistry<CodexUserInputResponse>();
+  private readonly questionInputs = new Map<string, { requestId: number | string; turnId: string; questions: CodexUserInputQuestion[] }>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
+  private readonly normalChannel = createAppServerChannel('normal');
+  private readonly incognitoChannel = createAppServerChannel('incognito');
+  private get child(): ChildProcessWithoutNullStreams | null {
+    return this.normalChannel.child;
+  }
+  private get rl(): ReadlineInterface | null {
+    return this.normalChannel.rl;
+  }
+  private get pendingRequests(): Map<number, PendingRequest> {
+    return this.normalChannel.pendingRequests;
+  }
+  private get threadToSession(): Map<string, string> {
+    return this.normalChannel.threadToSession;
+  }
+  private get appServerGeneration(): number {
+    return this.normalChannel.generation;
+  }
+  private get appServerCleanup(): Promise<void> | null {
+    return this.normalChannel.cleanup;
+  }
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -1489,14 +2783,30 @@ export class CodexSdkProvider implements TransportProvider {
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private rl: ReadlineInterface | null = null;
-  private nextRequestId = 1;
-  private pendingRequests = new Map<number, PendingRequest>();
-  private appServerAuthFingerprint: string | null = null;
-  private appServerRestart: Promise<void> | null = null;
+  private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
+  private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
+  private nextActiveTurnLeaseId = 1;
+  private heartbeatInFlightCount = 0;
+
+  private getChannelForSession(state: Pick<CodexSdkSessionState, 'incognito'>): CodexAppServerChannel {
+    return state.incognito ? this.incognitoChannel : this.normalChannel;
+  }
+
+  private getSessionsForChannel(channel: CodexAppServerChannel): Array<[string, CodexSdkSessionState]> {
+    const wantIncognito = channel.kind === 'incognito';
+    return [...this.sessions.entries()].filter(([, state]) => Boolean(state.incognito) === wantIncognito);
+  }
+
+  private getSessionIdForThread(channel: CodexAppServerChannel, threadId?: string | null): string | undefined {
+    if (!threadId) return undefined;
+    const sessionId = channel.threadToSession.get(threadId);
+    if (!sessionId) return undefined;
+    const state = this.sessions.get(sessionId);
+    if (!state || Boolean(state.incognito) !== (channel.kind === 'incognito')) return undefined;
+    return sessionId;
+  }
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -1509,26 +2819,64 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath, config, { clearSessions: true });
+    await this.startChannelAppServer(this.normalChannel, binaryPath, config, { clearSessions: true });
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
     return {
       providerId: this.id,
-      status: this.config && this.child ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
-      connected: Boolean(this.config && this.child),
+      status: this.config && this.normalChannel.child ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.normalChannel.child),
       degradedReasons: [],
     };
+  }
+
+  private getCurrentTurnWorkState(state: CodexSdkSessionState): {
+    activeWorkCount: number;
+    activeToolCount: number;
+    busyReasons: SessionActivityBusyReason[];
+  } {
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
+    const activeToolIds = new Set<string>(activeToolItemIds);
+    for (const toolId of state.openProviderToolCalls.keys()) activeToolIds.add(toolId);
+    const activeToolCount = activeToolIds.size;
+    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
+    const providerTurnActive = Boolean(state.runningTurnId || state.turnStartInFlight || state.authRecoveryPending);
+    const busyReasons: SessionActivityBusyReason[] = [];
+    const providerTurnOnlyCount = providerTurnActive && activeToolCount === 0 && !compactionActive ? 1 : 0;
+    if (providerTurnOnlyCount > 0) busyReasons.push('provider_wait');
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (compactionActive) busyReasons.push('provider_compaction');
+    return {
+      activeWorkCount: providerTurnOnlyCount + activeToolCount + (compactionActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+    };
+  }
+
+  private getActiveWorkSessionIds(excludeSessionId?: string, channel?: CodexAppServerChannel): string[] {
+    const active: string[] = [];
+    for (const [sessionId, state] of this.sessions) {
+      if (channel && Boolean(state.incognito) !== (channel.kind === 'incognito')) continue;
+      if (sessionId === excludeSessionId) continue;
+      const work = this.getCurrentTurnWorkState(state);
+      if (work.activeWorkCount > 0 || Boolean(state.cancelTimer)) active.push(sessionId);
+    }
+    return active;
   }
 
   getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    const channel = this.getChannelForSession(state);
     const activeItemIds = state.activeItemIds ?? new Set<string>();
     const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
     const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
-    const activeReason = state.runningCompact
+    const activeReason = state.authRecoveryPending
+      ? 'auth-recovery'
+      : state.runningCompact
       ? 'compact'
       : state.runningTurnId
         ? 'turn'
@@ -1541,11 +2889,24 @@ export class CodexSdkProvider implements TransportProvider {
               : null;
     return {
       provider: this.id,
+      appServerGeneration: channel.generation,
+      appServerPid: channel.child?.pid ?? null,
+      appServerCleanupPending: Boolean(channel.cleanup),
+      // RSS is not a safe restart signal: Codex can hold a legitimate large
+      // context and an active turn must never be torn down speculatively.
+      appServerRecoveryPolicy: 'auth-change-or-disconnect-only',
       routeId: state.routeId,
       active: activeReason !== null,
       activeReason,
       threadId: state.threadId ?? null,
       runningTurnId: state.runningTurnId ?? null,
+      heartbeatLeaseActive: state.activeTurnLease ? this.isHeartbeatLeaseActive(sessionId, state, state.activeTurnLease) : false,
+      heartbeatLeaseTurnId: state.activeTurnLease?.turnId ?? null,
+      heartbeatFailureCount: state.activeTurnLease?.heartbeatFailureCount ?? 0,
+      heartbeatInFlight: state.activeTurnLease?.heartbeatInFlight ?? false,
+      lastHeartbeatAttemptAtMs: state.activeTurnLease?.lastHeartbeatAtMs ?? null,
+      lastHeartbeatResponseAtMs: state.activeTurnLease?.lastHeartbeatResponseAtMs ?? null,
+      lastAliveHeartbeatAtMs: state.activeTurnLease?.lastAliveHeartbeatAtMs ?? null,
       turnStartInFlight: state.turnStartInFlight,
       runningCompact: state.runningCompact,
       loaded: state.loaded,
@@ -1570,47 +2931,99 @@ export class CodexSdkProvider implements TransportProvider {
   getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
-    const busyReasons: SessionActivityBusyReason[] = [];
-    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
-    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
-    const activeToolCount = activeToolItemIds.size;
-    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
-    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
-    if (compactionActive) busyReasons.push('provider_compaction');
+    const work = this.getCurrentTurnWorkState(state);
     return {
-      activeWorkCount: activeToolCount + (compactionActive ? 1 : 0),
-      activeToolCount,
-      busyReasons,
+      activeWorkCount: work.activeWorkCount,
+      activeToolCount: work.activeToolCount,
+      busyReasons: work.busyReasons,
       activityGeneration: state.runtimeActivityGeneration,
       providerDiagnosticGeneration: state.runningTurnId ?? state.deferredIdleSettleTurnId ?? state.deferredCompactSettleTurnId ?? null,
     };
   }
 
   async disconnect(): Promise<void> {
-    await this.stopAppServer({ clearSessions: true });
+    await Promise.all([
+      this.stopChannelAppServer(this.normalChannel, { clearSessions: true }),
+      this.stopChannelAppServer(this.incognitoChannel, { clearSessions: true }),
+    ]);
+    this.config = null;
+  }
+
+  private extractCustomModelProvider(
+    config: SessionConfig,
+    existing?: CodexModelProviderConfig,
+  ): CodexModelProviderConfig | undefined {
+    if (config.settings && typeof config.settings === 'object' && 'codexModelProvider' in config.settings) {
+      const p = (config.settings as Record<string, unknown>).codexModelProvider as CodexModelProviderConfig | undefined;
+      if (p?.providerId && p?.baseUrl) return p;
+    }
+    const env = (config.env as Record<string, string> | undefined) ?? {};
+    const rawBaseUrl = env['OPENAI_BASE_URL']?.trim() || env['CODEX_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim();
+    if (rawBaseUrl) {
+      const apiKey = env['OPENAI_API_KEY']?.trim() || env['CODEX_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim();
+      const presetName = env['IMCODES_CC_PRESET']?.trim();
+      const providerId = presetName ? normalizeCodexProviderId(presetName) : (existing?.providerId ?? 'custom');
+      return {
+        providerId,
+        baseUrl: normalizeCodexBaseUrl(rawBaseUrl),
+        ...(apiKey ? { apiKey } : {}),
+        wireApi: 'responses',
+      };
+    }
+    return existing;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
-    await this.refreshAppServerForLatestAuth('create-session');
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
-    this.sessions.set(routeId, {
+    const incognito = config.incognito === true || existing?.incognito === true;
+    const targetChannel = incognito ? this.incognitoChannel : this.normalChannel;
+    if (!incognito || targetChannel.child) {
+      await this.refreshAppServerForLatestAuth('create-session', targetChannel);
+    }
+    if (incognito) {
+      if (config.resumeId || config.skipCreate || existing?.threadId) {
+        throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+      }
+      setSessionIncognito(routeId, true);
+      if (config.sessionName) setSessionIncognito(config.sessionName, true);
+    }
+    const effectiveConfig: SessionConfig = incognito ? { ...config, incognito: true } : config;
+    const customModelProvider = this.extractCustomModelProvider(effectiveConfig, existing?.customModelProvider);
+    const state: CodexSdkSessionState = {
       routeId,
-      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
-      env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
-      mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
-      model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
-      effort: config.effort ?? existing?.effort,
-      threadId: config.resumeId ?? existing?.threadId,
+      ...(incognito ? { incognito: true } : {}),
+      ...(effectiveConfig.sessionName ? { imcodesSessionName: effectiveConfig.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
+      cwd: normalizeTransportCwd(effectiveConfig.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      env: { ...(existing?.env ?? {}), ...((effectiveConfig.env as Record<string, string> | undefined) ?? {}) },
+      mcpConfig: buildCodexMcpThreadConfig(effectiveConfig) ?? (incognito ? undefined : existing?.mcpConfig),
+      customModelProvider,
+      imcodesMcpRecoveryRequired: false,
+      imcodesMcpRecoveryPromise: undefined,
+      model: typeof effectiveConfig.agentId === 'string' ? effectiveConfig.agentId : existing?.model,
+      effort: effectiveConfig.effort ?? existing?.effort,
+      threadId: incognito ? undefined : (effectiveConfig.resumeId ?? existing?.threadId),
+      ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
       runningTurnId: undefined,
+      turnDispatchGeneration: 0,
+      currentTurnPayload: undefined,
+      authRecoveryPending: false,
+      authRecoveryRetriesRemaining: 0,
+      authRecoveryReplayUnsafe: false,
+      activeTurnLease: undefined,
       turnStartInFlight: false,
       runningCompact: false,
+      compactCommandInFlight: false,
       currentMessageId: null,
       currentText: '',
+      pendingAgentMessageQuestions: undefined,
       activeItemIds: new Set(),
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
+      openProviderToolCalls: new Map(),
+      customToolLifecycleByCallId: new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -1622,6 +3035,7 @@ export class CodexSdkProvider implements TransportProvider {
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
       completedTurnIds: existing?.completedTurnIds ?? new Set(),
+      terminalDuringTurnStartIds: existing?.terminalDuringTurnStartIds ?? new Set(),
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
       terminatedTurnIds: existing?.terminatedTurnIds ?? new Set(),
       terminatedCompactTurnIds: existing?.terminatedCompactTurnIds ?? new Set(),
@@ -1630,28 +3044,50 @@ export class CodexSdkProvider implements TransportProvider {
       generatedImageTracking: null,
       generatedImagePaths: [],
       rawChecklistStartedAt: Date.now(),
-      rawChecklistRolloutPath: existing?.rawChecklistRolloutPath,
-      rawChecklistRolloutOffset: existing?.rawChecklistRolloutOffset,
+      rawChecklistRolloutPath: incognito ? undefined : existing?.rawChecklistRolloutPath,
+      rawChecklistRolloutOffset: incognito ? undefined : existing?.rawChecklistRolloutOffset,
       rawChecklistSeenCallIds: existing?.rawChecklistSeenCallIds ?? new Set(),
       rawChecklistScanPromise: undefined,
       rawChecklistPollTimer: null,
       rawChecklistPollUntil: 0,
-    });
-    if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
+      rolloutSettlePollTimer: null,
+      childSubagentRolloutStartedAt: Date.now(),
+      childSubagentRolloutSeenIds: existing?.childSubagentRolloutSeenIds ?? new Set(),
+      childSubagentRolloutCompletedIds: existing?.childSubagentRolloutCompletedIds ?? new Set(),
+      childSubagentRolloutScanPromise: undefined,
+      childSubagentRolloutTimer: null,
+      childSubagentRolloutPollUntil: 0,
+    };
+    this.sessions.set(routeId, state);
+    if ((!incognito && effectiveConfig.resumeId) || effectiveConfig.effort) {
+      this.emitSessionInfo(routeId, {
+        ...(!incognito && effectiveConfig.resumeId ? { resumeId: effectiveConfig.resumeId } : {}),
+        ...(effectiveConfig.effort ? { effort: effectiveConfig.effort } : {}),
+      });
+    }
     return routeId;
   }
 
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    state.pendingAgentMessageQuestions = undefined;
+    this.questions.release(sessionId);
+    this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
-    if (state.threadId && state.loaded) {
-      await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
-      this.threadToSession.delete(state.threadId);
+    this.clearChildSubagentRolloutPollTimer(state);
+    const channel = this.getChannelForSession(state);
+    if (state.threadId) {
+      if (state.loaded) {
+        await this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
+      }
+      channel.threadToSession.delete(state.threadId);
     }
+    state.loaded = false;
     this.sessions.delete(sessionId);
+    this.maybeRunDeferredAuthRefresh(channel, 'end-session');
   }
 
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
@@ -1709,7 +3145,11 @@ export class CodexSdkProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
-    state.model = agentId;
+    if (state.model !== agentId) {
+      state.model = agentId;
+      // Ephemeral threads reject thread/resume; turn/start carries `state.model` in place.
+      if (!state.incognito) state.loaded = false;
+    }
   }
 
   setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
@@ -1719,24 +3159,63 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    // Preserve the exact durable thread id/history. The next turn crosses
+    // ensureThreadLoaded and issues thread/resume with freshly assembled
+    // baseInstructions, restoring prefix-cacheable identity immediately.
+    // Ephemeral threads cannot be resumed via thread/resume; clearing
+    // lastInjectedSessionSystemText re-injects updated system text on the next turn.
+    if (!state.incognito) state.loaded = false;
+    state.lastInjectedSessionSystemText = undefined;
+    this.clearPendingSessionSystemTextUpdate(state);
+  }
+
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
-    if (!this.config || !this.child) {
+    if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningTurnId || state.runningCompact) {
+    const channel = this.getChannelForSession(state);
+    if (channel.kind === 'normal' && !channel.child) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
+    return this.runWithPrivacy(sessionId, state, () => this.sendWithPrivacy(sessionId, state, payloadOrMessage, attachments, extraSystemPrompt));
+  }
+
+  private async sendWithPrivacy(sessionId: string, state: CodexSdkSessionState, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
+    if (state.runningTurnId || state.runningCompact || state.turnStartInFlight || state.authRecoveryPending) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
-    await this.refreshAppServerForLatestAuth('send');
-    if (!this.config || !this.child) {
+    const channel = this.getChannelForSession(state);
+    if (channel.child) {
+      await this.refreshAppServerForLatestAuth('send', channel);
+    }
+    if (channel.kind === 'incognito') {
+      if (!this.config) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+      }
+      if (!channel.child && !state.threadId) {
+        await this.ensureIncognitoChannelStarted();
+      }
+    } else if (!this.config || !channel.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
 
+    if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'abandoned', 'generation_rollover');
+      state.activeToolItemIds.clear();
+      state.activeCompactionItemIds.clear();
+      state.activeItemIds.clear();
+    }
     state.currentText = '';
-    state.currentMessageId = null;    state.activeItemIds.clear();
+    state.currentMessageId = null;
+    this.clearActiveItemEvidence(state);
+    this.clearActiveTurnLease(state);
     state.cancelled = false;
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
@@ -1746,10 +3225,129 @@ export class CodexSdkProvider implements TransportProvider {
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     state.runtimeActivityGeneration = payload.activityGeneration;
     if (this.isCompactCommand(payload)) {
-      await this.startCompact(sessionId, state);
+      await this.startCompact(sessionId, state, payload);
       return;
     }
-    await this.startTurn(sessionId, state, payload);
+    const turnDispatchGeneration = ++state.turnDispatchGeneration;
+    state.currentTurnPayload = payload;
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
+    state.authRecoveryReplayUnsafe = false;
+    let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
+    if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+    if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
+      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+    }
+    for (;;) {
+      try {
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          CODEX_AUTH_RECOVERY_RETRY_LIMIT,
+        );
+        state.imcodesMcpRecoveryRequired = false;
+        break;
+      } catch (error) {
+        if (!(error instanceof ImcodesDelegationUnavailableError)
+          || delegationRecoveryRetriesRemaining <= 0
+          || state.cancelled
+          || this.sessions.get(sessionId) !== state
+          || state.turnDispatchGeneration !== turnDispatchGeneration) throw error;
+        delegationRecoveryRetriesRemaining -= 1;
+        // The readiness failure happens before turn/start, provider output, or
+        // any tool side effect. Restarting is therefore replay-safe. Preserve
+        // the SAME durable session/thread identity, reload only the stale MCP
+        // client/catalog, and retry exactly once; no model turn or MCP tool call
+        // has started, so this boundary is replay-safe.
+        await this.reloadImcodesMcpClient('im-delegation-unavailable');
+      }
+    }
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    const turnId = state?.runningTurnId;
+    if (!state || !turnId || state.cancelled) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await this.requestOnChannel(this.getChannelForSession(state), 'turn/steer', {
+        threadId: state.threadId,
+        expectedTurnId: turnId,
+        clientUserMessageId: notification.notificationId,
+        input: [{ type: 'text', text: notification.text }],
+      });
+    } catch (error) {
+      const latest = this.sessions.get(sessionId);
+      if (!latest || latest.runningTurnId !== turnId || latest.cancelled) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      if (error instanceof CodexRpcResponseError) return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
+      throw error;
+    }
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+  }
+
+  private clearActiveItemEvidence(state: CodexSdkSessionState): void {
+    state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
+    state.pendingAgentMessageQuestions = undefined;
+  }
+
+  private readonly confirmedCancelOperations = new Map<string, Promise<void>>();
+  private readonly confirmedCancelTerminals = new WeakMap<CodexSdkSessionState, { turnId: string | null; generation: number; acceptancePending: boolean; seen: Set<string> }>();
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  /** Stop-and-send needs a real terminal notification, not a local watchdog. */
+  cancelAndWait(sessionId: string): Promise<void> {
+    const existing = this.confirmedCancelOperations.get(sessionId);
+    if (existing) return existing;
+    const state = this.sessions.get(sessionId);
+    if (!state) return Promise.reject(new Error('Codex session disconnected before Stop'));
+    const generation = state.turnDispatchGeneration;
+    const terminals = { turnId: state.runningTurnId ?? null, generation, acceptancePending: state.turnStartInFlight, seen: new Set<string>() };
+    this.confirmedCancelTerminals.set(state, terminals);
+    const operation = this.stopConfirmations.confirm(terminals, () => this.confirmCancel(sessionId, terminals),
+      () => this.sessions.get(sessionId) === state && state.turnDispatchGeneration === generation);
+    this.confirmedCancelOperations.set(sessionId, operation);
+    void operation.finally(() => {
+      if (this.confirmedCancelOperations.get(sessionId) === operation) {
+        this.confirmedCancelOperations.delete(sessionId);
+      }
+    }).catch(() => {});
+    return operation;
+  }
+
+  private async confirmCancel(sessionId: string, terminals: { turnId: string | null; acceptancePending: boolean; seen: Set<string> }): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error('Codex session disconnected before stop confirmation');
+    state.cancelled = true;
+    this.clearCancelTimer(state);
+    const deadline = Date.now() + CANCEL_INTERRUPT_TIMEOUT_MS;
+    // Acceptance can expose the id after Stop. startTurn must leave this
+    // operation in charge, rather than arming the ordinary local watchdog.
+    while ((state.turnStartInFlight || terminals.acceptancePending) && !state.runningTurnId) {
+      if (Date.now() >= deadline) throw new Error('Codex turn acceptance still pending');
+      if (this.sessions.get(sessionId) !== state) throw new Error('Codex session disconnected before stop confirmation');
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    const turnId = state.runningTurnId;
+    if (!turnId || !state.threadId) {
+      if (terminals.turnId && terminals.seen.has(terminals.turnId)) return;
+      throw new Error('Codex has no correlated turn to confirm stop');
+    }
+    terminals.turnId = turnId;
+    if (terminals.seen.has(turnId)) this.stopConfirmations.complete(terminals);
+    await this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', { threadId: state.threadId, turnId }, CANCEL_INTERRUPT_TIMEOUT_MS);
+    // The shared confirmation waits for the parser's captured terminal source,
+    // not this interrupt RPC receipt. Its expired outward wait can still accept
+    // a late physical proof without reviving the cancelled start continuation.
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -1761,11 +3359,13 @@ export class CodexSdkProvider implements TransportProvider {
     // carries the request across those async boundaries so startTurn() issues
     // turn/interrupt as soon as Codex exposes the id.
     state.cancelled = true;
+    this.questions.release(sessionId);
+    this.clearActiveTurnLease(state);
     if (!state.threadId) return;
-    if (state.runningCompact) {
+    if (state.runningCompact && state.compactCommandInFlight) {
       const turnId = state.runningTurnId;
       if (turnId) {
-        void this.request('turn/interrupt', {
+        void this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', {
           threadId: state.threadId,
           turnId,
         }).catch(() => {});
@@ -1774,8 +3374,37 @@ export class CodexSdkProvider implements TransportProvider {
       return;
     }
     const turnId = state.runningTurnId;
-    if (!turnId) return;
+    if (!turnId) {
+      this.cancelOrphanProviderWorkLocally(sessionId, state);
+      return;
+    }
     await this.interruptRunningTurn(sessionId, state, turnId);
+  }
+
+  private cancelOrphanProviderWorkLocally(sessionId: string, state: CodexSdkSessionState): boolean {
+    if (state.turnStartInFlight) return false;
+    const work = this.getCurrentTurnWorkState(state);
+    if (work.activeWorkCount <= 0 && !state.cancelTimer) return false;
+    this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
+    this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
+    this.clearChildSubagentRolloutPollTimer(state);
+    this.clearStatus(sessionId, state);
+    this.rememberTerminatedActiveTurn(state);
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
+    this.clearActiveItemEvidence(state);
+    this.clearPendingSessionSystemTextUpdate(state);
+    this.clearCodexAuthRecoveryState(state);
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+    return true;
   }
 
   private async interruptRunningTurn(
@@ -1788,20 +3417,39 @@ export class CodexSdkProvider implements TransportProvider {
     // Fire-and-watchdog. Do not await turn/interrupt acknowledgement before
     // arming the local cancellation timer; an app-server/RPC hang must not
     // leave the UI stuck in "stopping" forever.
-    void this.request('turn/interrupt', {
+    void this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', {
       threadId: state.threadId,
       turnId,
-    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch(() => {});
+    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch((err) => {
+      logger.warn(
+        {
+          err,
+          provider: this.id,
+          sessionId,
+          threadId: state.threadId,
+          turnId,
+        },
+        'Codex SDK turn interrupt request failed',
+      );
+    });
     this.clearCancelTimer(state);
     state.cancelTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
       if (state.runningTurnId !== turnId) return;
       this.clearStatus(sessionId, state);
       this.rememberTerminatedTurn(state, turnId);
+      this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
-      state.turnStartInFlight = false;      state.activeItemIds.clear();
+      state.turnStartInFlight = false;
+      state.runningCompact = false;
+      state.compactCommandInFlight = false;
+      state.compactObserved = false;
+      this.clearActiveItemEvidence(state);
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
       this.clearRawChecklistPollTimer(state);
+      this.clearChildSubagentRolloutPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
+      this.clearCodexAuthRecoveryState(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
     state.cancelTimer.unref?.();
@@ -1811,164 +3459,711 @@ export class CodexSdkProvider implements TransportProvider {
     return { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
   }
 
-  private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
-    this.rejectPending(new Error('Codex app-server disconnected'));
-    this.rl?.close();
-    this.rl = null;
-    for (const [sessionId, state] of this.sessions) {
+  private clearSessionWorkAfterDisconnect(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
+    this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
+    this.clearChildSubagentRolloutPollTimer(state);
+    this.clearStatus(sessionId, state);
+    this.rememberTerminatedActiveTurn(state);
+    state.loaded = false;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    this.clearActiveItemEvidence(state);
+    if (!state.authRecoveryPending) state.cancelled = false;
+    state.lastStatusSignature = null;
+    this.clearPendingSessionSystemTextUpdate(state);
+    if (!state.authRecoveryPending) this.clearCodexAuthRecoveryState(state);
+  }
+
+  private settleSessionAfterAppServerDisconnect(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    disconnectClass: CodexAppServerDisconnectClass,
+    message: string,
+  ): boolean {
+    const work = this.getCurrentTurnWorkState(state);
+    const hasCurrentWork = work.activeWorkCount > 0 || Boolean(state.cancelTimer);
+    if (!hasCurrentWork) {
+      this.clearSessionWorkAfterDisconnect(sessionId, state);
+      return false;
+    }
+
+    const terminalReason: ToolTerminalReason = disconnectClass === 'unexpected_eof'
+      ? 'unexpected_eof'
+      : disconnectClass === 'auth_refresh_restart'
+        ? 'auth_refresh_recovery_failed'
+        : 'app_server_disconnect';
+    this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', terminalReason);
+    this.clearSessionWorkAfterDisconnect(sessionId, state);
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, message, false));
+    return true;
+  }
+
+  private handleAppServerDisconnect(
+    channel: CodexAppServerChannel,
+    child: ChildProcessWithoutNullStreams,
+    disconnectClass: Exclude<CodexAppServerDisconnectClass, 'intentional_shutdown' | 'no_current_work_disconnect'>,
+    err: Error,
+  ): void {
+    if (channel.child !== child) return;
+    const channelSessions = this.getSessionsForChannel(channel);
+    for (const [sessionId] of channelSessions) {
+      this.questions.release(sessionId);
+    }
+    this.rejectChannelPending(channel, err);
+    let emittedError = false;
+    for (const [sessionId, state] of channelSessions) {
+      emittedError = this.settleSessionAfterAppServerDisconnect(sessionId, state, disconnectClass, err.message) || emittedError;
+    }
+    if (!emittedError) {
+      logger.info({ provider: this.id, channel: channel.kind, disconnectClass }, 'Codex app-server disconnected with no current work');
+    }
+    channel.child = null;
+    channel.rl = null;
+    channel.authFingerprint = null;
+    channel.pendingAuthRefreshRestart = false;
+    channel.deferredAuthRefreshLogKey = null;
+    void this.reapChannelGeneration(channel, child);
+  }
+
+  private reapChannelGeneration(
+    channel: CodexAppServerChannel,
+    child: ChildProcessWithoutNullStreams,
+  ): Promise<void> {
+    if (channel.cleanup) return channel.cleanup;
+    const cleanup = killProcessTree(child, { ownsProcessGroup: true }).catch((error) => {
+      logger.warn({ provider: this.id, channel: channel.kind, err: error }, 'Codex app-server descendant cleanup failed');
+    });
+    const tracked = cleanup.finally(() => {
+      if (channel.cleanup === tracked) channel.cleanup = null;
+    });
+    channel.cleanup = tracked;
+    return tracked;
+  }
+
+  private async stopChannelAppServer(
+    channel: CodexAppServerChannel,
+    options: { clearSessions: boolean },
+  ): Promise<void> {
+    const channelSessions = this.getSessionsForChannel(channel);
+    for (const [sessionId] of channelSessions) {
+      this.questions.release(sessionId);
+    }
+    this.rejectChannelPending(channel, new Error('Codex app-server disconnected'));
+    const child = channel.child;
+    channel.child = null;
+    channel.rl?.close();
+    channel.rl = null;
+    for (const [sessionId, state] of channelSessions) {
       this.clearCancelTimer(state);
-      this.clearCompactTimers(state);      this.clearRawChecklistPollTimer(state);
+      this.clearActiveTurnLease(state);
+      this.clearCompactTimers(state);
+      this.clearRawChecklistPollTimer(state);
+      this.clearChildSubagentRolloutPollTimer(state);
       if (!options.clearSessions) {
-        this.clearStatus(sessionId, state);
-        this.rememberTerminatedActiveTurn(state);
-        state.loaded = false;
-        state.runningTurnId = undefined;
-        state.turnStartInFlight = false;
-        state.runningCompact = false;
-        state.compactObserved = false;
-        state.currentMessageId = null;
-        state.currentText = '';
-        state.activeItemIds.clear();
-        state.cancelled = false;
-        state.lastStatusSignature = null;
-        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearSessionWorkAfterDisconnect(sessionId, state);
+      } else {
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_cancelled');
+        this.clearSessionWorkAfterDisconnect(sessionId, state);
       }
     }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
-    const child = this.child;
-    this.child = null;
-    if (child && !child.killed) {
-      void killProcessTree(child);
+    if (child) await this.reapChannelGeneration(channel, child);
+    // A prior EOF/crash may have already detached the generation from
+    // `channel.child`; wait for its process-tree cleanup before a replacement is
+    // spawned.  This closes the race that otherwise accumulated PPID=1 MCP
+    // children across reconnect/auth-restart loops.
+    if (channel.cleanup) await channel.cleanup;
+    channel.threadToSession.clear();
+    if (channel.kind === 'normal') {
+      this.rawSpawnAgentCalls.clear();
+      this.rawNativeCollabCalls.clear();
+      this.trackedSubagentThreads.clear();
     }
-    this.threadToSession.clear();
-    this.rawSpawnAgentCalls.clear();
-    this.trackedSubagentThreads.clear();
-    this.appServerAuthFingerprint = null;
+    channel.authFingerprint = null;
+    channel.pendingAuthRefreshRestart = false;
+    channel.deferredAuthRefreshLogKey = null;
     if (options.clearSessions) {
-      this.sessions.clear();
-      this.config = null;
+      for (const [sessionId] of channelSessions) {
+        this.sessions.delete(sessionId);
+      }
     }
   }
 
-  private async startAppServer(
+  /**
+   * Authoritative, thread-scoped proof that IM delegation is actually usable.
+   *
+   * The `mcpServer/startupStatus/updated` notification is NOT sufficient: a
+   * stale `ready` can survive a restart, a config change, or a tools-list
+   * invalidation. Only a COMPLETE `mcpServerStatus/list` snapshot is authority,
+   * so this re-verifies on every Brain turn.
+   *
+   * Anything short of "exact server connected with the exact delegation tools"
+   * fails closed. Native multi-agent is never a fallback for delegated task
+   * work: a managed Brain's thread is created without it.
+   */
+  private async assertImcodesDelegationReady(threadId: string): Promise<void> {
+    const servers: Array<Record<string, unknown>> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let completed = false;
+    for (let page = 0; page < MCP_STATUS_PAGE_LIMIT; page++) {
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = await this.request(CODEX_MCP_RPC_METHOD.STATUS_LIST, {
+          threadId,
+          detail: 'toolsAndAuthOnly',
+          ...(cursor ? { cursor } : {}),
+        }) as Record<string, unknown> | undefined;
+      } catch {
+        throw new ImcodesDelegationUnavailableError();
+      }
+      const data = Array.isArray(result?.data) ? result.data : undefined;
+      if (!data) throw new ImcodesDelegationUnavailableError();
+      for (const entry of data) if (isRecord(entry)) servers.push(entry);
+      const next = meaningfulString(result?.nextCursor);
+      if (!next) { completed = true; break; }
+      // A repeated cursor means the inventory never terminates: fail closed
+      // rather than accept a partial view as if it were complete.
+      if (seenCursors.has(next)) throw new ImcodesDelegationUnavailableError();
+      seenCursors.add(next);
+      cursor = next;
+    }
+    if (!completed) throw new ImcodesDelegationUnavailableError();
+
+    const server = servers.find((entry) => meaningfulString(entry.name) === IMCODES_DELEGATION_MCP_SERVER);
+    if (!server || !imcodesDelegationServerConnected(server)) {
+      throw new ImcodesDelegationUnavailableError();
+    }
+    const tools = isRecord(server.tools) ? server.tools : undefined;
+    if (!tools) throw new ImcodesDelegationUnavailableError();
+    for (const tool of IMCODES_DELEGATION_REQUIRED_TOOLS) {
+      if (!(tool in tools)) throw new ImcodesDelegationUnavailableError();
+    }
+  }
+
+  /**
+   * Pre-turn self-heal for EVERY session (not only a delegating Brain).
+   *
+   * Codex never respawns a thread's stdio MCP server on its own: once the
+   * process is gone, every IM tool call in that thread fails with "Transport
+   * closed" -- including across a `thread/resume`, which is a no-op for a
+   * loaded thread. Probe the thread's live IM transport with one read-only tool
+   * call and reload before the turn when it is closed, so the turn gets a live
+   * IM MCP instead of failing every call.
+   *
+   * The probe is `mcpServer/tool/call` rather than `mcpServerStatus/list`: the
+   * status list spawns a throwaway MCP server (bootstrap + heavy backend) per
+   * call, while a tool call rides the existing pipe, records nothing in the
+   * thread history, and fails immediately on a closed transport. Anything other
+   * than a closed-transport error -- a result, a tool error, a slow cold
+   * backend, an app-server without the method -- is not evidence and never
+   * blocks the turn.
+   */
+  private async healImcodesMcpIfTransportDead(
+    sessionId: string,
+    state: CodexSdkSessionState,
+  ): Promise<void> {
+    const threadId = state.threadId;
+    if (!threadId) return;
+    try {
+      await this.request(CODEX_MCP_RPC_METHOD.TOOL_CALL, {
+        threadId,
+        server: IMCODES_DELEGATION_MCP_SERVER,
+        tool: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+        arguments: {},
+      }, CODEX_IM_MCP_PROBE_TIMEOUT_MS);
+      return;
+    } catch (error) {
+      if (!isClosedMcpTransportMessage(error instanceof Error ? error.message : String(error))) return;
+    }
+    logger.warn({ provider: this.id, sessionId, threadId },
+      'Codex IM.codes MCP transport is closed on this thread; reloading before the turn');
+    try {
+      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-probe-transport-closed');
+    } catch (error) {
+      logger.warn({ provider: this.id, sessionId, threadId, err: error },
+        'Codex IM.codes MCP reload did not restore the thread; the turn proceeds and the next turn retries');
+    }
+  }
+
+  private async reloadImcodesMcpClient(reason: string): Promise<void> {
+    if (this.imcodesMcpReload) return this.imcodesMcpReload;
+    const child = this.child;
+    if (!child) throw new ImcodesDelegationUnavailableError();
+    this.imcodesMcpReload = this.request(CODEX_MCP_RPC_METHOD.RELOAD, {})
+      .then(() => {
+        if (this.child !== child) throw new ImcodesDelegationUnavailableError();
+        logger.info({ provider: this.id, reason }, 'Codex IM.codes MCP client/catalog reloaded');
+      })
+      .finally(() => { this.imcodesMcpReload = null; });
+    return this.imcodesMcpReload;
+  }
+
+  private async waitForImcodesMcpHydration(threadId: string): Promise<void> {
+    let lastError: unknown = new ImcodesDelegationUnavailableError();
+    for (const delayMs of CODEX_IM_MCP_RECOVERY_BACKOFF_MS) {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        await this.assertImcodesDelegationReady(threadId);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private recoverImcodesMcpAfterObservedClosure(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    reason: string,
+  ): Promise<void> {
+    state.imcodesMcpRecoveryRequired = true;
+    if (state.imcodesMcpRecoveryPromise) return state.imcodesMcpRecoveryPromise;
+    const threadId = state.threadId;
+    if (!threadId) return Promise.reject(new ImcodesDelegationUnavailableError());
+    const recovery = (async () => {
+      await this.reloadImcodesMcpClient(reason);
+      await this.waitForImcodesMcpHydration(threadId);
+      if (this.sessions.get(sessionId) === state && state.threadId === threadId) {
+        state.imcodesMcpRecoveryRequired = false;
+      }
+    })().finally(() => {
+      if (state.imcodesMcpRecoveryPromise === recovery) state.imcodesMcpRecoveryPromise = undefined;
+    });
+    state.imcodesMcpRecoveryPromise = recovery;
+    return recovery;
+  }
+
+  private async readIncognitoEnabledImcodesMcpKeys(
+    channel: CodexAppServerChannel,
+    cwd?: string,
+  ): Promise<string[]> {
+    const result = await this.requestOnChannel(channel, 'config/read', {
+      includeLayers: false,
+      ...(cwd ? { cwd } : {}),
+    }, CODEX_IM_MCP_PROBE_TIMEOUT_MS) as unknown;
+    if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.mcp_servers)) {
+      throw new Error('Incognito session blocked: invalid Codex config/read response');
+    }
+    return findEnabledImcodesMcpKeysFromConfig(result.config.mcp_servers);
+  }
+
+  private async startChannelAppServer(
+    channel: CodexAppServerChannel,
     binaryPath: string,
     config: ProviderConfig,
     options: { clearSessions: boolean },
+    allowIncognitoConfigRetry = true,
   ): Promise<void> {
-    await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+    await this.stopChannelAppServer(channel, { clearSessions: options.clearSessions }).catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
     const spawnEnv = this.buildSpawnEnv(config);
+    let disabledIncognitoKeys: string[] = [];
+    if (channel.kind === 'incognito') {
+      const configTomlPath = resolve(getCodexHome(spawnEnv), 'config.toml');
+      const tomlKeys = await readFile(configTomlPath, 'utf8')
+        .then((text) => collectCodexTomlMcpServerKeysForIncognito(text))
+        .catch(() => []);
+      disabledIncognitoKeys = [...new Set([...channel.disabledMcpKeys, ...tomlKeys])];
+      channel.disabledMcpKeys = disabledIncognitoKeys;
+    }
+    const channelArgs = channel.kind === 'incognito'
+      ? getCodexIncognitoAppServerArgs(disabledIncognitoKeys)
+      : getCodexAppServerArgs();
+    const args = [...resolved.prependArgs, ...channelArgs];
     const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: spawnEnv,
       windowsHide: true,
     });
-    this.child = child;
-    this.rl = readline.createInterface({ input: child.stdout });
-    this.rl.on('line', (line) => this.handleLine(line));
+    channel.generation += 1;
+    channel.child = child;
+    channel.rl = readline.createInterface({ input: gateChildStream(child.stdout) });
+    channel.rl.on('line', (line) => this.handleLine(channel, child, line));
+    channel.rl.on('close', () => {
+      if (channel.child !== child) return;
+      this.handleAppServerDisconnect(channel, child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
+    });
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString();
-      if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
+      if (text.trim()) logger.debug({ provider: this.id, channel: channel.kind, stderr: text.trim() }, 'Codex app-server stderr');
     });
     child.on('exit', (code) => {
-      if (this.child !== child) return;
-      const err = new Error(`Codex app-server exited with code ${code ?? 'unknown'}`);
-      this.rejectPending(err);
-      const sessions = [...this.sessions.keys()];
-      for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
-      }
-      this.child = null;
-      this.appServerAuthFingerprint = null;
+      if (channel.child !== child) return;
+      this.handleAppServerDisconnect(channel, child, 'unexpected_crash', new Error(`Codex app-server exited with code ${code ?? 'unknown'}`));
     });
     // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
-      if (this.child !== child) return;
-      logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
-      this.rejectPending(err);
-      const sessions = [...this.sessions.keys()];
-      for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
-      }
-      this.child = null;
-      this.appServerAuthFingerprint = null;
+      if (channel.child !== child) return;
+      logger.error({ provider: this.id, channel: channel.kind, err }, 'Codex app-server spawn error');
+      this.handleAppServerDisconnect(channel, child, 'unexpected_crash', err);
     });
 
     try {
-      await this.request('initialize', {
+      await this.requestOnChannel(channel, 'initialize', {
         clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
         capabilities: { experimentalApi: true },
-      });
-      this.notify('initialized', {});
+      }, CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS);
+      this.notifyOnChannel(channel, 'initialized', {});
       this.config = config;
-      this.appServerAuthFingerprint = authFingerprint;
+      channel.authFingerprint = authFingerprint;
+      channel.pendingAuthRefreshRestart = false;
+      channel.deferredAuthRefreshLogKey = null;
+      if (channel.kind === 'incognito') {
+        const remainingEnabled = await this.readIncognitoEnabledImcodesMcpKeys(channel);
+        if (remainingEnabled.length > 0) {
+          const merged = [...new Set([...disabledIncognitoKeys, ...remainingEnabled])];
+          const discoveredNew = remainingEnabled.some((key) => !disabledIncognitoKeys.includes(key));
+          if (allowIncognitoConfigRetry && discoveredNew) {
+            channel.disabledMcpKeys = merged;
+            await this.startChannelAppServer(channel, binaryPath, config, options, false);
+            return;
+          }
+          throw new Error('Incognito session blocked: IM.codes memory MCP could not be disabled at Codex app-server boundary');
+        }
+      }
     } catch (err) {
-      await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+      await this.stopChannelAppServer(channel, { clearSessions: options.clearSessions }).catch(() => {});
       throw err;
     }
   }
 
-  private async refreshAppServerForLatestAuth(reason: string): Promise<void> {
-    if (this.appServerRestart) await this.appServerRestart;
-    if (!this.config || !this.child) return;
-    const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
-    if (current === this.appServerAuthFingerprint) return;
-    logger.info({
-      provider: this.id,
-      reason,
-      previousAuthPresent: this.appServerAuthFingerprint !== null,
-      currentAuthPresent: current !== null,
-    }, 'Codex auth file changed; restarting app-server to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason);
+  private async ensureIncognitoChannelStarted(): Promise<void> {
+    if (this.incognitoChannel.restart) await this.incognitoChannel.restart;
+    if (this.incognitoChannel.startInFlight) {
+      await this.incognitoChannel.startInFlight;
+      return;
+    }
+    if (this.incognitoChannel.child?.stdin.writable) return;
+    const config = this.config;
+    if (!config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
+    const binaryPath = this.resolveBinaryPath(config);
+    const startPromise = this.startChannelAppServer(this.incognitoChannel, binaryPath, config, { clearSessions: false })
+      .finally(() => {
+        if (this.incognitoChannel.startInFlight === startPromise) {
+          this.incognitoChannel.startInFlight = null;
+        }
+      });
+    this.incognitoChannel.startInFlight = startPromise;
+    await startPromise;
   }
 
-  private async restartAppServerPreservingSessions(reason: string): Promise<void> {
-    if (this.appServerRestart) return this.appServerRestart;
+  private async refreshAppServerForLatestAuth(
+    reason: string,
+    channel: CodexAppServerChannel = this.normalChannel,
+  ): Promise<void> {
+    if (channel.authRefreshInFlight) return channel.authRefreshInFlight;
+    const refreshPromise = (async () => {
+      if (channel.restart) await channel.restart;
+      if (!this.config || !channel.child) return;
+      const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
+      if (current === channel.authFingerprint) {
+        channel.pendingAuthRefreshRestart = false;
+        channel.deferredAuthRefreshLogKey = null;
+        return;
+      }
+      const activeSessionIds = this.getActiveWorkSessionIds(undefined, channel);
+      if (activeSessionIds.length > 0) {
+        channel.pendingAuthRefreshRestart = true;
+        const transitionKey = `${channel.authFingerprint ?? 'none'}->${current ?? 'none'}`;
+        if (channel.deferredAuthRefreshLogKey !== transitionKey) {
+          channel.deferredAuthRefreshLogKey = transitionKey;
+          logger.info({
+            provider: this.id,
+            channel: channel.kind,
+            reason,
+            previousAuthPresent: channel.authFingerprint !== null,
+            currentAuthPresent: current !== null,
+            activeSessionCount: activeSessionIds.length,
+            activeSessionIds: activeSessionIds.slice(0, 10),
+          }, 'Codex auth file changed; deferring app-server restart until active work drains');
+        }
+        return;
+      }
+      channel.pendingAuthRefreshRestart = false;
+      channel.deferredAuthRefreshLogKey = null;
+      logger.info({
+        provider: this.id,
+        channel: channel.kind,
+        reason,
+        previousAuthPresent: channel.authFingerprint !== null,
+        currentAuthPresent: current !== null,
+      }, 'Codex auth file changed; restarting app-server to load latest authentication');
+      await this.restartAppServerPreservingSessions(reason, undefined, channel);
+    })().finally(() => {
+      if (channel.authRefreshInFlight === refreshPromise) channel.authRefreshInFlight = null;
+    });
+    channel.authRefreshInFlight = refreshPromise;
+    return refreshPromise;
+  }
+
+  private maybeRunDeferredAuthRefresh(channel: CodexAppServerChannel, reason: string): void {
+    if (!channel.pendingAuthRefreshRestart) return;
+    if (!this.config || !channel.child || channel.restart) return;
+    if (this.getActiveWorkSessionIds(undefined, channel).length > 0) return;
+    void this.refreshAppServerForLatestAuth(`drain:${reason}`, channel).catch((err) => {
+      logger.warn({ provider: this.id, channel: channel.kind, reason, err }, 'Deferred Codex auth-refresh restart failed');
+    });
+  }
+
+  private async restartAppServerPreservingSessions(
+    _reason: string,
+    recoverySessionId?: string,
+    channel: CodexAppServerChannel = this.normalChannel,
+  ): Promise<void> {
+    if (channel.restart) return channel.restart;
     const config = this.config;
     if (!config) return;
+    const activeSessionIds = this.getActiveWorkSessionIds(recoverySessionId, channel);
+    if (activeSessionIds.length > 0) {
+      logger.warn({
+        provider: this.id,
+        channel: channel.kind,
+        reason: _reason,
+        activeSessionCount: activeSessionIds.length,
+        activeSessionIds: activeSessionIds.slice(0, 10),
+      }, 'Codex app-server restart deferred while current work is active');
+      throw this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        'Codex app-server restart deferred while current work is active',
+        true,
+        {
+          disconnectClass: 'auth_refresh_restart',
+          activeSessionCount: activeSessionIds.length,
+          activeSessionIds: activeSessionIds.slice(0, 10),
+        },
+      );
+    }
     const binaryPath = this.resolveBinaryPath(config);
-    this.appServerRestart = (async () => {
-      await this.startAppServer(binaryPath, config, { clearSessions: false });
+    channel.restart = (async () => {
+      await this.startChannelAppServer(channel, binaryPath, config, { clearSessions: false });
     })().finally(() => {
-      this.appServerRestart = null;
+      channel.restart = null;
     });
-    return this.appServerRestart;
+    return channel.restart;
   }
 
-  private async restartAppServerAfterAuthFailure(reason: string, error: ProviderError): Promise<void> {
+  private async restartAppServerAfterAuthFailure(
+    reason: string,
+    error: ProviderError,
+    recoverySessionId?: string,
+    channel: CodexAppServerChannel = this.normalChannel,
+  ): Promise<void> {
     logger.warn({
       provider: this.id,
+      channel: channel.kind,
       reason,
       code: error.code,
       message: error.message,
     }, 'Codex app-server authentication failed; restarting to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason);
+    await this.restartAppServerPreservingSessions(reason, recoverySessionId, channel);
   }
 
-  private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
+  private clearCodexAuthRecoveryState(state: CodexSdkSessionState): void {
+    state.currentTurnPayload = undefined;
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = 0;
+    state.authRecoveryReplayUnsafe = false;
+  }
+
+  private isCodexAuthReplaySafe(state: CodexSdkSessionState): boolean {
+    return !state.authRecoveryReplayUnsafe
+      && state.currentText.trim().length === 0
+      && state.openProviderToolCalls.size === 0
+      && state.activeToolItemIds.size === 0
+      && state.activeCompactionItemIds.size === 0;
+  }
+
+  private isCodexFailedTurnAuthReplaySafe(
+    state: CodexSdkSessionState,
+    turn: Record<string, any>,
+  ): boolean {
+    if (!this.isCodexAuthReplaySafe(state)) return false;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    return items.every((item) => {
+      if (!isRecord(item)) return false;
+      if (item.type === 'reasoning') return true;
+      return item.type === 'agentMessage' && !meaningfulString(item.text);
+    });
+  }
+
+  private emitCodexAuthRecoveryError(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    error: ProviderError,
+    guidance: string,
+  ): void {
+    this.clearCodexAuthRecoveryState(state);
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, {
+      ...error,
+      message: appendCodexAuthRecoveryGuidance(error.message, guidance),
+    });
+  }
+
+  private async recoverCodexAuthAndReplay(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    payload: ProviderContextPayload,
+    turnDispatchGeneration: number,
+    authRecoveryRetriesRemaining: number,
+    error: ProviderError,
+    reason: string,
+  ): Promise<void> {
+    state.authRecoveryPending = true;
+    state.authRecoveryRetriesRemaining = authRecoveryRetriesRemaining;
+    this.emitStatus(sessionId, state, {
+      status: 'thinking',
+      label: 'Refreshing Codex authentication...',
+    });
+    try {
+      await this.restartAppServerAfterAuthFailure(reason, error, sessionId, this.getChannelForSession(state));
+    } catch (restartErr) {
+      if (
+        this.sessions.get(sessionId) !== state
+        || state.turnDispatchGeneration !== turnDispatchGeneration
+        || !state.authRecoveryPending
+      ) {
+        return;
+      }
+      this.emitCodexAuthRecoveryError(sessionId, state, {
+        ...error,
+        message: `${error.message}\nAutomatic Codex authentication recovery could not restart the app-server: ${errorMessage(restartErr)}`,
+      }, CODEX_AUTH_RECOVERY_GUIDANCE);
+      return;
+    }
+
+    if (
+      this.sessions.get(sessionId) !== state
+      || state.turnDispatchGeneration !== turnDispatchGeneration
+      || !state.authRecoveryPending
+    ) {
+      return;
+    }
+    if (state.cancelled) {
+      this.clearCodexAuthRecoveryState(state);
+      this.clearStatus(sessionId, state);
+      this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+      return;
+    }
+
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = authRecoveryRetriesRemaining - 1;
+    state.authRecoveryReplayUnsafe = false;
+    state.currentText = '';
+    state.currentMessageId = null;
+    logger.warn(
+      {
+        provider: this.id,
+        sessionId,
+        threadId: state.threadId,
+        retriesRemaining: state.authRecoveryRetriesRemaining,
+      },
+      'Codex authentication recovered; replaying the original turn once',
+    );
+    await this.startTurn(
+      sessionId,
+      state,
+      payload,
+      turnDispatchGeneration,
+      authRecoveryRetriesRemaining - 1,
+    );
+  }
+
+  private async startTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    payload: ProviderContextPayload,
+    turnDispatchGeneration: number,
+    authRecoveryRetriesRemaining: number,
+    activeWriterRecoveryRetriesRemaining = CODEX_ACTIVE_WRITER_RECOVERY_LIMIT,
+    missingRolloutRecoveryRetriesRemaining = CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT,
+  ): Promise<void> {
+    // Unconditionally establish an empty delegation scope for the new turn.
+    //
+    // Unconditional on purpose: no branch, no "only if absent". However the
+    // previous turn ended -- completed, cancelled, timed out, disconnected, or
+    // failed before it ever reached a terminal handler -- this turn begins with
+    // no inherited evidence. This is the load-bearing half of the invariant for
+    // currently observable behaviour, and it is what the cancel/error-A then
+    // zero-dispatch-B regressions actually hold.
+    state.turnDelegationDispatches = [];
+    state.pendingAgentMessageQuestions = undefined;
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      if (
+        !state.incognito
+        && state.threadId
+        && state.loaded
+        && !state.lastInjectedSessionSystemText
+        && desiredSessionSystemText
+      ) {
+        // The thread was loaded without IM.codes sessionSystemText (e.g. via
+        // `setServiceTier` or a bare control command before any normal turn).
+        // Force `ensureThreadLoaded` to re-issue `thread/resume` with the full
+        // `baseInstructions` (official Codex prompt + IM.codes runtime text)
+        // instead of dumping `sessionSystemText` into turn input.
+        state.loaded = false;
+      }
       const shouldInjectStableUpdate = !!(
         state.threadId
         && state.loaded
         && desiredSessionSystemText
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
+      const reusesExistingThread = Boolean(state.threadId);
       await this.ensureThreadLoaded(sessionId, state, payload);
+      // An existing thread may be bound to an IM MCP process that is already
+      // gone (a resume of a loaded thread never respawns it). A thread started
+      // just now spawned a fresh server and has nothing to heal.
+      if (!state.incognito && reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
+        await this.healImcodesMcpIfTransportDead(sessionId, state);
+      }
+      // A Brain must not begin a turn unless IM delegation is authoritatively
+      // usable: with native multi-agent removed at process start there is no
+      // fallback, so starting anyway would strand the user's delegation. The
+      // snapshot is re-verified per Brain turn -- a cached `ready` can outlive a
+      // restart, config change or tools-list invalidation.
+      if (!state.incognito && payload.sessionRole === 'brain' && state.threadId) {
+        await this.assertImcodesDelegationReady(state.threadId);
+      }
       await this.prepareGeneratedImageTracking(sessionId, state);
-      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? getProviderSessionSystemTextSpanned(payload) : undefined);
+      if (shouldInjectStableUpdate) {
+        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+        state.pendingSessionSystemTextUpdateTurnId = undefined;
+      }
       state.turnStartInFlight = true;
-      const result = await this.request('turn/start', {
+      // Every turn names its cwd, so a turn without a pair workspace starts in
+      // the session's own directory again: nothing needs undoing when a pair ends.
+      state.turnCwd = payload.turnCwd;
+      this.refreshActiveTurnLease(sessionId, state, { strong: true, turnStartInFlight: true });
+      const result = await this.requestOnChannel(this.getChannelForSession(state), 'turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
-        cwd: state.cwd,
+        cwd: payload.turnCwd ?? state.cwd,
         ...this.sessionEnvironmentParams(state),
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
@@ -1982,32 +4177,166 @@ export class CodexSdkProvider implements TransportProvider {
       // clobber an id already learned from streamed items/deltas with undefined,
       // or the turn-id guards below would start dropping live assistant text.
       const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
-      if (startedTurnId) state.runningTurnId = startedTurnId;
+      const stopTarget = this.confirmedCancelTerminals.get(state);
+      if (stopTarget && stopTarget.generation === state.turnDispatchGeneration) stopTarget.acceptancePending = false;
+      if (startedTurnId && stopTarget && stopTarget.generation === state.turnDispatchGeneration) {
+        stopTarget.turnId = startedTurnId;
+        if (stopTarget.seen.has(startedTurnId)) {
+          this.stopConfirmations.complete(stopTarget);
+          state.terminalDuringTurnStartIds.add(startedTurnId);
+        }
+      }
+      const terminalArrivedDuringStart = Boolean(startedTurnId && (
+        state.terminalDuringTurnStartIds.delete(startedTurnId)
+      ));
+      if (!terminalArrivedDuringStart) {
+        if (startedTurnId) {
+          state.completedTurnIds.delete(startedTurnId);
+          state.terminatedTurnIds.delete(startedTurnId);
+          state.completedCompactTurnIds.delete(startedTurnId);
+          state.terminatedCompactTurnIds.delete(startedTurnId);
+          state.runningTurnId = startedTurnId;
+        }
+        this.refreshActiveTurnLease(sessionId, state, { turnId: startedTurnId, strong: true });
+      }
       state.nativePlanEventSeen = false;
+      this.armChildSubagentRolloutPolling(sessionId, state);
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
         state.terminatedTurnIds.delete(state.runningTurnId);
       }
-      if (shouldInjectStableUpdate) {
-        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+      if (shouldInjectStableUpdate && state.pendingSessionSystemTextUpdate === desiredSessionSystemText) {
         state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
       }
-      if (state.cancelled && state.runningTurnId) {
+      if (state.cancelled && state.runningTurnId && !this.confirmedCancelOperations.has(sessionId)) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      // Delegation readiness is a PRECONDITION, not a turn failure: it must not
+      // be absorbed into turn-recovery status, or the caller would see a normal
+      // resolved send while the user's delegation silently never happened.
+      if (err instanceof ImcodesDelegationUnavailableError) {
+        state.turnStartInFlight = false;
+        throw err;
+      }
+      const authReplaySafe = this.isCodexAuthReplaySafe(state);
       this.rememberTerminatedTurn(state, state.runningTurnId);
+      this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
-      state.turnStartInFlight = false;      state.activeItemIds.clear();
+      state.turnStartInFlight = false;
+      this.clearActiveItemEvidence(state);
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
-      if (this.isCodexAuthError(error)) {
-        await this.restartAppServerAfterAuthFailure('start-turn', error).catch((restartErr) => {
-          logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
-        });
+      if (state.cancelled) {
+        this.clearCodexAuthRecoveryState(state);
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
       }
+      if (
+        !state.incognito
+        && missingRolloutRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && isCodexThreadNeverMaterializedError(error)
+        && this.sessions.get(sessionId) === state
+        && state.turnDispatchGeneration === turnDispatchGeneration
+      ) {
+        // `thread/start` may return before codex-core's rollout is visible to
+        // the app-server. A JSON-RPC rejection proves turn/start was not
+        // accepted, so retrying the same payload is safe. Force one exact
+        // thread/resume first: if the rollout appeared, the durable identity is
+        // retained; if it is genuinely absent, ensureThreadLoaded replaces the
+        // broken thread. Never loop or replay after provider/tool output.
+        state.loaded = false;
+        logger.warn(
+          { provider: this.id, sessionId, threadId: state.threadId },
+          'Codex turn start raced a missing rollout; rehydrating once before retry',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining,
+          missingRolloutRecoveryRetriesRemaining - 1,
+        );
+        return;
+      }
+      if (
+        !state.incognito
+        && activeWriterRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && /already has an active writer/i.test(error.message)
+      ) {
+        const conflictedThreadId = state.threadId;
+        if (conflictedThreadId) this.getChannelForSession(state).threadToSession.delete(conflictedThreadId);
+        state.threadId = undefined;
+        state.loaded = false;
+        state.currentText = '';
+        state.currentMessageId = null;
+        logger.warn(
+          { provider: this.id, sessionId, conflictedThreadId },
+          'Codex thread rejected a pre-accept turn because another writer is active; retrying once on a replacement thread',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining - 1,
+          missingRolloutRecoveryRetriesRemaining,
+        );
+        return;
+      }
+      if (this.isCodexAuthError(error)) {
+        if (
+          authRecoveryRetriesRemaining > 0
+          && authReplaySafe
+          && !state.cancelled
+          && this.sessions.get(sessionId) === state
+          && state.turnDispatchGeneration === turnDispatchGeneration
+        ) {
+          await this.recoverCodexAuthAndReplay(
+            sessionId,
+            state,
+            payload,
+            turnDispatchGeneration,
+            authRecoveryRetriesRemaining,
+            error,
+            'start-turn',
+          );
+          return;
+        }
+        if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
+          void this.restartAppServerAfterAuthFailure(
+            'start-turn-unsafe-replay',
+            error,
+            sessionId,
+            this.getChannelForSession(state),
+          ).catch((restartErr) => {
+            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+          });
+          this.emitCodexAuthRecoveryError(
+            sessionId,
+            state,
+            error,
+            CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE,
+          );
+          return;
+        }
+        this.emitCodexAuthRecoveryError(
+          sessionId,
+          state,
+          error,
+          CODEX_AUTH_RECOVERY_GUIDANCE,
+        );
+        return;
+      }
+      this.clearCodexAuthRecoveryState(state);
       this.emitError(sessionId, error);
     }
   }
@@ -2023,11 +4352,13 @@ export class CodexSdkProvider implements TransportProvider {
     return isSessionControlCommandText(payload.userMessage, 'compact');
   }
 
-  private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+  private async startCompact(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     try {
-      await this.ensureThreadLoaded(sessionId, state);
+      await this.ensureThreadLoaded(sessionId, state, payload);
       this.clearPendingSessionSystemTextUpdate(state);
+      this.clearActiveTurnLease(state);
       state.runningCompact = true;
+      state.compactCommandInFlight = true;
       state.compactObserved = false;
       state.currentText = '';
       state.currentMessageId = null;
@@ -2036,7 +4367,7 @@ export class CodexSdkProvider implements TransportProvider {
         label: 'Compacting context...',
       });
       this.armCompactHardTimeout(sessionId, state);
-      const result = await this.request('thread/compact/start', {
+      const result = await this.requestOnChannel(this.getChannelForSession(state), 'thread/compact/start', {
         threadId: state.threadId,
       }, COMPACT_START_ACCEPT_TIMEOUT_MS);
       // Some Codex app-server builds accept `thread/compact/start` as a
@@ -2054,6 +4385,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;
@@ -2063,6 +4395,12 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     if (state.threadId && state.loaded) return;
+    if (state.incognito && state.threadId) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+    }
+    if (state.incognito && !this.incognitoChannel.child?.stdin.writable) {
+      await this.ensureIncognitoChannelStarted();
+    }
 
     // Always send `baseInstructions`. Catalog models get codex's full
     // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
@@ -2082,9 +4420,12 @@ export class CodexSdkProvider implements TransportProvider {
         state.lastInjectedSessionSystemText = sessionSystemText;
         return;
       } catch (err) {
-        if (!isCodexThreadHistoryUnreadableError(err)) throw err;
+        if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
 
-        const repaired = await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
+        // A never-materialized thread names no rollout file, so there is no
+        // history to repair; replace it without probing unrelated files.
+        const repaired = !isCodexThreadNeverMaterializedError(err)
+          && await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
           logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
           return false;
         });
@@ -2099,8 +4440,13 @@ export class CodexSdkProvider implements TransportProvider {
         }
 
         const oldThreadId = state.threadId;
-        logger.warn({ provider: this.id, sessionId, threadId: oldThreadId, err }, 'Codex SDK stored thread history is unreadable; starting replacement thread');
-        if (oldThreadId) this.threadToSession.delete(oldThreadId);
+        logger.warn(
+          { provider: this.id, sessionId, threadId: oldThreadId, err },
+          isCodexThreadNeverMaterializedError(err)
+            ? 'Codex SDK stored thread has no rollout; starting replacement thread'
+            : 'Codex SDK stored thread history is unreadable; starting replacement thread',
+        );
+        if (oldThreadId) this.getChannelForSession(state).threadToSession.delete(oldThreadId);
         state.threadId = undefined;
         state.loaded = false;
       }
@@ -2111,45 +4457,123 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
+    if (state.incognito) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+    }
     if (!state.threadId) throw new Error('Codex SDK resume requested without a thread id');
     // Resume must carry the same `baseInstructions`: previously-broken
     // threads were persisted with empty base_instructions, and codex's
     // resolution priority (override > stored history > model default)
     // means supplying it on resume is the only way to repair them
     // mid-flight.
-    const result = await this.request('thread/resume', {
+    const channel = this.getChannelForSession(state);
+    const threadConfigParams = this.sessionThreadConfigParams(state, false);
+    const result = await this.requestOnChannel(channel, 'thread/resume', {
       threadId: state.threadId,
       ...this.sessionEnvironmentParams(state),
-      ...this.sessionMcpConfigParams(state),
+      ...threadConfigParams,
       ...(state.model ? { model: state.model } : {}),
       baseInstructions,
     });
     const resumedId = result?.thread?.id ?? state.threadId;
+    // One line per resume, so "was the identity re-sent after compaction?"
+    // is answerable from the log on any machine.
+    logger.info({
+      sessionId,
+      threadId: resumedId,
+      baseInstructionsChars: baseInstructions.length,
+      imcodesSystemTextIncluded: baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER),
+    }, 'codex-sdk: thread resumed with baseInstructions');
     state.threadId = resumedId;
     state.loaded = true;
-    this.threadToSession.set(resumedId, sessionId);
+    channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
   }
 
   private async startNewThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
-    const result = await this.request('thread/start', {
-      cwd: state.cwd,
-      ...this.sessionEnvironmentParams(state),
-      ...this.sessionMcpConfigParams(state),
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-      personality: 'none',
-      ...(state.model ? { model: state.model } : {}),
-      baseInstructions,
-    });
-    const threadId = result?.thread?.id;
-    if (!threadId) {
-      throw new Error('Codex app-server did not return a thread id');
+    // The fence is decided HERE, on the send path, before any user or task
+    // bytes reach the thread: a managed session's thread is created without
+    // native multi-agent tools, and Codex keeps that for every later resume.
+    const fenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
+    const fence = fenceOf(fenced);
+    state.pendingThreadFence = fence;
+    const channel = this.getChannelForSession(state);
+    let threadConfigParams = this.sessionThreadConfigParams(state, fenced);
+    if (state.incognito) {
+      const cwdEnabledKeys = await this.readIncognitoEnabledImcodesMcpKeys(channel, state.cwd);
+      if (cwdEnabledKeys.length > 0) {
+        const existingCfg = isRecord(threadConfigParams.config) ? { ...threadConfigParams.config } : {};
+        const disableMap: Record<string, { enabled: false }> = {};
+        // Passing config.mcp_servers on thread/start replaces the CLI -c mcp_servers layer in Codex,
+        // so re-assert every channel-disabled key alongside project cwd-discovered keys.
+        for (const key of [...channel.disabledMcpKeys, ...cwdEnabledKeys]) {
+          disableMap[key] = { enabled: false };
+        }
+        threadConfigParams = {
+          ...threadConfigParams,
+          config: { ...existingCfg, mcp_servers: disableMap },
+        };
+      }
     }
-    state.threadId = threadId;
-    state.loaded = true;
-    this.threadToSession.set(threadId, sessionId);
-    this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+    try {
+      const result = await this.requestOnChannel(channel, 'thread/start', {
+        cwd: state.cwd,
+        ...this.sessionEnvironmentParams(state),
+        ...threadConfigParams,
+        ...(state.incognito ? { ephemeral: true } : {}),
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        personality: 'none',
+        ...(state.model ? { model: state.model } : {}),
+        baseInstructions,
+      });
+      const threadId = result?.thread?.id;
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id');
+      }
+      state.threadId = threadId;
+      state.nativeAgentFence = { threadId, fence };
+      state.loaded = true;
+      channel.threadToSession.set(threadId, sessionId);
+      if (!state.incognito || state.model) {
+        this.emitSessionInfo(sessionId, {
+          ...(!state.incognito ? { resumeId: threadId } : {}),
+          ...(state.model ? { model: state.model } : {}),
+        });
+      }
+    } finally {
+      state.pendingThreadFence = undefined;
+    }
+  }
+
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * The native-agent fence of the thread serving this route. A thread's fence
+   * is what it was created with: recorded when this provider started it, or
+   * proven by the thread's own rollout (`turn_context.multi_agent_version`).
+   * With no thread yet, the send path's `thread/start` decides it.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    const threadId = state.threadId;
+    if (!threadId) {
+      return state.pendingThreadFence
+        ?? this.nativeAgentFence.nextLaunchFence(providerSessionId, state.imcodesSessionName);
+    }
+    if (state.nativeAgentFence?.threadId === threadId) return state.nativeAgentFence.fence;
+    if (state.incognito) return state.pendingThreadFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    const fence = await readCodexThreadNativeAgentFence(threadId, { env: state.env });
+    // Cache only a proven fence, and only for the thread that was read.
+    if (fence === NATIVE_AGENT_FENCES.DISABLED
+      && this.sessions.get(providerSessionId) === state
+      && state.threadId === threadId) {
+      state.nativeAgentFence = { threadId, fence };
+    }
+    return fence;
   }
 
   private async repairUnreadableThreadHistory(err: unknown): Promise<boolean> {
@@ -2173,8 +4597,35 @@ export class CodexSdkProvider implements TransportProvider {
     return state.env && Object.keys(state.env).length > 0 ? { env: state.env } : {};
   }
 
-  private sessionMcpConfigParams(state: CodexSdkSessionState): { config?: Record<string, unknown> } {
-    return state.mcpConfig ? { config: state.mcpConfig } : {};
+  private sessionThreadConfigParams(
+    state: CodexSdkSessionState,
+    fenced?: boolean,
+  ): { config?: Record<string, unknown>; modelProvider?: string } {
+    const rawMcp = fenced ? withCodexNativeAgentFence(state.mcpConfig) : (state.mcpConfig ?? {});
+    const baseConfig = rawMcp ? { ...rawMcp } : {};
+    if (state.incognito) delete baseConfig.mcp_servers;
+    const provider = state.customModelProvider;
+    if (!provider) {
+      return Object.keys(baseConfig).length > 0 ? { config: baseConfig } : {};
+    }
+    const existingModelProviders = (baseConfig['model_providers'] as Record<string, unknown> | undefined) ?? {};
+    const config = {
+      ...baseConfig,
+      model_providers: {
+        ...existingModelProviders,
+        [provider.providerId]: {
+          name: provider.providerId,
+          base_url: provider.baseUrl,
+          wire_api: provider.wireApi ?? 'responses',
+          ...(provider.apiKey ? { experimental_bearer_token: provider.apiKey } : {}),
+          ...(provider.httpHeaders ? { http_headers: provider.httpHeaders } : {}),
+        },
+      },
+    };
+    return {
+      config,
+      modelProvider: provider.providerId,
+    };
   }
 
   private codexGeneratedImageEnv(state: CodexSdkSessionState): Record<string, string | undefined> {
@@ -2237,7 +4688,11 @@ export class CodexSdkProvider implements TransportProvider {
     return freshPaths;
   }
 
-  private handleLine(line: string): void {
+  private handleLine(channel: CodexAppServerChannel, child: ChildProcessWithoutNullStreams, line: string): void {
+    // A prior app-server generation can still have already-buffered stdout
+    // callbacks after restart. Thread ids are deliberately preserved across
+    // restart, so threadToSession alone cannot distinguish those stale events.
+    if (channel.child !== child) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg: JsonRpcResponse;
@@ -2246,19 +4701,44 @@ export class CodexSdkProvider implements TransportProvider {
     } catch (err) {
       const runtimeSubagentPayload = parseCodexRuntimeSubagentTag(trimmed);
       if (runtimeSubagentPayload) {
-        this.emitRuntimeSubagentNotification(runtimeSubagentPayload);
+        this.emitRuntimeSubagentNotification(channel, runtimeSubagentPayload);
         return;
       }
-      logger.warn({ provider: this.id, line: trimmed, err }, 'Failed to parse Codex app-server line');
+      const requestId = extractMalformedJsonRpcRequestId(trimmed);
+      const pending = requestId === null ? undefined : channel.pendingRequests.get(requestId);
+      if (pending && requestId !== null) {
+        channel.pendingRequests.delete(requestId);
+        pending.reject(new CodexMalformedRpcResponseError(requestId, pending.method));
+      }
+      logger.warn({
+        provider: this.id,
+        channel: channel.kind,
+        lineSummary: requestId === null
+          ? (trimmed.startsWith('{') ? 'malformed JSON object' : 'non-JSON app-server output')
+          : 'malformed JSON-RPC response with numeric request id',
+        lineChars: trimmed.length,
+        lineUtf8Bytes: Buffer.byteLength(trimmed, 'utf8'),
+        lineSha256: createHash('sha256').update(trimmed, 'utf8').digest('hex'),
+        requestId: requestId ?? undefined,
+        pendingMethod: pending?.method,
+        parseError: summarizeJsonParseError(err),
+      }, 'Failed to parse Codex app-server line');
       return;
     }
 
-    if (typeof msg.id === 'number') {
-      const pending = this.pendingRequests.get(msg.id);
+    // Server-originated requests have their OWN id namespace. Check method
+    // first or a question can consume an unrelated outbound RPC with that id.
+    if (msg.method === CODEX_USER_INPUT_METHOD && (typeof msg.id === 'number' || typeof msg.id === 'string')) {
+      this.handleUserInputRequest(channel, child, msg.id, msg.params ?? {});
+      return;
+    }
+
+    if (typeof msg.id === 'number' && !msg.method) {
+      const pending = channel.pendingRequests.get(msg.id);
       if (!pending) return;
-      this.pendingRequests.delete(msg.id);
+      channel.pendingRequests.delete(msg.id);
       if (msg.error) {
-        pending.reject(new Error(msg.error.message ?? 'Codex app-server request failed'));
+        pending.reject(new CodexRpcResponseError(msg.error.message ?? 'Codex app-server request failed'));
       } else {
         pending.resolve(msg.result);
       }
@@ -2266,37 +4746,125 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (!msg.method) return;
-    void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
-      logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
+    void this.handleNotification(channel, msg.method, msg.params ?? {}).catch((err) => {
+      logger.warn({ provider: this.id, channel: channel.kind, method: msg.method, err }, 'Codex app-server notification handler failed');
     });
   }
 
-  private resolveRuntimeSubagentSession(params: Record<string, any>): string | undefined {
+  answerPendingQuestion(sessionName: string, answer: string): boolean {
+    for (const [sessionId, input] of this.questionInputs) {
+      const state = this.sessions.get(sessionId);
+      if ((state?.imcodesSessionName ?? sessionId) !== sessionName) continue;
+      return this.questions.resolve(sessionId, codexUserInputResponse(input.questions, answer));
+    }
+    return false;
+  }
+
+  private handleUserInputRequest(
+    channel: CodexAppServerChannel,
+    child: ChildProcessWithoutNullStreams,
+    id: number | string,
+    params: Record<string, any>,
+  ): void {
+    const sessionId = this.getSessionIdForThread(channel, params.threadId);
+    const state = sessionId ? this.sessions.get(sessionId) : undefined;
+    const rawQuestions: unknown[] = Array.isArray(params.questions) ? params.questions : [];
+    const validRawQuestions = rawQuestions.length > 0 && rawQuestions.every((q): q is CodexUserInputQuestion => (
+      Boolean(q)
+      && typeof q === 'object'
+      && typeof (q as Record<string, unknown>).id === 'string'
+      && ((q as Record<string, unknown>).id as string).trim().length > 0
+      && typeof (q as Record<string, unknown>).question === 'string'
+      && ((q as Record<string, unknown>).question as string).trim().length > 0
+      && (
+        (q as Record<string, unknown>).header === undefined
+        || (q as Record<string, unknown>).header === null
+        || typeof (q as Record<string, unknown>).header === 'string'
+      )
+    ));
+    const questions: CodexUserInputQuestion[] = validRawQuestions
+      ? rawQuestions.map((q) => ({
+          ...q,
+          header: typeof q.header === 'string' ? q.header : '',
+        }))
+      : [];
+    const closedTurn = Boolean(state && typeof params.turnId === 'string' && this.isClosedCodexTurn(state, params.turnId));
+    const hasUniqueIds = validRawQuestions && new Set(questions.map(q => q.id)).size === questions.length;
+    if (!sessionId || !state || state.cancelled || typeof params.turnId !== 'string'
+      || typeof params.itemId !== 'string' || !hasUniqueIds
+      || closedTurn
+      || (state.runningTurnId && state.runningTurnId !== params.turnId)) {
+      logger.warn({
+        provider: this.id,
+        sessionId: sessionId ?? null,
+        threadId: params.threadId ?? null,
+        turnId: params.turnId ?? null,
+        runningTurnId: state?.runningTurnId ?? null,
+        itemId: params.itemId ?? null,
+        questionCount: rawQuestions.length,
+        cancelled: state?.cancelled ?? false,
+        closedTurn,
+      }, 'Codex SDK rejected item/tool/requestUserInput request');
+      child.stdin.write(`${JSON.stringify({ id, error: { code: CODEX_USER_INPUT_INVALID_PARAMS, message: 'Question does not belong to a live session turn or has invalid questions' } })}\n`);
+      return;
+    }
+    if (this.questionInputs.get(sessionId)?.requestId === id && this.questions.has(sessionId)) return;
+    const input = { requestId: id, turnId: params.turnId, questions };
+    const waiting = this.questions.wait(sessionId, { timeoutMs: ASK_QUESTION_WAIT_MS, fallback: { answers: {} } });
+    this.questionInputs.set(sessionId, input);
+    state.authRecoveryReplayUnsafe = true;
+    this.recordStrongActivity(sessionId, state, params.turnId);
+    void waiting.then(result => {
+      if (this.questionInputs.get(sessionId) === input) this.questionInputs.delete(sessionId);
+      // A response must never leak into a replacement app-server generation.
+      if (channel.child === child && child.stdin.writable) child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    });
+    // Reuse the existing question-card relay and ask.answer control path.
+    this.emitToolCall(sessionId, {
+      id: params.itemId, name: INTERACTIVE_QUESTION_TOOL_NAME, status: 'complete', input: { questions },
+    });
+  }
+
+  private resolveRuntimeSubagentSession(channel: CodexAppServerChannel, params: Record<string, any>): string | undefined {
     const threadId = readParamThreadId(params);
-    if (threadId) return this.threadToSession.get(threadId);
-    const activeSessions = [...this.sessions.entries()]
+    if (threadId) return this.getSessionIdForThread(channel, threadId);
+    const channelSessions = this.getSessionsForChannel(channel);
+    const activeSessions = channelSessions
       .filter(([, state]) => state.runningTurnId || state.runningCompact)
       .map(([sessionId]) => sessionId);
     if (activeSessions.length === 1) return activeSessions[0];
-    if (this.sessions.size === 1) return [...this.sessions.keys()][0];
+    if (channelSessions.length === 1) return channelSessions[0]![0];
     return undefined;
   }
 
-  private emitRuntimeSubagentNotification(params: Record<string, any>): void {
-    const sessionId = this.resolveRuntimeSubagentSession(params);
+  private emitRuntimeSubagentNotification(channel: CodexAppServerChannel, params: Record<string, any>): void {
+    const sessionId = this.resolveRuntimeSubagentSession(channel, params);
     const state = sessionId ? this.sessions.get(sessionId) : null;
     if (!sessionId || !state) return;
     if (state.cancelled) return;
     this.clearStatus(sessionId, state);
     const tool = runtimeSubagentToolFromPayload(sessionId, params);
     if (!tool) return;
+    state.authRecoveryReplayUnsafe = true;
+    const detail = tool.detail as SdkSubagentDetail | undefined;
+    const canonicalKey = detail?.meta?.canonicalKey;
+    if (canonicalKey) {
+      const startedAtMs = detail.meta.startedAtMs
+        ?? state.runtimeSubagentStartedAtByKey.get(canonicalKey)
+        ?? Date.now();
+      detail.meta.startedAtMs = startedAtMs;
+      if (detail.meta.active && !detail.meta.terminal) {
+        state.runtimeSubagentStartedAtByKey.set(canonicalKey, startedAtMs);
+      }
+    }
     for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
   private async readRawChecklistHistoryChunk(state: CodexSdkSessionState): Promise<string | null> {
-    if (!state.threadId) return null;
-    const env = { ...process.env, ...(state.env ?? {}) };
-    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    if (state.incognito || !state.threadId) return null;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
     if (!rolloutPath) return null;
     state.rawChecklistRolloutPath = rolloutPath;
 
@@ -2359,12 +4927,12 @@ export class CodexSdkProvider implements TransportProvider {
       if (!tool) continue;
       if (state.rawChecklistSeenCallIds.has(tool.id)) continue;
       state.rawChecklistSeenCallIds.add(tool.id);
-      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+      this.emitToolCall(sessionId, tool);
     }
   }
 
   private queueRawChecklistHistoryScan(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId || state.rawChecklistScanPromise) return;
+    if (state.incognito || !state.threadId || state.rawChecklistScanPromise) return;
     state.rawChecklistScanPromise = this.scanRawChecklistHistory(sessionId, state)
       .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK raw checklist history scan failed'))
       .finally(() => {
@@ -2379,7 +4947,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private armRawChecklistPolling(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId) return;
+    if (state.incognito || !state.threadId) return;
     state.rawChecklistPollUntil = Date.now() + CODEX_RAW_CHECKLIST_POLL_WINDOW_MS;
     if (state.rawChecklistPollTimer) return;
     const tick = () => {
@@ -2397,19 +4965,424 @@ export class CodexSdkProvider implements TransportProvider {
     state.rawChecklistPollTimer.unref?.();
   }
 
-  private handleRawResponseItem(params: Record<string, any>): boolean {
+  // Dedicated fast poll so a zombie turn is settled from rollout evidence within
+  // a few seconds instead of waiting for the next ~20s thread/read heartbeat.
+  private armRolloutSettlePoll(sessionId: string, state: CodexSdkSessionState): void {
+    if (state.incognito || !state.threadId) return;
+    if (state.rolloutSettlePollTimer) return;
+    const tick = () => {
+      state.rolloutSettlePollTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      const lease = state.activeTurnLease;
+      const turnId = state.runningTurnId ?? lease?.turnId;
+      if (
+        !turnId
+        || state.cancelled
+        || state.runningCompact
+        || this.isClosedCodexTurn(state, turnId)
+      ) {
+        this.clearRolloutSettlePoll(state);
+        return;
+      }
+      // No-ops until the turn has been silent past the gate, so healthy,
+      // actively-streaming turns never touch the file; only zombies settle here.
+      if (lease && this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+        this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, Date.now());
+      } else {
+        // If the SDK notification/heartbeat path wedges but the runtime still
+        // has a current turn id, Codex core's rollout file is still the durable
+        // authority. Keep polling it so a recorded task_complete clears the
+        // underlying provider state instead of only letting the UI pretend idle.
+        this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, turnId);
+      }
+      state.rolloutSettlePollTimer = setTimeout(tick, CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS);
+      state.rolloutSettlePollTimer.unref?.();
+    };
+    state.rolloutSettlePollTimer = setTimeout(tick, CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS);
+    state.rolloutSettlePollTimer.unref?.();
+  }
+
+  private clearRolloutSettlePoll(state: CodexSdkSessionState): void {
+    if (state.rolloutSettlePollTimer) clearTimeout(state.rolloutSettlePollTimer);
+    state.rolloutSettlePollTimer = null;
+  }
+
+  // ROLLOUT-FIRST AUTHORITY — front-line, real-time turn-completion detection.
+  //
+  // Attaches an fs.watch to the running turn's rollout file so the terminal
+  // `task_complete{turn_id}` record settles the turn the instant it lands —
+  // independent of the app-server's `turn/completed`, the heartbeat lease, and
+  // the legacy 60s silence gate. Armed at the single activity choke-point
+  // (`refreshActiveTurnLease`), so every observed turn is covered; the immediate
+  // check on arm also self-heals a turn whose `task_complete` was already on disk
+  // (e.g. the app-server went silent, or the record landed between events).
+  private armRolloutAuthorityWatch(sessionId: string, state: CodexSdkSessionState, turnId: string | undefined): void {
+    if (state.incognito || !turnId || !state.threadId) return;
+    if (state.cancelled || state.runningCompact) return;
+    if (this.isClosedCodexTurn(state, turnId)) return;
+    // Already watching this exact turn — cheap no-op (called on every activity).
+    if (state.rolloutAuthorityWatcher && state.rolloutAuthorityTurnId === turnId) return;
+    if (state.rolloutAuthorityArmInFlight && state.rolloutAuthorityTurnId === turnId) return;
+    // New turn (or first arm): tear down any prior watcher and re-target.
+    this.disarmRolloutAuthorityWatch(state);
+    state.rolloutAuthorityTurnId = turnId;
+    state.rolloutAuthorityArmInFlight = true;
+    void (async () => {
+      try {
+        const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+        const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+        const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId!, { env });
+        const latest = this.sessions.get(sessionId);
+        // Turn rolled over or session gone while resolving the path.
+        if (!latest || latest.rolloutAuthorityTurnId !== turnId) return;
+        if (!rolloutPath) return; // file not resolvable yet; a later activity re-arms
+        latest.rawChecklistRolloutPath = rolloutPath;
+        let watcher: FSWatcher;
+        try {
+          watcher = watch(rolloutPath, { persistent: false }, () => {
+            this.scheduleRolloutAuthorityCheck(sessionId, CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS);
+          });
+        } catch (err) {
+          logger.debug({ provider: this.id, sessionId, threadId: latest.threadId, turnId, rolloutPath, err }, 'Codex rollout authority watch failed to attach');
+          return;
+        }
+        const cur = this.sessions.get(sessionId);
+        if (!cur || cur.rolloutAuthorityTurnId !== turnId) {
+          try { watcher.close(); } catch { /* ignore */ }
+          return;
+        }
+        cur.rolloutAuthorityWatcher = watcher;
+        cur.rolloutAuthorityWatchPath = rolloutPath;
+        // Immediate check: the terminal record may already be on disk (post-restart
+        // zombie, or it landed before the watcher attached).
+        this.scheduleRolloutAuthorityCheck(sessionId, 0);
+      } finally {
+        const s = this.sessions.get(sessionId);
+        if (s) s.rolloutAuthorityArmInFlight = false;
+      }
+    })();
+  }
+
+  private scheduleRolloutAuthorityCheck(sessionId: string, delayMs: number): void {
+    const state = this.sessions.get(sessionId);
+    if (!state || !state.rolloutAuthorityTurnId) return;
+    if (state.rolloutAuthorityDebounce) return; // coalesce the append burst
+    state.rolloutAuthorityDebounce = setTimeout(() => {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutAuthorityDebounce = undefined;
+      void this.runRolloutAuthorityCheck(sessionId);
+    }, Math.max(0, delayMs));
+    state.rolloutAuthorityDebounce.unref?.();
+  }
+
+  private async runRolloutAuthorityCheck(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    const turnId = state.rolloutAuthorityTurnId ?? state.runningTurnId;
+    if (!turnId) return;
+    if (state.cancelled || state.runningCompact || this.isClosedCodexTurn(state, turnId)) {
+      this.disarmRolloutAuthorityWatch(state);
+      return;
+    }
+    // Shared with the legacy settle poll so only one rollout read runs at a time.
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    // Current turn's start wallclock — rejects a PRIOR turn's task_complete during
+    // the window before this turn's own task_started has been flushed to disk.
+    const turnStartedAtMs = state.activeTurnLease?.startedAtMs ?? state.activeTurnLease?.turnStartInFlightAtMs ?? null;
+    try {
+      // Fast path — UNCHANGED behavior/timing: settle when the tracked turn's own
+      // task_complete is on disk. Keeping this first preserves the exact prior
+      // code path (and timing) for every healthy turn.
+      let evidence: CodexRolloutTaskCompleteEvidence | null = await this.rolloutTailReportsTaskComplete(state, turnId);
+      let settledTurnId = turnId;
+      let desync = false;
+      if (!evidence) {
+        // Desync fallback: the tracked turnId no longer matches the turn_id
+        // codex-core actually wrote (turn/start result missing / late / wrong id),
+        // so the turnId-scoped match above never fires even though task_complete
+        // is durably on disk — the exact case that used to strand a finished turn
+        // as "working" forever. The rollout file is already session-scoped, so
+        // judge liveness by the tail's LAST lifecycle marker and settle when the
+        // terminal task_complete was written at/after this turn started (the
+        // start-time guard rejects a stale prior turn's completion).
+        const terminal = await this.rolloutTailReportsTerminalTaskComplete(state);
+        if (
+          terminal
+          && terminal.turnId !== turnId
+          && turnStartedAtMs != null
+          && terminal.completedAtMs != null
+          && terminal.completedAtMs >= turnStartedAtMs
+        ) {
+          evidence = terminal;
+          settledTurnId = terminal.turnId;
+          desync = true;
+        }
+      }
+      if (!evidence) return;
+      const latest = this.sessions.get(sessionId);
+      if (!latest) return;
+      if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, settledTurnId)) return;
+      // A missing turn/start RPC response can leave startTurn() awaiting forever;
+      // record the terminal turn so a very late response cannot re-run it.
+      if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(settledTurnId);
+      if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+        latest.currentMessageId = `${settledTurnId}:rollout-task-complete`;
+        latest.currentText = evidence.lastAgentMessage;
+      }
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+        threadId: latest.threadId,
+        turnId: settledTurnId,
+        ...(desync ? { trackedTurnId: turnId, desyncSettle: true } : {}),
+      }, 'Codex rollout task_complete observed via real-time watch; settling turn from authoritative rollout evidence');
+      await this.completeTurn(sessionId, latest, settledTurnId, 'rollout_task_complete');
+    } catch (err) {
+      logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout authority check failed');
+    } finally {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutTaskCompleteCheckInFlight = false;
+    }
+  }
+
+  private disarmRolloutAuthorityWatch(state: CodexSdkSessionState): void {
+    if (state.rolloutAuthorityWatcher) {
+      try { state.rolloutAuthorityWatcher.close(); } catch { /* ignore */ }
+      state.rolloutAuthorityWatcher = undefined;
+    }
+    if (state.rolloutAuthorityDebounce) {
+      clearTimeout(state.rolloutAuthorityDebounce);
+      state.rolloutAuthorityDebounce = undefined;
+    }
+    state.rolloutAuthorityWatchPath = undefined;
+    state.rolloutAuthorityTurnId = undefined;
+  }
+
+  private clearChildSubagentRolloutPollTimer(state: CodexSdkSessionState): void {
+    if (state.childSubagentRolloutTimer) clearTimeout(state.childSubagentRolloutTimer);
+    state.childSubagentRolloutTimer = null;
+    state.childSubagentRolloutPollUntil = 0;
+  }
+
+  private queueChildSubagentRolloutScan(sessionId: string, state: CodexSdkSessionState): void {
+    if (state.incognito || !state.threadId || state.childSubagentRolloutScanPromise) return;
+    state.childSubagentRolloutScanPromise = this.scanChildSubagentRollouts(sessionId, state)
+      .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK child subagent rollout scan failed'))
+      .finally(() => {
+        state.childSubagentRolloutScanPromise = undefined;
+      });
+  }
+
+  private armChildSubagentRolloutPolling(sessionId: string, state: CodexSdkSessionState): void {
+    if (state.incognito || !state.threadId) return;
+    state.childSubagentRolloutPollUntil = Date.now() + CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS;
+    this.queueChildSubagentRolloutScan(sessionId, state);
+    if (state.childSubagentRolloutTimer) return;
+    const tick = () => {
+      state.childSubagentRolloutTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      const hasOpenChild = [...this.trackedSubagentThreads.values()].some(
+        (tracked) => tracked.sessionId === sessionId && tracked.rolloutPath,
+      );
+      if (!state.threadId || (Date.now() > state.childSubagentRolloutPollUntil && !hasOpenChild)) {
+        this.clearChildSubagentRolloutPollTimer(state);
+        return;
+      }
+      this.queueChildSubagentRolloutScan(sessionId, state);
+      state.childSubagentRolloutTimer = setTimeout(tick, CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS);
+      state.childSubagentRolloutTimer.unref?.();
+    };
+    state.childSubagentRolloutTimer = setTimeout(tick, CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS);
+    state.childSubagentRolloutTimer.unref?.();
+  }
+
+  private async scanChildSubagentRollouts(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    if (state.incognito || !state.threadId) return;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const discovered = await discoverCodexChildSubagentRolloutSnapshots(
+      env,
+      state.childSubagentRolloutStartedAt,
+    );
+    const snapshots = discovered.filter((snapshot) => snapshot.parentThreadId === state.threadId);
+    const seenRolloutPaths = new Set(snapshots.map((snapshot) => snapshot.rolloutPath));
+    const rememberSnapshot = (snapshot: CodexChildSubagentRolloutSnapshot | null | undefined): void => {
+      if (!snapshot || seenRolloutPaths.has(snapshot.rolloutPath)) return;
+      snapshots.push(snapshot);
+      seenRolloutPaths.add(snapshot.rolloutPath);
+    };
+    for (const tracked of this.trackedSubagentThreads.values()) {
+      if (tracked.sessionId !== sessionId) continue;
+      if (state.childSubagentRolloutCompletedIds.has(tracked.agentId)) continue;
+      const rolloutPath = tracked.rolloutPath ?? await findCodexRolloutPathByUuid(tracked.agentId, { env });
+      if (!rolloutPath || seenRolloutPaths.has(rolloutPath)) continue;
+      const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
+      if (snapshot?.agentId === tracked.agentId) {
+        rememberSnapshot(snapshot);
+      }
+    }
+    // Same traversal, second question: rollouts belonging to this session even
+    // when they do not name this thread as their parent.
+    const sessionName = state.imcodesSessionName ?? sessionId;
+    for (const snapshot of discovered) {
+      if (codexChildSubagentRolloutMatchesSession(snapshot, sessionName, state.cwd, state.turnCwd)) {
+        rememberSnapshot(snapshot);
+      }
+    }
+    for (const snapshot of snapshots) {
+      if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
+      const existingById = this.trackedSubagentThreads.get(snapshot.agentId);
+      const existingByPath = snapshot.agentPath
+        ? [...this.trackedSubagentThreads.values()].find((candidate) => (
+            candidate.sessionId === sessionId && candidate.agentPath === snapshot.agentPath
+          ))
+        : undefined;
+      const existing = existingById ?? existingByPath;
+      const tracked: CodexTrackedSubagentThread = existing ?? {
+        sessionId,
+        callId: `rollout:${snapshot.agentId}`,
+        agentId: snapshot.agentId,
+      };
+      if (existing && existing.agentId !== snapshot.agentId) {
+        this.trackedSubagentThreads.delete(existing.agentId);
+      }
+      tracked.agentId = snapshot.agentId;
+      tracked.agentPath = snapshot.agentPath ?? tracked.agentPath;
+      tracked.agentName = snapshot.agentName ?? tracked.agentName;
+      tracked.prompt = snapshot.prompt ?? tracked.prompt;
+      tracked.model = snapshot.model ?? tracked.model;
+      tracked.rolloutPath = snapshot.rolloutPath;
+      tracked.startedAtMs = tracked.startedAtMs ?? snapshot.startedAtMs ?? Date.now();
+      if (snapshot.usageTotalTokens !== undefined) tracked.usageTotalTokens = snapshot.usageTotalTokens;
+      this.trackedSubagentThreads.set(snapshot.agentId, tracked);
+
+      if (!state.childSubagentRolloutSeenIds.has(snapshot.agentId)) {
+        state.childSubagentRolloutSeenIds.add(snapshot.agentId);
+        this.emitTrackedSubagentSnapshot(tracked, 'running');
+      } else if (snapshot.usageTotalTokens !== undefined && !snapshot.completed) {
+        this.emitTrackedSubagentSnapshot(tracked, tracked.lastStatus ?? 'running');
+      }
+
+      if (snapshot.completed) {
+        const status = { completed: snapshot.output ?? 'completed' };
+        tracked.lastStatus = status;
+        this.emitTrackedSubagentSnapshot(tracked, status);
+        state.childSubagentRolloutCompletedIds.add(snapshot.agentId);
+        this.trackedSubagentThreads.delete(snapshot.agentId);
+      }
+    }
+  }
+
+  private handleRawResponseItem(channel: CodexAppServerChannel, params: Record<string, any>): boolean {
     const threadId = readParamThreadId(params);
-    const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+    const sessionId = this.getSessionIdForThread(channel, threadId);
     const state = sessionId ? this.sessions.get(sessionId) : null;
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
+    if (
+      item.type === 'custom_tool_call'
+      || item.type === 'custom_tool_call_output'
+      || item.type === 'function_call'
+      || item.type === 'function_call_output'
+    ) {
+      state.authRecoveryReplayUnsafe = true;
+    }
+    if (item.type === 'custom_tool_call') {
+      const tool = customToolFromItem(sessionId, item, 'started');
+      if (!tool) return false;
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        ...tool,
+        ...(turnId ? { turnId } : {}),
+      });
+      return true;
+    }
+
+    if (item.type === 'custom_tool_call_output') {
+      const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+      if (!callId) return false;
+      let prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      if (!prior) {
+        // A reconnect/version skew can deliver the result without its matching
+        // call notification. Emit a minimal running snapshot first so the
+        // transport relay has a card to terminate instead of an orphan result.
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: callId,
+          name: meaningfulString(item.name) ?? 'custom_tool',
+          status: 'running',
+          detail: {
+            kind: 'customToolCall',
+            summary: meaningfulString(item.name) ?? 'custom_tool',
+            meta: { callId, status: 'running', synthesizedFromOutput: true },
+            raw: item,
+          },
+        });
+        prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      }
+      const terminal = customToolTerminalFromOutput(item);
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+      const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+      const backgroundShellTool = codexBackgroundShellToolFromCustomToolOutput(sessionId, prior, item);
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        id: callId,
+        name: prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+        status: terminal.status,
+        ...(prior?.input !== undefined ? { input: prior.input } : {}),
+        output: terminal.output,
+        terminalStatus: terminal.terminalStatus,
+        terminalReason: terminal.terminalReason,
+        terminalSynthetic: false,
+        terminalSource: 'app_server_jsonrpc',
+        terminalDecisionReason: terminal.terminalReason,
+        ...(turnId ? { turnId } : {}),
+        detail: {
+          kind: 'customToolCall',
+          summary: priorDetail?.summary ?? prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+          ...(prior?.input !== undefined ? { input: prior.input } : {}),
+          output: item.output ?? item.result ?? item.content,
+          meta: {
+            ...priorMeta,
+            callId,
+            status: item.status ?? terminal.terminalStatus,
+          },
+          raw: item,
+        },
+      });
+      if (backgroundShellTool && !state.openProviderToolCalls.has(backgroundShellTool.id)) {
+        this.emitTrackedProviderToolCall(sessionId, state, backgroundShellTool);
+      }
+      return true;
+    }
+
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
       const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
       if (checklistTool) {
         state.rawChecklistSeenCallIds.add(checklistTool.id);
-        for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
+        this.emitToolCall(sessionId, checklistTool);
+        return true;
+      }
+      if (name && CODEX_NATIVE_COLLAB_FUNCTION_NAMES.has(name)) {
+        const collabCallId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+        if (!collabCallId) return true;
+        this.rawNativeCollabCalls.set(collabCallId, { sessionId, name });
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: collabCallId,
+          name,
+          status: 'running',
+          detail: {
+            kind: 'nativeCollaboration',
+            summary: name,
+            meta: { callId: collabCallId, durability: CODEX_NATIVE_COLLAB_DURABILITY },
+            raw: item,
+          },
+        });
         return true;
       }
       if (!name || !CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES.has(name)) return false;
@@ -2419,6 +5392,7 @@ export class CodexSdkProvider implements TransportProvider {
         sessionId,
         callId,
         args: parseJsonRecord(item.arguments) ?? {},
+        startedAtMs: Date.now(),
       });
       return true;
     }
@@ -2426,6 +5400,32 @@ export class CodexSdkProvider implements TransportProvider {
     if (item.type !== 'function_call_output') return false;
     const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
     if (!callId) return false;
+    const collab = this.rawNativeCollabCalls.get(callId);
+    if (collab) {
+      this.rawNativeCollabCalls.delete(callId);
+      const collabState = this.sessions.get(collab.sessionId);
+      if (!collabState) return true;
+      const rawOutput = meaningfulString(item.output);
+      // An empty output proves the call was ACCEPTED, not that anything was
+      // delivered. Reporting success here is what let "已分配/已排队" look
+      // confirmed when nothing durable existed.
+      this.emitTrackedProviderToolCall(collab.sessionId, collabState, {
+        id: callId,
+        name: collab.name,
+        status: 'complete',
+        detail: {
+          kind: 'nativeCollaboration',
+          summary: collab.name,
+          meta: {
+            callId,
+            durability: CODEX_NATIVE_COLLAB_DURABILITY,
+            outcome: rawOutput ? 'accepted' : 'accepted_unknown',
+          },
+          raw: item,
+        },
+      });
+      return true;
+    }
     const call = this.rawSpawnAgentCalls.get(callId);
     if (!call) return false;
     this.rawSpawnAgentCalls.delete(callId);
@@ -2433,15 +5433,19 @@ export class CodexSdkProvider implements TransportProvider {
     const outputRecord = parseJsonRecord(item.output) ?? {};
     const tool = rawSpawnAgentToolFromOutput(call, outputRecord);
     if (tool) {
-      for (const cb of this.toolCallCallbacks) cb(call.sessionId, tool);
+      this.emitToolCall(call.sessionId, tool);
     }
 
     const agentId = readRawSpawnAgentId(outputRecord);
-    if (agentId) {
-      this.trackedSubagentThreads.set(agentId, {
+    const agentPath = readRawSpawnAgentPath(call, outputRecord);
+    const trackingId = agentId ?? agentPath;
+    if (trackingId) {
+      this.trackedSubagentThreads.set(trackingId, {
         sessionId: call.sessionId,
         callId,
-        agentId,
+        agentId: trackingId,
+        ...(agentPath ? { agentPath } : {}),
+        startedAtMs: call.startedAtMs,
         agentName: meaningfulString(outputRecord.nickname)
           ?? meaningfulString(outputRecord.name)
           ?? meaningfulString(call.args.nickname)
@@ -2474,15 +5478,17 @@ export class CodexSdkProvider implements TransportProvider {
   private emitTrackedSubagentSnapshot(tracked: CodexTrackedSubagentThread, status: unknown): ToolCallEvent | null {
     const tool = runtimeSubagentToolFromPayload(tracked.sessionId, {
       agent_id: tracked.agentId,
+      ...(tracked.agentPath ? { agent_path: tracked.agentPath } : {}),
       status,
       ...(tracked.agentName ? { nickname: tracked.agentName } : {}),
       ...(tracked.prompt ? { prompt: tracked.prompt } : {}),
       ...(tracked.model ? { model: tracked.model } : {}),
       ...(tracked.usageTotalTokens !== undefined ? { usageTotalTokens: tracked.usageTotalTokens } : {}),
+      ...(tracked.startedAtMs !== undefined ? { startedAtMs: tracked.startedAtMs } : {}),
       backgrounded: true,
     });
     if (!tool) return null;
-    for (const cb of this.toolCallCallbacks) cb(tracked.sessionId, tool);
+    this.emitToolCall(tracked.sessionId, tool);
     return tool;
   }
 
@@ -2511,6 +5517,7 @@ export class CodexSdkProvider implements TransportProvider {
         : rawStatus ?? 'completed';
     tracked.lastStatus = status;
     this.emitTrackedSubagentSnapshot(tracked, status);
+    this.sessions.get(tracked.sessionId)?.childSubagentRolloutCompletedIds.add(threadId);
     this.trackedSubagentThreads.delete(threadId);
     return true;
   }
@@ -2529,34 +5536,76 @@ export class CodexSdkProvider implements TransportProvider {
     tracked.lastStatus = status;
     const tool = this.emitTrackedSubagentSnapshot(tracked, status);
     if ((tool?.detail as SdkSubagentDetail | undefined)?.meta?.terminal) {
+      this.sessions.get(tracked.sessionId)?.childSubagentRolloutCompletedIds.add(threadId);
       this.trackedSubagentThreads.delete(threadId);
     }
     return true;
   }
 
-  private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
+  private async handleNotification(channel: CodexAppServerChannel, method: string, params: Record<string, any>): Promise<void> {
+    if (method === CODEX_MCP_RPC_METHOD.STATUS_UPDATED) {
+      if (channel.kind === 'incognito') return;
+      if (meaningfulString(params.name) !== IMCODES_DELEGATION_MCP_SERVER
+        || !CODEX_MCP_TERMINAL_STARTUP_STATUS.has(meaningfulString(params.status) ?? '')) return;
+      const threadId = meaningfulString(params.threadId);
+      const targets = threadId
+        ? [...this.sessions.entries()].filter(([, state]) => state.threadId === threadId)
+        : [...this.sessions.entries()];
+      for (const [, state] of targets) {
+        if (state.incognito) continue;
+        // Never reload underneath an in-flight model turn. The startup event
+        // only invalidates this thread's MCP generation; the next explicit
+        // send performs the bounded reload + complete catalog hydration before
+        // dispatching any new model/tool work.
+        state.imcodesMcpRecoveryRequired = true;
+      }
+      return;
+    }
+
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
-      const sessionId = this.threadToSession.get(threadId);
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       if (!sessionId) return;
       const state = this.sessions.get(sessionId);
       if (!state) return;
       state.threadId = threadId;
       state.loaded = true;
-      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+      this.adoptServiceTier(sessionId, state, params.thread?.serviceTier);
+      if (!state.incognito || state.model || state.serviceTier) {
+        this.emitSessionInfo(sessionId, {
+          ...(!state.incognito ? { resumeId: threadId } : {}),
+          ...(state.model ? { model: state.model } : {}),
+          ...(state.serviceTier ? { serviceTier: state.serviceTier } : {}),
+        });
+      }
+      return;
+    }
+
+    if (method === 'thread/settings/updated') {
+      const threadId = readParamThreadId(params);
+      const sessionId = this.getSessionIdForThread(channel, threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      // Fast can be switched on from the Codex TUI or the ChatGPT app while this
+      // session is live; without following the notification the viewer would be
+      // told the old tier for the rest of the thread.
+      const tier = (params.settings as Record<string, unknown> | undefined)?.serviceTier
+        ?? (params as Record<string, unknown>).serviceTier;
+      this.adoptServiceTier(sessionId, state, tier);
       return;
     }
 
     if (method === 'thread/tokenUsage/updated') {
       if (this.handleTrackedSubagentTokenUsage(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;      const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
-      for (const cb of this.usageCallbacks) cb(sessionId, {
+      this.recordWeakActivity(sessionId, state);
+      this.emitUsage(sessionId, {
         usage: normalizedUsage,
         ...(state.model ? { model: state.model } : {}),
       });
@@ -2566,7 +5615,7 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (method === 'thread/compacted') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state || !state.runningCompact) return;
       this.completeCompact(sessionId, state, readParamTurnId(params));
@@ -2576,12 +5625,15 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/status/changed') {
       if (this.handleTrackedSubagentThreadStatus(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
         this.clearIdleSettleTimer(state); // turn resumed → cancel any pending idle settle
+        const turnId = readParamTurnId(params);
+        if (turnId && state.runningTurnId === turnId) this.recordStrongActivity(sessionId, state, turnId);
+        else this.recordWeakActivity(sessionId, state);
         if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -2596,22 +5648,32 @@ export class CodexSdkProvider implements TransportProvider {
           this.completeCompact(sessionId, state, readParamTurnId(params));
           return;
         }
-        // Authoritative turn-end signal for the current Codex app-server: it
-        // reports the thread going idle when a turn finishes but does NOT always
-        // emit an explicit `turn/completed` (confirmed via DIAG logs: turns
-        // started, did their work, but no `turn/completed` ever arrived → the
-        // runtime stayed "working" forever and the queued message could not
-        // drain until a manual STOP). So settle the active normal turn on
-        // thread-idle. The `completedTurnIds` dedup makes this coexist safely
-        // with a later `turn/completed` for the same turn — whichever arrives
-        // first settles it; the other is dropped by the dedup gate.
+        // App-server thread-idle is not terminal proof. Field logs show both
+        // directions: some finished turns never deliver `turn/completed`, while
+        // other turns report idle/completed before Codex core keeps producing
+        // output. Treat idle as a prompt to consult heartbeat/rollout evidence,
+        // not as permission to complete the turn directly.
         if (
           state.runningTurnId
           && !state.cancelled
           && !state.turnStartInFlight
           && !this.isClosedCodexTurn(state, state.runningTurnId)
         ) {
-          this.armIdleSettleTimer(sessionId, state, state.runningTurnId);
+          if (this.hasActiveToolItems(state)) {
+            state.deferredIdleSettleTurnId = state.runningTurnId;
+            return;
+          }
+          const lease = state.activeTurnLease;
+          if (lease && this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+            if (lease.heartbeatTimer) {
+              clearTimeout(lease.heartbeatTimer);
+              lease.heartbeatTimer = undefined;
+            }
+            void this.runHeartbeat(sessionId, lease.id, lease.attemptId);
+            return;
+          }
+          this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, state.runningTurnId);
+          this.armRolloutSettlePoll(sessionId, state);
           return;
         }
       }
@@ -2619,37 +5681,50 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (isCodexRuntimeSubagentMethod(method, params)) {
-      this.emitRuntimeSubagentNotification(params);
+      this.emitRuntimeSubagentNotification(channel, params);
+      return;
+    }
+
+    if (method === 'turn/started') {
+      const threadId = readParamThreadId(params);
+      const sessionId = this.getSessionIdForThread(channel, threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || state.cancelled || state.runningCompact) return;
+      state.pendingAgentMessageQuestions = undefined;
+      const turnId = readParamTurnId(params);
+      if (turnId && !this.isClosedCodexTurn(state, turnId)) state.runningTurnId = state.runningTurnId ?? turnId;
+      this.recordStrongActivity(sessionId, state, turnId);
       return;
     }
 
     if (method === 'rawResponseItem/completed') {
-      this.handleRawResponseItem(params);
+      this.handleRawResponseItem(channel, params);
       return;
     }
 
     if (method === 'turn/plan/updated') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
       if (turnId && (state.cancelled || this.isClosedCodexTurn(state, turnId))) return;
       if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+      this.recordStrongActivity(sessionId, state, turnId);
       // Native plan event (codex >= 0.139). Render it AND suppress the legacy
       // rollout-file scan for this session so old (file-scrape) + new never
       // double-render the same plan.
       state.nativePlanEventSeen = true;
       const tool = planToolFromTurnPlanEvent(sessionId, turnId ?? state.runningTurnId, params.plan);
       if (tool) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+        this.emitTrackedProviderToolCall(sessionId, state, tool);
       }
       return;
     }
 
     if (method === 'item/agentMessage/delta') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       if (state.cancelled) return;
@@ -2663,6 +5738,7 @@ export class CodexSdkProvider implements TransportProvider {
       // the UI. Closed/terminated turns may still render late text, but they
       // must never be adopted back into running state.
       if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.recordStrongActivity(sessionId, state, turnId);
       if (!closedTurn) this.clearStatus(sessionId, state);
       // Reset the streaming accumulator when a new agentMessage item starts so
       // its deltas don't render prefixed with the previous message's full text
@@ -2672,20 +5748,22 @@ export class CodexSdkProvider implements TransportProvider {
         state.currentText = '';
       }
       state.currentMessageId = params.itemId;
-      state.currentText += String(params.delta ?? '');
+      const textDelta = String(params.delta ?? '');
+      state.currentText += textDelta;
+      if (textDelta) state.authRecoveryReplayUnsafe = true;
       const delta: MessageDelta = {
         messageId: params.itemId,
         type: 'text',
         delta: state.currentText,
         role: 'assistant',
       };
-      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+      this.emitDelta(sessionId, delta);
       return;
     }
 
     if (method === 'item/started' || method === 'item/completed') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
@@ -2697,6 +5775,16 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (!state.incognito && method === 'item/completed' && isImcodesMcpTransportClosedItem(item)) {
+        // The failed MCP write has unknown outcome. Mark the generation stale,
+        // but neither replay the call nor reload beneath the current turn. A
+        // later explicit send crosses the pre-turn recovery boundary.
+        if (!state.imcodesMcpRecoveryRequired) {
+          logger.warn({ provider: this.id, sessionId, threadId, tool: meaningfulString(item.tool) },
+            'Codex IM.codes MCP call failed with a closed transport; recovery armed for the next turn');
+        }
+        state.imcodesMcpRecoveryRequired = true;
+      }
       if (closedTurn && item.type !== 'agentMessage') return;
       // NEVER drop a real provider item. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, or this event's
@@ -2705,9 +5793,16 @@ export class CodexSdkProvider implements TransportProvider {
       // assistant text. Closed/terminated turns may still surface final
       // assistant text, but they must never be adopted back into running state.
       if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.recordStrongActivity(sessionId, state, turnId);
       if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
+        // `contextCompaction` also occurs automatically INSIDE an ordinary
+        // model turn. Only a raw `/compact` send sets compactCommandInFlight.
+        // An inline compaction must keep the parent turn/dispatch alive; treating
+        // its item completion as a standalone transport completion produces a
+        // false idle while Codex immediately continues with more tool calls.
+        if (!state.runningCompact) state.compactCommandInFlight = false;
         state.runningCompact = true;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -2739,7 +5834,23 @@ export class CodexSdkProvider implements TransportProvider {
 
       const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+        this.emitTrackedProviderToolCall(sessionId, state, tool);
+      }
+
+      // Authoritative delegation evidence. Read from the MCP result itself --
+      // exact server + tool + dispatchId + delivery legs -- never from the
+      // assistant's prose. A native collaboration `send_message` shares the
+      // short name but is not this server, so it cannot substantiate a claim.
+      if (method === 'item/completed') {
+        const dispatchFact = readDelegationDispatchFact(
+          item.server,
+          item.tool,
+          item.arguments,
+          item.result?.structuredContent ?? item.result?.content,
+        );
+        if (dispatchFact) {
+          (state.turnDelegationDispatches ??= []).push(dispatchFact);
+        }
       }
 
       if (item.type === 'agentMessage') {
@@ -2753,18 +5864,32 @@ export class CodexSdkProvider implements TransportProvider {
           state.currentText = '';
         }
         state.currentMessageId = item.id;
-        if (method === 'item/completed' && typeof item.text === 'string') {
-          const prior = state.currentText;
-          state.currentText = item.text;
-          if (!prior && item.text) {
-            const delta: MessageDelta = {
-              messageId: item.id,
-              type: 'text',
-              delta: item.text,
-              role: 'assistant',
-            };
-            for (const cb of this.deltaCallbacks) cb(sessionId, delta);
-          }        }
+        if (method === 'item/completed') {
+          if (typeof item.text === 'string') {
+            const prior = state.currentText;
+            state.currentText = item.text;
+            if (item.text) state.authRecoveryReplayUnsafe = true;
+            if (!prior && item.text) {
+              const delta: MessageDelta = {
+                messageId: item.id,
+                type: 'text',
+                delta: item.text,
+                role: 'assistant',
+              };
+              this.emitDelta(sessionId, delta);
+            }
+          }
+          if (!closedTurn && !state.cancelled) {
+            const asyncQuestions = normalizeCodexAsyncQuestions(item.questions);
+            if (asyncQuestions.length > 0) {
+              const msgId = meaningfulString(item.id) ?? state.currentMessageId ?? `${sessionId}:agent-message`;
+              state.pendingAgentMessageQuestions = {
+                id: `${msgId}:questions`,
+                questions: asyncQuestions,
+              };
+            }
+          }
+        }
       }
       return;
     }
@@ -2772,78 +5897,183 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'turn/completed') {
       if (this.handleTrackedSubagentTurnCompleted(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
-      this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
-
-      if (turnId && this.isClosedCompactTurn(state, turnId)) {
+      // STOP can be followed by a new turn before the app-server emits the old
+      // turn's interrupted notification. Some app-server versions omit the
+      // turn id on that late notification. Applying an uncorrelated
+      // `interrupted` event while the current session is NOT cancelling would
+      // terminate the new turn, clear its rollout-settle poll, and mark the new
+      // turn id closed. Codex core can then write final text + task_complete,
+      // but the provider remains working until another manual STOP flushes the
+      // cached answer. An interrupt for the current turn is always initiated by
+      // cancel(), which sets state.cancelled first; otherwise an id-less
+      // interrupt is stale and must not mutate current-turn ownership.
+      if (
+        status === 'interrupted'
+        && !turnId
+        && !state.cancelled
+        && Boolean(state.runningTurnId || state.turnStartInFlight)
+      ) {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          threadId: state.threadId,
+          runningTurnId: state.runningTurnId,
+        }, 'Codex SDK ignored an uncorrelated interrupted notification while a newer turn is active');
         return;
       }
-      if (turnId && this.isClosedTurn(state, turnId)) {
+      const stopTarget = this.confirmedCancelTerminals.get(state);
+      if (stopTarget && stopTarget.generation !== state.turnDispatchGeneration) {
+        this.confirmedCancelTerminals.delete(state);
+      } else if (turnId && stopTarget) {
+        stopTarget.seen.add(turnId);
+        if (stopTarget.turnId === turnId) this.stopConfirmations.complete(stopTarget);
+        // This start continuation alone owns its terminal marker. Never keep
+        // adding ids for later generations through a completed Stop record.
+        if (state.turnStartInFlight) state.terminalDuringTurnStartIds.add(turnId);
+      }
+      this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
+
+      const terminalForTurnStartInFlight = Boolean(state.turnStartInFlight && turnId);
+      if (terminalForTurnStartInFlight && turnId) state.terminalDuringTurnStartIds.add(turnId);
+      if (turnId && this.isClosedCompactTurn(state, turnId) && !terminalForTurnStartInFlight && state.runningTurnId !== turnId) {
+        return;
+      }
+      if (turnId && this.isClosedTurn(state, turnId) && !terminalForTurnStartInFlight && state.runningTurnId !== turnId) {
         return;
       }
 
       if (status === 'failed') {
+        const authReplaySafe = this.isCodexFailedTurnAuthReplaySafe(state, turn);
+        const authRecoveryPayload = state.currentTurnPayload;
+        const authRecoveryRetriesRemaining = state.authRecoveryRetriesRemaining;
+        const turnDispatchGeneration = state.turnDispatchGeneration;
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
-        state.turnStartInFlight = false;        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();
+        state.turnStartInFlight = false;
+        this.clearActiveItemEvidence(state);
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
-        if (this.isCodexAuthError(error)) {
-          void this.restartAppServerAfterAuthFailure('turn-failed', error).catch((restartErr) => {
-            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
-          });
+        if (isCodexThreadNeverMaterializedError(error)) {
+          // The turn may already have executed tools, so never replay it here.
+          // Force only the next explicit user/daemon send through bounded
+          // thread rehydration while preserving the terminal tool evidence
+          // already emitted for this unknown-outcome turn.
+          state.loaded = false;
         }
+        if (this.isCodexAuthError(error)) {
+          if (
+            authRecoveryPayload
+            && authRecoveryRetriesRemaining > 0
+            && authReplaySafe
+            && !state.cancelled
+          ) {
+            void this.recoverCodexAuthAndReplay(
+              sessionId,
+              state,
+              authRecoveryPayload,
+              turnDispatchGeneration,
+              authRecoveryRetriesRemaining,
+              error,
+              'turn-failed',
+            );
+            return;
+          }
+          if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
+            void this.restartAppServerAfterAuthFailure(
+              'turn-failed-unsafe-replay',
+              error,
+              sessionId,
+              this.getChannelForSession(state),
+            ).catch((restartErr) => {
+              logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+            });
+            this.emitCodexAuthRecoveryError(
+              sessionId,
+              state,
+              error,
+              CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE,
+            );
+            return;
+          }
+          this.emitCodexAuthRecoveryError(
+            sessionId,
+            state,
+            error,
+            CODEX_AUTH_RECOVERY_GUIDANCE,
+          );
+          return;
+        }
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, error);
         return;
       }
       if (status === 'interrupted') {
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
-          state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
+          this.clearActiveItemEvidence(state);
+          this.clearPendingSessionSystemTextUpdate(state);
+          this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
+          this.clearCodexAuthRecoveryState(state);
+          this.maybeRunDeferredAuthRefresh(this.getChannelForSession(state), 'turn-interrupted');
           return;
         }
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_interrupted');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
-        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearActiveItemEvidence(state);
+        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
 
       if (state.runningCompact) {
-        this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
-        return;
+        if (state.compactCommandInFlight) {
+          this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
+          return;
+        }
+        this.completeInlineContextCompaction(sessionId, state, turnId);
       }
 
       if (state.cancelled) {
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
         state.currentMessageId = null;
         state.currentText = '';
-        state.activeItemIds.clear();
-        state.activeToolItemIds.clear();
-        state.activeCompactionItemIds.clear();
-        state.cancelled = false;        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearActiveItemEvidence(state);
+        state.cancelled = false;
+        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -2855,35 +6085,70 @@ export class CodexSdkProvider implements TransportProvider {
           state.currentText = completedAgentMessage.text;
         }
       }
-
-      if (this.hasActiveToolItems(state)) {
-        state.deferredIdleSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:turn-completed`;
-        return;
+      if (!state.pendingAgentMessageQuestions && Array.isArray(turn.items)) {
+        for (let index = turn.items.length - 1; index >= 0; index -= 1) {
+          const item = turn.items[index];
+          if (!isRecord(item) || item.type !== 'agentMessage') continue;
+          const asyncQuestions = normalizeCodexAsyncQuestions(item.questions);
+          if (asyncQuestions.length > 0) {
+            const msgId = meaningfulString(item.id) ?? state.currentMessageId ?? `${meaningfulString(turn.id) ?? 'turn'}:agent-message`;
+            state.pendingAgentMessageQuestions = {
+              id: `${msgId}:questions`,
+              questions: asyncQuestions,
+            };
+          }
+          break;
+        }
       }
 
-      await this.completeTurn(sessionId, state, turnId);
+      await this.completeTurn(sessionId, state, turnId, 'app_server_completed');
       return;
     }
   }
 
-  private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
+  private async completeTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId?: string,
+    terminalReason: ToolTerminalReason = 'app_server_completed',
+  ): Promise<void> {
+    // Snapshot the turn's authorized dispatches BEFORE any cleanup, and consume
+    // ONLY this snapshot below.
+    //
+    // The lease clear further down is the shared terminal seam and empties
+    // state.turnDelegationDispatches. Reading the live field after it would
+    // report every turn as unsubstantiated. Reading the snapshot is also what
+    // makes the ordering safe in the other direction: this completion reports
+    // exactly the dispatches that belonged to ITS turn, and the clear that runs
+    // in between cannot add to or subtract from what is reported here.
+    const turnDelegationDispatches = state.turnDelegationDispatches ?? [];
+    const pendingAgentMessageQuestions = state.pendingAgentMessageQuestions;
     this.clearIdleSettleTimer(state);
-    this.clearCancelTimer(state);    this.clearStatus(sessionId, state);
+    this.clearCompactTimers(state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.compactObserved = false;
+    state.deferredCompactSettleTurnId = undefined;
+    this.clearActiveTurnLease(state);
+    this.clearCancelTimer(state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
     this.commitPendingSessionSystemTextUpdate(state, turnId);
     this.rememberCompletedTurn(state, turnId);
+    this.closeOpenProviderToolCalls(sessionId, state, 'complete', 'succeeded', terminalReason);
     const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
     const currentText = state.currentText;
     const usage = state.lastUsage;
     const model = state.model;
-    const resumeId = state.threadId;
+    const resumeId = state.incognito ? undefined : state.threadId;
     const generatedImageTracking = state.generatedImageTracking;
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
-    state.activeItemIds.clear();
+    this.clearActiveItemEvidence(state);
     state.generatedImageTracking = null;
+    this.clearCodexAuthRecoveryState(state);
+    this.clearStatus(sessionId, state);
     const newlyDetectedImagePaths = generatedImageTracking
       ? await this.detectNewGeneratedImagePaths(generatedImageTracking)
       : [];
@@ -2912,9 +6177,24 @@ export class CodexSdkProvider implements TransportProvider {
         ...(usage ? { usage } : {}),
         ...(model ? { model } : {}),
         ...(resumeId ? { resumeId } : {}),
+        // Only formal task dispatches get a chat projection. Machine-control
+        // calls and prose-only claims leave no badge metadata at all.
+        ...(turnDelegationDispatches.length > 0
+          ? { [DELEGATION_CLAIM_METADATA_FIELD]: projectDelegationClaim(turnDelegationDispatches) }
+          : {}),
       },
     };
-    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+    this.emitComplete(sessionId, completed);
+    // Emit async agentMessage questions AFTER onComplete so final assistant.text
+    // precedes ask.question in the timeline (required by findTrailingAskQuestion).
+    if (pendingAgentMessageQuestions && pendingAgentMessageQuestions.questions.length > 0 && !state.cancelled) {
+      this.emitToolCall(sessionId, {
+        id: pendingAgentMessageQuestions.id,
+        name: INTERACTIVE_QUESTION_TOOL_NAME,
+        status: 'complete',
+        input: { questions: pendingAgentMessageQuestions.questions },
+      });
+    }
   }
 
   private rememberCompletedTurn(state: CodexSdkSessionState, turnId?: string): void {
@@ -2925,7 +6205,730 @@ export class CodexSdkProvider implements TransportProvider {
     if (oldest) state.completedTurnIds.delete(oldest);
   }
 
-  /** Cancel a pending debounced thread-idle settle (turn activity resumed). */
+  private sameHeartbeatGeneration(a: ActivityGenerationLike, b: ActivityGenerationLike): boolean {
+    const left = normalizeActivityGeneration(a);
+    const right = normalizeActivityGeneration(b);
+    if (left === null && right === null) return true;
+    return sameActivityGeneration(a, b);
+  }
+
+  private clearActiveTurnLease(state: CodexSdkSessionState): void {
+    const lease = state.activeTurnLease;
+    if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
+    this.clearRolloutSettlePoll(state);
+    this.disarmRolloutAuthorityWatch(state);
+    state.activeTurnLease = undefined;
+    // Terminal-seam clear: explicit defense-in-depth, and prompt release.
+    //
+    // Authorized dispatches are evidence about ONE turn. Every terminal path --
+    // completion, cancel, watchdog, disconnect, turn/start and emit failures --
+    // funnels through here, so residue from a cancelled or failed turn is
+    // dropped at the moment that turn ends rather than lingering in memory until
+    // the next one begins. After cancel/error nothing survives that any public
+    // completion, message metadata or read path could surface.
+    //
+    // KNOWINGLY REDUNDANT TODAY, and recorded as such in the revision gates:
+    // startTurn() already establishes an empty scope unconditionally, so with
+    // both halves present a mutant that removes THIS line changes no observable
+    // behaviour and survives. It is kept deliberately, not for a mutant score.
+    // Should a future completion path ever emit without a preceding startTurn,
+    // this clear is what keeps that path fail-closed instead of letting a stale
+    // dispatch substantiate a claim.
+    //
+    // The completion path snapshots the facts before calling this and reports
+    // only that snapshot, so clearing here never blanks a legitimate turn.
+    state.turnDelegationDispatches = [];
+    state.pendingAgentMessageQuestions = undefined;
+  }
+
+  private refreshActiveTurnLease(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    options: { turnId?: string; strong: boolean; turnStartInFlight?: boolean },
+  ): void {
+    if (!state.threadId || state.runningCompact || state.cancelled) return;
+    const now = Date.now();
+    const current = state.activeTurnLease;
+    const canReuse = current
+      && current.localSessionKey === sessionId
+      && current.threadId === state.threadId
+      && this.sameHeartbeatGeneration(current.activityGeneration, state.runtimeActivityGeneration);
+    const lease = canReuse
+      ? current
+      : {
+          id: `${sessionId}:${state.threadId}:${this.nextActiveTurnLeaseId++}`,
+          attemptId: 0,
+          localSessionKey: sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          providerSessionId: state.routeId,
+          threadId: state.threadId,
+          activityGeneration: state.runtimeActivityGeneration,
+          startedAtMs: now,
+          lastStrongActivityAtMs: now,
+          heartbeatFailureCount: 0,
+          heartbeatInFlight: false,
+        } satisfies CodexActiveTurnLease;
+    if (!canReuse) state.activeTurnLease = lease;
+    if (options.turnId && !this.isClosedCodexTurn(state, options.turnId)) {
+      lease.turnId = options.turnId;
+    }
+    if (options.turnStartInFlight) {
+      lease.turnStartInFlightAtMs = lease.turnStartInFlightAtMs ?? now;
+    }
+    if (options.strong) {
+      lease.lastStrongActivityAtMs = now;
+      lease.heartbeatFailureCount = 0;
+    } else {
+      lease.lastWeakActivityAtMs = now;
+    }
+    // ROLLOUT-FIRST: attach the authoritative real-time watch before the legacy
+    // heartbeat/poll fallbacks. The watch settles a dropped/absent
+    // `turn/completed` in ~0ms; the poll/heartbeat remain only as belt-and-suspenders.
+    this.armRolloutAuthorityWatch(sessionId, state, options.turnId ?? lease.turnId ?? state.runningTurnId);
+    this.scheduleHeartbeat(sessionId, state, lease);
+    this.armRolloutSettlePoll(sessionId, state);
+  }
+
+  private recordStrongActivity(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    if (state.cancelled || state.runningCompact) return;
+    if (turnId && this.isClosedCodexTurn(state, turnId)) return;
+    if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+    this.refreshActiveTurnLease(sessionId, state, { turnId, strong: true });
+  }
+
+  private recordWeakActivity(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.activeTurnLease) return;
+    this.refreshActiveTurnLease(sessionId, state, { strong: false });
+  }
+
+  private isHeartbeatLeaseActive(sessionId: string, state: CodexSdkSessionState, lease: CodexActiveTurnLease): boolean {
+    if (state.activeTurnLease !== lease) return false;
+    if (!this.sessions.has(sessionId)) return false;
+    if (lease.localSessionKey !== sessionId) return false;
+    if (!state.threadId || lease.threadId !== state.threadId) return false;
+    if (!this.sameHeartbeatGeneration(lease.activityGeneration, state.runtimeActivityGeneration)) return false;
+    if (state.cancelled || state.runningCompact) return false;
+    if (lease.turnId) {
+      if (this.isClosedCodexTurn(state, lease.turnId)) return false;
+      if (state.runningTurnId && state.runningTurnId !== lease.turnId) return false;
+      if (!state.runningTurnId && !state.turnStartInFlight) return false;
+    }
+    return true;
+  }
+
+  private scheduleHeartbeat(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    options: { minDelayMs?: number } = {},
+  ): void {
+    if (lease.heartbeatTimer) {
+      clearTimeout(lease.heartbeatTimer);
+      lease.heartbeatTimer = undefined;
+    }
+    if (!this.config || !this.getChannelForSession(state).child) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    const now = Date.now();
+    const strongWait = Math.max(0, CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS - (now - lease.lastStrongActivityAtMs));
+    const intervalWait = lease.lastHeartbeatAtMs
+      ? Math.max(0, CODEX_TURN_HEARTBEAT_INTERVAL_MS - (now - lease.lastHeartbeatAtMs))
+      : 0;
+    const backoffWait = lease.heartbeatFailureCount > 0
+      ? Math.min(CODEX_TURN_HEARTBEAT_INTERVAL_MS * lease.heartbeatFailureCount, 60_000)
+      : 0;
+    const jitter = Math.floor(Math.random() * (CODEX_TURN_HEARTBEAT_JITTER_MS + 1));
+    const delay = Math.max(strongWait, intervalWait, backoffWait, options.minDelayMs ?? 0) + jitter;
+    lease.nextHeartbeatAtMs = now + delay;
+    lease.heartbeatTimer = setTimeout(() => {
+      lease.heartbeatTimer = undefined;
+      void this.runHeartbeat(sessionId, lease.id, lease.attemptId);
+    }, delay);
+    lease.heartbeatTimer.unref?.();
+  }
+
+  private normalizeHeartbeatThreadSummary(raw: unknown, requestStartedAtMs: number, requestEndedAtMs: number): HeartbeatThreadSummary {
+    if (!isRecord(raw)) {
+      return { valid: false, malformedReason: 'malformed', threadStatus: 'unknown', turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: 0 };
+    }
+    const thread = isRecord(raw.thread) ? raw.thread : raw;
+    const threadStatus = normalizeHeartbeatThreadStatus(readThreadStatus(thread));
+    const rawTurnsValue = Array.isArray(thread.turns)
+      ? thread.turns
+      : Array.isArray(raw.turns)
+        ? raw.turns
+        : undefined;
+    if (!rawTurnsValue) {
+      return { valid: false, malformedReason: 'missing_turn_list', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: 0 };
+    }
+    if (rawTurnsValue.length > CODEX_TURN_HEARTBEAT_MAX_TURNS) {
+      return { valid: false, malformedReason: 'oversized', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+    }
+    const currentTurnIds = new Set<string>();
+    const addCurrent = (value: unknown) => {
+      if (typeof value === 'string' && value.trim()) currentTurnIds.add(value.trim());
+    };
+    addCurrent(thread.currentTurnId);
+    addCurrent(thread.current_turn_id);
+    addCurrent(raw.currentTurnId);
+    addCurrent(raw.current_turn_id);
+    const turns: HeartbeatTurnSummary[] = [];
+    let explicitCurrentCount = 0;
+    for (const entry of rawTurnsValue) {
+      if (!isRecord(entry)) {
+        return { valid: false, malformedReason: 'malformed', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+      }
+      const id = readParamTurnId(entry) ?? meaningfulString(entry.id);
+      const status = normalizeHeartbeatTurnStatus(readTurnStatus(entry));
+      const current = Boolean(entry.current || entry.isCurrent || entry.active || (id && currentTurnIds.has(id)));
+      if (current) explicitCurrentCount += 1;
+      turns.push({
+        ...(id ? { id } : {}),
+        status,
+        current,
+        ...(boundedTimestampMs(entry.startedAt ?? entry.started_at ?? entry.createdAt ?? entry.created_at) !== undefined ? { startedAtMs: boundedTimestampMs(entry.startedAt ?? entry.started_at ?? entry.createdAt ?? entry.created_at)! } : {}),
+        ...(boundedTimestampMs(entry.updatedAt ?? entry.updated_at) !== undefined ? { updatedAtMs: boundedTimestampMs(entry.updatedAt ?? entry.updated_at)! } : {}),
+        ...(boundedTimestampMs(entry.completedAt ?? entry.completed_at) !== undefined ? { completedAtMs: boundedTimestampMs(entry.completedAt ?? entry.completed_at)! } : {}),
+      });
+    }
+    const activeTurnCount = turns.filter((turn) => turn.status === 'active').length;
+    if (explicitCurrentCount > 1 || (explicitCurrentCount === 0 && activeTurnCount > 1)) {
+      return { valid: false, malformedReason: 'ambiguous_current_turn', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+    }
+    return { valid: true, threadStatus, turns, requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+  }
+
+  private classifyHeartbeatSummary(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+  ): HeartbeatClassification {
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return { outcome: 'stale', classifier: 'stale' };
+    if (lease.turnId && this.isClosedCodexTurn(state, lease.turnId)) return { outcome: 'inconclusive', classifier: 'local_terminal' };
+    if (!summary.valid) return { outcome: 'inconclusive', classifier: summary.malformedReason ?? 'malformed' };
+    if (summary.threadStatus === 'systemError') return { outcome: 'provider_error', classifier: 'system_error' };
+    if (summary.threadStatus === 'notLoaded') return { outcome: 'lost', classifier: 'not_loaded_with_active_lease' };
+    if (summary.threadStatus === 'active') return { outcome: 'active', classifier: 'active' };
+    if (summary.threadStatus === 'unknown') return { outcome: 'inconclusive', classifier: 'unknown_status' };
+
+    const activeOrCurrentTurns = summary.turns.filter((turn) => turn.current || turn.status === 'active');
+    if (lease.turnId) {
+      const matching = summary.turns.find((turn) => turn.id === lease.turnId);
+      if (!matching) return { outcome: 'lost', classifier: 'idle_missing_turn' };
+      if (matching.status === 'active' || matching.current) return { outcome: 'active', classifier: 'active' };
+      if (matching.status === 'completed') return { outcome: 'terminal', classifier: 'idle_completed', status: 'completed', turnId: matching.id };
+      if (matching.status === 'failed') return { outcome: 'terminal', classifier: 'idle_failed', status: 'failed', turnId: matching.id };
+      if (matching.status === 'interrupted') return { outcome: 'terminal', classifier: 'idle_interrupted', status: 'interrupted', turnId: matching.id };
+      return { outcome: 'inconclusive', classifier: 'unknown_status' };
+    }
+
+    if (Date.now() - lease.startedAtMs < CODEX_TURN_HEARTBEAT_START_GRACE_MS) {
+      return { outcome: 'inconclusive', classifier: 'start_grace' };
+    }
+    if (activeOrCurrentTurns.length > 0) return { outcome: 'inconclusive', classifier: 'start_grace' };
+    return { outcome: 'lost', classifier: 'start_grace_expired_no_current_turn' };
+  }
+
+  private async runHeartbeat(sessionId: string, leaseId: string, attemptId: number): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const lease = state?.activeTurnLease;
+    if (!state || !lease || lease.id !== leaseId || lease.attemptId !== attemptId) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    if (lease.heartbeatInFlight) return;
+    if (this.heartbeatInFlightCount >= CODEX_TURN_HEARTBEAT_PROVIDER_CAP) {
+      this.scheduleHeartbeat(sessionId, state, lease, { minDelayMs: CODEX_TURN_HEARTBEAT_INTERVAL_MS });
+      return;
+    }
+    lease.heartbeatInFlight = true;
+    this.heartbeatInFlightCount += 1;
+    const requestStartedAtMs = Date.now();
+    lease.lastHeartbeatAtMs = requestStartedAtMs;
+    try {
+      const raw = await this.requestOnChannel(this.getChannelForSession(state), 'thread/read', {
+        threadId: lease.threadId,
+        includeTurns: true,
+      }, CODEX_TURN_HEARTBEAT_TIMEOUT_MS);
+      const requestEndedAtMs = Date.now();
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (!latestState || !latestLease || latestLease.id !== leaseId || latestLease.attemptId !== attemptId || !this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
+      latestLease.lastHeartbeatResponseAtMs = requestEndedAtMs;
+      const summary = this.normalizeHeartbeatThreadSummary(raw, requestStartedAtMs, requestEndedAtMs);
+      const classification = this.classifyHeartbeatSummary(sessionId, latestState, latestLease, summary);
+      this.applyHeartbeatClassification(sessionId, latestState, latestLease, summary, classification);
+    } catch {
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (latestState && latestLease && latestLease.id === leaseId && latestLease.attemptId === attemptId && this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) {
+        latestLease.heartbeatFailureCount += 1;
+        const classification: HeartbeatClassification = latestLease.heartbeatFailureCount >= CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD
+          ? { outcome: 'degraded', classifier: 'timeout' }
+          : { outcome: 'inconclusive', classifier: 'timeout' };
+        this.applyHeartbeatClassification(sessionId, latestState, latestLease, {
+          valid: true,
+          threadStatus: 'unknown',
+          turns: [],
+          requestStartedAtMs,
+          requestEndedAtMs: Date.now(),
+          rawTurnCount: 0,
+        }, classification);
+      }
+    } finally {
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (latestLease?.id === leaseId) latestLease.heartbeatInFlight = false;
+      if (this.heartbeatInFlightCount > 0) this.heartbeatInFlightCount -= 1;
+      if (latestState && latestLease?.id === leaseId && this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) {
+        this.scheduleHeartbeat(sessionId, latestState, latestLease);
+      }
+    }
+  }
+
+  private applyHeartbeatClassification(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+    classification: HeartbeatClassification,
+  ): void {
+    if (classification.outcome === 'active') {
+      lease.heartbeatFailureCount = 0;
+      lease.lastAliveHeartbeatAtMs = summary.requestEndedAtMs;
+      // Zombie-turn cross-check: the app-server says the turn is active, but if
+      // the event stream has been silent past the rollout-confirm threshold,
+      // consult codex core's own durable record. A `task_complete` in the
+      // thread's rollout for this turn is authoritative completion evidence the
+      // app-server failed to deliver — settle instead of waiting for the
+      // daemon's 30-min last resort.
+      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
+      return;
+    }
+    if (classification.outcome === 'inconclusive' || classification.outcome === 'degraded' || classification.outcome === 'stale') {
+      // Heartbeat could not prove liveness either way — the rollout record can
+      // still prove completion (e.g. an unresponsive app-server whose core
+      // already finished the turn).
+      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
+      return;
+    }
+    if (classification.outcome === 'provider_error') {
+      this.clearActiveTurnLease(state);
+      this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex thread heartbeat reported systemError', false, {
+        heartbeat: {
+          classifier: classification.classifier,
+          threadStatus: summary.threadStatus,
+          requestDurationMs: Math.max(0, summary.requestEndedAtMs - summary.requestStartedAtMs),
+        },
+      }));
+      return;
+    }
+    if (classification.outcome === 'terminal') {
+      if (classification.status === 'completed') {
+        // `thread/read` / thread-idle can be a false terminal signal from the
+        // app-server while Codex core keeps producing output. Do not complete
+        // from it directly. Treat it as a hint to consult the durable rollout;
+        // only rollout task_complete or explicit turn/completed may end a turn.
+        this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
+        return;
+      }
+      this.clearActiveTurnLease(state);
+      this.rememberTerminatedActiveTurn(state, classification.turnId);
+      state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
+      this.clearActiveItemEvidence(state);
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
+      this.emitError(sessionId, this.makeError(
+        classification.status === 'interrupted' ? PROVIDER_ERROR_CODES.CANCELLED : PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        classification.status === 'interrupted' ? 'Codex turn cancelled' : 'Codex turn failed',
+        classification.status === 'interrupted',
+      ));
+      return;
+    }
+    if (classification.outcome === 'lost') {
+      this.emitSdkTurnLost(
+        sessionId,
+        state,
+        lease,
+        summary,
+        classification.classifier as 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn',
+      );
+    }
+  }
+
+  /**
+   * Fire-and-forget zombie-turn cross-check. Only runs when the provider event
+   * stream has been silent past CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS while
+   * the heartbeat cannot prove the turn terminal. Reads the thread's rollout
+   * tail; a recorded `task_complete` for the running turn settles it as
+   * completed. When the app-server missed the final delta too, the rollout's
+   * `last_agent_message` is the durable source of truth for the final text.
+   */
+  private maybeConfirmTaskCompleteFromRollout(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    nowMs: number,
+  ): void {
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    if (!state.threadId) return;
+    const turnId = state.runningTurnId ?? lease.turnId;
+    if (!turnId) return;
+    const silenceMs = nowMs - Math.max(lease.lastStrongActivityAtMs, lease.lastWeakActivityAtMs ?? 0);
+    if (silenceMs < CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    void this.confirmTaskCompleteFromRollout(sessionId, turnId, { leaseId: lease.id, attemptId: lease.attemptId })
+      .catch((err) => {
+        logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout task_complete cross-check failed');
+      })
+      .finally(() => {
+        const latest = this.sessions.get(sessionId);
+        if (latest) latest.rolloutTaskCompleteCheckInFlight = false;
+      });
+  }
+
+  private maybeConfirmCurrentTurnTaskCompleteFromRollout(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId: string,
+  ): void {
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    if (!state.threadId) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    void this.confirmTaskCompleteFromRollout(sessionId, turnId)
+      .catch((err) => {
+        logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout task_complete current-turn cross-check failed');
+      })
+      .finally(() => {
+        const latest = this.sessions.get(sessionId);
+        if (latest) latest.rolloutTaskCompleteCheckInFlight = false;
+      });
+  }
+
+  private async confirmTaskCompleteFromRollout(
+    sessionId: string,
+    turnId: string,
+    leaseGuard?: { leaseId: string; attemptId: number },
+  ): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const lease = state?.activeTurnLease;
+    if (!state) return;
+    if (leaseGuard) {
+      if (!lease || lease.id !== leaseGuard.leaseId || lease.attemptId !== leaseGuard.attemptId) return;
+      if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    } else {
+      if (state.cancelled || state.runningCompact) return;
+      if (state.runningTurnId !== turnId) return;
+      if (this.isClosedCodexTurn(state, turnId)) return;
+    }
+    const evidence = await this.rolloutTailReportsTaskComplete(state, turnId);
+    if (!evidence) return;
+    // Re-validate after the await — the turn may have settled or rolled over
+    // through the normal paths while the file read was in flight.
+    const latestState = this.sessions.get(sessionId);
+    const latestLease = latestState?.activeTurnLease;
+    if (!latestState) return;
+    if (leaseGuard) {
+      if (!latestLease || latestLease.id !== leaseGuard.leaseId || latestLease.attemptId !== leaseGuard.attemptId) return;
+      if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
+      if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
+    } else {
+      if (latestState.cancelled || latestState.runningCompact) return;
+      if (latestState.runningTurnId !== turnId) return;
+      if (this.isClosedCodexTurn(latestState, turnId)) return;
+    }
+    // A missing turn/start JSON-RPC response can leave startTurn() awaiting
+    // forever even though turn/started notifications, final output, and the
+    // core rollout task_complete all arrived. The rollout record is
+    // authoritative terminal evidence for this exact turn. Remember it while
+    // the start RPC is still pending so a very late response cannot assign the
+    // completed turn back to running state.
+    if (latestState.turnStartInFlight) {
+      latestState.terminalDuringTurnStartIds.add(turnId);
+    }
+    if (evidence.lastAgentMessage && latestState.currentText !== evidence.lastAgentMessage) {
+      latestState.currentMessageId = `${turnId}:rollout-task-complete`;
+      latestState.currentText = evidence.lastAgentMessage;
+    }
+    logger.warn({
+      provider: this.id,
+      sessionId,
+      ...(latestState.imcodesSessionName ? { sessionName: latestState.imcodesSessionName } : {}),
+      threadId: latestState.threadId,
+      turnId,
+    }, 'Codex rollout records task_complete for the running turn but the app-server never closed it; settling the zombie turn from rollout evidence');
+    await this.completeTurn(sessionId, latestState, turnId, 'rollout_task_complete');
+  }
+
+  /** Reads the tail of the thread's rollout file looking for a `task_complete` event for `turnId`. */
+  private async rolloutTailReportsTaskComplete(state: CodexSdkSessionState, turnId: string): Promise<CodexRolloutTaskCompleteEvidence | null> {
+    if (state.incognito || !state.threadId) return null;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
+      if (start >= size) return null;
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return null;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        // Cheap pre-filter before JSON.parse.
+        if (!trimmed || !trimmed.includes('task_complete') || !trimmed.includes(turnId)) continue;
+        try {
+          const record = JSON.parse(trimmed) as Record<string, unknown>;
+          const payload = isRecord(record.payload) ? record.payload : record;
+          if (payload.type !== 'task_complete') continue;
+          const completedTurnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
+          if (completedTurnId === turnId) {
+            const lastAgentMessage = readRolloutTaskCompleteMessage(payload);
+            return {
+              turnId,
+              ...(lastAgentMessage ? { lastAgentMessage } : {}),
+            };
+          }
+        } catch {
+          // Partial first line of the tail window or non-JSON noise — skip.
+        }
+      }
+      return null;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, turnId, err }, 'Codex rollout task_complete tail read failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Store-driven settle BACKSTOP (rollout is authority). When the persisted
+   * session state still says a codex turn is running but the rollout tail proves
+   * the turn already reached `task_complete`, settle it — WITHOUT requiring the
+   * per-turn rollout settle timer/fs.watch to still be armed and WITHOUT
+   * requiring `state.runningTurnId` to have been re-observed by a live
+   * notification. This closes the gap where a lost `turn/completed`, a disarmed
+   * rollout watch, or a `runningTurnId` desync leaves a finished turn "working"
+   * forever — a state neither the 2s primary settle poll nor the 12-minute
+   * active-turn watchdog can clear (both need a live, matching active turn).
+   *
+   * Called from the always-on daemon health poll, so it is independent of the
+   * per-turn timers that can be torn down mid-flight. Returns true iff it
+   * settled a turn. It fires for the exact tracked turn, or for the guarded
+   * orphan shape where no newer dispatch/turn owns the runtime state. Both
+   * paths drive the normal completion callback while protecting a different or
+   * newly starting turn from stale rollout evidence.
+   */
+  async settleCompletedTurnFromRolloutBackstop(
+    sessionId: string,
+    opts: ProviderRolloutCompletionReconcileOptions = {},
+  ): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.incognito) return false;
+    if (state.cancelled || state.runningCompact) return false;
+    const evidence = await this.rolloutTailReportsTerminalTaskComplete(state);
+    if (!evidence) return false;
+    // Never race the 2s primary settle path: only act once the terminal record
+    // has been durable for the grace window.
+    const minAge = opts.minCompleteAgeMs ?? CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS;
+    const now = opts.nowMs ?? Date.now();
+    if (evidence.completedAtMs != null && now - evidence.completedAtMs < minAge) return false;
+    // Re-read after the await; a newer turn may have genuinely started.
+    const latest = this.sessions.get(sessionId);
+    if (!latest || latest.cancelled || latest.runningCompact) return false;
+    // Normally settle only while the provider still believes THIS exact turn is
+    // in-flight. There is one additional zombie shape: app-server loses the
+    // terminal notification after leaving tool items open, then clears the turn
+    // identity. In that state the rollout tail is terminal, there is no current
+    // turn/start to protect, and the only provider "work" is orphaned tool
+    // evidence. Treat that evidence as stale and let completeTurn close it.
+    //
+    // Do NOT generalize this to every missing runningTurnId. During context
+    // bootstrap a fresh dispatch can briefly have no provider turn identity, and
+    // the rollout may still end with the previous turn's task_complete. An
+    // active runtime dispatch is eligible only when it crossed provider.send(),
+    // its generation still matches the provider generation, and orphaned tool
+    // evidence remains. That distinguishes the observed same-generation zombie
+    // from both a healthy pre-start window and a genuinely newer dispatch.
+    const activeWork = this.getCurrentTurnWorkState(latest);
+    const trackedTurnId = latest.runningTurnId ?? latest.activeTurnLease?.turnId;
+    const turnStartInFlightAtMs = latest.activeTurnLease?.turnStartInFlightAtMs;
+    const terminalBelongsToInFlightStart =
+      latest.turnStartInFlight
+      && latest.runningTurnId === undefined
+      && turnStartInFlightAtMs != null
+      && evidence.completedAtMs != null
+      && evidence.completedAtMs >= turnStartInFlightAtMs;
+    const providerStillRunningThisTurn =
+      latest.runningTurnId === evidence.turnId
+      || latest.activeTurnLease?.turnId === evidence.turnId
+      || terminalBelongsToInFlightStart;
+    const runtimeOwnsMatchingStartedDispatch =
+      opts.runtimeHasActiveDispatchOwnership === true
+      && opts.runtimeActiveDispatchProviderStarted === true
+      && sameActivityGeneration(opts.runtimeActivityGeneration, latest.runtimeActivityGeneration);
+    const terminalWithMatchingRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && activeWork.activeToolCount > 0
+      && runtimeOwnsMatchingStartedDispatch;
+    const terminalWithNoRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && opts.runtimeHasNoDispatchOwnership === true;
+    if (
+      !providerStillRunningThisTurn
+      && !terminalWithMatchingRuntimeDispatch
+      && !terminalWithNoRuntimeDispatch
+    ) return false;
+    if (this.isClosedCodexTurn(latest, evidence.turnId)) return false;
+    if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+      latest.currentMessageId = `${evidence.turnId}:rollout-backstop`;
+      latest.currentText = evidence.lastAgentMessage;
+    }
+    logger.warn({
+      provider: this.id,
+      sessionId,
+      ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+      threadId: latest.threadId,
+      turnId: evidence.turnId,
+      completedAtMs: evidence.completedAtMs,
+      ageMs: evidence.completedAtMs != null ? Math.max(0, now - evidence.completedAtMs) : null,
+      ...(terminalWithMatchingRuntimeDispatch
+        ? {
+            matchingRuntimeDispatchRecovered: true,
+            orphanedToolCount: activeWork.activeToolCount,
+            activityGeneration: normalizeActivityGeneration(latest.runtimeActivityGeneration),
+          }
+        : {}),
+      ...(terminalWithNoRuntimeDispatch ? { noRuntimeDispatchRecovered: true } : {}),
+    }, 'Codex store-driven backstop: rollout proves the running turn is complete; settling the zombie turn from rollout evidence');
+    await this.completeTurn(sessionId, latest, evidence.turnId, 'rollout_task_complete');
+    return true;
+  }
+
+  /**
+   * Read-only post-restart check: returns true iff the thread's rollout tail
+   * already ends with a terminal `task_complete` marker (with no later
+   * `task_started` or `turn_aborted`), proving the prior turn finished.
+   */
+  async hasCompletedRolloutTurn(sessionId: string): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.incognito || state.cancelled) return false;
+    return (await this.rolloutTailReportsTerminalTaskComplete(state)) !== null;
+  }
+
+  /**
+   * Reads the tail of the thread's rollout looking for the LAST turn-lifecycle
+   * marker. `task_started` (with no later completion) => a turn is in flight;
+   * `task_complete` / `turn_aborted` => the turn is closed. Deriving terminality
+   * from the last marker needs no in-memory turnId and is immune to a lost
+   * `turn/completed` notification or a `runningTurnId` desync. Returns the
+   * terminal `task_complete` evidence (with its wall-clock completion time) iff
+   * the tail's last marker is a `task_complete`, else null.
+   */
+  private async rolloutTailReportsTerminalTaskComplete(state: CodexSdkSessionState): Promise<CodexRolloutTerminalEvidence | null> {
+    if (state.incognito || !state.threadId) return null;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
+      if (start >= size) return null;
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return null;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      let terminal: CodexRolloutTerminalEvidence | null = null;
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        // Cheap pre-filter before JSON.parse — only the three lifecycle markers matter.
+        if (!trimmed.includes('task_started') && !trimmed.includes('task_complete') && !trimmed.includes('turn_aborted')) continue;
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
+        const payload = isRecord(record.payload) ? record.payload : record;
+        const type = payload.type;
+        if (type === 'task_complete') {
+          const turnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
+          if (!turnId) { terminal = null; continue; }
+          const parsed = meaningfulString(record.timestamp) ? Date.parse(String(record.timestamp)) : NaN;
+          const lastAgentMessage = readRolloutTaskCompleteMessage(payload as Record<string, any>);
+          terminal = {
+            turnId,
+            ...(lastAgentMessage ? { lastAgentMessage } : {}),
+            completedAtMs: Number.isFinite(parsed) ? parsed : null,
+          };
+        } else if (type === 'task_started' || type === 'turn_aborted') {
+          // A start (or abort) AFTER the last task_complete means the completed
+          // turn is no longer the tail state: a new turn is running, or the tail
+          // ended on an abort with nothing to settle here. Either way, not terminal.
+          terminal = null;
+        }
+      }
+      return terminal;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex rollout terminal tail read failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  private emitSdkTurnLost(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+    classifier: 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn',
+  ): void {
+    const recoveryAttemptId = `${sessionId}:${normalizeActivityGeneration(lease.activityGeneration) ?? 'unknown'}:${lease.threadId}:${lease.turnId ?? 'no-turn'}:${lease.attemptId + 1}`;
+    const details: SdkTurnLostRecoveryMetadata = {
+      reason: SDK_TURN_LOST_REASON,
+      localSessionKey: sessionId,
+      ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+      providerId: this.id,
+      providerSessionId: state.routeId,
+      codexThreadId: lease.threadId,
+      ...(lease.turnId ? { codexTurnId: lease.turnId } : {}),
+      activityGeneration: lease.activityGeneration ?? state.runtimeActivityGeneration,
+      leaseStartedAt: lease.startedAtMs,
+      lastProviderEventAt: lease.lastStrongActivityAtMs,
+      heartbeatStartedAt: summary.requestStartedAtMs,
+      heartbeatCompletedAt: summary.requestEndedAtMs,
+      heartbeatDurationMs: Math.max(0, summary.requestEndedAtMs - summary.requestStartedAtMs),
+      silenceDurationMs: Math.max(0, summary.requestStartedAtMs - lease.lastStrongActivityAtMs),
+      heartbeatFailureCount: lease.heartbeatFailureCount,
+      classifier,
+      recoveryAttemptId,
+      correlationId: recoveryAttemptId,
+      replayDecision: 'pending',
+    };
+    this.clearActiveTurnLease(state);
+    this.rememberTerminatedActiveTurn(state, lease.turnId);
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    this.clearActiveItemEvidence(state);
+    this.closeOpenProviderToolCalls(sessionId, state, 'error');
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, this.makeError(
+      PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+      'Codex SDK active turn was lost by the app-server',
+      true,
+      details,
+    ));
+  }
+
+  /** Clear pending idle hints when fresh activity or an explicit terminal event arrives. */
   private clearIdleSettleTimer(state: CodexSdkSessionState): void {
     if (state.idleSettleTimer) {
       clearTimeout(state.idleSettleTimer);
@@ -2939,31 +6942,6 @@ export class CodexSdkProvider implements TransportProvider {
     return state.activeToolItemIds.size > 0;
   }
 
-  /** Arm the debounced thread-idle settle for `turnId`. If no turn activity
-   *  arrives before the debounce elapses, the turn is completed (handles the
-   *  current Codex app-server ending a turn with only a thread-idle status). */
-  private armIdleSettleTimer(sessionId: string, state: CodexSdkSessionState, turnId: string): void {
-    this.clearIdleSettleTimer(state);
-    state.idleSettleTurnId = turnId;
-    state.idleSettleTimer = setTimeout(() => {
-      state.idleSettleTimer = undefined;
-      state.idleSettleTurnId = undefined;
-      if (
-        (!state.runningTurnId || state.runningTurnId === turnId)
-        && !state.cancelled
-        && !state.turnStartInFlight
-        && !this.isClosedCodexTurn(state, turnId)
-      ) {
-        if (this.hasActiveToolItems(state)) {
-          state.deferredIdleSettleTurnId = turnId;
-          return;
-        }
-        void this.completeTurn(sessionId, state, turnId);
-      }
-    }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
-    state.idleSettleTimer.unref?.();
-  }
-
   private maybeArmDeferredIdleSettle(sessionId: string, state: CodexSdkSessionState): void {
     const turnId = state.deferredIdleSettleTurnId;
     if (!turnId || this.hasActiveToolItems(state)) return;
@@ -2973,7 +6951,8 @@ export class CodexSdkProvider implements TransportProvider {
       && !state.turnStartInFlight
       && !this.isClosedCodexTurn(state, turnId)
     ) {
-      this.armIdleSettleTimer(sessionId, state, turnId);
+      this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, turnId);
+      this.armRolloutSettlePoll(sessionId, state);
       return;
     }
     state.deferredIdleSettleTurnId = undefined;
@@ -3010,21 +6989,32 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
-    if (!this.child?.stdin.writable) {
+    return this.requestOnChannel(this.normalChannel, method, params, timeoutMs);
+  }
+
+  private requestOnChannel(
+    channel: CodexAppServerChannel,
+    method: string,
+    params: Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<any> {
+    const child = channel.child;
+    if (!child?.stdin.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
-    const id = this.nextRequestId++;
+    const id = channel.nextRequestId++;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       if (timeoutMs && timeoutMs > 0 && Number.isFinite(timeoutMs)) {
         timer = setTimeout(() => {
-          if (!this.pendingRequests.delete(id)) return;
+          if (!channel.pendingRequests.delete(id)) return;
           reject(new Error(`Codex app-server request ${method} did not settle within ${Math.round(timeoutMs)}ms`));
         }, timeoutMs);
         timer.unref?.();
       }
-      this.pendingRequests.set(id, {
+      channel.pendingRequests.set(id, {
+        method,
         resolve: (value) => {
           if (timer) clearTimeout(timer);
           resolve(value);
@@ -3034,17 +7024,54 @@ export class CodexSdkProvider implements TransportProvider {
           reject(error);
         },
       });
-      this.child!.stdin.write(`${payload}\n`);
+      child.stdin.write(`${payload}\n`);
     });
   }
 
+  private completeInlineContextCompaction(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId?: string,
+  ): void {
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.deferredCompactSettleTurnId = undefined;
+    state.compactObserved = false;
+    for (const itemId of state.activeCompactionItemIds) state.activeItemIds.delete(itemId);
+    state.activeCompactionItemIds.clear();
+
+    // Native compaction may replace the stored prefix with a summary. Force
+    // the next turn through thread/resume on the SAME durable thread so its
+    // cacheable baseInstructions (including merged identity) are reasserted.
+    this.refreshSessionSystemText(sessionId);
+
+    // Auto-compaction is an item INSIDE the current model turn, not a transport
+    // turn completion. Keep all parent turn identity/text/tool ownership intact
+    // and re-arm terminal authority now that the inline compact phase is over.
+    const activeTurnId = turnId ?? state.runningTurnId;
+    if (!state.cancelled && activeTurnId) {
+      state.runningTurnId = activeTurnId;
+      this.recordStrongActivity(sessionId, state, activeTurnId);
+      this.armRawChecklistPolling(sessionId, state);
+      this.armChildSubagentRolloutPolling(sessionId, state);
+    }
+  }
+
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    if (!state.compactCommandInFlight) {
+      this.completeInlineContextCompaction(sessionId, state, turnId);
+      return;
+    }
     this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.deferredCompactSettleTurnId = undefined;
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
@@ -3053,6 +7080,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
+    this.refreshSessionSystemText(sessionId);
     const completed: AgentMessage = {
       id: turnId ? `${turnId}:context-compaction` : `${sessionId}:context-compaction:${Date.now()}`,
       sessionId,
@@ -3065,11 +7093,11 @@ export class CodexSdkProvider implements TransportProvider {
         provider: this.id,
         event: 'thread/compacted',
         [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
-        ...(state.threadId ? { resumeId: state.threadId } : {}),
+        ...(!state.incognito && state.threadId ? { resumeId: state.threadId } : {}),
         ...(turnId ? { turnId } : {}),
       },
     };
-    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+    this.emitComplete(sessionId, completed);
   }
 
   private rememberCompletedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
@@ -3134,6 +7162,7 @@ export class CodexSdkProvider implements TransportProvider {
           id: m.id,
           ...(m.name ? { name: m.name } : {}),
           ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+          ...(m.supportedEffortLevels?.length ? { supportedEffortLevels: m.supportedEffortLevels } : {}),
         })),
         ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
         ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
@@ -3167,13 +7196,17 @@ export class CodexSdkProvider implements TransportProvider {
               : '';
           if (!modelId || seen.has(modelId)) continue;
           seen.add(modelId);
+          const supportedEffortLevels = normalizeSupportedEffortLevels(entry.supportedReasoningEfforts);
           discovered.push({
             id: modelId,
             ...(typeof entry.displayName === 'string' && entry.displayName.trim()
               ? { name: entry.displayName.trim() }
               : {}),
-            ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
-              ? { supportsReasoningEffort: true }
+            ...(supportedEffortLevels
+              ? {
+                supportsReasoningEffort: true,
+                supportedEffortLevels,
+              }
               : {}),
             ...(entry.isDefault === true ? { isDefault: true } : {}),
           });
@@ -3188,18 +7221,93 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private notify(method: string, params: Record<string, any>): void {
-    if (!this.child?.stdin.writable) return;
-    this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  private notifyOnChannel(channel: CodexAppServerChannel, method: string, params: Record<string, any>): void {
+    if (!channel.child?.stdin.writable) return;
+    channel.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
   }
 
-  private rejectPending(err: Error): void {
-    for (const pending of this.pendingRequests.values()) pending.reject(err);
-    this.pendingRequests.clear();
+  private rejectChannelPending(channel: CodexAppServerChannel, err: Error): void {
+    for (const pending of channel.pendingRequests.values()) pending.reject(err);
+    channel.pendingRequests.clear();
+  }
+
+  /**
+   * Records a tier reported by Codex and tells the app when it changed. Silent
+   * about repeats: this arrives on every settings notification, and a viewer
+   * warning that re-renders on unchanged state is noise.
+   */
+  private adoptServiceTier(sessionId: string, state: CodexSdkSessionState, reported: unknown): void {
+    if (typeof reported !== 'string' || !reported) return;
+    if (state.serviceTier === reported) return;
+    state.serviceTier = reported;
+    this.emitSessionInfo(sessionId, { serviceTier: reported });
+  }
+
+  /**
+   * Leaves or enters Codex's Fast tier for this thread only. Codex keeps the
+   * tier on the thread, so this is what makes the switch reversible from here;
+   * the machine's own default in ~/.codex/config.toml is never touched.
+   */
+  async setServiceTier(sessionId: string, tier: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error('codex_service_tier_unknown_session');
+    const wasLoaded = Boolean(state.threadId && state.loaded);
+    await this.ensureThreadLoaded(sessionId, state);
+    if (!state.threadId) throw new Error('codex_service_tier_no_thread');
+    try {
+      await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
+        threadId: state.threadId,
+        serviceTier: tier,
+      });
+      this.adoptServiceTier(sessionId, state, tier);
+    } finally {
+      if (!wasLoaded && !state.incognito && !state.lastInjectedSessionSystemText) {
+        // `ensureThreadLoaded` ran without a payload (`baseInstructions` had no
+        // IM.codes tail/sessionSystemText). Mark unloaded so the next `send()`
+        // re-establishes full `baseInstructions` via `thread/resume`.
+        state.loaded = false;
+      }
+    }
+  }
+
+  private runWithPrivacy<T>(sessionId: string, state: CodexSdkSessionState | undefined, fn: () => T): T {
+    return withSessionPrivacy(state?.imcodesSessionName ?? sessionId, state?.incognito === true, fn);
+  }
+
+  private emitDelta(sessionId: string, delta: MessageDelta): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+    });
+  }
+
+  private emitComplete(sessionId: string, message: AgentMessage): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.completeCallbacks) cb(sessionId, message);
+    });
+    if (state) this.maybeRunDeferredAuthRefresh(this.getChannelForSession(state), 'complete');
+  }
+
+  private emitUsage(sessionId: string, update: ProviderUsageUpdate): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.usageCallbacks) cb(sessionId, update);
+    });
+  }
+
+  private emitToolCall(sessionId: string, tool: ToolCallEvent): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    });
   }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
-    for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+    });
   }
 
   private emitStatus(sessionId: string, state: CodexSdkSessionState, status: ProviderStatusUpdate): void {
@@ -3209,7 +7317,9 @@ export class CodexSdkProvider implements TransportProvider {
     });
     if (state.lastStatusSignature === signature) return;
     state.lastStatusSignature = signature;
-    for (const cb of this.statusCallbacks) cb(sessionId, status);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.statusCallbacks) cb(sessionId, status);
+    });
   }
 
   private clearStatus(sessionId: string, state: CodexSdkSessionState): void {
@@ -3219,6 +7329,201 @@ export class CodexSdkProvider implements TransportProvider {
   private clearPendingSessionSystemTextUpdate(state: CodexSdkSessionState): void {
     state.pendingSessionSystemTextUpdate = undefined;
     state.pendingSessionSystemTextUpdateTurnId = undefined;
+  }
+
+  private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
+    state.authRecoveryReplayUnsafe = true;
+    const dedupedTool = this.dedupeCustomToolLifecycle(state, tool);
+    if (!dedupedTool) return;
+    tool = dedupedTool;
+    const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
+    if (tool.status === 'running' && !backgroundedSubagent) {
+      state.openProviderToolCalls.set(tool.id, tool);
+    } else {
+      state.openProviderToolCalls.delete(tool.id);
+    }
+    this.emitToolCall(sessionId, tool);
+
+    if (tool.status !== 'running' && this.isCodexCollabSdkTool(tool)) {
+      this.closeOpenCodexCollabProviderToolCalls(
+        sessionId,
+        state,
+        tool.status === 'complete' ? 'complete' : 'error',
+        tool.terminalStatus ?? (tool.status === 'complete' ? 'succeeded' : 'errored'),
+        tool.terminalReason ?? (tool.status === 'complete' ? 'provider_result' : 'provider_error'),
+        tool.id,
+      );
+    }
+  }
+
+  private dedupeCustomToolLifecycle(state: CodexSdkSessionState, tool: ToolCallEvent): ToolCallEvent | null {
+    const detail = isRecord(tool.detail) ? tool.detail : undefined;
+    if (detail?.kind !== 'customToolCall') return tool;
+    const meta = isRecord(detail.meta) ? detail.meta : undefined;
+    const callId = meaningfulString(meta?.callId) ?? meaningfulString(tool.id);
+    if (!callId) return tool;
+
+    const priorLifecycle = state.customToolLifecycleByCallId.get(callId);
+    if (priorLifecycle?.terminal) return null;
+    const prior = priorLifecycle?.tool;
+    const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+    const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+    const mergedDetail = {
+      ...(priorDetail ?? {}),
+      ...detail,
+      kind: 'customToolCall',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      meta: { ...priorMeta, ...meta, callId },
+    };
+    const normalizedTool: ToolCallEvent = {
+      ...(prior ?? {}),
+      ...tool,
+      id: callId,
+      name: tool.name || prior?.name || 'custom_tool',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      detail: mergedDetail,
+    };
+
+    // The same logical start can arrive once as a typed item and once as a raw
+    // response item. Retain whichever snapshot is richer, but emit only once.
+    if (tool.status === 'running' && priorLifecycle) {
+      state.customToolLifecycleByCallId.set(callId, { tool: normalizedTool, terminal: false });
+      state.openProviderToolCalls.set(callId, normalizedTool);
+      return null;
+    }
+
+    state.customToolLifecycleByCallId.set(callId, {
+      tool: normalizedTool,
+      terminal: tool.status !== 'running',
+    });
+    this.pruneCustomToolLifecycleCache(state);
+    return normalizedTool;
+  }
+
+  private pruneCustomToolLifecycleCache(state: CodexSdkSessionState): void {
+    if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
+    for (const [callId, lifecycle] of state.customToolLifecycleByCallId) {
+      if (!lifecycle.terminal) continue;
+      state.customToolLifecycleByCallId.delete(callId);
+      if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
+    }
+  }
+
+  private isCodexCollabSdkTool(tool: ToolCallEvent): boolean {
+    const detail = isRecord(tool.detail) ? tool.detail : undefined;
+    const meta = isRecord(detail?.meta) ? detail.meta : undefined;
+    return detail?.kind === SDK_SUBAGENT_DETAIL_KIND
+      && meta?.provider === SDK_SUBAGENT_PROVIDERS.CODEX_SDK
+      && meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT;
+  }
+
+  private codexLifecycleItemKindForTool(tool: ToolCallEvent): CodexLifecycleItemKind {
+    if (this.isCodexCollabSdkTool(tool)) return 'codex_collaboration';
+    if (tool.name === 'WebSearch' || String(tool.detail?.kind ?? '').toLowerCase() === 'websearch') return 'web_search';
+    if (String(tool.detail?.kind ?? '') === SDK_SUBAGENT_DETAIL_KIND) return 'sdk_subagent';
+    return 'provider_tool_like';
+  }
+
+  private closeOpenCodexCollabProviderToolCalls(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus = status === 'complete' ? 'succeeded' : 'errored',
+    terminalReason: ToolTerminalReason = status === 'complete' ? 'provider_result' : 'provider_error',
+    exceptToolId?: string,
+  ): void {
+    if (state.openProviderToolCalls.size === 0) return;
+    for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
+      if (toolId === exceptToolId) continue;
+      if (!this.isCodexCollabSdkTool(runningTool)) continue;
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status, terminalStatus, terminalReason);
+    }
+  }
+
+  private closeOpenProviderToolCalls(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus = status === 'complete' ? 'succeeded' : 'errored',
+    terminalReason: ToolTerminalReason = status === 'complete' ? 'provider_result' : 'provider_error',
+  ): void {
+    this.questions.release(sessionId);
+    if (state.openProviderToolCalls.size === 0) return;
+    for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status, terminalStatus, terminalReason);
+    }
+  }
+
+  private closeOneOpenProviderToolCall(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    toolId: string,
+    runningTool: ToolCallEvent,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus,
+    terminalReason: ToolTerminalReason,
+  ): void {
+    const output = runningTool.output !== undefined ? runningTool.output : status === 'complete' ? 'completed' : 'failed';
+    const detail = isRecord(runningTool.detail) && runningTool.detail.kind === SDK_SUBAGENT_DETAIL_KIND && isRecord(runningTool.detail.meta)
+      ? buildSdkSubagentSafeDetail({
+        ...(runningTool.detail as SdkSubagentDetail),
+        output,
+        meta: {
+          ...(runningTool.detail.meta as SdkSubagentDetail['meta']),
+          normalizedStatus: status === 'complete' ? SDK_SUBAGENT_STATUS.COMPLETE : SDK_SUBAGENT_STATUS.ERROR,
+          rawStatus: status === 'complete' ? 'completed' : 'error',
+          active: false,
+          terminal: true,
+          ...((runningTool.detail.meta as SdkSubagentDetail['meta']).providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT
+            ? { runningChildCount: 0 }
+            : {}),
+        },
+      } satisfies SdkSubagentDetail, { allowRaw: false })
+      : runningTool.detail;
+    const terminalSource = (
+      terminalReason === 'thread_idle_settle'
+      || terminalReason === 'generation_rollover'
+      || terminalReason === 'user_cancelled'
+    ) ? 'daemon_synthetic' : 'app_server_jsonrpc';
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId,
+      terminalStatus,
+      terminalReason,
+      synthetic: true,
+      source: terminalSource,
+      decisionReason: terminalReason,
+      ...(state.runtimeActivityGeneration ? { activityGeneration: state.runtimeActivityGeneration } : {}),
+      toolCallId: toolId,
+      ...(state.runningTurnId ? { turnId: state.runningTurnId } : {}),
+      itemKind: this.codexLifecycleItemKindForTool(runningTool),
+    });
+    const terminalTool: ToolCallEvent = {
+      ...runningTool,
+      id: toolId,
+      status,
+      output,
+      terminalStatus: metadata.terminalStatus,
+      terminalReason: metadata.terminalReason,
+      terminalSynthetic: metadata.synthetic,
+      terminalSource: metadata.source,
+      terminalDecisionReason: metadata.decisionReason,
+      terminalIdempotencyKey: metadata.idempotencyKey,
+      ...(state.runtimeActivityGeneration ? { activityGeneration: state.runtimeActivityGeneration } : {}),
+      ...(state.runningTurnId ? { turnId: state.runningTurnId } : {}),
+      lifecycleItemKind: metadata.itemKind,
+      ...(detail ? { detail } : {}),
+    };
+    state.openProviderToolCalls.delete(toolId);
+    const customDetail = isRecord(terminalTool.detail) ? terminalTool.detail : undefined;
+    const customMeta = isRecord(customDetail?.meta) ? customDetail.meta : undefined;
+    if (customDetail?.kind === 'customToolCall') {
+      const callId = meaningfulString(customMeta?.callId) ?? meaningfulString(toolId);
+      if (callId) {
+        state.customToolLifecycleByCallId.set(callId, { tool: terminalTool, terminal: true });
+        this.pruneCustomToolLifecycleCache(state);
+      }
+    }
+    this.emitToolCall(sessionId, terminalTool);
   }
 
   private commitPendingSessionSystemTextUpdate(state: CodexSdkSessionState, turnId?: string): void {
@@ -3233,24 +7538,29 @@ export class CodexSdkProvider implements TransportProvider {
 
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
     this.rememberTerminatedCompactTurn(state, state.runningTurnId);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
-    state.activeItemIds.clear();
-    state.activeToolItemIds.clear();
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
+    this.closeOpenProviderToolCalls(sessionId, state, 'error');
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 
   private emitError(sessionId: string, error: ProviderError): void {
-    for (const cb of this.errorCallbacks) cb(sessionId, error);
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.errorCallbacks) cb(sessionId, error);
+    });
+    if (state) this.maybeRunDeferredAuthRefresh(this.getChannelForSession(state), 'error');
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {
@@ -3265,10 +7575,17 @@ export class CodexSdkProvider implements TransportProvider {
     if (isCodexAuthFailureMessage(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, details ?? err);
     }
-    if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
+    if (isCodexThreadHistoryUnreadableError(err) || isCodexThreadNeverMaterializedError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
-    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+    // A Codex app-server capacity refusal is emitted as a terminal failed
+    // turn before the turn is admitted/executed. Preserve that explicit
+    // provider-boundary fact so the transport can retry it safely while still
+    // terminalizing generic late/ambiguous capacity callbacks.
+    const capacityDetails = /at capacity|capacity (?:limit|exceeded|reached)|no capacity|over capacity|out of capacity/i.test(message)
+      ? { providerAdmission: 'rejected' as const }
+      : err;
+    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, capacityDetails);
   }
 
   private isCodexAuthError(error: ProviderError): boolean {
@@ -3324,16 +7641,29 @@ export class CodexSdkProvider implements TransportProvider {
     state.compactHardTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
+      if (!state.compactCommandInFlight) {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          threadId: state.threadId,
+          turnId: state.runningTurnId,
+        }, 'Codex inline context compaction exceeded compact timeout; resuming parent turn without emitting completion');
+        this.completeInlineContextCompaction(sessionId, state, state.runningTurnId);
+        return;
+      }
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;
       this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
-      state.activeItemIds.clear();
+      this.clearActiveItemEvidence(state);
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
       this.emitError(sessionId, this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,

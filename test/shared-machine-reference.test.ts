@@ -1,0 +1,95 @@
+import { describe, it, expect } from 'vitest';
+import * as machineReference from '../shared/machine-reference.js';
+import {
+  buildMachineMarker,
+  parseMachineMarkers,
+  isValidMachineName,
+  isValidMachineTarget,
+  normalizeMachineTarget,
+  deriveDisplayName,
+  normalizeMachineDisplayName,
+  buildResolvedMachines,
+  MACHINE_NAME_PATTERN,
+  type MachineRef,
+} from '../shared/machine-reference.js';
+
+describe('machine markers', () => {
+  it('builds and parses a valid marker', () => {
+    expect(buildMachineMarker('winhost-a1b2c3')).toBe('^^(winhost-a1b2c3)');
+    expect(parseMachineMarkers('run on ^^(winhost-a1b2c3) now')).toEqual(['winhost-a1b2c3']);
+  });
+
+  it('rejects nested parentheses (not a marker)', () => {
+    expect(parseMachineMarkers('^^(na(me)')).toEqual([]);
+  });
+
+  it('ignores invalid names (spaces / too long / disallowed chars)', () => {
+    expect(parseMachineMarkers('^^(has space)')).toEqual([]);
+    expect(parseMachineMarkers(`^^(${'x'.repeat(41)})`)).toEqual([]);
+    expect(parseMachineMarkers('^^(a;b)')).toEqual([]);
+  });
+
+  it('dedupes by first occurrence', () => {
+    expect(parseMachineMarkers('^^(m1) and ^^(m1) and ^^(m2)')).toEqual(['m1', 'm2']);
+  });
+
+  it('normalizes bare and complete-marker action targets to the same ref_name', () => {
+    expect(normalizeMachineTarget('server-0b87da')).toBe('server-0b87da');
+    expect(normalizeMachineTarget('^^(server-0b87da)')).toBe('server-0b87da');
+    expect(isValidMachineTarget('server-0b87da')).toBe(true);
+    expect(isValidMachineTarget('^^(server-0b87da)')).toBe(true);
+  });
+
+  it('rejects partial, embedded, nested, spaced, and overlong action markers', () => {
+    expect(normalizeMachineTarget('run ^^(server-0b87da)')).toBeNull();
+    expect(normalizeMachineTarget('^^(server-0b87da')).toBeNull();
+    expect(normalizeMachineTarget('^^(na(me))')).toBeNull();
+    expect(normalizeMachineTarget('^^(has space)')).toBeNull();
+    expect(normalizeMachineTarget(`^^(${'x'.repeat(41)})`)).toBeNull();
+  });
+});
+
+describe('legacy alias minting boundary', () => {
+  it('does not expose an OS/hostname-derived ref_name generator', () => {
+    expect(machineReference).not.toHaveProperty('deriveRefName');
+  });
+});
+
+describe('deriveDisplayName', () => {
+  it('strips control/bidi and bounds length', () => {
+    const d = deriveDisplayName('host‮name\0', 'win32');
+    expect(d).toContain('(win32)');
+    expect(d).not.toMatch(/[\0‮]/);
+  });
+});
+
+describe('normalizeMachineDisplayName', () => {
+  it('trims and NFC-normalizes a valid owner-supplied name', () => {
+    expect(normalizeMachineDisplayName('  Office PC  ')).toBe('Office PC');
+  });
+
+  it('rejects empty, control/bidi, and overlong names', () => {
+    expect(normalizeMachineDisplayName('   ')).toBeNull();
+    expect(normalizeMachineDisplayName('unsafe\u202ename')).toBeNull();
+    expect(normalizeMachineDisplayName('x'.repeat(121))).toBeNull();
+  });
+});
+
+describe('buildResolvedMachines', () => {
+  const machines: MachineRef[] = [
+    { serverId: 's1', refName: 'm1', online: true },
+    { serverId: 's2', refName: 'dup', online: true },
+    { serverId: 's3', refName: 'dup', online: true },
+  ];
+  it('resolves a known unique name, skips unknown, flags ambiguous', () => {
+    const r = buildResolvedMachines('^^(m1) ^^(missing) ^^(dup)', machines);
+    expect(r.resolvedMachines).toEqual({ m1: 's1' });
+    expect(r.unresolved).toContain('missing');
+    expect(r.ambiguous).toContain('dup');
+    expect(r.text).toContain('^^(m1)'); // marker stays literal/visible
+  });
+  it('isValidMachineName mirrors the pattern', () => {
+    expect(isValidMachineName('ok-name_1')).toBe(true);
+    expect(isValidMachineName('bad name')).toBe(false);
+  });
+});

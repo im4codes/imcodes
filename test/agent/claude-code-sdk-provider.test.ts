@@ -1,4 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 const childProcessMock = vi.hoisted(() => ({
   // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
@@ -9,15 +14,28 @@ const childProcessMock = vi.hoisted(() => ({
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
-  spawn: vi.fn(() => ({
-    killed: false,
-    kill: vi.fn(function (this: { killed: boolean }) {
-      this.killed = true;
+  // A real EventEmitter that dies when signalled, because that is what a
+  // process does and what teardown now waits for. The previous fake had no-op
+  // `once`/`on`, so it modelled a child that never reports its own death: with
+  // the audited awaited teardown, killProcessTree could then only escape via
+  // its grace timer, and under fake timers nothing advances that timer once the
+  // test's advance window has passed. The provider was fine; the fake could not
+  // answer the question teardown had started asking.
+  spawn: vi.fn(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      killed: boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+    };
+    child.killed = false;
+    child.kill = vi.fn((_signal?: NodeJS.Signals) => {
+      child.killed = true;
+      // Asynchronous, like a real signal delivery: teardown must observe the
+      // exit through its listener, not synchronously inside kill().
+      setImmediate(() => child.emit('exit', null, _signal ?? 'SIGTERM'));
       return true;
-    }),
-    once: vi.fn(),
-    on: vi.fn(),
-  }) as never),
+    }) as never;
+    return child;
+  }) as never,
 }));
 
 vi.mock('node:child_process', () => ({
@@ -27,21 +45,35 @@ vi.mock('node:child_process', () => ({
 
 const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
+  let nextMessageBatches: any[][] | null = null;
   let waitForClose = false;
   let interruptNeverResolves = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
-  const query = vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-    const run = { prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
+  let nextContextUsage: { totalTokens?: number } | null = null;
+  const runs: Array<{ prompt: string; promptSource: unknown; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; contextUsageCalls: number; resolveClose?: () => void }> = [];
+  // The provider drives the SDK in streaming-input mode, so `prompt` is an
+  // AsyncIterable<SDKUserMessage>, not a string — that is what lets a message
+  // reach a query still running subagents. This mock stands in for the SDK, so it
+  // resolves the queue to the user text the SDK would read, keeping `run.prompt`
+  // a string for every assertion below.
+  const readPromptText = (prompt: unknown): string => {
+    if (typeof prompt === 'string') return prompt;
+    const buffered = (prompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0];
+    const content = buffered?.message?.content;
+    return typeof content === 'string' ? content : '';
+  };
+  const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+    const run = { prompt: readPromptText(prompt), promptSource: prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], contextUsageCalls: 0, resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
+    const messages = nextMessageBatches?.shift() ?? nextMessages;
     async function* gen() {
-      for (const message of nextMessages) yield message;
+      for (const message of messages) yield message;
       if (waitForClose && !run.closed) {
         await new Promise<void>((resolve) => {
           run.resolveClose = resolve;
         });
       }
     }
-    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
+    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void>; getContextUsage(): Promise<{ totalTokens?: number }> };
     iterator.close = () => {
       run.closed = true;
       run.resolveClose?.();
@@ -55,14 +87,21 @@ const sdkMock = vi.hoisted(() => {
     iterator.stopTask = async (taskId: string) => {
       run.stoppedTasks.push(taskId);
     };
+    iterator.getContextUsage = async () => {
+      run.contextUsageCalls += 1;
+      return nextContextUsage ?? {};
+    };
     return iterator;
   });
   return {
     query,
     runs,
-    setNextMessages(messages: any[]) { nextMessages = messages; },
+    readPromptText,
+    setNextMessages(messages: any[]) { nextMessages = messages; nextMessageBatches = null; },
+    setNextMessageBatches(batches: any[][]) { nextMessageBatches = batches.map((batch) => [...batch]); },
     setWaitForClose(value: boolean) { waitForClose = value; },
     setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
+    setNextContextUsage(value: { totalTokens?: number } | null) { nextContextUsage = value; },
   };
 });
 
@@ -74,10 +113,14 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { ClaudeCodeSdkProvider, isClaudeAuthFailureMessage } from '../../src/agent/providers/claude-code-sdk.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import {
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -86,8 +129,29 @@ import {
   SDK_SUBAGENT_STATUS,
   makeClaudeSubagentCanonicalKey,
 } from '../../shared/sdk-subagent-status.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
+import { buildProviderContextPayload } from '../../src/agent/transport-runtime-assembly.js';
+import { renderSessionIdentityProfiles } from '../../shared/session-identity.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+};
+const sdkPresetAppend = (options: Record<string, unknown>): string | undefined => {
+  const systemPrompt = options.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return undefined;
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : undefined;
+};
 const sdkSubagentTools = (tools: ToolCallEvent[]) => tools.filter((tool) => tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
 
 describe('ClaudeCodeSdkProvider', () => {
@@ -98,7 +162,115 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setNextMessages([]);
     sdkMock.setWaitForClose(false);
     sdkMock.setInterruptNeverResolves(false);
+    sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'connects by probing the bundled claude binary, not a bare PATH lookup of `claude`',
+    async () => {
+      // A systemd/nvm daemon's PATH has no `claude`. Probing the bare name made
+      // connect() spawn it and fail with `spawn claude ENOENT`, so no Claude,
+      // MiniMax or GLM session could start even though the SDK's bundled
+      // binary was present and every real spawn uses it.
+      childProcessMock.execFile.mockClear();
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      expect(childProcessMock.execFile.mock.calls.filter((call) => call[0] === 'claude')).toEqual([]);
+      expect(childProcessMock.execFile).not.toHaveBeenCalled();
+    },
+  );
+
+  it('queues a correlated peer notification at Claude\'s next safe boundary without closing the live query', async () => {
+    sdkMock.setWaitForClose(true);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-delegation-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    const sendPromise = provider.send('route-delegation-notify', 'foreground work');
+    await waitFor(() => sdkMock.runs.length === 1);
+
+    const result = await provider.notifyActiveDelegation?.('route-delegation-notify', {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const queue = sdkMock.runs[0]?.promptSource as { buffer?: Array<Record<string, any>> };
+    expect(queue.buffer?.at(-1)).toMatchObject({
+      type: 'user',
+      uuid: 'notification_identity',
+      // `now` preempts the Agent SDK turn; a completed audit/delegation reply
+      // must arrive during the active query without stopping its work.
+      priority: 'next',
+      shouldQuery: true,
+      isSynthetic: true,
+      origin: {
+        kind: 'peer',
+        from: 'deck_sub_auditor',
+        name: 'delegation_identity',
+      },
+      message: { role: 'user', content: 'delegated audit finished' },
+    });
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+
+    await provider.endSession('route-delegation-notify');
+    await sendPromise;
+  });
+
+  it.each([
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+  ])('inserts %s at Claude\'s next safe boundary instead of preempting it', async (deliveryKind) => {
+    sdkMock.setWaitForClose(true);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-queued-message-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    const sendPromise = provider.send('route-queued-message-notify', 'foreground work');
+    await waitFor(() => sdkMock.runs.length === 1);
+
+    const result = await provider.notifyActiveDelegation?.('route-queued-message-notify', {
+      notificationId: 'queued_notification_identity',
+      delegationId: 'queue-append:queued_notification_identity',
+      sourceSessionName: 'deck_project_brain',
+      text: 'append at the next safe boundary',
+      deliveryKind,
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const queue = sdkMock.runs[0]?.promptSource as { buffer?: Array<Record<string, any>> };
+    expect(queue.buffer?.at(-1)).toMatchObject({
+      type: 'user',
+      uuid: 'queued_notification_identity',
+      // `now` cancels/preempts an Agent SDK turn. `next` keeps the live turn
+      // running and drains at its next safe boundary.
+      priority: 'next',
+      shouldQuery: true,
+      // A queued message is the user's own composer input; appending it
+      // mid-turn must not restamp it as synthetic peer input, or the model
+      // reports it as "not from the user".
+      origin: { kind: 'human' },
+      message: { role: 'user', content: 'append at the next safe boundary' },
+    });
+    expect(queue.buffer?.at(-1)).not.toHaveProperty('isSynthetic');
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+
+    await provider.endSession('route-queued-message-notify');
+    await sendPromise;
+  });
+
+  afterEach(() => {
+    delete process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS;
+    delete process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS;
   });
 
   const collectToolsForMessages = async (
@@ -141,6 +313,115 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('keeps concurrent session MCP resource identities isolated from a poisoned parent environment', async () => {
+    const priorInstance = process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+    const priorEpoch = process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+    process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = 'foreign-instance';
+    process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = 'foreign-epoch';
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await Promise.all([
+        provider.createSession({
+          sessionKey: 'route-resource-a', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+          sessionInstanceId: 'instance-a', runtimeEpoch: 'epoch-a',
+        }),
+        provider.createSession({
+          sessionKey: 'route-resource-b', sessionName: 'deck_beta_brain', cwd: '/tmp/b',
+          sessionInstanceId: 'instance-b', runtimeEpoch: 'epoch-b',
+        }),
+      ]);
+
+      await Promise.all([
+        provider.send('route-resource-a', 'turn a'),
+        provider.send('route-resource-b', 'turn b'),
+      ]);
+      await flush();
+
+      const envFor = (prompt: string) => {
+        const run = sdkMock.runs.find((candidate) => candidate.prompt === prompt)!;
+        const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+        return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+      };
+      expect(envFor('turn a')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-a',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-a',
+      });
+      expect(envFor('turn b')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-b',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-b',
+      });
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-instance');
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-epoch');
+    } finally {
+      if (priorInstance === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = priorInstance;
+      if (priorEpoch === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = priorEpoch;
+    }
+  });
+
+  it('refreshes MCP resource identity on restart/resume instead of retaining the previous epoch', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-before', resumeId: 'claude-thread',
+    });
+    await provider.send('route-resource-refresh', 'before refresh');
+    await flush();
+
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-after',
+      resumeId: 'claude-thread', skipCreate: true,
+    });
+    await provider.send('route-resource-refresh', 'after refresh');
+    await flush();
+
+    const envs = sdkMock.runs.map((run) => {
+      const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+      return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+    });
+    expect(envs[0]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-before',
+    });
+    expect(envs[1]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-after',
+    });
+  });
+
+  it('keeps an incognito query in memory across turns with persistence and MCP memory disabled', async () => {
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'private-native' },
+      { type: 'assistant', session_id: 'private-native', message: { content: [{ type: 'text', text: 'private answer' }], stop_reason: 'end_turn' } },
+      { type: 'result', subtype: 'success', session_id: 'private-native', result: 'private answer', usage: { input_tokens: 1, output_tokens: 1 } },
+    ]);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'private-route', sessionName: 'deck_private_brain', cwd: '/tmp/project', incognito: true });
+    const completed: string[] = [];
+    provider.onComplete((_sid, message) => completed.push(message.content));
+    await provider.send('private-route', 'first private turn');
+    await waitFor(() => completed.length === 1);
+    expect(completed).toEqual(['private answer']);
+    expect(sdkMock.runs[0].options).toMatchObject({ persistSession: false, strictMcpConfig: true, mcpServers: {} });
+    expect(sdkMock.runs[0].options.resume).toBeUndefined();
+    expect(sdkMock.runs[0].closed).toBe(false);
+    await provider.send('private-route', 'second private turn');
+    expect(sdkMock.runs).toHaveLength(1);
+    expect((sdkMock.runs[0].promptSource as { buffer: unknown[] }).buffer).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.objectContaining({ content: 'second private turn' }) })]));
+    await provider.cancel('private-route');
+    await expect(provider.send('private-route', 'must not resume')).rejects.toThrow('Incognito conversation ended');
+    expect(sdkMock.runs).toHaveLength(1);
+    await provider.endSession('private-route');
+    expect(sdkMock.runs[0].closed).toBe(true);
+    await provider.disconnect();
+  });
+
   it('uses stable resume id, emits cumulative text deltas, and completes from result', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },
@@ -174,6 +455,8 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
     expect(run.options.includePartialMessages).toBe(true);
     expect(run.options.permissionMode).toBe('bypassPermissions');
+    expect(run.options.settings).toBeUndefined();
+    expect(run.options.appendSubagentSystemPrompt).toBeUndefined();
     // Native scheduling tools are disabled so the agent uses our imcodes-memory
     // MCP cron instead of creating claude.ai routines via RemoteTrigger.
     expect(run.options.disallowedTools).toContain('RemoteTrigger');
@@ -186,6 +469,172 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed).toEqual(['Hello']);
     expect(sessionInfo.some((info) => info.resumeId === 'session-1')).toBe(true);
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
+  });
+
+  describe('AskUserQuestion pause (canUseTool) and in-place answer', () => {
+    async function startSession(sessionName: string | undefined) {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },
+      ]);
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({ sessionKey: 'route-ask', cwd: '/tmp/project', resumeId: 'session-1', ...(sessionName ? { sessionName } : {}) });
+      await provider.send('route-ask', 'hello');
+      await flush();
+      const canUseTool = sdkMock.runs[0]!.options.canUseTool as (name: string, input: Record<string, unknown>, opts: { signal?: AbortSignal }) => Promise<Record<string, unknown>>;
+      return { provider, canUseTool };
+    }
+    const questionInput = { questions: [{ question: 'Pick', options: [{ label: 'A' }, { label: 'B' }] }] };
+
+    it('pauses the model on AskUserQuestion until the daemon answers by sessionName, then continues the SAME turn with the answer', async () => {
+      const { provider, canUseTool } = await startSession('deck_proj_brain');
+      let settled: Record<string, unknown> | null = null;
+      const pending = canUseTool('AskUserQuestion', questionInput, {}).then((result) => { settled = result; return result; });
+      await flush();
+      expect(settled).toBeNull(); // paused: the model has not been released
+
+      // handleAskAnswer answers by the daemon-facing sessionName, not the route id.
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'Option B')).toBe(true);
+      await expect(pending).resolves.toEqual({ behavior: 'deny', message: 'Option B', interrupt: false });
+      // Nothing is pending any more: a second answer is not swallowed as if it were the first.
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'Option A')).toBe(false);
+    });
+
+    it('lets every other tool through untouched', async () => {
+      const { canUseTool } = await startSession('deck_proj_brain');
+      await expect(canUseTool('Read', { file_path: 'a.ts' }, {})).resolves.toEqual({ behavior: 'allow', updatedInput: { file_path: 'a.ts' } });
+    });
+
+    it('releases the model with its own choice when the question is aborted (stop), so nothing hangs', async () => {
+      const { provider, canUseTool } = await startSession('deck_proj_brain');
+      const abort = new AbortController();
+      const pending = canUseTool('AskUserQuestion', questionInput, { signal: abort.signal });
+      abort.abort();
+      await expect(pending).resolves.toEqual({ behavior: 'allow', updatedInput: questionInput });
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'late')).toBe(false);
+    });
+
+    it('is keyed by the route id when no sessionName was given (documents why createSession must always pass it)', async () => {
+      const { provider, canUseTool } = await startSession(undefined);
+      void canUseTool('AskUserQuestion', questionInput, {});
+      await flush();
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'x')).toBe(false);
+      expect(provider.answerPendingQuestion('route-ask', 'x')).toBe(true);
+    });
+  });
+
+  it('does not carry finished subagent rows into the next turn', async () => {
+    // `subagentTasks` was append-only and survives session re-create, so rows
+    // from a finished turn stayed forever. The 15-minute stale sweep and cancel
+    // are both turn-blind: they flip such a row terminal and emit a snapshot
+    // for it, which reaches the session as a completion notice naming a task
+    // the current turn never started ("bvmpd67sr 在本会话不存在"). Live rows
+    // must survive — a retained query exists because subagents are running.
+    const provider = new ClaudeCodeSdkProvider();
+    const state = {
+      subagentTasks: new Map<string, { terminal: boolean; active: boolean }>([
+        ['done-1', { terminal: true, active: false }],
+        ['stopped-1', { terminal: false, active: false }],
+        ['running-1', { terminal: false, active: true }],
+      ]),
+    };
+
+    (provider as unknown as { pruneTerminalSubagentTasks: (s: unknown) => void })
+      .pruneTerminalSubagentTasks(state);
+
+    expect([...state.subagentTasks.keys()]).toEqual(['running-1']);
+  });
+
+  it('keeps subagent stream and full assistant frames out of the foreground message', async () => {
+    // A Task subagent's frames ride the SAME session stream, tagged with
+    // `parent_tool_use_id`. `currentText` / `currentMessageId` describe the
+    // FOREGROUND message only. The token-stream path already checks that tag,
+    // but the trailing full assistant frames did not: a text frame replaced
+    // the foreground body, while a tool-only frame reset it to an empty string.
+    // The next foreground token then rendered only the suffix after that reset.
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-sub', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'message_start', message: { id: 'fg-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: "I'll begin" } } },
+      // A real foreground tool remains open while a child happens to reuse the
+      // same content-block index. The child must not replace or complete it.
+      {
+        type: 'stream_event', session_id: 'session-sub',
+        event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'fg-tool-1', name: 'Read', input: {} } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"main.ts"}' } },
+      },
+      // Subagent starts and streams while the foreground message is still open.
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'message_start', message: { id: 'sub-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'SUBAGENT REPORT' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' CONTINUED' } } },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'sub-stream-tool-1', name: 'Bash', input: {} } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"command":"private"}' } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_stop', index: 1 },
+      },
+      // The SDK also flushes a full assistant frame for the subagent. Filtering
+      // only its stream_event frames is insufficient: this frame used to
+      // replace the foreground accumulator with the subagent's final text.
+      {
+        type: 'assistant',
+        session_id: 'session-sub',
+        parent_tool_use_id: 'toolu_sub_1',
+        message: {
+          id: 'sub-1-tools',
+          content: [{ type: 'tool_use', id: 'sub-tool-1', name: 'Bash', input: { command: 'private subagent command' } }],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-sub',
+        parent_tool_use_id: 'toolu_sub_1',
+        message: {
+          id: 'sub-1-final',
+          content: [{ type: 'text', text: 'SUBAGENT FULL REPORT' }],
+          stop_reason: 'end_turn',
+        },
+      },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_stop', index: 1 } },
+      // Foreground resumes; it must continue from its own text, not the Task's.
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' searching.' } } },
+      { type: 'assistant', session_id: 'session-sub', message: { content: [{ type: 'text', text: "I'll begin searching." }] } },
+      { type: 'result', session_id: 'session-sub', subtype: 'success', is_error: false, result: "I'll begin searching.", usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-sub', cwd: '/tmp/project', resumeId: 'session-sub' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    const tools: Array<{ id: string; name: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+    provider.onToolCall((_sid, tool) => tools.push({ id: tool.id, name: tool.name }));
+
+    await provider.send('route-sub', 'hello');
+    await flush();
+
+    // No subagent text may appear in any emitted delta, under any id.
+    for (const d of deltas) {
+      expect(d.text, 'subagent text leaked into a foreground delta').not.toContain('SUBAGENT');
+    }
+    // The foreground message accumulates only its own text, uninterrupted.
+    const foreground = deltas.filter((d) => d.id === 'fg-1').map((d) => d.text);
+    expect(foreground).toEqual(["I'll begin", "I'll begin searching."]);
+    expect(tools).toEqual([
+      { id: 'fg-tool-1', name: 'Read' },
+      { id: 'fg-tool-1', name: 'Read' },
+    ]);
   });
 
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
@@ -275,6 +724,265 @@ describe('ClaudeCodeSdkProvider', () => {
         cache_creation_input_tokens: 400,
         cache_read_input_tokens: 300,
         output_tokens: 50,
+      },
+    });
+  });
+
+  it('reports usage that arrives in the full assistant frame after a terminal stream delta', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-late-usage' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        message: {
+          id: 'msg-late-usage',
+          content: [{ type: 'text', text: 'Done' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 12_000,
+            cache_read_input_tokens: 700_000,
+            output_tokens: 80,
+          },
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-late-usage',
+      cwd: '/tmp/project',
+      resumeId: 'session-late-usage',
+      agentId: 'MiniMax-M3',
+    });
+
+    const completed: AgentMessage[] = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-late-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(usageUpdates).toEqual([{
+      messageId: 'msg-late-usage',
+      finalized: true,
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 12_000,
+        cache_read_input_tokens: 700_000,
+        output_tokens: 80,
+      },
+    }]);
+  });
+
+  it('reports result-only usage that trails a terminal stream delta', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-result-usage', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-result-usage' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-result-usage',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: {
+          input_tokens: 14_000,
+          cache_read_input_tokens: 710_000,
+          output_tokens: 90,
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-result-usage',
+      cwd: '/tmp/project',
+      resumeId: 'session-result-usage',
+      agentId: 'MiniMax-M3',
+    });
+
+    const completed: AgentMessage[] = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-result-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(usageUpdates).toEqual([{
+      messageId: 'msg-result-usage',
+      finalized: true,
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 14_000,
+        cache_read_input_tokens: 710_000,
+        output_tokens: 90,
+      },
+    }]);
+  });
+
+  it('uses the SDK live context meter when a compatible endpoint reports zero usage', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 734_321 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-context', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-live-context' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-context',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-context',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-context',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-context', 'hello');
+    await flush();
+
+    expect(sdkMock.runs.at(-1)?.contextUsageCalls).toBeGreaterThanOrEqual(1);
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-context',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 734_321,
+        output_tokens: 0,
+      },
+    });
+  });
+
+  it('keeps MiniMax message_start cache usage when reconciling the live context total', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 452_797 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-cache', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'msg-live-cache',
+            usage: {
+              input_tokens: 4_930,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 447_867,
+              output_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-cache',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-cache',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-cache',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-cache', 'hello');
+    await flush();
+
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-cache',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 4_930,
+        cache_read_input_tokens: 447_867,
+        output_tokens: 0,
       },
     });
   });
@@ -388,6 +1096,11 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(run.closed).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    // The awaited teardown resolved on the child's own exit, so no escalation
+    // was needed. Pinning the absence matters: if teardown ever stops observing
+    // the exit it would sit out the whole grace window and SIGKILL a process
+    // that had already died.
+    expect(child.kill).not.toHaveBeenCalledWith('SIGKILL');
   });
 
   it('fresh createSession ignores previous internal continuity for the same route', async () => {
@@ -444,8 +1157,8 @@ describe('ClaudeCodeSdkProvider', () => {
     };
 
     sdkMock.query
-      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+      .mockImplementationOnce(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt: sdkMock.readPromptText(prompt), options, closed: false, interrupted: false });
         return makeIterator([
           {
             type: 'result',
@@ -456,8 +1169,8 @@ describe('ClaudeCodeSdkProvider', () => {
           },
         ]);
       })
-      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+      .mockImplementationOnce(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt: sdkMock.readPromptText(prompt), options, closed: false, interrupted: false });
         return makeIterator([
           { type: 'system', subtype: 'init', session_id: 'session-missing', model: 'claude-sonnet-4-6' },
           { type: 'result', session_id: 'session-missing', subtype: 'success', is_error: false, result: 'ACK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
@@ -488,6 +1201,391 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs[1]?.options.resume).toBeUndefined();
     expect(completed).toEqual(['ACK']);
     expect(errors).toEqual([]);
+  });
+
+  it('interrupts a stuck connection-closed result and auto-continues the same session twice', async () => {
+    const connectionError = 'API Error: Connection closed mid-response. The response above may be incomplete.';
+    const makeIterator = (messages: any[], waitForClose: boolean) => {
+      const run = {
+        prompt: '',
+        options: {} as Record<string, unknown>,
+        closed: false,
+        interrupted: false,
+        stoppedTasks: [] as string[],
+        resolveClose: undefined as (() => void) | undefined,
+      };
+      async function* gen() {
+        for (const message of messages) yield message;
+        if (waitForClose && !run.closed) {
+          await new Promise<void>((resolve) => { run.resolveClose = resolve; });
+        }
+      }
+      const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
+      iterator.close = () => {
+        run.closed = true;
+        run.resolveClose?.();
+      };
+      iterator.interrupt = async () => { run.interrupted = true; };
+      iterator.stopTask = async (taskId: string) => { run.stoppedTasks.push(taskId); };
+      return { run, iterator };
+    };
+    // The provider now drives the SDK in streaming-input mode, so `prompt` is an
+    // AsyncIterable<SDKUserMessage> rather than a string (this is what lets a
+    // message reach a query that is still running subagents). This mock stands in
+    // for the SDK, so it resolves the queue to the user text the SDK would read —
+    // keeping `run.prompt` a string for the assertions below.
+    const readPromptText = (prompt: unknown): string => {
+      if (typeof prompt === 'string') return prompt;
+      const buffered = (prompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0];
+      const content = buffered?.message?.content;
+      return typeof content === 'string' ? content : '';
+    };
+    const queueRun = (messages: any[], waitForClose: boolean) => ({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+      const { run, iterator } = makeIterator(messages, waitForClose);
+      run.prompt = readPromptText(prompt);
+      run.options = options;
+      sdkMock.runs.push(run);
+      return iterator;
+    };
+
+    sdkMock.query
+      .mockImplementationOnce(queueRun([
+        { type: 'system', subtype: 'init', session_id: 'session-connection-retry', model: 'claude-sonnet-4-6' },
+        { type: 'assistant', session_id: 'session-connection-retry', message: { content: [{ type: 'text', text: connectionError }] } },
+        // Exact production shape: the useful reason is in assistant text and
+        // the terminal result omits errors[]. Recovery must still engage.
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true },
+      ], true))
+      .mockImplementationOnce(queueRun([
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true, errors: [connectionError] },
+      ], true))
+      .mockImplementationOnce(queueRun([
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'success', is_error: false, result: 'Recovered answer', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ], false));
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-connection-retry', cwd: '/tmp/project' });
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('route-connection-retry', 'original work');
+    for (let i = 0; i < 8; i++) await flush();
+
+    expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['original work', 'continue', 'continue']);
+    expect(sdkMock.runs.slice(0, 2).every((run) => run.interrupted && run.closed)).toBe(true);
+    expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
+    expect(completed).toEqual(['Recovered answer']);
+    expect(errors).toEqual([]);
+  });
+
+  it('does not append recovery guidance to prose that merely mentions a 401', () => {
+    // Every string here came from, or models, a real successful answer. Telling
+    // the user their session is broken because their reply contained the digits
+    // 401 is worse than saying nothing: it sends them to /logout for no reason.
+    const innocuous = [
+      '平均每 G 毛利 401.61 元/G/月（12.96 元/G/天）',
+      'Total: $401.00',
+      'See server/src/routes/enroll.ts:401 for the guard.',
+      'The endpoint returns 401 when the bearer token is missing.',
+      'Detector matches the `[API Error: 401 Invalid API Key]` shape exactly.',
+      'Service listens on port 4011 and answered in 4010ms.',
+      'HEAD is now at 401abc9.',
+      'All 402 tests passed.',
+    ];
+    for (const text of innocuous) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: false });
+    }
+  });
+
+  it('still recognizes a real auth failure, including inside a joined SDK error list', () => {
+    const genuine = [
+      'Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'API Error: 401 Unauthorized',
+      'Invalid authentication credentials',
+      // SDK errors arrive joined with '; ', so the notice is not always first.
+      'stream closed; Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'first line\nAPI Error: 401 Unauthorized',
+    ];
+    for (const text of genuine) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: true });
+    }
+  });
+
+  it('tells users to logout, fully exit, and login again after a 401', async () => {
+    const authError = 'Failed to authenticate. API Error: 401 Invalid authentication credentials';
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-auth-guidance',
+        message: { content: [{ type: 'text', text: authError }] },
+      },
+      {
+        type: 'result',
+        session_id: 'session-auth-guidance',
+        subtype: 'error',
+        is_error: true,
+        errors: [authError],
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-auth-guidance', cwd: '/tmp/project' });
+    const deltas: string[] = [];
+    const errors: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-auth-guidance', 'hello');
+    await flush();
+
+    for (const message of [...deltas, ...errors]) {
+      expect(message).toContain(authError);
+      expect(message).toContain('run `/logout`');
+      expect(message).toContain('fully exit Claude Code');
+      expect(message).toContain('run `/login`');
+    }
+    expect(deltas).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+  });
+
+  it('waits for refreshed Claude credentials and retries one transient auth 403 without exposing it', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-refresh-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'system', subtype: 'init', session_id: 'session-auth-refresh', model: 'claude-sonnet-4-6' },
+        { type: 'assistant', session_id: 'session-auth-refresh', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-refresh', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'result', session_id: 'session-auth-refresh', subtype: 'success', is_error: false, result: 'Recovered answer', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-refresh',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const completed: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onComplete((_sid, message) => completed.push(message.content));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-refresh', 'hello');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => completed.length === 1);
+
+      expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['hello', 'hello']);
+      expect(deltas).toEqual([]);
+      expect(completed).toEqual(['Recovered answer']);
+      expect(errors).toEqual([]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('retries one transient auth 403 immediately when the credential file is unavailable', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-no-file-'));
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '5000';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'assistant', session_id: 'session-auth-no-file', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-no-file', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'result', session_id: 'session-auth-no-file', subtype: 'success', is_error: false, result: 'Recovered without credential file', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-no-file',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const completed: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onComplete((_sid, message) => completed.push(message.content));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-no-file', 'hello');
+      await waitFor(() => completed.length === 1);
+
+      expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['hello', 'hello']);
+      expect(deltas).toEqual([]);
+      expect(completed).toEqual(['Recovered without credential file']);
+      expect(errors).toEqual([]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the transient auth 403 when Claude credentials do not refresh in time', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-timeout-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '25';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessages([
+      { type: 'assistant', session_id: 'session-auth-timeout', message: { content: [{ type: 'text', text: authError }] } },
+      { type: 'result', session_id: 'session-auth-timeout', subtype: 'error', is_error: true, errors: [authError] },
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-timeout',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-timeout', 'hello');
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(1);
+      expect(deltas).toEqual([]);
+      expect(errors[0]).toContain(authError);
+      expect(errors[0]).toContain('run `/logout`');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not retry a second transient auth 403 after credentials refresh', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-bounded-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'assistant', session_id: 'session-auth-bounded', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-bounded', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'assistant', session_id: 'session-auth-bounded', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-bounded', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-bounded',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-bounded', 'hello');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(2);
+      expect(deltas).toEqual([]);
+      expect(errors[0]).toContain(authError);
+      expect(errors[0]).toContain('run `/logout`');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels a pending credential-refresh wait without starting another Claude process', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-cancel-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessages([
+      { type: 'assistant', session_id: 'session-auth-cancel', message: { content: [{ type: 'text', text: authError }] } },
+      { type: 'result', session_id: 'session-auth-cancel', subtype: 'error', is_error: true, errors: [authError] },
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-cancel',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const errors: string[] = [];
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-cancel', 'hello');
+      await waitFor(() => provider.getSessionDiagnostics('route-auth-cancel')?.authRefreshRetryPending === true);
+      await provider.cancel('route-auth-cancel');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(1);
+      expect(errors).toEqual(['Claude turn cancelled']);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('stops after two auto-continues and emits a recoverable terminal error', async () => {
+    const connectionError = 'Claude Code returned an error result: API Error: Connection closed mid-response.';
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-connection-exhausted', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-connection-exhausted', subtype: 'error', is_error: true, errors: [connectionError] },
+    ]);
+    sdkMock.setWaitForClose(true);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-connection-exhausted', cwd: '/tmp/project' });
+    const errors: Array<{ message: string; recoverable: boolean }> = [];
+    provider.onError((_sid, err) => errors.push({ message: err.message, recoverable: err.recoverable }));
+
+    await provider.send('route-connection-exhausted', 'original work');
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['original work', 'continue', 'continue']);
+    expect(sdkMock.runs.every((run) => run.interrupted && run.closed)).toBe(true);
+    expect(errors).toEqual([{ message: connectionError, recoverable: true }]);
   });
 
   it('passes session env through to the Claude SDK query options', async () => {
@@ -538,7 +1636,8 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
-    expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+    expect(sdkPresetAppend(run.options)).toBe('Visible description\n\nRuntime note only');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
   });
 
   it('declares /compact as a verified Claude slash command capability', async () => {
@@ -567,39 +1666,106 @@ describe('ClaudeCodeSdkProvider', () => {
     const statuses: Array<{ status: string | null; label?: string | null }> = [];
     provider.onStatus?.((_sid, status) => statuses.push(status));
 
-    await provider.send('route-compact', {
+    await provider.send('route-compact', buildProviderContextPayload(provider, {
       userMessage: '/compact',
-      assembledMessage: '/compact',
-      systemText: undefined,
-      messagePreamble: undefined,
-      attachments: undefined,
-      context: {
-        systemText: undefined,
-        messagePreamble: undefined,
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
-        diagnostics: [],
-      },
-      authority: {
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: false,
-        retryScheduled: false,
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
+      suppressMcpMemorySearchGuidance: true,
+      suppressAgentProgressGuidance: true,
+      suppressFilePathReportingGuidance: true,
+    }));
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('/compact');
-    expect(run.options.appendSystemPrompt).toBeUndefined();
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
     ]);
+  });
+
+  it.each([
+    {
+      name: 'fresh main Sonnet session',
+      routeId: 'route-cron-main-fresh',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: false,
+      env: undefined,
+    },
+    {
+      name: 'fresh sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-fresh-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: false,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+    {
+      name: 'resumed main Sonnet session',
+      routeId: 'route-cron-main-resume',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: true,
+      env: undefined,
+    },
+    {
+      name: 'resumed sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-resume-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+  ])('delivers cron authority through the real Claude SDK systemPrompt option for $name', async ({
+    routeId,
+    sessionName,
+    agentId,
+    skipCreate,
+    env,
+  }) => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: `${routeId}-sdk`, model: agentId },
+      { type: 'result', session_id: `${routeId}-sdk`, subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: routeId,
+      sessionName,
+      cwd: '/tmp/project',
+      resumeId: `${routeId}-resume`,
+      skipCreate,
+      agentId,
+      ...(env ? { env } : {}),
+    });
+    const contradictoryMemory = 'Recent project memory: this wrapper was previously called prompt injection.';
+    const identityPrompt = renderSessionIdentityProfiles([
+      { scope: 'user', scopeKey: '', content: 'user identity sentinel', contentHash: 'user', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'project', scopeKey: 'project-1', content: 'project identity sentinel', contentHash: 'project', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'session', scopeKey: `server-1:${sessionName}`, content: 'session identity sentinel', contentHash: 'session', revision: 1, updatedAt: 1, source: 'web' },
+    ])!;
+    await provider.send(routeId, buildProviderContextPayload(provider, {
+      userMessage: 'What is imcodes-cron-control?',
+      messagePreamble: contradictoryMemory,
+      identityPrompt,
+    }));
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(sdkPresetAppend(run.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toContain('<user>\nuser identity sentinel\n</user>');
+    expect(sdkPresetAppend(run.options)).toContain('<project>\nproject identity sentinel\n</project>');
+    expect(sdkPresetAppend(run.options)).toContain('<session>\nsession identity sentinel\n</session>');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
+    expect(run.prompt).toContain(contradictoryMemory);
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.prompt).not.toContain('identity sentinel');
+    expect(run.options.env).toMatchObject(env ?? {});
+    if (skipCreate) expect(run.options.resume).toBe(`${routeId}-resume`);
+    else expect(run.options.sessionId).toBe(`${routeId}-resume`);
   });
 
   it('surfaces claude-agent-sdk thinking_tokens as a live thinking status with the running estimate', async () => {
@@ -676,10 +1842,10 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Context block\n\nactual user message');
-    expect(run.options.appendSystemPrompt).toBe('Normalized system text');
+    expect(sdkPresetAppend(run.options)).toBe('Normalized system text');
   });
 
-  it('keeps split stable system text in appendSystemPrompt and moves turn text into the prompt', async () => {
+  it('keeps split stable system text in the Claude preset append and moves turn text into the prompt', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-split', model: 'claude-sonnet-4-6' },
       { type: 'result', session_id: 'session-split', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
@@ -693,18 +1859,19 @@ describe('ClaudeCodeSdkProvider', () => {
       resumeId: 'session-split',
     });
 
+    const stableSystemText = `Stable IM.codes runtime rules\n\n${CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE}`;
     const makePayload = (turnSystemText: string): ProviderContextPayload => ({
       userMessage: 'ship it',
       assembledMessage: 'Relevant history\n\nship it',
-      sessionSystemText: 'Stable IM.codes runtime rules',
+      sessionSystemText: stableSystemText,
       turnSystemText,
-      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      systemText: `${stableSystemText}\n\n${turnSystemText}`,
       messagePreamble: 'Relevant history',
       attachments: undefined,
       context: {
-        sessionSystemText: 'Stable IM.codes runtime rules',
+        sessionSystemText: stableSystemText,
         turnSystemText,
-        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        systemText: `${stableSystemText}\n\n${turnSystemText}`,
         messagePreamble: 'Relevant history',
         requiredAuthoredContext: [turnSystemText],
         advisoryAuthoredContext: [],
@@ -729,13 +1896,70 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const [first, second] = sdkMock.runs.slice(-2);
-    expect(first.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
-    expect(second.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
+    expect(sdkPresetAppend(first.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(second.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(first.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(first.options).not.toHaveProperty('appendSystemPrompt');
+    expect(second.options).not.toHaveProperty('appendSystemPrompt');
     expect(first.prompt).toContain('Required shared context:\n- First file rule');
     expect(first.prompt).not.toContain('Second file rule');
     expect(second.prompt).toContain('Required shared context:\n- Second file rule');
     expect(second.prompt).not.toContain('First file rule');
-    expect(second.prompt).not.toContain('Stable IM.codes runtime rules');
+    expect(second.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+  });
+
+  it('starts a pair participant query in the pair workspace and every other query in the session cwd', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-pair-cwd', cwd: '/tmp/project', resumeId: 'session-pair-cwd' });
+    const pairCwdPayload = (turnCwd?: string): ProviderContextPayload => ({
+      userMessage: 'work on the pair',
+      assembledMessage: 'work on the pair',
+      sessionSystemText: 'Stable runtime',
+      turnSystemText: undefined,
+      systemText: 'Stable runtime',
+      messagePreamble: undefined,
+      attachments: [],
+      ...(turnCwd ? { turnCwd } : {}),
+      context: {
+        sessionSystemText: 'Stable runtime',
+        turnSystemText: undefined,
+        systemText: 'Stable runtime',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-pair-cwd' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+          diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+
+    const before = sdkMock.runs.length;
+    await provider.send('route-pair-cwd', pairCwdPayload('/tmp/worktrees/pair_tsk_demo/repo'));
+    await flush();
+    await provider.send('route-pair-cwd', pairCwdPayload());
+    await flush();
+    await provider.send('route-pair-cwd', 'plain message');
+    await flush();
+    await provider.send('route-pair-cwd', pairCwdPayload('C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo'));
+    await flush();
+
+    expect(sdkMock.runs.slice(before).map((run) => run.options.cwd)).toEqual([
+      '/tmp/worktrees/pair_tsk_demo/repo',
+      '/tmp/project',
+      '/tmp/project',
+      'C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo',
+    ]);
+    expect(provider.capabilities.turnCwd).toBe(true);
   });
 
   it('accepts a normalized provider payload', async () => {
@@ -781,7 +2005,7 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Relevant history\n\nhello');
-    expect(run.options.appendSystemPrompt).toBe('Enterprise standard');
+    expect(sdkPresetAppend(run.options)).toBe('Enterprise standard');
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
@@ -845,6 +2069,65 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(deltas).toEqual(['STREAM_OK']);
     expect(completed).toEqual(['STREAM_OK']);
+  });
+
+  it('retries third-party resumed sessions fresh when Claude returns the no-response seed artifact', async () => {
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'system', subtype: 'init', session_id: 'old-session', model: 'MiniMax-M3' },
+        {
+          type: 'assistant',
+          session_id: 'old-session',
+          message: {
+            content: [{ type: 'text', text: 'No response requested.' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+          },
+        },
+        {
+          type: 'result',
+          session_id: 'old-session',
+          subtype: 'success',
+          is_error: false,
+          result: 'No response requested.',
+          usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+        },
+      ],
+      [
+        { type: 'system', subtype: 'init', session_id: 'fresh-session', model: 'MiniMax-M3' },
+        { type: 'assistant', session_id: 'fresh-session', message: { content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn' } },
+        { type: 'result', session_id: 'fresh-session', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-minimax-resume',
+      cwd: '/tmp/project',
+      resumeId: 'old-session',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onSessionInfo((_sid, info) => {
+      if (info.resumeId) resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('route-minimax-resume', 'hello');
+    await flush();
+    await flush();
+
+    expect(sdkMock.runs).toHaveLength(2);
+    expect(sdkMock.runs[0]?.options.resume).toBe('old-session');
+    expect(sdkMock.runs[1]?.options.sessionId).toEqual(expect.any(String));
+    expect(sdkMock.runs[1]?.options.sessionId).not.toBe('old-session');
+    expect(sdkMock.runs[1]?.prompt).toBe('hello');
+    expect(completed).toEqual(['OK']);
+    expect(resumeIds).toContain('fresh-session');
   });
 
   it('builds tool input from input_json_delta events', async () => {
@@ -1075,6 +2358,185 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(tool?.detail?.raw).toBeUndefined();
   });
 
+  it('surfaces local_bash in the agent process panel and wakes the parent with an explicit Bash kind', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-local-bash-task', model: 'MiniMax-M3' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-start',
+        task_id: 'bp1xwk3v9',
+        tool_use_id: 'call-local-bash',
+        description: 'Search for income user rec references',
+        task_type: 'local_bash',
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-local-bash-task',
+        parent_tool_use_id: null,
+        message: { id: 'message-local-bash-parent', content: [{ type: 'text', text: 'Waiting for Explore agents' }], stop_reason: 'end_turn' },
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-complete',
+        task_id: 'bp1xwk3v9',
+        status: 'completed',
+        summary: 'Search for income user rec references',
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-local-bash-task',
+      sessionName: 'deck_project_claude_local_bash',
+      cwd: '/tmp/project',
+      resumeId: 'session-local-bash-task',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, message) => completed.push(message));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-local-bash-task', 'hello');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+    expect(completed.map((message) => message.content)).toEqual(['Waiting for Explore agents']);
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      name: 'Bash',
+      status: 'complete',
+      input: {
+        action: 'claude-bash-task',
+        description: 'Search for income user rec references',
+      },
+      detail: {
+        meta: {
+          taskId: 'bp1xwk3v9',
+          taskType: 'local_bash',
+          backgrounded: true,
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+    expect(provider.getActiveWorkSnapshot('route-local-bash-task')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    const queuedInputs = (sdkMock.runs[0]?.promptSource as {
+      buffer?: Array<{ message?: { content?: unknown } }>;
+    })?.buffer?.map((entry) => entry.message?.content);
+    expect(queuedInputs).toEqual(expect.arrayContaining([
+      expect.stringContaining('kind=bash means Bash/shell'),
+      expect.stringContaining('"kind":"bash"'),
+    ]));
+    expect(provider.getSessionDiagnostics('route-local-bash-task')).toMatchObject({
+      completed: false,
+      retainedSubagentMode: true,
+      currentQueryActive: true,
+    });
+    await provider.endSession('route-local-bash-task');
+  });
+
+  it('routes recursive task lifecycle to its direct parent instead of the main session', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    let finishAgent!: (message: unknown) => void;
+    const agentTerminal = new Promise((resolve) => { finishAgent = resolve; });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-nested-bash', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'agent-research-1', tool_use_id: 'agent-tool-1', task_type: 'local_agent', spawn_depth: 1,
+        description: 'Research buyers',
+      },
+      // This tool block came from inside agent-research-1. Its subsequent
+      // local_bash lifecycle is owned by that agent even though local_bash
+      // messages do not carry spawn_depth themselves.
+      {
+        type: 'stream_event', session_id: 'session-nested-bash', parent_tool_use_id: 'agent-tool-1',
+        event: { type: 'content_block_start', index: 4, content_block: { type: 'tool_use', id: 'bash-tool-1', name: 'Bash', input: {} } },
+      },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'bash-search-1', tool_use_id: 'bash-tool-1', task_type: 'local_bash',
+        description: 'Run one child search',
+      },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'agent-grandchild-1', tool_use_id: 'agent-tool-2', task_type: 'local_agent', spawn_depth: 2,
+        description: 'Grandchild research',
+      },
+      {
+        type: 'assistant', session_id: 'session-nested-bash', parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Waiting for the research agent.' }], stop_reason: 'end_turn' },
+      },
+      {
+        type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+        task_id: 'bash-search-1', status: 'completed', summary: 'Child search complete',
+      },
+      {
+        type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+        task_id: 'agent-grandchild-1', status: 'completed', summary: 'Grandchild complete',
+      },
+      agentTerminal,
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-nested-bash',
+      sessionName: 'deck_project_claude_nested_bash',
+      cwd: '/tmp/project',
+      resumeId: 'session-nested-bash',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    const sendPromise = provider.send('route-nested-bash', 'deep research');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    const queuedCompletionTexts = () => ((sdkMock.runs[0]?.promptSource as {
+      buffer?: Array<{ message?: { content?: unknown } }>;
+    })?.buffer ?? [])
+      .map((entry) => entry.message?.content)
+      .filter((content): content is string => typeof content === 'string' && content.includes('# IM.codes background task completion'));
+    expect(queuedCompletionTexts()).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-nested-bash')).toMatchObject({
+      completed: true,
+      retainedSubagentMode: true,
+      currentQueryActive: true,
+    });
+    expect(sdkSubagentTools(tools).map((tool) => tool.detail?.meta?.taskId)).toEqual([
+      'agent-research-1',
+    ]);
+
+    finishAgent({
+      type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+      task_id: 'agent-research-1', status: 'completed', summary: 'Research complete',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(queuedCompletionTexts()).toHaveLength(1);
+    expect(queuedCompletionTexts()[0]).toContain('"taskId":"agent-research-1"');
+    expect(queuedCompletionTexts()[0]).toContain('"kind":"agent"');
+    expect(queuedCompletionTexts()[0]).not.toContain('bash-search-1');
+
+    await provider.endSession('route-nested-bash');
+    await sendPromise;
+  });
+
   it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {
     const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
     process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';
@@ -1134,6 +2596,116 @@ describe('ClaudeCodeSdkProvider', () => {
             active: false,
             terminal: true,
           },
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+      if (previousStaleMs === undefined) delete process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+      else process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = previousStaleMs;
+    }
+  });
+
+  it('reports detached Claude tasks as non-blocking background work after the foreground turn completes', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-backgrounded', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-backgrounded',
+        uuid: 'uuid-task-backgrounded-start',
+        task_id: 'task-backgrounded-1',
+        tool_use_id: 'tool-use-backgrounded',
+        description: 'Run a detached task',
+      },
+      {
+        type: 'system',
+        subtype: 'task_updated',
+        session_id: 'session-route-subagent-backgrounded',
+        uuid: 'uuid-task-backgrounded-update',
+        task_id: 'task-backgrounded-1',
+        patch: { status: 'running', is_backgrounded: true },
+      },
+      { type: 'result', session_id: 'session-route-subagent-backgrounded', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-backgrounded',
+      sessionName: 'deck_project_claude_backgrounded',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-backgrounded',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-backgrounded', 'hello');
+    await flush();
+
+    expect(provider.getActiveWorkSnapshot('route-subagent-backgrounded')).toMatchObject({
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+    expect(sdkSubagentTools(tools).at(-1)?.detail).toMatchObject({
+      meta: {
+        provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+        backgrounded: true,
+        active: true,
+        terminal: false,
+      },
+    });
+  });
+
+  it('does not expire a quiet detached Claude task before its real terminal update', async () => {
+    const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+    process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';
+    try {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-route-detached-long', model: 'claude-sonnet-4-6' },
+        {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: 'session-route-detached-long',
+          uuid: 'uuid-task-detached-long-start',
+          task_id: 'task-detached-long-1',
+          tool_use_id: 'tool-use-detached-long',
+          description: 'Render a long video',
+          task_type: 'local_bash',
+        },
+        { type: 'result', session_id: 'session-route-detached-long', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ]);
+
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-detached-long',
+        sessionName: 'deck_project_claude_detached_long',
+        cwd: '/tmp/project',
+        resumeId: 'session-route-detached-long',
+      });
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+      await provider.send('route-detached-long', 'hello');
+      await flush();
+
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 1_001);
+      expect(provider.getActiveWorkSnapshot('route-detached-long')).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        busyReasons: ['background_monitor'],
+      });
+      expect(sdkSubagentTools(tools).at(-1)?.detail).toMatchObject({
+        meta: {
+          taskId: 'task-detached-long-1',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          backgrounded: true,
+          active: true,
+          terminal: false,
         },
       });
     } finally {
@@ -1205,7 +2777,7 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
-  it('closes the retained background-task query after a stopped task notification settles active work', async () => {
+  it('keeps a stopped-task notification alive until the retained parent reports it', async () => {
     sdkMock.setWaitForClose(true);
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stopped-notification', model: 'claude-sonnet-4-6' },
@@ -1218,7 +2790,10 @@ describe('ClaudeCodeSdkProvider', () => {
         tool_use_id: 'tool-use-stopped-notification',
         description: 'Run a background task that stops after the foreground result',
       },
-      { type: 'result', session_id: 'session-route-subagent-stopped-notification', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'assistant', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Foreground done' }], stop_reason: 'end_turn' },
+      },
       {
         type: 'system',
         subtype: 'task_notification',
@@ -1227,6 +2802,26 @@ describe('ClaudeCodeSdkProvider', () => {
         task_id: 'task-stopped-notification',
         status: 'stopped',
         summary: 'Background task stopped',
+      },
+      {
+        type: 'user', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        origin: { kind: 'task-notification' },
+        message: { role: 'user', content: 'The background task stopped.' },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'message-stopped-task-wake' } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: {
+          type: 'content_block_delta', index: 0,
+          delta: { type: 'text_delta', text: 'Stopped task reported to parent' },
+        },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
       },
     ]);
 
@@ -1247,7 +2842,7 @@ describe('ClaudeCodeSdkProvider', () => {
 
     await vi.waitFor(() => {
       expect(sdkMock.runs[0]?.closed).toBe(true);
-      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done']);
+      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done', 'Stopped task reported to parent']);
     });
     expect(provider.getActiveWorkSnapshot('route-subagent-stopped-notification')).toMatchObject({
       activeWorkCount: 0,
@@ -1337,6 +2932,7 @@ describe('ClaudeCodeSdkProvider', () => {
         status: 'running',
         name: 'Hooke',
         prompt: 'Wait for the read-only sync worker',
+        is_backgrounded: true,
       },
       {
         type: 'system',
@@ -1379,6 +2975,7 @@ describe('ClaudeCodeSdkProvider', () => {
           normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
           active: true,
           terminal: false,
+          backgrounded: true,
         },
       },
     });
@@ -1629,6 +3226,59 @@ describe('ClaudeCodeSdkProvider', () => {
       },
     });
     expect(JSON.stringify(terminal?.input ?? null)).not.toContain('/tmp/full-output.log');
+  });
+
+  it('preserves authoritative completion output when a late notification reports a conflicting terminal status', async () => {
+    const sessionName = 'deck_project_claude_late_degraded_notification';
+    const { tools } = await collectToolsForMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-late-degraded', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-start',
+        task_id: 'task-late-degraded-1',
+        description: 'Run a background Bash verification',
+        task_type: 'local_bash',
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-complete',
+        task_id: 'task-late-degraded-1',
+        status: 'completed',
+        summary: 'Background command completed (exit code 0)',
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-stopped',
+        task_id: 'task-late-degraded-1',
+        status: 'stopped',
+        summary: 'No completion record was found for this background shell command from the previous session.',
+      },
+      { type: 'result', session_id: 'session-route-subagent-late-degraded', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ], 'route-subagent-late-degraded', sessionName);
+
+    const subagents = sdkSubagentTools(tools);
+    expect(subagents).toHaveLength(2);
+    expect(subagents.at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey(sessionName, 'task-late-degraded-1'),
+      name: 'Bash',
+      status: 'complete',
+      output: 'Background command completed (exit code 0)',
+      detail: {
+        summary: 'Background command completed (exit code 0)',
+        meta: {
+          rawStatus: 'completed',
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
   });
 
   it.each(['failed', 'stopped', 'killed'] as const)('emits terminal error SDK subagent snapshots for Claude task_notification %s', async (status) => {
@@ -1942,6 +3592,37 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
     ]);
+  });
+
+  it('tolerates Claude SDK 0.3.330 session_writes_lost system messages without failing the turn', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-writes-lost', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'session_writes_lost',
+        session_id: 'session-writes-lost',
+        uuid: 'uuid-writes-lost',
+        error_code: 'ENOSPC',
+        lost: ['transcript'],
+        transcript_session_ids: ['session-writes-lost'],
+      },
+      { type: 'result', session_id: 'session-writes-lost', subtype: 'success', is_error: false, result: 'Done safely', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-writes-lost', cwd: '/tmp/project', resumeId: 'session-writes-lost' });
+
+    const completions: string[] = [];
+    const errors: unknown[] = [];
+    provider.onComplete((_sid, msg) => completions.push(msg.content));
+    provider.onError((_sid, err) => errors.push(err));
+
+    await provider.send('route-writes-lost', 'hello');
+    await flush();
+
+    expect(errors).toEqual([]);
+    expect(completions).toEqual(['Done safely']);
   });
 });
 

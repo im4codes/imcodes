@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,6 +33,8 @@ const {
   deleteMemoryMock,
   listSessionsMock,
   recallClientControl,
+  collectRecentSummarySyncCandidatesMock,
+  memoryInjectionEnabledMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -61,6 +64,12 @@ const {
   // existing expectations). One test flips it true to exercise the owner-mode
   // bounded-empty path (no in-process recall).
   recallClientControl: { isProductionOwner: false },
+  collectRecentSummarySyncCandidatesMock: vi.fn(),
+  memoryInjectionEnabledMock: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/context/memory-injection-toggle.js', () => ({
+  isMemoryInjectionEnabled: memoryInjectionEnabledMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -259,6 +268,11 @@ vi.mock('../../src/context/memory-recall-client.js', () => ({
   searchLocalMemoryAuthorizedForManagement: vi.fn(async (query) => searchLocalMemorySemanticMock(query)),
 }));
 
+vi.mock('../../src/context/summary-sync.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/context/summary-sync.js')>()),
+  collectRecentSummarySyncCandidates: collectRecentSummarySyncCandidatesMock,
+}));
+
 vi.mock('../../src/repo/detector.js', () => ({
   detectRepo: detectRepoMock,
   parseRemoteUrl: vi.fn((url: string) => {
@@ -283,13 +297,20 @@ vi.mock('../../src/repo/detector.js', () => ({
     .filter((remote): remote is { name: string; url: string; host: string; owner: string; repo: string } => Boolean(remote))),
 }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, sendProcessSessionMessageForAutomation } from '../../src/daemon/command-handler.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
+import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
+import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
+import { ALIAS_REASONS, ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
+import { getResendEntries, clearResend } from '../../src/daemon/transport-resend-queue.js';
+// Resolves to the vi.fn() from the ../../src/agent/tmux.js mock above — lets the
+// fail-closed tests assert the raw `sendKeys` variant is never called with `;;(`.
+import { sendKeys as tmuxSendKeysMock } from '../../src/agent/tmux.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const originalFeatureEnv = {
@@ -330,6 +351,8 @@ describe('handleWebCommand memory context timeline', () => {
     process.env.IMCODES_MEM_FEATURE_OBSERVATION_STORE = 'true';
     resetMemoryFeatureConfigStoreForTests();
     resetAllRecentInjectionHistories();
+    resetAllSummarySyncHistories();
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([]);
     setContextModelRuntimeConfig(null);
     getProcessedProjectionStatsMock.mockReturnValue({
       totalRecords: 0,
@@ -588,6 +611,7 @@ describe('handleWebCommand memory context timeline', () => {
       type: MEMORY_WS.PERSONAL_QUERY,
       requestId: 'personal-list',
       projectId: 'github.com/acme/repo',
+      includeShortRefs: true,
       [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
         actorId: 'user-bob',
         userId: 'user-bob',
@@ -628,6 +652,7 @@ describe('handleWebCommand memory context timeline', () => {
       requestId: 'personal-list',
       records: [expect.objectContaining({
         id: 'bob-proj',
+        ref: makeMemoryShortRef('projection', 'bob-proj'),
         summary: 'Bob private project memory',
         ownerUserId: 'user-bob',
         createdByUserId: 'user-bob',
@@ -712,6 +737,34 @@ describe('handleWebCommand memory context timeline', () => {
       requestId: 'archive-legacy',
       success: true,
     }));
+  });
+
+  it('completes delete, archive, and restore actions when the local store is healthy', async () => {
+    getProcessedProjectionByIdMock.mockReturnValue({
+      id: 'healthy-proj',
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-bob' },
+      class: 'recent_summary', sourceEventIds: ['evt-healthy'], summary: 'Healthy local memory',
+      content: {}, createdAt: 1, updatedAt: 2, status: 'active',
+    });
+    archiveMemoryMock.mockReturnValue(true);
+    restoreArchivedMemoryMock.mockReturnValue(true);
+    deleteMemoryMock.mockReturnValue(true);
+    const context = (requestId: string) => ({
+      actorId: 'user-bob', userId: 'user-bob', role: 'user', source: 'server_bridge', requestId,
+      boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+    });
+    for (const [type, responseType, requestId] of [
+      [MEMORY_WS.ARCHIVE, MEMORY_WS.ARCHIVE_RESPONSE, 'healthy-archive'],
+      [MEMORY_WS.RESTORE, MEMORY_WS.RESTORE_RESPONSE, 'healthy-restore'],
+      [MEMORY_WS.DELETE, MEMORY_WS.DELETE_RESPONSE, 'healthy-delete'],
+    ] as const) {
+      handleWebCommand({ type, responseType, requestId, id: 'healthy-proj', canonicalRepoId: 'github.com/acme/repo', [MEMORY_MANAGEMENT_CONTEXT_FIELD]: context(requestId) }, serverLink as any);
+      await flushAsync();
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({ type: responseType, requestId, success: true }));
+    }
+    expect(archiveMemoryMock).toHaveBeenCalledWith('healthy-proj');
+    expect(restoreArchivedMemoryMock).toHaveBeenCalledWith('healthy-proj');
+    expect(deleteMemoryMock).toHaveBeenCalledWith('healthy-proj');
   });
 
   it('allows explicit manual create, edit, and pin for visible project personal memory', async () => {
@@ -1358,8 +1411,149 @@ describe('handleWebCommand memory context timeline', () => {
         localUnavailable: true,
       }),
     }));
-    expect(queryPendingContextEventsMock).not.toHaveBeenCalled();
-    expect(listMemoryProjectSummariesMock).not.toHaveBeenCalled();
+    // The four context-store reads fire concurrently rather than one at a
+    // time (sequential round trips made every load of this "just show two
+    // count badges" panel noticeably slow), so a failure in one no longer
+    // holds the others back -- their results are simply discarded once the
+    // response is already going to report unavailable.
+    expect(queryPendingContextEventsMock).toHaveBeenCalled();
+    expect(listMemoryProjectSummariesMock).toHaveBeenCalled();
+  });
+
+  it('returns a structured response instead of rejecting when personal memory stats are unavailable', async () => {
+    getProcessedProjectionStatsMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-stats-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'personal-stats-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-stats-degraded',
+      records: [],
+      pendingRecords: [],
+      projects: [],
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
+      stats: expect.objectContaining({ localUnavailable: true }),
+    }));
+    // Fired concurrently with the (failing) stats read rather than gated
+    // behind it; its result is simply discarded once stats fails.
+    expect(queryProcessedProjectionsMock).toHaveBeenCalled();
+  });
+
+  it('bounds observation reads to authorized namespaces inside the context-store worker', async () => {
+    listContextNamespacesMock.mockReturnValue([
+      {
+        id: 'ns-bob',
+        scope: 'personal',
+        userId: 'user-bob',
+        projectId: 'github.com/acme/repo',
+        key: 'personal::user-bob::github.com/acme/repo',
+        visibility: 'private',
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      {
+        id: 'ns-alice',
+        scope: 'personal',
+        userId: 'user-alice',
+        projectId: 'github.com/acme/repo',
+        key: 'personal::user-alice::github.com/acme/repo',
+        visibility: 'private',
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    ]);
+    listContextObservationsMock.mockReturnValue([]);
+
+    handleWebCommand({
+      type: MEMORY_WS.OBSERVATION_QUERY,
+      requestId: 'observations-bounded',
+      scope: 'personal',
+      class: 'note',
+      limit: 17,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'observations-bounded',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(listContextObservationsMock).toHaveBeenCalledWith(expect.objectContaining({
+      namespaceIds: ['ns-bob'],
+      scope: 'personal',
+      class: 'note',
+      limit: 17,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId: 'observations-bounded',
+      records: [],
+    }));
+  });
+
+  it('degrades observation and preference worker failures without unhandled rejections', async () => {
+    listContextNamespacesMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+    handleWebCommand({
+      type: MEMORY_WS.OBSERVATION_QUERY,
+      requestId: 'observations-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'observations-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+    await flushAsync();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId: 'observations-degraded',
+      localUnavailable: true,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
+    }));
+
+    serverLink.send.mockClear();
+    listContextObservationsMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+    handleWebCommand({
+      type: MEMORY_WS.PREF_QUERY,
+      requestId: 'preferences-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'preferences-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+    await flushAsync();
+    expect(listContextObservationsMock).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'active',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId: 'preferences-degraded',
+      localUnavailable: true,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
+    }));
   });
 
   it('emits a linked memory.context event for injected related history', async () => {
@@ -1383,10 +1577,13 @@ describe('handleWebCommand memory context timeline', () => {
       expect.objectContaining({
         relatedToEventId: 'evt-user-1',
         query: 'Fix reconnect issues in websocket client',
-        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [codedeck] Fix websocket reconnect loop\n</related-past-work>',
+        // Each line carries a redeemable handle so the agent can call
+        // get_memory_sources when the summary alone isn't enough.
+        injectedText: `[Related past work]\n<related-past-work advisory="true">\n- [codedeck] (${makeMemoryShortRef('projection', 'mem-1')}) Fix websocket reconnect loop\n</related-past-work>`,
         items: [
           expect.objectContaining({
             id: 'mem-1',
+            ref: makeMemoryShortRef('projection', 'mem-1'),
             projectId: 'codedeck',
             relevanceScore: 0.812,
             hitCount: 4,
@@ -1397,6 +1594,157 @@ describe('handleWebCommand memory context timeline', () => {
     );
     expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('injects no related history into a process send when the project turned memory injection off', async () => {
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'Fix reconnect issues in websocket client',
+        commandId: 'cmd-memory-off',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(memoryInjectionEnabledMock).toHaveBeenCalled();
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+        'deck_process_brain',
+        'Fix reconnect issues in websocket client',
+        undefined,
+      );
+      expect(emitMock).not.toHaveBeenCalledWith('deck_process_brain', 'memory.context', expect.anything(), expect.anything());
+      expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
+  });
+
+  it('synchronizes a new recent summary once across subsequent process sends', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'New project summary created after this process session started';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-new',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+        updatedAt: 2,
+      },
+    }]);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'First concurrent normal request',
+      commandId: 'cmd-summary-one',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Second concurrent normal request',
+      commandId: 'cmd-summary-two',
+    }, serverLink as any);
+
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const delivered = sendKeysDelayedEnterMock.mock.calls.map((call) => String(call[1]));
+    expect(delivered).toHaveLength(2);
+    expect(collectRecentSummarySyncCandidatesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'personal' }),
+      { currentSessionName: 'deck_process_brain' },
+    );
+    expect(delivered.filter((text) => text.includes(summary))).toHaveLength(1);
+    expect(delivered.find((text) => text.includes(summary))).toContain('# Recent project memory (reference only)');
+  });
+
+  it('keeps P2P metadata while the common automation boundary synchronizes summaries', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'Summary synchronized into a process P2P prompt';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-p2p-process',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+
+    await sendProcessSessionMessageForAutomation('deck_process_brain', '[P2P Discussion Task] inspect changes', {
+      userMessageMetadata: {
+        memoryExcluded: true,
+        p2pRunId: 'p2p-run-1',
+        p2pDiscussionId: 'discussion-1',
+        p2pPhase: 'round',
+      },
+    });
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      expect.stringContaining(summary),
+      undefined,
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'user.message',
+      expect.objectContaining({
+        text: '[P2P Discussion Task] inspect changes',
+        memoryExcluded: true,
+        p2pRunId: 'p2p-run-1',
+        p2pDiscussionId: 'discussion-1',
+        p2pPhase: 'round',
+      }),
+    );
+  });
+
+  it('command mode (verbatim) delivers a process agent the exact text with no recall or summary injection; an ordinary send still gets it', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'Summary that an ordinary process send would carry';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-verbatim-process',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+
+    await sendProcessSessionMessageForAutomation('deck_process_brain', 'Please summarise the open work items now');
+    expect(String(sendKeysDelayedEnterMock.mock.calls.at(-1)?.[1])).toContain(summary);
+    const recallCallsBefore = searchLocalMemorySemanticMock.mock.calls.length;
+    const summaryCallsBefore = collectRecentSummarySyncCandidatesMock.mock.calls.length;
+
+    const raw = 'Please summarise the open work items now';
+    await sendProcessSessionMessageForAutomation('deck_process_brain', raw, { verbatim: true });
+    expect(sendKeysDelayedEnterMock.mock.calls.at(-1)?.[1]).toBe(raw);
+    expect(searchLocalMemorySemanticMock.mock.calls.length).toBe(recallCallsBefore);
+    expect(collectRecentSummarySyncCandidatesMock.mock.calls.length).toBe(summaryCallsBefore);
   });
 
   it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {
@@ -1497,6 +1845,49 @@ describe('handleWebCommand memory context timeline', () => {
       'memory.context',
       expect.anything(),
     );
+  });
+
+  it('retries an unsynchronized summary after a process delivery failure', async () => {
+    const summary = 'Process delivery must not tombstone this summary on failure';
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-process-retry',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+    sendKeysDelayedEnterMock.mockRejectedValueOnce(new Error('tmux failed'));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'First process delivery attempt',
+      commandId: 'cmd-summary-failed',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Second process delivery attempt',
+      commandId: 'cmd-summary-retry',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(String(sendKeysDelayedEnterMock.mock.calls[1]?.[1])).toContain(summary);
   });
 
   it('emits a no-matches status when no related process memory is found', async () => {
@@ -1680,4 +2071,358 @@ describe('handleWebCommand memory context timeline', () => {
       }),
     );
   });
+
+  // ── Alias quick-insert (A′) — process/tmux dispatch wiring ────────────────
+  // The human-facing `user.message` ALWAYS carries the ORIGINAL `;;(name)`
+  // markers; only the agent-bound tmux input is expanded. Inline mode (shell /
+  // script) substitutes values in place and FAILS CLOSED on an unresolved
+  // marker; legend mode (LLM process agents) keeps markers + prepends a legend.
+  describe('alias quick-insert (A′) — process/tmux wiring', () => {
+    const emptyRecall = {
+      items: [] as unknown[],
+      stats: {
+        totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0,
+        projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0,
+      },
+    };
+    const shellSession = (agentType: 'shell' | 'script' = 'shell') => ({
+      name: 'deck_process_brain',
+      projectName: 'codedeck',
+      role: 'brain',
+      agentType,
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/worktrees/codedeck',
+    });
+    const lastKeysText = () => {
+      const call = sendKeysDelayedEnterMock.mock.calls.at(-1);
+      return call ? String(call[1]) : undefined;
+    };
+    const userMessageEmit = (commandId: string) => emitMock.mock.calls.find(
+      ([session, type, payload]) => session === 'deck_process_brain'
+        && type === 'user.message'
+        && (payload as { commandId?: string } | undefined)?.commandId === commandId,
+    );
+
+    it.each(['shell', 'script'] as const)('%s chat sends keep long multiline commands and leading ! verbatim without memory', async (agentType) => {
+      getSessionMock.mockReturnValue(shellSession(agentType));
+      const text = '! true\n' + 'printf "中文 $HOME @file ; literal\\n"\n'.repeat(20);
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text,
+        commandId: `cmd-shell-verbatim-${agentType}`,
+      }, serverLink as any);
+      await flushAsync();
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith('deck_process_brain', text, { verbatim: true });
+      expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+      expect(collectRecentSummarySyncCandidatesMock).not.toHaveBeenCalled();
+      expect(userMessageEmit(`cmd-shell-verbatim-${agentType}`)?.[2]).toMatchObject({ text });
+    });
+
+    it('12.5 shell inline: substituted value reaches the agent; timeline keeps the marker', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'echo ;;(greeting)',
+        commandId: 'cmd-alias-inline-shell',
+        resolvedAliases: { greeting: 'hello world' },
+      }, serverLink as any);
+      await flushAsync();
+
+      // Agent-bound tmux input has the value substituted in place — no marker.
+      expect(lastKeysText()).toBe('echo hello world');
+      expect(lastKeysText()).not.toContain(';;(');
+      // Human-facing timeline keeps the ORIGINAL marker text.
+      expect(userMessageEmit('cmd-alias-inline-shell')?.[2]).toMatchObject({ text: 'echo ;;(greeting)' });
+    });
+
+    it('12.5 script inline: multiple markers substituted; timeline unchanged', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('script'));
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'deploy ;;(host) as ;;(user)',
+        commandId: 'cmd-alias-inline-script',
+        resolvedAliases: { host: 'prod.example.com', user: 'deployer' },
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(lastKeysText()).toBe('deploy prod.example.com as deployer');
+      expect(userMessageEmit('cmd-alias-inline-script')?.[2]).toMatchObject({ text: 'deploy ;;(host) as ;;(user)' });
+    });
+
+    it('12.5 LLM (legend): claude-code process agent keeps markers in body + prepends the legend directive', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue({ ...shellSession('shell'), agentType: 'claude-code' });
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'ping ;;(host) please',
+        commandId: 'cmd-alias-legend',
+        resolvedAliases: { host: 'prod.example.com' },
+      }, serverLink as any);
+      await flushAsync();
+
+      const delivered = lastKeysText() ?? '';
+      // Directive + legend line present, and the original marker is STILL in the body.
+      expect(delivered).toContain(ALIAS_LEGEND_DIRECTIVE);
+      expect(delivered).toContain(buildAliasLegendLine('host', 'prod.example.com'));
+      expect(delivered).toContain('ping ;;(host) please');
+      // Timeline keeps the original.
+      expect(userMessageEmit('cmd-alias-legend')?.[2]).toMatchObject({ text: 'ping ;;(host) please' });
+    });
+
+    it('12.6 shell unresolved marker: command NOT delivered, diagnostic emitted, no literal ;; reaches the agent', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+      sendKeysDelayedEnterMock.mockClear();
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'rm -rf ;;(target)',
+        commandId: 'cmd-alias-failclosed',
+        resolvedAliases: {}, // marker unresolved → fail closed
+      }, serverLink as any);
+      await flushAsync();
+
+      // Nothing at all was handed to the shell — the literal ;;(target) never runs.
+      expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+      // Original message still shows on the timeline (the user typed it).
+      expect(userMessageEmit('cmd-alias-failclosed')?.[2]).toMatchObject({ text: 'rm -rf ;;(target)' });
+      // A non-blocking diagnostic names the unresolved marker + reason.
+      const diag = emitMock.mock.calls.find(
+        ([session, type, payload]) => session === 'deck_process_brain'
+          && type === 'assistant.text'
+          && String((payload as { text?: string } | undefined)?.text ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+      );
+      expect(diag).toBeDefined();
+      expect(diag?.[2]).toMatchObject({ memoryExcluded: true });
+      expect(String(diag?.[2]?.text)).toContain('target');
+    });
+
+    it('12.6 NL (legend) unresolved marker: stays literal AND is delivered to the agent', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue({ ...shellSession('shell'), agentType: 'claude-code' });
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'summarize ;;(missing) for me',
+        commandId: 'cmd-alias-legend-unresolved',
+        resolvedAliases: {}, // unresolved
+      }, serverLink as any);
+      await flushAsync();
+
+      // Legend agents always deliver; the unresolved marker stays literal in the body.
+      const delivered = lastKeysText() ?? '';
+      expect(delivered).toContain('summarize ;;(missing) for me');
+      // No legend directive is prepended when there is nothing resolved to explain.
+      expect(delivered).not.toContain(ALIAS_LEGEND_DIRECTIVE);
+      expect(userMessageEmit('cmd-alias-legend-unresolved')?.[2]).toMatchObject({ text: 'summarize ;;(missing) for me' });
+    });
+
+    it('12.8 fail-closed diagnostic contains the marker name + reason but NEVER the value', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+      sendKeysDelayedEnterMock.mockClear();
+
+      const SECRET = 'super-secret-token-abc123';
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        // 'token' IS resolved (to a secret), but 'other' is NOT → whole inline
+        // send fails closed. The diagnostic must never leak the resolved value.
+        text: 'use ;;(token) and ;;(other)',
+        commandId: 'cmd-alias-noleak',
+        resolvedAliases: { token: SECRET },
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+      const diag = emitMock.mock.calls.find(
+        ([session, type, payload]) => session === 'deck_process_brain'
+          && type === 'assistant.text'
+          && String((payload as { text?: string } | undefined)?.text ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+      );
+      expect(diag).toBeDefined();
+      const diagText = String(diag?.[2]?.text ?? '');
+      expect(diagText).toContain('other'); // unresolved name is fine
+      expect(diagText).toContain(ALIAS_REASONS.UNRESOLVED_FAILCLOSED);
+      // The resolved value must NEVER appear in any emitted diagnostic.
+      expect(diagText).not.toContain(SECRET);
+      for (const call of emitMock.mock.calls) {
+        expect(JSON.stringify(call[2] ?? '')).not.toContain(SECRET);
+      }
+    });
+
+    // ── Real-dispatch fail-closed integration (the bug that shipped: the pure
+    //    function was tested, but real dispatch to a shell/script never was). ──
+    // Timeline `command.ack` error emissions captured by emitMock.
+    const failClosedTimelineAcks = () => emitMock.mock.calls.filter(
+      ([session, type, payload]) => session === 'deck_process_brain'
+        && type === 'command.ack'
+        && (payload as { status?: string } | undefined)?.status === 'error'
+        && String((payload as { error?: string } | undefined)?.error ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+    );
+    // Reliable ack (outbox → serverLink.send) carries type 'command.ack' + reason.
+    const failClosedWireAcks = () => (serverLink.send as any).mock.calls.filter(
+      ([msg]: [Record<string, unknown>]) => msg?.type === 'command.ack'
+        && msg?.status === 'error'
+        && String(msg?.error ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+    );
+    // Any tmux write (either variant) that carries a literal `;;(` — must be none.
+    const anyLiteralMarkerSent = () => {
+      const delayed = sendKeysDelayedEnterMock.mock.calls.some((c) => String(c[1] ?? '').includes(';;('));
+      const raw = (tmuxSendKeysMock as any).mock.calls.some((c: unknown[]) => String(c[1] ?? '').includes(';;('));
+      return delayed || raw;
+    };
+
+    for (const agentType of ['shell', 'script'] as const) {
+      it(`12.9 REAL dispatch (${agentType}): unresolved marker never reaches tmux; command.ack error emitted`, async () => {
+        searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+        getSessionMock.mockReturnValue(shellSession(agentType));
+        sendKeysDelayedEnterMock.mockClear();
+        (tmuxSendKeysMock as any).mockClear();
+        (serverLink.send as any).mockClear();
+
+        handleWebCommand({
+          type: 'session.send',
+          session: 'deck_process_brain',
+          text: `deploy ;;(missingHost) now`,
+          commandId: `cmd-failclosed-${agentType}`,
+          resolvedAliases: {}, // unresolved → fail closed
+        }, serverLink as any);
+        await flushAsync();
+
+        // NOTHING with a literal `;;(` reached the shell/script via EITHER tmux fn.
+        expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+        expect(tmuxSendKeysMock).not.toHaveBeenCalled();
+        expect(anyLiteralMarkerSent()).toBe(false);
+        // A terminal command.ack error was emitted on BOTH channels with the code.
+        expect(failClosedTimelineAcks().length).toBeGreaterThanOrEqual(1);
+        expect(failClosedWireAcks().length).toBeGreaterThanOrEqual(1);
+        // The reliable ack also carries the machine reason (never a value).
+        const wireAck = failClosedWireAcks()[0]?.[0] as Record<string, unknown>;
+        expect(wireAck?.reason).toBe(ALIAS_REASONS.UNRESOLVED_FAILCLOSED);
+        // Human-facing echo still shows the original marker text.
+        expect(userMessageEmit(`cmd-failclosed-${agentType}`)?.[2]).toMatchObject({
+          text: 'deploy ;;(missingHost) now',
+        });
+      });
+    }
+
+    it('12.10 REAL dispatch (transport, no runtime): guard fires BEFORE enqueue — no literal ;;( queued', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      // A session flagged transport (runtimeType='transport') whose agentType is
+      // unknown → alias mode defaults to `inline`, so an unresolved marker fails
+      // closed. No transport runtime is registered, so WITHOUT the early guard the
+      // message would fall into the no-runtime enqueueResend branch carrying the
+      // literal `;;(`. The guard must short-circuit BEFORE that enqueue.
+      const transportInlineSession = {
+        name: 'deck_process_brain',
+        projectName: 'codedeck',
+        role: 'brain',
+        agentType: 'brand-new-inline-agent', // unknown → aliasExpansionModeFor → inline
+        runtimeType: 'transport',
+        providerId: 'unknown',
+        state: 'idle',
+        projectDir: '/worktrees/codedeck',
+      };
+      getSessionMock.mockReturnValue(transportInlineSession);
+      getTransportRuntimeMock.mockReturnValue(undefined); // no runtime → would enqueue
+      clearResend('deck_process_brain');
+      (serverLink.send as any).mockClear();
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'run ;;(nope) please',
+        commandId: 'cmd-failclosed-transport',
+        resolvedAliases: {}, // unresolved
+      }, serverLink as any);
+      await flushAsync();
+
+      // The real resend queue is untouched — nothing (least of all a literal
+      // `;;(`) was enqueued for redelivery.
+      const queued = getResendEntries('deck_process_brain');
+      expect(queued.length).toBe(0);
+      for (const entry of queued) {
+        expect(entry.text).not.toContain(';;(');
+        expect(entry.providerText ?? '').not.toContain(';;(');
+      }
+      // Terminal command.ack error surfaced (reliable channel).
+      expect(failClosedWireAcks().length).toBeGreaterThanOrEqual(1);
+      // Human echo preserved.
+      expect(userMessageEmit('cmd-failclosed-transport')?.[2]).toMatchObject({
+        text: 'run ;;(nope) please',
+      });
+    });
+  });
+  it('drops a superseded Pair wake after waiting for process typing, but releases the lock for ordinary work', async () => {
+    let release!: () => void;
+    sendKeysDelayedEnterMock.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    const first = sendProcessSessionMessageForAutomation('deck_process_brain', 'first', { verbatim: true, suppressTimeline: true });
+    await vi.waitFor(() => expect(sendKeysDelayedEnterMock).toHaveBeenCalledTimes(1));
+    let allowed = true;
+    const stale = sendProcessSessionMessageForAutomation('deck_process_brain', 'obsolete wake', { verbatim: true, suppressTimeline: true, beforeTyping: () => allowed });
+    await flushAsync(); allowed = false; release();
+    await Promise.all([first, stale]);
+    await sendProcessSessionMessageForAutomation('deck_process_brain', 'ordinary work', { verbatim: true, suppressTimeline: true });
+    expect(sendKeysDelayedEnterMock.mock.calls.map((call) => call[1])).toEqual(['first', 'ordinary work']);
+  });
+
+  it('preserves legacy no-mode shared_context.runtime_config.apply selections as manual while honoring explicit auto mode', async () => {
+    const { getContextModelConfig } = await import('../../src/context/context-model-config.js');
+    const { resolveEffectiveSharedContextRuntimeConfig } = await import('../../shared/shared-context-runtime-config.js');
+    const { SHARED_CONTEXT_RUNTIME_CONFIG_MSG } = await import('../../shared/shared-context-runtime-config.js');
+
+    handleWebCommand({
+      type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
+      config: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'MiniMax-M2.7',
+        primaryContextPreset: 'MiniMax',
+        enablePersonalMemorySync: true,
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    const legacyApplied = getContextModelConfig();
+    expect(legacyApplied.modelSelectionMode).toBe('manual');
+    expect(resolveEffectiveSharedContextRuntimeConfig(legacyApplied, { sessionAgentType: 'codex-sdk' })).toMatchObject({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M2.7',
+      primaryContextPreset: 'MiniMax',
+    });
+
+    handleWebCommand({
+      type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
+      config: {
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+        enablePersonalMemorySync: true,
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    const autoApplied = getContextModelConfig();
+    expect(autoApplied.modelSelectionMode).toBe('auto');
+    expect(resolveEffectiveSharedContextRuntimeConfig(autoApplied, { sessionAgentType: 'claude-code-sdk' })).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+      primaryContextPreset: undefined,
+    });
+  });
+
 });

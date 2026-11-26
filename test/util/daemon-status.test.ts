@@ -14,6 +14,7 @@ import {
   readServiceRestartCount,
   recordDaemonStart,
   recordDaemonServerLinkStatus,
+  recordDaemonEventLoopStall,
   setDaemonRuntimeDiagnosticsProvider,
 } from '../../src/util/daemon-status.js';
 
@@ -185,6 +186,24 @@ describe('daemon status helpers', () => {
         serverId: 'srv_1',
         lastDisconnectedAt: 13_000,
         lastError: 'closed:1006',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists a phase-tagged event-loop stall for status diagnostics', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      recordDaemonStart({ pid: 401, nowMs: 10_000, baseDir: dir, version: '1.0.0' });
+      recordDaemonEventLoopStall({ pid: 401, nowMs: 11_000, baseDir: dir, stallMs: 321.456, phase: 'supervision-console.build-snapshot' });
+      recordDaemonEventLoopStall({ pid: 401, nowMs: 12_000, baseDir: dir, stallMs: 100, phase: 'other' });
+      expect(readDaemonRuntimeStatus(dir)?.eventLoop).toEqual({
+        lastStallAt: 12_000,
+        lastStallMs: 100,
+        maxStallMs: 321.456,
+        stallCount: 2,
+        phase: 'other',
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });

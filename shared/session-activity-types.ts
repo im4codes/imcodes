@@ -1,7 +1,16 @@
+import { TIMELINE_EVENT_FILE_CHANGE } from './file-change.js';
+import { EXECUTION_CLONE_TIMELINE } from './execution-clone.js';
+import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from './session-control-commands.js';
+
 export type SessionActivityBusyReason =
   | 'runtime_dispatch'
   | 'active_dispatch_entry'
   | 'recoverable_retry'
+  | 'capacity_retry'
   | 'provider_session_binding'
   | 'provider_tool_item'
   | 'provider_compaction'
@@ -22,12 +31,46 @@ export type ToolTerminalStatus = 'succeeded' | 'abandoned' | 'cancelled' | 'erro
 export type ToolTerminalReason =
   | 'provider_result'
   | 'provider_error'
+  | 'provider_cancelled'
+  | 'provider_interrupted'
   | 'user_cancelled'
   | 'generation_rollover'
   | 'daemon_restart_orphan'
   | 'provider_stale'
+  | 'thread_idle_settle'
+  | 'app_server_completed'
+  | 'app_server_failed'
+  | 'app_server_disconnect'
+  | 'auth_refresh_recovery_failed'
+  | 'app_server_restart_recovery_failed'
+  | 'rollout_task_complete'
+  | 'unexpected_eof'
+  | 'no_current_work_disconnect'
   | 'unknown_tool'
   | 'duplicate_terminal';
+
+export type CodexLifecycleEvidenceSource =
+  | 'app_server_jsonrpc'
+  | 'exec_jsonl_compat'
+  | 'rollout_jsonl_diagnostic'
+  | 'provider_snapshot'
+  | 'projection_only'
+  | 'daemon_synthetic';
+
+export type CodexLifecycleItemKind =
+  | 'turn_start'
+  | 'command_execution'
+  | 'web_search'
+  | 'mcp_tool_call'
+  | 'provider_tool_like'
+  | 'sdk_subagent'
+  | 'codex_collaboration'
+  | 'context_compaction'
+  | 'agent_message'
+  | 'reasoning'
+  | 'usage_or_status'
+  | 'diagnostic'
+  | 'unknown';
 
 export interface ActivityGeneration {
   scope: 'session';
@@ -46,6 +89,27 @@ export interface ActivityDiagnosticInput {
 export interface ProviderActiveWorkSnapshot {
   status?: ProviderSnapshotStatus;
   activeWorkCount: number;
+  /**
+   * How much of `activeWorkCount` is BACKGROUND work rather than turn work —
+   * work that outlives the settled turn and must not block new input. Today only
+   * the Claude SDK reports it (a Task subagent still running after the main turn
+   * returned): counting that as turn work made the runtime queue every message
+   * behind the subagent, which is why `/stop` used to be the only way through.
+   *
+   * Turn work is `activeWorkCount - backgroundWorkCount`, and only turn work
+   * gates dispatch. Omit the field (or 0) to keep the pre-existing behaviour —
+   * every other provider does, so their idle detection is unchanged.
+   */
+  backgroundWorkCount?: number;
+  /**
+   * Optional status hint when `backgroundWorkCount > 0` and turn work is 0:
+   * - omitted / `'idle'`: background work does not hold runtime/session state `'running'`
+   *   (preserves Claude Code SDK backgrounded Task subagent idle semantics).
+   * - `'running'`: background work remains non-blocking for dispatch (`blockingWorkCount === 0`)
+   *   while keeping runtime/session state active (`'tool_running'` / `'running'`) until finished
+   *   (used by AG SDK native background commands / timers / reactive turns).
+   */
+  backgroundSessionStatus?: 'idle' | 'running';
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Runtime-minted generation. Required for a clear snapshot to prove clean idle. */
@@ -64,6 +128,11 @@ export interface AuthoritativeIdlePayload {
   blockingWorkCount: 0;
   activeWorkCount: 0;
   activeToolCount: 0;
+  /**
+   * Diagnostic-only legacy queue count. Transport queue authority lives in the
+   * structured queue snapshot/reducer protocol; this value must not drive live
+   * queue cards, session-live-status, or watch/server queue state.
+   */
   pendingCount: number;
   pendingVersion: number;
   decisionReason: string;
@@ -86,6 +155,21 @@ export interface ActivityDrainMetadata {
   entries: ActivityDrainEntryMetadata[];
 }
 
+export interface CodexLifecycleTerminalMetadata {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  synthetic: boolean;
+  source: CodexLifecycleEvidenceSource;
+  decisionReason: string;
+  idempotencyKey: string;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+  itemKind?: CodexLifecycleItemKind;
+}
+
 export interface TimelineActivityEvent {
   type: string;
   payload?: Record<string, unknown>;
@@ -101,19 +185,344 @@ export interface TimelineActivityState {
   lastTerminalReason?: string;
 }
 
+/**
+ * Session/timeline states that mean a turn still owns the foreground session.
+ * `permission` is intentionally included: the provider may be waiting on the
+ * user rather than consuming CPU, but the turn is not idle and must not be
+ * projected as available for another dispatch.
+ */
+export const WORKING_SESSION_STATES: ReadonlySet<string> = new Set([
+  'running',
+  'queued',
+  'streaming',
+  'thinking',
+  'tool_running',
+  'permission',
+]);
+
+export function isWorkingSessionState(value: unknown): boolean {
+  return typeof value === 'string' && WORKING_SESSION_STATES.has(value);
+}
+
+/** Extract non-empty error/detail text carried on a `session.state` payload. */
+export function getSessionStatePayloadDetail(payload: unknown): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
+  const record = payload as Record<string, unknown>;
+  for (const key of ['error', 'message', 'errorReason'] as const) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+/**
+ * True when a `session.state` payload is user-visible in the chat timeline
+ * (e.g. `stopping` with `reason: 'user_cancel'`, `stopped`, `compacting`,
+ * `started`, `starting`, `error`, or any state carrying error/detail text).
+ * Transient `running`/`queued`/`idle` frames without detail return false.
+ */
+export function isVisibleSessionStatePayload(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  const record = payload as Record<string, unknown>;
+  if (getSessionStatePayloadDetail(record).length > 0) return true;
+  if (record.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL) return true;
+  const state = typeof record.state === 'string' ? record.state.trim() : '';
+  if (!state) return false;
+  return !isWorkingSessionState(state) && state !== 'idle';
+}
+
+/** True when a timeline event is a visible `session.state` that must not be coalesced/dropped. */
+export function isNonCoalescibleSessionStateEvent(
+  event: { type?: unknown; payload?: unknown } | null | undefined,
+): boolean {
+  return event?.type === 'session.state' && isVisibleSessionStatePayload(event.payload);
+}
+
+/**
+ * `decisionReason` stamped on a `session.state` that is a RE-BROADCAST of state
+ * the daemon already knew, emitted after the server link is restored so the
+ * server and browsers can resync. It carries no new information.
+ *
+ * Daemon-local listeners MUST ignore it. Treating it as a genuine idle
+ * transition made every reconnect replay a full "turn finished" edge for every
+ * transport session, which re-ran `drainQueue()` across all of them: queued
+ * messages that had been sitting for days were delivered at once, every agent
+ * answered, and each answer fired an idle hook — hundreds of push notifications
+ * quoting days-old messages. The resync must inform remote consumers WITHOUT
+ * re-triggering local side effects.
+ */
+export const SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC = 'server_link_resync' as const;
+
+/** True when a `session.state` payload is a link-restore re-broadcast. */
+export function isServerLinkResyncStatePayload(payload: unknown): boolean {
+  return Boolean(payload)
+    && typeof payload === 'object'
+    && !Array.isArray(payload)
+    && (payload as { decisionReason?: unknown }).decisionReason
+      === SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC;
+}
+
+/**
+ * Timeline events that are pure metadata/telemetry: they say nothing about
+ * whether a turn is still running, so any tail scan looking for activity
+ * evidence must WALK THROUGH them rather than stop.
+ *
+ * This is not cosmetic. `memory.context` is emitted immediately after the
+ * `user.message` of every context-injecting send, i.e. it is the tail event for
+ * the whole "model is thinking before its first tool call" window. While it
+ * terminated the scan, `hasActiveTimelineTurn()` returned false for that entire
+ * window, and `resolveTimelineBackedSessionState()` then overrode the daemon's
+ * `session.state: running` with the (possibly lagging) store snapshot — the
+ * session rendered IDLE while the agent was demonstrably working. Observed live
+ * on deck_sub_704c1g42: `running` at 08:53:32 followed by 34 s of thinking with
+ * a `memory.context` tail, footer asleep the whole time.
+ *
+ * Shared so the tail-activity scan and the thinking scan cannot drift apart.
+ */
+export const TIMELINE_METADATA_EVENT_TYPES: readonly string[] = [
+  'memory.context',
+  'memory.compression',
+  TIMELINE_EVENT_FILE_CHANGE,
+  'peer_audit.status',
+  'peer_audit.result',
+  'transport.queue.snapshot',
+  'transport.queue.delivery',
+  'transport.queue.receipt',
+  'transport.queue.failure',
+  'transport.queue.reset',
+  EXECUTION_CLONE_TIMELINE.TERMINAL,
+];
+
 export function normalizeActivityGeneration(value: ActivityGenerationLike): string | null {
   if (value == null) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? `session:${value}` : null;
   if (typeof value === 'string') return value.trim() || null;
+  if (typeof value.scope !== 'string' || typeof value.sessionName !== 'string') return null;
   const sessionName = value.sessionName.trim();
   if (!sessionName || !Number.isFinite(value.generation)) return null;
   return `${value.scope}:${sessionName}:${value.generation}`;
+}
+
+const TOOL_TERMINAL_STATUSES = new Set<ToolTerminalStatus>([
+  'succeeded',
+  'abandoned',
+  'cancelled',
+  'errored',
+  'stale',
+]);
+
+const TOOL_TERMINAL_REASONS = new Set<ToolTerminalReason>([
+  'provider_result',
+  'provider_error',
+  'provider_cancelled',
+  'provider_interrupted',
+  'user_cancelled',
+  'generation_rollover',
+  'daemon_restart_orphan',
+  'provider_stale',
+  'thread_idle_settle',
+  'app_server_completed',
+  'app_server_failed',
+  'app_server_disconnect',
+  'auth_refresh_recovery_failed',
+  'app_server_restart_recovery_failed',
+  'rollout_task_complete',
+  'unexpected_eof',
+  'no_current_work_disconnect',
+  'unknown_tool',
+  'duplicate_terminal',
+]);
+
+const CODEX_LIFECYCLE_SOURCES = new Set<CodexLifecycleEvidenceSource>([
+  'app_server_jsonrpc',
+  'exec_jsonl_compat',
+  'rollout_jsonl_diagnostic',
+  'provider_snapshot',
+  'projection_only',
+  'daemon_synthetic',
+]);
+
+const CODEX_LIFECYCLE_ITEM_KINDS = new Set<CodexLifecycleItemKind>([
+  'turn_start',
+  'command_execution',
+  'web_search',
+  'mcp_tool_call',
+  'provider_tool_like',
+  'sdk_subagent',
+  'codex_collaboration',
+  'context_compaction',
+  'agent_message',
+  'reasoning',
+  'usage_or_status',
+  'diagnostic',
+  'unknown',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function cleanMetadataString(value: unknown, maxLength = 256): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+export function buildCodexLifecycleIdempotencyKey(input: {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+}): string {
+  const generation = normalizeActivityGeneration(input.activityGeneration) ?? 'generation:unknown';
+  const workId = input.itemId?.trim()
+    ? `item:${input.itemId.trim()}`
+    : input.toolCallId?.trim()
+      ? `tool:${input.toolCallId.trim()}`
+      : input.turnId?.trim()
+        ? `turn:${input.turnId.trim()}`
+        : 'work:unknown';
+  return [
+    'codex-terminal',
+    input.sessionId.trim() || 'session:unknown',
+    generation,
+    workId,
+    input.terminalStatus,
+    input.terminalReason,
+  ].join(':');
+}
+
+export function isCodexLifecycleTerminalMetadata(value: unknown): value is CodexLifecycleTerminalMetadata {
+  if (!isRecord(value)) return false;
+  if (typeof value.sessionId !== 'string' || !value.sessionId.trim()) return false;
+  if (!TOOL_TERMINAL_STATUSES.has(value.terminalStatus as ToolTerminalStatus)) return false;
+  if (!TOOL_TERMINAL_REASONS.has(value.terminalReason as ToolTerminalReason)) return false;
+  if (typeof value.synthetic !== 'boolean') return false;
+  if (!CODEX_LIFECYCLE_SOURCES.has(value.source as CodexLifecycleEvidenceSource)) return false;
+  if (typeof value.decisionReason !== 'string' || !value.decisionReason.trim()) return false;
+  if (typeof value.idempotencyKey !== 'string' || !value.idempotencyKey.trim()) return false;
+  if (value.activityGeneration !== undefined && normalizeActivityGeneration(value.activityGeneration as ActivityGenerationLike) === null) return false;
+  if (value.itemId !== undefined && (typeof value.itemId !== 'string' || !value.itemId.trim())) return false;
+  if (value.toolCallId !== undefined && (typeof value.toolCallId !== 'string' || !value.toolCallId.trim())) return false;
+  if (value.turnId !== undefined && (typeof value.turnId !== 'string' || !value.turnId.trim())) return false;
+  if (value.itemKind !== undefined && !CODEX_LIFECYCLE_ITEM_KINDS.has(value.itemKind as CodexLifecycleItemKind)) return false;
+  return true;
+}
+
+export function buildCodexLifecycleTerminalMetadata(input: Omit<CodexLifecycleTerminalMetadata, 'idempotencyKey'> & { idempotencyKey?: string }): CodexLifecycleTerminalMetadata {
+  const idempotencyKey = input.idempotencyKey ?? buildCodexLifecycleIdempotencyKey(input);
+  return {
+    sessionId: input.sessionId,
+    terminalStatus: input.terminalStatus,
+    terminalReason: input.terminalReason,
+    synthetic: input.synthetic,
+    source: input.source,
+    decisionReason: input.decisionReason,
+    idempotencyKey,
+    ...(input.activityGeneration !== undefined ? { activityGeneration: input.activityGeneration } : {}),
+    ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
+    ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
+    ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
+    ...(input.itemKind !== undefined ? { itemKind: input.itemKind } : {}),
+  };
+}
+
+export function toPrivacySafeLifecycleMetadata(input: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  const stringKeys = [
+    'sessionId',
+    'itemId',
+    'toolCallId',
+    'turnId',
+    'terminalStatus',
+    'terminalReason',
+    'source',
+    'decisionReason',
+    'idempotencyKey',
+    'itemKind',
+  ];
+  for (const key of stringKeys) {
+    const value = cleanMetadataString(input[key]);
+    if (value !== undefined) output[key] = value;
+  }
+  if (typeof input.synthetic === 'boolean') output.synthetic = input.synthetic;
+  if (typeof input.activeWorkCount === 'number' && Number.isFinite(input.activeWorkCount)) output.activeWorkCount = input.activeWorkCount;
+  if (typeof input.activeToolCount === 'number' && Number.isFinite(input.activeToolCount)) output.activeToolCount = input.activeToolCount;
+  if (typeof input.blockingWorkCount === 'number' && Number.isFinite(input.blockingWorkCount)) output.blockingWorkCount = input.blockingWorkCount;
+  if (input.activityGeneration !== undefined && normalizeActivityGeneration(input.activityGeneration as ActivityGenerationLike) !== null) {
+    output.activityGeneration = input.activityGeneration;
+  }
+  return output;
 }
 
 export function sameActivityGeneration(a: ActivityGenerationLike, b: ActivityGenerationLike): boolean {
   const left = normalizeActivityGeneration(a);
   const right = normalizeActivityGeneration(b);
   return left !== null && right !== null && left === right;
+}
+
+type OrderedActivityGeneration = { scope: string; sessionName?: string; generation: number };
+
+function parseOrderedActivityGeneration(value: ActivityGenerationLike): OrderedActivityGeneration | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? { scope: 'session', generation: value } : null;
+  if (value && typeof value === 'object') {
+    return Number.isFinite(value.generation)
+      && typeof value.scope === 'string'
+      && typeof value.sessionName === 'string'
+      && value.sessionName.trim()
+      ? { scope: value.scope, sessionName: value.sessionName.trim(), generation: value.generation }
+      : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  const full = /^(.*?):(.+):(-?\d+(?:\.\d+)?)$/.exec(normalized);
+  if (full) return { scope: full[1], sessionName: full[2], generation: Number(full[3]) };
+  const short = /^(.*?):(-?\d+(?:\.\d+)?)$/.exec(normalized);
+  return short ? { scope: short[1], generation: Number(short[2]) } : null;
+}
+
+/** Whether a frame carries a generation with an ordered numeric form. */
+export function isOrderedActivityGeneration(value: ActivityGenerationLike): boolean {
+  return parseOrderedActivityGeneration(value) !== null;
+}
+
+/**
+ * Returns whether an incoming ordered generation may replace the current
+ * ordered fence. Unknown/opaque values and cross-session generations cannot
+ * replace an existing fence.
+ */
+export function canReplaceActivityGeneration(
+  incoming: ActivityGenerationLike,
+  current: ActivityGenerationLike,
+): boolean {
+  const left = parseOrderedActivityGeneration(incoming);
+  if (!left) return false;
+  const right = parseOrderedActivityGeneration(current);
+  if (!right) return true;
+  if (left.scope !== right.scope) return false;
+  if (left.sessionName && right.sessionName && left.sessionName !== right.sessionName) return false;
+  return left.generation >= right.generation;
+}
+
+/**
+ * Returns true only when both values carry an ordered generation for the same
+ * session scope and the incoming frame is older.  Opaque/legacy strings remain
+ * incomparable and therefore keep the historical safe behavior (accept the
+ * frame rather than guessing that it is stale).
+ */
+export function isOlderActivityGeneration(
+  incoming: ActivityGenerationLike,
+  current: ActivityGenerationLike,
+): boolean {
+  const left = parseOrderedActivityGeneration(incoming);
+  const right = parseOrderedActivityGeneration(current);
+  if (!left || !right || left.scope !== right.scope) return false;
+  if (left.sessionName && right.sessionName && left.sessionName !== right.sessionName) return false;
+  return left.generation < right.generation;
 }
 
 export type ProviderSnapshotEvaluation =
@@ -152,6 +561,17 @@ export function evaluateProviderSnapshot(
   return { state: 'clear', blocking: false, clear: true, reason: 'clear' };
 }
 
+export function isProviderSnapshotNonBlockingForStoppedGeneration(
+  snapshot: ProviderActiveWorkSnapshot | null | undefined,
+  stoppedGeneration: ActivityGenerationLike,
+): boolean {
+  if (!snapshot) return false;
+  if ((snapshot.status ?? 'current') !== 'current') return false;
+  if (snapshot.activeWorkCount <= 0 && snapshot.activeToolCount <= 0) return false;
+  const snapshotGeneration = snapshot.activityGeneration ?? snapshot.generation;
+  return sameActivityGeneration(snapshotGeneration, stoppedGeneration);
+}
+
 export function isProviderSnapshotBlocking(
   snapshot: ProviderActiveWorkSnapshot | null | undefined,
   currentGeneration?: ActivityGenerationLike,
@@ -161,6 +581,189 @@ export function isProviderSnapshotBlocking(
 
 export function hasProviderActiveWork(snapshot: ProviderActiveWorkSnapshot | null | undefined): boolean {
   return isProviderSnapshotBlocking(snapshot);
+}
+
+export const SDK_TURN_LOST_RECOVERY_REASON = 'sdk_turn_lost' as const;
+
+export type SdkTurnLostClassifier =
+  | 'idle_missing_turn'
+  | 'not_loaded_with_active_lease'
+  | 'start_grace_expired_no_current_turn';
+
+export type SdkTurnLostReplayDecision =
+  | 'pending'
+  | 'safe_replay'
+  | 'unsafe_side_effect'
+  | 'unsafe_ambiguous'
+  | 'unsafe_terminal'
+  | 'budget_exhausted'
+  | 'failed'
+  | 'not_applicable';
+
+export type SdkTurnLostRecoveryPhase = 'detected' | 'recovering' | 'recovered' | 'failed';
+
+export interface SdkTurnLostRecoveryMetadata {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  localSessionKey: string;
+  sessionName?: string;
+  providerId?: string;
+  providerSessionId?: string;
+  codexThreadId?: string;
+  codexTurnId?: string;
+  activityGeneration: ActivityGenerationLike;
+  leaseStartedAt?: number;
+  lastStrongActivityAt?: number;
+  lastProviderEventAt?: number;
+  heartbeatStartedAt?: number;
+  heartbeatCompletedAt?: number;
+  heartbeatDurationMs?: number;
+  heartbeatFailureCount?: number;
+  silenceDurationMs?: number;
+  classifier: SdkTurnLostClassifier;
+  attempt?: number;
+  recoveryAttemptId?: string;
+  correlationId?: string;
+  replayDecision: SdkTurnLostReplayDecision;
+  phase?: SdkTurnLostRecoveryPhase;
+}
+
+export interface SdkTurnLostRecoveryEnvelope {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  metadata: SdkTurnLostRecoveryMetadata;
+}
+
+const SDK_TURN_LOST_CLASSIFIERS = new Set<SdkTurnLostClassifier>([
+  'idle_missing_turn',
+  'not_loaded_with_active_lease',
+  'start_grace_expired_no_current_turn',
+]);
+
+const SDK_TURN_LOST_REPLAY_DECISIONS = new Set<SdkTurnLostReplayDecision>([
+  'pending',
+  'safe_replay',
+  'unsafe_side_effect',
+  'unsafe_ambiguous',
+  'unsafe_terminal',
+  'budget_exhausted',
+  'failed',
+  'not_applicable',
+]);
+
+const SDK_TURN_LOST_RECOVERY_PHASES = new Set<SdkTurnLostRecoveryPhase>([
+  'detected',
+  'recovering',
+  'recovered',
+  'failed',
+]);
+
+export interface SdkTurnLostRecoverySanitizeOptions {
+  expectedLocalSessionKey?: string;
+  expectedSessionName?: string;
+  expectedProviderSessionId?: string;
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+}
+
+function readString(value: unknown, maxLength = 512): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function readFiniteNumber(value: unknown, maxValue = Number.MAX_SAFE_INTEGER): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(Math.trunc(value), maxValue);
+}
+
+function isActivityGenerationLikeValue(value: unknown): value is ActivityGenerationLike {
+  return normalizeActivityGeneration(value as ActivityGenerationLike) !== null;
+}
+
+function sanitizeActivityGenerationValue(value: unknown): ActivityGenerationLike | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed.slice(0, 256) : null;
+  }
+  const object = readObject(value);
+  if (!object) return null;
+  if (object.scope !== 'session') return null;
+  const sessionName = readString(object.sessionName, 256);
+  const generation = readFiniteNumber(object.generation);
+  if (!sessionName || generation === undefined) return null;
+  return {
+    scope: 'session',
+    sessionName,
+    generation,
+  };
+}
+
+function expectedMatches(actual: string | undefined, expected: string | undefined): boolean {
+  return !actual || !expected || actual === expected;
+}
+
+export function isSdkTurnLostRecoveryPhase(value: unknown): value is SdkTurnLostRecoveryPhase {
+  return SDK_TURN_LOST_RECOVERY_PHASES.has(value as SdkTurnLostRecoveryPhase);
+}
+
+export function readSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  const source = readObject(value);
+  if (!source) return null;
+  const details = readObject(source.details);
+  const candidate = readObject(details?.metadata) ?? details ?? source;
+  if (candidate.reason !== SDK_TURN_LOST_RECOVERY_REASON) return null;
+  const localSessionKey = readString(candidate.localSessionKey);
+  if (!localSessionKey) return null;
+  const activityGeneration = sanitizeActivityGenerationValue(candidate.activityGeneration);
+  if (activityGeneration === null || !isActivityGenerationLikeValue(activityGeneration)) return null;
+  if (!SDK_TURN_LOST_CLASSIFIERS.has(candidate.classifier as SdkTurnLostClassifier)) return null;
+  if (!SDK_TURN_LOST_REPLAY_DECISIONS.has(candidate.replayDecision as SdkTurnLostReplayDecision)) return null;
+  const sessionName = readString(candidate.sessionName);
+  const providerSessionId = readString(candidate.providerSessionId);
+  if (!expectedMatches(localSessionKey, options.expectedLocalSessionKey)) return null;
+  if (!expectedMatches(sessionName, options.expectedSessionName)) return null;
+  if (!expectedMatches(providerSessionId, options.expectedProviderSessionId)) return null;
+
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey,
+    ...(sessionName ? { sessionName } : {}),
+    ...(readString(candidate.providerId) ? { providerId: readString(candidate.providerId) } : {}),
+    ...(providerSessionId ? { providerSessionId } : {}),
+    ...(readString(candidate.codexThreadId) ? { codexThreadId: readString(candidate.codexThreadId) } : {}),
+    ...(readString(candidate.codexTurnId) ? { codexTurnId: readString(candidate.codexTurnId) } : {}),
+    activityGeneration,
+    ...(readFiniteNumber(candidate.leaseStartedAt) !== undefined ? { leaseStartedAt: readFiniteNumber(candidate.leaseStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.lastStrongActivityAt) !== undefined ? { lastStrongActivityAt: readFiniteNumber(candidate.lastStrongActivityAt) } : {}),
+    ...(readFiniteNumber(candidate.lastProviderEventAt) !== undefined ? { lastProviderEventAt: readFiniteNumber(candidate.lastProviderEventAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatStartedAt) !== undefined ? { heartbeatStartedAt: readFiniteNumber(candidate.heartbeatStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatCompletedAt) !== undefined ? { heartbeatCompletedAt: readFiniteNumber(candidate.heartbeatCompletedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatDurationMs) !== undefined ? { heartbeatDurationMs: readFiniteNumber(candidate.heartbeatDurationMs) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatFailureCount) !== undefined ? { heartbeatFailureCount: readFiniteNumber(candidate.heartbeatFailureCount) } : {}),
+    ...(readFiniteNumber(candidate.silenceDurationMs) !== undefined ? { silenceDurationMs: readFiniteNumber(candidate.silenceDurationMs) } : {}),
+    classifier: candidate.classifier as SdkTurnLostClassifier,
+    ...(readFiniteNumber(candidate.attempt) !== undefined ? { attempt: readFiniteNumber(candidate.attempt) } : {}),
+    ...(readString(candidate.recoveryAttemptId) ? { recoveryAttemptId: readString(candidate.recoveryAttemptId) } : {}),
+    ...(readString(candidate.correlationId) ? { correlationId: readString(candidate.correlationId) } : {}),
+    replayDecision: candidate.replayDecision as SdkTurnLostReplayDecision,
+    ...(isSdkTurnLostRecoveryPhase(candidate.phase) ? { phase: candidate.phase } : {}),
+  };
+}
+
+export function sanitizeSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  return readSdkTurnLostRecoveryMetadata(value, options);
+}
+
+export function isSdkTurnLostRecovery(value: unknown): value is SdkTurnLostRecoveryEnvelope {
+  return readSdkTurnLostRecoveryMetadata(value) !== null;
 }
 
 export function isAuthoritativeIdlePayloadShape(payload: Record<string, unknown> | null | undefined): boolean {
@@ -192,19 +795,28 @@ export function isWeakIdlePayload(payload: Record<string, unknown> | null | unde
   return payload?.state === 'idle' && !isAuthoritativeCleanIdlePayload(payload);
 }
 
+/** Whether a `session.state` payload acknowledges an explicit user Stop (`stopping` / `user_cancel`). */
+export function isUserCancelStoppingPayload(payload: Record<string, unknown> | null | undefined): boolean {
+  return payload?.state === SESSION_CONTROL_TIMELINE_STATE_STOPPING
+    && payload?.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
+}
+
+/** Whether a `session.state: 'idle'` payload explicitly comes from user Stop cancellation. */
+export function isCancelIdlePayload(payload: Record<string, unknown> | null | undefined): boolean {
+  if (payload?.state !== 'idle') return false;
+  if (payload.decisionReason === SESSION_CANCEL_IDLE_DECISION_REASON) return true;
+  if (payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL) return true;
+  const snapshot = payload.queueSnapshot;
+  return isRecord(snapshot) && snapshot.source === SESSION_CANCEL_IDLE_DECISION_REASON;
+}
+
 function readTerminalStatus(payload: Record<string, unknown> | undefined): ToolTerminalStatus | undefined {
   const status = typeof payload?.terminalStatus === 'string'
     ? payload.terminalStatus
     : typeof payload?.status === 'string'
       ? payload.status
       : undefined;
-  return status === 'succeeded'
-    || status === 'abandoned'
-    || status === 'cancelled'
-    || status === 'errored'
-    || status === 'stale'
-    ? status
-    : undefined;
+  return TOOL_TERMINAL_STATUSES.has(status as ToolTerminalStatus) ? status as ToolTerminalStatus : undefined;
 }
 
 function readToolKey(payload: Record<string, unknown> | undefined): string | null {
@@ -216,18 +828,29 @@ function readToolKey(payload: Record<string, unknown> | undefined): string | nul
   return null;
 }
 
+function isSdkSubagentTimelinePayload(payload: Record<string, unknown> | undefined): boolean {
+  const detail = payload?.detail;
+  return isRecord(detail) && detail.kind === 'sdkSubagent';
+}
+
 export function reduceTimelineActivity(events: TimelineActivityEvent[]): TimelineActivityState {
   const openToolIds = new Set<string>();
   let anonymousOpenToolCount = 0;
   let degraded = false;
   let active = false;
+  let pendingUserCancelStop = false;
   let currentGeneration: string | undefined;
   const degradedReasons = new Set<string>();
   let lastTerminalStatus: ToolTerminalStatus | undefined;
   let lastTerminalReason: string | undefined;
 
   for (const event of events) {
+    if (event.type === 'user.message') {
+      pendingUserCancelStop = false;
+      continue;
+    }
     if (event.type === 'tool.call') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) openToolIds.add(key);
       else anonymousOpenToolCount += 1;
@@ -235,6 +858,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
       continue;
     }
     if (event.type === 'tool.result') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) {
         if (openToolIds.has(key)) openToolIds.delete(key);
@@ -256,10 +880,12 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
       if (state !== 'idle' && eventGeneration) currentGeneration = eventGeneration;
       if (state === 'idle') {
         const expectedGeneration = currentGeneration ?? eventGeneration ?? undefined;
-        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)) {
+        const userCancelIdle = pendingUserCancelStop || isCancelIdlePayload(event.payload);
+        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration) || userCancelIdle) {
           openToolIds.clear();
           anonymousOpenToolCount = 0;
           active = false;
+          pendingUserCancelStop = false;
           if (eventGeneration) currentGeneration = eventGeneration;
         } else if (openToolIds.size > 0) {
           // Anonymous tool calls are common in legacy/process-backed histories and
@@ -277,7 +903,10 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
         }
         continue;
       }
-      if (state === 'running' || state === 'queued' || state === 'streaming' || state === 'thinking' || state === 'tool_running') {
+      if (isUserCancelStoppingPayload(event.payload)) {
+        pendingUserCancelStop = true;
+      } else if (isWorkingSessionState(state)) {
+        pendingUserCancelStop = false;
         active = true;
       }
     }

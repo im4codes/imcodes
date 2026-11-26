@@ -1,40 +1,192 @@
 /**
  * VoiceInput — speech recognition wrapper.
- * On native (Capacitor) it uses the platform's SFSpeechRecognizer via the
- * @capgo plugin. On desktop browsers (Chrome / Edge / Safari) it falls back to
+ * Native Android/iOS use our shared offline streaming bridge when installed;
+ * older shells retain the existing @capgo platform recognizer. On desktop browsers (Chrome / Edge / Safari) it falls back to
  * the Web Speech API (window.SpeechRecognition / webkitSpeechRecognition).
  * Firefox has no Web Speech API, so the button is hidden there.
  * Both paths share the same callback contract: onResult receives the FULL
  * cumulative transcript of the current session each time (the overlay replaces
  * the prior voice segment with it), plus an isFinal flag.
  */
-import { SpeechRecognition } from '@capgo/capacitor-speech-recognition';
+import {
+  formatActiveVoiceServiceLabel,
+  getNativeRawPcmCapture,
+  getNativeSpeechRecognition,
+  getPlatformFallbackSpeechRecognition,
+  getVoiceRecognitionEngine,
+  isIosNativePlatform,
+  isNativeTranscribePcmSupported,
+  isOpenNativeAppSettingsAvailable,
+  isStreamingSpeechAvailable,
+  openNativeAppSettings,
+  setVoiceRecognitionEngine as persistVoiceRecognitionEngine,
+  transcribeNativePcm,
+  VOICE_ENGINE_STORAGE_KEY,
+  type ActiveVoiceServiceInfo,
+  type ActiveVoiceServiceKind,
+  type NativePermissionStatus,
+  type NativeSpeechRecognition,
+  type VoiceRecognitionEngine,
+} from '../voice-recognition-backend.js';
+import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
 import type { PluginListenerHandle } from '@capacitor/core';
+import {
+  getPcAppBridge,
+  isPcAppInlineVoiceSupported,
+  type PcAppBridge,
+  type PcAppSpeechModelChoice,
+  type PcAppVoiceEvent,
+} from '../native-platform.js';
+import { getLocalPcAppRemoteDeviceId } from '../remote-voice-provider.js';
+import { isTtsVoiceCaptureActive, setTtsVoiceCaptureActive, stopSpeaking } from '../tts.js';
+export { normalizeVoiceWaveformLevel } from '../voice-waveform.js';
+import {
+  REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS,
+  cancelRemoteVoiceCapturePrime,
+  clearRemoteVoiceFallbackNotice,
+  drainRemoteVoiceCapturePrimePcm,
+  encodeInt16PcmToBase64,
+  finishRemoteVoiceCapturePrime,
+  getRemoteVoiceState,
+  hasOnlinePrimaryRemoteProvider,
+  isRemoteMicPermissionKnownGranted,
+  markRemoteMicPermissionKnownGranted,
+  primeRemoteVoiceCapture,
+  probeRemoteMicPermission,
+  resolveRemoteVoiceRoute,
+  setRemoteVoiceFallbackNotice,
+  startRemoteVoiceSession,
+  type ActiveRemoteVoiceSessionHandle,
+  type RemoteVoiceFallbackInfo,
+} from '../remote-voice-client.js';
+
+export {
+  formatActiveVoiceServiceLabel,
+  getVoiceRecognitionEngine,
+  isIosNativePlatform,
+  isStreamingSpeechAvailable,
+  openNativeAppSettings,
+  VOICE_ENGINE_STORAGE_KEY,
+  type ActiveVoiceServiceInfo,
+  type ActiveVoiceServiceKind,
+  type VoiceRecognitionEngine,
+};
+
+export function canSwitchVoiceEngine(): boolean {
+  return isCapacitorNative() && isStreamingSpeechAvailable();
+}
+
+export type VoiceLanguageMode = 'follow' | 'auto';
+export const VOICE_LANG_STORAGE_KEY = 'imcodes_voice_lang';
+
+/** Read the persisted speech recognition language mode ('follow' UI language by default, or 'auto'). */
+export function getVoiceLanguageMode(): VoiceLanguageMode {
+  try {
+    const saved = globalThis.localStorage?.getItem(VOICE_LANG_STORAGE_KEY);
+    return saved === 'auto' ? 'auto' : 'follow';
+  } catch {
+    return 'follow';
+  }
+}
+
+/** Persist the speech recognition language mode ('follow' or 'auto'). */
+export function setVoiceLanguageMode(mode: VoiceLanguageMode): void {
+  try {
+    globalThis.localStorage?.setItem(VOICE_LANG_STORAGE_KEY, mode);
+  } catch { /* localStorage may be unavailable in restricted contexts */ }
+}
+
+/** Resolve the native speech-recognition locale for the active voice mode, or undefined in auto-detect mode. */
+export function pickRecognitionLocale(preferredLang?: string): string | undefined {
+  if (getVoiceLanguageMode() === 'auto') return undefined;
+  return pickLocale(preferredLang);
+}
+
+/** Resolve the user's active UI language preference first, then system navigator language, then <html lang>. */
+function resolvePreferredLanguageTag(preferredLang?: string): string {
+  if (typeof preferredLang === 'string' && preferredLang.trim()) {
+    return preferredLang.trim();
+  }
+  try {
+    const saved = globalThis.localStorage?.getItem('imcodes_lang');
+    if (typeof saved === 'string' && saved.trim()) {
+      return saved.trim();
+    }
+  } catch { /* localStorage may be unavailable in restricted contexts */ }
+  // Prefer system/browser language before static <html lang="en"> from index.html when imcodes_lang is unset,
+  // matching i18n detectUiLanguage() so a Chinese OS with English fallback HTML doesn't force English ASR.
+  const sysLang = typeof navigator !== 'undefined' ? resolveSystemLanguageTag() : '';
+  if (sysLang) return sysLang;
+  const docLang = typeof document !== 'undefined' ? document.documentElement?.lang?.trim() : '';
+  if (docLang) return docLang;
+  return 'en-US';
+}
 
 /** Native (Capacitor) speech-recognition locale tags. */
-export function pickLocale(): string {
-  const lang = navigator.language.toLowerCase();
-  if (lang.startsWith('zh')) return 'zh-Hans';
+export function pickLocale(preferredLang?: string): string {
+  const lang = resolvePreferredLanguageTag(preferredLang).toLowerCase();
+  if (lang.startsWith('zh')) {
+    return lang.includes('tw') || lang.includes('hk') || lang.includes('hant') ? 'zh-Hant' : 'zh-Hans';
+  }
   if (lang.startsWith('ja')) return 'ja-JP';
   if (lang.startsWith('ko')) return 'ko-KR';
   if (lang.startsWith('es')) return 'es-ES';
   if (lang.startsWith('ru')) return 'ru-RU';
   return 'en-US';
+}
+
+function mapWebLocaleTag(rawTag: string, preserveOtherRegion = false): string {
+  const trimmed = rawTag.trim();
+  const lang = trimmed.toLowerCase();
+  if (lang.startsWith('zh')) {
+    return lang.includes('tw') || lang.includes('hk') || lang.includes('hant') ? 'zh-TW' : 'zh-CN';
+  }
+  if (lang.startsWith('ja')) return 'ja-JP';
+  if (lang.startsWith('ko')) return 'ko-KR';
+  if (lang.startsWith('es')) return 'es-ES';
+  if (lang.startsWith('ru')) return 'ru-RU';
+  if (preserveOtherRegion && trimmed.includes('-')) return trimmed;
+  return 'en-US';
+}
+
+function resolveSystemLanguageTag(): string {
+  if (typeof navigator !== 'undefined') {
+    const langs = Array.isArray(navigator.languages) ? navigator.languages : [];
+    for (const entry of langs) {
+      if (typeof entry === 'string' && entry.trim()) return entry.trim();
+    }
+    if (typeof navigator.language === 'string' && navigator.language.trim()) {
+      return navigator.language.trim();
+    }
+  }
+  return '';
+}
+
+/** Web Speech API auto-mode fallback locale from browser system language (ignores `<html lang>` and `imcodes_lang`). */
+export function pickWebAutoLocale(): string {
+  return mapWebLocaleTag(resolveSystemLanguageTag() || 'en-US', true);
 }
 
 /** Web Speech API locale tags (BCP-47, region-specific). */
-export function pickWebLocale(): string {
-  const lang = navigator.language.toLowerCase();
-  if (lang.startsWith('zh')) return lang.includes('tw') || lang.includes('hk') ? 'zh-TW' : 'zh-CN';
-  if (lang.startsWith('ja')) return 'ja-JP';
-  if (lang.startsWith('ko')) return 'ko-KR';
-  if (lang.startsWith('es')) return 'es-ES';
-  if (lang.startsWith('ru')) return 'ru-RU';
-  return 'en-US';
+export function pickWebLocale(preferredLang?: string): string {
+  return mapWebLocaleTag(resolvePreferredLanguageTag(preferredLang), false);
+}
+
+export function isCapacitorNative(): boolean {
+  return !!(globalThis as any).Capacitor?.isNativePlatform?.();
+}
+
+export function canOpenNativeAppSettings(): boolean {
+  return isCapacitorNative() && isOpenNativeAppSettingsAvailable();
+}
+
+export function isPcAppNativeSpeech(): boolean {
+  if (isCapacitorNative()) return false;
+  return isPcAppInlineVoiceSupported();
 }
 
 function isNative(): boolean {
-  return !!(globalThis as any).Capacitor?.isNativePlatform?.();
+  return isCapacitorNative() || isPcAppNativeSpeech();
 }
 
 function getWebSpeechCtor(): any {
@@ -47,34 +199,796 @@ function isWebSpeechAvailable(): boolean {
 }
 
 export function isAvailable(): boolean {
-  return isNative() || isWebSpeechAvailable();
+  return isNative() || isWebSpeechAvailable() || hasOnlinePrimaryRemoteProvider();
+}
+
+let _pcAppDeniedTarget: 'mic' | 'speech' | null = null;
+
+export function getPcAppPermissionDeniedTarget(): 'mic' | 'speech' | null {
+  return _pcAppDeniedTarget;
+}
+
+export function clearPcAppPermissionDeniedTarget(): void {
+  _pcAppDeniedTarget = null;
+}
+
+function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRecognition, 'start' | 'addListener'> & {
+  checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
+  start: (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => Promise<{ matches?: string[] } | void>;
+  addListener: (eventName: string, listenerFunc: (data: any) => void) => Promise<PluginListenerHandle>;
+} {
+  const voice = bridge.voice!;
+  const listeners = new Map<string, Set<(data: any) => void>>();
+  let ipcUnsub: (() => void) | null = null;
+
+  const dispatch = (eventName: string, payload: unknown) => {
+    const set = listeners.get(eventName);
+    if (!set) return;
+    for (const fn of [...set]) {
+      fn(payload);
+    }
+  };
+
+  const ensureSubscribed = () => {
+    if (ipcUnsub || typeof voice.subscribe !== 'function') return;
+    ipcUnsub = voice.subscribe((ev: PcAppVoiceEvent) => {
+      if (!ev || typeof ev.type !== 'string') return;
+      if (ev.type === 'loading') {
+        dispatch('listeningState', { status: 'loading', ...(ev.variant ? { variant: ev.variant } : {}) });
+      } else if (ev.type === 'start') {
+        dispatch('listeningState', { status: 'started' });
+      } else if (ev.type === 'result') {
+        dispatch('partialResults', { matches: [ev.text], isFinal: ev.isFinal });
+      } else if (ev.type === 'level') {
+        dispatch('audioLevel', { level: ev.value });
+      } else if (ev.type === 'error') {
+        if (ev.code === 'permission_denied') {
+          _pcAppDeniedTarget = ev.target ?? 'mic';
+          dispatch('recognitionError', { message: 'permission_denied' });
+        } else {
+          dispatch('recognitionError', { message: ev.message || ev.code || 'Speech recognition failed' });
+        }
+      } else if (ev.type === 'end') {
+        dispatch('listeningState', { status: 'stopped' });
+      }
+    });
+  };
+
+  const mapPerms = (perms?: { mic?: string; speech?: string } | null): 'granted' | 'denied' | 'prompt' => {
+    if (!perms) return 'denied';
+    if (perms.mic === 'granted' && perms.speech === 'granted') {
+      _pcAppDeniedTarget = null;
+      return 'granted';
+    }
+    if (perms.mic === 'not-determined' || perms.speech === 'not-determined') {
+      return 'prompt';
+    }
+    _pcAppDeniedTarget = perms.mic !== 'granted' ? 'mic' : 'speech';
+    return 'denied';
+  };
+
+  return {
+    available: async () => ({ available: voice.isNativeSpeechSupported?.() === true }),
+    checkPermissions: async () => {
+      const perms = await voice.getPermissions?.();
+      return { speechRecognition: mapPerms(perms) };
+    },
+    requestPermissions: async () => {
+      const perms = await voice.requestPermissions?.();
+      const mapped = mapPerms(perms);
+      return { speechRecognition: mapped === 'granted' ? 'granted' : 'denied' };
+    },
+    start: async (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => {
+      ensureSubscribed();
+      const res = await voice.startListening?.({
+        ...(options?.language ? { locale: options.language } : {}),
+        ...(options?.initialPcmBase64 ? { initialPcmBase64: options.initialPcmBase64 } : {}),
+        ...(options?.finalizeOnly ? { finalizeOnly: true } : {}),
+      });
+      if (!res || res.ok !== true) {
+        if (res?.error === 'permission_denied') {
+          _pcAppDeniedTarget = res.target ?? 'mic';
+          throw new Error('permission_denied');
+        }
+        throw new Error(res?.error || 'Speech recognition failed to start');
+      }
+      _pcAppDeniedTarget = null;
+      return { matches: [] };
+    },
+    stop: async () => {
+      await voice.stopListening?.({ abort: false });
+      ipcUnsub?.();
+      ipcUnsub = null;
+    },
+    addListener: async (eventName: string, listenerFunc: (data: any) => void) => {
+      ensureSubscribed();
+      let set = listeners.get(eventName);
+      if (!set) {
+        set = new Set();
+        listeners.set(eventName, set);
+      }
+      set.add(listenerFunc);
+      return {
+        remove: async () => {
+          set?.delete(listenerFunc);
+          let hasAny = false;
+          for (const s of listeners.values()) {
+            if (s.size > 0) {
+              hasAny = true;
+              break;
+            }
+          }
+          if (!hasAny) {
+            ipcUnsub?.();
+            ipcUnsub = null;
+          }
+        },
+      };
+    },
+  } as unknown as Omit<NativeSpeechRecognition, 'start' | 'addListener'> & {
+    checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
+    start: (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => Promise<{ matches?: string[] } | void>;
+    addListener: (eventName: string, listenerFunc: (data: any) => void) => Promise<PluginListenerHandle>;
+  };
+}
+
+interface CaptureOwner {
+  id: number;
+  retired: boolean;
+  notifiedListening?: boolean;
+  normalStopRequested?: boolean;
+  pendingFallback?: { promise: Promise<void>; abort: () => void };
+  pendingPreReadyWait?: Promise<void>;
+  resolvePreReadyWait?: () => void;
+  onResult: ((text: string, isFinal: boolean) => void) | null;
+  onListeningChange: ((listening: boolean) => void) | null;
+  onError: ((error: string) => void) | null;
+}
+
+interface NativeSession {
+  generation: number;
+  owner: CaptureOwner;
+  recognition: NativeSpeechRecognition;
+  isFallback?: boolean;
+  initialPcmBase64?: string;
+  text: string | null;
+  final: boolean;
+  aborted: boolean;
+  retired: boolean;
+  stopStarted: boolean;
+  primed: boolean;
+  deferAudioPause: boolean;
+  captureStarted: boolean;
+  startInvoked: boolean;
+  abortPendingStart?: (() => void) | null;
+  handles: PluginListenerHandle[];
+}
+
+interface PrewarmCacheEntry {
+  primary: NativeSpeechRecognition;
+  effective: NativeSpeechRecognition;
+  checkedAt: number;
+  permissionGranted: boolean;
+  available: boolean;
+  verifiedByPrewarm?: boolean;
+}
+
+const PREWARM_CACHE_TTL_MS = 15_000;
+/** Longer window used only by synchronous `pointerdown` gesture priming once mic permission was confirmed. */
+const NATIVE_PRIME_CACHE_TTL_MS = 300_000;
+/** Upper bound for quick native capability/permission checks during prewarm and start setup. */
+export const NATIVE_PREWARM_CALL_TIMEOUT_MS = 3_500;
+/** Upper bound for interactive native OS permission requests. */
+export const NATIVE_PERMISSION_TIMEOUT_MS = 15_000;
+/** Upper bound for native `recognition.start()` before falling back or failing out of `'starting'`. */
+export const NATIVE_START_TIMEOUT_MS = 15_000;
+/** Upper bound for normal native `stop()` drain (>15s so legitimate slow drains pass without timing out). */
+export const NATIVE_STOP_DRAIN_MS = 20_000;
+/** Short cleanup bound when stopping an unsettled native `start()` that never began capture (`!captureStarted`). */
+export const NATIVE_UNSTARTED_STOP_DRAIN_MS = 2_000;
+/** Upper bound waiting for Web Speech `onstart`/`onaudiostart`/`onresult` after `rec.start()`. */
+export const WEB_START_CONFIRM_TIMEOUT_MS = 5_000;
+
+class VoiceTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VoiceTimeoutError';
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      timer = null;
+      reject(new VoiceTimeoutError(message));
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve(value);
+      },
+      (err) => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        reject(err);
+      },
+    );
+  });
+}
+
+interface WebSession {
+  generation: number;
+  owner: CaptureOwner;
+  rec: any;
+  retired: boolean;
+  ended: boolean;
+  primed: boolean;
+  deferAudioPause: boolean;
+  captureStarted: boolean;
+  lastText: string;
+  emittedFinal: boolean;
+  earlyError: string | null;
+  startConfirmTimer: ReturnType<typeof setTimeout> | null;
+}
+
+interface PrimedWebOutcome {
+  generation: number;
+  error: string | null;
+  text: string | null;
+  endedWithCapture: boolean;
 }
 
 let _listening = false;
 let _generation = 0;
-let _pendingStart: Promise<boolean> | null = null;
+let _ownerSeq = 0;
+let _intentSeq = 0;
+let _lastStopIntent = 0;
+let _pendingStart: { promise: Promise<boolean>; generation: number; session: NativeSession } | null = null;
 let _pendingStop: Promise<void> | null = null;
-let _removePartial: (() => void | Promise<void>) | null = null;
-let _removeLevel: (() => void | Promise<void>) | null = null;
-let _removeListeningState: (() => void | Promise<void>) | null = null;
-let _onResult: ((text: string, isFinal: boolean) => void) | null = null;
+let _pendingStopMaxWaitMs = NATIVE_STOP_DRAIN_MS + 1_000;
+let _nativeSession: NativeSession | null = null;
+let _activeOwner: CaptureOwner | null = null;
+let _prewarmCache: PrewarmCacheEntry | null = null;
+let _lastAuthorizedPrewarm: PrewarmCacheEntry | null = null;
+let _prewarmEpoch = 0;
+let _prewarmInFlight: {
+  promise: Promise<void>;
+  requestPermission: boolean;
+  recognition: NativeSpeechRecognition;
+  epoch: number;
+} | null = null;
 let _onLevel: ((level: number) => void) | null = null;
-let _onListeningChange: ((listening: boolean) => void) | null = null;
+let _onModelLoading: ((loading: boolean, variant?: string) => void) | null = null;
+let _modelLoadingActive = false;
+let _onError: ((error: string) => void) | null = null;
+let _lastError: string | null = null;
 
-// --- Web Speech API fallback state (desktop browsers) ---
-let _webRec: any = null;
+let _activeService: ActiveVoiceServiceInfo | null = null;
+const _activeServiceListeners = new Set<(info: ActiveVoiceServiceInfo | null) => void>();
+let _pcModelQuerySeq = 0;
+let _cachedPcModelBridge: PcAppBridge['voice'] | null = null;
+let _cachedPcModelChoice: PcAppSpeechModelChoice | null = null;
+
+function isSameActiveVoiceService(a: ActiveVoiceServiceInfo | null, b: ActiveVoiceServiceInfo | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.kind === b.kind && a.label === b.label && Boolean(a.isFallback) === Boolean(b.isFallback);
+}
+
+function setActiveVoiceService(next: ActiveVoiceServiceInfo | null): void {
+  if (isSameActiveVoiceService(_activeService, next)) return;
+  _activeService = next;
+  for (const listener of [..._activeServiceListeners]) {
+    try {
+      listener(_activeService);
+    } catch { /* keep notifying remaining listeners */ }
+  }
+}
+
+export function getActiveVoiceService(): ActiveVoiceServiceInfo | null {
+  return _activeService;
+}
+
+export function subscribeActiveVoiceService(
+  listener: (info: ActiveVoiceServiceInfo | null) => void,
+): () => void {
+  _activeServiceListeners.add(listener);
+  return () => {
+    _activeServiceListeners.delete(listener);
+  };
+}
+
+function formatRemoteProviderDisplayLabel(provider: RemoteVoiceProviderInfo): string {
+  const displayName = provider.displayName?.trim() ?? '';
+  const modelLabel = provider.modelLabel?.trim() ?? '';
+  if (provider.providerKind === 'http_asr') {
+    return displayName || modelLabel;
+  }
+  if (!modelLabel || displayName.includes(modelLabel)) {
+    return displayName || modelLabel;
+  }
+  return displayName ? `${displayName} (${modelLabel})` : modelLabel;
+}
+
+function buildRemoteActiveService(provider: RemoteVoiceProviderInfo): ActiveVoiceServiceInfo {
+  return {
+    kind: provider.providerKind === 'http_asr' ? 'remote_http_asr' : 'remote_desktop',
+    label: formatRemoteProviderDisplayLabel(provider),
+  };
+}
+
+function syncPcModelCacheBridge(): void {
+  const currentVoice = getPcAppBridge()?.voice ?? null;
+  if (currentVoice !== _cachedPcModelBridge) {
+    _cachedPcModelBridge = currentVoice;
+    _cachedPcModelChoice = null;
+  }
+}
+
+function resolvePcModelDisplayLabel(choice?: PcAppSpeechModelChoice | null): string | undefined {
+  if (choice === 'qwen3-1.7b') return 'Qwen3-ASR 1.7B';
+  if (choice === 'qwen3-0.6b') return 'Qwen3-ASR 0.6B';
+  return undefined;
+}
+
+function parsePcModelVariantChoice(variant?: string): PcAppSpeechModelChoice | null {
+  const normalized = variant?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === '1.7b' || normalized === 'qwen3-1.7b') return 'qwen3-1.7b';
+  if (normalized === '0.6b' || normalized === 'qwen3-0.6b') return 'qwen3-0.6b';
+  if (normalized === 'system') return 'system';
+  return null;
+}
+
+function buildLocalActiveService(options?: {
+  recognizer?: NativeSpeechRecognition;
+  isFallback?: boolean;
+}): ActiveVoiceServiceInfo {
+  const isFallback = options?.isFallback === true;
+  if (isPcAppNativeSpeech()) {
+    syncPcModelCacheBridge();
+    const label = resolvePcModelDisplayLabel(_cachedPcModelChoice);
+    return {
+      kind: 'local_pc_model',
+      ...(label ? { label } : {}),
+      ...(isFallback ? { isFallback: true } : {}),
+    };
+  }
+  if (isCapacitorNative()) {
+    const useBuiltin = isStreamingSpeechAvailable() && getVoiceRecognitionEngine() === 'builtin';
+    const isFallbackPlatform = useBuiltin && options?.recognizer
+      ? options.recognizer === getPlatformFallbackSpeechRecognition()
+      : false;
+    return {
+      kind: useBuiltin && !isFallbackPlatform ? 'local_builtin' : 'local_system',
+      ...(isFallback ? { isFallback: true } : {}),
+    };
+  }
+  return {
+    kind: 'local_web',
+    ...(isFallback ? { isFallback: true } : {}),
+  };
+}
+
+function refreshPcAppSpeechModelForSession(
+  owner: CaptureOwner,
+  generation: number,
+  isFallback: boolean,
+): void {
+  if (!isPcAppNativeSpeech()) return;
+  syncPcModelCacheBridge();
+  const voice = getPcAppBridge()?.voice;
+  if (!voice) return;
+  const querySeq = ++_pcModelQuerySeq;
+  const readPromise = typeof voice.getSpeechModelStatus === 'function'
+    ? voice.getSpeechModelStatus().then((status) => status?.activeBackend ?? status?.selectedModel ?? null)
+    : typeof voice.getSpeechModel === 'function'
+      ? voice.getSpeechModel()
+      : null;
+  if (!readPromise) return;
+  void Promise.resolve(readPromise)
+    .then((choice) => {
+      if (choice === 'system' || choice === 'qwen3-0.6b' || choice === 'qwen3-1.7b') {
+        syncPcModelCacheBridge();
+        _cachedPcModelChoice = choice;
+      }
+      if (
+        querySeq !== _pcModelQuerySeq
+        || generation !== _generation
+        || !isOwnerCurrent(owner)
+        || _activeService === null
+        || _activeService.kind !== 'local_pc_model'
+      ) {
+        return;
+      }
+      const label = resolvePcModelDisplayLabel(_cachedPcModelChoice);
+      setActiveVoiceService({
+        kind: 'local_pc_model',
+        ...(label ? { label } : {}),
+        ...(isFallback ? { isFallback: true } : {}),
+      });
+    })
+    .catch(() => {});
+}
+
+function setModelLoadingState(loading: boolean, variant?: string): void {
+  if (!loading && !_modelLoadingActive) return;
+  _modelLoadingActive = loading;
+  _onModelLoading?.(loading, variant);
+}
+
+function clearPrewarmCaches(): void {
+  _prewarmCache = null;
+  _lastAuthorizedPrewarm = null;
+}
+
+/** Persist the native speech engine preference and invalidate cached recognizer prewarm state. */
+export function setVoiceRecognitionEngine(engine: VoiceRecognitionEngine): void {
+  persistVoiceRecognitionEngine(engine);
+  clearPrewarmCaches();
+  _prewarmEpoch++;
+}
+
+function setAuthorizedPrewarmEntry(entry: PrewarmCacheEntry): void {
+  if (entry.permissionGranted && entry.available) {
+    _lastAuthorizedPrewarm = entry;
+  } else {
+    _lastAuthorizedPrewarm = null;
+  }
+}
+
+// --- Web Speech API fallback state (desktop & mobile browsers) ---
+let _webSession: WebSession | null = null;
+let _primedOutcome: PrimedWebOutcome | null = null;
+let _webDrainCancel: (() => void) | null = null;
 let _webStream: MediaStream | null = null;
 let _webAudioCtx: AudioContext | null = null;
 let _webLevelRAF: number | null = null;
 
-function setListening(next: boolean): void {
-  _listening = next;
-  _onListeningChange?.(next);
+// --- Shared remote ASR session state ---
+interface EagerRemoteStartState {
+  intent: number;
+  aborted: boolean;
+  releasedToSend: boolean;
+  captureStarted: boolean;
+  listeningNotified: boolean;
+  failedReason: string | null;
+  failedPermission: boolean;
+  onListeningChange?: (listening: boolean) => void;
+  adoptedOwner: CaptureOwner | null;
+  handoffPromise: Promise<void>;
+  resolveHandoff: () => void;
+  donePromise: Promise<void>;
+  resolveDone: () => void;
+}
+let _pendingRemoteAbort: AbortController | null = null;
+let _pendingRemoteStart: EagerRemoteStartState | null = null;
+let _activeRemoteSession: {
+  handle: ActiveRemoteVoiceSessionHandle;
+  owner: CaptureOwner;
+  generation: number;
+} | null = null;
+let _pendingRemoteStop: Promise<void> | null = null;
+let _pendingRemoteStopMicReleased: Promise<void> | null = null;
+let _pendingRemoteStopAbort: (() => void) | null = null;
+let _pendingFinalizeAbort: (() => void) | null = null;
+let _pendingFinalizePromise: Promise<void> | null = null;
+
+function trackPendingFinalize(promise: Promise<void>): Promise<void> {
+  _pendingFinalizePromise = promise;
+  return promise.finally(() => {
+    if (_pendingFinalizePromise === promise) {
+      _pendingFinalizePromise = null;
+    }
+  });
 }
 
-function forgetRecognitionCallbacks(): void {
-  _onResult = null;
-  _onListeningChange = null;
+function canFinalizeBufferedPcm(): boolean {
+  if (isPcAppNativeSpeech()) {
+    const voice = getPcAppBridge()?.voice;
+    if (!voice || (voice.supportsPcmFinalize !== true && typeof voice.finalizePcmListening !== 'function')) {
+      return false;
+    }
+    syncPcModelCacheBridge();
+    return _cachedPcModelChoice !== 'system';
+  }
+  if (isCapacitorNative()) {
+    return isNativeTranscribePcmSupported();
+  }
+  return false;
+}
+
+function encodeInitialPcmForLocalStart(initialPcm?: Int16Array): string | undefined {
+  if (!initialPcm || initialPcm.length === 0) return undefined;
+  if (isPcAppNativeSpeech()) {
+    syncPcModelCacheBridge();
+    if (_cachedPcModelChoice === 'system') return undefined;
+    return encodeInt16PcmToBase64(initialPcm);
+  }
+  if (isCapacitorNative() && isStreamingSpeechAvailable() && getVoiceRecognitionEngine() !== 'system') {
+    return encodeInt16PcmToBase64(initialPcm);
+  }
+  return undefined;
+}
+
+async function finalizeBufferedSpeechOnOwner(
+  owner: CaptureOwner,
+  bufferedPcm: Int16Array,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted || !isOwnerCurrent(owner) || bufferedPcm.length === 0 || !canFinalizeBufferedPcm()) {
+    return;
+  }
+  const pcmBase64 = encodeInt16PcmToBase64(bufferedPcm);
+  const locale = pickRecognitionLocale();
+  if (isPcAppNativeSpeech()) {
+    const bridge = getPcAppBridge();
+    if (!bridge?.voice) return;
+    const choicePromise = typeof bridge.voice.getSpeechModelStatus === 'function'
+      ? bridge.voice.getSpeechModelStatus().then((status) => status?.activeBackend ?? status?.selectedModel ?? null)
+      : typeof bridge.voice.getSpeechModel === 'function'
+        ? bridge.voice.getSpeechModel()
+        : null;
+    if (choicePromise) {
+      const choice = await choicePromise.catch(() => null);
+      if (choice === 'system' || choice === 'qwen3-0.6b' || choice === 'qwen3-1.7b') {
+        syncPcModelCacheBridge();
+        _cachedPcModelChoice = choice;
+      }
+      if (choice === 'system' || signal.aborted || !isOwnerCurrent(owner)) {
+        return;
+      }
+    }
+    const rec = createPcAppSpeechRecognition(bridge);
+    setActiveVoiceService(buildLocalActiveService({ recognizer: rec, isFallback: true }));
+    const handles: PluginListenerHandle[] = [];
+    let settled = false;
+    let resolveDone!: () => void;
+    const donePromise = new Promise<void>((res) => {
+      resolveDone = res;
+    });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolveDone();
+    };
+    const onAbort = () => {
+      finish();
+      void bridge.voice?.stopListening?.({ abort: true }).catch(() => {});
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      handles.push(await rec.addListener('partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
+        if (signal.aborted || !isOwnerCurrent(owner)) return;
+        const text = data.matches?.[0] ?? '';
+        if (text.trim() || data.isFinal) {
+          emitOwnerResult(owner, text, Boolean(data.isFinal));
+        }
+      }));
+      handles.push(await rec.addListener('recognitionError', (err: { message?: string }) => {
+        if (!signal.aborted && isOwnerCurrent(owner) && err?.message) {
+          reportOwnerError(owner, err.message);
+        }
+        finish();
+      }));
+      handles.push(await rec.addListener('listeningState', (state: { status?: string }) => {
+        if (state?.status === 'stopped') {
+          finish();
+        }
+      }));
+      if (signal.aborted || !isOwnerCurrent(owner)) return;
+      if (typeof bridge.voice.finalizePcmListening === 'function') {
+        const res = await bridge.voice.finalizePcmListening({
+          ...(locale ? { locale } : {}),
+          pcmBase64,
+        });
+        if (!res || res.ok !== true) {
+          throw new Error(res?.error || 'Speech recognition failed to start');
+        }
+      } else {
+        await rec.start({
+          ...(locale ? { language: locale } : {}),
+          initialPcmBase64: pcmBase64,
+          finalizeOnly: true,
+        });
+      }
+      if (!signal.aborted) {
+        await withTimeout(donePromise, NATIVE_STOP_DRAIN_MS, 'PC voice finalize timed out').catch(() => {
+          void bridge.voice?.stopListening?.({ abort: true }).catch(() => {});
+        });
+      }
+    } catch (err) {
+      if (!signal.aborted && isOwnerCurrent(owner)) {
+        const msg = err instanceof Error ? err.message : String(err ?? 'Speech recognition failed');
+        if (msg) reportOwnerError(owner, msg);
+      }
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+      await Promise.allSettled(handles.map((h) => h.remove()));
+      if (!_activeRemoteSession && !_nativeSession && !_webSession && !_pendingStart) {
+        setActiveVoiceService(null);
+      }
+    }
+    return;
+  }
+
+  setActiveVoiceService(buildLocalActiveService({ recognizer: getNativeSpeechRecognition(), isFallback: true }));
+  let abortTimer: (( ) => void) | null = null;
+  const abortPromise = new Promise<{ aborted: true }>((res) => {
+    const onAbort = () => res({ aborted: true });
+    abortTimer = onAbort;
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    const raced = await Promise.race([
+      withTimeout(
+        transcribeNativePcm({
+          pcmBase64,
+          ...(locale ? { language: locale } : {}),
+        }),
+        NATIVE_STOP_DRAIN_MS,
+        'Offline transcription timed out',
+      ),
+      abortPromise,
+    ]);
+    if ('aborted' in raced || signal.aborted || !isOwnerCurrent(owner)) return;
+    if (raced.ok) {
+      if (raced.text.trim()) {
+        emitOwnerResult(owner, raced.text, true);
+      }
+    } else if (!raced.unimplemented) {
+      reportOwnerError(owner, raced.error);
+    }
+  } catch (err) {
+    if (!signal.aborted && isOwnerCurrent(owner)) {
+      reportOwnerError(owner, err instanceof Error ? err.message : 'Offline transcription failed');
+    }
+  } finally {
+    if (abortTimer) {
+      signal.removeEventListener('abort', abortTimer);
+    }
+    if (!_activeRemoteSession && !_nativeSession && !_webSession && !_pendingStart) {
+      setActiveVoiceService(null);
+    }
+  }
+}
+
+function createCaptureOwner(
+  onResult: (text: string, isFinal: boolean) => void,
+  onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
+): CaptureOwner {
+  return {
+    id: ++_ownerSeq,
+    retired: false,
+    onResult,
+    onListeningChange: onListeningChange ?? null,
+    onError: onError ?? null,
+  };
+}
+
+function isOwnerCurrent(owner: CaptureOwner | null): boolean {
+  return !!owner && !owner.retired && _activeOwner === owner;
+}
+
+function setOwnerListening(owner: CaptureOwner | null, next: boolean): void {
+  if (!isOwnerCurrent(owner)) return;
+  _listening = next;
+  syncTtsVoiceSuppression();
+  if (owner!.notifiedListening === next) return;
+  owner!.notifiedListening = next;
+  owner!.onListeningChange?.(next);
+}
+
+function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: boolean): void {
+  if (!isOwnerCurrent(owner)) return;
+  owner!.onResult?.(text, isFinal);
+}
+
+const _stoppedSessionRecognitions = new WeakMap<NativeSession, WeakSet<NativeSpeechRecognition>>();
+
+function canSessionStopRecognition(
+  session: NativeSession,
+  targetRecognition: NativeSpeechRecognition,
+): boolean {
+  if (session.generation !== _generation) return false;
+  if (session.retired || session.aborted || session.stopStarted || session.owner.retired) return false;
+  if (_nativeSession !== session) return false;
+  if (_pendingStop) return false;
+  if (_pendingStart && _pendingStart.session !== session) return false;
+  if (_stoppedSessionRecognitions.get(session)?.has(targetRecognition)) return false;
+  return true;
+}
+
+/** Stop the shared native plugin at most once per timed-out recognizer while this session still owns hardware. */
+function stopRecognitionOnceIfOwned(
+  session: NativeSession,
+  targetRecognition: NativeSpeechRecognition,
+): Promise<void> {
+  if (!canSessionStopRecognition(session, targetRecognition)) return Promise.resolve();
+  let stopped = _stoppedSessionRecognitions.get(session);
+  if (!stopped) {
+    stopped = new WeakSet<NativeSpeechRecognition>();
+    _stoppedSessionRecognitions.set(session, stopped);
+  }
+  stopped.add(targetRecognition);
+  return Promise.resolve(targetRecognition.stop()).catch(() => {});
+}
+
+function isRecognitionAvailabilityReady(
+  status: { available?: boolean; downloading?: boolean } | null | undefined,
+): boolean {
+  return Boolean(status?.available) && !status?.downloading;
+}
+
+function isRecognitionDownloading(
+  status: { available?: boolean; downloading?: boolean } | null | undefined,
+): boolean {
+  return Boolean(status?.downloading);
+}
+
+function reportOwnerError(owner: CaptureOwner | null, error: string): void {
+  if (!isOwnerCurrent(owner)) return;
+  setModelLoadingState(false);
+  clearPrewarmCaches();
+  _lastError = error;
+  (owner!.onError ?? _onError)?.(error);
+}
+
+function retireOwner(
+  owner: CaptureOwner | null,
+  clearActiveService = true,
+  preserveListeningForFallback = false,
+): void {
+  if (!owner || owner.retired) return;
+  const keepActiveForEagerRemote = Boolean(
+    preserveListeningForFallback
+    || (_pendingRemoteStart
+      && !_pendingRemoteStart.aborted
+      && _pendingRemoteStart.captureStarted
+      && !_pendingRemoteStart.releasedToSend),
+  );
+  if (_activeOwner === owner) {
+    setModelLoadingState(false);
+    if (!keepActiveForEagerRemote) {
+      _listening = false;
+      if (clearActiveService) {
+        setActiveVoiceService(null);
+      }
+    }
+    _activeOwner = null;
+  }
+  if (!keepActiveForEagerRemote && owner.notifiedListening) {
+    _listening = false;
+    owner.notifiedListening = false;
+    owner.onListeningChange?.(false);
+  }
+  owner.retired = true;
+  owner.onResult = null;
+  owner.onListeningChange = null;
+  owner.onError = null;
+  syncTtsVoiceSuppression();
+}
+
+function claimActiveOwner(nextOwner: CaptureOwner): void {
+  if (_activeOwner && _activeOwner !== nextOwner) {
+    // Coalescing updates callbacks without dropping active capture state unless explicitly retired.
+    _activeOwner.retired = true;
+    _activeOwner.onResult = null;
+    _activeOwner.onListeningChange = null;
+    _activeOwner.onError = null;
+  }
+  _activeOwner = nextOwner;
 }
 
 async function removeHandle(handle: PluginListenerHandle | null): Promise<void> {
@@ -84,82 +998,935 @@ async function removeHandle(handle: PluginListenerHandle | null): Promise<void> 
   } catch { /* best effort listener cleanup */ }
 }
 
-async function removeRecognitionListeners(): Promise<void> {
-  const removePartial = _removePartial;
-  const removeLevel = _removeLevel;
-  const removeListeningState = _removeListeningState;
-  _removePartial = null;
-  _removeLevel = null;
-  _removeListeningState = null;
-  await Promise.all([
-    Promise.resolve().then(() => removePartial?.()).catch(() => undefined),
-    Promise.resolve().then(() => removeLevel?.()).catch(() => undefined),
-    Promise.resolve().then(() => removeListeningState?.()).catch(() => undefined),
-  ]);
+async function cleanupSessionListeners(session: NativeSession | null): Promise<void> {
+  if (!session || session.handles.length === 0) return;
+  const handles = session.handles.splice(0);
+  await withTimeout(
+    Promise.allSettled(handles.map((handle) => removeHandle(handle))),
+    NATIVE_PREWARM_CALL_TIMEOUT_MS,
+    'Speech listener cleanup timed out',
+  ).catch(() => {});
+  syncTtsVoiceSuppression();
 }
 
-async function startListeningInternal(generation: number): Promise<boolean> {
-  await removeRecognitionListeners();
-  if (generation !== _generation) return false;
+function isUnadoptedDeferredPrime(): boolean {
+  if (_activeRemoteSession === null && _pendingRemoteAbort === null) {
+    const nativePrime = _nativeSession && !_nativeSession.retired && !_nativeSession.aborted
+      ? _nativeSession
+      : (_pendingStart && !_pendingStart.session.retired && !_pendingStart.session.aborted ? _pendingStart.session : null);
+    if (nativePrime?.primed && nativePrime.deferAudioPause && !_webSession) {
+      return true;
+    }
+    if (_webSession && !_webSession.retired && !_webSession.ended && _webSession.primed && _webSession.deferAudioPause && !nativePrime) {
+      return true;
+    }
+  }
+  return false;
+}
 
-  try {
-    const perms = await SpeechRecognition.requestPermissions();
-    if (perms.speechRecognition !== 'granted') return false;
-    if (generation !== _generation) return false;
+function shouldSuppressTtsForVoiceCapture(): boolean {
+  if (isUnadoptedDeferredPrime()) {
+    return false;
+  }
+  if (_listening || _activeRemoteSession !== null || _pendingRemoteAbort !== null) {
+    return true;
+  }
+  if (_pendingRemoteStart && !_pendingRemoteStart.aborted && !_pendingRemoteStart.releasedToSend) {
+    return true;
+  }
+  if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
+    return true;
+  }
+  if (_pendingStart && !_pendingStart.session.retired && !_pendingStart.session.aborted) {
+    return true;
+  }
+  if (_webSession && !_webSession.retired && !_webSession.ended) {
+    return true;
+  }
+  return false;
+}
 
-    const available = await SpeechRecognition.available();
-    if (!available.available) return false;
-    if (generation !== _generation) return false;
+function syncTtsVoiceSuppression(): void {
+  setTtsVoiceCaptureActive(shouldSuppressTtsForVoiceCapture());
+}
 
-    const locale = pickLocale();
+/** Pause app-owned playback before activating a recording audio session. This
+ * avoids a simultaneous playback/record route transition; never change the
+ * system volume or attempt to control other apps. Resumption is user-owned. */
+function pauseBackgroundAudio(): void {
+  for (const media of document.querySelectorAll<HTMLMediaElement>('audio, video')) {
+    if (media.tagName === 'VIDEO' && (media.muted || media.defaultMuted)) continue;
+    try { if (!media.paused) media.pause(); } catch { /* best effort */ }
+  }
+  if (!isTtsVoiceCaptureActive()) {
+    syncTtsVoiceSuppression();
+    if (!isTtsVoiceCaptureActive()) {
+      void stopSpeaking();
+    }
+  }
+}
 
-    // Partial results listener
-    const h1 = await SpeechRecognition.addListener('partialResults', (data) => {
-      if (data.matches?.length) {
-        _onResult?.(data.matches[0], false);
+async function attachSessionListeners(
+  recognition: NativeSpeechRecognition,
+  session: NativeSession,
+  shouldKeep?: () => boolean,
+): Promise<boolean> {
+  const { generation } = session;
+  let aborted = false;
+
+  const isSessionLive = (): boolean =>
+    !aborted
+    && (shouldKeep ? shouldKeep() : true)
+    && !session.retired
+    && !session.aborted
+    && !session.owner.retired
+    && _nativeSession === session;
+
+  const registrations: Array<readonly [any, (data: any) => void]> = [
+    ['partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
+      if (!isSessionLive() || session.final || !data.matches?.length) return;
+      setModelLoadingState(false);
+      const text = data.matches[0];
+      const final = data.isFinal === true;
+      // Native owns committed + unfixed text and emits a cumulative snapshot,
+      // not an append-only delta. Corrections may shorten the unfixed tail.
+      // Keep this listener through stop ACK so its final short tail is retained.
+      if (typeof text !== 'string' || (!final && session.text === text)) return;
+      session.captureStarted = true;
+      if (!_listening && generation === _generation) {
+        setOwnerListening(session.owner, true);
       }
-    });
-    _removePartial = () => removeHandle(h1);
-
-    // Audio level listener (emitted from native at ~15fps)
-    const h2 = await SpeechRecognition.addListener('audioLevel' as any, (data: any) => {
+      session.text = text;
+      session.final = final;
+      emitOwnerResult(session.owner, text, final);
+    }],
+    // Audio level listener (emitted from native at ~15-20fps; ignore while primed or after stop advances generation)
+    ['audioLevel', (data: any) => {
+      if (!isSessionLive() || session.primed || generation !== _generation) return;
       _onLevel?.(data.level ?? 0);
-    });
-    _removeLevel = () => removeHandle(h2);
-
-    const h3 = await SpeechRecognition.addListener('listeningState', (data) => {
-      if (data.status === 'started') {
-        setListening(true);
+    }],
+    ['listeningState', (data: { status?: string; variant?: string }) => {
+      if (!isSessionLive() || generation !== _generation) return;
+      if (data.status === 'loading') {
+        const variant = typeof data.variant === 'string' ? data.variant : undefined;
+        setModelLoadingState(true, variant);
+        if (isPcAppNativeSpeech()) {
+          const parsedChoice = parsePcModelVariantChoice(variant);
+          if (parsedChoice) {
+            syncPcModelCacheBridge();
+            _cachedPcModelChoice = parsedChoice;
+            if (_activeService?.kind === 'local_pc_model') {
+              const label = resolvePcModelDisplayLabel(parsedChoice);
+              setActiveVoiceService({
+                kind: 'local_pc_model',
+                ...(label ? { label } : {}),
+                ...(session.isFallback ? { isFallback: true } : {}),
+              });
+            }
+          }
+        }
         return;
       }
-      _generation++;
-      setListening(false);
-      void removeRecognitionListeners().then(forgetRecognitionCallbacks);
-    });
-    _removeListeningState = () => removeHandle(h3);
+      if (data.status === 'started') {
+        setModelLoadingState(false);
+        session.captureStarted = true;
+        setOwnerListening(session.owner, true);
+        return;
+      }
+      setModelLoadingState(false);
+      if (session.primed) {
+        const hadCapture = session.captureStarted || session.text !== null;
+        const bufferedText = session.text;
+        session.retired = true;
+        if (_nativeSession === session) _nativeSession = null;
+        if (_pendingStart?.session === session) _pendingStart = null;
+        void cleanupSessionListeners(session);
+        _generation++;
+        if (hadCapture) {
+          _primedOutcome = {
+            generation: _generation,
+            error: null,
+            text: bufferedText,
+            endedWithCapture: true,
+          };
+        } else {
+          clearPrewarmCaches();
+          _primedOutcome = {
+            generation: _generation,
+            error: _lastError ?? 'Speech recognition stopped before capture started',
+            text: null,
+            endedWithCapture: false,
+          };
+        }
+        setOwnerListening(session.owner, false);
+        retireOwner(session.owner);
+        return;
+      }
+      // Serialize cleanup with the next start; a late stopped event from this
+      // recognizer cannot tear down a new language session.
+      void stopListening();
+    }],
+    ['recognitionError', (data: any) => {
+      if (!isSessionLive()) return;
+      const message = typeof data?.message === 'string' && data.message.trim()
+        ? data.message.trim()
+        : 'Speech recognition error';
+      console.warn('[voice] recognitionError:', message);
+      if (session.primed) {
+        clearPrewarmCaches();
+        session.retired = true;
+        if (session.startInvoked && !session.stopStarted) {
+          session.stopStarted = true;
+          void session.recognition.stop().catch(() => {});
+        }
+        if (_nativeSession === session) _nativeSession = null;
+        if (_pendingStart?.session === session) _pendingStart = null;
+        void cleanupSessionListeners(session);
+        _generation++;
+        _primedOutcome = {
+          generation: _generation,
+          error: message,
+          text: null,
+          endedWithCapture: false,
+        };
+        setOwnerListening(session.owner, false);
+        retireOwner(session.owner);
+        return;
+      }
+      reportOwnerError(session.owner, message);
+      void stopListening();
+    }],
+  ];
 
-    await SpeechRecognition.start({
-      language: locale,
-      partialResults: true,
-      popup: false,
-      addPunctuation: true,
-    });
+  try {
+    const outcomes = await Promise.all(
+      registrations.map(async ([eventName, handler]) => {
+        let abandoned = false;
+        const registrationPromise = Promise.resolve(recognition.addListener(eventName, handler)).then(
+          async (handle) => {
+            if (abandoned || aborted || !isSessionLive() || generation !== _generation) {
+              await removeHandle(handle);
+              return null;
+            }
+            return handle;
+          },
+        );
+        const handle = await withTimeout(
+          registrationPromise,
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Speech listener registration timed out',
+        ).catch((err) => {
+          abandoned = true;
+          throw err;
+        });
+        if (!handle || !isSessionLive() || generation !== _generation) {
+          if (handle) {
+            await removeHandle(handle);
+          }
+          return false;
+        }
+        session.handles.push(handle);
+        return true;
+      }),
+    );
 
-    if (generation !== _generation) {
-      try {
-        await SpeechRecognition.stop();
-      } catch { /* stale start cleanup */ }
-      await removeRecognitionListeners();
-      setListening(false);
+    if (outcomes.some((ok) => !ok) || !isSessionLive() || generation !== _generation) {
+      aborted = true;
+      await cleanupSessionListeners(session);
       return false;
     }
 
-    setListening(true);
+    return true;
+  } catch (err) {
+    aborted = true;
+    await cleanupSessionListeners(session);
+    throw err;
+  }
+}
+
+interface FallbackResolveResult {
+  recognizer: NativeSpeechRecognition | null;
+  error: string | null;
+}
+
+function resolveUsableFallbackRecognizer(
+  primary: NativeSpeechRecognition,
+  requestPermission = true,
+): Promise<NativeSpeechRecognition | null> {
+  return resolveUsableFallbackRecognizerDetailed(primary, requestPermission).then((res) => res.recognizer);
+}
+
+function resolveUsableFallbackRecognizerDetailed(
+  primary: NativeSpeechRecognition,
+  requestPermission = true,
+): Promise<FallbackResolveResult> {
+  if (isPcAppNativeSpeech()) return Promise.resolve({ recognizer: null, error: null });
+  return resolveUsableFallbackRecognizerInner(primary, requestPermission);
+}
+
+async function resolveUsableFallbackRecognizerInner(
+  primary: NativeSpeechRecognition,
+  requestPermission = true,
+): Promise<FallbackResolveResult> {
+  if (getVoiceRecognitionEngine() === 'system') return { recognizer: null, error: null };
+  const fallback = getPlatformFallbackSpeechRecognition();
+  if (!fallback || fallback === primary || typeof fallback.available !== 'function') {
+    return { recognizer: null, error: null };
+  }
+  try {
+    const checkPerms = (
+      fallback as NativeSpeechRecognition & {
+        checkPermissions?: () => Promise<{ speechRecognition?: string }>;
+      }
+    ).checkPermissions;
+    let granted = false;
+    if (typeof checkPerms === 'function') {
+      const checked = await withTimeout(
+        checkPerms(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Fallback permission check timed out',
+      ).catch(() => ({ speechRecognition: undefined }));
+      granted = checked?.speechRecognition === 'granted';
+    }
+    if (!granted && !requestPermission) return { recognizer: null, error: null };
+    const [perms, avail] = await Promise.all([
+      granted
+        ? Promise.resolve({ speechRecognition: 'granted' })
+        : (typeof fallback.requestPermissions === 'function'
+            ? withTimeout(
+                fallback.requestPermissions(),
+                NATIVE_PERMISSION_TIMEOUT_MS,
+                'Fallback permission request timed out',
+              )
+            : Promise.resolve({ speechRecognition: 'granted' })),
+      withTimeout(
+        fallback.available(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Fallback availability check timed out',
+      ),
+    ]);
+    if (perms?.speechRecognition !== 'granted') {
+      return { recognizer: null, error: 'permission_denied' };
+    }
+    return { recognizer: avail?.available ? fallback : null, error: null };
+  } catch (err) {
+    const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
+    const mapped = /permission|denied|not allowed/i.test(msg) ? 'permission_denied' : (msg || null);
+    return { recognizer: null, error: mapped };
+  }
+}
+
+function getFreshPrewarmCache(primary: NativeSpeechRecognition): PrewarmCacheEntry | null {
+  if (!_prewarmCache) return null;
+  if (
+    _prewarmCache.primary !== primary
+    || Date.now() - _prewarmCache.checkedAt > PREWARM_CACHE_TTL_MS
+  ) {
+    _prewarmCache = null;
+    return null;
+  }
+  return _prewarmCache;
+}
+
+function getPrimeReadyPrewarmCache(primary: NativeSpeechRecognition): PrewarmCacheEntry | null {
+  if (!_lastAuthorizedPrewarm) return null;
+  if (
+    _lastAuthorizedPrewarm.primary !== primary
+    || !_lastAuthorizedPrewarm.permissionGranted
+    || !_lastAuthorizedPrewarm.available
+    || Date.now() - _lastAuthorizedPrewarm.checkedAt > NATIVE_PRIME_CACHE_TTL_MS
+  ) {
+    _lastAuthorizedPrewarm = null;
+    return null;
+  }
+  return _lastAuthorizedPrewarm;
+}
+
+function getPrewarmExtendedCache(primary: NativeSpeechRecognition): PrewarmCacheEntry | null {
+  const entry = getPrimeReadyPrewarmCache(primary);
+  return entry?.verifiedByPrewarm ? entry : null;
+}
+
+/** Pre-warm native speech permissions and recognizer availability so hold-to-talk
+ * starts without an extra IPC permission/availability roundtrip on finger down.
+ * Idempotent and deduplicated across concurrent callers; never throws. */
+export async function prewarm(options?: { requestPermission?: boolean }): Promise<void> {
+  if (hasOnlinePrimaryRemoteProvider() || !isNative()) {
+    void probeRemoteMicPermission();
+  }
+  if (!isNative()) return;
+  const requestPermission = options?.requestPermission !== false;
+  let recognition: NativeSpeechRecognition;
+  try {
+    recognition = isPcAppNativeSpeech()
+      ? createPcAppSpeechRecognition(getPcAppBridge()!)
+      : getNativeSpeechRecognition();
+  } catch {
+    return;
+  }
+
+  const cached = getFreshPrewarmCache(recognition);
+  if (cached && (cached.permissionGranted || !requestPermission)) {
+    return;
+  }
+
+  if (_prewarmInFlight) {
+    const inflight = _prewarmInFlight;
+    const sameEngine = inflight.epoch === _prewarmEpoch && inflight.recognition === recognition;
+    const shouldAwaitOnly = sameEngine && (inflight.requestPermission || !requestPermission);
+    await inflight.promise;
+    if (shouldAwaitOnly) return;
+    if (sameEngine) {
+      const afterWait = getFreshPrewarmCache(recognition);
+      if (afterWait && afterWait.permissionGranted) return;
+    }
+  }
+
+  const startEpoch = _prewarmEpoch;
+  const runPromise = (async () => {
+    try {
+      // Warm native audio graph / MLX Metal shaders / ONNX decoder in parallel with
+      // permission & availability checks; ignore absence or rejection on fallback plugins.
+      void Promise.resolve(recognition.prewarm?.()).catch(() => {});
+
+      const checkPerms = (
+        recognition as NativeSpeechRecognition & {
+          checkPermissions?: () => Promise<{ speechRecognition?: string }>;
+        }
+      ).checkPermissions;
+
+      let permissionGranted = false;
+      if (typeof checkPerms === 'function') {
+        const checked = await withTimeout(
+          checkPerms(),
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Permission check timed out',
+        ).catch(() => ({ speechRecognition: undefined }));
+        permissionGranted = checked?.speechRecognition === 'granted';
+        if (!permissionGranted) {
+          _lastAuthorizedPrewarm = null;
+        }
+      }
+
+      if (!permissionGranted && requestPermission) {
+        const perms = await withTimeout(
+          recognition.requestPermissions(),
+          NATIVE_PERMISSION_TIMEOUT_MS,
+          'Permission request timed out',
+        ).catch(() => ({ speechRecognition: 'denied' }));
+        permissionGranted = perms?.speechRecognition === 'granted';
+        if (!permissionGranted) {
+          clearPrewarmCaches();
+          return;
+        }
+      }
+
+      const available = await withTimeout(
+        recognition.available(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Availability check timed out',
+      ).catch(() => ({ available: false }));
+      let effective: NativeSpeechRecognition | null = isRecognitionAvailabilityReady(available) ? recognition : null;
+      if (!effective && (permissionGranted || requestPermission)) {
+        effective = await resolveUsableFallbackRecognizer(recognition, requestPermission);
+        if (effective) {
+          permissionGranted = true;
+        }
+      }
+
+      if (!effective) {
+        if (startEpoch === _prewarmEpoch) clearPrewarmCaches();
+        return;
+      }
+
+      if (startEpoch !== _prewarmEpoch) return;
+
+      const entry: PrewarmCacheEntry = {
+        primary: recognition,
+        effective,
+        checkedAt: Date.now(),
+        permissionGranted,
+        available: true,
+        verifiedByPrewarm: true,
+      };
+      _prewarmCache = entry;
+      setAuthorizedPrewarmEntry(entry);
+      if (isCapacitorNative() && permissionGranted && getNativeRawPcmCapture() !== null) {
+        markRemoteMicPermissionKnownGranted(true);
+      }
+    } catch {
+      if (startEpoch === _prewarmEpoch) clearPrewarmCaches();
+    }
+  })();
+
+  const entry = { promise: runPromise, requestPermission, recognition, epoch: startEpoch };
+  _prewarmInFlight = entry;
+  try {
+    await runPromise;
+  } finally {
+    if (_prewarmInFlight === entry) {
+      _prewarmInFlight = null;
+    }
+  }
+}
+
+export function isNativeMicPermissionKnownGranted(): boolean {
+  if (!isCapacitorNative()) return true;
+  if (getRemoteVoiceState().primaryDeviceId !== null) {
+    return isRemoteMicPermissionKnownGranted();
+  }
+  try {
+    const recognition = getNativeSpeechRecognition();
+    return !!(getPrimeReadyPrewarmCache(recognition) || getFreshPrewarmCache(recognition)?.permissionGranted);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure native mic permission is checked/requested on Capacitor (Android/iOS) before
+ * hold-to-talk enters active capture so OS dialog `pointercancel` interruptions never
+ * flash a false `permission_denied` banner.
+ */
+export async function ensureNativeMicPermissionForHold(): Promise<{ granted: boolean; prompted: boolean }> {
+  if (!isCapacitorNative()) return { granted: true, prompted: false };
+  if (isNativeMicPermissionKnownGranted()) return { granted: true, prompted: false };
+
+  const remotePrimary = getRemoteVoiceState().primaryDeviceId !== null;
+  let bridge: {
+    checkPermissions?: () => Promise<NativePermissionStatus>;
+    requestPermissions?: () => Promise<NativePermissionStatus>;
+  };
+  try {
+    bridge = remotePrimary
+      ? (getNativeRawPcmCapture() ?? getNativeSpeechRecognition())
+      : getNativeSpeechRecognition();
+  } catch {
+    return { granted: false, prompted: false };
+  }
+
+  if (_prewarmInFlight?.requestPermission) {
+    await withTimeout(
+      _prewarmInFlight.promise,
+      NATIVE_PERMISSION_TIMEOUT_MS,
+      'Speech prewarm permission timed out',
+    ).catch(() => {});
+    if (isNativeMicPermissionKnownGranted()) {
+      return { granted: true, prompted: true };
+    }
+  }
+
+  try {
+    if (typeof bridge.checkPermissions === 'function') {
+      const checked = await withTimeout(
+        bridge.checkPermissions(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Permission check timed out',
+      ).catch(() => ({ speechRecognition: undefined }));
+      if (checked?.speechRecognition === 'granted') {
+        if (remotePrimary || getNativeRawPcmCapture() !== null) {
+          markRemoteMicPermissionKnownGranted(true);
+        }
+        if (!remotePrimary) {
+          void prewarm({ requestPermission: false });
+        }
+        return { granted: true, prompted: false };
+      }
+    }
+    if (typeof bridge.requestPermissions !== 'function') {
+      return { granted: true, prompted: false };
+    }
+    const perms = await withTimeout(
+      bridge.requestPermissions(),
+      NATIVE_PERMISSION_TIMEOUT_MS,
+      'Permission request timed out',
+    );
+    const granted = perms?.speechRecognition === 'granted';
+    if (granted) {
+      if (remotePrimary || getNativeRawPcmCapture() !== null) {
+        markRemoteMicPermissionKnownGranted(true);
+      }
+      if (!remotePrimary) {
+        void prewarm({ requestPermission: false });
+      }
+    } else {
+      markRemoteMicPermissionKnownGranted(false);
+      clearPrewarmCaches();
+    }
+    return { granted, prompted: true };
+  } catch {
+    markRemoteMicPermissionKnownGranted(false);
+    clearPrewarmCaches();
+    return { granted: false, prompted: true };
+  }
+}
+
+async function startListeningInternal(session: NativeSession): Promise<boolean> {
+  const { generation } = session;
+  const primaryRecognition = session.recognition;
+  let recognition = session.recognition;
+  _lastError = null;
+
+  const isSessionStarting = (): boolean =>
+    generation === _generation
+    && !session.retired
+    && !session.aborted
+    && !session.owner.retired;
+
+  const prevSession = _nativeSession;
+  if (!isSessionStarting()) return false;
+  if (prevSession && prevSession !== session) {
+    prevSession.retired = true;
+    _nativeSession = null;
+    await cleanupSessionListeners(prevSession);
+    if (!isSessionStarting()) return false;
+  }
+  _nativeSession = session;
+  syncTtsVoiceSuppression();
+  if (isPcAppNativeSpeech()) {
+    refreshPcAppSpeechModelForSession(session.owner, generation, Boolean(session.isFallback));
+  }
+
+  try {
+    let attached = false;
+    if (session.primed) {
+      const primeReady = getPrimeReadyPrewarmCache(primaryRecognition);
+      if (!primeReady) {
+        session.retired = true;
+        if (_nativeSession === session) _nativeSession = null;
+        retireOwner(session.owner);
+        return false;
+      }
+      recognition = primeReady.effective;
+      session.recognition = primeReady.effective;
+      setActiveVoiceService(buildLocalActiveService({
+        recognizer: recognition,
+        isFallback: Boolean(session.isFallback || recognition !== primaryRecognition),
+      }));
+      attached = await attachSessionListeners(recognition, session);
+    } else {
+      // Only wait on an active in-flight prewarm (to avoid duplicate OS permission prompts);
+      // never let a slow passive prewarm block an immediate mic press.
+      const cachedOrPrimeReady = getFreshPrewarmCache(recognition) ?? getPrewarmExtendedCache(recognition);
+      if (!cachedOrPrimeReady && _prewarmInFlight?.requestPermission) {
+        await withTimeout(
+          _prewarmInFlight.promise,
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Speech prewarm timed out',
+        ).catch(() => {});
+        if (!isSessionStarting()) {
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+      }
+
+      const prewarmed = getFreshPrewarmCache(recognition) ?? getPrewarmExtendedCache(recognition);
+      if (prewarmed && prewarmed.permissionGranted && prewarmed.available) {
+        recognition = prewarmed.effective;
+        session.recognition = prewarmed.effective;
+        setActiveVoiceService(buildLocalActiveService({
+          recognizer: recognition,
+          isFallback: Boolean(session.isFallback || recognition !== primaryRecognition),
+        }));
+        attached = await attachSessionListeners(recognition, session);
+      } else if (prewarmed && prewarmed.available) {
+        recognition = prewarmed.effective;
+        session.recognition = prewarmed.effective;
+        setActiveVoiceService(buildLocalActiveService({
+          recognizer: recognition,
+          isFallback: Boolean(session.isFallback || recognition !== primaryRecognition),
+        }));
+        const listenerPromise = attachSessionListeners(recognition, session);
+        listenerPromise.catch(() => {});
+        const perms = await withTimeout(
+          recognition.requestPermissions(),
+          NATIVE_PERMISSION_TIMEOUT_MS,
+          'Speech permission timed out',
+        );
+        if (!isSessionStarting()) {
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+        if (perms.speechRecognition !== 'granted') {
+          console.warn('[voice] microphone permission denied');
+          reportOwnerError(session.owner, 'permission_denied');
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+        prewarmed.permissionGranted = true;
+        setAuthorizedPrewarmEntry({
+          primary: primaryRecognition,
+          effective: recognition,
+          checkedAt: Date.now(),
+          permissionGranted: true,
+          available: true,
+        });
+        if (isCapacitorNative() && getNativeRawPcmCapture() !== null) {
+          markRemoteMicPermissionKnownGranted(true);
+        }
+        attached = await listenerPromise;
+      } else {
+        let keepPrimaryListeners = true;
+        const listenerPromise = attachSessionListeners(recognition, session, () => keepPrimaryListeners);
+        listenerPromise.catch(() => {});
+        const [perms, available] = await Promise.all([
+          withTimeout(
+            recognition.requestPermissions(),
+            NATIVE_PERMISSION_TIMEOUT_MS,
+            'Speech permission timed out',
+          ),
+          withTimeout(
+            recognition.available(),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Speech availability check timed out',
+          ).catch(() => ({ available: false })),
+        ]);
+        if (!isSessionStarting()) {
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+        if (perms.speechRecognition !== 'granted') {
+          console.warn('[voice] microphone permission denied');
+          reportOwnerError(session.owner, 'permission_denied');
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+        if (isCapacitorNative() && getNativeRawPcmCapture() !== null) {
+          markRemoteMicPermissionKnownGranted(true);
+        }
+        if (!isRecognitionAvailabilityReady(available)) {
+          keepPrimaryListeners = false;
+          await cleanupSessionListeners(session);
+          const fallbackResult = await resolveUsableFallbackRecognizerDetailed(recognition);
+          if (!isSessionStarting()) {
+            await cleanupSessionListeners(session);
+            if (_nativeSession === session) _nativeSession = null;
+            retireOwner(session.owner);
+            return false;
+          }
+          const fallback = fallbackResult.recognizer;
+          if (fallback) {
+            console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
+            recognition = fallback;
+            session.recognition = fallback;
+            session.isFallback = true;
+            setActiveVoiceService(buildLocalActiveService({ recognizer: fallback, isFallback: true }));
+            attached = await attachSessionListeners(recognition, session);
+            if (attached) {
+              const fallbackEntry: PrewarmCacheEntry = {
+                primary: primaryRecognition,
+                effective: fallback,
+                checkedAt: Date.now(),
+                permissionGranted: true,
+                available: true,
+              };
+              if (isRecognitionDownloading(available)) {
+                _prewarmCache = fallbackEntry;
+              }
+              setAuthorizedPrewarmEntry(fallbackEntry);
+            }
+          } else {
+            const errMsg = fallbackResult.error ?? 'Offline speech model unavailable';
+            console.warn('[voice] speech recognition unavailable:', errMsg);
+            reportOwnerError(session.owner, errMsg);
+            session.retired = true;
+            if (_nativeSession === session) _nativeSession = null;
+            retireOwner(session.owner);
+            return false;
+          }
+        } else {
+          attached = await listenerPromise;
+          if (attached) {
+            setAuthorizedPrewarmEntry({
+              primary: primaryRecognition,
+              effective: recognition,
+              checkedAt: Date.now(),
+              permissionGranted: true,
+              available: true,
+            });
+          }
+        }
+      }
+    }
+
+    if (!attached || !isSessionStarting() || _nativeSession !== session) {
+      await cleanupSessionListeners(session);
+      if (_nativeSession === session) _nativeSession = null;
+      retireOwner(session.owner);
+      return false;
+    }
+
+    const locale = pickRecognitionLocale();
+    const effectiveLocale = locale ?? (recognition !== primaryRecognition ? pickWebAutoLocale() : undefined);
+    const startOpts = {
+      ...(effectiveLocale ? { language: effectiveLocale } : {}),
+      partialResults: true,
+      popup: false,
+      addPunctuation: true,
+    };
+    if (!session.primed || !session.deferAudioPause) {
+      session.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
+    const awaitSessionStartCall = (target: NativeSpeechRecognition, opts: Record<string, unknown>): Promise<unknown> => {
+      const startCall = withTimeout(
+        target.start(opts),
+        NATIVE_START_TIMEOUT_MS,
+        'Speech recognition timed out',
+      );
+      return new Promise<unknown>((resolve, reject) => {
+        let settled = false;
+        const finishResolve = (v: unknown) => {
+          if (settled) return;
+          settled = true;
+          session.abortPendingStart = null;
+          resolve(v);
+        };
+        const finishReject = (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          session.abortPendingStart = null;
+          reject(err);
+        };
+        session.abortPendingStart = () => {
+          finishReject(new Error('Speech start cancelled'));
+        };
+        if (!isSessionStarting()) {
+          session.abortPendingStart();
+          return;
+        }
+        startCall.then(finishResolve, finishReject);
+      });
+    };
+
+    session.startInvoked = true;
+    const initialStartOpts = {
+      ...startOpts,
+      ...(session.initialPcmBase64 && (isPcAppNativeSpeech() || recognition !== getPlatformFallbackSpeechRecognition())
+        ? { initialPcmBase64: session.initialPcmBase64 }
+        : {}),
+    };
+    try {
+      await awaitSessionStartCall(recognition, initialStartOpts);
+    } catch (startErr) {
+      if (!isSessionStarting()) {
+        session.retired = true;
+        await cleanupSessionListeners(session);
+        if (_nativeSession === session) _nativeSession = null;
+        retireOwner(session.owner);
+        return false;
+      }
+      clearPrewarmCaches();
+      const timedOutPrimary = startErr instanceof VoiceTimeoutError;
+      const stopPrimaryPromise = timedOutPrimary
+        ? stopRecognitionOnceIfOwned(session, recognition)
+        : null;
+      const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
+      if (!/permission|denied|not allowed/i.test(startMsg)) {
+        const fallback = await resolveUsableFallbackRecognizer(recognition);
+        if (fallback && isSessionStarting()) {
+          console.warn('[voice] custom offline speech start failed, falling back to platform recognizer:', startMsg);
+          await withTimeout(
+            stopPrimaryPromise ?? stopRecognitionOnceIfOwned(session, recognition),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Timed out stopping failed recognizer before fallback',
+          ).catch(() => {});
+          if (!isSessionStarting()) {
+            await cleanupSessionListeners(session);
+            if (_nativeSession === session) _nativeSession = null;
+            retireOwner(session.owner);
+            return false;
+          }
+          await cleanupSessionListeners(session);
+          recognition = fallback;
+          session.recognition = fallback;
+          session.isFallback = true;
+          setActiveVoiceService(buildLocalActiveService({ recognizer: fallback, isFallback: true }));
+          const fallbackAttached = await attachSessionListeners(recognition, session);
+          if (!fallbackAttached || !isSessionStarting() || _nativeSession !== session) {
+            await cleanupSessionListeners(session);
+            if (_nativeSession === session) _nativeSession = null;
+            retireOwner(session.owner);
+            return false;
+          }
+          const fallbackLocale = locale ?? pickWebAutoLocale();
+          const fallbackOpts = {
+            ...startOpts,
+            ...(fallbackLocale ? { language: fallbackLocale } : {}),
+          };
+          await awaitSessionStartCall(recognition, fallbackOpts);
+        } else {
+          throw startErr;
+        }
+      } else {
+        throw startErr;
+      }
+    }
+
+    if (!isSessionStarting()) {
+      // Only stop native capture if this session wasn't already aborted/stopped and no newer session owns or is starting the shared plugin.
+      if (!session.stopStarted && !_nativeSession && !_pendingStart) {
+        session.stopStarted = true;
+        try {
+          await withTimeout(
+            recognition.stop(),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Stale speech stop timed out',
+          );
+        } catch { /* stale start cleanup */ }
+      }
+      session.retired = true;
+      await cleanupSessionListeners(session);
+      if (_nativeSession === session) _nativeSession = null;
+      retireOwner(session.owner);
+      return false;
+    }
+
+    session.captureStarted = true;
+    if (!session.primed && session.deferAudioPause) {
+      session.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
+    setOwnerListening(session.owner, true);
     return true;
   } catch (err) {
     console.warn('[voice] start failed:', err);
-    if (generation === _generation) setListening(false);
-    await removeRecognitionListeners();
+    if (err instanceof VoiceTimeoutError) {
+      stopRecognitionOnceIfOwned(session, session.recognition);
+    }
+    if (isSessionStarting()) {
+      const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start speech recognition');
+      const mapped = /permission|denied|not allowed/i.test(msg) ? 'permission_denied' : msg;
+      if (session.primed) {
+        clearPrewarmCaches();
+        _generation++;
+        _primedOutcome = { generation: _generation, error: mapped, text: null, endedWithCapture: false };
+      } else {
+        reportOwnerError(session.owner, mapped);
+      }
+      setOwnerListening(session.owner, false);
+      retireOwner(session.owner);
+    } else {
+      retireOwner(session.owner);
+    }
+    session.retired = true;
+    await cleanupSessionListeners(session);
+    if (_nativeSession === session) _nativeSession = null;
+    syncTtsVoiceSuppression();
     return false;
   }
 }
@@ -182,11 +1949,22 @@ function stopWebLevelMeter(): void {
 }
 
 /** Best-effort waveform levels via Web Audio. Failure must not break recognition. */
+function shouldSkipWebLevelMeter(): boolean {
+  // Touch-capable browsers (including iPad Safari "Request Desktop Website" and
+  // Android Chrome "Desktop site" where UA omits Mobile/iPad tokens) share an
+  // exclusive mic capture route with Web SpeechRecognition.
+  return typeof navigator !== 'undefined' && (navigator.maxTouchPoints ?? 0) > 0;
+}
+
 async function startWebLevelMeter(generation: number): Promise<void> {
+  // Transcript ownership intentionally survives Stop until final/onend, but
+  // microphone/RAF ownership ends immediately when capture stops.
+  const isCapturing = (): boolean => generation === _generation && _listening;
   try {
-    if (!navigator.mediaDevices?.getUserMedia) return;
+    if (shouldSkipWebLevelMeter()) return;
+    if (!isCapturing() || !navigator.mediaDevices?.getUserMedia) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (generation !== _generation) {
+    if (!isCapturing()) {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -201,7 +1979,7 @@ async function startWebLevelMeter(generation: number): Promise<void> {
     source.connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
     const tick = (): void => {
-      if (generation !== _generation) return;
+      if (!isCapturing()) return;
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
@@ -210,163 +1988,1667 @@ async function startWebLevelMeter(generation: number): Promise<void> {
       }
       const rms = Math.sqrt(sum / data.length);
       _onLevel?.(Math.min(1, rms * 3));
-      _webLevelRAF = requestAnimationFrame(tick);
+      if (isCapturing()) _webLevelRAF = requestAnimationFrame(tick);
     };
     _webLevelRAF = requestAnimationFrame(tick);
   } catch { /* no level meter; recognition still works */ }
 }
 
-function startWebListening(): boolean {
-  const Ctor = getWebSpeechCtor();
-  if (!Ctor) return false;
+function clearWebRecHandlers(rec: any): void {
+  if (!rec) return;
+  rec.onstart = null;
+  rec.onaudiostart = null;
+  rec.onend = null;
+  rec.onresult = null;
+  rec.onerror = null;
+}
 
-  // Tear down any prior instance so a fresh start never hits InvalidStateError.
-  if (_webRec) {
+function clearWebStartConfirmTimer(session: WebSession | null): void {
+  if (!session || session.startConfirmTimer === null) return;
+  clearTimeout(session.startConfirmTimer);
+  session.startConfirmTimer = null;
+}
+
+function startWebListening(
+  owner: CaptureOwner,
+  options?: { primed?: boolean; deferAudioPause?: boolean; isFallback?: boolean },
+): boolean {
+  const primed = options?.primed === true;
+  const deferAudioPause = options?.deferAudioPause === true;
+  const isFallback = options?.isFallback === true;
+  const Ctor = getWebSpeechCtor();
+  if (!Ctor) {
+    if (!primed) {
+      reportOwnerError(owner, 'Speech recognition is not available');
+      retireOwner(owner);
+    }
+    return false;
+  }
+  _lastError = null;
+  _primedOutcome = null;
+  setActiveVoiceService(buildLocalActiveService({ isFallback }));
+
+  // Tear down any prior instance (and any pending drain timer) so a fresh start never hits InvalidStateError.
+  _webDrainCancel?.();
+  _webDrainCancel = null;
+  if (_webSession) {
+    clearWebStartConfirmTimer(_webSession);
+    _webSession.retired = true;
+    const prevRec = _webSession.rec;
+    _webSession = null;
+    clearWebRecHandlers(prevRec);
     try {
-      _webRec.onend = null;
-      _webRec.onresult = null;
-      _webRec.onerror = null;
-      _webRec.abort();
+      prevRec.abort();
     } catch { /* best effort */ }
-    _webRec = null;
   }
   stopWebLevelMeter();
 
   const generation = ++_generation;
   try {
     const rec = new Ctor();
-    rec.lang = pickWebLocale();
+    const session: WebSession = {
+      generation,
+      owner,
+      rec,
+      retired: false,
+      ended: false,
+      primed,
+      deferAudioPause,
+      captureStarted: false,
+      lastText: '',
+      emittedFinal: false,
+      earlyError: null,
+      startConfirmTimer: null,
+    };
+    const confirmWebCapture = (): void => {
+      if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      clearWebStartConfirmTimer(session);
+      if (session.captureStarted) return;
+      session.captureStarted = true;
+      setOwnerListening(session.owner, true);
+      if (!session.primed) {
+        void startWebLevelMeter(generation);
+      }
+    };
+    rec.lang = getVoiceLanguageMode() === 'auto' ? pickWebAutoLocale() : pickWebLocale();
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
+    rec.onstart = confirmWebCapture;
+    rec.onaudiostart = confirmWebCapture;
     rec.onresult = (event: any): void => {
-      if (generation !== _generation) return;
+      if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      if (!event?.results?.length) return;
+      confirmWebCapture();
       let txt = '';
       for (let i = 0; i < event.results.length; i++) {
         txt += event.results[i][0]?.transcript ?? '';
       }
+      const trimmed = txt.trim();
       const last = event.results[event.results.length - 1];
-      _onResult?.(txt.trim(), !!last?.isFinal);
+      const isFinal = !!last?.isFinal;
+      session.lastText = trimmed;
+      session.emittedFinal = isFinal;
+      emitOwnerResult(session.owner, trimmed, isFinal);
     };
     rec.onerror = (e: any): void => {
       // 'no-speech' / 'aborted' are routine; only surface real failures.
       if (e?.error && e.error !== 'no-speech' && e.error !== 'aborted') {
         console.warn('[voice] web speech error:', e.error);
+        if (!session.retired && generation === _generation && isOwnerCurrent(session.owner)) {
+          const errStr = String(e.error);
+          const mapped = /not-allowed|service-not-allowed|permission/i.test(errStr) ? 'permission_denied' : errStr;
+          if (session.primed) {
+            clearWebStartConfirmTimer(session);
+            session.earlyError = mapped;
+            session.ended = true;
+            session.retired = true;
+            clearWebRecHandlers(rec);
+            if (_webSession === session) _webSession = null;
+            _generation++;
+            _primedOutcome = { generation: _generation, error: mapped, text: null, endedWithCapture: false };
+            retireOwner(session.owner);
+            stopWebLevelMeter();
+            try { rec.abort?.(); } catch { /* already ended */ }
+            return;
+          }
+          clearWebStartConfirmTimer(session);
+          reportOwnerError(session.owner, mapped);
+          void stopListening();
+        }
       }
     };
     rec.onend = (): void => {
-      if (generation !== _generation) return;
-      // Browser auto-ends on silence; reflect not-listening so the UI updates.
-      setListening(false);
+      if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      clearWebStartConfirmTimer(session);
+      if (!session.captureStarted) {
+        const err = session.earlyError ?? _lastError ?? 'permission_denied';
+        session.ended = true;
+        session.retired = true;
+        clearWebRecHandlers(rec);
+        if (_webSession === session) _webSession = null;
+        _generation++;
+        if (session.primed) {
+          _primedOutcome = { generation: _generation, error: err, text: null, endedWithCapture: false };
+          retireOwner(session.owner);
+          stopWebLevelMeter();
+          return;
+        }
+        reportOwnerError(session.owner, err);
+        retireOwner(session.owner);
+        stopWebLevelMeter();
+        return;
+      }
+      if (session.lastText && !session.emittedFinal) {
+        session.emittedFinal = true;
+        emitOwnerResult(session.owner, session.lastText, true);
+      }
+      session.ended = true;
+      session.retired = true;
+      clearWebRecHandlers(rec);
+      if (_webSession === session) _webSession = null;
+      _generation++;
+      if (session.primed) {
+        _primedOutcome = {
+          generation: _generation,
+          error: null,
+          text: session.lastText || null,
+          endedWithCapture: true,
+        };
+        setOwnerListening(session.owner, false);
+        retireOwner(session.owner);
+        stopWebLevelMeter();
+        return;
+      }
+      // Browser auto-ends on silence; reflect not-listening and retire so stopListening resolves immediately.
+      setOwnerListening(session.owner, false);
+      retireOwner(session.owner);
       stopWebLevelMeter();
     };
-    _webRec = rec;
+    _webSession = session;
+    syncTtsVoiceSuppression();
+    if (!deferAudioPause) {
+      pauseBackgroundAudio();
+    }
     rec.start();
-    setListening(true);
-    void startWebLevelMeter(generation);
+    // Do NOT mark _listening / invoke onListeningChange(true) here: in Web Speech API,
+    // rec.start() only submits the request; browser permission rejection (not-allowed)
+    // arrives asynchronously before onstart/onaudiostart ever fires.
+    // Guard against silent iOS/WebKit stalls where neither onstart, onerror, nor onend ever fires.
+    if (!session.captureStarted && !session.retired && !session.ended && generation === _generation) {
+      session.startConfirmTimer = setTimeout(() => {
+        session.startConfirmTimer = null;
+        if (session.captureStarted || session.retired || session.ended || generation !== _generation) return;
+        const currentOwner = session.owner;
+        session.ended = true;
+        session.retired = true;
+        clearWebRecHandlers(rec);
+        if (_webSession === session) _webSession = null;
+        _generation++;
+        stopWebLevelMeter();
+        syncTtsVoiceSuppression();
+        try {
+          rec.abort?.();
+        } catch {
+          try { rec.stop?.(); } catch { /* already ended */ }
+        }
+        const timeoutErr = 'Speech recognition timed out';
+        if (session.primed) {
+          _primedOutcome = { generation: _generation, error: timeoutErr, text: null, endedWithCapture: false };
+          retireOwner(currentOwner);
+          return;
+        }
+        if (isOwnerCurrent(currentOwner)) {
+          reportOwnerError(currentOwner, timeoutErr);
+          setOwnerListening(currentOwner, false);
+          retireOwner(currentOwner);
+        }
+      }, WEB_START_CONFIRM_TIMEOUT_MS);
+    }
     return true;
   } catch (err) {
     console.warn('[voice] web start failed:', err);
-    setListening(false);
+    const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start web speech');
+    const mapped = /permission|denied|not-allowed/i.test(msg) ? 'permission_denied' : msg;
+    if (_webSession && _webSession.generation === generation) {
+      clearWebStartConfirmTimer(_webSession);
+      _webSession.retired = true;
+      clearWebRecHandlers(_webSession.rec);
+      _webSession = null;
+    }
+    if (primed) {
+      _primedOutcome = { generation: ++_generation, error: mapped, text: null, endedWithCapture: false };
+      setOwnerListening(owner, false);
+      retireOwner(owner);
+      return false;
+    }
+    reportOwnerError(owner, mapped);
+    setOwnerListening(owner, false);
+    retireOwner(owner);
     return false;
   }
 }
 
-function stopWebListening(): void {
-  _generation++;
-  setListening(false);
-  stopWebLevelMeter();
-  const rec = _webRec;
-  _webRec = null;
-  if (rec) {
-    try {
-      rec.onend = null;
-      rec.onresult = null;
-      rec.onerror = null;
-      rec.stop();
-      rec.abort?.();
-    } catch { /* best effort */ }
+/**
+ * Synchronously start/unlock Web SpeechRecognition inside a direct browser user
+ * gesture (`pointerdown` / `click`), so mobile WebKit/Safari preserves gesture
+ * activation across async modal opens or hold timers. Caller adopts via
+ * `startListening()` or aborts cleanly via `cancelWebGesturePrime()`.
+ */
+export function primeWebGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (isNative() || !isAvailable() || !getWebSpeechCtor()) return false;
+  if (_pendingStop) return false;
+  if (_webSession && !_webSession.retired && !_webSession.ended) {
+    return _webSession.primed;
   }
+  if (_listening) return false;
+  const noop = () => {};
+  const primedOwner = createCaptureOwner(noop, noop, noop);
+  claimActiveOwner(primedOwner);
+  return startWebListening(primedOwner, {
+    primed: true,
+    deferAudioPause: options?.deferAudioPause === true,
+  });
+}
+
+/** Silently abort an un-adopted Web Speech gesture prime (e.g. short tap / scroll). */
+export function cancelWebGesturePrime(): void {
+  _primedOutcome = null;
+  const session = _webSession;
+  if (!session || !session.primed) return;
+  clearWebStartConfirmTimer(session);
+  session.retired = true;
+  session.ended = true;
+  const rec = session.rec;
+  if (_webSession === session) _webSession = null;
+  _generation++;
+  clearWebRecHandlers(rec);
+  stopWebLevelMeter();
+  retireOwner(session.owner);
+  try {
+    rec?.abort?.();
+  } catch {
+    try { rec?.stop?.(); } catch { /* already ended */ }
+  }
+}
+
+function primeNativeGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (!isNative() || !isAvailable()) return false;
+  if (_pendingStop) return false;
+  if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
+    return _nativeSession.primed;
+  }
+  if (_listening || _pendingStart) return false;
+  let primary: NativeSpeechRecognition;
+  try {
+    primary = getNativeSpeechRecognition();
+  } catch {
+    return false;
+  }
+  // Never prompt for OS permissions synchronously on finger down; only prime when ready.
+  const cached = getPrimeReadyPrewarmCache(primary);
+  if (!cached) return false;
+
+  _primedOutcome = null;
+  const noop = () => {};
+  const primedOwner = createCaptureOwner(noop, noop, noop);
+  claimActiveOwner(primedOwner);
+  const generation = ++_generation;
+  const session: NativeSession = {
+    generation,
+    owner: primedOwner,
+    recognition: cached.effective,
+    isFallback: cached.effective !== cached.primary,
+    text: null,
+    final: false,
+    aborted: false,
+    retired: false,
+    stopStarted: false,
+    primed: true,
+    deferAudioPause: options?.deferAudioPause === true,
+    captureStarted: false,
+    startInvoked: false,
+    handles: [],
+  };
+  const startPromise = startListeningInternal(session);
+  const entry = { promise: startPromise, generation, session };
+  _pendingStart = entry;
+  syncTtsVoiceSuppression();
+  void startPromise.finally(() => {
+    if (_pendingStart === entry) {
+      _pendingStart = null;
+    }
+    syncTtsVoiceSuppression();
+  });
+  return true;
+}
+
+function cancelNativeGesturePrime(): void {
+  _primedOutcome = null;
+  const pendingEntry = _pendingStart;
+  const session =
+    (_nativeSession?.primed ? _nativeSession : null)
+    ?? (pendingEntry?.session.primed ? pendingEntry.session : null);
+  if (!session || !session.primed) return;
+  const startPromise = pendingEntry?.session === session ? pendingEntry.promise : null;
+  if (pendingEntry?.session === session) {
+    _pendingStart = null;
+  }
+  const shouldStopNative = !!(session.startInvoked && !session.stopStarted);
+  void beginNativeSessionAbort(session, startPromise, shouldStopNative);
+}
+
+/**
+ * Returns true only when `pointerdown` must synchronously start speech capture
+ * to preserve browser user-gesture activation (non-native Web Speech API without
+ * an online primary remote voice provider). Native Capacitor recognizers and
+ * remote voice providers do not need t=0 `pointerdown` audio priming, keeping
+ * single-tap composer focus instant with zero audio/bridge churn.
+ */
+export function needsPointerDownGesturePrime(): boolean {
+  if (!isAvailable()) return false;
+  if (hasOnlinePrimaryRemoteProvider()) return false;
+  if (isPcAppNativeSpeech() || isNative()) return false;
+  return isWebSpeechAvailable();
+}
+
+/**
+ * Synchronously start/unlock speech capture inside a direct `pointerdown` user
+ * gesture (Web Speech API on browsers; cached-permission Capacitor bridge on native)
+ * so hold-to-talk captures the first syllable immediately with zero timer delay.
+ * Caller adopts via `startListening()` or aborts silently via `cancelVoiceGesturePrime()`.
+ */
+export function primeVoiceGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (!isAvailable()) return false;
+  if (hasOnlinePrimaryRemoteProvider()) {
+    return primeRemoteVoiceCapture();
+  }
+  if (isPcAppNativeSpeech()) return false;
+  return isNative() ? primeNativeGesture(options) : primeWebGesture(options);
+}
+
+/** Silently abort an un-adopted Web, native, or remote gesture prime (e.g. short tap / scroll). */
+export function cancelVoiceGesturePrime(): void {
+  cancelRemoteVoiceCapturePrime();
+  if (isNative()) {
+    cancelNativeGesturePrime();
+    return;
+  }
+  cancelWebGesturePrime();
+}
+
+/**
+ * Trigger short tactile hold confirmation: native Android WebView HapticFeedback when
+ * running on Android native shell (works even when navigator.vibrate is blocked/silent),
+ * falling back cleanly to `navigator.vibrate`. Never throws.
+ */
+export async function triggerHapticFeedback(durationMs = 20): Promise<void> {
+  if (isCapacitorNative()) {
+    try {
+      const cap = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+      const platform = cap?.getPlatform?.();
+      if (platform !== 'ios') {
+        const recognition = getNativeSpeechRecognition();
+        if (typeof recognition.performHaptic === 'function') {
+          await recognition.performHaptic();
+          return;
+        }
+      }
+    } catch {
+      // Fall back to navigator.vibrate below.
+    }
+  }
+  try {
+    globalThis.navigator?.vibrate?.(durationMs);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Silent cleanup delay in case a browser speech engine omits `onend` after `stop()`.
+ * Never emits a timeout error and never cuts off active recording. */
+export const WEB_FINAL_DRAIN_MS = 10_000;
+/** Upper bound when aborting/cancelling a native recognizer so hung native start/stop calls cannot wedge future holds. */
+export const NATIVE_ABORT_DRAIN_MS = 1_500;
+
+export interface StopListeningOptions {
+  abort?: boolean;
+}
+
+function beginNativeSessionAbort(
+  session: NativeSession | null,
+  startPromise: Promise<boolean> | null,
+  shouldStopNative: boolean,
+): Promise<void> {
+  const priorPendingStop = _pendingStop;
+  const owner = session?.owner ?? _activeOwner;
+  if (session) {
+    session.aborted = true;
+    session.retired = true;
+    session.abortPendingStart?.();
+    if (shouldStopNative) {
+      session.stopStarted = true;
+    }
+    if (_nativeSession === session) {
+      _nativeSession = null;
+    }
+  }
+  _generation++;
+  setOwnerListening(owner, false);
+  retireOwner(owner);
+  syncTtsVoiceSuppression();
+
+  // Detach listener handles immediately in parallel so a hung prior stop/start/stop
+  // cannot leave old native listeners attached across an abort timeout.
+  const detachPromise = cleanupSessionListeners(session).catch(() => {});
+  const stopCallPromise = shouldStopNative && session
+    ? session.recognition.stop().catch((err) => {
+        console.warn('[voice] abort stop failed:', err);
+      })
+    : Promise.resolve();
+  const priorStopWait = priorPendingStop ? priorPendingStop.catch(() => {}) : Promise.resolve();
+  const startWait = startPromise ? startPromise.catch(() => false) : Promise.resolve();
+  const cleanupAndStop = Promise.all([
+    detachPromise,
+    stopCallPromise,
+    priorStopWait,
+    startWait,
+  ]).then(() => {});
+
+  let abortTimer: ReturnType<typeof setTimeout> | null = null;
+  const boundedAbort = (async () => {
+    try {
+      await Promise.race([
+        cleanupAndStop,
+        new Promise<void>((resolve) => {
+          abortTimer = setTimeout(() => {
+            abortTimer = null;
+            console.warn('[voice] native abort drain timed out; releasing session');
+            resolve();
+          }, NATIVE_ABORT_DRAIN_MS);
+        }),
+      ]);
+    } finally {
+      if (abortTimer !== null) {
+        clearTimeout(abortTimer);
+        abortTimer = null;
+      }
+      if (session && _nativeSession === session) _nativeSession = null;
+    }
+  })();
+
+  _pendingStopMaxWaitMs = NATIVE_ABORT_DRAIN_MS + 500;
+  _pendingStop = boundedAbort;
+  void boundedAbort.finally(() => {
+    if (_pendingStop === boundedAbort) {
+      _pendingStop = null;
+    }
+  });
+  return boundedAbort;
+}
+
+function consumePrimedOutcome(
+  onResult: (text: string, isFinal: boolean) => void,
+  onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
+  isFallback = false,
+): { handled: true; started: boolean } | { handled: false } {
+  if (!_primedOutcome) return { handled: false };
+  const outcome = _primedOutcome;
+  _primedOutcome = null;
+  if (outcome.error !== null) {
+    clearPrewarmCaches();
+    _lastError = outcome.error;
+    (onError ?? _onError)?.(outcome.error);
+    return { handled: true, started: false };
+  }
+  if (outcome.endedWithCapture) {
+    const owner = createCaptureOwner(onResult, onListeningChange, onError);
+    claimActiveOwner(owner);
+    setActiveVoiceService(buildLocalActiveService({ isFallback }));
+    setOwnerListening(owner, true);
+    if (outcome.text) {
+      emitOwnerResult(owner, outcome.text, true);
+    }
+    setOwnerListening(owner, false);
+    retireOwner(owner);
+    return { handled: true, started: true };
+  }
+  return { handled: false };
+}
+
+function stopWebListening(abort = false): Promise<void> {
+  const session = _webSession;
+  const owner = session?.owner ?? _activeOwner;
+  clearWebStartConfirmTimer(session);
+  if (_listening) {
+    setOwnerListening(owner, false);
+  }
+  stopWebLevelMeter();
+  if (abort) {
+    _webDrainCancel?.();
+    _webDrainCancel = null;
+  }
+  const rec = session?.rec ?? null;
+  if (!session || !rec) {
+    _generation++;
+    retireOwner(owner);
+    return Promise.resolve();
+  }
+  if (abort) {
+    session.retired = true;
+    clearWebRecHandlers(rec);
+    if (_webSession === session) _webSession = null;
+    _generation++;
+    retireOwner(owner);
+    syncTtsVoiceSuppression();
+    try { rec.abort?.(); } catch {
+      try { rec.stop?.(); } catch { /* already ended */ }
+    }
+    return Promise.resolve();
+  }
+  // Do not restart listening or start the level meter if capture starts while draining,
+  // but still mark captureStarted so onend does not falsely report permission_denied.
+  const markDrainCaptureStarted = (): void => {
+    session.captureStarted = true;
+  };
+  rec.onstart = markDrainCaptureStarted;
+  rec.onaudiostart = markDrainCaptureStarted;
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (_webDrainCancel === finish) _webDrainCancel = null;
+      if (!abort && session.captureStarted && session.lastText && !session.emittedFinal && isOwnerCurrent(session.owner)) {
+        session.emittedFinal = true;
+        emitOwnerResult(session.owner, session.lastText, true);
+      }
+      session.ended = true;
+      session.retired = true;
+      stopWebLevelMeter();
+      clearWebRecHandlers(rec);
+      if (_webSession === session) _webSession = null;
+      _generation++;
+      if (isOwnerCurrent(session.owner)) {
+        retireOwner(session.owner);
+      }
+      syncTtsVoiceSuppression();
+      resolve();
+    };
+    _webDrainCancel = finish;
+    const timer = setTimeout(() => {
+      // Browser failed to fire onend after stop(); clean up silently without surfacing a timeout error.
+      console.warn('[voice] web final drain missing onend; cleaning up silently');
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }, WEB_FINAL_DRAIN_MS);
+    // Keep onresult and its generation alive until onend: stop() asks the
+    // browser for the remaining final hypothesis, abort() would discard it.
+    rec.onend = finish;
+    try { rec.stop(); } catch {
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }
+  });
+}
+
+function isLocalAvailable(): boolean {
+  return isNative() || isWebSpeechAvailable();
+}
+
+function beginPendingRemoteStop(
+  handle: ActiveRemoteVoiceSessionHandle,
+  owner: CaptureOwner,
+  generation: number,
+  abort: boolean,
+): Promise<void> {
+  if (!abort) {
+    owner.normalStopRequested = true;
+  }
+  const micReleased = handle.micReleased ?? null;
+  let abortedStop = abort;
+  let stopping!: Promise<void>;
+  stopping = handle.stop(abort)
+    .then(async () => {
+      if (!abortedStop && owner.pendingPreReadyWait) {
+        await owner.pendingPreReadyWait;
+      }
+      if (!abortedStop && owner.pendingFallback) {
+        await owner.pendingFallback.promise;
+      }
+    })
+    .finally(() => {
+      if (_generation === generation) {
+        _generation++;
+      }
+      retireOwner(owner);
+      if (_pendingRemoteStop === stopping) {
+        _pendingRemoteStop = null;
+        _pendingRemoteStopMicReleased = null;
+        _pendingRemoteStopAbort = null;
+      }
+    });
+  _pendingRemoteStop = stopping;
+  _pendingRemoteStopMicReleased = micReleased ? micReleased.catch(() => {}) : stopping.catch(() => {});
+  _pendingRemoteStopAbort = () => {
+    abortedStop = true;
+    owner.pendingFallback?.abort();
+    if (_generation === generation) {
+      _generation++;
+    }
+    retireOwner(owner);
+    void handle.stop(true);
+  };
+  return stopping;
 }
 
 export async function startListening(
   onResult: (text: string, isFinal: boolean) => void,
   onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
 ): Promise<boolean> {
-  if (!isAvailable()) return false;
+  const remotePrimary = getRemoteVoiceState().primaryDeviceId;
+  if (!isAvailable() && !remotePrimary) {
+    const msg = 'Speech recognition is not available';
+    _lastError = msg;
+    (onError ?? _onError)?.(msg);
+    return false;
+  }
 
-  if (!isNative()) {
-    _onResult = onResult;
-    _onListeningChange = onListeningChange ?? null;
-    if (_listening) {
-      setListening(true);
+  const startIntent = ++_intentSeq;
+
+  if (remotePrimary !== null) {
+    const initialRemoteState = getRemoteVoiceState();
+    const localDeviceId = getLocalPcAppRemoteDeviceId();
+    const isSelfPrimary = Boolean(localDeviceId && remotePrimary === localDeviceId);
+    if (isSelfPrimary) {
+      setActiveVoiceService(buildLocalActiveService());
+      if (_pendingRemoteStop) {
+        await _pendingRemoteStop;
+        if (startIntent < _lastStopIntent) {
+          if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+            setActiveVoiceService(null);
+          }
+          return false;
+        }
+      }
+      if (_activeRemoteSession) {
+        const owner = createCaptureOwner(onResult, onListeningChange, onError);
+        claimActiveOwner(owner);
+        _activeRemoteSession.owner = owner;
+        setOwnerListening(owner, true);
+        return true;
+      }
+      const route = await resolveRemoteVoiceRoute();
+      if (startIntent < _lastStopIntent) {
+        if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+          setActiveVoiceService(null);
+        }
+        return false;
+      }
+      if (route.route === 'local_fallback') {
+        const initialPcm = await drainRemoteVoiceCapturePrimePcm();
+        if (startIntent < _lastStopIntent) {
+          if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+            setActiveVoiceService(null);
+          }
+          return false;
+        }
+        setRemoteVoiceFallbackNotice(route.reason);
+        if (!isLocalAvailable()) {
+          setActiveVoiceService(null);
+          const msg = route.reason;
+          _lastError = msg;
+          (onError ?? _onError)?.(msg);
+          return false;
+        }
+        return startLocalListening(
+          onResult,
+          onListeningChange,
+          onError,
+          startIntent,
+          true,
+          false,
+          initialPcm.length > 0 ? initialPcm : undefined,
+        );
+      }
+      const initialPcm = await drainRemoteVoiceCapturePrimePcm();
+      if (startIntent < _lastStopIntent) {
+        if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+          setActiveVoiceService(null);
+        }
+        return false;
+      }
+      clearRemoteVoiceFallbackNotice();
+      return startLocalListening(
+        onResult,
+        onListeningChange,
+        onError,
+        startIntent,
+        false,
+        false,
+        initialPcm.length > 0 ? initialPcm : undefined,
+      );
+    }
+
+    const cachedPrimary = initialRemoteState.providers.find((p) => p.deviceId === remotePrimary);
+    if (cachedPrimary) {
+      setActiveVoiceService(buildRemoteActiveService(cachedPrimary));
+    }
+
+    if (_activeRemoteSession && !_pendingRemoteStop) {
+      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      claimActiveOwner(owner);
+      _activeRemoteSession.owner = owner;
+      setOwnerListening(owner, true);
       return true;
     }
-    return startWebListening();
+
+    while (_pendingRemoteStart) {
+      const prevPending = _pendingRemoteStart;
+      if (!prevPending.aborted && prevPending.releasedToSend) {
+        await prevPending.handoffPromise;
+        if (startIntent < _lastStopIntent) {
+          return false;
+        }
+        continue;
+      }
+      prevPending.aborted = true;
+      prevPending.resolveHandoff();
+      prevPending.resolveDone();
+      if (_pendingRemoteStart === prevPending) {
+        _pendingRemoteStart = null;
+      }
+    }
+    let resolveHandoff!: () => void;
+    const handoffPromise = new Promise<void>((res) => {
+      resolveHandoff = res;
+    });
+    let resolveDone!: () => void;
+    const donePromise = new Promise<void>((res) => {
+      resolveDone = res;
+    });
+    const eager: EagerRemoteStartState = {
+      intent: startIntent,
+      aborted: false,
+      releasedToSend: false,
+      captureStarted: false,
+      listeningNotified: false,
+      failedReason: null,
+      failedPermission: false,
+      onListeningChange,
+      adoptedOwner: null,
+      handoffPromise,
+      resolveHandoff,
+      donePromise,
+      resolveDone,
+    };
+    _pendingRemoteStart = eager;
+    pauseBackgroundAudio();
+
+    // Only wait for previous utterance's hardware mic release (~ms), NOT full remote WS drain.
+    if (_pendingRemoteStop) {
+      await (_pendingRemoteStopMicReleased ?? _pendingRemoteStop);
+      if (eager.aborted || startIntent < _lastStopIntent) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+          setActiveVoiceService(null);
+        }
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return false;
+      }
+    }
+
+    if (_activeRemoteSession && !_pendingRemoteStop) {
+      if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      claimActiveOwner(owner);
+      _activeRemoteSession.owner = owner;
+      setOwnerListening(owner, true);
+      eager.resolveHandoff();
+      eager.resolveDone();
+      return true;
+    }
+
+    // Start local PCM capture immediately with zero wait for WS drain or HTTP route refresh.
+    if (!eager.releasedToSend) {
+      primeRemoteVoiceCapture({
+        allowPrompt: true,
+        onCaptureStarted: () => {
+          if (eager.aborted || eager.releasedToSend || startIntent < _lastStopIntent) return;
+          eager.captureStarted = true;
+          _listening = true;
+          syncTtsVoiceSuppression();
+          if (!eager.listeningNotified) {
+            eager.listeningNotified = true;
+            eager.onListeningChange?.(true);
+          }
+        },
+        onLevel: (lvl) => {
+          if (eager.aborted || eager.releasedToSend || !_listening) return;
+          _onLevel?.(lvl);
+        },
+        onError: (reason, isPermissionDenied) => {
+          if (eager.aborted) return;
+          eager.failedReason = reason;
+          eager.failedPermission = Boolean(isPermissionDenied);
+          if (eager.listeningNotified) {
+            eager.listeningNotified = false;
+            _listening = false;
+            syncTtsVoiceSuppression();
+            eager.onListeningChange?.(false);
+          }
+        },
+      });
+    }
+
+    // Run route resolution and any remaining prior-utterance WS drain in parallel while audio buffers locally.
+    const routePromise = resolveRemoteVoiceRoute();
+    if (_pendingRemoteStop) {
+      await _pendingRemoteStop;
+    }
+    const route = await routePromise;
+
+    if (eager.aborted || startIntent < _lastStopIntent) {
+      if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+      cancelRemoteVoiceCapturePrime();
+      if (eager.listeningNotified) {
+        eager.listeningNotified = false;
+        _listening = false;
+        eager.onListeningChange?.(false);
+      }
+      if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+        setActiveVoiceService(null);
+      }
+      eager.resolveHandoff();
+      eager.resolveDone();
+      return false;
+    }
+
+    if (route.route === 'remote') {
+      setActiveVoiceService(buildRemoteActiveService(route.provider));
+      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      let resolvePreReadyWait!: () => void;
+      owner.pendingPreReadyWait = new Promise<void>((res) => {
+        resolvePreReadyWait = res;
+      });
+      owner.resolvePreReadyWait = () => {
+        resolvePreReadyWait();
+      };
+      if (eager.listeningNotified && !eager.releasedToSend) {
+        owner.notifiedListening = true;
+      }
+      eager.adoptedOwner = owner;
+      claimActiveOwner(owner);
+      const generation = ++_generation;
+      const abortCtrl = new AbortController();
+      _pendingRemoteAbort = abortCtrl;
+      let captureStarted = false;
+
+      const failedPermissionReason = eager.failedPermission && eager.failedReason
+        ? eager.failedReason
+        : null;
+      const res = failedPermissionReason
+        ? (cancelRemoteVoiceCapturePrime(), { ok: false as const, cancelled: false, reason: failedPermissionReason })
+        : await startRemoteVoiceSession({
+          targetDeviceId: route.targetDeviceId,
+          locale: getVoiceLanguageMode() === 'auto' ? undefined : pickLocale(),
+          signal: abortCtrl.signal,
+          ...(route.provider.providerKind === 'http_asr'
+            ? { stopDrainMs: REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS }
+            : {}),
+          onCaptureStarted: (handle) => {
+            if (_pendingRemoteAbort === abortCtrl) {
+              _pendingRemoteAbort = null;
+            }
+            if (eager.aborted || (!eager.releasedToSend && startIntent < _lastStopIntent) || abortCtrl.signal.aborted || !isOwnerCurrent(owner)) {
+              syncTtsVoiceSuppression();
+              void handle.stop(true);
+              return;
+            }
+            captureStarted = true;
+            if (eager.releasedToSend) {
+              const stopping = beginPendingRemoteStop(handle, owner, generation, false);
+              if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+              eager.resolveHandoff();
+              void stopping.finally(() => {
+                eager.resolveDone();
+              });
+              return;
+            }
+            if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+            _activeRemoteSession = { handle, owner, generation };
+            setOwnerListening(owner, true);
+            eager.resolveHandoff();
+          },
+          onResult: (text, isFinal) => {
+            if (generation !== _generation || !isOwnerCurrent(owner)) return;
+            emitOwnerResult(owner, text, isFinal);
+          },
+          onLevel: (lvl) => {
+            if (generation === _generation && _listening) {
+              _onLevel?.(lvl);
+            }
+          },
+          onEnd: () => {
+            if (_activeRemoteSession?.generation === generation) {
+              _activeRemoteSession = null;
+              _generation++;
+              setOwnerListening(owner, false);
+              retireOwner(owner);
+            }
+          },
+          onError: (code) => {
+            if (
+              _activeRemoteSession?.generation === generation
+              || (generation === _generation && isOwnerCurrent(owner))
+            ) {
+              if (_activeRemoteSession?.generation === generation) {
+                _activeRemoteSession = null;
+              }
+              _generation++;
+              reportOwnerError(owner, code);
+              setOwnerListening(owner, false);
+              retireOwner(owner);
+            }
+          },
+          onFallback: (reason, info?: RemoteVoiceFallbackInfo) => {
+            const isActiveMidSession = _activeRemoteSession?.generation === generation && isOwnerCurrent(owner);
+            const isPostStopFallback = Boolean(info?.stoppedByCaller) && isOwnerCurrent(owner);
+            if (!isActiveMidSession && !isPostStopFallback) return false;
+            if (_activeRemoteSession?.generation === generation) {
+              _activeRemoteSession = null;
+            }
+            setRemoteVoiceFallbackNotice(reason);
+            const bufferedPcm = info?.bufferedPcm;
+            if (info?.stoppedByCaller) {
+              if (!isLocalAvailable() || !bufferedPcm || bufferedPcm.length === 0 || !canFinalizeBufferedPcm()) {
+                return false;
+              }
+              const finalizeCtrl = new AbortController();
+              const abortFinalize = () => finalizeCtrl.abort();
+              const finalizePromise = trackPendingFinalize(
+                finalizeBufferedSpeechOnOwner(owner, bufferedPcm, finalizeCtrl.signal)
+                  .finally(() => {
+                    if (owner.pendingFallback?.abort === abortFinalize) {
+                      owner.pendingFallback = undefined;
+                    }
+                  }),
+              );
+              owner.pendingFallback = { promise: finalizePromise, abort: abortFinalize };
+              return true;
+            }
+            _generation++;
+            const hadNotified = Boolean(owner.notifiedListening);
+            const localAvail = isLocalAvailable();
+            _listening = false;
+            retireOwner(owner, !localAvail, hadNotified && localAvail);
+            if (!localAvail) {
+              reportOwnerError(owner, reason || 'provider_offline');
+              return false;
+            }
+            void startLocalListening(
+              onResult,
+              onListeningChange,
+              onError,
+              startIntent,
+              true,
+              hadNotified,
+              bufferedPcm && bufferedPcm.length > 0 ? bufferedPcm : undefined,
+            );
+            return true;
+          },
+        });
+
+      if (_pendingRemoteAbort === abortCtrl) {
+        _pendingRemoteAbort = null;
+      }
+      syncTtsVoiceSuppression();
+
+      if ((eager.releasedToSend || owner.normalStopRequested) && captureStarted && res.ok) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        owner.resolvePreReadyWait?.();
+        eager.resolveHandoff();
+        return true;
+      }
+
+      const activeRemote = _activeRemoteSession as { handle: ActiveRemoteVoiceSessionHandle; owner: unknown; generation: number } | null;
+
+      if (res.cancelled || eager.aborted || (!captureStarted && !eager.releasedToSend && !owner.normalStopRequested && startIntent < _lastStopIntent) || !isOwnerCurrent(owner)) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        owner.resolvePreReadyWait?.();
+        if (res.ok) {
+          void res.handle.stop(true);
+        }
+        if (activeRemote?.generation === generation) {
+          _activeRemoteSession = null;
+          _generation++;
+        }
+        setOwnerListening(owner, false);
+        if (!_pendingRemoteStop) {
+          retireOwner(owner);
+        }
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return false;
+      }
+
+      if (res.ok) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        owner.resolvePreReadyWait?.();
+        clearRemoteVoiceFallbackNotice();
+        if (activeRemote?.generation !== generation && startIntent >= _lastStopIntent) {
+          _activeRemoteSession = { handle: res.handle, owner, generation };
+          setOwnerListening(owner, true);
+        }
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return true;
+      }
+
+      if (activeRemote?.generation === generation) {
+        _activeRemoteSession = null;
+        _generation++;
+      }
+      if (eager.releasedToSend || owner.normalStopRequested) {
+        _listening = false;
+        syncTtsVoiceSuppression();
+        const localAvail = isLocalAvailable();
+        setRemoteVoiceFallbackNotice(res.reason || 'provider_offline');
+        eager.resolveHandoff();
+        if (!localAvail) {
+          if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+          owner.resolvePreReadyWait?.();
+          reportOwnerError(owner, res.reason || 'provider_offline');
+          if (!captureStarted && !_pendingRemoteStop) {
+            retireOwner(owner);
+          }
+          eager.resolveDone();
+          return false;
+        }
+        if (res.bufferedPcm && res.bufferedPcm.length > 0 && canFinalizeBufferedPcm() && !eager.aborted) {
+          const finalizeCtrl = new AbortController();
+          const abortFinalize = () => finalizeCtrl.abort();
+          _pendingFinalizeAbort = abortFinalize;
+          const finalizePromise = trackPendingFinalize(
+            finalizeBufferedSpeechOnOwner(owner, res.bufferedPcm, finalizeCtrl.signal)
+              .finally(() => {
+                if (_pendingFinalizeAbort === abortFinalize) {
+                  _pendingFinalizeAbort = null;
+                }
+                if (owner.pendingFallback?.abort === abortFinalize) {
+                  owner.pendingFallback = undefined;
+                }
+              }),
+          );
+          owner.pendingFallback = { promise: finalizePromise, abort: abortFinalize };
+          if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+          eager.resolveHandoff();
+          owner.resolvePreReadyWait?.();
+          await finalizePromise;
+        } else {
+          if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+          owner.resolvePreReadyWait?.();
+        }
+        if (!captureStarted && !_pendingRemoteStop) {
+          retireOwner(owner);
+        }
+        eager.resolveDone();
+        return false;
+      }
+      if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+      owner.resolvePreReadyWait?.();
+      const hadNotifiedListening = Boolean(eager.listeningNotified || owner.notifiedListening);
+      const localAvail = isLocalAvailable();
+      _listening = false;
+      retireOwner(owner, !localAvail, hadNotifiedListening && localAvail);
+      setRemoteVoiceFallbackNotice(res.reason || 'provider_offline');
+      if (!localAvail) {
+        if (hadNotifiedListening) {
+          onListeningChange?.(false);
+        }
+        const msg = res.reason || 'provider_offline';
+        _lastError = msg;
+        (onError ?? _onError)?.(msg);
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return false;
+      }
+      eager.resolveHandoff();
+      eager.resolveDone();
+      return startLocalListening(
+        onResult,
+        onListeningChange,
+        onError,
+        startIntent,
+        true,
+        hadNotifiedListening,
+        res.bufferedPcm,
+      );
+    }
+
+    const isRouteFallback = route.route === 'local_fallback';
+    const routeFallbackReason = isRouteFallback ? route.reason : null;
+    const initialPcm = await drainRemoteVoiceCapturePrimePcm();
+    if (eager.aborted || (!eager.releasedToSend && startIntent < _lastStopIntent)) {
+      if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+      if (eager.listeningNotified) {
+        eager.listeningNotified = false;
+        _listening = false;
+        eager.onListeningChange?.(false);
+      }
+      syncTtsVoiceSuppression();
+      if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+        setActiveVoiceService(null);
+      }
+      eager.resolveHandoff();
+      eager.resolveDone();
+      return false;
+    }
+    _listening = false;
+    if (isRouteFallback) {
+      setRemoteVoiceFallbackNotice(routeFallbackReason!);
+    } else {
+      clearRemoteVoiceFallbackNotice();
+    }
+    if (eager.releasedToSend) {
+      syncTtsVoiceSuppression();
+      eager.resolveHandoff();
+      if (!isLocalAvailable()) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        setActiveVoiceService(null);
+        if (routeFallbackReason) {
+          const msg = routeFallbackReason;
+          _lastError = msg;
+          (onError ?? _onError)?.(msg);
+        }
+        eager.resolveDone();
+        return false;
+      }
+      if (initialPcm.length > 0 && canFinalizeBufferedPcm() && !eager.aborted) {
+        const owner = createCaptureOwner(onResult, onListeningChange, onError);
+        owner.notifiedListening = false;
+        claimActiveOwner(owner);
+        const finalizeCtrl = new AbortController();
+        const abortFinalize = () => finalizeCtrl.abort();
+        _pendingFinalizeAbort = abortFinalize;
+        const finalizePromise = trackPendingFinalize(
+          finalizeBufferedSpeechOnOwner(owner, initialPcm, finalizeCtrl.signal)
+            .finally(() => {
+              if (_pendingFinalizeAbort === abortFinalize) {
+                _pendingFinalizeAbort = null;
+              }
+              retireOwner(owner);
+            }),
+        );
+        try {
+          await finalizePromise;
+        } finally {
+          if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        }
+      } else if (_pendingRemoteStart === eager) {
+        _pendingRemoteStart = null;
+      }
+      eager.resolveDone();
+      return false;
+    }
+    if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+    if (isRouteFallback && !isLocalAvailable()) {
+      if (eager.listeningNotified) {
+        eager.listeningNotified = false;
+        eager.onListeningChange?.(false);
+      }
+      syncTtsVoiceSuppression();
+      setActiveVoiceService(null);
+      const msg = routeFallbackReason!;
+      _lastError = msg;
+      (onError ?? _onError)?.(msg);
+      eager.resolveHandoff();
+      eager.resolveDone();
+      return false;
+    }
+    const hadNotified = eager.listeningNotified;
+    eager.resolveHandoff();
+    eager.resolveDone();
+    return startLocalListening(
+      onResult,
+      onListeningChange,
+      onError,
+      startIntent,
+      isRouteFallback,
+      hadNotified,
+      initialPcm.length > 0 ? initialPcm : undefined,
+    );
   }
 
-  if (_pendingStop) {
-    await _pendingStop;
+  cancelRemoteVoiceCapturePrime();
+  return startLocalListening(onResult, onListeningChange, onError, startIntent, false);
+}
+
+async function startLocalListening(
+  onResult: (text: string, isFinal: boolean) => void,
+  onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
+  startIntent = ++_intentSeq,
+  isFallback = false,
+  alreadyNotifiedListening = false,
+  initialPcm?: Int16Array,
+): Promise<boolean> {
+  if (!isLocalAvailable()) {
+    if (alreadyNotifiedListening) {
+      _listening = false;
+      syncTtsVoiceSuppression();
+      onListeningChange?.(false);
+    }
+    const msg = 'Speech recognition is not available';
+    _lastError = msg;
+    (onError ?? _onError)?.(msg);
+    return false;
   }
 
-  _onResult = onResult;
-  _onListeningChange = onListeningChange ?? null;
+  if (!isNative()) {
+    if (_pendingStop) {
+      await _pendingStop;
+      if (startIntent < _lastStopIntent) {
+        if (alreadyNotifiedListening) {
+          _listening = false;
+          syncTtsVoiceSuppression();
+          onListeningChange?.(false);
+        }
+        return false;
+      }
+    }
+    const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback);
+    if (primedOutcome.handled) {
+      return primedOutcome.started;
+    }
+    const owner = createCaptureOwner(onResult, onListeningChange, onError);
+    if (alreadyNotifiedListening) {
+      owner.notifiedListening = true;
+    }
+    claimActiveOwner(owner);
+    setActiveVoiceService(buildLocalActiveService({ isFallback }));
+    if (_webSession && !_webSession.retired && !_webSession.ended && _webSession.generation === _generation) {
+      const session = _webSession;
+      const wasPrimed = session.primed;
+      session.primed = false;
+      session.owner = owner;
+      syncTtsVoiceSuppression();
+      if (wasPrimed && session.deferAudioPause) {
+        session.deferAudioPause = false;
+        pauseBackgroundAudio();
+      }
+      if (_listening || session.captureStarted) {
+        setOwnerListening(owner, true);
+        if (wasPrimed) {
+          void startWebLevelMeter(session.generation);
+        }
+      }
+      if (session.lastText) {
+        emitOwnerResult(owner, session.lastText, session.emittedFinal);
+      }
+      return true;
+    }
+    if (_listening) {
+      setOwnerListening(owner, true);
+      return true;
+    }
+    _primedOutcome = null;
+    return startWebListening(owner, { isFallback });
+  }
 
-  if (_listening) {
-    setListening(true);
+  while (_pendingStop) {
+    const pending = _pendingStop;
+    const maxWaitMs = _pendingStopMaxWaitMs;
+    try {
+      await withTimeout(pending, maxWaitMs, 'Previous voice stop timed out');
+    } catch {
+      if (_pendingStop === pending) {
+        _pendingStop = null;
+      }
+      if (_nativeSession) {
+        _nativeSession.retired = true;
+        void cleanupSessionListeners(_nativeSession).catch(() => {});
+        _nativeSession = null;
+      }
+      retireOwner(_activeOwner);
+    }
+    if (startIntent < _lastStopIntent) {
+      if (alreadyNotifiedListening) {
+        _listening = false;
+        syncTtsVoiceSuppression();
+        onListeningChange?.(false);
+      }
+      return false;
+    }
+  }
+
+  const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback);
+  if (primedOutcome.handled) {
+    return primedOutcome.started;
+  }
+
+  const owner = createCaptureOwner(onResult, onListeningChange, onError);
+  if (alreadyNotifiedListening) {
+    owner.notifiedListening = true;
+  }
+  claimActiveOwner(owner);
+
+  const adoptable =
+    (_pendingStart && _pendingStart.generation === _generation && !_pendingStart.session.retired && !_pendingStart.session.aborted
+      ? _pendingStart.session
+      : null)
+    ?? (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted && _nativeSession.generation === _generation
+      ? _nativeSession
+      : null);
+
+  if (adoptable && (adoptable.primed || _listening || _pendingStart?.session === adoptable)) {
+    const wasPrimed = adoptable.primed;
+    adoptable.primed = false;
+    adoptable.owner = owner;
+    syncTtsVoiceSuppression();
+    adoptable.isFallback = Boolean(adoptable.isFallback || isFallback);
+    setActiveVoiceService(buildLocalActiveService({
+      recognizer: adoptable.recognition,
+      isFallback: adoptable.isFallback,
+    }));
+    if (isPcAppNativeSpeech()) {
+      refreshPcAppSpeechModelForSession(owner, adoptable.generation, adoptable.isFallback);
+    }
+    if (wasPrimed && adoptable.deferAudioPause && adoptable.startInvoked) {
+      adoptable.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
+    if (_listening || adoptable.captureStarted) {
+      setOwnerListening(owner, true);
+    }
+    if (wasPrimed && adoptable.text !== null) {
+      emitOwnerResult(owner, adoptable.text, adoptable.final);
+    }
+    if (_pendingStart && _pendingStart.session === adoptable) {
+      return _pendingStart.promise;
+    }
     return true;
   }
 
-  if (_pendingStart) return _pendingStart;
+  if (_listening) {
+    let effectiveIsFallback = isFallback;
+    if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
+      _nativeSession.owner = owner;
+      _nativeSession.isFallback = Boolean(_nativeSession.isFallback || isFallback);
+      effectiveIsFallback = _nativeSession.isFallback;
+    }
+    setActiveVoiceService(buildLocalActiveService({
+      recognizer: _nativeSession?.recognition,
+      isFallback: effectiveIsFallback,
+    }));
+    if (isPcAppNativeSpeech() && _nativeSession) {
+      refreshPcAppSpeechModelForSession(owner, _nativeSession.generation, effectiveIsFallback);
+    }
+    setOwnerListening(owner, true);
+    return true;
+  }
 
+  _primedOutcome = null;
+  const recognition = isPcAppNativeSpeech()
+    ? createPcAppSpeechRecognition(getPcAppBridge()!)
+    : getNativeSpeechRecognition();
+  setActiveVoiceService(buildLocalActiveService({ recognizer: recognition, isFallback }));
   const generation = ++_generation;
-  const startPromise = startListeningInternal(generation);
-  _pendingStart = startPromise;
+  const initialPcmBase64 = encodeInitialPcmForLocalStart(initialPcm);
+  const session: NativeSession = {
+    generation,
+    owner,
+    recognition,
+    isFallback,
+    ...(initialPcmBase64 ? { initialPcmBase64 } : {}),
+    text: null,
+    final: false,
+    aborted: false,
+    retired: false,
+    stopStarted: false,
+    primed: false,
+    deferAudioPause: false,
+    captureStarted: false,
+    startInvoked: false,
+    handles: [],
+  };
+  const startPromise = startListeningInternal(session);
+  const entry = { promise: startPromise, generation, session };
+  _pendingStart = entry;
+  syncTtsVoiceSuppression();
   try {
     return await startPromise;
   } finally {
-    if (_pendingStart === startPromise) {
+    if (_pendingStart === entry) {
       _pendingStart = null;
     }
+    syncTtsVoiceSuppression();
   }
 }
 
-export async function stopListening(): Promise<void> {
+export async function stopListening(options?: StopListeningOptions): Promise<void> {
+  const abort = options?.abort === true;
+  const activePendingRemote = _pendingRemoteStart && !_pendingRemoteStart.aborted ? _pendingRemoteStart : null;
+  if (abort || (!activePendingRemote && !_pendingFinalizePromise && !_pendingRemoteStop)) {
+    _lastStopIntent = ++_intentSeq;
+  }
+  setModelLoadingState(false);
+
+  if (!abort && activePendingRemote) {
+    activePendingRemote.releasedToSend = true;
+    const donePromise = activePendingRemote.donePromise;
+    _listening = false;
+    syncTtsVoiceSuppression();
+    if (activePendingRemote.listeningNotified) {
+      activePendingRemote.listeningNotified = false;
+      activePendingRemote.onListeningChange?.(false);
+    }
+    if (activePendingRemote.adoptedOwner) {
+      activePendingRemote.adoptedOwner.notifiedListening = false;
+    }
+    await finishRemoteVoiceCapturePrime();
+    if (!_activeRemoteSession) {
+      await donePromise;
+      return;
+    }
+  } else if (!abort && _pendingFinalizePromise && !_activeRemoteSession) {
+    await _pendingFinalizePromise;
+    return;
+  } else {
+    _pendingFinalizeAbort?.();
+    _pendingFinalizeAbort = null;
+    if (activePendingRemote) {
+      activePendingRemote.aborted = true;
+      if (_pendingRemoteStart === activePendingRemote) {
+        _pendingRemoteStart = null;
+      }
+      _listening = false;
+      if (activePendingRemote.listeningNotified) {
+        activePendingRemote.listeningNotified = false;
+        activePendingRemote.onListeningChange?.(false);
+      }
+      activePendingRemote.resolveHandoff();
+      activePendingRemote.resolveDone();
+    }
+    cancelRemoteVoiceCapturePrime();
+  }
+  if (!_activeRemoteSession && !_nativeSession && !_webSession && !_pendingStart && !_pendingRemoteAbort) {
+    setActiveVoiceService(null);
+  }
+
+  if (_pendingRemoteAbort) {
+    const ctrl = _pendingRemoteAbort;
+    _pendingRemoteAbort = null;
+    _generation++;
+    ctrl.abort();
+    setOwnerListening(_activeOwner, false);
+    retireOwner(_activeOwner);
+    return;
+  }
+  if (_activeRemoteSession) {
+    const active = _activeRemoteSession;
+    _activeRemoteSession = null;
+    setOwnerListening(active.owner, false);
+    if (abort) {
+      _generation++;
+      retireOwner(active.owner);
+    }
+    const stopping = beginPendingRemoteStop(active.handle, active.owner, active.generation, abort);
+    await stopping;
+    return;
+  }
+  if (_pendingRemoteStop) {
+    if (abort) {
+      _pendingRemoteStopAbort?.();
+    }
+    await _pendingRemoteStop;
+    return;
+  }
+
   if (!isAvailable()) return;
 
   if (!isNative()) {
-    stopWebListening();
-    forgetRecognitionCallbacks();
+    if (abort) {
+      const aborting = stopWebListening(true);
+      _pendingStop = aborting;
+      try { await aborting; }
+      finally { if (_pendingStop === aborting) _pendingStop = null; }
+      return;
+    }
+    if (_pendingStop) return _pendingStop;
+    const stopping = stopWebListening(false);
+    _pendingStop = stopping;
+    try { await stopping; }
+    finally { if (_pendingStop === stopping) _pendingStop = null; }
     return;
   }
 
-  const startPromise = _pendingStart;
+  if (abort) {
+    const pendingEntry = _pendingStart;
+    const startPromise = pendingEntry?.promise ?? null;
+    _pendingStart = null;
+    const session = _nativeSession ?? pendingEntry?.session ?? null;
+    const shouldStopNative = !!(
+      session
+      && !session.stopStarted
+      && (!session.primed || session.startInvoked)
+      && (_listening || !!startPromise)
+    );
+    await beginNativeSessionAbort(session, startPromise, shouldStopNative);
+    return;
+  }
+
+  if (_pendingStop) {
+    _generation++;
+    _pendingStart = null;
+    return _pendingStop;
+  }
+  const pendingEntry = _pendingStart;
+  const startPromise = pendingEntry?.promise ?? null;
+  _pendingStart = null;
+  const session = _nativeSession ?? pendingEntry?.session ?? null;
+  const owner = session?.owner ?? _activeOwner;
+  const hadCaptureStarted = Boolean(session?.captureStarted || _listening);
   const shouldStopNative = _listening || !!startPromise;
   _generation++;
-  setListening(false);
+  setOwnerListening(owner, false);
 
   if (!shouldStopNative) {
-    await removeRecognitionListeners();
-    forgetRecognitionCallbacks();
+    if (session) session.retired = true;
+    await cleanupSessionListeners(session);
+    if (_nativeSession === session) _nativeSession = null;
+    retireOwner(owner);
     return;
   }
 
-  const stopPromise = (async () => {
-    try {
-      await SpeechRecognition.stop();
-    } catch (err) {
-      console.warn('[voice] stop failed:', err);
+  if (session) {
+    session.stopStarted = true;
+    if (!hadCaptureStarted) {
+      session.retired = true;
+      session.abortPendingStart?.();
+    }
+  }
+
+  let stopPromise!: Promise<void>;
+  stopPromise = (async () => {
+    let stopFailure: string | null = null;
+    if (hadCaptureStarted) {
+      try {
+        if (session) {
+          await withTimeout(
+            session.recognition.stop(),
+            NATIVE_STOP_DRAIN_MS,
+            'Speech recognition stop timed out',
+          );
+        }
+      } catch (err) {
+        if (err instanceof VoiceTimeoutError) {
+          console.warn('[voice] native stop timed out; releasing session');
+        } else {
+          console.warn('[voice] stop failed:', err);
+          const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
+          stopFailure = msg || 'Speech recognition stop failed';
+        }
+      }
+
+      try {
+        if (startPromise) {
+          await withTimeout(
+            startPromise,
+            NATIVE_STOP_DRAIN_MS,
+            'Speech start settle during stop timed out',
+          );
+        }
+      } catch { /* start failure / timeout already handled */ }
+    } else {
+      // Capture never started (!session.captureStarted): _generation++ and session.retired
+      // already cancelled the pending start and there is no recorded audio to drain, so
+      // bound cleanup strictly to NATIVE_UNSTARTED_STOP_DRAIN_MS instead of stalling 20s.
+      const nativeCancelCalls: Array<Promise<unknown>> = [];
+      if (session && session.startInvoked) {
+        nativeCancelCalls.push(
+          Promise.resolve(session.recognition.stop()).catch((err) => {
+            console.warn('[voice] unstarted native stop failed:', err);
+          }),
+        );
+      }
+      if (startPromise) {
+        nativeCancelCalls.push(startPromise.catch(() => false));
+      }
+      if (nativeCancelCalls.length > 0) {
+        await withTimeout(
+          Promise.allSettled(nativeCancelCalls),
+          NATIVE_UNSTARTED_STOP_DRAIN_MS,
+          'Unstarted speech stop settle timed out',
+        ).catch(() => {
+          console.warn('[voice] unstarted stop settle timed out; releasing session');
+        });
+      }
     }
 
-    try {
-      await startPromise;
-    } catch { /* start failure already logged */ }
+    const stillCurrentOwner = !!owner
+      && isOwnerCurrent(owner)
+      && (!session || (!session.retired && !session.aborted && _nativeSession === session));
+    if (stopFailure && stillCurrentOwner) {
+      reportOwnerError(owner, stopFailure);
+    }
 
-    await removeRecognitionListeners();
-    forgetRecognitionCallbacks();
-    setListening(false);
+    await cleanupSessionListeners(session);
+    if (session) session.retired = true;
+    if (_nativeSession === session) _nativeSession = null;
+    if (hadCaptureStarted ? stillCurrentOwner : isOwnerCurrent(owner)) {
+      retireOwner(owner);
+    }
+    syncTtsVoiceSuppression();
   })();
 
+  _pendingStopMaxWaitMs = hadCaptureStarted
+    ? NATIVE_STOP_DRAIN_MS + 1_000
+    : NATIVE_UNSTARTED_STOP_DRAIN_MS + 500;
   _pendingStop = stopPromise;
   try {
     await stopPromise;
@@ -380,6 +3662,23 @@ export async function stopListening(): Promise<void> {
 /** Register a callback for real-time audio level (0..1). Call before startListening. */
 export function onAudioLevel(cb: ((level: number) => void) | null): void {
   _onLevel = cb;
+}
+
+/** Register a callback for speech model loading/warming-up state before capture starts. */
+export function onModelLoading(cb: ((loading: boolean, variant?: string) => void) | null): void {
+  _onModelLoading = cb;
+  if (!cb) {
+    _modelLoadingActive = false;
+  }
+}
+
+/** Register a callback for recognition / permission / startup errors. */
+export function onRecognitionError(cb: ((error: string) => void) | null): void {
+  _onError = cb;
+}
+
+export function getLastError(): string | null {
+  return _lastError;
 }
 
 export function isListening(): boolean {

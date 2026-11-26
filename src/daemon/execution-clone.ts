@@ -85,6 +85,7 @@ export const EXECUTION_CLONE_IDENTITY_DENYLIST: string[] = [
   'restartTimestamps',
   'startupMemoryInjected',
   'recentInjectionHistory',
+  'summarySyncFingerprints',
   'qwenFreshOnResume',
   'label',
   'quotaLabel',

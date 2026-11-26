@@ -1,13 +1,16 @@
 export const SESSION_COMPACT_COMMAND = '/compact' as const;
 export const SESSION_CLEAR_COMMAND = '/clear' as const;
+export const SESSION_HANDOFF_COMMAND = '/handoff' as const;
 export const SESSION_STOP_COMMAND = '/stop' as const;
+export const SESSION_MODEL_COMMAND = '/model' as const;
 export const SESSION_CONTROL_METADATA_COMMAND_FIELD = 'controlCommand' as const;
 export const SESSION_CONTROL_TIMELINE_STATE_COMPACTING = 'compacting' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT = 'user_compact' as const;
 export const SESSION_CONTROL_TIMELINE_STATE_STOPPING = 'stopping' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL = 'user_cancel' as const;
+export const SESSION_CANCEL_IDLE_DECISION_REASON = 'command_handler_cancel_idle' as const;
 
-export type SessionControlCommandId = 'compact' | 'clear' | 'stop';
+export type SessionControlCommandId = 'compact' | 'clear' | 'handoff' | 'stop';
 export type SessionControlHandling = 'provider-dispatched' | 'daemon-managed';
 export type SessionControlVisibility = 'visible' | 'hidden';
 export type SessionControlTimelineFeedback =
@@ -60,6 +63,17 @@ export const SESSION_CONTROL_COMMANDS = [
     resetsTransportPreferenceContextOnSend: false,
   },
   {
+    id: 'handoff',
+    command: SESSION_HANDOFF_COMMAND,
+    handling: 'daemon-managed',
+    timelineUserMessage: 'visible',
+    optimisticUserMessage: 'visible',
+    timelineFeedback: null,
+    daemonHandledReceiptAck: true,
+    resetsProcessPreferenceContext: true,
+    resetsTransportPreferenceContextOnSend: false,
+  },
+  {
     id: 'stop',
     command: SESSION_STOP_COMMAND,
     handling: 'daemon-managed',
@@ -92,6 +106,18 @@ export function isSessionCompactCommandText(text: string): boolean {
 
 export function isSessionClearCommandText(text: string): boolean {
   return isSessionControlCommandText(text, 'clear');
+}
+
+export function isSessionHandoffCommandText(text: string): boolean {
+  return isSessionControlCommandText(text, 'handoff');
+}
+
+/** Match a complete model-switch command while leaving ordinary prose untouched. */
+export function isSessionModelSwitchCommandText(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized.startsWith(SESSION_MODEL_COMMAND)) return false;
+  const argumentsText = normalized.slice(SESSION_MODEL_COMMAND.length);
+  return /^\s+\S+(?:\s+.*)?$/.test(argumentsText);
 }
 
 export function isDaemonHandledSessionControlSend(text: string): boolean {

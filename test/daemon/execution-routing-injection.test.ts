@@ -164,6 +164,7 @@ function fakeAutoDeliverRun(
       markerPath: '/work/project/.imc/marker.json',
       spec: { runId: 'auto_test123', cycleIndex: 1, cycleTotal: 5, nonce: 'nonce-1' },
       retryCount: 0,
+      createdAt: Date.now(),
     },
     specAuditDiscussionFilePath: '/work/project/.imc/spec-audit.md',
     ...(routing ? { dedicatedExecutionRouting: routing } : {}),

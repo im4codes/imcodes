@@ -16,13 +16,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync,
+  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 const PREFLIGHT_SRC = join(process.cwd(), 'src', 'util', 'windows-launch-preflight.mjs');
+const NODE_DATACHANNEL_REPAIR_SRC = join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs');
 
 interface Sandbox {
   root: string;
@@ -39,23 +40,30 @@ function makeSandbox(opts: {
   halfInstalledDeps?: string[];
   npmExitCode?: number;
   pinnedVersion?: string;
+  brokenNodeDatachannel?: boolean;
 }): Sandbox {
   const root = mkdtempSync(join(tmpdir(), 'win-preflight-'));
-  const pkgRoot = join(root, 'lib', 'node_modules', 'imcodes');
-  const distSrcUtil = join(pkgRoot, 'dist', 'src', 'util');
+  const pkgRootPath = join(root, 'lib', 'node_modules', 'imcodes');
+  const distSrcUtilPath = join(pkgRootPath, 'dist', 'src', 'util');
   const shimDir = join(root, 'shims');
   const homeDir = join(root, 'home');
   const npmCallLog = join(root, 'npm-calls.log');
   const repairLog = join(homeDir, '.imcodes', 'launch-repair.log');
 
-  mkdirSync(distSrcUtil, { recursive: true });
+  mkdirSync(distSrcUtilPath, { recursive: true });
+  const pkgRoot = realpathSync(pkgRootPath);
+  const distSrcUtil = join(pkgRoot, 'dist', 'src', 'util');
   mkdirSync(shimDir, { recursive: true });
   mkdirSync(join(homeDir, '.imcodes'), { recursive: true });
 
   // package.json with pinned version (default 1.2.3, override per test).
   writeFileSync(
     join(pkgRoot, 'package.json'),
-    JSON.stringify({ name: 'imcodes', version: opts.pinnedVersion ?? '1.2.3' }),
+    JSON.stringify({
+      name: 'imcodes',
+      version: opts.pinnedVersion ?? '1.2.3',
+      ...(opts.brokenNodeDatachannel ? { optionalDependencies: { 'node-datachannel': '0.0.0-test' } } : {}),
+    }),
   );
 
   // dist/src/index.js (optional).
@@ -81,6 +89,26 @@ function makeSandbox(opts: {
   // resolution (`SELF → util/ → src/ → dist/ → PKG_ROOT`) lands here.
   const preflight = join(distSrcUtil, 'windows-launch-preflight.mjs');
   writeFileSync(preflight, readFileSync(PREFLIGHT_SRC, 'utf8'));
+  if (opts.brokenNodeDatachannel) {
+    const dependencyDir = join(pkgRoot, 'node_modules', 'node-datachannel');
+    writeFileSync(join(distSrcUtil, 'node-datachannel-repair.mjs'), readFileSync(NODE_DATACHANNEL_REPAIR_SRC, 'utf8'));
+    mkdirSync(dependencyDir, { recursive: true });
+    writeFileSync(join(dependencyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.0.0-test', type: 'module', main: 'index.js',
+    }));
+    writeFileSync(join(dependencyDir, 'index.js'), "throw new Error('native addon missing');\n");
+
+    // A parent-level decoy models the shared /tmp/node_modules (or global
+    // dependency) present on CI hosts. Bare package imports walk upward and
+    // incorrectly accept this after the local broken copy is removed. The
+    // repair must verify the package-root-local entry instead.
+    const parentDependencyDir = join(root, 'node_modules', 'node-datachannel');
+    mkdirSync(parentDependencyDir, { recursive: true });
+    writeFileSync(join(parentDependencyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: 'parent-decoy', type: 'module', main: 'index.js',
+    }));
+    writeFileSync(join(parentDependencyDir, 'index.js'), 'export const parentDecoy = true;\n');
+  }
 
   // npm shim — captures argv. Both `npm` and `npm.cmd` so the
   // platform-conditional in the preflight resolves to the right name.
@@ -103,8 +131,16 @@ function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
       PATH: `${sb.shimDir}:${process.env.PATH ?? ''}`,
       HOME: sb.homeDir,
       USERPROFILE: sb.homeDir,        // Windows env name; preflight uses homedir() either way
-      IMCODES_HOME: sb.homeDir,
+      IMCODES_HOME: join(sb.homeDir, '.imcodes'),
       IMCODES_LAUNCH_REPAIR_LOG: sb.repairLog,
+      // Keep npm and module lookup hermetic; the shim never reaches the
+      // registry, and no ambient NODE_PATH/global cache may influence checks.
+      NODE_PATH: '',
+      npm_config_cache: join(sb.root, 'npm-cache'),
+      npm_config_prefix: join(sb.root, 'npm-prefix'),
+      npm_config_userconfig: join(sb.root, 'npmrc'),
+      npm_config_update_notifier: 'false',
+      npm_config_offline: 'true',
     },
     encoding: 'utf8',
     timeout: 15_000,
@@ -113,12 +149,34 @@ function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
 }
 
 describe('src/util/windows-launch-preflight.mjs', () => {
+  it('uses a state-dir IMCODES_HOME or overridden HOME consistently', () => {
+    const src = readFileSync(PREFLIGHT_SRC, 'utf8');
+    expect(src).toContain('function resolveImcodesStateDir()');
+    expect(src).toMatch(/process\.env\.IMCODES_HOME\?\.trim\(\)/);
+    expect(src).toMatch(/process\.env\.HOME\?\.trim\(\)\s*\|\|\s*process\.env\.USERPROFILE\?\.trim\(\)\s*\|\|\s*homedir\(\)/);
+    expect(src).toContain("const lockDir = join(IMCODES_HOME, 'upgrade.lock.d')");
+    expect(src).not.toContain("join(process.env.IMCODES_HOME ?? homedir(), '.imcodes'");
+  });
+
   it('healthy install: exits 0 without invoking npm', () => {
     const sb = makeSandbox({});
     try {
       const r = runPreflight(sb);
       expect(r.status).toBe(0);
       expect(existsSync(sb.npmCallLog)).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('first fixed-version launch invokes optional-native repair before returning to watchdog', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel --ignore-scripts=false --foreground-scripts`);
+      expect(npmLog).toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test`);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -138,6 +196,27 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       expect(r.stderr).toMatch(/half-installed/);
       expect(r.stderr).toMatch(/commander/);
       expect(r.stderr).toMatch(/hono/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs the optional native addon again after a successful half-install reinstall', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['commander'], brokenNodeDatachannel: true });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const calls = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n');
+      const globalInstall = calls.findIndex((call) => call.includes('install -g'));
+      expect(globalInstall).toBeGreaterThan(0);
+      expect(calls.slice(0, globalInstall).some((call) => (
+        call.includes(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel`)
+      ))).toBe(true);
+      expect(calls.slice(globalInstall + 1).some((call) => (
+        call.includes(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel`)
+        || (call.includes(`install --global=false --prefix ${sb.pkgRoot} --no-save`)
+          && call.includes('node-datachannel@0.0.0-test'))
+      ))).toBe(true);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

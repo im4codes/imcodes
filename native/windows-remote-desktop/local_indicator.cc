@@ -1,0 +1,882 @@
+// Winsock must precede windows.h (local_indicator.h includes it) to avoid the winsock.h redefinitions.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include "third_party/imcodes_remote_desktop/local_indicator.h"
+#include "third_party/imcodes_remote_desktop/common/data_channel_constants.h"
+#include "third_party/imcodes_remote_desktop/common/platform_interfaces.h"
+#include "third_party/imcodes_remote_desktop/common/aidesk_product_name.h"
+#include "third_party/imcodes_remote_desktop/common/local_indicator_visuals.h"
+#include "third_party/imcodes_remote_desktop/common/local_management_open_window.h"
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <thread>
+
+#include <windowsx.h>
+#include <shellapi.h>
+#include <dwmapi.h>
+#include <wtsapi32.h>
+
+#include "third_party/imcodes_remote_desktop/brand_logo_generated.h"
+
+namespace imcodes::rd {
+namespace common = imcodes::remote_desktop::common;
+namespace {
+
+constexpr wchar_t kWindowClass[] = L"IMCodesRemoteDesktopIndicator";
+constexpr wchar_t kWindowTitle[] = L"IM.codes Remote Desktop";
+constexpr wchar_t kRegistryPath[] = L"Software\\IM.codes\\RemoteDesktop";
+constexpr wchar_t kCollapsedValue[] = L"IndicatorCollapsed";
+constexpr UINT kUpdateMessage = WM_APP + 1;
+constexpr UINT kStopMessage = WM_APP + 2;
+constexpr UINT kDispatchInputMessage = WM_APP + 3;
+constexpr UINT kProbeInputMessage = WM_APP + 4;
+constexpr UINT kReadClipboardMessage = WM_APP + 5;
+constexpr UINT kMovePointerMessage = WM_APP + 6;
+constexpr UINT_PTR kAutoCollapseTimer = 1;
+// Logical (96-dpi) geometry. Every consumer scales it through Scaled(); the
+// window used to be laid out in raw pixels while only the fonts scaled, so at
+// 200% the text overflowed a window that had stayed 368x148.
+constexpr int kExpandedWidth = 368;
+constexpr int kExpandedHeight = 148;
+constexpr int kCollapsedWidth = 54;
+constexpr int kCollapsedHeight = 38;
+constexpr int kCornerMargin = 14;
+constexpr int kLogoLogicalSize = 20;
+// The product name is a compile-time constant on purpose. Nothing a remote
+// requester sends may ever reach this window -- see the note on Update().
+constexpr wchar_t kSurfaceName[] = L"Remote Desktop";
+
+/**
+ * Asks the node to open (or focus) the local management panel as an independent window -- the one place that decides how (native
+ * window, app-mode browser, default browser, single instance). Blocking: runs on its own thread. True only when the node answered
+ * 200; an older node (404/501), a node failure (502), no node, or a timeout is false and the caller opens the URL as before.
+ */
+bool RequestNodeOpenPanelWindow() {
+  WSADATA data{};
+  if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return false;
+  bool accepted = false;
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock != INVALID_SOCKET) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(common::kLocalManagementPort);
+    if (InetPtonA(AF_INET, common::kLocalManagementHost, &address.sin_addr) == 1) {
+      const DWORD answer_timeout = common::kLocalManagementOpenWindowAnswerTimeoutMs;
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&answer_timeout), sizeof(answer_timeout));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&answer_timeout), sizeof(answer_timeout));
+      if (connect(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+        const std::string request = common::LocalManagementOpenWindowRequest();
+        if (send(sock, request.data(), static_cast<int>(request.size()), 0) == static_cast<int>(request.size())) {
+          char buffer[64];
+          int received = 0;
+          while (received < 12) {
+            const int read = recv(sock, buffer + received, static_cast<int>(sizeof(buffer)) - received, 0);
+            if (read <= 0) break;
+            received += read;
+          }
+          accepted = common::LocalManagementOpenWindowAccepted(std::string_view(buffer, static_cast<size_t>(received)));
+        }
+      }
+    }
+    closesocket(sock);
+  }
+  WSACleanup();
+  return accepted;
+}
+
+/** Click on the indicator: the node opens the window; only if it cannot, the browser opens the panel URL (the previous behaviour). */
+void OpenLocalManagement() {
+  std::thread([] {
+    if (RequestNodeOpenPanelWindow()) return;
+    const std::string_view url = common::kLocalManagementUrl;
+    const std::wstring wide(url.begin(), url.end());
+    ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  }).detach();
+}
+
+int Scaled(UINT dpi, int logical) {
+  return MulDiv(logical, dpi > 0 ? static_cast<int>(dpi) : 96, 96);
+}
+
+UINT WindowDpi(HWND window) {
+  const UINT dpi = window ? GetDpiForWindow(window) : 0;
+  return dpi > 0 ? dpi : 96;
+}
+
+/**
+ * High contrast replaces the brand palette with the user's chosen system
+ * colours. Ignoring it would leave an always-on-top window that a
+ * low-vision user cannot read, and it is the one surface they cannot dismiss.
+ */
+bool HighContrastActive() {
+  HIGHCONTRASTW info{};
+  info.cbSize = sizeof(info);
+  if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(info), &info, 0)) {
+    return false;
+  }
+  return (info.dwFlags & HCF_HIGHCONTRASTON) != 0;
+}
+
+struct Palette {
+  COLORREF surface;
+  COLORREF border;
+  COLORREF title;
+  COLORREF detail;
+  COLORREF stop_fill;
+  COLORREF stop_border;
+  COLORREF stop_text;
+};
+
+Palette CurrentPalette(bool stopping, bool paused, int viewers, int controllers) {
+  if (HighContrastActive()) {
+    const COLORREF window = GetSysColor(COLOR_WINDOW);
+    const COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
+    const COLORREF accent = GetSysColor(stopping ? COLOR_GRAYTEXT : COLOR_HOTLIGHT);
+    return Palette{window, text, text, text, window, accent, text};
+  }
+  const COLORREF state = paused ? RGB(129, 139, 151)
+      : controllers > 0 ? RGB(244, 80, 112)
+      : viewers > 0 ? RGB(242, 169, 59) : RGB(50, 196, 255);
+  return Palette{
+      RGB(5, 16, 29), state, RGB(227, 247, 255), RGB(137, 177, 205),
+      stopping ? RGB(52, 63, 74) : RGB(116, 29, 49),
+      stopping ? RGB(88, 103, 117) : RGB(244, 80, 112),
+      stopping ? RGB(165, 179, 190) : RGB(255, 236, 241)};
+}
+
+/** Nearest compiled bitmap at or above `wanted`, so we never upscale. */
+const brand::LogoBitmap* SelectLogoBitmap(int wanted) {
+  const brand::LogoBitmap* best = nullptr;
+  for (int i = 0; i < brand::kLogoBitmapCount; ++i) {
+    const brand::LogoBitmap& candidate = brand::kLogoBitmaps[i];
+    if (candidate.size >= wanted && (!best || candidate.size < best->size)) {
+      best = &candidate;
+    }
+  }
+  if (best) return best;
+  // Every compiled size is smaller than the monitor wants: use the largest.
+  for (int i = 0; i < brand::kLogoBitmapCount; ++i) {
+    if (!best || brand::kLogoBitmaps[i].size > best->size) {
+      best = &brand::kLogoBitmaps[i];
+    }
+  }
+  return best;
+}
+
+/**
+ * Returns false when the logo could not be composited for any reason -- no
+ * compiled bitmap, DIB allocation refused, AlphaBlend unavailable. The caller
+ * then draws the text-only layout instead of leaving a hole, so a failed
+ * image can never cost the user the disclosure itself.
+ */
+bool DrawBrandLogo(HDC dc, int x, int y, int edge) {
+  const brand::LogoBitmap* bitmap = SelectLogoBitmap(edge);
+  if (!bitmap || !bitmap->premultiplied_bgra || bitmap->size <= 0) return false;
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(info.bmiHeader);
+  info.bmiHeader.biWidth = bitmap->size;
+  // Negative height: the generated rows are top-down.
+  info.bmiHeader.biHeight = -bitmap->size;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  void* pixels = nullptr;
+  const HDC memory = CreateCompatibleDC(dc);
+  if (!memory) return false;
+  const HBITMAP dib =
+      CreateDIBSection(memory, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+  if (!dib || !pixels) {
+    if (dib) DeleteObject(dib);
+    DeleteDC(memory);
+    return false;
+  }
+  memcpy(pixels, bitmap->premultiplied_bgra,
+         static_cast<size_t>(bitmap->size) * bitmap->size * 4);
+  const HGDIOBJ old = SelectObject(memory, dib);
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = 255;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  const BOOL drawn = AlphaBlend(dc, x, y, edge, edge, memory, 0, 0,
+                                bitmap->size, bitmap->size, blend);
+  SelectObject(memory, old);
+  DeleteObject(dib);
+  DeleteDC(memory);
+  return drawn != FALSE;
+}
+
+struct InputDispatchRequest {
+  UINT count = 0;
+  LPINPUT inputs = nullptr;
+  int size = 0;
+  UINT accepted = 0;
+  DWORD error = ERROR_SUCCESS;
+};
+
+struct ClipboardReadRequest {
+  DWORD previous_sequence = 0;
+  std::u16string text;
+  bool available = false;
+};
+
+/**
+ * Whether Windows is hiding the pointer because nothing physical has moved it.
+ * Distinct from an application hiding the cursor on purpose, which reports no
+ * state at all and must be left alone.
+ */
+bool PointerSuppressed() {
+  CURSORINFO cursor{};
+  cursor.cbSize = sizeof(cursor);
+  if (!GetCursorInfo(&cursor)) return false;
+  return (cursor.flags & CURSOR_SUPPRESSED) != 0 &&
+         (cursor.flags & CURSOR_SHOWING) == 0;
+}
+
+struct PointerMoveRequest {
+  int x = 0;
+  int y = 0;
+  bool accepted = false;
+  DWORD error = ERROR_SUCCESS;
+};
+
+bool ReadCollapsedPreference() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  const LONG result = RegGetValueW(HKEY_CURRENT_USER, kRegistryPath,
+                                   kCollapsedValue, RRF_RT_REG_DWORD, nullptr,
+                                   &value, &size);
+  return result == ERROR_SUCCESS && value != 0;
+}
+
+void WriteCollapsedPreference(bool collapsed) {
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegistryPath, 0, nullptr, 0,
+                      KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+    return;
+  }
+  const DWORD value = collapsed ? 1 : 0;
+  RegSetValueExW(key, kCollapsedValue, 0, REG_DWORD,
+                 reinterpret_cast<const BYTE*>(&value), sizeof(value));
+  RegCloseKey(key);
+}
+
+RECT CollapseRect(const RECT& client, UINT dpi) {
+  return RECT{client.right - Scaled(dpi, 42), Scaled(dpi, 8),
+              client.right - Scaled(dpi, 8), Scaled(dpi, 40)};
+}
+
+RECT StopRect(const RECT& client, UINT dpi) {
+  return RECT{Scaled(dpi, 16), client.bottom - Scaled(dpi, 50),
+              client.right - Scaled(dpi, 16), client.bottom - Scaled(dpi, 14)};
+}
+
+bool Contains(const RECT& rect, int x, int y) {
+  const POINT point{x, y};
+  return PtInRect(&rect, point) != FALSE;
+}
+
+HMONITOR ActiveMonitor() {
+  if (const HWND foreground = GetForegroundWindow()) {
+    if (const HMONITOR monitor =
+            MonitorFromWindow(foreground, MONITOR_DEFAULTTONULL)) {
+      return monitor;
+    }
+  }
+  POINT cursor{};
+  if (GetCursorPos(&cursor))
+    return MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+  return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+HFONT CreateUiFont(HWND window, int points, int weight) {
+  const UINT dpi = GetDpiForWindow(window);
+  const int height = -MulDiv(points, dpi > 0 ? static_cast<int>(dpi) : 96, 72);
+  return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                     L"Segoe UI Variable Text");
+}
+
+void DrawRoundedFill(HDC dc, const RECT& rect, int radius, COLORREF fill,
+                     COLORREF border) {
+  const HBRUSH brush = CreateSolidBrush(fill);
+  const HPEN pen = CreatePen(PS_SOLID, 1, border);
+  const HGDIOBJ old_brush = SelectObject(dc, brush);
+  const HGDIOBJ old_pen = SelectObject(dc, pen);
+  RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+  SelectObject(dc, old_brush);
+  SelectObject(dc, old_pen);
+  DeleteObject(brush);
+  DeleteObject(pen);
+}
+
+}  // namespace
+
+LocalIndicator::LocalIndicator() = default;
+LocalIndicator::~LocalIndicator() { Stop(); }
+
+bool LocalIndicator::Start(StopAll stop_all,
+                           EnvironmentChanged environment_changed) {
+  if (thread_.joinable()) return start_ok_;
+  stop_all_ = std::move(stop_all);
+  environment_changed_ = std::move(environment_changed);
+  stopping_ = false;
+  confirming_stop_ = false;
+  stop_requested_ = false;
+  {
+    std::lock_guard lock(start_mutex_);
+    start_complete_ = false;
+    start_ok_ = false;
+  }
+  thread_ = std::thread(&LocalIndicator::ThreadMain, this);
+  std::unique_lock lock(start_mutex_);
+  start_cv_.wait(lock, [this] { return start_complete_; });
+  return start_ok_;
+}
+
+void LocalIndicator::Update(int viewers, int controllers) {
+  viewers_ = std::max(0, viewers);
+  controllers_ = std::max(0, controllers);
+  const HWND window = window_.load();
+  // Visibility is a privacy boundary: the signaling thread must not return
+  // (and start DXGI capture) until the interactive indicator applied state.
+  if (window) SendMessageW(window, kUpdateMessage, 0, 0);
+}
+
+void LocalIndicator::UpdateAccessPaused(bool paused) {
+  access_paused_ = paused;
+  const HWND window = window_.load();
+  if (window) PostMessageW(window, kUpdateMessage, 0, 0);
+}
+
+UINT LocalIndicator::DispatchInput(UINT count, LPINPUT inputs, int size) {
+  const HWND window = window_.load();
+  if (!window || !inputs || count == 0 || size != sizeof(INPUT)) return 0;
+  InputDispatchRequest request{count, inputs, size};
+  SendMessageW(window, kDispatchInputMessage, 0,
+               reinterpret_cast<LPARAM>(&request));
+  SetLastError(request.error);
+  return request.accepted;
+}
+
+bool LocalIndicator::MovePointer(int x, int y) {
+  const HWND window = window_.load();
+  if (!window) return false;
+  PointerMoveRequest request{x, y};
+  SendMessageW(window, kMovePointerMessage, 0,
+               reinterpret_cast<LPARAM>(&request));
+  SetLastError(request.error);
+  return request.accepted;
+}
+
+bool LocalIndicator::InputAvailable() {
+  const HWND window = window_.load();
+  return window && SendMessageW(window, kProbeInputMessage, 0, 0) == TRUE;
+}
+
+DWORD LocalIndicator::ClipboardSequence() const {
+  return GetClipboardSequenceNumber();
+}
+
+std::optional<std::u16string> LocalIndicator::ReadClipboardText(
+    DWORD previous_sequence) {
+  const HWND window = window_.load();
+  if (!window) return std::nullopt;
+  ClipboardReadRequest request;
+  request.previous_sequence = previous_sequence;
+  SendMessageW(window, kReadClipboardMessage, 0,
+               reinterpret_cast<LPARAM>(&request));
+  return request.available
+             ? std::optional<std::u16string>(std::move(request.text))
+             : std::nullopt;
+}
+
+void LocalIndicator::Stop() {
+  if (!thread_.joinable()) return;
+  stopping_ = true;
+  const HWND window = window_.load();
+  if (window) PostMessageW(window, kStopMessage, 0, 0);
+  thread_.join();
+  window_ = nullptr;
+  std::lock_guard lock(bound_desktop_mutex_);
+  bound_desktop_.clear();
+}
+
+LRESULT CALLBACK LocalIndicator::WindowProc(HWND window, UINT message,
+                                             WPARAM wparam, LPARAM lparam) {
+  LocalIndicator* self = reinterpret_cast<LocalIndicator*>(
+      GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+    self = static_cast<LocalIndicator*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(self));
+  }
+  return self ? self->HandleMessage(window, message, wparam, lparam)
+              : DefWindowProcW(window, message, wparam, lparam);
+}
+
+LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
+                                       WPARAM wparam, LPARAM lparam) {
+  switch (message) {
+    case WM_PAINT:
+      PaintWindow(window);
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_LBUTTONUP: {
+      if (collapsed_) {
+        SetCollapsed(false, true);
+        if (viewers_.load() > 0) {
+          SetTimer(window, kAutoCollapseTimer,
+                   common::kLocalIndicatorAutoCollapseDelayMs, nullptr);
+        }
+        return 0;
+      }
+      RECT client{};
+      GetClientRect(window, &client);
+      const int x = GET_X_LPARAM(lparam);
+      const int y = GET_Y_LPARAM(lparam);
+      if (Contains(CollapseRect(client, WindowDpi(window)), x, y)) {
+        SetCollapsed(true, true);
+      } else if (Contains(StopRect(client, WindowDpi(window)), x, y)) {
+        RequestStopAll();
+      } else {
+        OpenLocalManagement();
+      }
+      return 0;
+    }
+    case WM_TIMER:
+      if (wparam == kAutoCollapseTimer) {
+        KillTimer(window, kAutoCollapseTimer);
+        if (viewers_.load() > 0 && !confirming_stop_.load()) {
+          SetCollapsed(true, false);
+        }
+        return 0;
+      }
+      break;
+    case WM_SETCURSOR: {
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      ScreenToClient(window, &cursor);
+      RECT client{};
+      GetClientRect(window, &client);
+      const UINT hover_dpi = WindowDpi(window);
+      if (collapsed_ ||
+          Contains(CollapseRect(client, hover_dpi), cursor.x, cursor.y) ||
+          Contains(StopRect(client, hover_dpi), cursor.x, cursor.y)) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return TRUE;
+      }
+      break;
+    }
+    case WM_CLOSE:
+      RequestStopAll();
+      return 0;
+    case WM_DISPLAYCHANGE:
+      AnchorToCorner(window);
+      if (environment_changed_)
+        environment_changed_(kEnvironmentDisplayChanged);
+      return 0;
+    case WM_DWMCOMPOSITIONCHANGED:
+      // A DWM restart invalidates more than the output rectangle: active DXGI
+      // duplication and encoder state may remain alive but never progress.
+      // Force the bounded media reinitialization path instead of treating the
+      // compositor restart as an ordinary topology refresh.
+      AnchorToCorner(window);
+      if (environment_changed_)
+        environment_changed_(kEnvironmentCompositionChanged);
+      return 0;
+    case WM_SETTINGCHANGE:
+    case WM_DPICHANGED:
+      AnchorToCorner(window);
+      return 0;
+    case WM_POWERBROADCAST:
+      if (environment_changed_) {
+        if (wparam == PBT_APMSUSPEND)
+          environment_changed_(kEnvironmentSuspend);
+        else if (wparam == PBT_APMRESUMEAUTOMATIC ||
+                 wparam == PBT_APMRESUMESUSPEND ||
+                 wparam == PBT_APMRESUMECRITICAL)
+          environment_changed_(kEnvironmentResume);
+      }
+      return TRUE;
+    case WM_WTSSESSION_CHANGE:
+      if (environment_changed_) {
+        if (wparam == WTS_SESSION_LOCK) {
+          // Locking moves the desktops; it does not end the session. Reporting
+          // it as unavailable is what used to make signing in look like a
+          // dropped remote-desktop connection.
+          environment_changed_(kEnvironmentSessionLocked);
+        } else if (wparam == WTS_SESSION_UNLOCK) {
+          environment_changed_(kEnvironmentSessionUnlocked);
+        } else if (wparam == WTS_SESSION_LOGOFF ||
+                   wparam == WTS_CONSOLE_DISCONNECT ||
+                   wparam == WTS_REMOTE_DISCONNECT) {
+          // "Unavailable" describes the user session, not this LocalSystem
+          // worker or its peer. The runtime keeps the peer and waits for the
+          // Winlogon desktop to become readable.
+          environment_changed_(kEnvironmentSessionUnavailable);
+        } else if (wparam == WTS_SESSION_LOGON ||
+                   wparam == WTS_CONSOLE_CONNECT ||
+                   wparam == WTS_REMOTE_CONNECT) {
+          // Logon/connect is the other half of the same in-place desktop
+          // transition; it must not request a fresh media process.
+          environment_changed_(kEnvironmentSessionAvailable);
+        }
+      }
+      return 0;
+    case kUpdateMessage: {
+      const int viewers = viewers_.load();
+      const int controllers = controllers_.load();
+      if (viewers > 0 &&
+          (viewers != presented_viewers_ || controllers != presented_controllers_)) {
+        SetCollapsed(false, false);
+        SetTimer(window, kAutoCollapseTimer,
+                 common::kLocalIndicatorAutoCollapseDelayMs, nullptr);
+      } else if (viewers == 0) {
+        KillTimer(window, kAutoCollapseTimer);
+      }
+      presented_viewers_ = viewers;
+      presented_controllers_ = controllers;
+      RefreshWindow();
+      return 0;
+    }
+    case kDispatchInputMessage: {
+      auto* request = reinterpret_cast<InputDispatchRequest*>(lparam);
+      if (!request || !request->inputs || request->count == 0 ||
+          request->size != sizeof(INPUT)) {
+        return 0;
+      }
+      SetLastError(ERROR_SUCCESS);
+      request->accepted =
+          SendInput(request->count, request->inputs, request->size);
+      request->error = GetLastError();
+      return request->accepted;
+    }
+    case kProbeInputMessage: {
+      POINT cursor{};
+      return GetCursorPos(&cursor) && SetCursorPos(cursor.x, cursor.y);
+    }
+    case kMovePointerMessage: {
+      auto* request = reinterpret_cast<PointerMoveRequest*>(lparam);
+      if (!request) return FALSE;
+      SetLastError(ERROR_SUCCESS);
+      request->accepted = SetCursorPos(request->x, request->y) == TRUE;
+      request->error = GetLastError();
+      // A machine with no physical mouse keeps its pointer suppressed, and
+      // SetCursorPos moves a suppressed pointer without ever revealing it — the
+      // viewer sees a desktop where the cursor simply is not there. Measured on
+      // such a node: a zero-delta mouse move clears the suppression and leaves
+      // the position exactly where it was put, so the remote pointer stays
+      // pixel-exact and visible.
+      if (request->accepted && PointerSuppressed()) {
+        INPUT reveal{};
+        reveal.type = INPUT_MOUSE;
+        reveal.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &reveal, sizeof(INPUT));
+      }
+      return request->accepted ? TRUE : FALSE;
+    }
+    case kReadClipboardMessage: {
+      auto* request = reinterpret_cast<ClipboardReadRequest*>(lparam);
+      if (!request || GetClipboardSequenceNumber() == 0 ||
+          GetClipboardSequenceNumber() == request->previous_sequence ||
+          !OpenClipboard(window)) {
+        return 0;
+      }
+      const HANDLE data = GetClipboardData(CF_UNICODETEXT);
+      const SIZE_T allocation_bytes = data ? GlobalSize(data) : 0;
+      const auto* value = data
+          ? static_cast<const wchar_t*>(GlobalLock(data))
+          : nullptr;
+      constexpr size_t kMaximumClipboardCodeUnits = kMaxClipboardTextBytes;
+      size_t length = 0;
+      if (value && allocation_bytes >= sizeof(wchar_t)) {
+        const size_t allocation_units = allocation_bytes / sizeof(wchar_t);
+        const size_t scan_limit = std::min(
+            allocation_units, kMaximumClipboardCodeUnits + 1);
+        while (length < scan_limit && value[length] != L'\0') ++length;
+        if (length > 0 && length <= kMaximumClipboardCodeUnits &&
+            length < allocation_units) {
+          request->text.assign(
+              reinterpret_cast<const char16_t*>(value), length);
+          request->available = true;
+        }
+      }
+      if (value) GlobalUnlock(data);
+      CloseClipboard();
+      return request->available ? TRUE : FALSE;
+    }
+    case kStopMessage:
+      DestroyWindow(window);
+      return 0;
+    case WM_DESTROY:
+      if (wts_registered_) WTSUnRegisterSessionNotification(window);
+      PostQuitMessage(0);
+      return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+std::wstring LocalIndicator::BoundDesktop() const {
+  std::lock_guard lock(bound_desktop_mutex_);
+  return bound_desktop_;
+}
+
+void LocalIndicator::ThreadMain() {
+  // Bind before creating the window: a thread that already owns windows cannot
+  // change desktops, so the desktop this indicator serves is fixed here. The
+  // worker restarts the indicator to move it, which is how one process follows
+  // Windows across the sign-in/user desktop boundary.
+  {
+    std::wstring bound;
+    HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+    if (input && SetThreadDesktop(input)) {
+      wchar_t name[64] = {};
+      DWORD needed = 0;
+      if (GetUserObjectInformationW(input, UOI_NAME, name, sizeof(name),
+                                    &needed)) {
+        bound = name;
+      }
+    } else if (input) {
+      CloseDesktop(input);
+      input = nullptr;
+    }
+    if (bound.empty()) {
+      wchar_t name[64] = {};
+      DWORD needed = 0;
+      if (GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),
+                                    UOI_NAME, name, sizeof(name), &needed)) {
+        bound = name;
+      }
+    }
+    std::lock_guard lock(bound_desktop_mutex_);
+    bound_desktop_ = bound;
+  }
+  const HINSTANCE instance = GetModuleHandleW(nullptr);
+  WNDCLASSW window_class{};
+  window_class.style = CS_HREDRAW | CS_VREDRAW;
+  window_class.lpfnWndProc = &LocalIndicator::WindowProc;
+  window_class.hInstance = instance;
+  window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  window_class.lpszClassName = kWindowClass;
+  RegisterClassW(&window_class);
+
+  collapsed_ = ReadCollapsedPreference();
+  // Creation size is logical only; the window does not exist yet so its DPI is
+  // unknown. AnchorToCorner() re-sizes with the real monitor DPI right after.
+  const int width = collapsed_ ? kCollapsedWidth : kExpandedWidth;
+  const int height = collapsed_ ? kCollapsedHeight : kExpandedHeight;
+  const HWND window = CreateWindowExW(
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kWindowClass, kWindowTitle,
+      WS_POPUP, 0, 0, width, height, nullptr, nullptr, instance, this);
+  window_ = window;
+  if (window) {
+    // Session notifications improve response time, but their registration can
+    // transiently fail during logon. The bounded desktop poll remains active,
+    // so do not kill the media worker (the old source of 56ms worker_failed).
+    wts_registered_ =
+        WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) != FALSE;
+    AnchorToCorner(window);
+    RefreshWindow();
+  }
+  {
+    std::lock_guard lock(start_mutex_);
+    start_ok_ = window != nullptr;
+    start_complete_ = true;
+  }
+  start_cv_.notify_all();
+  if (!start_ok_) return;
+
+  MSG message{};
+  while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+  window_ = nullptr;
+}
+
+void LocalIndicator::RefreshWindow() {
+  const HWND window = window_.load();
+  if (!window) return;
+  if (viewers_.load() == 0) {
+    confirming_stop_ = false;
+    stop_requested_ = false;
+  }
+  // Idle is still a real product state. The controlled-node process is
+  // running and can accept a connection, so hiding its only local affordance
+  // made remote access undiscoverable. Collapse remains available, but at
+  // least its clickable corner is always on-screen.
+  AnchorToCorner(window);
+  InvalidateRect(window, nullptr, FALSE);
+  ShowWindow(window, SW_SHOWNOACTIVATE);
+  SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void LocalIndicator::AnchorToCorner(HWND window) {
+  if (!window) return;
+  MONITORINFO info{};
+  info.cbSize = sizeof(info);
+  if (!GetMonitorInfoW(ActiveMonitor(), &info)) return;
+  const UINT dpi = WindowDpi(window);
+  const int width = Scaled(dpi, collapsed_ ? kCollapsedWidth : kExpandedWidth);
+  const int height = Scaled(dpi, collapsed_ ? kCollapsedHeight : kExpandedHeight);
+  const int margin = Scaled(dpi, kCornerMargin);
+  const int x = std::max(info.rcWork.left, info.rcWork.right - width - margin);
+  const int y = std::max(info.rcWork.top, info.rcWork.bottom - height - margin);
+  SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  const int radius = Scaled(dpi, collapsed_ ? 12 : 18);
+  SetWindowRgn(window, CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                                          radius, radius), TRUE);
+}
+
+void LocalIndicator::SetCollapsed(bool collapsed, bool persist) {
+  if (collapsed_ == collapsed) return;
+  collapsed_ = collapsed;
+  if (persist) WriteCollapsedPreference(collapsed);
+  const HWND window = window_.load();
+  if (!window) return;
+  AnchorToCorner(window);
+  InvalidateRect(window, nullptr, FALSE);
+}
+
+void LocalIndicator::PaintWindow(HWND window) {
+  PAINTSTRUCT paint{};
+  const HDC dc = BeginPaint(window, &paint);
+  RECT client{};
+  GetClientRect(window, &client);
+  const UINT dpi = WindowDpi(window);
+  const bool stopping = stop_requested_.load();
+  const Palette palette = CurrentPalette(
+      stopping, access_paused_.load(), viewers_.load(), controllers_.load());
+  SetBkMode(dc, TRANSPARENT);
+  DrawRoundedFill(dc, client, Scaled(dpi, collapsed_ ? 12 : 18),
+                  palette.surface, palette.border);
+
+  if (collapsed_) {
+    const HFONT arrow_font = CreateUiFont(window, 13, FW_BOLD);
+    const HGDIOBJ old_font = SelectObject(dc, arrow_font);
+    SetTextColor(dc, palette.border);
+    RECT arrow{Scaled(dpi, 3), Scaled(dpi, 5), Scaled(dpi, 23),
+               Scaled(dpi, 33)};
+    static_assert(common::LocalIndicatorExpandChevron(
+        common::LocalIndicatorEdge::kRight) == '<');
+    DrawTextW(dc, L"<", -1, &arrow,
+              DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    const std::string badge = common::LocalIndicatorBadgeText(
+        static_cast<std::uint32_t>(std::max(0, viewers_.load())));
+    if (!badge.empty()) {
+      RECT bubble{Scaled(dpi, 26), Scaled(dpi, 7), Scaled(dpi, 51),
+                  Scaled(dpi, 31)};
+      DrawRoundedFill(dc, bubble, Scaled(dpi, 12), palette.border,
+                      palette.border);
+      SetTextColor(dc, palette.surface);
+      const std::wstring value(badge.begin(), badge.end());
+      DrawTextW(dc, value.c_str(), -1, &bubble,
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    } else if (!DrawBrandLogo(dc, Scaled(dpi, 30), Scaled(dpi, 10),
+                              Scaled(dpi, 18))) {
+      const HBRUSH mark = CreateSolidBrush(palette.border);
+      const HGDIOBJ old_mark = SelectObject(dc, mark);
+      Ellipse(dc, Scaled(dpi, 35), Scaled(dpi, 15), Scaled(dpi, 43),
+              Scaled(dpi, 23));
+      SelectObject(dc, old_mark);
+      DeleteObject(mark);
+    }
+    SelectObject(dc, old_font);
+    DeleteObject(arrow_font);
+    EndPaint(window, &paint);
+    return;
+  }
+
+  const int logo_edge = Scaled(dpi, kLogoLogicalSize);
+  const int logo_x = Scaled(dpi, 16);
+  const int logo_y = Scaled(dpi, 12);
+  const bool logo_drawn = DrawBrandLogo(dc, logo_x, logo_y, logo_edge);
+  if (!logo_drawn) {
+    // Image failure must not shift the text: the live dot occupies the same
+    // box the logo would have.
+    const HBRUSH live = CreateSolidBrush(palette.border);
+    const HGDIOBJ old_live = SelectObject(dc, live);
+    Ellipse(dc, logo_x + logo_edge / 4, logo_y + logo_edge / 4,
+            logo_x + logo_edge * 3 / 4, logo_y + logo_edge * 3 / 4);
+    SelectObject(dc, old_live);
+    DeleteObject(live);
+  }
+
+  const HFONT title_font = CreateUiFont(window, 11, FW_SEMIBOLD);
+  const HFONT detail_font = CreateUiFont(window, 9, FW_NORMAL);
+  const HFONT button_font = CreateUiFont(window, 9, FW_SEMIBOLD);
+  const HGDIOBJ old_font = SelectObject(dc, title_font);
+  SetTextColor(dc, palette.title);
+  // The product name is spelled out next to the mark so the disclosure is
+  // attributable even when the logo cannot render or the user cannot see it.
+  const std::wstring heading =
+      std::wstring(common::kAiDeskProductNameWide) + L"  ·  " + kSurfaceName;
+  RECT title{logo_x + logo_edge + Scaled(dpi, 10), Scaled(dpi, 9),
+             client.right - Scaled(dpi, 50), Scaled(dpi, 39)};
+  DrawTextW(dc, heading.c_str(), -1, &title,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+  SelectObject(dc, detail_font);
+  SetTextColor(dc, palette.detail);
+  // Counts only. See the isolation note on LocalIndicator::Update().
+  const std::wstring detail = access_paused_.load()
+      ? L"REMOTE ACCESS PAUSED"
+      : std::to_wstring(viewers_.load()) + L" VIEWING  ·  " +
+            std::to_wstring(controllers_.load()) + L" CONTROLLING";
+  RECT detail_rect{Scaled(dpi, 18), Scaled(dpi, 42),
+                   client.right - Scaled(dpi, 18), Scaled(dpi, 75)};
+  DrawTextW(dc, detail.c_str(), -1, &detail_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+  const RECT collapse = CollapseRect(client, dpi);
+  DrawRoundedFill(dc, collapse, Scaled(dpi, 10),
+                  HighContrastActive() ? palette.surface : RGB(10, 35, 55),
+                  HighContrastActive() ? palette.title : RGB(43, 111, 149));
+  SetTextColor(dc, HighContrastActive() ? palette.title : RGB(119, 213, 255));
+  RECT fold_text = collapse;
+  DrawTextW(dc, L">", -1, &fold_text,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+
+  const RECT stop = StopRect(client, dpi);
+  DrawRoundedFill(dc, stop, Scaled(dpi, 12), palette.stop_fill,
+                  palette.stop_border);
+  SelectObject(dc, button_font);
+  SetTextColor(dc, palette.stop_text);
+  RECT stop_text = stop;
+  DrawTextW(dc, stopping ? L"STOPPING…"
+                         : confirming_stop_.load() ? L"CONFIRM STOP ALL"
+                                                   : L"STOP ALL REMOTE SESSIONS", -1,
+            &stop_text,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS |
+                DT_NOPREFIX);
+
+  SelectObject(dc, old_font);
+  DeleteObject(title_font);
+  DeleteObject(detail_font);
+  DeleteObject(button_font);
+  EndPaint(window, &paint);
+}
+
+void LocalIndicator::RequestStopAll() {
+  if (stopping_ || stop_requested_) return;
+  const HWND window = window_.load();
+  if (!confirming_stop_.exchange(true)) {
+    if (window) InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
+  confirming_stop_ = false;
+  stop_requested_ = true;
+  if (window) InvalidateRect(window, nullptr, FALSE);
+  if (stop_all_) stop_all_();
+}
+
+}  // namespace imcodes::rd

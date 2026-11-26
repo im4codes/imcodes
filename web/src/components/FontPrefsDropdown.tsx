@@ -12,9 +12,25 @@
  * `storage` event for cross-tab). Preferences are persisted per-machine
  * via localStorage under `imcodes_fontPrefs:<scope>`.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
+import {
+  formatGlobalFontDelta,
+  MAX_GLOBAL_FONT_DELTA,
+  MIN_GLOBAL_FONT_DELTA,
+  useGlobalFontDelta,
+} from '../global-font.js';
+import {
+  formatUiScale,
+  getActiveCssZoom,
+  markUiScalePrompted,
+  MAX_UI_SCALE,
+  MIN_UI_SCALE,
+  UI_SCALE_EVENT,
+  UI_SCALE_STEP,
+  useUiScale,
+} from '../ui-scale.js';
 
 export interface FontPrefs {
   family: string;
@@ -249,6 +265,17 @@ export function useFontPrefs(scope: string, defaults: FontPrefs): [FontPrefs, (n
   defaultsRef.current = defaults;
 
   useEffect(() => {
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem(STORAGE_PREFIX + scope) !== null) {
+        return;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+    setPrefs(readFontPrefs(scope, defaultsRef.current));
+  }, [scope, defaults.family, defaults.cjkFamily, defaults.size]);
+
+  useEffect(() => {
     const refresh = () => setPrefs(readFontPrefs(scope, defaultsRef.current));
     const onSameTab = (e: Event) => {
       const detail = (e as CustomEvent<{ scope?: string }>).detail;
@@ -414,8 +441,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [activeTab, setActiveTab] = useState<FontTab>('code');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const [showAllSystemCJK, setShowAllSystemCJK] = useState(false);
+  const [globalDelta, setGlobalDelta] = useGlobalFontDelta();
+  const [uiScale, setUiScale, defaultUiScale] = useUiScale();
   const wrapRef = useRef<HTMLDivElement>(null);
-  const suppressNextSizeClickRef = useRef(false);
+  const popRef = useRef<HTMLDivElement>(null);
+  const latestPrefsRef = useRef(prefs);
+  latestPrefsRef.current = prefs;
   const lastSelectEventRef = useRef('');
 
   // Filter the curated preset list down to families actually installed on
@@ -449,12 +480,44 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     };
   }, [open]);
 
+  // Clamp horizontal position into the zoomed logical viewport so the popover
+  // never overflows off the right or left screen edge on narrow phones (e.g. 360dp @ 150%).
+  useLayoutEffect(() => {
+    if (!open || typeof window === 'undefined') return;
+    const clampHorizontal = () => {
+      const popEl = popRef.current;
+      if (!popEl) return;
+      popEl.style.left = '0px';
+      const popRect = popEl.getBoundingClientRect();
+      if (popRect.width <= 0 || window.innerWidth <= 0) return;
+      const rootRect = document.documentElement.getBoundingClientRect();
+      const viewportW = rootRect.width > 0 ? rootRect.width : window.innerWidth;
+      const rectToCssScale = rootRect.width > 0 && Math.abs(rootRect.width - window.innerWidth) > 2
+        ? 1
+        : getActiveCssZoom();
+      const margin = 8 / (rectToCssScale === 1 ? getActiveCssZoom() : 1);
+      const maxLeft = Math.max(margin, viewportW - margin - popRect.width);
+      const clampedLeft = Math.max(margin, Math.min(popRect.left, maxLeft));
+      const delta = clampedLeft - popRect.left;
+      if (Math.abs(delta) > 0.5) {
+        popEl.style.left = `${Math.round(delta / rectToCssScale)}px`;
+      }
+    };
+    clampHorizontal();
+    window.addEventListener('resize', clampHorizontal);
+    window.addEventListener(UI_SCALE_EVENT, clampHorizontal);
+    return () => {
+      window.removeEventListener('resize', clampHorizontal);
+      window.removeEventListener(UI_SCALE_EVENT, clampHorizontal);
+    };
+  }, [open, uiScale, globalDelta, prefs.size, activeTab]);
+
   const compact = variant === 'compact';
   const btnSize = compact ? 22 : 26;
 
   const triggerStyle = {
-    width: btnSize,
-    height: btnSize,
+    minWidth: btnSize,
+    minHeight: btnSize,
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -467,7 +530,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     fontWeight: 600,
     fontFamily: 'system-ui',
     lineHeight: 1,
-    padding: 0,
+    padding: '0 4px',
     transition: 'background 0.12s, border-color 0.12s',
     flexShrink: 0,
   } as const;
@@ -475,12 +538,16 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const popStyle = {
     position: 'absolute' as const,
     top: 'calc(100% + 4px)',
-    // Anchor to the trigger's left edge — the trigger sits on the left side
-    // of the chat title bar, so a left-anchored popover stays on screen and
-    // reads naturally left-to-right on both desktop and mobile.
+    // Anchor to the trigger's left edge by default, then clamp into the zoomed
+    // viewport width via useLayoutEffect so narrow screens @ 150% never clip.
     left: 0,
     zIndex: 80,
-    width: 220,
+    minWidth: 'min(236px, calc(var(--imcodes-ui-vw, 100vw) - 16px))',
+    width: 'max-content',
+    maxWidth: 'min(300px, calc(var(--imcodes-ui-vw, 100vw) - 16px))',
+    maxHeight: 'calc(var(--vvh, var(--imcodes-ui-dvh)) - 56px)',
+    overflowY: 'auto' as const,
+    boxSizing: 'border-box' as const,
     background: '#1e293b',
     border: '1px solid #334155',
     borderRadius: 8,
@@ -494,7 +561,24 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const sizeRowStyle = {
     display: 'flex',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap' as const,
+    gap: '4px 8px',
+  } as const;
+
+  const sizeRowLabelStyle = {
+    fontSize: 11,
+    fontWeight: 600,
+    fontFamily: 'system-ui',
+    color: '#cbd5e1',
+    whiteSpace: 'nowrap' as const,
+  } as const;
+
+  const sizeControlsGroupStyle = {
+    display: 'inline-flex',
+    alignItems: 'center',
     gap: 4,
+    flexShrink: 0,
   } as const;
 
   const tabRowStyle = {
@@ -575,8 +659,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   } as const;
 
   const sizeBtnStyle = (disabled: boolean) => ({
-    width: 30,
-    height: 26,
+    minWidth: 28,
+    minHeight: 26,
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -584,12 +668,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     color: '#e2e8f0',
     border: '1px solid #334155',
     borderRadius: 6,
-    fontSize: 16,
+    fontSize: 15,
     fontFamily: 'system-ui',
     fontWeight: 500,
     cursor: disabled ? 'not-allowed' : 'pointer',
     opacity: disabled ? 0.4 : 1,
-    padding: 0,
+    padding: '2px 6px',
     lineHeight: 1,
   } as const);
 
@@ -617,31 +701,43 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   } as const;
 
   const setSize = useCallback((delta: number) => {
-    const next = clampSize(prefs.size + delta);
-    if (next !== prefs.size) onChange({ ...prefs, size: next });
-  }, [onChange, prefs]);
-
-  const handleSizePointerDown = useCallback((delta: number) => (e: JSX.TargetedPointerEvent<HTMLButtonElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    suppressNextSizeClickRef.current = true;
-    setSize(delta);
-    window.setTimeout(() => { suppressNextSizeClickRef.current = false; }, 0);
-  }, [setSize]);
+    // More than one activation can arrive before the parent commits a render
+    // (e.g. assistive clicks). Advance the pending value, not a stale closure.
+    const current = latestPrefsRef.current;
+    const next = clampSize(current.size + delta);
+    if (next !== current.size) {
+      latestPrefsRef.current = { ...current, size: next };
+      onChange(latestPrefsRef.current);
+    }
+  }, [onChange]);
 
   const handleSizeClick = useCallback((delta: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (suppressNextSizeClickRef.current) return;
+    // Native button activation unifies mouse, touch, keyboard and AT. Updating
+    // on press as well would double-count the later click and commit cancels.
     setSize(delta);
   }, [setSize]);
 
-  const handleSizeKeyDown = useCallback((delta: number) => (e: JSX.TargetedKeyboardEvent<HTMLButtonElement>) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
+  const handleGlobalDeltaClick = useCallback((step: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    setSize(delta);
-  }, [setSize]);
+    setGlobalDelta((prev) => prev + step);
+  }, [setGlobalDelta]);
+
+  const handleUiScaleClick = useCallback((step: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    markUiScalePrompted();
+    setUiScale((prev) => prev + step);
+  }, [setUiScale]);
+
+  const handleUiScaleResetClick = useCallback((e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    markUiScalePrompted();
+    setUiScale(defaultUiScale);
+  }, [setUiScale, defaultUiScale]);
 
   const pickCodeFamily = (cssValue: string) => {
     const cjkFamily = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
@@ -731,33 +827,96 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
         Aa
       </button>
       {open && (
-        <div style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
-          {/* Row 1 — size adjuster (− current +). Always first so the most
-              common adjustment is the closest to the trigger. */}
-          <div style={sizeRowStyle}>
-            <button
-              type="button"
-              onPointerDown={handleSizePointerDown(-1)}
-              onClick={handleSizeClick(-1)}
-              onKeyDown={handleSizeKeyDown(-1)}
-              disabled={prefs.size <= MIN_SIZE}
-              aria-label="−"
-              style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
-            >
-              −
-            </button>
-            <div style={sizeReadoutStyle}>{prefs.size}</div>
-            <button
-              type="button"
-              onPointerDown={handleSizePointerDown(1)}
-              onClick={handleSizeClick(1)}
-              onKeyDown={handleSizeKeyDown(1)}
-              disabled={prefs.size >= MAX_SIZE}
-              aria-label="+"
-              style={sizeBtnStyle(prefs.size >= MAX_SIZE)}
-            >
-              +
-            </button>
+        <div ref={popRef} data-testid="font-prefs-popover" style={popStyle} role="dialog" aria-modal="false" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
+          {/* Row 0 — whole-page UI scale (− 100% +), scales chrome, icons, cards, modals, and text uniformly. */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              {uiScale !== defaultUiScale && (
+                <button
+                  type="button"
+                  onClick={handleUiScaleResetClick}
+                  data-testid="ui-scale-reset"
+                  aria-label={t('chat.font.uiScaleReset', { defaultValue: 'Reset UI scale' })}
+                  style={{ ...sizeBtnStyle(false), fontSize: 11, padding: '0 6px' }}
+                >
+                  {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleUiScaleClick(-UI_SCALE_STEP)}
+                disabled={uiScale <= MIN_UI_SCALE}
+                aria-label={t('chat.font.uiScaleDecrease', { defaultValue: 'Decrease UI scale' })}
+                style={sizeBtnStyle(uiScale <= MIN_UI_SCALE)}
+              >
+                −
+              </button>
+              <div style={{ ...sizeReadoutStyle, minWidth: 38 }} data-testid="ui-scale-readout">
+                {formatUiScale(uiScale)}
+              </div>
+              <button
+                type="button"
+                onClick={handleUiScaleClick(UI_SCALE_STEP)}
+                disabled={uiScale >= MAX_UI_SCALE}
+                aria-label={t('chat.font.uiScaleIncrease', { defaultValue: 'Increase UI scale' })}
+                style={sizeBtnStyle(uiScale >= MAX_UI_SCALE)}
+              >
+                +
+              </button>
+            </div>
+          </div>
+          {/* Row 1 — global UI font size delta (− 0 +), scales all app typography by ±1px per step. */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              <button
+                type="button"
+                onClick={handleGlobalDeltaClick(-1)}
+                disabled={globalDelta <= MIN_GLOBAL_FONT_DELTA}
+                aria-label={t('chat.font.globalDecrease', { defaultValue: 'Decrease global font size' })}
+                style={sizeBtnStyle(globalDelta <= MIN_GLOBAL_FONT_DELTA)}
+              >
+                −
+              </button>
+              <div style={sizeReadoutStyle} data-testid="global-font-delta-readout">
+                {formatGlobalFontDelta(globalDelta)}
+              </div>
+              <button
+                type="button"
+                onClick={handleGlobalDeltaClick(1)}
+                disabled={globalDelta >= MAX_GLOBAL_FONT_DELTA}
+                aria-label={t('chat.font.globalIncrease', { defaultValue: 'Increase global font size' })}
+                style={sizeBtnStyle(globalDelta >= MAX_GLOBAL_FONT_DELTA)}
+              >
+                +
+              </button>
+            </div>
+          </div>
+          {/* Row 2 — chat message font size adjuster (− current +). */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.chatSizeLabel', { defaultValue: 'Chat size' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.chatSizeLabel', { defaultValue: 'Chat size' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              <button
+                type="button"
+                onClick={handleSizeClick(-1)}
+                disabled={prefs.size <= MIN_SIZE}
+                aria-label="−"
+                style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
+              >
+                −
+              </button>
+              <div style={sizeReadoutStyle} data-testid="chat-font-size-readout">{prefs.size}</div>
+              <button
+                type="button"
+                onClick={handleSizeClick(1)}
+                disabled={prefs.size >= MAX_SIZE}
+                aria-label="+"
+                style={sizeBtnStyle(prefs.size >= MAX_SIZE)}
+              >
+                +
+              </button>
+            </div>
           </div>
           <div style={tabRowStyle} role="tablist" aria-label={t('chat.font.typeLabel', { defaultValue: 'Font type' })}>
             <button

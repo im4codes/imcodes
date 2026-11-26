@@ -40,6 +40,7 @@ function createCopilotHarness(options?: {
   const createdConfigs: FakeSessionConfig[] = [];
   const resumedConfigs: Array<{ sessionId: string; config: FakeSessionConfig }> = [];
   const deletedSessions: string[] = [];
+  const listSessionFilters: Array<Record<string, unknown> | undefined> = [];
   let nextSessionId = 1;
 
   class FakeSession {
@@ -57,7 +58,7 @@ function createCopilotHarness(options?: {
         }))),
       },
     };
-    constructor(readonly sessionId: string) {}
+    constructor(readonly sessionId: string, readonly config: FakeSessionConfig = {}) {}
     on(handler: (event: Record<string, unknown>) => void): () => void {
       this.handlers.add(handler);
       return () => this.handlers.delete(handler);
@@ -81,21 +82,32 @@ function createCopilotHarness(options?: {
     listModels = vi.fn(async () => [{ id: 'gpt-5.4' }]);
     createSession = vi.fn(async (config: FakeSessionConfig) => {
       createdConfigs.push(config);
-      const session = new FakeSession(`session-${nextSessionId++}`);
+      const session = new FakeSession(`session-${nextSessionId++}`, config);
       sessions.set(session.sessionId, session);
       return session;
     });
     resumeSession = vi.fn(async (sessionId: string, config: FakeSessionConfig) => {
       resumedConfigs.push({ sessionId, config });
-      const session = sessions.get(sessionId) ?? new FakeSession(sessionId);
+      const session = sessions.get(sessionId) ?? new FakeSession(sessionId, config);
       sessions.set(session.sessionId, session);
       return session;
     });
-    listSessions = vi.fn(async () => [...sessions.values()].map((session) => ({
-      sessionId: session.sessionId,
-      summary: `summary:${session.sessionId}`,
-      modifiedTime: new Date('2026-01-01T00:00:00Z'),
-    })));
+    listSessions = vi.fn(async (filter?: Record<string, unknown>) => {
+      listSessionFilters.push(filter);
+      return [...sessions.values()]
+        .filter((session) => (
+          typeof filter?.cwd !== 'string'
+          || session.config.workingDirectory === filter.cwd
+        ))
+        .map((session) => ({
+          sessionId: session.sessionId,
+          summary: `summary:${session.sessionId}`,
+          modifiedTime: new Date('2026-01-01T00:00:00Z'),
+          context: {
+            cwd: String(session.config.workingDirectory ?? ''),
+          },
+        }));
+    });
     deleteSession = vi.fn(async (sessionId: string) => {
       deletedSessions.push(sessionId);
       sessions.delete(sessionId);
@@ -108,6 +120,7 @@ function createCopilotHarness(options?: {
     createdConfigs,
     resumedConfigs,
     deletedSessions,
+    listSessionFilters,
   };
 }
 
@@ -144,6 +157,48 @@ describe('CopilotSdkProvider', () => {
       connected: true,
       degradedReasons: [],
     });
+  });
+
+  it('detaches a stale route without disconnecting or silencing its replacement attachment', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+    const deltas: Array<{ sessionId: string; text: string }> = [];
+    provider.onDelta((sessionId, delta) => deltas.push({ sessionId, text: delta.delta }));
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({
+      sessionKey: 'route-stale',
+      sessionName: 'Stale route',
+      cwd: '/tmp/project',
+    });
+    await provider.createSession({
+      sessionKey: 'route-replacement',
+      sessionName: 'Replacement route',
+      cwd: '/tmp/project',
+      resumeId: 'session-1',
+      skipCreate: true,
+    });
+    const sharedSession = harness.sessions.get('session-1');
+
+    await provider.detachSession('route-stale');
+
+    expect(sharedSession?.disconnect).not.toHaveBeenCalled();
+    expect((provider as any).sessions.has('route-stale')).toBe(false);
+    expect((provider as any).sessions.has('route-replacement')).toBe(true);
+    sharedSession?.emit({
+      type: 'assistant.message_delta',
+      data: {
+        messageId: 'replacement-message',
+        deltaContent: 'replacement still streams',
+      },
+    });
+    expect(deltas).toEqual([{
+      sessionId: 'route-replacement',
+      text: 'replacement still streams',
+    }]);
+    await provider.disconnect();
   });
 
   it('bridges SDK permission requests into approval callbacks and resolves responses', async () => {
@@ -234,7 +289,7 @@ describe('CopilotSdkProvider', () => {
     await provider.send(routeId, '/compact');
 
     expect(session?.send).not.toHaveBeenCalled();
-    expect(session?.rpc.history.compact).toHaveBeenCalledOnce();
+    expect(session?.rpc.history.compact).toHaveBeenCalledWith({ trigger: 'manual' });
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
@@ -390,6 +445,26 @@ describe('CopilotSdkProvider', () => {
     const sessions = await provider.listSessions();
     expect(sessions.some((item) => item.key === 'session-1')).toBe(false);
     expect(sessions.some((item) => item.key === 'session-2')).toBe(true);
+  });
+
+  it('scopes session discovery by cwd and returns directory metadata', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-a', cwd: '/tmp/project-a' });
+    await provider.createSession({ sessionKey: 'route-b', cwd: '/tmp/project-b' });
+
+    await expect(provider.listSessions({ directory: '/tmp/project-b' })).resolves.toEqual([
+      expect.objectContaining({
+        key: 'session-2',
+        directory: '/tmp/project-b',
+      }),
+    ]);
+    expect(harness.listSessionFilters).toEqual([{ cwd: '/tmp/project-b' }]);
   });
 
   it('waits for idle before completing a tool-driven turn with an initially empty assistant message', async () => {
@@ -617,5 +692,63 @@ describe('CopilotSdkProvider', () => {
     await expect(authProvider.connect({ binaryPath: 'copilot' })).rejects.toMatchObject({
       code: 'AUTH_FAILED',
     });
+  });
+
+  it('passes xhigh for max effort on createSession, resumeSession, and setModel/setSessionEffort', async () => {
+    const harness = createCopilotHarness({ version: '1.0.112' });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({
+      sessionKey: 'route-effort',
+      cwd: '/tmp/project',
+      agentId: 'gpt-5.4',
+      effort: 'max',
+    });
+    expect(harness.createdConfigs[0]).toMatchObject({
+      model: 'gpt-5.4',
+      reasoningEffort: 'xhigh',
+    });
+
+    provider.setSessionEffort(routeId, 'high');
+    const session = harness.sessions.get('session-1');
+    expect(session?.setModel).toHaveBeenCalledWith('gpt-5.4', { reasoningEffort: 'high' });
+
+    await provider.createSession({
+      sessionKey: 'route-effort-resumed',
+      cwd: '/tmp/project',
+      agentId: 'gpt-5.4',
+      effort: 'max',
+      resumeId: 'session-1',
+      skipCreate: true,
+    });
+    expect(harness.resumedConfigs[0]?.config).toMatchObject({
+      model: 'gpt-5.4',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('passes an explicit absolute binaryPath via 1.0.34 stdio connection.path', async () => {
+    const harness = createCopilotHarness({ version: '1.0.112' });
+    const clientCtors: unknown[] = [];
+    const CapturingClient = class extends harness.FakeClient {
+      constructor(opts?: unknown) {
+        super();
+        clientCtors.push(opts);
+      }
+    };
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: CapturingClient,
+    }) as unknown as typeof import('@github/copilot-sdk');
+
+    await provider.connect({ binaryPath: process.execPath });
+    expect(clientCtors[0]).toEqual({
+      connection: { kind: 'stdio', path: process.execPath },
+    });
+    await provider.disconnect();
   });
 });

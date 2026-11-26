@@ -1,0 +1,215 @@
+/**
+ * Executor of the local-panel window decision (shared/local-panel-window.ts). It gathers the facts from a platform adapter, runs the
+ * plan, keeps the single-instance record, and logs exactly one reason code per outcome. Everything platform-specific lives behind
+ * `LocalPanelWindowPlatform`; nothing here knows how a window is opened on any one OS.
+ */
+import {
+  LOCAL_PANEL_PHASE,
+  LOCAL_PANEL_WINDOW_MECHANISM,
+  LOCAL_PANEL_WINDOW_REASON,
+  isAllowedLocalPanelUrl,
+  isRecordedWindowAlive,
+  localPanelUrl,
+  openedReasonOf,
+  LOCAL_PANEL_PENDING_LAUNCH_MS,
+  parseLocalPanelPendingLaunch,
+  parseLocalPanelWindowRecord,
+  planLocalPanelWindow,
+  type LocalPanelWindowAttempt,
+  type LocalPanelWindowMechanism,
+  type LocalPanelWindowReason,
+  type LocalPanelWindowRecord,
+} from '../../shared/local-panel-window.js';
+
+import { createLocalPanelPhaseTimer, type LocalPanelPhaseTimer, type LocalPanelTimingEntry } from './local-panel-timing.js';
+
+export interface LocalPanelWindowProcess { pid: number; startedAtMs: number }
+
+/** The thin, per-OS part: how to find, focus and start things for the ACTIVE USER's desktop. */
+export interface LocalPanelWindowPlatform {
+  readonly platform: NodeJS.Platform;
+  /** An interactive desktop exists for a user (Windows/macOS: an active session; Linux: a reachable X/Wayland display). */
+  hasDesktop(): Promise<boolean>;
+  /** Absolute path of the native aiDesk window, when it is installed AND verified (see aidesk-local-ui-artifact.ts). */
+  nativeUiPath(): Promise<string | undefined>;
+  /** How the host returned by the last `nativeUiPath()` was trusted: `record` (an earlier full verification still covers it) or `full`. */
+  nativeVerifySource?(): string | undefined;
+  /** App-mode capable browsers that can be tried, in preference order (identifiers the platform's launchAppMode understands). */
+  findAppModeBrowsers(): Promise<string[]>;
+  /** A running panel window (native or app-mode), found by what it is -- not by a record. */
+  findWindowProcess(): Promise<LocalPanelWindowProcess | undefined>;
+  probePid(pid: number): Promise<{ alive: boolean; startedAtMs?: number }>;
+  readonly canFocus: boolean;
+  /** The native host (when installed) keeps its own single instance: it is simply asked each time, never looked for or focused from outside. */
+  readonly nativeHostsOwnInstance?: boolean;
+  /** Why the native host could not be offered (installed but its runtime is missing), read right after `nativeUiPath()` answered undefined. */
+  nativeUnavailableReason?(): LocalPanelWindowReason | undefined;
+  focusWindow(window: LocalPanelWindowProcess): Promise<boolean>;
+  launchNative(path: string): Promise<boolean>;
+  launchAppMode(browser: string): Promise<boolean>;
+  /** Last resort: the user's default browser opens `url` (always the panel URL, checked by the caller). */
+  openDefaultBrowser(url: string): Promise<boolean>;
+}
+
+/** Where the single-instance record lives (the node state directory); a stale one is removed, never trusted. */
+export interface LocalPanelWindowRecordStore {
+  read(): string | undefined;
+  write(value: string): void;
+  clear(): void;
+}
+
+export interface LocalPanelWindowOutcome {
+  reason: LocalPanelWindowReason;
+  mechanism?: LocalPanelWindowMechanism;
+  /** Reason codes of attempts that failed or mechanisms that were skipped on the way (for the log and for tests). */
+  trail: LocalPanelWindowReason[];
+  /** Where the time between the click and this outcome went (also logged and kept in the bounded timing history). */
+  timing?: LocalPanelTimingEntry;
+}
+
+export interface OpenLocalPanelWindowInput {
+  platform: LocalPanelWindowPlatform;
+  store: LocalPanelWindowRecordStore;
+  /** The panel server answers (a node with a public id): nothing may open a window onto a dead port. */
+  panelRunning: () => Promise<boolean>;
+  log: (level: 'info' | 'warn', fields: Record<string, unknown>, message: string) => void;
+  /** How long to look for the window process after launching it (for the record). Default 3 s in 200 ms steps. */
+  locateTimeoutMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  /** Phase timer of this request (default: a real one); tests inject a clock. */
+  timer?: LocalPanelPhaseTimer;
+  /** Receives the finished timing of every request that got an outcome (the runner logs it and keeps the bounded history). */
+  onTiming?: (entry: LocalPanelTimingEntry) => void;
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** What is known about the window: it is there, or one was started a moment ago and has not shown up yet. */
+interface ExistingWindow { window?: LocalPanelWindowProcess; launchInProgress?: boolean }
+
+/** The window opened earlier, if it is still there: the record when it still matches a live process, else a fresh look. */
+async function resolveExistingWindow(input: OpenLocalPanelWindowInput): Promise<ExistingWindow> {
+  const now = input.now ?? Date.now;
+  const raw = input.store.read();
+  const record = parseLocalPanelWindowRecord(raw ?? '');
+  const pending = record ? undefined : parseLocalPanelPendingLaunch(raw ?? '');
+  if (record) {
+    const probe = await input.platform.probePid(record.pid);
+    if (isRecordedWindowAlive(record, probe)) return { window: { pid: record.pid, startedAtMs: record.startedAtMs } };
+    // The pid is gone, or was recycled by another process: the record is stale.
+    input.store.clear();
+    input.log('info', { reason: 'stale_window_record_cleared', pid: record.pid }, 'local panel window: stale record removed');
+  } else if (raw !== undefined && !pending) {
+    input.store.clear();
+    input.log('info', { reason: 'unreadable_window_record_cleared' }, 'local panel window: unreadable record removed');
+  }
+  const found = await input.platform.findWindowProcess();
+  if (found) { rememberWindow(input.store, found, pending?.mechanism ?? LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE); return { window: found }; }
+  if (pending) {
+    // A window was started a moment ago and is not visible yet: do not start another; once the wait is over the start is forgotten.
+    if (now() - pending.atMs < LOCAL_PANEL_PENDING_LAUNCH_MS) return { launchInProgress: true };
+    input.store.clear();
+  }
+  return {};
+}
+
+function rememberWindow(store: LocalPanelWindowRecordStore, window: LocalPanelWindowProcess, mechanism: LocalPanelWindowMechanism): void {
+  const record: LocalPanelWindowRecord = { pid: window.pid, startedAtMs: window.startedAtMs, mechanism };
+  store.write(JSON.stringify(record));
+}
+
+const timedIn = <T>(timer: LocalPanelPhaseTimer, phase: Parameters<LocalPanelPhaseTimer['measure']>[0], work: () => Promise<T>): Promise<T> => timer.measure(phase, work);
+
+async function locateLaunchedWindow(input: OpenLocalPanelWindowInput, mechanism: LocalPanelWindowMechanism): Promise<void> {
+  const sleep = input.sleep ?? defaultSleep;
+  const deadline = (input.locateTimeoutMs ?? 3_000) / 200;
+  for (let step = 0; step <= deadline; step += 1) {
+    const found = await input.platform.findWindowProcess();
+    if (found) { rememberWindow(input.store, found, mechanism); return; }
+    await sleep(200);
+  }
+  // Started but not visible yet (a slow machine): remember that, so a quick second click does not start a second window.
+  input.store.write(JSON.stringify({ pendingLaunch: { atMs: (input.now ?? Date.now)(), mechanism } }));
+}
+
+async function runAttempt(input: OpenLocalPanelWindowInput, timer: LocalPanelPhaseTimer, attempt: LocalPanelWindowAttempt, nativePath: string | undefined): Promise<boolean> {
+  const { platform } = input;
+  if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE) {
+    // The host was verified moments ago for this very click (and is verified again by the platform if it is asked for a second time).
+    const path = nativePath ?? await timedIn(timer, LOCAL_PANEL_PHASE.NATIVE_VERIFY, () => platform.nativeUiPath());
+    return path !== undefined && timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_NATIVE, () => platform.launchNative(path));
+  }
+  if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE) return timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_APP_MODE, () => platform.launchAppMode(attempt.browser));
+  const url = localPanelUrl();
+  // Defense in depth: the only URL any mechanism is ever handed is the panel's own.
+  return isAllowedLocalPanelUrl(url) && timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_DEFAULT_BROWSER, () => platform.openDefaultBrowser(url));
+}
+
+/** One click on "local management": open the panel as an independent window, or focus the one already open. Never throws. */
+export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Promise<LocalPanelWindowOutcome> {
+  const trail: LocalPanelWindowReason[] = [];
+  const timer = input.timer ?? createLocalPanelPhaseTimer();
+  // A logger that cannot write (unwritable log file, closed stream) must never turn a window that opened into a failure.
+  const log: OpenLocalPanelWindowInput['log'] = (level, fields, message) => { try { input.log(level, fields, message); } catch { /* logging is best effort */ } };
+  const finish = (outcome: Omit<LocalPanelWindowOutcome, 'trail'>, level: 'info' | 'warn' = 'info'): LocalPanelWindowOutcome => {
+    const timing = timer.finish({ platform: input.platform.platform, reason: outcome.reason, ...(outcome.mechanism ? { mechanism: outcome.mechanism } : {}) });
+    const result = { ...outcome, trail, timing };
+    log(level, { reason: result.reason, mechanism: result.mechanism, trail, url: localPanelUrl(), totalMs: timing.totalMs, phases: timing.phases, verify: timing.verify }, 'local panel window');
+    try { input.onTiming?.(timing); } catch { /* history only */ }
+    return result;
+  };
+  try {
+    const panelRunning = await timer.measure(LOCAL_PANEL_PHASE.PANEL_PROBE, () => input.panelRunning());
+    // The desktop check and the host verification do not depend on each other: they run side by side (the slower one sets the pace,
+    // not their sum). A host verified for a machine with no desktop is simply not used.
+    const [hasDesktop, verifiedNative] = panelRunning
+      ? await Promise.all([
+        timer.measure(LOCAL_PANEL_PHASE.DESKTOP_CHECK, () => input.platform.hasDesktop()),
+        timer.measure(LOCAL_PANEL_PHASE.NATIVE_VERIFY, () => input.platform.nativeUiPath()),
+      ])
+      : [false, undefined];
+    const nativePath = panelRunning && hasDesktop ? verifiedNative : undefined;
+    if (nativePath !== undefined) timer.note('verify', input.platform.nativeVerifySource?.() ?? 'full');
+    const selfManagedNative = nativePath !== undefined && input.platform.nativeHostsOwnInstance === true;
+    const known: ExistingWindow = panelRunning && hasDesktop && !selfManagedNative ? await timer.measure(LOCAL_PANEL_PHASE.EXISTING_WINDOW, () => resolveExistingWindow(input)) : {};
+    const existing = known.window;
+    if (known.launchInProgress) return finish({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_IN_PROGRESS });
+    const appModeBrowsers = panelRunning && hasDesktop && !existing ? await timer.measure(LOCAL_PANEL_PHASE.BROWSER_SEARCH, () => input.platform.findAppModeBrowsers()) : [];
+    const plan = planLocalPanelWindow({
+      platform: input.platform.platform,
+      panelRunning,
+      hasDesktop,
+      nativeUiInstalled: nativePath !== undefined,
+      nativeHostsOwnInstance: input.platform.nativeHostsOwnInstance === true,
+      appModeBrowsers,
+      existingWindowAlive: existing !== undefined,
+      canFocusExisting: input.platform.canFocus,
+    });
+    if (plan.action === 'none') return finish({ reason: plan.reason }, plan.reason === LOCAL_PANEL_WINDOW_REASON.NO_PANEL ? 'warn' : 'info');
+    if (plan.action === 'focus') {
+      if (input.platform.canFocus && existing && !(await timer.measure(LOCAL_PANEL_PHASE.FOCUS, () => input.platform.focusWindow(existing)))) {
+        trail.push(LOCAL_PANEL_WINDOW_REASON.KEPT_EXISTING);
+        return finish({ reason: LOCAL_PANEL_WINDOW_REASON.KEPT_EXISTING });
+      }
+      return finish({ reason: plan.reason });
+    }
+    // The host is installed but cannot run here (e.g. no WebView2 runtime): say so instead of "not installed".
+    const unavailable = nativePath === undefined ? input.platform.nativeUnavailableReason?.() : undefined;
+    trail.push(...plan.skipped.map((reason) => (reason === LOCAL_PANEL_WINDOW_REASON.NATIVE_UI_MISSING && unavailable ? unavailable : reason)));
+    for (const attempt of plan.attempts) {
+      let ok = false;
+      try { ok = await runAttempt(input, timer, attempt, nativePath); } catch { ok = false; }
+      if (ok) {
+        const selfManaged = attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE && input.platform.nativeHostsOwnInstance === true;
+        if (attempt.mechanism !== LOCAL_PANEL_WINDOW_MECHANISM.DEFAULT_BROWSER && !selfManaged) await timer.measure(LOCAL_PANEL_PHASE.LOCATE, () => locateLaunchedWindow(input, attempt.mechanism));
+        return finish({ reason: openedReasonOf(attempt.mechanism), mechanism: attempt.mechanism });
+      }
+      trail.push(LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED);
+    }
+    return finish({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED }, 'warn');
+  } catch (error) {
+    log('warn', { reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, error: error instanceof Error ? error.message : String(error) }, 'local panel window failed');
+    return { reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, trail };
+  }
+}

@@ -62,6 +62,13 @@ export const MEMORY_COUNTERS = [
   'mem.compression.admission_closed',
   'mem.pinned_notes_overflow',
   'mem.telemetry.buffer_overflow',
+  // Compact memory handles (ref → id). A handle that fails to persist, or a row
+  // discarded while loading, still resolves in-process but dies on the next
+  // restart — these have to be collectable, not just counted in memory.
+  'mem.short_ref.persist_failure',
+  'mem.short_ref.collision',
+  'mem.short_ref.legacy_import',
+  'mem.short_ref.discarded_row',
 ] as const;
 
 export type MemoryCounter = (typeof MEMORY_COUNTERS)[number];

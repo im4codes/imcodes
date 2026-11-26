@@ -5,7 +5,6 @@ export const FILE_CHANGE_PROVIDER_KINDS = [
   'opencode',
   'codex-sdk',
   'qwen',
-  'gemini',
 ] as const;
 
 export type FileChangeProviderKind = (typeof FILE_CHANGE_PROVIDER_KINDS)[number];

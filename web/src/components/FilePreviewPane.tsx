@@ -3,7 +3,8 @@
  * Extracted from FileBrowser to keep heavy hljs/marked imports out of the
  * main FileBrowser bundle (prevents test OOM when importing FileBrowser).
  */
-import { pathBasename } from '../util/path-utils.js';
+import { useCallback } from 'preact/hooks';
+import { pathBasename, resolveMarkdownLocalPath } from '../util/path-utils.js';
 import hljs from 'highlight.js/lib/core';
 import hljsBash from 'highlight.js/lib/languages/bash';
 import hljsC from 'highlight.js/lib/languages/c';
@@ -26,6 +27,9 @@ import hljsTs from 'highlight.js/lib/languages/typescript';
 import hljsXml from 'highlight.js/lib/languages/xml';
 import hljsYaml from 'highlight.js/lib/languages/yaml';
 import { marked } from 'marked';
+import type { ChatPathDownloadHandler } from '../chat-path-actions.js';
+import { ChatMarkdown } from './ChatMarkdown.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 
 // Register languages
 hljs.registerLanguage('bash', hljsBash);
@@ -103,14 +107,47 @@ export function highlightCode(content: string, filename: string): { html: string
 export interface FilePreviewPaneProps {
   content: string;
   path: string;
+  /** Explicit filesystem boundary for relative Markdown references. Defaults to the file's directory. */
+  allowedRootPath?: string;
+  onPathClick?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onImagePreview?: ChatLocalImagePreviewLoader;
 }
 
 /** Renders highlighted code or markdown. Lazy-loaded by FileBrowser. */
-export function FilePreviewPane({ content, path }: FilePreviewPaneProps) {
+export function FilePreviewPane({ content, path, allowedRootPath, onPathClick, onDownload, onImagePreview }: FilePreviewPaneProps) {
   const filename = pathBasename(path);
   const { html, isMarkdown } = highlightCode(content, filename);
+  const resolveReference = useCallback(
+    (reference: string) => resolveMarkdownLocalPath(path, reference, allowedRootPath),
+    [allowedRootPath, path],
+  );
+  const openReferencedPath = useCallback((reference: string) => {
+    const resolved = resolveReference(reference);
+    if (resolved) onPathClick?.(resolved);
+  }, [onPathClick, resolveReference]);
+  const downloadReferencedPath = useCallback(async (reference: string) => {
+    const resolved = resolveReference(reference);
+    if (!resolved || !onDownload) return;
+    await onDownload(resolved);
+  }, [onDownload, resolveReference]);
+  const previewReferencedImage = useCallback<ChatLocalImagePreviewLoader>(async (reference: string) => {
+    const resolved = resolveReference(reference);
+    if (!resolved || !onImagePreview) throw new Error('invalid_local_markdown_image');
+    return onImagePreview(resolved);
+  }, [onImagePreview, resolveReference]);
+
   if (isMarkdown) {
-    return <div class="fb-preview-md" dangerouslySetInnerHTML={{ __html: html }} />;
+    return (
+      <div class="fb-preview-md">
+        <ChatMarkdown
+          text={content}
+          onPathClick={onPathClick ? openReferencedPath : undefined}
+          onDownload={onDownload ? downloadReferencedPath : undefined}
+          onImagePreview={onImagePreview ? previewReferencedImage : undefined}
+        />
+      </div>
+    );
   }
   return <pre class="fb-preview-code hljs"><code dangerouslySetInnerHTML={{ __html: html }} /></pre>;
 }

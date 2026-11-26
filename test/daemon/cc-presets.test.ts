@@ -7,6 +7,17 @@ const state = vi.hoisted(() => ({
   home: '',
 }));
 
+const loggerWarn = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/util/logger.js', () => ({
+  default: {
+    warn: loggerWarn,
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
   return {
@@ -17,7 +28,11 @@ vi.mock('node:os', async (importOriginal) => {
 
 describe('cc presets', () => {
   beforeEach(async () => {
+    loggerWarn.mockClear();
     state.home = await mkdtemp(join(tmpdir(), 'imcodes-cc-presets-'));
+    vi.stubEnv('HOME', state.home);
+    vi.stubEnv('USERPROFILE', state.home);
+    vi.stubEnv('IMCODES_HOME', join(state.home, '.imcodes'));
     await mkdir(join(state.home, '.imcodes'), { recursive: true });
     await writeFile(
       join(state.home, '.imcodes', 'cc-presets.json'),
@@ -37,6 +52,8 @@ describe('cc presets', () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.resetModules();
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';
@@ -47,6 +64,27 @@ describe('cc presets', () => {
 
     await expect(getPreset('minimax')).resolves.toMatchObject({ name: 'minimax' });
     await expect(getPreset('MiniMax')).resolves.toMatchObject({ name: 'minimax' });
+  });
+
+  it('upgrades the legacy MiniMax-M3 200K preset window to 1M', async () => {
+    const { savePresets, getPreset, resolvePresetEnv } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([{
+      name: 'minimax',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_MODEL: 'MiniMax-M3',
+      },
+      defaultModel: 'MiniMax-M3',
+      contextWindow: 200_000,
+    }]);
+
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      contextWindow: 1_000_000,
+    });
+    await expect(resolvePresetEnv('minimax')).resolves.toMatchObject({
+      IMCODES_CONTEXT_WINDOW: '1000000',
+    });
   });
 
   it('resolves env and context hints for mixed-case preset names', async () => {
@@ -63,6 +101,93 @@ describe('cc presets', () => {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
       IMCODES_CONTEXT_WINDOW: '200000',
     });
+  });
+
+  it('applies a per-session model across the provider model aliases and runtime prompt', async () => {
+    const { resolvePresetEnv, getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(resolvePresetEnv('MiniMax', undefined, 'MiniMax-M3')).resolves.toMatchObject({
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3',
+    });
+    const overrides = await getPresetTransportOverrides('MiniMax', 'MiniMax-M3');
+    expect(overrides).toMatchObject({
+      model: 'MiniMax-M3',
+      systemPrompt: expect.stringContaining('Authoritative runtime model: MiniMax-M3.'),
+    });
+    expect(overrides.systemPrompt).toContain('They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults.');
+    expect(overrides.systemPrompt).toContain('Follow every provided tool input schema exactly and never omit required fields.');
+    expect(overrides.systemPrompt).not.toContain('override any generic Claude Code tool schema');
+  });
+
+  it('discovers and persists every page from the Anthropic-compatible models API', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'MiniMax-M3', display_name: 'MiniMax M3' },
+            { id: 'MiniMax-M2.7' },
+          ],
+          has_more: true,
+          last_id: 'MiniMax-M2.7',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'MiniMax-M2.7' },
+            { id: 'MiniMax-M2.7-highspeed' },
+          ],
+          has_more: false,
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const { refreshPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+    const catalog = await refreshPresetModels('MiniMax');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstUrl = new URL(String(fetchMock.mock.calls[0][0]));
+    const secondUrl = new URL(String(fetchMock.mock.calls[1][0]));
+    expect(`${firstUrl.origin}${firstUrl.pathname}`).toBe('https://api.minimax.io/anthropic/v1/models');
+    expect(firstUrl.searchParams.get('limit')).toBe('1000');
+    expect(secondUrl.searchParams.get('after_id')).toBe('MiniMax-M2.7');
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      headers: {
+        'x-api-key': 'test-token',
+        'anthropic-version': '2023-06-01',
+      },
+    });
+    expect(catalog.models).toEqual([
+      { id: 'MiniMax-M3', name: 'MiniMax M3' },
+      { id: 'MiniMax-M2.7' },
+      { id: 'MiniMax-M2.7-highspeed' },
+    ]);
+    expect(catalog.defaultModel).toBe('MiniMax-M2.7');
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      availableModels: catalog.models,
+    });
+  });
+
+  it('preserves an authenticated models endpoint error instead of masking it with a fallback 404', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { discoverPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+    const preset = await getPreset('MiniMax');
+
+    await expect(discoverPresetModels(preset!)).rejects.toThrow('HTTP 401 Unauthorized');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/anthropic/v1/models');
   });
 
   it('builds qwen transport config for anthropic-compatible presets', async () => {
@@ -103,6 +228,71 @@ describe('cc presets', () => {
     expect(result.systemPrompt).toContain('MiniMax-M2.7');
     expect(result.systemPrompt).toContain('https://api.minimax.io/anthropic');
     expect(result.systemPrompt).toMatch(/not running on Qwen/i);
+  });
+
+  it('routes a deliberately selected model from the preset catalog', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getQwenPresetTransportConfig('MiniMax', 'MiniMax-M2.5');
+
+    expect(result.model).toBe('MiniMax-M2.5');
+    expect(result.env).toMatchObject({ ANTHROPIC_MODEL: 'MiniMax-M2.5' });
+    expect(result.settings).toMatchObject({ model: { name: 'MiniMax-M2.5' } });
+    expect(result.systemPrompt).toContain('MiniMax-M2.5');
+  });
+
+  it('builds a dsh route config without placing the preset key in generic env', async () => {
+    const { getDshPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getDshPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      model: 'MiniMax-M2.7',
+      contextWindow: 200_000,
+      llm: {
+        provider: 'minimax',
+        model: 'MiniMax-M2.7',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        contextWindow: 200_000,
+      },
+    });
+    expect(result.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+  });
+
+  it('builds a Pi provider route without exposing the preset key in argv or generic env', async () => {
+    const { getPiPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getPiPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      model: 'MiniMax-M2.7',
+      contextWindow: 200_000,
+      piLlm: {
+        provider: 'minimax',
+        model: 'MiniMax-M2.7',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        contextWindow: 200_000,
+      },
+    });
+    expect(result.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+  });
+
+  it('clamps a previous provider model to the newly selected preset catalogue', async () => {
+    const { selectPresetModel } = await import('../../src/daemon/cc-presets.js');
+    const nextPreset = {
+      env: { ANTHROPIC_MODEL: 'next-default' },
+      defaultModel: 'next-default',
+      availableModels: [{ id: 'shared-model' }, { id: 'next-default' }],
+    };
+
+    expect(selectPresetModel(nextPreset, 'old-provider-only')).toBe('next-default');
+    // A deliberately selected overlapping id is valid inside this preset; the
+    // web route-identity hook is responsible for resetting it at switch time.
+    expect(selectPresetModel(nextPreset, 'shared-model')).toBe('shared-model');
   });
 
   it('uses discovered compatible-api models when building qwen transport config', async () => {
@@ -197,4 +387,217 @@ describe('cc presets', () => {
       env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
     });
   });
+
+  describe('undiscovered preset model guard', () => {
+    // Anthropic-compatible third-party endpoints accept an unknown model id
+    // without an error and silently serve their own default, so a typo like
+    // `MiniMax-M.27` (for `MiniMax-M2.7`) otherwise runs invisibly on the
+    // wrong model.
+    async function writePreset(model: string, availableModels?: { id: string }[]): Promise<void> {
+      await writeFile(
+        join(state.home, '.imcodes', 'cc-presets.json'),
+        JSON.stringify([{
+          name: 'mm',
+          env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic', ANTHROPIC_MODEL: model },
+          ...(availableModels ? { availableModels } : {}),
+        }]),
+        'utf8',
+      );
+    }
+
+    const undiscoveredWarnings = () => loggerWarn.mock.calls.filter(
+      (call) => typeof call[1] === 'string' && call[1].includes('discovered model list'),
+    );
+
+    it('warns when the configured model is not among the discovered models', async () => {
+      await writePreset('MiniMax-M.27', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(1);
+      expect(undiscoveredWarnings()[0][0]).toMatchObject({
+        preset: 'mm',
+        configuredModel: 'MiniMax-M.27',
+      });
+    });
+
+    it('warns only once per preset/model pair', async () => {
+      await writePreset('MiniMax-M.27', [{ id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+      await getPresetTransportOverrides('mm');
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(1);
+    });
+
+    it('stays quiet when the configured model is discovered', async () => {
+      await writePreset('MiniMax-M2.7', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(0);
+    });
+
+    it('stays quiet when the provider advertised no models (nothing to check against)', async () => {
+      await writePreset('some-custom-model');
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(0);
+    });
+  });
+
+  describe('OpenAI-compatible presets and Codex transport config', () => {
+    it('builds codex transport config for anthropic preset (cross-protocol alignment)', async () => {
+      const { getCodexPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+      const result = await getCodexPresetTransportConfig('MiniMax');
+      expect(result).toMatchObject({
+        model: 'MiniMax-M2.7',
+        contextWindow: 200_000,
+        env: expect.objectContaining({
+          OPENAI_BASE_URL: 'https://api.minimax.io/v1',
+          OPENAI_API_KEY: 'test-token',
+          OPENAI_MODEL: 'MiniMax-M2.7',
+          CODEX_BASE_URL: 'https://api.minimax.io/v1',
+          CODEX_API_KEY: 'test-token',
+          CODEX_MODEL: 'MiniMax-M2.7',
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_API_KEY: 'test-token',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        }),
+        codexModelProvider: {
+          providerId: 'minimax',
+          baseUrl: 'https://api.minimax.io/v1',
+          apiKey: 'test-token',
+          wireApi: 'responses',
+        },
+      });
+      expect(result.systemPrompt).toContain('MiniMax');
+      expect(result.systemPrompt).toContain('Authoritative runtime model: MiniMax-M2.7');
+    });
+
+    it('builds codex transport config for native openai preset', async () => {
+      const { savePresets, getCodexPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+      await savePresets([
+        {
+          name: 'minimax-openai',
+          authType: 'openai',
+          env: {
+            OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
+            OPENAI_API_KEY: 'openai-test-key',
+            OPENAI_MODEL: 'MiniMax-Text-01',
+          },
+          contextWindow: 128_000,
+          defaultModel: 'MiniMax-Text-01',
+        },
+      ]);
+
+      const result = await getCodexPresetTransportConfig('minimax-openai');
+      expect(result).toMatchObject({
+        model: 'MiniMax-Text-01',
+        contextWindow: 128_000,
+        env: expect.objectContaining({
+          OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
+          OPENAI_API_KEY: 'openai-test-key',
+          OPENAI_MODEL: 'MiniMax-Text-01',
+          CODEX_BASE_URL: 'https://api.minimax.chat/v1',
+          CODEX_API_KEY: 'openai-test-key',
+          CODEX_MODEL: 'MiniMax-Text-01',
+        }),
+        codexModelProvider: {
+          providerId: 'minimax-openai',
+          baseUrl: 'https://api.minimax.chat/v1',
+          apiKey: 'openai-test-key',
+          wireApi: 'responses',
+        },
+      });
+      expect(result.systemPrompt).toContain('MiniMax');
+    });
+
+    it('discovers models from OpenAI-compatible endpoint with Bearer auth', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'MiniMax-Text-01', name: 'MiniMax Text 01' },
+            { id: 'MiniMax-VL-01' },
+          ],
+        }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const { savePresets, refreshPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+      await savePresets([
+        {
+          name: 'custom-openai',
+          authType: 'openai',
+          env: {
+            OPENAI_BASE_URL: 'https://api.example.com/v1',
+            OPENAI_API_KEY: 'sk-bearer-token',
+            OPENAI_MODEL: 'MiniMax-Text-01',
+          },
+          defaultModel: 'MiniMax-Text-01',
+        },
+      ]);
+
+      const catalog = await refreshPresetModels('custom-openai');
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const call = fetchMock.mock.calls[0];
+      const url = String(call[0]);
+      expect(url).toBe('https://api.example.com/v1/models');
+      expect(call[1]).toMatchObject({
+        headers: {
+          Authorization: 'Bearer sk-bearer-token',
+        },
+      });
+      expect(catalog.models).toEqual([
+        { id: 'MiniMax-Text-01', name: 'MiniMax Text 01' },
+        { id: 'MiniMax-VL-01' },
+      ]);
+      expect(catalog.defaultModel).toBe('MiniMax-Text-01');
+
+      const saved = await getPreset('custom-openai');
+      expect(saved?.authType).toBe('openai');
+      expect(saved?.availableModels).toHaveLength(2);
+    });
+
+    it('handles 401 error from OpenAI-compatible model discovery without swallowing error', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const { savePresets, discoverPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+      await savePresets([
+        {
+          name: 'unauth-openai',
+          authType: 'openai',
+          env: {
+            OPENAI_BASE_URL: 'https://api.example.com/v1',
+            OPENAI_API_KEY: 'invalid-key',
+          },
+        },
+      ]);
+
+      const preset = await getPreset('unauth-openai');
+      await expect(discoverPresetModels(preset!)).rejects.toThrow('HTTP 401 Unauthorized');
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(fetchMock.mock.calls[0][1]).toMatchObject({
+        headers: { Authorization: 'Bearer invalid-key' },
+      });
+    });
+  });
+
 });

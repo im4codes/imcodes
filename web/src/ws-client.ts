@@ -6,18 +6,33 @@ import type { TerminalDiff } from './types.js';
 import type { TransportPendingMessageEntry } from './transport-queue.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { markPerfFrame } from './perf-render-debug.js';
+import { DAEMON_LIVENESS_MSG, DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
+import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
 import type { ResourceChangedMessage } from '@shared/resource-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_EVENT } from '@shared/transport-events.js';
+import type { DiskUsage } from '@shared/disk-usage.js';
+import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { AGENT_AVAILABILITY_MSG, type AgentAvailabilityMap } from '@shared/agent-availability.js';
+import type { ControlledNodeWorkerRefreshStatusMessage } from '@shared/controlled-node-worker-refresh.js';
+import { PEER_AUDIT_MESSAGES } from '@shared/peer-audit.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES, FS_WRITE_OUTBOUND_WS_MAX_BYTES } from '@shared/fs-write-limits.js';
+import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
-import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
+import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
+import type { ShareDenialReason, SharedActorEnvelope } from '@shared/tab-sharing.js';
 import type { ShareTarget } from './tab-sharing-ui.js';
 import {
   SESSION_GROUP_CLONE_MSG,
@@ -27,17 +42,24 @@ import {
 } from '@shared/session-group-clone.js';
 import {
   TIMELINE_MESSAGES,
+  TIMELINE_ASSISTANT_TEXT_EVENT_TYPE,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_TERMINAL_SESSION_STATES,
   type TimelineCursor,
+  type TimelineHistoryContentFilter,
+  type TimelineDeleteRequest,
   type TimelineDetailRefV1,
   type TimelineDetailResponse,
   type TimelineHistoryResponse,
   type TimelinePageResponse,
   type TimelineReplayResponse,
 } from '@shared/timeline-protocol.js';
+import type { TimelineSeqGap, TimelineSubscriptionMode } from '@shared/timeline-protocol.js';
+import { isVisibleSessionStatePayload } from '@shared/session-activity-types.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS, type MemoryMcpStatusResponseMessage } from '@shared/memory-ws.js';
+import type { SessionIdentityResolveResponse } from '@shared/session-identity-ws.js';
 import type {
   MemoryFeatureAdminRecord,
   MemoryFeatureSetResponse,
@@ -47,7 +69,9 @@ import type {
   MemorySkillAdminRecord,
 } from '@shared/memory-management.js';
 import type { MemoryProjectResolveResponsePayload } from '@shared/memory-project-options.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1, ASK_ANSWER_COMMAND } from '@shared/ask-answer.js';
 import {
+  MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
   MSG_DAEMON_ONLINE,
   MSG_DAEMON_OFFLINE,
@@ -65,8 +89,29 @@ import type {
   FsDeleteResponse,
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
+import type { DirectFileTransferServerMessage } from '@shared/direct-file-transfer.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
+export type SessionMessageHandler = (msg: ServerMessage) => void;
+
+function sessionIdForServerMessage(msg: ServerMessage): string | null {
+  if (msg.type === TIMELINE_MESSAGES.EVENT) return msg.event.sessionId;
+  if (msg.type === TIMELINE_MESSAGES.SEQ_GAP) return msg.sessionId;
+  if (msg.type === TRANSPORT_MSG.CHAT_HISTORY
+    || msg.type === TRANSPORT_MSG.CHAT_APPROVAL
+    || msg.type === TRANSPORT_MSG.APPROVAL_RESPONSE) return msg.sessionId;
+  if (msg.type === TIMELINE_MESSAGES.HISTORY
+    || msg.type === TIMELINE_MESSAGES.REPLAY
+    || msg.type === TIMELINE_MESSAGES.PAGE
+    || msg.type === TIMELINE_MESSAGES.DETAIL) return msg.sessionName ?? null;
+  if (msg.type === 'terminal.diff') return msg.diff.sessionName;
+  if (msg.type === 'terminal.history') return msg.sessionName;
+  if (msg.type === 'terminal.stream_reset') return msg.session;
+  if (msg.type === 'session.event' || msg.type === 'session.idle' || msg.type === 'session.notification' || msg.type === 'session.tool') return msg.session;
+  if (msg.type === MSG_COMMAND_ACK || msg.type === MSG_COMMAND_FAILED) return msg.session;
+  return null;
+}
 
 export interface P2pWorkflowRequestScope {
   sessionName?: string;
@@ -76,6 +121,14 @@ export interface P2pWorkflowRequestScope {
 
 export interface FsListDirOptions {
   includeOpenSpecTaskStats?: boolean;
+  /** Session whose project directory scopes this request. */
+  sessionName?: string;
+  /**
+   * Filter/order the listing on the machine before it is cut to its entry
+   * limit. Only the controlled-node directory adapter honours it (it asks the
+   * node, which must advertise the capability); a daemon socket ignores it.
+   */
+  query?: import('@shared/transport/file-transfer.js').FileDirectoryListQuery;
 }
 
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser
@@ -119,49 +172,106 @@ export type SessionEventReason =
   | 'socket_open'
   | 'probe_start'
   | 'probe_recovered'
-  | 'socket_closed';
+  | 'socket_closed'
+  /** The bounded terminal-input queue had to discard the oldest keystrokes. */
+  | 'input_buffer_overflow';
 
 export type ServerMessage =
   | ResourceChangedMessage
+  | DirectFileTransferServerMessage
+  | ControlledNodeWorkerRefreshStatusMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
-  | { type: 'terminal.stream_reset'; session: string; reason: string }
+  | { type: typeof TERMINAL_CONTROL.STREAM_RESET; session: string; reason: string }
+  | { type: typeof TERMINAL_CONTROL.RECOVERY_EXHAUSTED; session: string; reason: string }
   | { type: 'session.event'; event: string; session: string; state: string; reason?: SessionEventReason }
-  | { type: 'session.error'; project: string; message: string }
+  | { type: 'session.error'; project?: string; id?: string; session?: string; sessionName?: string; message: string }
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
-  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string; provider?: string; providerGeneration?: number; providerToolUseId?: string; inputPreview?: string }
   | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'auto_deliver_active'; activeRunIds?: string[] }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'toolchain_unavailable'; nodeBinPresent?: boolean; npmAvailable?: boolean }
+  | { type: typeof DAEMON_MSG.UPGRADING; targetVersion?: string; fromVersion?: string }
+  | {
+    type: typeof DAEMON_MSG.UPGRADE_BLOCKED;
+    reason:
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.COMPRESSION_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED;
+    activeRunIds?: string[];
+    activeSessionNames?: string[];
+    blockedSessions?: TransportUpgradeBlockedSession[];
+    activeMasterCompactions?: number;
+    compressionState?: { active?: boolean; activeCount?: number; queued?: number; idle?: boolean };
+    cooldownRemainingMs?: number;
+    lastUpgradeAt?: number | null;
+    nodeBinPresent?: boolean;
+    npmAvailable?: boolean;
+    failureId?: string;
+    fromVersion?: string;
+    targetVersion?: string;
+    retryReason?: string;
+    attempts?: number;
+    exitCode?: number;
+    log?: string;
+    signal?: string;
+    ts?: number;
+  }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[] }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; incognito?: boolean; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number; activeDispatchId?: string | null }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | TimelineEventMessage
+  | TimelineSeqGap
   | TimelineReplayResponseMessage
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
   | TimelineDetailResponseMessage
-  | { type: 'command.ack'; commandId: string; status: string; session: string }
-  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
+  // command.ack is the only reliable, replayable frame in this closure. A
+  // not-found append answers with the recipient-gated queue authority attached
+  // HERE, not on a best-effort timeline event that may never arrive, so these
+  // fields are part of the ack contract rather than unknown extras.
+  | {
+    type: typeof MSG_COMMAND_ACK;
+    commandId: string;
+    status: string;
+    session: string;
+    error?: string;
+    activeDispatchId?: string | null;
+    queueEpoch?: string;
+    queueAuthorityId?: string;
+    pendingMessageVersion?: number;
+    pendingMessageEntries?: unknown;
+    failedMessageEntries?: unknown;
+    queueReconcilesCommandId?: string;
+  }
+  | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
+  | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
+  | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
+  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason | ShareDenialReason; retryable: boolean; /** Set when a shared participant's cancel was refused because the turn changed. */ activeDispatchId?: string | null }
   | { type: typeof MSG_DAEMON_ONLINE }
   | { type: typeof MSG_DAEMON_OFFLINE }
   | { type: 'error'; message: string }
-  | { type: 'pong' }
+  | { type: 'pong'; id?: number | string }
   | { type: 'subsession.shells'; shells: string[] }
+  | { type: typeof AGENT_AVAILABILITY_MSG.RESULT; agents: AgentAvailabilityMap; checkedAt: number }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
   | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }>; sharedActor?: SharedActorEnvelope }
   | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string; sharedActor?: SharedActorEnvelope }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
-  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
+  | { type: typeof DAEMON_LIVENESS_MSG; daemonVersion?: string | null; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
+  | { type: typeof DAEMON_STATS_MSG; daemonVersion?: string | null; latestDaemonVersion?: string | null; autoUpgrade?: import('@shared/daemon-upgrade.js').DaemonAutoUpgradeView; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse
@@ -171,8 +281,9 @@ export type ServerMessage =
   | { type: typeof P2P_WORKFLOW_MSG.RUN_SAVE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
+  | { type: typeof SUBSESSION_CREATED_BATCH_MSG; items: Array<Extract<ServerMessage, { type: 'subsession.created' }>> }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; sessionInstanceId?: string; runtimeEpoch?: string; activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; providerId?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
   | { type: typeof P2P_WORKFLOW_MSG.CANCEL_RESPONSE; runId: string; ok: boolean }
@@ -182,6 +293,9 @@ export type ServerMessage =
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
   | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; requestId?: string; ok: boolean; error?: string }
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
+  | { type: typeof CODEX_RESET_CREDITS_MSG.LIST_RESPONSE; requestId?: string; ok: boolean; credits?: CodexResetCredit[]; availableCount?: number; error?: string }
+  | { type: typeof CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE; requestId?: string; ok: boolean; outcome?: CodexConsumeOutcome; error?: string }
+  | { type: typeof CODEX_CREDIT_HISTORY_MSG.RESPONSE; requestId?: string; ok: boolean; snapshots?: CodexCreditSnapshot[]; error?: string }
   | SessionGroupCloneEvent
   | FsGitDiffResponse
   | FsWriteResponse
@@ -199,10 +313,25 @@ export type ServerMessage =
   | { type: 'repo.commit_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.pr_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
+  | {
+    type: typeof REPO_MSG.CALLBACK_STATUS_RESPONSE;
+    requestId?: string;
+    projectDir: string;
+    enabled: boolean;
+    checking: boolean;
+    lastCheckedAt?: number;
+    lastError?: string;
+    callbacks: CallbackTaskRecord[];
+  }
+  | {
+    type: typeof REPO_MSG.CALLBACK_EVENT;
+    projectDir: string;
+    callback: CallbackTaskRecord;
+  }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
   | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
-  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string; provider?: string; providerGeneration?: number; providerToolUseId?: string; inputPreview?: string }
   | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: 'provider.status'; providerId: string; connected: boolean }
   | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
@@ -223,9 +352,10 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.PIN_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
+  | SessionIdentityResolveResponse
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
   | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
-  | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean; localUnavailable?: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
@@ -234,7 +364,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.SKILL_READ_RESPONSE; requestId?: string; success: boolean; key?: string; layer?: string; content?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.SKILL_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.MD_INGEST_RUN_RESPONSE; requestId?: string; success: boolean; filesChecked?: number; observationsWritten?: number; error?: string; errorCode?: MemoryManagementErrorCode; featureEnabled?: boolean }
-  | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean; localUnavailable?: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode }
@@ -263,9 +393,36 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
 const TERMINAL_SUBSCRIPTION_DEBOUNCE_MS = 50;
 const TERMINAL_SUBSCRIPTION_STAGGER_MS = 30;
 const TERMINAL_RECONNECT_REPLAY_STAGGER_MS = 90;
+/** Spacing between per-session transport `chat.history` replay requests after a
+ *  reconnect. Each one makes the daemon read and ship that session's whole
+ *  history, and the browser then parses + merges + re-renders it. Firing them
+ *  all in one loop — which is what happened before — put N of those bursts on
+ *  the main thread back to back. `subscribeTransportSession` already documents
+ *  this hazard for the page-open path; the reconnect path bypassed that
+ *  protection entirely. Kept in the same order of magnitude as the terminal
+ *  stagger so a reconnect with both kinds of subscription interleaves. */
+const TRANSPORT_RECONNECT_HISTORY_STAGGER_MS = 120;
+
+/** Minimum spacing between snapshot requests for the SAME session.
+ *  Previously this lived only inside `handleStreamReset`; `sendSnapshotRequest`
+ *  had no governance at all, so component-driven requests bypassed it. */
+const SNAPSHOT_SESSION_MIN_INTERVAL_MS = 500;
+/** Spacing between snapshot requests for DIFFERENT sessions.
+ *
+ *  A per-session limiter has no ceiling once K sessions are open: K terminals
+ *  reconnecting (or K stream_resets arriving) each get their own 500ms budget,
+ *  so the client can emit K requests in one tick. Every one of them makes the
+ *  daemon fork a `capture-pane` AND makes the server broadcast a full frame to
+ *  EVERY browser subscribed to that session, so the cost grows with tabs x
+ *  sessions. This global cursor is the missing brake. */
+const SNAPSHOT_GLOBAL_STAGGER_MS = 60;
 const POST_CONNECT_NON_CRITICAL_WINDOW_MS = 1_000;
 const POST_CONNECT_NON_CRITICAL_BASE_DELAY_MS = 250;
 const POST_CONNECT_NON_CRITICAL_STAGGER_MS = 90;
+/** Delay initial RTT heartbeat until after the synchronous post-open
+ *  subscription replay burst + initial Preact hydration settles so the first
+ *  latency badge reading reflects network/server RTT rather than connect churn. */
+const POST_CONNECT_INITIAL_PING_DELAY_MS = 1_500;
 /** If no pong arrives within this window after a ping, assume the socket is a
  *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
  *  background eviction) and force a fresh reconnect.
@@ -289,6 +446,7 @@ const WS_TICKET_TIMEOUT_MS = 30_000;
 const WS_OPEN_TIMEOUT_MS = 15_000;
 const RESUME_FORCE_STALE_PONG_MS = 30_000;
 const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES = 60_000;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
  *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
@@ -296,6 +454,19 @@ const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+/** Latency spike confirmation & steady-state smoothing guard against transient
+ *  main-thread stalls, background/resume bursts, and HOL queueing spikes. */
+const LATENCY_SPIKE_HEALTHY_BASE_MS = 150;
+const LATENCY_SPIKE_RELATIVE_FLOOR_MS = 200;
+const LATENCY_SPIKE_INITIAL_THRESHOLD_MS = 250;
+const LATENCY_SPIKE_THRESHOLD_MS = 600;
+const LATENCY_SPIKE_MULTIPLIER = 3;
+const LATENCY_SPIKE_REPROBE_DELAY_MS = 1_000;
+const LATENCY_SMOOTHING_WINDOW = 3;
+const PING_CONGESTED_BUFFERED_BYTES = 4096;
+/** Terminal input survives a brief probe/reconnect window, never an unbounded backlog. */
+const MAX_PENDING_INPUT_ENTRIES = 500;
+const MAX_PENDING_INPUT_BYTES = 32 * 1024;
 /** When a user interaction requests fresh data (opening a sub-session,
  *  subscribing to a terminal, asking for timeline history) and the socket has
  *  NOT proven liveness for at least one full heartbeat+pong window, eagerly
@@ -307,6 +478,9 @@ const PROBE_FRESHNESS_MS = 5_000;
  *  every ~10s) is never probed by ordinary interaction — only a genuinely
  *  stalled one is. */
 const INTERACTION_PROBE_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
+const OWNED_DATA_REQUEST_TTL_MS = 20_000;
+const OWNED_DATA_REQUEST_RATE_WINDOW_MS = 10_000;
+const OWNED_DATA_REQUEST_RATE_LIMIT = 64;
 
 function createP2pWorkflowRequestId(): string {
   const requestId = globalThis.crypto?.randomUUID?.()
@@ -325,9 +499,63 @@ function compactP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | 
   return compacted;
 }
 
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+/** Envelope + margin for `{"type":"subsession.rebuild_all","subSessions":[…]}`. */
+const SUBSESSION_REBUILD_BATCH_BUDGET_BYTES = DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES - 2_048;
+// Let the first durable event paint, then yield.  A burst of 32 synchronous
+// dispatches made every mounted pane reduce before the browser could handle
+// input, producing the startup long-task wedge.  Transient state is coalesced
+// per session while queued; durable events retain order and are never dropped.
+const TIMELINE_EVENT_IMMEDIATE_BURST = 1;
+const TIMELINE_EVENT_FLUSH_BATCH = 8;
+
+/**
+ * Split a rebuild list into batches that each serialize under the outbound cap.
+ *
+ * Greedy by measured size rather than a fixed count: entries vary by more than
+ * an order of magnitude (a shell sub-session versus one carrying
+ * `transportConfig`), so any fixed count is either wasteful or still too large.
+ * An entry that cannot fit even alone still gets its own batch — the daemon
+ * rejecting one oversized record is recoverable, silently dropping it is not.
+ */
+export function chunkSubSessionRebuildBatches<T>(items: readonly T[]): T[][] {
+  if (items.length === 0) return [];
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const itemBytes = utf8ByteLength(JSON.stringify(item)) + 1; // +1 for the comma
+    if (current.length > 0 && currentBytes + itemBytes > SUBSESSION_REBUILD_BATCH_BUDGET_BYTES) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += itemBytes;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+const OUTBOUND_MESSAGE_TOO_LARGE = 'Message too large';
+
+function maxOutboundMessageBytes(msg: object): number {
+  return (msg as { type?: unknown }).type === 'fs.write'
+    ? FS_WRITE_OUTBOUND_WS_MAX_BYTES
+    : DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES;
+}
+
+export type AskAnswerSendResult =
+  | { ok: true; commandId?: string }
+  | { ok: false; reason: 'not_connected' | 'too_large' };
+
 export class WsClient {
   private ws: WebSocket | null = null;
   private handlers = new Set<MessageHandler>();
+  private sessionHandlers = new Map<string, Set<SessionMessageHandler>>();
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private wsTicketTimer: ReturnType<typeof setTimeout> | null = null;
@@ -339,19 +567,74 @@ export class WsClient {
   private serverId: string;
   private shareTarget: ShareTarget | null;
   private _connected = false;
+  /**
+   * Terminal keystrokes awaiting an OPEN socket. Terminal input is the one
+   * payload with no commandId, ACK or replay, so it must not be discarded by
+   * the probe heuristic. Strictly bounded -- never an unlimited buffer.
+   */
+  private pendingInput: Array<{ sessionName: string; data: string }> = [];
+  private pendingInputBytes = 0;
   private _connecting = false;
+  private attemptStartedAt = 0;
+  private wsOpenStartedAt = 0;
   private _destroyed = false;
+  /** Timeline backlog delivery is yielded after a small first-paint burst. */
+  private pendingTimelineEvents: TimelineEventMessage[] = [];
+  /** Latest queued transient status per session/type. These events are state
+   * snapshots, not durable content; retaining every intermediate frame while
+   * a reconnect backlog drains turns a burst into a render storm. */
+  private pendingTimelineCoalesced = new Map<string, TimelineEventMessage>();
+  /** Only the current undelivered stream segment for each session. Its text
+   * is cumulative, so retaining every intermediate copy can consume hundreds
+   * of MB while background timers are suspended. Any same-session content or
+   * lifecycle boundary retires the segment; durable event ordering is kept. */
+  private pendingTimelineStreams = new Map<string, TimelineEventMessage>();
+  private timelineEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private timelineEventsSinceYield = 0;
   private _pingLatency: number | null = null;
+  private _recentLatencySamples: number[] = [];
   private _pingSentAt: number | null = null;
+  private _pingSampleCongested = false;
+  private _nextPingId = 1;
+  private _pendingPingId: number | null = null;
+  /** True when a ping was issued while an earlier un-acked ping could still
+   *  answer with a legacy untagged `{ type: 'pong' }`. Keeps untagged pongs
+   *  from producing bogus RTT samples without breaking tagged `pong.id` matches. */
+  private _pendingPingRequiresId = false;
+  /** Number of pings sent on the current socket that have not yet seen a pong. */
+  private _unackedPingCount = 0;
   /** Wall-clock time of the last received pong. Used by `probeConnection` to
    *  skip a resume probe when a recent heartbeat already proved liveness. */
   private _lastPongAt = 0;
+  private _initialPingTimer: ReturnType<typeof setTimeout> | null = null;
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _spikeReprobeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _awaitingSpikeConfirmation = false;
   private _visibilityListener: (() => void) | null = null;
+  private _pageHideListener: (() => void) | null = null;
+  private _pageShowListener: (() => void) | null = null;
+  private _freezeListener: (() => void) | null = null;
+  private _focusListener: (() => void) | null = null;
   private _missedHeartbeatPongs = 0;
   private _resumeProbeMisses = 0;
+  /** Coalesce concurrent control-plane session-list requests until the response. */
+  private sessionListRequestInFlight = false;
+  /**
+   * A busy socket can deliver timeline frames while a foreground probe is
+   * waiting for its pong.  Those frames prove liveness, but must not each
+   * synthesize a `probe_recovered` lifecycle event: the app treats that event
+   * as a control-plane resync and would otherwise refetch app-build,
+   * session-list and sub-sessions once per incoming frame.
+   */
+  /** True while a foreground liveness probe is awaiting an inbound frame. */
+  private _probePending = false;
+  /** Native app inactive state (Capacitor appStateChange isActive=false); cleared only by notifyForegrounded(). */
+  private _nativeBackgrounded = false;
+  /** Browser lifecycle suspension state (pagehide/freeze); cleared only by visible-page recovery or notifyForegrounded(). */
+  private _pageSuspended = false;
   private _onLatency: ((ms: number) => void) | null = null;
+  private _onPongLiveness: (() => void) | null = null;
   private p2pWorkflowPendingRequests = new Map<string, ReturnType<typeof setTimeout>>();
   private p2pWorkflowRequestScope: P2pWorkflowRequestScope = {};
   /** Last observed daemon capability handshake, or null if none received yet
@@ -388,6 +671,8 @@ export class WsClient {
   private terminalRawHolds = new Map<string, number>();
   private sentTerminalSubscriptions = new Map<string, boolean>();
   private terminalSubscriptionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Staggered `forceHistory` upgrades issued after a reconnect (see replayAllSubscriptionsForNewSocket). */
+  private transportHistoryReplayTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private terminalSubscriptionNextFlushAt = 0;
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
@@ -396,10 +681,22 @@ export class WsClient {
   private transportSubscriptionReplayHistory = new Map<string, boolean>();
   /** Transport-chat subscriptions confirmed sent on the current browser WS. */
   private sentTransportSubscriptions = new Set<string>();
+  /** Last sub-session rebuild payload sent on this socket. */
+  private sentSubSessionRebuildSignature: string | null = null;
+  /** Ref-counted per-session timeline subscriptions. Full wins while any view is visible. */
+  private timelineSubscriptions = new Map<string, Map<symbol, TimelineSubscriptionMode>>();
+  private sentTimelineSubscriptions = new Map<string, TimelineSubscriptionMode>();
 
   private postConnectNonCriticalUntil = 0;
   private postConnectNonCriticalSlots = 0;
   private nonCriticalSendTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Browser-owner single-flight for daemon reads that can return large
+   * payloads. Multiple mounted panels asking for the same snapshot share one
+   * requestId/response instead of multiplying daemon work and retained WS
+   * payloads. */
+  private ownedDataRequests = new Map<string, { requestId: string; expiresAt: number }>();
+  private ownedDataRequestKeyById = new Map<string, string>();
+  private ownedDataRequestStarts: number[] = [];
 
   /** Per-session stream reset recovery state.
    *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
@@ -415,6 +712,12 @@ export class WsClient {
     lastSnapshotAt: number;
     pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
+  /** Global (cross-session) cursor for outbound snapshot requests. */
+  private snapshotNextGlobalSlotAt = 0;
+  /** Last dimensions actually sent per session. tmux keeps ONE size per
+   *  session, so a redundant resize still reflows the whole pane and streams
+   *  that reflow to every subscriber as raw PTY bytes. */
+  private lastSentResize = new Map<string, string>();
 
   constructor(baseUrl: string, serverId: string, options: { shareTarget?: ShareTarget | null } = {}) {
     this.baseUrl = baseUrl;
@@ -426,19 +729,36 @@ export class WsClient {
     return this._connected;
   }
 
+  targetsServer(serverId: string): boolean {
+    return this.serverId === serverId;
+  }
+
+  getServerId(): string {
+    return this.serverId;
+  }
+
   get connecting(): boolean {
-    return this._connecting
-      || this.ws?.readyState === WebSocket.CONNECTING
+    return this.connectionAttemptInFlight
       || (!this._connected && !this._destroyed && this.reconnectTimer !== null);
+  }
+
+  /** An actual bounded ticket/open attempt, not a scheduled backoff retry. */
+  get connectionAttemptInFlight(): boolean {
+    return this._connecting || this.ws?.readyState === WebSocket.CONNECTING;
   }
 
   get pingLatency(): number | null {
     return this._pingLatency;
   }
 
-  /** Register a callback for latency updates (called on every pong). */
+  /** Register a callback for validated RTT latency updates. */
   onLatency(fn: ((ms: number) => void) | null): void {
     this._onLatency = fn;
+  }
+
+  /** Register a callback fired on every correlated pong (including spike-suppressed samples). */
+  onPongLiveness(fn: (() => void) | null): void {
+    this._onPongLiveness = fn;
   }
 
   /** Register a per-session callback for raw PTY binary frames. Returns an unsubscribe function. */
@@ -470,13 +790,21 @@ export class WsClient {
 
   disconnect(): void {
     this._destroyed = true;
+    if (this.timelineEventFlushTimer) clearTimeout(this.timelineEventFlushTimer);
+    this.timelineEventFlushTimer = null;
+    this.pendingTimelineEvents = [];
+    this.pendingTimelineCoalesced.clear();
+    this.pendingTimelineStreams.clear();
+    this.timelineEventsSinceYield = 0;
     this._connecting = false;
     this.clearTimers();
+    this.clearLifecycleListeners();
     if (this.ws) {
       this.ws.close(1000, 'client disconnect');
       this.ws = null;
     }
     this._connected = false;
+    this._probePending = false;
     this.setDaemonCapabilitySnapshot(null);
   }
 
@@ -506,8 +834,8 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
-      throw new Error('Message too large');
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
+      throw new Error(OUTBOUND_MESSAGE_TOO_LARGE);
     }
     return json;
   }
@@ -522,7 +850,7 @@ export class WsClient {
   private shouldStaggerNonCriticalMessage(msg: object): boolean {
     if (this.postConnectNonCriticalUntil <= Date.now()) return false;
     const type = (msg as { type?: unknown }).type;
-    if (type === 'transport.list_models') {
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
       return (msg as { force?: unknown }).force !== true;
     }
     return type === 'fs.ls' || type === 'fs.git_status';
@@ -572,8 +900,8 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
-      throw new Error('Message too large');
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
+      throw new Error(OUTBOUND_MESSAGE_TOO_LARGE);
     }
     this.ws.send(json);
   }
@@ -606,9 +934,29 @@ export class WsClient {
    *      verified.
    */
   probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
+    // Ticket acquisition and socket opening already have bounded watchdogs.
+    // Resume/focus must not restart them before they can finish, unless OS sleep
+    // suspended timers past their wall-clock deadline.
     if (this._destroyed) return;
+    if (this.isBackgrounded()) {
+      this.clearBackgroundWatchdogs();
+      return;
+    }
+    if (this.connectionAttemptInFlight) {
+      if (this.isConnectionAttemptWallClockStale()) {
+        this.reconnectNow(true);
+      }
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.reconnectNow(false);
+      return;
+    }
+
+    // Desktop sleep/lock often resumes via `focus` only without `visibilitychange`.
+    // If pong age exceeds 2x stale threshold, tear down the dead TCP socket immediately.
+    if (this._lastPongAt > 0 && Date.now() - this._lastPongAt > RESUME_FORCE_STALE_PONG_MS * 2) {
+      this.reconnectNow(true);
       return;
     }
 
@@ -621,9 +969,8 @@ export class WsClient {
     // multiple pings/timers when visibility/focus/pageshow all fire.
     if (this._resumeProbeTimer) return;
 
-    const wasConnected = this._connected;
-    this._connected = false;
-    if (wasConnected) {
+    if (!this._probePending) {
+      this._probePending = true;
       this.dispatch({
         type: 'session.event',
         event: 'probing',
@@ -633,8 +980,22 @@ export class WsClient {
       });
     }
 
-    this.clearPongWatchdog();
     this._resumeProbeMisses = 0;
+    const now = this.nowMs();
+    const canAdoptInFlightPing = this._pendingPingId !== null
+      && this._pingSentAt !== null
+      && (this._pongTimer !== null || now - this._pingSentAt < timeoutMs);
+    if (canAdoptInFlightPing && this._pingSentAt !== null) {
+      // Reuse the in-flight heartbeat ping rather than transmitting a second
+      // ping that would overwrite `_pendingPingId`/`_pingSentAt` and misattribute
+      // an untagged legacy `{ type: 'pong' }` from the first ping.
+      this.clearPongWatchdog();
+      const remainingMs = Math.max(0, timeoutMs - Math.max(0, now - this._pingSentAt));
+      this.armResumeProbeWatchdog(timeoutMs, remainingMs);
+      return;
+    }
+
+    this.clearPongWatchdog();
     this.sendResumeProbePing(timeoutMs);
   }
 
@@ -666,6 +1027,12 @@ export class WsClient {
    */
   resumeConnection(forceIfStale = false): void {
     if (this._destroyed) return;
+    if (this.connectionAttemptInFlight) {
+      if (this.isConnectionAttemptWallClockStale()) {
+        this.reconnectNow(true);
+      }
+      return;
+    }
     if (!forceIfStale) {
       this.probeConnection();
       return;
@@ -686,6 +1053,56 @@ export class WsClient {
   onMessage(handler: MessageHandler): () => void {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
+  }
+
+  /** Subscribe only to frames belonging to one exact session. Global control frames never fan out here. */
+  onSessionMessage(sessionName: string, handler: SessionMessageHandler): () => void {
+    let set = this.sessionHandlers.get(sessionName);
+    if (!set) {
+      set = new Set();
+      this.sessionHandlers.set(sessionName, set);
+    }
+    set.add(handler);
+    return () => {
+      const current = this.sessionHandlers.get(sessionName);
+      current?.delete(handler);
+      if (current?.size === 0) this.sessionHandlers.delete(sessionName);
+    };
+  }
+
+  subscribeTimelineSession(sessionName: string, owner: symbol, mode: TimelineSubscriptionMode, cursor?: { epoch?: number; afterSeq?: number }): void {
+    if (!sessionName) return;
+    let owners = this.timelineSubscriptions.get(sessionName);
+    if (!owners) {
+      owners = new Map();
+      this.timelineSubscriptions.set(sessionName, owners);
+    }
+    owners.set(owner, mode);
+    this.syncTimelineSubscription(sessionName, cursor);
+  }
+
+  unsubscribeTimelineSession(sessionName: string, owner: symbol): void {
+    const owners = this.timelineSubscriptions.get(sessionName);
+    if (!owners) return;
+    owners.delete(owner);
+    if (owners.size === 0) this.timelineSubscriptions.delete(sessionName);
+    this.syncTimelineSubscription(sessionName);
+  }
+
+  private syncTimelineSubscription(sessionName: string, cursor?: { epoch?: number; afterSeq?: number }): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const owners = this.timelineSubscriptions.get(sessionName);
+    const mode: TimelineSubscriptionMode | undefined = owners?.size
+      ? (Array.from(owners.values()).includes('full') ? 'full' : 'summary')
+      : undefined;
+    if (mode === this.sentTimelineSubscriptions.get(sessionName)) return;
+    if (!mode) {
+      this.send({ type: TIMELINE_MESSAGES.UNSUBSCRIBE, sessionName });
+      this.sentTimelineSubscriptions.delete(sessionName);
+      return;
+    }
+    this.send({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName, mode, ...cursor });
+    this.sentTimelineSubscriptions.set(sessionName, mode);
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
@@ -780,7 +1197,14 @@ export class WsClient {
   private replayAllSubscriptionsForNewSocket(): void {
     this.sentTerminalSubscriptions.clear();
     this.sentTransportSubscriptions.clear();
+    this.sentTimelineSubscriptions.clear();
     this.terminalSubscriptionNextFlushAt = 0;
+
+    for (const [sessionName, owners] of this.timelineSubscriptions) {
+      const mode: TimelineSubscriptionMode = Array.from(owners.values()).includes('full') ? 'full' : 'summary';
+      this.send({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName, mode });
+      this.sentTimelineSubscriptions.set(sessionName, mode);
+    }
 
     let terminalReplayIndex = 0;
     for (const session of this.terminalSubscriptions.keys()) {
@@ -788,10 +1212,47 @@ export class WsClient {
       terminalReplayIndex++;
     }
 
+    // Two-phase, deliberately. Phase 1 re-establishes every LIVE subscription
+    // immediately and with `forceHistory:false`, so no session misses realtime
+    // events while the reconnect settles (the server drops events for sessions
+    // with no subscriber). Phase 2 asks for the expensive `chat.history` replay
+    // one session at a time.
+    //
+    // Doing both in a single synchronous loop meant that after a lock/sleep —
+    // where the socket almost always died and every open session reconnects at
+    // once — the daemon replayed N full histories in parallel and the browser
+    // had to parse, merge and re-render all of them back to back on the main
+    // thread. That is a subscription storm, and it scales with the number of
+    // open sessions, which matches "the more tabs are open, the worse it is".
+    let historyReplayIndex = 0;
     for (const sessionId of this.transportSubscriptions) {
-      const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
-      if (!this.sendTransportSubscribe(sessionId, replayHistory)) break;
+      if (!this.sendTransportSubscribe(sessionId, false)) break;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) continue;
+      this.queueTransportHistoryReplay(sessionId, historyReplayIndex * TRANSPORT_RECONNECT_HISTORY_STAGGER_MS);
+      historyReplayIndex++;
     }
+  }
+
+  /** Ask for one session's transport history replay after `delayMs`. Replaces any
+   *  pending request for the same session and is cancelled on socket teardown, so
+   *  a flapping link cannot accumulate replay requests. */
+  private queueTransportHistoryReplay(sessionId: string, delayMs: number): void {
+    const existing = this.transportHistoryReplayTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.transportHistoryReplayTimers.delete(sessionId);
+      // Still wanted? A session unsubscribed during the stagger window must not
+      // pull a history it no longer displays.
+      if (!this.transportSubscriptions.has(sessionId)) return;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) return;
+      this.sendTransportSubscribe(sessionId, true);
+    }, Math.max(0, delayMs));
+    this.transportHistoryReplayTimers.set(sessionId, timer);
+  }
+
+  private clearTransportHistoryReplayTimers(): void {
+    for (const timer of this.transportHistoryReplayTimers.values()) clearTimeout(timer);
+    this.transportHistoryReplayTimers.clear();
   }
 
   private flushSubscriptionDiffAfterProbeRecovery(): void {
@@ -814,12 +1275,21 @@ export class WsClient {
     for (const sessionId of this.transportSubscriptions) {
       const wasSent = this.sentTransportSubscriptions.has(sessionId);
       const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
-      if (!this.sendTransportSubscribe(sessionId, replayHistory && !wasSent)) break;
+      // Probe recovery explicitly repairs the server-side subscription even
+      // though the browser socket never closed. This is distinct from a
+      // metadata/render effect repeating the same desired subscription.
+      if (!this.sendTransportSubscribe(sessionId, replayHistory && !wasSent, true)) break;
     }
   }
 
-  private sendTransportSubscribe(sessionId: string, forceHistory: boolean): boolean {
+  private sendTransportSubscribe(sessionId: string, forceHistory: boolean, forceResubscribe = false): boolean {
     if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    // Subscription effects run from several session surfaces and may observe
+    // metadata-only updates. Once this socket has sent the desired live
+    // subscription, repeating the same frame just replays history/server work
+    // and can starve the browser under many windows. A true forceHistory is an
+    // explicit upgrade/reconnect replay and remains allowed.
+    if (this.sentTransportSubscriptions.has(sessionId) && !forceHistory && !forceResubscribe) return true;
     try {
       this.send({
         type: TRANSPORT_MSG.CHAT_SUBSCRIBE,
@@ -883,6 +1353,24 @@ export class WsClient {
     if (wasSent) this.sendTransportUnsubscribe(sessionId);
   }
 
+  /** Request the codex account's rate-limit reset-credit list. */
+  listCodexResetCredits(requestId: string): void {
+    if (!requestId) return;
+    this.send({ type: CODEX_RESET_CREDITS_MSG.LIST, requestId });
+  }
+
+  /** Consume one codex reset credit. `idempotencyKey` should be a fresh UUID. */
+  consumeCodexResetCredit(requestId: string, idempotencyKey: string): void {
+    if (!requestId || !idempotencyKey) return;
+    this.send({ type: CODEX_RESET_CREDITS_MSG.CONSUME, requestId, idempotencyKey });
+  }
+
+  /** Request the codex account's recorded pay-as-you-go credit-balance history. */
+  requestCodexCreditHistory(requestId: string, limit?: number): void {
+    if (!requestId) return;
+    this.send({ type: CODEX_CREDIT_HISTORY_MSG.REQUEST, requestId, ...(limit ? { limit } : {}) });
+  }
+
   /** Respond to a transport approval request. */
   respondTransportApproval(sessionId: string, requestId: string, approved: boolean): void {
     if (!sessionId || !requestId) return;
@@ -897,12 +1385,14 @@ export class WsClient {
     this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
-  sendExecutionClones(payload: object = {}): void {
+  sendExecutionClones(payload: object = {}): boolean {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     const sessionName = (payload as { sessionName?: unknown }).sessionName;
     if (typeof sessionName === 'string' && sessionName.trim()) {
       this.setP2pWorkflowRequestScope({ sessionName });
     }
     this.send({ type: DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES, ...payload });
+    return true;
   }
 
   /**
@@ -912,14 +1402,23 @@ export class WsClient {
    * Acked via the normal command.ack path. Pod-routing is implicit: this WS is already
    * connected to the session's owning server.
    */
-  deleteTimelineMessage(sessionName: string, eventId: string): void {
-    if (!sessionName || !eventId) return;
-    this.send({
+  deleteTimelineMessage(
+    sessionName: string,
+    eventId: string,
+    opts: { eventIds?: readonly string[]; eventTypes?: Readonly<Record<string, string>>; commandId?: string } = {},
+  ): string {
+    const commandId = opts.commandId ?? crypto.randomUUID();
+    if (!sessionName || !eventId) return commandId;
+    const request: TimelineDeleteRequest = {
       type: TIMELINE_MESSAGES.DELETE,
       sessionName,
       eventId,
-      commandId: crypto.randomUUID(),
-    });
+      ...(opts.eventIds && opts.eventIds.length > 0 ? { eventIds: [...opts.eventIds] } : {}),
+      ...(opts.eventTypes && Object.keys(opts.eventTypes).length > 0 ? { eventTypes: { ...opts.eventTypes } } : {}),
+      commandId,
+    };
+    this.send(request);
+    return commandId;
   }
 
   /**
@@ -933,17 +1432,70 @@ export class WsClient {
 
   /** Send raw keyboard input (from xterm onData) to a tmux session. */
   sendInput(sessionName: string, data: string): void {
-    this.send({ type: 'session.input', sessionName, data });
+    // The generic send() gate is deliberately left unchanged. Terminal input
+    // alone bypasses the probe heuristic, because `_connected=false` is flipped
+    // on every tab resume while readyState is still OPEN, and a dropped
+    // keystroke has no retry path (unlike session.send). readyState OPEN stays
+    // required -- the same OS-level truth sendUrgent() uses for /stop.
+    // Everything goes through the queue so order is preserved exactly.
+    this.queueInput(sessionName, data);
+    this.flushPendingInput();
+  }
+
+  private queueInput(sessionName: string, data: string): void {
+    this.pendingInput.push({ sessionName, data });
+    this.pendingInputBytes += utf8ByteLength(data);
+    while (
+      this.pendingInput.length > MAX_PENDING_INPUT_ENTRIES
+      || this.pendingInputBytes > MAX_PENDING_INPUT_BYTES
+    ) {
+      const dropped = this.pendingInput.shift();
+      if (!dropped) break;
+      this.pendingInputBytes -= utf8ByteLength(dropped.data);
+      // A bound is required, but a drop is never silent.
+      this.dispatch({
+        type: 'session.event',
+        event: 'warning',
+        session: dropped.sessionName,
+        state: 'warning',
+        reason: 'input_buffer_overflow',
+      });
+    }
+  }
+
+  private flushPendingInput(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    while (this.pendingInput.length > 0) {
+      const next = this.pendingInput[0]!;
+      try {
+        this.ws.send(JSON.stringify({ type: 'session.input', sessionName: next.sessionName, data: next.data }));
+      } catch {
+        return; // keep the remainder queued, in order
+      }
+      this.pendingInput.shift();
+      this.pendingInputBytes -= utf8ByteLength(next.data);
+    }
   }
 
   /** Notify the daemon that the terminal viewport has been resized. */
   sendResize(sessionName: string, cols: number, rows: number): void {
     if (!this._connected) return;
+    // An unchanged resize is NOT a no-op on the daemon: `handleResize` still
+    // calls `resizeSession`, tmux reflows the entire pane, and that reflow is
+    // streamed to every subscriber as raw PTY bytes. Every terminal re-runs
+    // its resize effect on reconnect, so without this guard one reconnect
+    // replays a full-screen reflow per open terminal.
+    const key = `${cols}x${rows}`;
+    if (this.lastSentResize.get(sessionName) === key) return;
+    this.lastSentResize.set(sessionName, key);
     this.send({ type: 'session.resize', sessionName, cols, rows });
   }
 
   /** Request the current session list from the daemon. */
   requestSessionList(): void {
+    if (this.sessionListRequestInFlight) return;
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.sessionListRequestInFlight = true;
     this.send({ type: 'get_sessions' });
   }
 
@@ -990,11 +1542,50 @@ export class WsClient {
   }
 
   subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportConfig?: Record<string, unknown> | null }>): void {
-    this.send({ type: 'subsession.rebuild_all', subSessions });
+    const signature = JSON.stringify(subSessions);
+    if (signature === this.sentSubSessionRebuildSignature) return;
+    // Send in size-bounded batches.
+    //
+    // One message carrying every sub-session crosses the 60 KB outbound cap at
+    // roughly 150 of them, and `send` answers that by THROWING. The throw
+    // escaped the effect that calls this, which aborted the rest of that
+    // effect flush — including the effect immediately after it that opens the
+    // transport chat subscriptions for those same sub-sessions. With no
+    // subscriber the server discards their live timeline events, so their
+    // replies only reappeared through history backfill: the typewriter stopped
+    // for sub-sessions while main sessions, subscribed in an earlier flush,
+    // were untouched.
+    //
+    // `rebuildSubSessions` on the daemon upserts per item and prunes nothing,
+    // so splitting the list is equivalent to sending it whole.
+    // One undeliverable batch must not starve the ones behind it. A single
+    // entry can exceed the cap on its own — `chunkSubSessionRebuildBatches`
+    // gives it its own batch rather than dropping it silently — and `send`
+    // rejects that locally, before the socket. In a bare loop that throw ends
+    // the loop, so every later batch is lost too and nothing retries until the
+    // next connection. Isolate each batch and keep going.
+    let sent = false;
+    for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
+      try {
+        this.send({ type: 'subsession.rebuild_all', subSessions: batch, supportsCreatedBatch: true });
+        sent = true;
+      } catch (err) {
+        console.warn(
+          '[ws] subsession.rebuild_all batch dropped',
+          { size: batch.length, ids: batch.slice(0, 3).map((sub) => sub.id) },
+          err,
+        );
+      }
+    }
+    if (sent || subSessions.length === 0) this.sentSubSessionRebuildSignature = signature;
   }
 
   subSessionDetectShells(): void {
     this.send({ type: 'subsession.detect_shells' });
+  }
+
+  detectAgents(forceRefresh = false): void {
+    this.send({ type: AGENT_AVAILABILITY_MSG.DETECT, ...(forceRefresh ? { forceRefresh: true } : {}) });
   }
 
   subSessionReadResponse(sessionName: string): void {
@@ -1009,8 +1600,34 @@ export class WsClient {
     this.send({ type: 'subsession.set_model', sessionName, model, cwd });
   }
 
-  askAnswer(sessionName: string, answer: string): void {
-    this.send({ type: 'ask.answer', sessionName, answer });
+  /**
+   * Answer an AskUserQuestion card. Unlike the fire-and-forget `send()`, this
+   * reports whether the frame actually left the browser: the user's choice must
+   * never be dropped silently while the card is dismissed as if it was sent.
+   * Uses the OS-level socket state (like /stop) so a focus/visibility probe that
+   * momentarily flips `_connected` cannot swallow the tap.
+   *
+   * With a daemon that advertises ASK_ANSWER_ACK_CAPABILITY_V1 the frame carries a
+   * `commandId`, and the returned id is what the daemon's `command.ack` /
+   * the bridge's `command.failed` will name. Older daemons get the legacy frame
+   * and no id (no confirmation will ever come).
+   */
+  askAnswer(sessionName: string, answer: string, opts: { toolUseId?: string } = {}): AskAnswerSendResult {
+    const acked = this.daemonCapabilitySnapshot?.capabilities.includes(ASK_ANSWER_ACK_CAPABILITY_V1) === true;
+    const commandId = acked ? crypto.randomUUID() : undefined;
+    try {
+      this.sendUrgent({
+        type: ASK_ANSWER_COMMAND,
+        sessionName,
+        answer,
+        ...(opts.toolUseId ? { toolUseId: opts.toolUseId } : {}),
+        ...(commandId ? { commandId } : {}),
+      });
+    } catch (err) {
+      const tooLarge = err instanceof Error && err.message === OUTBOUND_MESSAGE_TOO_LARGE;
+      return { ok: false, reason: tooLarge ? 'too_large' : 'not_connected' };
+    }
+    return { ok: true, ...(commandId ? { commandId } : {}) };
   }
 
   // ── Discussion commands ────────────────────────────────────────────────────
@@ -1148,7 +1765,9 @@ export class WsClient {
     P2P_WORKFLOW_MSG.STATUS_RESPONSE,
     P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
-    'daemon.stats',
+    DAEMON_STATS_MSG,
+    // Link-worker liveness: the daemon's own process produced it moments ago.
+    DAEMON_LIVENESS_MSG,
     TIMELINE_MESSAGES.EVENT,
     TIMELINE_MESSAGES.REPLAY,
     TIMELINE_MESSAGES.HISTORY,
@@ -1157,6 +1776,8 @@ export class WsClient {
     'session_list',
     REPO_MSG.DETECTED,
     REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+    REPO_MSG.CALLBACK_STATUS_RESPONSE,
+    REPO_MSG.CALLBACK_EVENT,
     TRANSPORT_MSG.PROVIDER_STATUS,
     TRANSPORT_MSG.CHAT_HISTORY,
     TRANSPORT_EVENT.CHAT_DELTA,
@@ -1178,6 +1799,40 @@ export class WsClient {
     if (WsClient.DAEMON_ORIGIN_MESSAGE_TYPES.has(msg.type)) {
       this.daemonLastSeenAt = Date.now();
     }
+  }
+
+  /**
+   * Any frame received on the current OPEN socket proves the browser/server path
+   * is alive. Probe recovery used to wait only for an explicit `pong`; if that
+   * pong was delayed/dropped while daemon-originated frames (session_list,
+   * timeline.event, transport deltas) kept arriving, `_connected` stayed false
+   * and all foreground refresh sends became silent no-ops until the user
+   * switched windows. Treat inbound traffic as liveness so active pages recover
+   * immediately without needing a focus/visibility nudge.
+   */
+  private markSocketAliveFromInboundFrame(): void {
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+    if (this._pongTimer) {
+      clearTimeout(this._pongTimer);
+      this._pongTimer = null;
+    }
+    if (this._resumeProbeTimer) {
+      clearTimeout(this._resumeProbeTimer);
+      this._resumeProbeTimer = null;
+    }
+    if (!this._connected) return;
+    this.flushPendingInput();
+    if (!this._probePending) return;
+    this._probePending = false;
+    this.flushSubscriptionDiffAfterProbeRecovery();
+    this.dispatch({
+      type: 'session.event',
+      event: 'connected',
+      session: '',
+      state: 'connected',
+      reason: 'probe_recovered',
+    });
   }
 
   private handleDaemonHelloMessage(msg: ServerMessage): void {
@@ -1255,28 +1910,156 @@ export class WsClient {
   }
 
   /** Request a terminal snapshot (fullFrame) for a session. */
+  /** Request a fresh full-frame snapshot for a session.
+   *
+   *  Governed, NOT a bare send. Three call sites (`TerminalView`,
+   *  `SessionPane`, `SubSessionWindow`) all fire on the same `connected`
+   *  transition, and `SessionPane`/`SubSessionWindow` each render a
+   *  `TerminalView` for the SAME session — so one reconnect emitted at least
+   *  two requests per session, times every open session, times every browser
+   *  tab. Each request costs a `capture-pane` fork on the daemon and a
+   *  full-frame broadcast to every subscriber of that session. */
   sendSnapshotRequest(sessionName: string): void {
-    this.send({ type: 'terminal.snapshot_request', sessionName });
+    this.requestSnapshotGoverned(sessionName);
+  }
+
+  /** Shared implementation behind `sendSnapshotRequest` and stream-reset
+   *  recovery: at most one request per session per
+   *  SNAPSHOT_SESSION_MIN_INTERVAL_MS, spread across sessions by a global
+   *  cursor. Requests inside the window collapse into a single deferred one,
+   *  so a session can never be starved and can never be frozen. */
+  private requestSnapshotGoverned(session: string): void {
+    if (!this._connected || this._destroyed) return;
+    const now = Date.now();
+    let state = this.resetState.get(session);
+    if (!state) {
+      state = { lastSnapshotAt: 0, pendingSnapshot: null };
+      this.resetState.set(session, state);
+    }
+
+    const sessionReadyAt = state.lastSnapshotAt === 0
+      ? now
+      : state.lastSnapshotAt + SNAPSHOT_SESSION_MIN_INTERVAL_MS;
+    const slotAt = Math.max(sessionReadyAt, this.snapshotNextGlobalSlotAt, now);
+
+    if (slotAt <= now) {
+      state.lastSnapshotAt = now;
+      this.snapshotNextGlobalSlotAt = now + SNAPSHOT_GLOBAL_STAGGER_MS;
+      this.emitSnapshotRequest(session);
+      return;
+    }
+
+    if (state.pendingSnapshot) return;
+    this.snapshotNextGlobalSlotAt = slotAt + SNAPSHOT_GLOBAL_STAGGER_MS;
+    state.pendingSnapshot = setTimeout(() => {
+      const s = this.resetState.get(session);
+      if (!s) return;
+      s.pendingSnapshot = null;
+      if (this._destroyed || !this._connected) return;
+      s.lastSnapshotAt = Date.now();
+      this.emitSnapshotRequest(session);
+    }, Math.max(0, slotAt - now));
+  }
+
+  private emitSnapshotRequest(session: string): void {
+    try {
+      this.send({ type: 'terminal.snapshot_request', sessionName: session });
+    } catch {
+      // ws not open right now; the next reset / reconnect replay recovers.
+    }
+  }
+
+  private settleOwnedDataRequest(msg: ServerMessage): void {
+    const requestId = typeof (msg as { requestId?: unknown }).requestId === 'string'
+      ? (msg as { requestId: string }).requestId
+      : undefined;
+    if (!requestId) return;
+    this.forgetOwnedDataRequest(requestId);
+  }
+
+  /**
+   * Give up locally on a request that went through beginOwnedDataRequest
+   * (fsListDir, fsGitStatus, sendTimelineHistoryRequest, requestTransportModels,
+   * …). Without this, a caller-side timeout leaves the dedup entry parked for
+   * up to OWNED_DATA_REQUEST_TTL_MS: an immediate retry for the same key would
+   * silently reuse the dead requestId and send nothing, guaranteeing the retry
+   * also times out. Callers should invoke this exactly when they stop waiting
+   * for requestId (e.g. their own timeout fires) so the next attempt for the
+   * same key actually goes over the wire.
+   */
+  forgetOwnedDataRequest(requestId: string): void {
+    const key = this.ownedDataRequestKeyById.get(requestId);
+    if (!key) return;
+    this.ownedDataRequestKeyById.delete(requestId);
+    const current = this.ownedDataRequests.get(key);
+    if (current?.requestId === requestId) this.ownedDataRequests.delete(key);
+  }
+
+  private beginOwnedDataRequest(
+    key: string,
+    buildRequest: (requestId: string) => Record<string, unknown>,
+    buildOverloadResponse: (requestId: string) => ServerMessage,
+  ): string {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // send() drops outbound frames when disconnected; return an untracked id
+      // without poisoning ownedDataRequests/ownedDataRequestStarts for the TTL.
+      return crypto.randomUUID();
+    }
+    const now = Date.now();
+    for (const [pendingKey, pending] of this.ownedDataRequests) {
+      if (pending.expiresAt > now) continue;
+      this.ownedDataRequests.delete(pendingKey);
+      this.ownedDataRequestKeyById.delete(pending.requestId);
+    }
+    const existing = this.ownedDataRequests.get(key);
+    if (existing) return existing.requestId;
+
+    const requestId = crypto.randomUUID();
+    this.ownedDataRequestStarts = this.ownedDataRequestStarts.filter(
+      (startedAt) => now - startedAt < OWNED_DATA_REQUEST_RATE_WINDOW_MS,
+    );
+    if (this.ownedDataRequestStarts.length >= OWNED_DATA_REQUEST_RATE_LIMIT) {
+      queueMicrotask(() => this.dispatch(buildOverloadResponse(requestId)));
+      return requestId;
+    }
+    this.ownedDataRequestStarts.push(now);
+    this.ownedDataRequests.set(key, { requestId, expiresAt: now + OWNED_DATA_REQUEST_TTL_MS });
+    this.ownedDataRequestKeyById.set(requestId, key);
+    this.send(buildRequest(requestId));
+    return requestId;
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
   fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: 'fs.ls',
-      path,
-      requestId,
-      includeFiles,
-      includeMetadata,
-      ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
-    });
-    return requestId;
+    const key = JSON.stringify(['fs.ls', path, includeFiles, includeMetadata, options?.includeOpenSpecTaskStats === true, options?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.ls',
+        path,
+        requestId,
+        includeFiles,
+        includeMetadata,
+        ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+        ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.ls_response', requestId, path, status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
-  fsReadFile(path: string): string {
+  fsReadFile(path: string, sessionName?: string, options?: { chatFileReference?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.read', path, requestId });
+    this.send({
+      type: 'fs.read',
+      path,
+      requestId,
+      ...(sessionName ? { sessionName } : {}),
+      ...(options?.chatFileReference ? { chatFileReference: true } : {}),
+    });
     return requestId;
   }
 
@@ -1284,6 +2067,9 @@ export class WsClient {
   fsWriteFile(path: string, content: string, expectedMtime?: number): string;
   fsWriteFile(path: string, content: string, options?: FsWriteOptions): string;
   fsWriteFile(path: string, content: string, expectedMtimeOrOptions?: number | FsWriteOptions): string {
+    if (utf8ByteLength(content) > FS_WRITE_MAX_BYTES) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
     const requestId = crypto.randomUUID();
     const options = typeof expectedMtimeOrOptions === 'object' ? expectedMtimeOrOptions : undefined;
     const expectedMtime = typeof expectedMtimeOrOptions === 'number' ? expectedMtimeOrOptions : options?.expectedMtime;
@@ -1294,14 +2080,15 @@ export class WsClient {
       requestId,
       ...(expectedMtime !== undefined ? { expectedMtime } : {}),
       ...(options?.createOnly ? { createOnly: true } : {}),
+      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
     });
     return requestId;
   }
 
   /** Create a directory on the daemon. Returns requestId. */
-  fsMkdir(path: string): string {
+  fsMkdir(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.mkdir', path, requestId });
+    this.send({ type: 'fs.mkdir', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1320,51 +2107,66 @@ export class WsClient {
   }
 
   /** Request git status for a directory. Returns requestId. */
-  fsGitStatus(path: string, opts?: { includeStats?: boolean }): string {
-    const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_status', path, requestId, ...(opts?.includeStats ? { includeStats: true } : {}) });
-    return requestId;
+  fsGitStatus(path: string, opts?: { includeStats?: boolean; summaryOnly?: boolean; sessionName?: string }): string {
+    const summaryOnly = opts?.summaryOnly === true;
+    const includeStats = !summaryOnly && opts?.includeStats === true;
+    const key = JSON.stringify(['fs.git_status', path, includeStats, summaryOnly, opts?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.git_status',
+        path,
+        requestId,
+        ...(includeStats ? { includeStats: true } : {}),
+        ...(summaryOnly ? { summaryOnly: true } : {}),
+        ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.git_status_response', requestId, path, status: 'error', files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request git diff for a file. Returns requestId. */
-  fsGitDiff(path: string): string {
+  fsGitDiff(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_diff', path, requestId });
+    this.send({ type: 'fs.git_diff', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
   // ── Repo commands ──────────────────────────────────────────────────────────
 
   /** Detect repo context for a project directory. Returns requestId. */
-  repoDetect(projectDir: string, opts?: { force?: boolean }): string {
+  repoDetect(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List issues for a project. Returns requestId. */
-  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ISSUES, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
-  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_PRS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List branches for a project. Returns requestId. */
-  repoListBranches(projectDir: string, opts?: { force?: boolean }): string {
+  repoListBranches(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
-  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean }): string {
+  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_COMMITS, requestId, projectDir, ...opts });
     return requestId;
@@ -1384,53 +2186,121 @@ export class WsClient {
   }
 
   /** List workflow runs (CI/CD actions) for a project. Returns requestId. */
-  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
+  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ACTIONS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** Get workflow run jobs/steps for a project. Returns requestId. */
-  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean }): string {
+  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */
-  repoCommitDetail(projectDir: string, sha: string): string {
+  repoCommitDetail(projectDir: string, sha: string, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId });
+    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get PR detail (body, review, checks, stats). Returns requestId. */
-  repoPRDetail(projectDir: string, number: number): string {
+  repoPRDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get issue detail (body, comments). Returns requestId. */
-  repoIssueDetail(projectDir: string, number: number): string {
+  repoIssueDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
+    return requestId;
+  }
+
+  /** Notify daemon to refresh repo callback monitoring config from server preferences. */
+  repoCallbackSync(projectDir?: string): void {
+    this.send({
+      type: REPO_MSG.CALLBACK_SYNC,
+      ...(projectDir ? { projectDir } : {}),
+    });
+  }
+
+  /** Trigger an immediate repo callback poll for a project directory. Returns requestId. */
+  repoCallbackCheckNow(projectDir: string, opts?: { sessionName?: string }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: REPO_MSG.CALLBACK_CHECK_NOW,
+      requestId,
+      projectDir,
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
+    return requestId;
+  }
+
+  /** Request current repo callback status & recent records for a project directory. Returns requestId. */
+  repoCallbackStatus(projectDir: string, opts?: { sessionName?: string }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: REPO_MSG.CALLBACK_STATUS_REQUEST,
+      requestId,
+      projectDir,
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
     return requestId;
   }
 
   /** Request full timeline history for a session (used on first load / daemon reconnect).
    *  afterTs: client's latest known event timestamp — server returns only newer events.
    *  beforeTs: for backward pagination — server returns only older events. */
-  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+  sendTimelineHistoryRequest(
+    sessionName: string,
+    limit = 200,
+    afterTs?: number,
+    beforeTs?: number,
+    cursor?: TimelineCursor,
+    budgetBytes?: number,
+    contentFilter?: TimelineHistoryContentFilter,
+  ): string {
+    const key = JSON.stringify([
+      TIMELINE_MESSAGES.HISTORY_REQUEST,
       sessionName,
-      requestId,
       limit,
-      ...(afterTs !== undefined ? { afterTs } : {}),
-      ...(beforeTs !== undefined ? { beforeTs } : {}),
-    });
+      afterTs ?? null,
+      beforeTs ?? null,
+      cursor ?? null,
+      budgetBytes ?? null,
+      // Keyed only when set, so every existing (unfiltered) key stays byte-identical.
+      ...(contentFilter ? [contentFilter] : []),
+    ]);
+    const requestId = this.beginOwnedDataRequest(
+      key,
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName,
+        requestId: nextRequestId,
+        limit,
+        ...(afterTs !== undefined ? { afterTs } : {}),
+        ...(beforeTs !== undefined ? { beforeTs } : {}),
+        ...(cursor ? { cursor } : {}),
+        ...(budgetBytes !== undefined ? { budgetBytes } : {}),
+        ...(contentFilter ? { contentFilter } : {}),
+      }),
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: nextRequestId,
+        status: 'error',
+        source: 'error',
+        errorReason: 'queue_full',
+        events: [],
+        payloadTruncated: false,
+        hasMore: false,
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
     // Probe AFTER sending (not before): the send must run while the socket is
     // still logically connected. If the socket turned out to be a zombie, the
     // send is silently lost, but this kicks recovery so the window's foreground
@@ -1439,8 +2309,44 @@ export class WsClient {
     return requestId;
   }
 
+  requestTransportModels(options: {
+    agentType: string;
+    sessionName?: string;
+    ccPreset?: string;
+    force?: boolean;
+  }): string {
+    const key = JSON.stringify([
+      TRANSPORT_MSG.LIST_MODELS,
+      options.agentType,
+      options.sessionName ?? '',
+      options.ccPreset?.trim().toLowerCase() ?? '',
+      options.force === true,
+    ]);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: TRANSPORT_MSG.LIST_MODELS,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        ...(options.force ? { force: true } : {}),
+      }),
+      (requestId) => ({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        models: [],
+        error: 'queue_full',
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
+  }
+
   /** Request a bounded explicit timeline page. */
-  sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500): string {
+  sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500, budgetBytes = 1024 * 1024): string {
     if (!this.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)) {
       throw new Error('timeline_protocol_unavailable');
     }
@@ -1455,6 +2361,7 @@ export class WsClient {
       ...(cursor.beforeTs !== undefined ? { beforeTs: cursor.beforeTs } : {}),
       ...(cursor.afterSeq !== undefined ? { afterSeq: cursor.afterSeq } : {}),
       epoch: cursor.epoch,
+      budgetBytes,
     });
     return requestId;
   }
@@ -1485,7 +2392,10 @@ export class WsClient {
       this.detachCurrentSocket(4001, 'client reconnect stale socket');
     }
     this._connecting = true;
+    this.attemptStartedAt = Date.now();
+    this.wsOpenStartedAt = 0;
     const generation = ++this.socketGeneration;
+    this.installVisibilityListener();
 
     const wsUrl = this.baseUrl
       .replace(/^http/, 'ws')
@@ -1522,6 +2432,8 @@ export class WsClient {
     } catch (err) {
       if (generation !== this.socketGeneration) return;
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       // Auth expired (401) → onAuthExpired already fired, don't keep reconnecting
       if (err instanceof ApiError && err.status === 401) return;
       this.scheduleReconnect();
@@ -1535,6 +2447,8 @@ export class WsClient {
     if (generation !== this.socketGeneration) return;
     if (this._destroyed) {
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       return;
     }
 
@@ -1543,10 +2457,12 @@ export class WsClient {
     if (this.ws) {
       this.detachCurrentSocket(4001, 'client replace stale socket');
       this._connecting = true;
+      this.attemptStartedAt = Date.now();
     }
 
     const socket = new WebSocket(url);
     this.ws = socket;
+    this.wsOpenStartedAt = Date.now();
     socket.binaryType = 'arraybuffer';
     this.armWsOpenTimer(socket, generation);
 
@@ -1554,7 +2470,15 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.clearWsOpenTimer();
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       this._connected = true;
+      this._probePending = false;
+      this._lastPongAt = 0;
+      // Rebuild state is scoped to the actual WebSocket. Probe recovery keeps
+      // this signature; a new socket receives one fresh rebuild payload.
+      this.sentSubSessionRebuildSignature = null;
+      this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
       this.postConnectNonCriticalUntil = Date.now() + POST_CONNECT_NON_CRITICAL_WINDOW_MS;
@@ -1567,6 +2491,10 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
+      this.snapshotNextGlobalSlotAt = 0;
+      // A new socket means the daemon may have restarted or the pane may have
+      // been rebuilt — the remembered size is no longer known-applied.
+      this.lastSentResize.clear();
       this.replayAllSubscriptionsForNewSocket();
       this.dispatch({
         type: 'session.event',
@@ -1581,6 +2509,7 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
+        this.markSocketAliveFromInboundFrame();
         this.handleRawFrame(ev.data);
         return;
       }
@@ -1588,37 +2517,45 @@ export class WsClient {
       try {
         const msg = JSON.parse(ev.data as string) as ServerMessage;
         if (msg.type === 'pong') {
-          this._missedHeartbeatPongs = 0;
-          this._resumeProbeMisses = 0;
           this._lastPongAt = Date.now();
-          if (this._pingSentAt !== null) {
-            this._pingLatency = Date.now() - this._pingSentAt;
-            this._pingSentAt = null;
-            this._onLatency?.(this._pingLatency);
+          if (this._unackedPingCount > 0) {
+            this._unackedPingCount -= 1;
           }
-          // Clear the dead-socket watchdog — we just proved the socket is alive.
-          if (this._pongTimer) {
-            clearTimeout(this._pongTimer);
-            this._pongTimer = null;
-          }
-          if (this._resumeProbeTimer) {
-            clearTimeout(this._resumeProbeTimer);
-            this._resumeProbeTimer = null;
-            if (!this._connected) {
-              this._connected = true;
-              this.flushSubscriptionDiffAfterProbeRecovery();
-              this.dispatch({
-                type: 'session.event',
-                event: 'connected',
-                session: '',
-                state: 'connected',
-                reason: 'probe_recovered',
-              });
+          const rawId = (msg as { id?: unknown }).id;
+          const pongId = (typeof rawId === 'number' && Number.isFinite(rawId)) || typeof rawId === 'string'
+            ? rawId
+            : undefined;
+          const matchesPending = this._pingSentAt !== null && (
+            pongId !== undefined
+              ? pongId === this._pendingPingId
+              : !this._pendingPingRequiresId
+          );
+          if (matchesPending && this._pingSentAt !== null) {
+            const sampleMs = Math.max(0, Math.round(this.nowMs() - this._pingSentAt));
+            const wasAwaitingConfirmation = this._awaitingSpikeConfirmation;
+            const sampleCongested = this._pingSampleCongested || this.isClientTransportCongested();
+            this.clearPendingPingSample();
+            const isAnomalousSpike = !wasAwaitingConfirmation
+              && this.isAnomalousLatencySpike(sampleMs, sampleCongested);
+            this.markSocketAliveFromInboundFrame();
+            this._onPongLiveness?.();
+            if (isAnomalousSpike) {
+              this._awaitingSpikeConfirmation = true;
+              this.scheduleLatencySpikeReprobe();
+            } else {
+              this._awaitingSpikeConfirmation = false;
+              this.clearSpikeReprobeTimer();
+              const reportedMs = this.recordAndSmoothLatency(sampleMs, wasAwaitingConfirmation);
+              this._pingLatency = reportedMs;
+              this._onLatency?.(reportedMs);
             }
+            return;
           }
+          this.markSocketAliveFromInboundFrame();
           return;
         }
-        if (msg.type === 'terminal.stream_reset') {
+        this.markSocketAliveFromInboundFrame();
+        if (msg.type === TERMINAL_CONTROL.STREAM_RESET) {
           this.handleStreamReset(msg.session);
           this.dispatch(msg); // Let TerminalView know to reset terminal state
           return;
@@ -1627,6 +2564,7 @@ export class WsClient {
         // before dispatch so any listener that immediately re-asks
         // `isDaemonCapabilityStale()` sees the fresh value.
         this.bumpDaemonLastSeenIfFromDaemon(msg);
+        if (msg.type === TIMELINE_MESSAGES.EVENT && this.deferTimelineEvent(msg)) return;
         this.dispatch(msg);
       } catch {
         // ignore parse errors
@@ -1637,6 +2575,7 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       const wasConnected = this._connected;
       this._connected = false;
+      this._probePending = false;
       this._connecting = false;
       this.ws = null;
       this.clearSocketTimers();
@@ -1699,43 +2638,11 @@ export class WsClient {
    *     this design cannot.
    */
   private handleStreamReset(session: string): void {
-    if (!this._connected) return;
-    const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 500;
-    const now = Date.now();
-    let state = this.resetState.get(session);
-    if (!state) {
-      state = { lastSnapshotAt: 0, pendingSnapshot: null };
-      this.resetState.set(session, state);
-    }
-
-    const sinceLast = now - state.lastSnapshotAt;
-    if (sinceLast >= SNAPSHOT_REQUEST_MIN_INTERVAL_MS) {
-      // Window open — fire snapshot now.
-      state.lastSnapshotAt = now;
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch {
-        // ws not open right now; the next reset (or the reconnect resubscribe
-        // replay) will recover.
-      }
-      return;
-    }
-
-    // Inside the rate-limit window — defer one snapshot to the end of the
-    // window. If a deferred snapshot is already scheduled, leave it alone:
-    // multiple resets in the same window collapse into a single snapshot.
-    if (state.pendingSnapshot) return;
-    const remaining = SNAPSHOT_REQUEST_MIN_INTERVAL_MS - sinceLast;
-    state.pendingSnapshot = setTimeout(() => {
-      const s = this.resetState.get(session);
-      if (!s) return;
-      s.pendingSnapshot = null;
-      if (this._destroyed || !this._connected) return;
-      s.lastSnapshotAt = Date.now();
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch { /* covered by next reset / reconnect */ }
-    }, remaining);
+    // Shares ONE window with component-driven requests. Previously this kept a
+    // second, independent per-session limiter, so overflow recovery and a
+    // reconnect-driven request could fire back to back for the same session,
+    // neither knowing about the other.
+    this.requestSnapshotGoverned(session);
   }
 
   private isCurrentSocket(socket: WebSocket, generation: number): boolean {
@@ -1781,25 +2688,32 @@ export class WsClient {
 
   private clearSocketTimers(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this._initialPingTimer) clearTimeout(this._initialPingTimer);
     this.clearPongWatchdog();
     this.clearTerminalSubscriptionTimers();
+    this.clearTransportHistoryReplayTimers();
     this.clearNonCriticalSendTimers();
+    this.sessionListRequestInFlight = false;
+    this.ownedDataRequests.clear();
+    this.ownedDataRequestKeyById.clear();
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown
     // the cached snapshot is no longer authoritative and must be cleared
     // so the UI re-disables advanced launch until a fresh hello arrives.
     this.setDaemonCapabilitySnapshot(null);
-    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
-    if (this._visibilityListener && typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this._visibilityListener);
-    }
+    this.clearResumeProbeWatchdog();
+    this.clearSpikeReprobeTimer();
     this.clearWsOpenTimer();
     this.heartbeatTimer = null;
-    this._visibilityListener = null;
-    this._resumeProbeTimer = null;
-    this._pingSentAt = null;
+    this._initialPingTimer = null;
+    this._awaitingSpikeConfirmation = false;
     this._missedHeartbeatPongs = 0;
     this._resumeProbeMisses = 0;
+    this._pingLatency = null;
+    this._recentLatencySamples = [];
+    this.clearPendingPingSample();
+    this._unackedPingCount = 0;
+    this._lastPongAt = 0;
   }
 
   private clearTerminalSubscriptionTimers(): void {
@@ -1821,12 +2735,25 @@ export class WsClient {
     this.postConnectNonCriticalSlots = 0;
   }
 
+  private isConnectionAttemptWallClockStale(now = Date.now()): boolean {
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      return this.wsOpenStartedAt > 0 && now - this.wsOpenStartedAt >= WS_OPEN_TIMEOUT_MS;
+    }
+    if (this._connecting) {
+      return this.attemptStartedAt > 0 && now - this.attemptStartedAt >= WS_TICKET_TIMEOUT_MS;
+    }
+    return false;
+  }
+
   private detachCurrentSocket(code: number, reason: string): void {
     const socket = this.ws;
     const wasConnected = this._connected;
     this.ws = null;
     this._connected = false;
+    this._probePending = false;
     this._connecting = false;
+    this.attemptStartedAt = 0;
+    this.wsOpenStartedAt = 0;
     this.clearSocketTimers();
     if (wasConnected) {
       this.dispatch({
@@ -1869,59 +2796,164 @@ export class WsClient {
       this.socketGeneration++;
       this.abortWsTicketRequest();
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
     }
 
     if (this.ws) {
       this.detachCurrentSocket(4001, force ? 'client refresh' : 'client reconnect stale socket');
     } else if (force) {
       this._connected = false;
+      this._probePending = false;
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       this.clearSocketTimers();
     }
 
     void this.openSocket();
   }
 
+  private nowMs(): number {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+  }
+
+  private isClientTransportCongested(): boolean {
+    return (this.ws?.bufferedAmount ?? 0) > PING_CONGESTED_BUFFERED_BYTES
+      || this.pendingTimelineEvents.length > 0
+      || this.timelineEventFlushTimer !== null;
+  }
+
+  private createCorrelatedPingPayload(): { type: 'ping'; id: number } {
+    this._unackedPingCount += 1;
+    this._pendingPingRequiresId = this._unackedPingCount > 1;
+    const id = this._nextPingId++;
+    this._pendingPingId = id;
+    this._pingSentAt = this.nowMs();
+    this._pingSampleCongested = this.isClientTransportCongested();
+    return { type: 'ping', id };
+  }
+
+  private clearPendingPingSample(): void {
+    this._pingSentAt = null;
+    this._pendingPingId = null;
+    this._pendingPingRequiresId = false;
+    this._pingSampleCongested = false;
+  }
+
+  private isAnomalousLatencySpike(sampleMs: number, sampleCongested: boolean): boolean {
+    const baseline = this._pingLatency;
+    if (baseline === null) {
+      return sampleMs >= LATENCY_SPIKE_INITIAL_THRESHOLD_MS;
+    }
+    if (baseline < LATENCY_SPIKE_HEALTHY_BASE_MS) {
+      return sampleMs >= LATENCY_SPIKE_RELATIVE_FLOOR_MS;
+    }
+    return (
+      sampleMs >= LATENCY_SPIKE_THRESHOLD_MS
+      && (baseline < 400 || sampleMs >= baseline * LATENCY_SPIKE_MULTIPLIER)
+    ) || (
+      sampleCongested
+      && sampleMs >= baseline * 2
+      && sampleMs >= LATENCY_SPIKE_RELATIVE_FLOOR_MS
+    );
+  }
+
+  private recordAndSmoothLatency(sampleMs: number, wasAwaitingConfirmation: boolean): number {
+    const confirmedSustainedSpike = wasAwaitingConfirmation && sampleMs >= LATENCY_SPIKE_RELATIVE_FLOOR_MS;
+    const recoveredToHealthy = this._pingLatency !== null
+      && this._pingLatency >= LATENCY_SPIKE_HEALTHY_BASE_MS
+      && sampleMs < LATENCY_SPIKE_HEALTHY_BASE_MS;
+    if (confirmedSustainedSpike || recoveredToHealthy) {
+      this._recentLatencySamples = [sampleMs];
+      return sampleMs;
+    }
+    this._recentLatencySamples.push(sampleMs);
+    if (this._recentLatencySamples.length > LATENCY_SMOOTHING_WINDOW) {
+      this._recentLatencySamples.shift();
+    }
+    if (this._recentLatencySamples.length < LATENCY_SMOOTHING_WINDOW) {
+      return sampleMs;
+    }
+    const sorted = [...this._recentLatencySamples].sort((a, b) => a - b);
+    return sorted[1]!;
+  }
+
+  private clearBackgroundWatchdogs(): void {
+    this.clearPongWatchdog();
+    this.clearResumeProbeWatchdog();
+    this.clearSpikeReprobeTimer();
+    this._awaitingSpikeConfirmation = false;
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+    this.clearPendingPingSample();
+  }
+
+  /**
+   * Clear pending RTT/heartbeat/resume watchdogs and pause probing while the
+   * native app is inactive (`isActive: false`), even if DOM `visibilityState`
+   * remains `'visible'` or the socket subsequently opens/reconnects. Only
+   * `notifyForegrounded()` clears this native inactive pause.
+   */
+  notifyBackgrounded(): void {
+    this._nativeBackgrounded = true;
+    this.clearBackgroundWatchdogs();
+  }
+
+  /**
+   * Clear the native background pause when Capacitor reports `isActive: true`.
+   */
+  notifyForegrounded(): void {
+    this._nativeBackgrounded = false;
+    this._pageSuspended = false;
+  }
+
+  private sendHeartbeatPing(): void {
+    if (this.isBackgrounded()) {
+      this.clearBackgroundWatchdogs();
+      return;
+    }
+    if (this._pongTimer || this._resumeProbeTimer) return;
+    this.clearSpikeReprobeTimer();
+    try {
+      this.send(this.createCorrelatedPingPayload());
+    } catch {
+      // If send itself threw, the socket is already broken — let close
+      // handler + scheduleReconnect take over.
+      return;
+    }
+    this._pongTimer = setTimeout(() => {
+      this._pongTimer = null;
+      if (this._destroyed) return;
+      if (this.isBackgrounded()) {
+        this.clearBackgroundWatchdogs();
+        return;
+      }
+      this._missedHeartbeatPongs += 1;
+      if (this._missedHeartbeatPongs >= PONG_MISSES_BEFORE_RECONNECT) {
+        // Socket is half-open. Force a fresh connection so subscriptions
+        // and optimistic bubbles get re-synced via the reconnect path.
+        this.reconnectNow(true);
+        return;
+      }
+      // One missed pong can be normal under short browser stalls. Confirm
+      // with a second immediate ping before tearing down the socket.
+      this.sendHeartbeatPing();
+    }, PONG_TIMEOUT_MS);
+  }
+
   private startHeartbeat(): void {
-    // Each ping arms a watchdog. If no pong arrives before the watchdog fires
-    // we assume the socket is a zombie (mobile OS commonly half-closes the
-    // TCP on background eviction without propagating close() to the WebView)
-    // and force a fresh reconnect. Without this, the client believes it's
-    // still "connected" indefinitely while no new events ever arrive — which
-    // is exactly the "回前台后消息不同步" symptom users reported.
-    const armPing = () => {
-      if (this.isDocumentHidden()) {
-        this.clearPongWatchdog();
-        this._missedHeartbeatPongs = 0;
-        this._pingSentAt = null;
-        return;
-      }
-      if (this._pongTimer) return;
-      try {
-        this._pingSentAt = Date.now();
-        this.send({ type: 'ping' });
-      } catch {
-        // If send itself threw, the socket is already broken — let close
-        // handler + scheduleReconnect take over.
-        return;
-      }
-      this._pongTimer = setTimeout(() => {
-        this._pongTimer = null;
-        if (this._destroyed) return;
-        this._missedHeartbeatPongs += 1;
-        if (this._missedHeartbeatPongs >= PONG_MISSES_BEFORE_RECONNECT) {
-          // Socket is half-open. Force a fresh connection so subscriptions
-          // and optimistic bubbles get re-synced via the reconnect path.
-          this.reconnectNow(true);
-          return;
-        }
-        // One missed pong can be normal under short browser stalls. Confirm
-        // with a second immediate ping before tearing down the socket.
-        armPing();
-      }, PONG_TIMEOUT_MS);
-    };
+    const armPing = () => this.sendHeartbeatPing();
     this.installVisibilityListener();
-    armPing(); // send first ping immediately for initial latency
+    // Schedule first RTT probe after the synchronous post-open subscription
+    // replay burst so initial latency reflects network/server RTT cleanly.
+    this._initialPingTimer = setTimeout(() => {
+      this._initialPingTimer = null;
+      if (this._destroyed || !this._connected) return;
+      armPing();
+    }, POST_CONNECT_INITIAL_PING_DELAY_MS);
     this.heartbeatTimer = setInterval(armPing, HEARTBEAT_MS);
   }
 
@@ -1931,8 +2963,29 @@ export class WsClient {
     this.clearSocketTimers();
   }
 
+  private clearLifecycleListeners(): void {
+    if (typeof document !== 'undefined') {
+      if (this._visibilityListener) document.removeEventListener('visibilitychange', this._visibilityListener);
+      if (this._freezeListener) document.removeEventListener('freeze', this._freezeListener);
+    }
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      if (this._pageHideListener) window.removeEventListener('pagehide', this._pageHideListener);
+      if (this._pageShowListener) window.removeEventListener('pageshow', this._pageShowListener);
+      if (this._focusListener) window.removeEventListener('focus', this._focusListener);
+    }
+    this._visibilityListener = null;
+    this._pageHideListener = null;
+    this._pageShowListener = null;
+    this._freezeListener = null;
+    this._focusListener = null;
+  }
+
   private isDocumentHidden(): boolean {
     return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+
+  private isBackgrounded(): boolean {
+    return this._nativeBackgrounded || this._pageSuspended || this.isDocumentHidden();
   }
 
   private clearPongWatchdog(): void {
@@ -1941,58 +2994,262 @@ export class WsClient {
     this._pongTimer = null;
   }
 
-  private installVisibilityListener(): void {
-    if (this._visibilityListener || typeof document === 'undefined') return;
-    this._visibilityListener = () => {
-      if (!this.isDocumentHidden()) return;
-      // Desktop browsers aggressively throttle background timers. A ping sent
-      // just before tab hiding can have its pong callback delayed past the
-      // foreground 2s watchdog, causing false reconnect loops and subscription
-      // churn. Foreground resume still runs probeConnection() immediately,
-      // but now also requires two missed pongs before reconnecting.
-      this.clearPongWatchdog();
-      this._missedHeartbeatPongs = 0;
-      this._pingSentAt = null;
-    };
-    document.addEventListener('visibilitychange', this._visibilityListener);
+  private clearResumeProbeWatchdog(): void {
+    if (!this._resumeProbeTimer) return;
+    clearTimeout(this._resumeProbeTimer);
+    this._resumeProbeTimer = null;
   }
 
-  private sendResumeProbePing(timeoutMs: number): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.reconnectNow(false);
-      return;
-    }
-    try {
-      this._pingSentAt = Date.now();
-      this.ws.send(JSON.stringify({ type: 'ping' }));
-    } catch {
-      this.reconnectNow(true);
-      return;
-    }
+  private clearSpikeReprobeTimer(): void {
+    if (!this._spikeReprobeTimer) return;
+    clearTimeout(this._spikeReprobeTimer);
+    this._spikeReprobeTimer = null;
+  }
 
+  private scheduleLatencySpikeReprobe(): void {
+    this.clearSpikeReprobeTimer();
+    if (this._destroyed || !this._connected || this.isBackgrounded()) return;
+    this._spikeReprobeTimer = setTimeout(() => {
+      this._spikeReprobeTimer = null;
+      if (this._destroyed || !this._connected || this.isBackgrounded()) return;
+      if (this._pongTimer || this._resumeProbeTimer) return;
+      this.sendHeartbeatPing();
+    }, LATENCY_SPIKE_REPROBE_DELAY_MS);
+  }
+
+  private installVisibilityListener(): void {
+    if (!this._visibilityListener && typeof document !== 'undefined') {
+      this._visibilityListener = () => {
+        if (!this.isDocumentHidden()) {
+          this._pageSuspended = false;
+          return;
+        }
+        // Desktop browsers aggressively throttle background timers. A ping sent
+        // just before tab hiding can have its pong callback delayed past the
+        // foreground 2s watchdog, causing false reconnect loops and subscription
+        // churn. Foreground resume still runs probeConnection() immediately,
+        // but now also requires two missed pongs before reconnecting.
+        this.clearBackgroundWatchdogs();
+      };
+      document.addEventListener('visibilitychange', this._visibilityListener);
+    }
+    if (!this._freezeListener && typeof document !== 'undefined') {
+      this._freezeListener = () => {
+        this._pageSuspended = true;
+        this.clearBackgroundWatchdogs();
+      };
+      document.addEventListener('freeze', this._freezeListener);
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      if (!this._pageHideListener) {
+        this._pageHideListener = () => {
+          this._pageSuspended = true;
+          this.clearBackgroundWatchdogs();
+        };
+        window.addEventListener('pagehide', this._pageHideListener);
+      }
+      if (!this._pageShowListener) {
+        this._pageShowListener = () => {
+          if (!this.isDocumentHidden()) this._pageSuspended = false;
+        };
+        window.addEventListener('pageshow', this._pageShowListener);
+      }
+      if (!this._focusListener) {
+        this._focusListener = () => {
+          if (!this.isDocumentHidden()) this._pageSuspended = false;
+        };
+        window.addEventListener('focus', this._focusListener);
+      }
+    }
+  }
+
+  private armResumeProbeWatchdog(timeoutMs: number, waitMs = timeoutMs): void {
+    if (this._destroyed || this.isBackgrounded()) {
+      if (this.isBackgrounded()) this.clearBackgroundWatchdogs();
+      return;
+    }
+    this.clearResumeProbeWatchdog();
     this._resumeProbeTimer = setTimeout(() => {
       this._resumeProbeTimer = null;
       if (this._destroyed) return;
+      if (this.isBackgrounded()) {
+        this.clearBackgroundWatchdogs();
+        return;
+      }
       this._resumeProbeMisses += 1;
       if (this._resumeProbeMisses >= PONG_MISSES_BEFORE_RECONNECT) {
         this.reconnectNow(true);
         return;
       }
       this.sendResumeProbePing(timeoutMs);
-    }, timeoutMs);
+    }, waitMs);
+  }
+
+  private sendResumeProbePing(timeoutMs: number): void {
+    if (this._destroyed || this.isBackgrounded()) {
+      if (this.isBackgrounded()) this.clearBackgroundWatchdogs();
+      return;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.reconnectNow(false);
+      return;
+    }
+    try {
+      this.ws.send(JSON.stringify(this.createCorrelatedPingPayload()));
+    } catch {
+      this.reconnectNow(true);
+      return;
+    }
+
+    this.armResumeProbeWatchdog(timeoutMs);
   }
 
   private dispatch(msg: ServerMessage): void {
+    if (msg.type === TIMELINE_MESSAGES.EVENT) markPerfFrame(msg.event?.type ?? 'other');
+    if (msg.type === 'session_list') {
+      this.sessionListRequestInFlight = false;
+    }
+    this.settleOwnedDataRequest(msg);
     this.settleP2pWorkflowRequest(msg);
+    // Daemon lifecycle generations are independent from the browser↔Server
+    // WebSocket.  During an in-place daemon upgrade that browser socket stays
+    // open, so clear the generation-bound capability snapshot explicitly.  A
+    // fresh daemon.hello follows RECONNECTED after authentication; clearing
+    // first also permits its process-local helloEpoch to restart from one and
+    // invalidates file-transfer lease waiters/peers tied to the old process.
+    if (msg.type === DAEMON_MSG.DISCONNECTED || msg.type === DAEMON_MSG.RECONNECTED) {
+      this.setDaemonCapabilitySnapshot(null);
+    }
     if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
       this.handleDaemonHelloMessage(msg);
     }
-    for (const h of this.handlers) {
+    const sessionName = sessionIdForServerMessage(msg);
+    const targeted = sessionName ? this.sessionHandlers.get(sessionName) : undefined;
+    // '*' is the single app-level session/control observer. It receives all
+    // frames so the shell can update list-level state without registering one
+    // handler per pane. Exact handlers still avoid fan-out across sessions.
+    const wildcard = this.sessionHandlers.get('*');
+    const handlers = sessionName
+      ? [...(targeted ?? []), ...(wildcard ?? []), ...this.handlers]
+      : [...(wildcard ?? []), ...this.handlers];
+    for (const h of handlers) {
       try {
         h(msg);
       } catch {
         // ignore handler errors
       }
+    }
+  }
+
+  /**
+   * A reconnect can deliver thousands of timeline.event frames in one socket
+   * turn. Dispatching each synchronously lets every mounted timeline run its
+   * reducer before the browser can paint. Keep the first small burst
+   * immediate for fast first paint, then yield in bounded batches.
+   */
+  private deferTimelineEvent(msg: TimelineEventMessage): boolean {
+    if (this.pendingTimelineEvents.length === 0 && this.timelineEventsSinceYield < TIMELINE_EVENT_IMMEDIATE_BURST) {
+      this.timelineEventsSinceYield += 1;
+      return false;
+    }
+    if (this._pingSentAt !== null) {
+      this._pingSampleCongested = true;
+    }
+    const event = msg.event;
+    const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : '';
+    const streamSnapshot = event?.type === TIMELINE_ASSISTANT_TEXT_EVENT_TYPE
+      && event.payload?.streaming === true && typeof event.payload.text === 'string'
+      // Only the daemon's plain cumulative text shape is replaceable. Partial,
+      // hydrated, hidden or metadata-bearing revisions retain normal delivery.
+      && Object.keys(event.payload).every(key => key === 'text' || key === 'streaming')
+      && !event.completeness && !event.timelineCompleteness && !event.detailRefs?.length
+      && event.summary !== true && event.hidden !== true
+      && !!sessionId && typeof event.eventId === 'string' && !!event.eventId
+      && Number.isFinite(event.epoch) && Number.isFinite(event.seq);
+    const previousStream = this.pendingTimelineStreams.get(sessionId);
+    if (streamSnapshot && previousStream
+      && previousStream.event.eventId === event.eventId
+      && previousStream.event.epoch === event.epoch
+      && previousStream.event.seq < event.seq) {
+      // This queue node has never been dispatched. Replace its complete
+      // snapshot in O(1), not its text as a delta. Other sessions are unrelated;
+      // a different message/epoch or a durable event in this session is a barrier.
+      previousStream.event = event;
+      return true;
+    }
+    this.pendingTimelineStreams.delete(sessionId);
+    if (streamSnapshot) this.pendingTimelineStreams.set(sessionId, msg);
+    const coalescedType = this.getSummaryCoalescedType(msg.event);
+    if (coalescedType) {
+      const eventSessionId = typeof msg.event?.sessionId === 'string' ? msg.event.sessionId : '';
+      const key = `${eventSessionId}\0${coalescedType}`;
+      const previous = this.pendingTimelineCoalesced.get(key);
+      if (previous) {
+        // Keep the original queue position so durable events retain their
+        // relative order, while replacing stale transient state in place.
+        const index = this.pendingTimelineEvents.indexOf(previous);
+        if (index >= 0) this.pendingTimelineEvents[index] = msg;
+      } else {
+        this.pendingTimelineEvents.push(msg);
+      }
+      this.pendingTimelineCoalesced.set(key, msg);
+    } else {
+      if (msg.event?.type === 'session.state') {
+        const eventSessionId = typeof msg.event?.sessionId === 'string' ? msg.event.sessionId : '';
+        this.pendingTimelineCoalesced.delete(`${eventSessionId}\0session.state`);
+      }
+      this.pendingTimelineEvents.push(msg);
+    }
+    if (!this.timelineEventFlushTimer) {
+      this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
+    }
+    return true;
+  }
+
+  private getSummaryCoalescedType(event: TimelineEvent | undefined): 'session.state' | 'agent.status' | 'usage.update' | null {
+    if (!event || event.summary !== true) return null;
+    if (event.type === 'session.state') {
+      const state = String(event.payload?.state ?? '');
+      if (TIMELINE_TERMINAL_SESSION_STATES.includes(state as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number])) {
+        return null;
+      }
+      if (isVisibleSessionStatePayload(event.payload)) return null;
+      return 'session.state';
+    }
+    if (event.type === 'agent.status' || event.type === 'usage.update') {
+      return event.type;
+    }
+    return null;
+  }
+
+  private flushTimelineEvents(): void {
+    this.timelineEventFlushTimer = null;
+    if (this._destroyed) {
+      this.pendingTimelineEvents = [];
+      this.pendingTimelineCoalesced.clear();
+      this.pendingTimelineStreams.clear();
+      this.timelineEventsSinceYield = 0;
+      return;
+    }
+    const batch = this.pendingTimelineEvents.splice(0, TIMELINE_EVENT_FLUSH_BATCH);
+    for (const event of batch) {
+      if (this.pendingTimelineStreams.get(event.event.sessionId) === event) {
+        this.pendingTimelineStreams.delete(event.event.sessionId);
+      }
+      const coalescedType = this.getSummaryCoalescedType(event.event);
+      if (coalescedType) {
+        const sessionId = typeof event.event?.sessionId === 'string' ? event.event.sessionId : '';
+        const key = `${sessionId}\0${coalescedType}`;
+        if (this.pendingTimelineCoalesced.get(key) === event) {
+          this.pendingTimelineCoalesced.delete(key);
+        }
+      }
+      this.dispatch(event);
+    }
+    if (this.pendingTimelineEvents.length > 0) {
+      this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
+    } else {
+      this.timelineEventsSinceYield = 0;
     }
   }
 

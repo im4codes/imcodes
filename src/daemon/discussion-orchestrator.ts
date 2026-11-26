@@ -25,7 +25,6 @@ const MODEL_STRENGTH: Record<string, number> = {
   opus: 100,
   sonnet: 80,
   codex: 50,
-  gemini: 50,
 };
 
 const BUILTIN_ROLES: Record<string, { label: string; prompt: string }> = {
@@ -349,30 +348,13 @@ async function runDiscussion(
       logger.info({ sessionName: p.sessionName }, 'Reusing existing sub-session for discussion');
     } else {
       const ccSessionId = p.agentType === 'claude-code' ? crypto.randomUUID() : null;
-      // Resolve a unique Gemini session ID so multiple Gemini participants don't share sessions
-      let geminiSessionId: string | null = null;
-      let fileSnapshot: Set<string> | undefined;
-      if (p.agentType === 'gemini') {
-        const { snapshotSessionFiles } = await import('./gemini-watcher.js');
-        fileSnapshot = await snapshotSessionFiles();
-        try {
-          const { GeminiDriver } = await import('../agent/drivers/gemini.js');
-          geminiSessionId = await new GeminiDriver().resolveSessionId(d.cwd || undefined);
-          logger.info({ sessionName: p.sessionName, geminiSessionId }, 'Resolved Gemini session ID');
-          fileSnapshot = undefined;
-        } catch (e) {
-          logger.warn({ err: e, sessionName: p.sessionName }, 'Failed to resolve Gemini session ID — using snapshot-diff');
-        }
-      }
       await startSubSession({
         id: p.subSessionId,
         type: p.agentType,
         cwd: d.cwd || null,
         ccSessionId,
-        geminiSessionId,
         codexModel: p.agentType === 'codex' && p.model ? p.model : null,
-        fresh: !geminiSessionId,
-        _fileSnapshot: fileSnapshot,
+        fresh: true,
       });
       // Sync to DB so frontend can see the sub-session
       onUpdate({

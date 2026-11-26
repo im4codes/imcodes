@@ -42,6 +42,13 @@ describe('context-store worker foundation', () => {
   });
 
 
+  it('keeps the per-event ingest write on the normal lane and the master sweep on the low lane', () => {
+    expect(defaultPriorityForOp('ingestContextEvent')).toBe('normal');
+    expect(defaultPriorityForOp('enqueueContextJob')).toBe('normal');
+    expect(defaultPriorityForOp('listLatestRecentSummarySessions')).toBe('low');
+    expect(defaultPriorityForOp('getLatestMasterSummaryUpdatedAt')).toBe('low');
+  });
+
   it('defaults authorized management recall to normal priority, not L3 high', () => {
     expect(defaultPriorityForOp('searchLocalMemoryAuthorizedBounded')).toBe('normal');
     expect(defaultPriorityForOp('searchLocalMemorySemanticBounded')).toBe('high');

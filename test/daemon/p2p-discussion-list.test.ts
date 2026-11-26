@@ -32,7 +32,12 @@ const serverLink = {
 };
 
 async function waitForSentCount(count: number): Promise<void> {
-  for (let i = 0; i < 50; i += 1) {
+  // Poll up to ~5s. The handler does async fs work (e.g. the "limit" case writes
+  // + reads 51 discussion files); under full-suite CPU/fs contention a 500ms
+  // budget could expire before the response was pushed, so `sent[0]` read as
+  // undefined (a load-dependent flake). The loop still returns the instant the
+  // count is met, so widening the ceiling has no happy-path cost.
+  for (let i = 0; i < 500; i += 1) {
     if (sent.length >= count) return;
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }

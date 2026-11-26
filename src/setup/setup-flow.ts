@@ -12,18 +12,65 @@
  */
 
 import { randomBytes, createHash } from 'node:crypto';
-import { writeFile, readFile, mkdir } from 'node:fs/promises';
-import { existsSync, writeFileSync, readFileSync } from 'node:fs';
+import { writeFile, readFile, mkdir, chmod, unlink } from 'node:fs/promises';
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { join } from 'node:path';
-import { homedir, hostname } from 'node:os';
-import { dockerComposeTemplate, caddyfileTemplate, envTemplate } from './templates.js';
+import { dirname, join } from 'node:path';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { parse, stringify } from 'yaml';
+import {
+  dockerComposeTemplate,
+  caddyfileTemplate,
+  onlyofficeCaddyRouteBlock,
+  envTemplate,
+  turnEntrypointTemplate,
+  turnserverConfigTemplate,
+  type TurnDeploymentTemplateConfig,
+  type OnlyOfficeDeploymentTemplateConfig,
+  NODE_EXE_VERSION_VOLUME,
+  NODE_EXE_VERSION_DIR,
+  ONLYOFFICE_DATA_VOLUME,
+  ONLYOFFICE_LOGS_VOLUME,
+} from './templates.js';
+import {
+  ONLYOFFICE_SERVICE_DEFAULTS,
+  ONLYOFFICE_SERVICE_ENV,
+  defaultOnlyOfficePublicUrl,
+  isOnlyOfficeEnabledValue,
+} from '../../shared/onlyoffice-service.js';
+import {
+  TURN_RELAY_CAPACITY,
+  TURN_RELAY_NETWORK,
+  TURN_RELAY_NETWORK_MODES,
+  TURN_RELAY_RANGE_REJECTION,
+  TURN_SERVICE_DEFAULTS,
+  TURN_SERVICE_ENV,
+  parseTurnRelayCapacity,
+  parseTurnRelayRange,
+  isTurnServiceHost,
+  isTurnServiceIpv4,
+  isTurnServicePort,
+  isTurnRelayNetworkMode,
+  turnRelayCapacityForRange,
+  turnRelayCapacityRejectionMessage,
+  turnRelayNetworkMode,
+  turnRelayPortCount,
+  turnRelayRangeForCapacity,
+  type TurnRelayNetworkMode,
+  type TurnRelayRangeOrigin,
+} from '../../shared/turn-service.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
+import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
+import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
+import { daemonFatalReportNodeOptions } from '../../shared/daemon-memory-guard.js';
+import { reportExcludeEnvFlagUsable } from '../util/report-privacy.js';
 
-const CREDS_DIR = join(homedir(), '.imcodes');
-const CREDS_PATH = join(CREDS_DIR, 'server.json');
+function credentialsDir(): string { return resolveImcodesHome(); }
+function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +101,17 @@ async function confirm(prompt: string): Promise<boolean> {
   });
 }
 
+/** Free-text prompt. An empty line means "use the documented default". */
+async function ask(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`  ${prompt} `, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
 /** Stop and remove all containers, volumes, and config files for a clean reinstall. */
 function teardown(compose: string, dir: string): void {
   log('Stopping and removing all containers and volumes...');
@@ -66,7 +124,14 @@ function teardown(compose: string, dir: string): void {
     // compose down may fail if services never started — that's fine
   }
   // Remove generated config files
-  for (const file of ['.env', '.setup-secrets.json', 'docker-compose.yml', 'Caddyfile']) {
+  for (const file of [
+    '.env',
+    '.setup-secrets.json',
+    'docker-compose.yml',
+    'Caddyfile',
+    'turnserver.conf',
+    'turn-entrypoint.sh',
+  ]) {
     const p = join(dir, file);
     if (existsSync(p)) {
       execSync(`rm -f "${p}"`);
@@ -172,9 +237,66 @@ function checkDns(domain: string): void {
   }
 }
 
+function parseIpv4Lines(value: string): string[] {
+  return value.split(/\s+/).map((entry) => entry.trim()).filter(isTurnServiceIpv4);
+}
+
+function discoverPublicIpv4(): string | undefined {
+  try {
+    const result = execFileSync('curl', [
+      '-4fsS',
+      '--connect-timeout',
+      '5',
+      '--max-time',
+      '8',
+      'https://api.ipify.org',
+    ], { encoding: 'utf8', timeout: 10_000 }).trim();
+    return isTurnServiceIpv4(result) ? result : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface TurnDnsLookup {
+  status: 'resolved' | 'no_record' | 'unavailable';
+  addresses: string[];
+}
+
+function resolveHostIpv4(host: string): TurnDnsLookup {
+  try {
+    const addresses = parseIpv4Lines(execFileSync('dig', ['+short', 'A', host], {
+      encoding: 'utf8',
+      timeout: 5000,
+    }));
+    return { status: addresses.length > 0 ? 'resolved' : 'no_record', addresses };
+  } catch {
+    return { status: 'unavailable', addresses: [] };
+  }
+}
+
+export function validateTurnDnsOnly(
+  host: string,
+  externalIp: string,
+  resolvedIpv4: readonly string[],
+): string | undefined {
+  if (!isTurnServiceHost(host)) return 'TURN host must be a valid DNS hostname.';
+  if (!isTurnServiceIpv4(externalIp)) return 'TURN external IP must be a valid public IPv4 address.';
+  if (resolvedIpv4.length === 0) {
+    return `TURN hostname ${host} has no directly verifiable IPv4 A record. `
+      + 'Use a DNS-only hostname for TURN. If the application hostname is proxied, create a separate TURN hostname '
+      + 'instead of disabling protection on the application hostname.';
+  }
+  if (!resolvedIpv4.includes(externalIp)) {
+    return `TURN hostname ${host} resolves to ${resolvedIpv4.join(', ')}, not this server (${externalIp}). `
+      + 'Use a DNS-only TURN hostname pointing directly to this server. If the application hostname is proxied, '
+      + 'create a separate TURN hostname instead of disabling its protection.';
+  }
+  return undefined;
+}
+
 // ── Config generation ────────────────────────────────────────────────────────
 
-interface SetupSecrets {
+export interface SetupSecrets {
   postgresPassword: string;
   jwtSigningKey: string;
   adminPassword: string;
@@ -182,7 +304,24 @@ interface SetupSecrets {
   serverId: string;
   apiKeyRaw: string;
   apiKeyId: string;
+  turnSharedSecret?: string;
+  onlyofficeJwtSecret?: string;
 }
+
+export interface SetupFlowOptions {
+  force?: boolean;
+  onlyoffice?: boolean;
+  turn?: boolean;
+  turnHost?: string;
+  turnPort?: string | number;
+  turnExternalIp?: string;
+  turnRelayCapacity?: string | number;
+  turnRelayMinPort?: string | number;
+  turnRelayMaxPort?: string | number;
+  turnDnsOnly?: boolean;
+}
+
+type EnabledTurnDeployment = Required<Omit<TurnDeploymentTemplateConfig, 'enabled'>> & { enabled: true };
 
 function generateSecrets(): SetupSecrets {
   return {
@@ -197,7 +336,7 @@ function generateSecrets(): SetupSecrets {
 }
 
 /** Parse existing .env to recover secrets that were generated in a previous run. */
-function parseEnvFile(content: string): Record<string, string> {
+export function parseEnvFile(content: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -207,6 +346,19 @@ function parseEnvFile(content: string): Record<string, string> {
     env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
   }
   return env;
+}
+
+/** Read DOMAIN from an existing .env file in `dir` if present. */
+export function recoverDomainFromEnv(dir: string): string | undefined {
+  const envPath = join(dir, '.env');
+  if (!existsSync(envPath)) return undefined;
+  try {
+    const env = parseEnvFile(readFileSync(envPath, 'utf8'));
+    const domain = env['DOMAIN']?.trim().replace(/^['"]|['"]$/g, '');
+    return domain || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Read existing .env + setup-secrets.json to recover all secrets for resume. */
@@ -232,6 +384,8 @@ async function recoverSecrets(dir: string): Promise<SetupSecrets | null> {
       serverId: raw.serverId,
       apiKeyRaw: raw.apiKeyRaw,
       apiKeyId: raw.apiKeyId,
+      turnSharedSecret: env[TURN_SERVICE_ENV.SHARED_SECRET],
+      onlyofficeJwtSecret: env[ONLYOFFICE_SERVICE_ENV.JWT_SECRET] || raw.onlyofficeJwtSecret,
     };
   } catch {
     return null;
@@ -249,21 +403,1099 @@ async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void>
     serverId: secrets.serverId,
     apiKeyRaw: secrets.apiKeyRaw,
     apiKeyId: secrets.apiKeyId,
+    ...(secrets.onlyofficeJwtSecret ? { onlyofficeJwtSecret: secrets.onlyofficeJwtSecret } : {}),
   }, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await chmod(secretsPath, 0o600);
 }
 
-async function writeConfigs(dir: string, domain: string, secrets: SetupSecrets, mirrorMode: boolean): Promise<void> {
+export interface RecoveredOnlyOfficeDeployment {
+  enabled: boolean;
+  enabledExplicit: boolean;
+  jwtSecret?: string;
+  publicUrl?: string;
+  internalUrl?: string;
+  domain?: string;
+}
+
+export function recoverOnlyOfficeDeployment(dir: string): RecoveredOnlyOfficeDeployment | undefined {
+  const envPath = join(dir, '.env');
+  if (!existsSync(envPath)) return undefined;
+  const env = parseEnvFile(readFileSync(envPath, 'utf8'));
+  const rawEnabled = env[ONLYOFFICE_SERVICE_ENV.ENABLED];
+  const enabledExplicit = rawEnabled !== undefined && rawEnabled.trim() !== '';
+  const enabled = isOnlyOfficeEnabledValue(rawEnabled);
+  return {
+    enabled,
+    enabledExplicit,
+    jwtSecret: env[ONLYOFFICE_SERVICE_ENV.JWT_SECRET]?.trim() || undefined,
+    publicUrl: env[ONLYOFFICE_SERVICE_ENV.PUBLIC_URL]?.trim() || undefined,
+    internalUrl: env[ONLYOFFICE_SERVICE_ENV.INTERNAL_URL]?.trim() || undefined,
+    domain: env['DOMAIN']?.trim() || undefined,
+  };
+}
+
+export function resolveOnlyOfficeDeployment(
+  domain: string,
+  dir: string,
+  secrets: Partial<SetupSecrets>,
+  opts: SetupFlowOptions = {},
+): OnlyOfficeDeploymentTemplateConfig {
+  const recovered = recoverOnlyOfficeDeployment(dir);
+  let enabled: boolean;
+  if (opts.onlyoffice === false) {
+    enabled = false;
+  } else if (opts.onlyoffice === true) {
+    enabled = true;
+  } else if (recovered) {
+    enabled = recovered.enabled;
+  } else {
+    enabled = true;
+  }
+
+  const defaultPublicUrl = defaultOnlyOfficePublicUrl(domain);
+  const recoveredDomainDefaultUrl = recovered?.domain ? defaultOnlyOfficePublicUrl(recovered.domain) : undefined;
+  const publicUrl = recovered?.publicUrl && recovered.publicUrl !== recoveredDomainDefaultUrl
+    ? recovered.publicUrl
+    : defaultPublicUrl;
+  const internalUrl = recovered?.internalUrl || ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL;
+
+  if (!enabled) {
+    secrets.onlyofficeJwtSecret = undefined;
+    return {
+      enabled: false,
+      jwtSecret: '',
+      publicUrl,
+      internalUrl,
+    };
+  }
+
+  const jwtSecret = recovered?.jwtSecret
+    || secrets.onlyofficeJwtSecret
+    || randomHex(ONLYOFFICE_SERVICE_DEFAULTS.JWT_SECRET_BYTES);
+  secrets.onlyofficeJwtSecret = jwtSecret;
+
+  return {
+    enabled: true,
+    jwtSecret,
+    publicUrl,
+    internalUrl,
+  };
+}
+
+function parsePortOption(value: string | number | undefined, fallback?: number): number | undefined {
+  if (value === undefined) return fallback;
+  if (typeof value === 'number') return isTurnServicePort(value) ? value : undefined;
+  if (!/^\d{1,5}$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return isTurnServicePort(parsed) ? parsed : undefined;
+}
+
+function parseBoundedInteger(
+  value: string | number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number | undefined {
+  if (value === undefined) return fallback;
+  if (typeof value === 'string' && !/^\d+$/.test(value)) return undefined;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
+}
+
+/**
+ * A recovered deployment, plus whether it published a relay range of its own.
+ * That flag is load-bearing: an existing range must be preserved exactly, so
+ * "absent" and "present but unreadable" cannot be collapsed into a default.
+ */
+type RecoveredTurnDeployment = Partial<EnabledTurnDeployment> & {
+  relayRangeConfigured: boolean;
+  /** Exactly what TURN_RELAY_NETWORK_MODE said, so an unusable value can fail closed. */
+  relayNetworkModeRaw?: string;
+};
+
+function recoverTurnDeployment(dir: string): RecoveredTurnDeployment | undefined {
+  const envPath = join(dir, '.env');
+  if (!existsSync(envPath)) return undefined;
+  const env = parseEnvFile(readFileSync(envPath, 'utf8'));
+  if (env[TURN_SERVICE_ENV.ENABLED] !== 'true') return undefined;
+  const relayNetworkModeRaw = env[TURN_SERVICE_ENV.RELAY_NETWORK_MODE];
+  return {
+    enabled: true,
+    host: env[TURN_SERVICE_ENV.HOST],
+    port: parsePortOption(env[TURN_SERVICE_ENV.PORT], TURN_SERVICE_DEFAULTS.PORT),
+    externalIp: env[TURN_SERVICE_ENV.EXTERNAL_IP],
+    // No default fallback here on purpose. Substituting the current default
+    // range for a deployment that already published one is exactly how an
+    // upgrade silently moves — and shrinks — the ports coturn is bound to.
+    relayRangeConfigured: env[TURN_SERVICE_ENV.RELAY_MIN_PORT] !== undefined
+      || env[TURN_SERVICE_ENV.RELAY_MAX_PORT] !== undefined,
+    relayMinPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MIN_PORT]),
+    relayMaxPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MAX_PORT]),
+    // The deployment's own record of how its container is attached. Absent
+    // means legacy, which is bridge — the only shape older installers built.
+    relayNetworkModeRaw,
+    networkMode: isTurnRelayNetworkMode(relayNetworkModeRaw) ? relayNetworkModeRaw : undefined,
+    sharedSecret: env[TURN_SERVICE_ENV.SHARED_SECRET],
+    credentialTtlSeconds: parseBoundedInteger(
+      env[TURN_SERVICE_ENV.CREDENTIAL_TTL_SECONDS],
+      TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS,
+      TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_MIN_SECONDS,
+      TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_MAX_SECONDS,
+    ),
+  };
+}
+
+function requireTurnRelayCapacity(value: string | number | undefined): number {
+  const parsed = parseTurnRelayCapacity(value);
+  if ('rejection' in parsed) fatal(turnRelayCapacityRejectionMessage(parsed.rejection));
+  return parsed.capacity;
+}
+
+function describeTurnRelayCapacity(relayMinPort: number, relayMaxPort: number): string {
+  const capacity = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  return `${capacity} concurrent relay allocation${capacity === 1 ? '' : 's'}`;
+}
+
+function warnIfTurnRelayRangeMoved(
+  recovered: RecoveredTurnDeployment | undefined,
+  next: { relayMinPort: number; relayMaxPort: number },
+): void {
+  const { relayMinPort, relayMaxPort } = recovered ?? {};
+  if (relayMinPort === undefined || relayMaxPort === undefined) return;
+  if (relayMinPort === next.relayMinPort && relayMaxPort === next.relayMaxPort) return;
+  const before = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  const after = turnRelayCapacityForRange(next.relayMinPort, next.relayMaxPort);
+  console.warn(`\n  Warning: the TURN relay range changes from ${relayMinPort}-${relayMaxPort} `
+    + `(${before} concurrent allocations) to ${next.relayMinPort}-${next.relayMaxPort} (${after}). `
+    + 'Open the new UDP range in the firewall before relying on it.'
+    + (after < before
+      ? ` This REDUCES capacity: allocations beyond ${after} concurrent relays will be refused.`
+      : '')
+    + '\n');
+}
+
+/**
+ * Decide the relay range, from exactly one authority per run.
+ *
+ * The capacity question is the normal path: "how many concurrent relay
+ * allocations" is answerable, and standard coturn turns it into a port count
+ * 1:1. The derived range is anchored at the top of the port space precisely so
+ * the largest accepted answer still fits — a fixed low start cannot hold 30000
+ * ports.
+ *
+ * An explicit port range stays supported and stays authoritative when given,
+ * because a range already published to coturn, to Docker and to a firewall is
+ * deployment configuration, not something application code gets to second-guess
+ * by width. Only the protocol rule in `parseTurnRelayRange` may refuse it. What
+ * IS refused here is ambiguity: a capacity that disagrees with an explicit
+ * range, or half a range on a fresh install, fails closed instead of quietly
+ * picking a winner.
+ */
+interface ResolvedTurnRelayRange {
+  relayMinPort: number;
+  relayMaxPort: number;
+  rangeOrigin: TurnRelayRangeOrigin;
+}
+
+async function resolveTurnRelayRange(
+  opts: SetupFlowOptions,
+  recovered: RecoveredTurnDeployment | undefined,
+): Promise<ResolvedTurnRelayRange> {
+  const explicitMin = opts.turnRelayMinPort !== undefined;
+  const explicitMax = opts.turnRelayMaxPort !== undefined;
+
+  if (explicitMin || explicitMax) {
+    const relayMinPort = explicitMin
+      ? parsePortOption(opts.turnRelayMinPort)
+      : recovered?.relayMinPort;
+    const relayMaxPort = explicitMax
+      ? parsePortOption(opts.turnRelayMaxPort)
+      : recovered?.relayMaxPort;
+    if (relayMinPort === undefined) {
+      fatal(explicitMin
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-max-port was given without --turn-relay-min-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MIN_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (relayMaxPort === undefined) {
+      fatal(explicitMax
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-min-port was given without --turn-relay-max-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MAX_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (opts.turnRelayCapacity !== undefined) {
+      const requested = requireTurnRelayCapacity(opts.turnRelayCapacity);
+      const offered = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+      if (requested !== offered) {
+        fatal(`--turn-relay-capacity ${requested} conflicts with the explicit relay range `
+          + `${relayMinPort}-${relayMaxPort}, which serves ${offered} concurrent relay allocations. `
+          + 'Pass one or the other, or make the two agree.');
+      }
+    }
+    warnIfTurnRelayRangeMoved(recovered, { relayMinPort, relayMaxPort });
+    // An explicit capacity was stated and agrees with these ports, so setup may
+    // still choose the network strategy for it.
+    return {
+      relayMinPort,
+      relayMaxPort,
+      rangeOrigin: opts.turnRelayCapacity === undefined ? 'configured' : 'capacity',
+    };
+  }
+
+  if (opts.turnRelayCapacity !== undefined) {
+    const range = turnRelayRangeForCapacity(requireTurnRelayCapacity(opts.turnRelayCapacity));
+    warnIfTurnRelayRangeMoved(recovered, range);
+    return { ...range, rangeOrigin: 'capacity' };
+  }
+
+  if (recovered?.relayRangeConfigured) {
+    // The existing deployment's own answer. Preserved verbatim — including
+    // 49201-50200, which is not derivable from any capacity anchor — and never
+    // re-derived from the current default.
+    if (recovered.relayMinPort === undefined || recovered.relayMaxPort === undefined) {
+      fatal(`Existing ${TURN_SERVICE_ENV.RELAY_MIN_PORT}/${TURN_SERVICE_ENV.RELAY_MAX_PORT} in .env is not a `
+        + 'usable UDP port range. Fix those two values, or pass --turn-relay-min-port and --turn-relay-max-port '
+        + 'explicitly; setup will not replace a configured relay range with a default.');
+    }
+    return {
+      relayMinPort: recovered.relayMinPort,
+      relayMaxPort: recovered.relayMaxPort,
+      rangeOrigin: 'configured',
+    };
+  }
+
+  if (!process.stdin.isTTY) {
+    return { ...turnRelayRangeForCapacity(TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS), rangeOrigin: 'capacity' };
+  }
+  console.log('\n  TURN relay capacity is the maximum number of CONCURRENT relayed connections, not users.');
+  console.log('  Standard coturn binds one UDP port per relayed connection, so this many ports are published.');
+  const answer = await ask(`Maximum concurrent TURN relay allocations `
+    + `(${TURN_RELAY_CAPACITY.MIN_ALLOCATIONS}-${TURN_RELAY_CAPACITY.MAX_ALLOCATIONS}) `
+    + `[${TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS}]:`);
+  return { ...turnRelayRangeForCapacity(requireTurnRelayCapacity(answer)), rangeOrigin: 'capacity' };
+}
+
+/**
+ * Apply the network strategy the shared rule chose, and refuse the one shape it
+ * cannot honestly deliver.
+ *
+ * Nothing here reduces the capacity or edits the range. Host networking is only
+ * ever selected for a capacity the operator asked for, and only where it exists;
+ * a range the deployment already publishes keeps publishing it, with the cost
+ * stated rather than silently changed.
+ */
+function resolveTurnRelayNetworkMode(
+  range: ResolvedTurnRelayRange,
+  recovered: RecoveredTurnDeployment | undefined,
+): TurnRelayNetworkMode {
+  const raw = recovered?.relayNetworkModeRaw;
+  if (raw !== undefined && !isTurnRelayNetworkMode(raw)) {
+    // Fail closed. Both guesses are damaging and neither is recoverable from
+    // the range alone, so setup will not pick one on the operator's behalf.
+    fatal(`${TURN_SERVICE_ENV.RELAY_NETWORK_MODE} in .env is "${raw}", which is not a network mode. `
+      + `Set it to one of ${TURN_RELAY_NETWORK_MODES.join(' or ')} to state how this deployment's TURN `
+      + 'container is attached; setup will not guess, because guessing either republishes every relay port '
+      + 'or moves a running relay off the bridge.');
+  }
+  const mode = turnRelayNetworkMode({ ...range, persistedMode: recovered?.networkMode });
+  if (recovered?.networkMode !== undefined && recovered.networkMode !== mode) {
+    console.warn(`\n  Warning: the TURN container moves from ${recovered.networkMode} to ${mode} networking. `
+      + (mode === 'host'
+        ? 'Docker will no longer publish the relay range; open it in the host firewall.'
+        : 'Docker will publish the relay range again; the host firewall rule for it is no longer required.')
+      + '\n');
+  }
+  return mode;
+}
+
+function applyTurnRelayNetworkStrategy(
+  range: ResolvedTurnRelayRange,
+  networkMode: TurnRelayNetworkMode,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const ports = turnRelayPortCount(range.relayMinPort, range.relayMaxPort);
+  const oversizedForBridge = ports > TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS;
+  if (networkMode === 'host') {
+    if (platform !== 'linux') {
+      // Fail closed instead of publishing 30000 bridge mappings, and instead of
+      // quietly serving a smaller relay than the one that was requested.
+      fatal(`${ports} concurrent relay allocations need Docker host networking, which only exists on Linux; `
+        + `this host is ${platform}. Deploy TURN on a Linux host, or choose a capacity of at most `
+        + `${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} allocations, which a bridge deployment publishes `
+        + 'safely. Setup will not reduce the requested capacity for you.');
+    }
+    console.warn(`\n  Note: ${ports} relay ports is past the ${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} `
+      + 'a Docker bridge can publish sanely, so the TURN container uses host networking. Docker will NOT open '
+      + `the UDP range for you: allow ${range.relayMinPort}-${range.relayMaxPort}/udp in the host firewall.\n`);
+    return;
+  }
+  if (oversizedForBridge) {
+    // Reachable only for a range the deployment already configured, which is
+    // preserved exactly — ports and network mode. Say what it costs.
+    console.warn(`\n  Warning: the configured relay range ${range.relayMinPort}-${range.relayMaxPort} publishes `
+      + `${ports} UDP ports through the Docker bridge, and Docker expands that into one mapping, one proxy and `
+      + 'its own DNAT rules per port — a slow start and a very large resolved Compose model. The range and its '
+      + 'network mode are preserved exactly. To have setup pick host networking instead, re-run with '
+      + '--turn-relay-capacity <allocations>.\n');
+  }
+}
+
+async function resolveTurnDeployment(
+  domain: string,
+  dir: string,
+  secrets: SetupSecrets,
+  opts: SetupFlowOptions,
+): Promise<EnabledTurnDeployment | undefined> {
+  const recovered = recoverTurnDeployment(dir);
+  const turnConfigRequested = opts.turnHost !== undefined
+    || opts.turnPort !== undefined
+    || opts.turnExternalIp !== undefined
+    || opts.turnRelayCapacity !== undefined
+    || opts.turnRelayMinPort !== undefined
+    || opts.turnRelayMaxPort !== undefined;
+  let enabled = opts.turn ?? (Boolean(recovered) || turnConfigRequested);
+  if (opts.turn === undefined && !recovered && !turnConfigRequested && process.stdin.isTTY) {
+    enabled = await confirm('Enable optional authenticated TURN relay for difficult NAT networks?');
+  }
+  if (!enabled) {
+    secrets.turnSharedSecret = undefined;
+    return undefined;
+  }
+
+  const defaultHost = domain.toLowerCase().startsWith('turn.') ? domain : `turn.${domain}`;
+  const host = (opts.turnHost ?? recovered?.host ?? defaultHost).trim().toLowerCase();
+  const port = parsePortOption(opts.turnPort, recovered?.port ?? TURN_SERVICE_DEFAULTS.PORT);
+  const resolvedRelayRange = await resolveTurnRelayRange(opts, recovered);
+  const { relayMinPort, relayMaxPort, rangeOrigin } = resolvedRelayRange;
+  const discoveredExternalIp = opts.turnExternalIp === undefined ? discoverPublicIpv4()?.trim() : undefined;
+  let externalIp = (opts.turnExternalIp ?? recovered?.externalIp ?? discoveredExternalIp)?.trim();
+
+  if (!isTurnServiceHost(host)) fatal('TURN host must be a valid DNS hostname.');
+  if (!port) fatal('TURN listener port must be between 1 and 65535.');
+  // The SAME rule the server runtime applies. These were two separate
+  // implementations with different ceilings, so this installer wrote a relay
+  // range into .env, coturn's min-port/max-port and the Docker publish list
+  // that the runtime then refused — serving every client a STUN-only ICE list
+  // against a healthy coturn.
+  const relayRange = parseTurnRelayRange({ port, relayMinPort, relayMaxPort });
+  if ('rejection' in relayRange) {
+    // `fatal` never returns, which is also what narrows `relayRange` below —
+    // no second copy of the rule, and no unchecked non-null assertion either.
+    if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE) {
+      fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
+    }
+    fatal('TURN relay port range is invalid.');
+  }
+  if (port === 80 || port === 443) {
+    fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
+  }
+  const networkMode = resolveTurnRelayNetworkMode(resolvedRelayRange, recovered);
+  applyTurnRelayNetworkStrategy(resolvedRelayRange, networkMode);
+  if (!externalIp || !isTurnServiceIpv4(externalIp)) {
+    fatal('Could not determine the TURN server public IPv4. Pass --turn-external-ip <ipv4>.');
+  }
+
+  const dnsLookup = resolveHostIpv4(host);
+  let recoveredIpUpdated = false;
+  if (opts.turnExternalIp === undefined
+    && recovered?.externalIp
+    && discoveredExternalIp
+    && recovered.externalIp !== discoveredExternalIp
+    && dnsLookup.status === 'resolved'
+    && dnsLookup.addresses.includes(discoveredExternalIp)) {
+    console.warn(`\n  Warning: TURN public IPv4 changed from ${recovered.externalIp} to ${discoveredExternalIp}; `
+      + 'the recovered deployment will be updated to match its DNS A record.\n');
+    externalIp = discoveredExternalIp;
+    recoveredIpUpdated = true;
+  }
+  if (dnsLookup.status === 'resolved') {
+    const dnsError = validateTurnDnsOnly(host, externalIp, dnsLookup.addresses);
+    if (dnsError) {
+      if (opts.turnExternalIp === undefined
+        && recovered?.externalIp
+        && discoveredExternalIp
+        && recovered.externalIp !== discoveredExternalIp) {
+        fatal(`${dnsError} The recovered TURN external IP may be stale; verify the current public IPv4 and re-run `
+          + 'with --turn-external-ip <ipv4>.');
+      }
+      fatal(dnsError);
+    }
+  } else {
+    const reason = dnsLookup.status === 'unavailable'
+      ? 'DNS lookup tooling is unavailable or the lookup timed out.'
+      : `No IPv4 A record is currently published for ${host}.`;
+    console.warn(`\n  Warning: ${reason}`);
+    if (opts.turnExternalIp === undefined
+      && recovered?.externalIp
+      && discoveredExternalIp
+      && recovered.externalIp !== discoveredExternalIp) {
+      console.warn(`  The recovered TURN external IP (${recovered.externalIp}) differs from the currently detected `
+        + `public IPv4 (${discoveredExternalIp}). DNS could not confirm which value is authoritative; re-run with `
+        + '--turn-external-ip <ipv4> after verification.');
+    }
+    console.warn('  TURN DNS could not be verified automatically; setup will continue only with explicit DNS-only acknowledgement.\n');
+  }
+
+  const previouslyAcknowledged = Boolean(
+    recovered
+    && recovered.host === host
+    && (recovered.externalIp === externalIp || recoveredIpUpdated),
+  );
+  if (!opts.turnDnsOnly && !previouslyAcknowledged) {
+    if (!process.stdin.isTTY) {
+      fatal('TURN requires a DNS-only hostname. If the application hostname is proxied, create a separate one '
+        + '(for example turn.example.com) pointing directly to this server; a DNS-only application hostname may '
+        + 'reuse the same name on the dedicated TURN port. Then re-run with --turn-dns-only.');
+    }
+    console.warn('\n  TURN cannot use a Cloudflare-proxied (orange-cloud) hostname or Caddy HTTP proxying.');
+    console.warn(`  Use a separate DNS-only hostname such as ${defaultHost}, pointed directly to ${externalIp}.`);
+    console.warn('  If the application hostname is already DNS only, the same hostname may use the dedicated TURN port.');
+    console.warn('  Otherwise do not disable its Cloudflare protection; create the separate TURN hostname.\n');
+    if (!await confirm(`I confirm ${host} is DNS only`)) fatal('TURN DNS-only confirmation was not accepted.');
+  }
+
+  const recoveredCredentialTtlSeconds = recovered?.credentialTtlSeconds;
+  const upgradeLegacyCredentialTtl = recoveredCredentialTtlSeconds
+    === TURN_SERVICE_DEFAULTS.LEGACY_CREDENTIAL_TTL_SECONDS;
+  if (upgradeLegacyCredentialTtl) {
+    console.warn(`\n  Warning: upgrading the legacy ${recoveredCredentialTtlSeconds}-second TURN credential lifetime `
+      + `to ${TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS} seconds so active two-hour route renewals remain effective.\n`);
+  }
+  secrets.turnSharedSecret ??= recovered?.sharedSecret ?? randomHex(TURN_SERVICE_DEFAULTS.SHARED_SECRET_BYTES);
+  return {
+    enabled: true,
+    host,
+    port,
+    externalIp,
+    // Narrowed by the shared rule above, not by a second copy of it.
+    relayMinPort: relayRange.relayMinPort,
+    relayMaxPort: relayRange.relayMaxPort,
+    // Carried into the generated Compose file so the installer and the template
+    // ask the SAME shared rule which network strategy this range gets.
+    rangeOrigin,
+    // Persisted into .env, because it cannot be re-derived from the range on
+    // the next run: a wide range is equally consistent with a legacy bridge
+    // deployment and a host one.
+    networkMode,
+    sharedSecret: secrets.turnSharedSecret,
+    credentialTtlSeconds: recoveredCredentialTtlSeconds === undefined || upgradeLegacyCredentialTtl
+      ? TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS
+      : recoveredCredentialTtlSeconds,
+  };
+}
+
+/**
+ * Non-destructively upsert ONLYOFFICE_* keys (and DOMAIN if changed/missing)
+ * into an existing .env file content while preserving all other variables,
+ * comments, and ordering.
+ */
+export function upsertOnlyOfficeEnvContent(
+  existingContent: string,
+  domain: string,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
+): string {
+  const updates: Record<string, string> = {
+    DOMAIN: domain,
+    [ONLYOFFICE_SERVICE_ENV.ENABLED]: onlyoffice.enabled ? 'true' : 'false',
+    [ONLYOFFICE_SERVICE_ENV.JWT_SECRET]: onlyoffice.jwtSecret ?? '',
+    [ONLYOFFICE_SERVICE_ENV.PUBLIC_URL]: onlyoffice.publicUrl ?? defaultOnlyOfficePublicUrl(domain),
+    [ONLYOFFICE_SERVICE_ENV.INTERNAL_URL]: onlyoffice.internalUrl ?? ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL,
+  };
+  const seen = new Set<string>();
+  const lines = existingContent.replace(/\r\n/g, '\n').split('\n');
+  const updatedLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      updatedLines.push(line);
+      continue;
+    }
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) {
+      updatedLines.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (key in updates) {
+      if (!seen.has(key)) {
+        updatedLines.push(`${key}=${updates[key]}`);
+        seen.add(key);
+      }
+      // Drop any duplicate occurrences of the same managed key
+    } else {
+      updatedLines.push(line);
+    }
+  }
+
+  while (updatedLines.length > 0 && updatedLines[updatedLines.length - 1] === '') {
+    updatedLines.pop();
+  }
+
+  for (const [key, val] of Object.entries(updates)) {
+    if (!seen.has(key)) {
+      updatedLines.push(`${key}=${val}`);
+    }
+  }
+
+  return `${updatedLines.join('\n')}\n`;
+}
+
+/**
+ * Ensure an existing docker-compose.yml content includes the `onlyoffice`
+ * service, `server.environment` ONLYOFFICE_* variables, and `onlyoffice_data`
+ * / `onlyoffice_logs` volumes without losing existing services (such as TURN)
+ * or custom server environment variables.
+ */
+export function ensureComposeHasOnlyOffice(
+  existingComposeContent: string | undefined,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
+  mirrorMode = false,
+): string {
+  if (!existingComposeContent || !existingComposeContent.trim()) {
+    return dockerComposeTemplate({
+      ...(mirrorMode ? {
+        ghcrPrefix: GHCR_MIRROR_PREFIX,
+        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
+      } : {}),
+      onlyoffice,
+    });
+  }
+
+  const doc = parse(existingComposeContent) as {
+    services?: Record<string, Record<string, unknown>>;
+    volumes?: Record<string, unknown>;
+  } | null;
+
+  if (!doc || typeof doc !== 'object' || !doc.services || typeof doc.services !== 'object') {
+    throw new Error('Invalid docker-compose.yml: missing services structure');
+  }
+
+  const server = doc.services.server ?? {};
+  const rawEnv = server.environment;
+  const envObj: Record<string, string | null> = {};
+  if (Array.isArray(rawEnv)) {
+    for (const entry of rawEnv) {
+      if (entry === null || entry === undefined) continue;
+      const str = String(entry);
+      const eq = str.indexOf('=');
+      if (eq !== -1) {
+        envObj[str.slice(0, eq)] = str.slice(eq + 1);
+      } else {
+        envObj[str] = null;
+      }
+    }
+  } else if (rawEnv && typeof rawEnv === 'object') {
+    for (const [k, v] of Object.entries(rawEnv)) {
+      if (v === null || v === undefined) {
+        envObj[k] = null;
+      } else {
+        envObj[k] = String(v);
+      }
+    }
+  }
+
+  envObj[ONLYOFFICE_SERVICE_ENV.ENABLED] = `\${${ONLYOFFICE_SERVICE_ENV.ENABLED}:-true}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.JWT_SECRET] = `\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}:-}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.PUBLIC_URL] = `\${${ONLYOFFICE_SERVICE_ENV.PUBLIC_URL}:-https://\${DOMAIN}${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.INTERNAL_URL] = `\${${ONLYOFFICE_SERVICE_ENV.INTERNAL_URL}:-${ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL}}`;
+  if (!envObj['IMCODES_NODE_EXE_VERSION_DIR']) {
+    envObj['IMCODES_NODE_EXE_VERSION_DIR'] = NODE_EXE_VERSION_DIR;
+  }
+  server.environment = envObj;
+
+  const serverVolumes = Array.isArray(server.volumes) ? [...server.volumes] : [];
+  const versionMount = `${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}`;
+  const hasVersionMount = serverVolumes.some((v) => {
+    if (typeof v === 'string') return v === versionMount;
+    if (v && typeof v === 'object') {
+      const vol = v as { source?: string; target?: string };
+      return vol.source === NODE_EXE_VERSION_VOLUME && vol.target === NODE_EXE_VERSION_DIR;
+    }
+    return false;
+  });
+  if (!hasVersionMount) {
+    serverVolumes.push(versionMount);
+  }
+  server.volumes = serverVolumes;
+  doc.services.server = server;
+
+  if (onlyoffice.enabled) {
+    doc.services.onlyoffice = {
+      image: onlyoffice.image ?? ONLYOFFICE_SERVICE_DEFAULTS.IMAGE,
+      restart: 'unless-stopped',
+      environment: {
+        JWT_ENABLED: 'true',
+        JWT_SECRET: `\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}}`,
+        JWT_HEADER: 'Authorization',
+        JWT_IN_BODY: 'true',
+        WOPI_ENABLED: 'false',
+      },
+      volumes: [
+        `${ONLYOFFICE_DATA_VOLUME}:/var/www/onlyoffice/Data`,
+        `${ONLYOFFICE_LOGS_VOLUME}:/var/log/onlyoffice`,
+      ],
+    };
+  } else {
+    delete doc.services.onlyoffice;
+  }
+
+  doc.volumes = doc.volumes && typeof doc.volumes === 'object' ? doc.volumes : {};
+  if (!(ONLYOFFICE_DATA_VOLUME in doc.volumes)) doc.volumes[ONLYOFFICE_DATA_VOLUME] = null;
+  if (!(ONLYOFFICE_LOGS_VOLUME in doc.volumes)) doc.volumes[ONLYOFFICE_LOGS_VOLUME] = null;
+  if (!(NODE_EXE_VERSION_VOLUME in doc.volumes)) doc.volumes[NODE_EXE_VERSION_VOLUME] = null;
+
+  return stringify(doc, { lineWidth: 0 });
+}
+
+/**
+ * Ensure an existing Caddyfile includes the `handle_path /onlyoffice/*` reverse
+ * proxy block while preserving existing site address (`{$DOMAIN}` or literal
+ * domain) and custom directives.
+ */
+function stripCaddyDirectiveBlock(content: string, headerRegex: RegExp): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let depth = 0;
+  let skipping = false;
+  for (const line of lines) {
+    if (!skipping && headerRegex.test(line)) {
+      skipping = true;
+      for (const ch of line) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      if (depth <= 0) {
+        skipping = false;
+        depth = 0;
+      }
+      continue;
+    }
+    if (skipping) {
+      for (const ch of line) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      if (depth <= 0) {
+        skipping = false;
+        depth = 0;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+export function ensureCaddyfileHasOnlyOffice(
+  existingCaddyfile: string | undefined,
+  domain: string,
+  enabled = true,
+): string {
+  if (!existingCaddyfile || !existingCaddyfile.trim()) {
+    return caddyfileTemplate(domain, { onlyoffice: enabled });
+  }
+
+  const escapedSubpath = ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const activeRouteRegex = new RegExp(`^[ \\t]*handle_path\\s+${escapedSubpath}/\\*`, 'm');
+
+  if (!enabled) {
+    if (!activeRouteRegex.test(existingCaddyfile)) {
+      return existingCaddyfile;
+    }
+    let next = stripCaddyDirectiveBlock(
+      existingCaddyfile,
+      new RegExp(`^[ \\t]*handle_path\\s+${escapedSubpath}/\\*`),
+    );
+    next = stripCaddyDirectiveBlock(next, /^[ \t]*@onlyoffice_static\b/);
+    next = stripCaddyDirectiveBlock(next, /^[ \t]*@onlyoffice_bootstrap\b/);
+    return next;
+  }
+  if (activeRouteRegex.test(existingCaddyfile)) {
+    return existingCaddyfile;
+  }
+  const handleBlock = onlyofficeCaddyRouteBlock();
+
+  const proxyRegex = /^([ \t]*reverse_proxy\s+(?:https?:\/\/)?(?:\S+)?19138[^\n]*)$/m;
+  if (proxyRegex.test(existingCaddyfile)) {
+    return existingCaddyfile.replace(proxyRegex, `${handleBlock}$1`);
+  }
+
+  throw new Error(
+    `Cannot patch Caddyfile for ONLYOFFICE: could not locate server upstream reverse_proxy (:19138) in existing configuration`,
+  );
+}
+
+async function writeConfigs(
+  dir: string,
+  domain: string,
+  secrets: SetupSecrets,
+  mirrorMode: boolean,
+  turn: EnabledTurnDeployment | undefined,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
+): Promise<void> {
   await writeFile(join(dir, '.env'), envTemplate({
     domain,
     postgresPassword: secrets.postgresPassword,
     jwtSigningKey: secrets.jwtSigningKey,
     adminPassword: secrets.adminPassword,
-  }));
+    turn,
+    onlyoffice,
+  }), { encoding: 'utf8', mode: 0o600 });
+  await chmod(join(dir, '.env'), 0o600);
 
   await writeFile(join(dir, 'docker-compose.yml'), dockerComposeTemplate(
-    mirrorMode ? { ghcrPrefix: GHCR_MIRROR_PREFIX } : undefined,
+    {
+      ...(mirrorMode ? {
+        ghcrPrefix: GHCR_MIRROR_PREFIX,
+        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
+      } : {}),
+      turn,
+      onlyoffice,
+    },
   ));
-  await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
+  await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain, { onlyoffice: onlyoffice.enabled }));
+  const turnConfigPath = join(dir, 'turnserver.conf');
+  const turnEntrypointPath = join(dir, 'turn-entrypoint.sh');
+  // The bridge-address entrypoint belongs to bridge mode only. In host mode
+  // there is no bridge address to translate, and the address it would discover
+  // is a HOST address that denied-peer-ip may deliberately be blocking, so the
+  // wrapper is neither mounted nor left lying around.
+  const usesBridgeEntrypoint = turn?.networkMode === 'bridge';
+  if (turn && usesBridgeEntrypoint) {
+    await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
+    await chmod(turnConfigPath, 0o600);
+    await writeFile(turnEntrypointPath, turnEntrypointTemplate(), { encoding: 'utf8', mode: 0o700 });
+    await chmod(turnEntrypointPath, 0o700);
+  } else if (turn) {
+    await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
+    await chmod(turnConfigPath, 0o600);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
+  } else if (existsSync(turnConfigPath)) {
+    await unlink(turnConfigPath);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
+  } else if (existsSync(turnEntrypointPath)) {
+    await unlink(turnEntrypointPath);
+  }
+}
+
+async function runIncrementalOnlyOfficeAddon(
+  compose: string,
+  dir: string,
+  domain: string,
+  opts: SetupFlowOptions,
+): Promise<void> {
+  log('Existing .env detected — running non-destructive ONLYOFFICE add-on setup...');
+
+  log('Detecting network...');
+  const mirrorMode = detectMirrorMode();
+  if (mirrorMode) {
+    log('Mirror mode: hub.docker.com unreachable, using registry mirrors for service images.');
+  } else {
+    log('Direct mode: hub.docker.com reachable.');
+  }
+
+  // Stage retained artifacts BEFORE writing config files or replacing `server`.
+  const stagedVersions = stageRetainedArtifactVersions(compose, dir);
+  assertRetainedArtifactStagingSafe(stagedVersions);
+  if (stagedVersions.kind === 'staged') {
+    log('Preserving retained Windows installers from the previous container...');
+  }
+
+  const existingSecrets = await recoverSecrets(dir);
+  const secrets: Partial<SetupSecrets> = existingSecrets ?? {};
+  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, secrets, { ...opts, onlyoffice: true });
+
+  const envPath = join(dir, '.env');
+  const existingEnvContent = await readFile(envPath, 'utf8');
+  const updatedEnvContent = upsertOnlyOfficeEnvContent(existingEnvContent, domain, onlyoffice);
+
+  const composePath = join(dir, 'docker-compose.yml');
+  const existingCompose = existsSync(composePath) ? await readFile(composePath, 'utf8') : undefined;
+  const updatedComposeContent = ensureComposeHasOnlyOffice(existingCompose, onlyoffice, mirrorMode);
+
+  const caddyPath = join(dir, 'Caddyfile');
+  const existingCaddy = existsSync(caddyPath) ? await readFile(caddyPath, 'utf8') : undefined;
+  const updatedCaddyContent = ensureCaddyfileHasOnlyOffice(existingCaddy, domain, true);
+
+  // All candidates validated successfully — commit configuration and secrets
+  if (existingSecrets && onlyoffice.jwtSecret && existingSecrets.onlyofficeJwtSecret !== onlyoffice.jwtSecret) {
+    existingSecrets.onlyofficeJwtSecret = onlyoffice.jwtSecret;
+    await persistSecrets(dir, existingSecrets);
+  }
+
+  await writeFile(envPath, updatedEnvContent, { encoding: 'utf8', mode: 0o600 });
+  await chmod(envPath, 0o600);
+  await writeFile(composePath, updatedComposeContent, 'utf8');
+  await writeFile(caddyPath, updatedCaddyContent, 'utf8');
+
+  log('Updated .env, docker-compose.yml, and Caddyfile with ONLYOFFICE configuration.');
+  log('Starting ONLYOFFICE Document Server and updating server + Caddy...');
+  composeCmd(compose, dir, 'up -d onlyoffice server caddy');
+  if (!isServiceHealthy(compose, dir, 'server')) {
+    await waitForService(compose, dir, 'server');
+  }
+
+  log('Reloading Caddy configuration...');
+  try {
+    composeCmd(compose, dir, 'exec -T caddy caddy reload --config /etc/caddy/Caddyfile');
+    log('Caddy configuration reloaded successfully.');
+  } catch {
+    log('Graceful caddy reload failed; restarting caddy container...');
+    composeCmd(compose, dir, 'restart caddy');
+  }
+  log('ONLYOFFICE Document Server, server, and Caddy updated.');
+
+  if (stagedVersions.kind === 'staged') {
+    const outcome = finalizeRetainedArtifactMigration(compose, dir, stagedVersions.dir);
+    log(outcome.restored
+      ? 'Retained Windows installers migrated into the durable volume.'
+      : `Could not migrate retained Windows installers. The only copy is preserved at ${outcome.retainedStagingDir}; `
+        + `copy it into the server's ${NODE_EXE_VERSION_DIR} to keep existing install codes resolvable.`);
+  }
+
+  console.log(`
+  ┌──────────────────────────────────────────────────────┐
+  │  ONLYOFFICE Document Server added to https://${domain}
+  │
+  │  Document server: https://${domain}/onlyoffice (ONLYOFFICE enabled)
+  └──────────────────────────────────────────────────────┘
+`);
+}
+
+
+// ── Retained-artifact migration ─────────────────────────────────────────────
+
+/**
+ * Where a pre-fix deployment kept superseded controlled-node artifacts.
+ *
+ * Before the named volume existed, tsk_jgt's store resolved to
+ * `<IMCODES_NODE_EXE_DIR>/versions`, and the image sets IMCODES_NODE_EXE_DIR to
+ * /app/controlled-node-executables. Those bytes therefore live in the old
+ * container's writable layer, which `compose up -d` discards when it recreates
+ * the service. Declaring the volume alone does not save them: the new container
+ * starts with an empty volume and every install code minted against a
+ * superseded digest stops resolving on the first upgrade.
+ */
+export const LEGACY_NODE_EXE_VERSION_DIR = '/app/controlled-node-executables/versions';
+
+/**
+ * Printed when the legacy directory does not exist at all.
+ *
+ * A sentinel rather than an empty listing, because "not there" and "there but
+ * unreadable" must not produce the same output. Chosen to be impossible as a
+ * real directory entry produced by `ls -A`.
+ */
+export const LEGACY_ABSENT_SENTINEL = '__imcodes_legacy_versions_absent__';
+
+/**
+ * Outcome of staging, as three states rather than two.
+ *
+ * `none` and `failed` were previously both `null`, and the caller read that as
+ * "nothing to preserve" and went on to replace the container - destroying the
+ * only copy of bytes it had just failed to read. Absence and failure demand
+ * opposite responses, so they are no longer the same value. (`already` is
+ * folded into `none`: the bytes are already in the durable volume.)
+ */
+export type RetainedArtifactStaging =
+  | { kind: 'none' }
+  | { kind: 'staged'; dir: string }
+  | { kind: 'failed'; step: string; detail: string };
+
+/**
+ * True only for docker's "that path is not in the container" error.
+ *
+ * Used solely on the stopped-container path, where `exec` is unavailable and
+ * `cp` is both the probe and the copy. Recognised absence is benign; anything
+ * unrecognised is treated as a failure, so a new or reworded docker error can
+ * only ever make this stricter, never quieter.
+ */
+function isMissingContainerPathError(error: unknown): boolean {
+  const text = `${error instanceof Error ? error.message : String(error)} `
+    + `${(error as { stderr?: unknown } | null)?.stderr ?? ''}`;
+  // Docker 20.x reports a missing `docker cp` source as `No such container:path`; newer CLIs say `Could not find the file`.
+  return /no such file or directory|could not find the file|no such container:path/i.test(text);
+}
+
+function stagingFailure(step: string, error: unknown): RetainedArtifactStaging {
+  return { kind: 'failed', step, detail: error instanceof Error ? error.message : String(error) };
+}
+
+/**
+ * Copy the pre-fix retained tree OUT of the running container, before anything
+ * replaces it.
+ *
+ * Returns `none` only when there is genuinely nothing to preserve: no server
+ * container, a container that already mounts the durable path, or an empty
+ * legacy tree. Anything that went wrong while trying to find out returns
+ * `failed`, because the caller must not treat an unanswered question as a "no".
+ */
+export function stageRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  deps: {
+    runQuiet: (cmd: string, cwd: string) => string;
+    mkdtemp: () => string;
+    readdir?: (path: string) => string[];
+  } = {
+    runQuiet,
+    mkdtemp: () => mkdtempSync(join(tmpdir(), 'imcodes-node-exe-versions-')),
+  },
+): RetainedArtifactStaging {
+  let containerIds: string[];
+  try {
+    // `-a`: compose ps omits stopped containers by default, so an ordinary
+    // exited or operator-stopped legacy Server produced no id and was read as a
+    // fresh install -- then recreated, discarding a writable layer that was
+    // still perfectly copyable. Stopped containers are exactly the ones an
+    // operator is most likely to be upgrading from.
+    containerIds = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -aq server`,
+      dir,
+    ).split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch (err) {
+    return stagingFailure('compose-ps', err);
+  }
+  // No server in any state: a fresh install has nothing to preserve.
+  if (containerIds.length === 0) return { kind: 'none' };
+  // More than one candidate is ambiguous, and guessing which holds the real
+  // retained bytes is exactly the kind of assumption that loses them.
+  if (containerIds.length > 1) {
+    return { kind: 'failed', step: 'compose-ps', detail: `ambiguous server containers: ${containerIds.join(', ')}` };
+  }
+  const containerId = containerIds[0]!;
+
+  try {
+    const mounts = deps.runQuiet(
+      `docker inspect -f '{{range .Mounts}}{{.Destination}}\n{{end}}' ${containerId}`,
+      dir,
+    );
+    // Already migrated: the retained bytes live in the volume and survive on
+    // their own, so there is nothing to stage.
+    if (mounts.split('\n').some((line) => line.trim() === NODE_EXE_VERSION_DIR)) return { kind: 'none' };
+  } catch (err) {
+    return stagingFailure('docker-inspect', err);
+  }
+
+  let running = false;
+  try {
+    running = deps.runQuiet(`docker inspect -f '{{.State.Running}}' ${containerId}`, dir).trim() === 'true';
+  } catch (err) {
+    return stagingFailure('docker-state', err);
+  }
+
+  let staging: string;
+  try {
+    staging = deps.mkdtemp();
+  } catch (err) {
+    return stagingFailure('staging-dir', err);
+  }
+
+  if (running) {
+    // Running container: probe with an explicit exit status. No masking -- a
+    // missing directory answers with a sentinel and anything else lets `ls`
+    // exit non-zero, which becomes a failure rather than an empty listing.
+    let listing: string;
+    try {
+      listing = deps.runQuiet(
+        `docker exec ${containerId} sh -c `
+        + `'if [ ! -d "${LEGACY_NODE_EXE_VERSION_DIR}" ]; then echo ${LEGACY_ABSENT_SENTINEL}; exit 0; fi; `
+        + `ls -A "${LEGACY_NODE_EXE_VERSION_DIR}"'`,
+        dir,
+      );
+    } catch (err) {
+      return stagingFailure('legacy-listing', err);
+    }
+    if (listing.trim() === LEGACY_ABSENT_SENTINEL || !listing.trim()) return { kind: 'none' };
+  }
+
+  try {
+    // `docker cp` works against stopped containers, which is why the stopped
+    // path relies on it rather than on `exec`.
+    deps.runQuiet(`docker cp ${containerId}:${LEGACY_NODE_EXE_VERSION_DIR}/. ${staging}/`, dir);
+  } catch (err) {
+    // A genuinely absent legacy directory is benign and must stay upgradeable.
+    // Everything else fails closed: an unrecognised copy error is exactly the
+    // case where continuing would destroy bytes we could not read.
+    if (!running && isMissingContainerPathError(err)) return { kind: 'none' };
+    return stagingFailure('docker-cp', err);
+  }
+  const listStaged = deps.readdir ?? ((path: string) => readdirSync(path));
+  if (!running && listStaged(staging).length === 0) return { kind: 'none' };
+  return { kind: 'staged', dir: staging };
+}
+
+/**
+ * Refuse to continue when migration was attempted and failed.
+ *
+ * Replacement is irreversible: `compose up -d` discards the old writable layer,
+ * and with it the only copy of bytes we just proved we cannot read. Stopping
+ * here leaves the deployment exactly as it was, which is recoverable; carrying
+ * on is not.
+ */
+export function assertRetainedArtifactStagingSafe(staging: RetainedArtifactStaging): void {
+  if (staging.kind !== 'failed') return;
+  throw new Error(
+    `Refusing to replace the server container: could not preserve retained Windows installers `
+    + `(${staging.step}: ${staging.detail}). The existing deployment is untouched. `
+    + `Resolve the Docker error and re-run setup, or remove `
+    + `${LEGACY_NODE_EXE_VERSION_DIR} in the running container if those installers are expendable.`,
+  );
+}
+
+/**
+ * Restore staged bytes into the recreated server's durable volume.
+ *
+ * Must run AFTER the container has actually been replaced; writing into the old
+ * container would simply be discarded with it. Copying into the container path
+ * lands in the mounted volume, so the bytes outlive every later replacement.
+ */
+export function restoreRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: { runQuiet: (cmd: string, cwd: string) => string } = { runQuiet },
+): boolean {
+  try {
+    const containerId = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -q server`,
+      dir,
+    ).split('\n')[0]?.trim() ?? '';
+    if (!containerId) return false;
+    deps.runQuiet(`docker exec ${containerId} sh -c 'mkdir -p ${NODE_EXE_VERSION_DIR}'`, dir);
+    deps.runQuiet(`docker cp ${staging}/. ${containerId}:${NODE_EXE_VERSION_DIR}/`, dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restore, then delete the staging copy ONLY if the restore actually succeeded.
+ *
+ * After replacement the staging directory is the sole surviving copy. Deleting
+ * it unconditionally turned an ordinary transient failure - a disk hiccup, a
+ * permission problem, a container not ready yet - into permanent data loss, so
+ * the copy is retained on failure and its path is reported for manual recovery.
+ */
+export function finalizeRetainedArtifactMigration(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: {
+    restore: (compose: string, dir: string, staging: string) => boolean;
+    remove: (path: string) => void;
+  } = {
+    restore: restoreRetainedArtifactVersions,
+    remove: (path) => rmSync(path, { recursive: true, force: true }),
+  },
+): { restored: boolean; retainedStagingDir?: string } {
+  const restored = deps.restore(compose, dir, staging);
+  if (!restored) return { restored: false, retainedStagingDir: staging };
+  deps.remove(staging);
+  return { restored: true };
 }
 
 // ── Docker lifecycle ────────────────────────────────────────────────────────
@@ -354,7 +1586,7 @@ function bootstrapDatabase(compose: string, dir: string, secrets: SetupSecrets):
 // ── Self-binding ────────────────────────────────────────────────────────────
 
 async function selfBind(secrets: SetupSecrets): Promise<void> {
-  await mkdir(CREDS_DIR, { recursive: true });
+  await mkdir(credentialsDir(), { recursive: true });
   const creds = {
     serverId: secrets.serverId,
     token: secrets.serverToken,
@@ -362,7 +1594,7 @@ async function selfBind(secrets: SetupSecrets): Promise<void> {
     serverName: hostname(),
     boundAt: Date.now(),
   };
-  await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
 function installService(): void {
@@ -376,9 +1608,10 @@ function installService(): void {
 }
 
 function installSystemdService(): void {
+  const service = resolvePosixDaemonServicePaths();
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
-  const servicePath = join(serviceDir, 'imcodes.service');
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const servicePath = service.systemdUnitPath;
+  const logPath = join(credentialsDir(), 'daemon.log');
 
   // Prefer the self-healing launcher when this install ships it. See
   // `src/util/launch-target.ts` for the why — half-finished `npm install`
@@ -387,22 +1620,28 @@ function installSystemdService(): void {
   const target = resolveDaemonLaunchTarget();
 
   const unit = `[Unit]
-Description=IM.codes Daemon
+Description=IM.codes Daemon${service.scoped ? ` (${service.stateHome})` : ''}
 After=network.target
+${renderSystemdStartLimitBlock()}
 
 [Service]
 Type=simple
 ExecStart=${renderSystemdExecStart(target)}
 Restart=on-failure
 RestartSec=5
-KillMode=process
+KillMode=control-group
+${renderSystemdTerminalDiagnostics()}
+TimeoutStopSec=45s
+SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
-Environment=NODE_ENV=production
+${service.scoped ? `Environment=IMCODES_HOME=${service.stateHome}
+Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
+` : ''}Environment=NODE_ENV=production
 # See bind-flow.ts.installSystemdService for rationale on these two.
 # Mirrors the flags there so the one-click setup and the manual bind
 # install produce equivalent units.
-Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'systemd', reportExcludeEnvFlagUsable(target.program))}"
 # Caps glibc malloc arenas — see bind-flow.ts for the full rationale.
 # Mirrors that unit so one-click setup and manual bind behave identically.
 # Bounds the ~730 MB of off-heap arena RSS that onnxruntime/sharp native
@@ -419,10 +1658,19 @@ WantedBy=default.target
   writeFileSync(servicePath, unit);
   try {
     execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
-    execSync('systemctl --user enable imcodes', { stdio: 'ignore' });
-    execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
+    execSync(`systemctl --user enable ${service.systemdUnitName}`, { stdio: 'ignore' });
+    execSync(`systemctl --user restart ${service.systemdUnitName}`, { stdio: 'ignore' });
   } catch {
     console.log('  Could not start systemd service automatically. Run: systemctl --user start imcodes');
+  }
+
+  // External recovery trigger, installed as its own timer/oneshot pair so it can
+  // still act when imcodes.service itself is wedged falsely-active. Idempotent:
+  // a re-run rewrites nothing and reloads nothing when the units already match.
+  if (!service.scoped) {
+    installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+  } else {
+    log('Scoped daemon: skipped the shared recovery timer to preserve default-service isolation.');
   }
 
   const linger = enableSystemdUserLinger();
@@ -436,8 +1684,12 @@ WantedBy=default.target
 
 // ── Main flow ───────────────────────────────────────────────────────────────
 
-export async function setupFlow(domain: string, opts: { force?: boolean } = {}): Promise<void> {
+export async function setupFlow(domainInput?: string, opts: SetupFlowOptions = {}): Promise<void> {
   const dir = process.cwd();
+  const domain = domainInput?.trim() || recoverDomainFromEnv(dir);
+  if (!domain) {
+    fatal('Domain is required. Pass --domain <domain> or run in a directory with an existing .env containing DOMAIN.');
+  }
 
   console.log('\n  IM.codes Setup\n');
 
@@ -465,13 +1717,17 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
   }
 
   if (!opts.force) {
+    if (existsSync(join(dir, '.env')) && opts.onlyoffice === true) {
+      await runIncrementalOnlyOfficeAddon(compose, dir, domain, opts);
+      return;
+    }
     const existing = await recoverSecrets(dir);
     if (existing) {
       secrets = existing;
       resumed = true;
       log('Resuming previous setup (existing .env + secrets found).');
     } else if (existsSync(join(dir, '.env'))) {
-      // .env exists but no .setup-secrets.json — can't safely resume
+      // .env exists but no .setup-secrets.json — can't safely resume full setup
       fatal('Incomplete setup state: .env exists but secrets file is missing. Use --force to start fresh.');
     } else {
       secrets = generateSecrets();
@@ -479,6 +1735,9 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
   } else {
     secrets = generateSecrets();
   }
+
+  const turn = await resolveTurnDeployment(domain, dir, secrets, opts);
+  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, secrets, opts);
 
   // 3. Detect mirror mode (hub.docker.com unreachable → use mirrors)
   log('Detecting network...');
@@ -496,9 +1755,16 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
   } else {
     log('Updating configuration files...');
   }
-  await writeConfigs(dir, domain, secrets, mirrorMode);
+  // Stage retained artifacts BEFORE anything recreates the server. A pre-fix
+  // container keeps them in its writable layer, which `compose up -d` discards.
+  const stagedVersions = stageRetainedArtifactVersions(compose, dir);
+  // A failed attempt is not the same as nothing to do: stop before anything is
+  // rewritten or recreated, leaving the existing deployment intact.
+  assertRetainedArtifactStagingSafe(stagedVersions);
+  if (stagedVersions.kind === 'staged') log('Preserving retained Windows installers from the previous container...');
+  await writeConfigs(dir, domain, secrets, mirrorMode, turn, onlyoffice);
   await persistSecrets(dir, secrets);
-  log(`Created .env, docker-compose.yml, Caddyfile${mirrorMode ? ' (mirror mode)' : ''}`);
+  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${onlyoffice.enabled ? ', ONLYOFFICE config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
 
   // 4. Start PostgreSQL (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'postgres')) {
@@ -510,7 +1776,26 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
     log('PostgreSQL ready.');
   }
 
-  // 5. Start server (skip if already healthy)
+  // 5. Always recreate TURN after rewriting its bind-mounted configuration.
+  // Docker Compose does not otherwise notice file-content or REST-secret
+  // changes, leaving coturn with stale in-memory credentials and ACLs.
+  if (turn) {
+    log('Starting TURN with current configuration...');
+    composeCmd(compose, dir, 'up -d --force-recreate turn');
+    await waitForService(compose, dir, 'turn');
+    log('TURN ready.');
+  }
+
+  if (onlyoffice.enabled) {
+    if (isServiceHealthy(compose, dir, 'onlyoffice')) {
+      log('ONLYOFFICE Document Server already running.');
+    } else {
+      log('Starting ONLYOFFICE Document Server...');
+      composeCmd(compose, dir, 'up -d onlyoffice');
+    }
+  }
+
+  // 6. Start server (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'server')) {
     log('Server already running.');
   } else {
@@ -522,23 +1807,33 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
     log('Server ready.');
   }
 
-  // 6. Bootstrap database (idempotent — handles duplicates gracefully)
+  // 7. Bootstrap database (idempotent — handles duplicates gracefully)
   log('Bootstrapping database...');
   bootstrapDatabase(compose, dir, secrets);
   log('Database bootstrapped.');
 
-  // 7. Start remaining services
-  log('Starting Caddy and Watchtower...');
+  // 8. Start remaining services
+  log(`Starting Caddy${turn ? ', TURN' : ''}${onlyoffice.enabled ? ', ONLYOFFICE' : ''} and Watchtower...`);
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
-  // 8. Self-bind
+  // Restore only now: the server has actually been replaced, so this lands in
+  // the durable volume rather than in a container about to be discarded.
+  if (stagedVersions.kind === 'staged') {
+    const outcome = finalizeRetainedArtifactMigration(compose, dir, stagedVersions.dir);
+    log(outcome.restored
+      ? 'Retained Windows installers migrated into the durable volume.'
+      : `Could not migrate retained Windows installers. The only copy is preserved at ${outcome.retainedStagingDir}; `
+        + `copy it into the server's ${NODE_EXE_VERSION_DIR} to keep existing install codes resolvable.`);
+  }
+
+  // 9. Self-bind
   log('Binding daemon to local server...');
   await selfBind(secrets);
   installService();
   log('Daemon bound and running.');
 
-  // 9. Print summary
+  // 10. Print summary
   const bindUrl = `https://${domain}/bind/${secrets.apiKeyRaw}`;
   console.log(`
   ┌──────────────────────────────────────────────────────┐
@@ -546,11 +1841,16 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
   │
   │  Admin login:    admin / ${secrets.adminPassword}
   │  Bind URL:       ${bindUrl}
+${onlyoffice.enabled ? `  │  Document server: https://${domain}/onlyoffice (ONLYOFFICE enabled)\n` : ''}${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
+${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  Installer retention: docker volume ${NODE_EXE_VERSION_VOLUME} (keeps superseded
+  │                        Windows installers; do not prune it or existing
+  │                        install codes stop resolving)
   │
   │  This machine is bound and daemon is running.
   │
   │  To connect another machine:
-  │    npm install -g imcodes
+  │    curl -fsSL https://im.codes/install.sh | bash
+  │    # Windows: irm https://im.codes/install.ps1 | iex  (fallback: npm install -g imcodes)
   │    imcodes bind ${bindUrl}
   └──────────────────────────────────────────────────────┘
 `);

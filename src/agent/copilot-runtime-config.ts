@@ -1,3 +1,5 @@
+import type { ModelInfo } from '@github/copilot-sdk';
+import { normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../shared/effort-levels.js';
 import logger from '../util/logger.js';
 
 const CACHE_TTL_MS = 60_000;
@@ -6,6 +8,14 @@ export interface CopilotModelInfo {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: readonly TransportEffortLevel[];
+}
+
+/** Map Copilot reasoning effort labels (`xhigh` -> IM.codes `max`) and filter to valid transport levels. */
+export function normalizeCopilotSupportedEfforts(value: unknown): TransportEffortLevel[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const mapped = value.map((entry) => (entry === 'xhigh' ? 'max' : entry));
+  return normalizeSupportedEffortLevels(mapped);
 }
 
 export interface CopilotRuntimeConfig {
@@ -79,7 +89,7 @@ async function getCopilotClient(): Promise<unknown> {
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
     const sdk = await import('@github/copilot-sdk');
-    const client = new sdk.CopilotClient({ autoStart: false });
+    const client = new sdk.CopilotClient();
     await client.start();
     return client;
   })().catch((err) => {
@@ -110,16 +120,18 @@ async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
     }
     const models: CopilotModelInfo[] = [];
     try {
-      const raw = await client.listModels();
+      const raw = await client.listModels() as ModelInfo[] | unknown;
       if (Array.isArray(raw)) {
         for (const entry of raw) {
           if (!entry || typeof entry.id !== 'string') continue;
+          const supportedEffortLevels = normalizeCopilotSupportedEfforts(entry.supportedReasoningEfforts);
+          const supportsReasoningEffort = entry.capabilities?.supports?.reasoningEffort === true
+            || Boolean(supportedEffortLevels?.length);
           models.push({
             id: entry.id,
             ...(typeof entry.name === 'string' ? { name: entry.name } : {}),
-            ...(entry.capabilities?.supports?.reasoningEffort === true
-              ? { supportsReasoningEffort: true }
-              : {}),
+            ...(supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+            ...(supportedEffortLevels ? { supportedEffortLevels } : {}),
           });
         }
       }

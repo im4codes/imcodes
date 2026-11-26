@@ -29,9 +29,11 @@ vi.mock('@github/copilot-sdk', () => ({
 
 import {
   getCopilotRuntimeConfig,
+  normalizeCopilotSupportedEfforts,
   __copilotRuntimeConfigInternals,
   COPILOT_FALLBACK_MODEL_IDS,
 } from '../../src/agent/copilot-runtime-config.js';
+import { CopilotSdkProvider } from '../../src/agent/providers/copilot-sdk.js';
 
 describe('getCopilotRuntimeConfig', () => {
   beforeEach(() => {
@@ -146,5 +148,62 @@ describe('getCopilotRuntimeConfig', () => {
     // listModels returned [], so availableModels falls back for usability.
     expect(config.availableModels).toEqual([...COPILOT_FALLBACK_MODEL_IDS]);
     expect(config.isAuthenticated).toBe(false);
+  });
+
+  it('extracts per-model supportedReasoningEfforts (mapping xhigh -> max) while preserving legacy supportsReasoningEffort fallback', async () => {
+    sdkMock.clientFactory.mockReturnValue({
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue([]),
+      getStatus: vi.fn().mockResolvedValue({ version: '1.0.112', protocolVersion: 3 }),
+      getAuthStatus: vi.fn().mockResolvedValue({ isAuthenticated: true }),
+      listModels: vi.fn().mockResolvedValue([
+        {
+          id: 'gpt-5.4',
+          name: 'GPT-5.4',
+          capabilities: { supports: { reasoningEffort: true } },
+          supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+          defaultReasoningEffort: 'medium',
+        },
+        {
+          id: 'claude-sonnet-4.6',
+          name: 'Claude Sonnet 4.6',
+          supportedReasoningEfforts: ['low', 'high', 'unknown-tier'],
+        },
+        {
+          id: 'legacy-reasoning',
+          name: 'Legacy Reasoning',
+          capabilities: { supports: { reasoningEffort: true } },
+        },
+      ]),
+    });
+
+    const config = await getCopilotRuntimeConfig(true);
+    expect(config.models).toEqual([
+      {
+        id: 'gpt-5.4',
+        name: 'GPT-5.4',
+        supportsReasoningEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'max'],
+      },
+      {
+        id: 'claude-sonnet-4.6',
+        name: 'Claude Sonnet 4.6',
+        supportsReasoningEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+      },
+      {
+        id: 'legacy-reasoning',
+        name: 'Legacy Reasoning',
+        supportsReasoningEffort: true,
+      },
+    ]);
+
+    const providerList = await new CopilotSdkProvider().listModels(false);
+    expect(providerList.isAuthenticated).toBe(true);
+    expect(providerList.models).toEqual(config.models);
+
+    expect(normalizeCopilotSupportedEfforts(['low', 'xhigh'])).toEqual(['low', 'max']);
+    expect(normalizeCopilotSupportedEfforts(['unknown'])).toBeUndefined();
+    expect(normalizeCopilotSupportedEfforts(undefined)).toBeUndefined();
   });
 });

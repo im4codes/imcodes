@@ -11,55 +11,403 @@
  *
  * Drain:
  *   - `drainResend()` is invoked from `restoreTransportSessions()` after the
- *     runtime is added to `transportRuntimes`. The queue is emptied before any
- *     dispatch so re-queueing inside the dispatcher is safe.
+ *     runtime is added to `transportRuntimes`. SQLite handoff is committed
+ *     before entries leave the in-memory holder or dispatch begins.
  *
  * Cancellation:
  *   - `clearResend(session)` is called on explicit user actions that should
  *     discard pending work (`/stop`, `/clear`, session removal).
  */
 
+import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import type { AliasSendAudit } from '../../shared/alias-types.js';
+import type { MemoryMcpSendDeliveryMode } from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import type { QueueDeliveryFact, QueueDropReason, QueueResetReason, QueueSnapshot, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import {
   bumpTransportQueueRevision,
   clearAllTransportQueueRevisions,
 } from './transport-queue-revision.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from './transport-queue-store.js';
+import type { QueueRecipientIdentity } from './transport-queue-store.js';
+import type { ProviderActiveTurnDeliveryKind } from '../agent/transport-provider.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
 /** Per-session cap to prevent unbounded growth during prolonged outages. */
 export const MAX_RESEND_ENTRIES = 10;
 
+function cronScheduleId(commandId: string | undefined): string | undefined {
+  const match = typeof commandId === 'string' ? /^cron:([^:]+):/.exec(commandId.trim()) : null;
+  return match?.[1] || undefined;
+}
+
 export interface ResendEntry {
-  /** User-visible task text — will be passed to runtime.send() as userMessage. */
+  /**
+   * The runtime this work is addressed to, captured from the live SessionRecord
+   * at enqueue. Queued work belongs to an instance, not to a reusable name.
+   */
+  recipient?: QueueRecipientIdentity;
+  supervisionReference?: QueueSupervisionReference;
+  /** Runtime-private routing metadata; never reconstructed from visible text. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
+  /** Peer-audit ownership remains valid only inside the current daemon process. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
+  /** Durable task-bound delegation completion marker. */
+  delegationReply?: {
+    delegationId: string;
+  };
+  /** Command-mode send: delivered verbatim on drain, alone (never merged with other queued text). */
+  commandMode?: true;
+  /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
+  /**
+   * Agent-bound text after alias expansion (A′). When set it is delivered to the
+   * provider (via runtime.send metadata) while `text` stays the timeline copy.
+   */
+  providerText?: string;
+  /** Alias send audit anchor (names + hash only) to project when this is finally delivered. */
+  aliasAudit?: AliasSendAudit;
+  /** Author of a non-human message (shared/chat-message-origin.ts), projected when delivered. */
+  messageOrigin?: ChatMessageOrigin;
   /** Provider-visible context to pass through TransportSessionRuntime messagePreamble. */
   messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
   commandId: string;
+  /** Stable queue identity. Command ids are receipts only and never queue authority ids. */
+  clientMessageId?: string;
   /** Attachment refs at enqueue time. Not resolved lazily — we do not re-walk the store. */
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** Opaque server-signed device authority; private queue material only. */
+  sharedMachineAuthority?: string;
+  /** Opaque server-signed owner-turn device authority; private queue material only. */
+  ownerMachineAuthority?: string;
+  /** Preserve the trusted MCP delivery policy across runtime restore windows. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** Private dynamic system contract required to reconstruct a queued cron turn. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
+  };
   /** Enqueue timestamp for expiry calculation. */
   queuedAt: number;
 }
 
 const queues = new Map<string, ResendEntry[]>();
 
+function supervisionReferencesMatch(
+  durable: QueueSupervisionReference | undefined,
+  replay: QueueSupervisionReference | undefined,
+): boolean {
+  return durable === undefined
+    ? replay === undefined
+    : replay !== undefined && isDeepStrictEqual(durable, replay);
+}
+
+/**
+ * R9 wrote supervision authority in the queue row but not its private material,
+ * and omitted an active delivery kind that can be inferred from the retained
+ * private delegation/supervision marker. Accept only that bounded legacy shape;
+ * a metadata-less replay of a stronger durable row remains a conflict.
+ */
+function privateMaterialMatchesReplay(
+  durableJson: string | undefined,
+  replayJson: string,
+  durableReference: QueueSupervisionReference | undefined,
+  replayReference: QueueSupervisionReference | undefined,
+): boolean {
+  if (durableJson === replayJson) return true;
+  if (!durableJson || !supervisionReferencesMatch(durableReference, replayReference)) return false;
+  try {
+    const durable = JSON.parse(durableJson) as Record<string, unknown>;
+    const replay = JSON.parse(replayJson) as Record<string, unknown>;
+    if (durableReference && durable.supervisionReference === undefined) {
+      durable.supervisionReference = durableReference;
+    }
+    if (durable.activeTurnDeliveryKind === undefined) {
+      const delegationReply = durable.delegationReply;
+      if (delegationReply && typeof delegationReply === 'object'
+        && replay.activeTurnDeliveryKind === 'delegation_reply') {
+        durable.activeTurnDeliveryKind = 'delegation_reply';
+      } else if (durableReference && durable.deliveryMode === 'append'
+        && replay.activeTurnDeliveryKind === 'mcp_message') {
+        durable.activeTurnDeliveryKind = 'mcp_message';
+      }
+    }
+    return isDeepStrictEqual(durable, replay);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
  * entry is discarded (FIFO) so newly-typed messages always take priority.
  */
-export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean; pendingVersion: number } {
-  const list = queues.get(sessionName) ?? [];
+/**
+ * The queue recipient for a live session record, or undefined when the record
+ * cannot name a runtime. Callers that hold a SessionRecord must use this so the
+ * identity actually reaches the durable row.
+ */
+export function recipientFromSessionRecord(
+  record: { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | null | undefined,
+): QueueRecipientIdentity | undefined {
+  const sessionInstanceId = record?.sessionInstanceId?.trim();
+  const runtimeEpoch = record?.runtimeEpoch?.trim();
+  return sessionInstanceId && runtimeEpoch ? { sessionInstanceId, runtimeEpoch } : undefined;
+}
+
+export type EnqueueResendResult = {
+  accepted: true;
+  droppedOldest: boolean;
+  pendingVersion: number;
+  queueSnapshot?: QueueSnapshot;
+  dropSnapshot?: QueueSnapshot;
+} | {
+  accepted: false;
+  droppedOldest: false;
+  pendingVersion: number;
+  reason: 'sqlite_enqueue_failed' | 'cancelled' | 'idempotency_conflict' | 'capacity_exhausted';
+};
+
+export function enqueueResend(sessionName: string, entry: ResendEntry): EnqueueResendResult {
+  return enqueueResendInternal(sessionName, entry, true);
+}
+
+/**
+ * Persist work from a non-daemon process without creating a second in-memory
+ * queue owner. The daemon later rehydrates the row and owns its only drain.
+ */
+export function enqueueDurableResend(sessionName: string, entry: ResendEntry): EnqueueResendResult {
+  return enqueueResendInternal(sessionName, entry, false);
+}
+
+function enqueueResendInternal(
+  sessionName: string,
+  entry: ResendEntry,
+  retainInMemory: boolean,
+): EnqueueResendResult {
+  let list = queues.get(sessionName) ?? [];
+  const clientMessageId = entry.clientMessageId?.trim() || randomUUID();
   let droppedOldest = false;
+  const normalizedEntry: ResendEntry = {
+    ...entry,
+    clientMessageId,
+  };
+  const privateMaterialJson = JSON.stringify({
+    clientMessageId: normalizedEntry.clientMessageId,
+    text: normalizedEntry.text,
+    ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
+    ...(normalizedEntry.aliasAudit ? { aliasAudit: normalizedEntry.aliasAudit } : {}),
+    ...(normalizedEntry.messageOrigin ? { messageOrigin: normalizedEntry.messageOrigin } : {}),
+    ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
+    ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
+    ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
+    ...(normalizedEntry.sharedMachineAuthority ? { sharedMachineAuthority: normalizedEntry.sharedMachineAuthority } : {}),
+    ...(normalizedEntry.ownerMachineAuthority ? { ownerMachineAuthority: normalizedEntry.ownerMachineAuthority } : {}),
+    ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
+    ...(normalizedEntry.activeTurnDeliveryKind
+      ? { activeTurnDeliveryKind: normalizedEntry.activeTurnDeliveryKind }
+      : {}),
+    ...(normalizedEntry.peerAudit ? { peerAudit: normalizedEntry.peerAudit } : {}),
+    ...(normalizedEntry.delegationReply ? { delegationReply: normalizedEntry.delegationReply } : {}),
+    ...(normalizedEntry.commandMode ? { commandMode: true } : {}),
+    ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
+    ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
+    ...(normalizedEntry.supervisionReference
+      ? { supervisionReference: normalizedEntry.supervisionReference }
+      : {}),
+    ...(normalizedEntry.registeredSystemContract
+      ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
+      : {}),
+  });
+  // Stable message ids are replay authority. An exact retry is accepted once;
+  // the same id carrying different bytes or recipient context is rejected
+  // rather than acknowledged as work that will never be delivered.
+  try {
+    const existingSnapshot = getTransportQueueStore().readSnapshot(sessionName);
+    const existing = existingSnapshot.pendingMessageEntries.find(
+      (candidate) => candidate.clientMessageId === clientMessageId,
+    );
+    if (existing) {
+      const existingPrivateMaterial = getTransportQueueStore().readPrivateDispatchMaterial(
+        sessionName,
+        clientMessageId,
+        normalizedEntry.recipient ?? null,
+      );
+      const local = retainInMemory
+        ? list.find((candidate) => candidate.clientMessageId === clientMessageId)
+        : undefined;
+      const localMatches = !local || JSON.stringify({ ...local, queuedAt: normalizedEntry.queuedAt })
+        === JSON.stringify(normalizedEntry);
+      const durableReference = existing.supervisionReference;
+      const referenceMatches = supervisionReferencesMatch(
+        durableReference,
+        normalizedEntry.supervisionReference,
+      );
+      const privateMaterialMatches = privateMaterialMatchesReplay(
+        existingPrivateMaterial,
+        privateMaterialJson,
+        durableReference,
+        normalizedEntry.supervisionReference,
+      )
+        // Legacy SQLite-only producers may not have written a private row.
+        // Preserve the prior hydration behavior only for identity-less legacy
+        // entries; recipient-bound work must match its private authority row.
+        || (existingPrivateMaterial === undefined && !normalizedEntry.recipient);
+      const exactReplay = existing.text === normalizedEntry.text
+        && existing.commandId === normalizedEntry.commandId
+        && referenceMatches
+        && privateMaterialMatches
+        && localMatches;
+      if (!exactReplay) {
+        return {
+          accepted: false,
+          droppedOldest: false,
+          pendingVersion: existingSnapshot.pendingMessageVersion,
+          reason: 'idempotency_conflict',
+        };
+      }
+      if (retainInMemory && !local) {
+        list.push(normalizedEntry);
+        queues.set(sessionName, list);
+      }
+      return {
+        accepted: true,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot.pendingMessageVersion,
+        queueSnapshot: existingSnapshot,
+      };
+    }
+    if (!retainInMemory && existingSnapshot.pendingMessageEntries.length >= MAX_RESEND_ENTRIES) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot.pendingMessageVersion,
+        reason: 'capacity_exhausted',
+      };
+    }
+  } catch {
+    // The transactional enqueue below remains authoritative. This read is only
+    // an idempotency fast path and must not turn a store read fault into an
+    // acknowledgement.
+  }
+  const evicted = list.length >= MAX_RESEND_ENTRIES ? list[0] : undefined;
+  let queueSnapshot: QueueSnapshot;
+  let dropSnapshot: QueueSnapshot | undefined;
+  try {
+    const result = getTransportQueueStore().enqueueWithCapacityEviction({
+      sessionName,
+      ...(normalizedEntry.recipient ? { recipient: normalizedEntry.recipient } : {}),
+      clientMessageId: normalizedEntry.clientMessageId,
+      commandId: normalizedEntry.commandId,
+      text: normalizedEntry.text,
+      now: normalizedEntry.queuedAt,
+      privateMaterialJson,
+      ...(normalizedEntry.supervisionReference ? { supervisionReference: normalizedEntry.supervisionReference } : {}),
+    }, evicted?.clientMessageId);
+    queueSnapshot = result.queueSnapshot;
+    dropSnapshot = result.dropSnapshot;
+    if (result.cancelled) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: queueSnapshot.pendingMessageVersion,
+        reason: 'cancelled',
+      };
+    }
+  } catch (err) {
+    const existingSnapshot = (() => {
+      try {
+        return getTransportQueueStore().readSnapshot(sessionName);
+      } catch {
+        return null;
+      }
+    })();
+    const existing = existingSnapshot?.pendingMessageEntries.find(
+      (candidate) => candidate.clientMessageId === clientMessageId,
+    );
+    const existingPrivateMaterial = existingSnapshot
+      ? getTransportQueueStore().readPrivateDispatchMaterial(
+          sessionName,
+          clientMessageId,
+          normalizedEntry.recipient ?? null,
+        )
+      : undefined;
+    const exactConcurrentReplay = Boolean(
+      existing
+      && existing.text === normalizedEntry.text
+      && existing.commandId === normalizedEntry.commandId
+      && supervisionReferencesMatch(existing.supervisionReference, normalizedEntry.supervisionReference)
+      && (
+        privateMaterialMatchesReplay(
+          existingPrivateMaterial,
+          privateMaterialJson,
+          existing.supervisionReference,
+          normalizedEntry.supervisionReference,
+        )
+        || (existingPrivateMaterial === undefined && !normalizedEntry.recipient)
+      ),
+    );
+    if (exactConcurrentReplay && existingSnapshot) {
+      queueSnapshot = existingSnapshot;
+      logger.warn(
+        { err, sessionName, commandId: entry.commandId, clientMessageId: normalizedEntry.clientMessageId },
+        'transport queue sqlite enqueue found existing live entry; preserving resend memory handoff',
+      );
+    } else if (existing) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot?.pendingMessageVersion ?? bumpTransportQueueRevision(sessionName),
+        reason: 'idempotency_conflict',
+      };
+    } else {
+      logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite enqueue failed for resend entry; resend enqueue rejected');
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: bumpTransportQueueRevision(sessionName),
+        reason: 'sqlite_enqueue_failed',
+      };
+    }
+  }
+  if (!retainInMemory) {
+    return {
+      accepted: true,
+      droppedOldest: false,
+      pendingVersion: queueSnapshot.pendingMessageVersion,
+      queueSnapshot,
+      ...(dropSnapshot ? { dropSnapshot } : {}),
+    };
+  }
+  // The durable store marks older pending fires as superseded. Mirror that
+  // decision in the in-memory holder so a same-process drain cannot replay
+  // entries that were already coalesced in SQLite.
+  const schedule = cronScheduleId(normalizedEntry.commandId);
+  if (schedule) {
+    const before = list.length;
+    const kept = list.filter((candidate) => cronScheduleId(candidate.commandId) !== schedule);
+    if (kept.length !== before) {
+      list = kept;
+      queues.set(sessionName, list);
+      bumpTransportQueueRevision(sessionName);
+    }
+  }
   if (list.length >= MAX_RESEND_ENTRIES) {
     const removed = list.shift();
     droppedOldest = true;
@@ -68,9 +416,9 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): { accept
       'transport resend queue full — dropped oldest entry',
     );
   }
-  list.push(entry);
+  list.push(normalizedEntry);
   queues.set(sessionName, list);
-  return { accepted: true, droppedOldest, pendingVersion: bumpTransportQueueRevision(sessionName) };
+  return { accepted: true, droppedOldest, pendingVersion: queueSnapshot.pendingMessageVersion, queueSnapshot, ...(dropSnapshot ? { dropSnapshot } : {}) };
 }
 
 /** Non-mutating snapshot of the queue for UI / diagnostics. */
@@ -106,6 +454,42 @@ export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;
 }
 
+/** Expire stale resend entries before projecting queue state without dispatching. */
+export function expireResendEntries(sessionName: string, nowMs: number = Date.now()): QueueSnapshot | undefined {
+  const list = queues.get(sessionName);
+  if (!list || list.length === 0) return undefined;
+
+  const freshEntries = list.filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS);
+  const expiredEntries = list.filter((entry) => nowMs - entry.queuedAt > RESEND_EXPIRY_MS);
+  if (expiredEntries.length === 0) return undefined;
+
+  if (freshEntries.length > 0) {
+    queues.set(sessionName, freshEntries);
+  } else {
+    queues.delete(sessionName);
+  }
+  bumpTransportQueueRevision(sessionName);
+
+  let snapshot: QueueSnapshot | undefined;
+  for (const entry of expiredEntries) {
+    const clientMessageId = entry.clientMessageId;
+    if (!clientMessageId) {
+      logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
+      continue;
+    }
+    try {
+      snapshot = getTransportQueueStore().markFailed(sessionName, clientMessageId, 'expired', nowMs);
+    } catch (err) {
+      logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend projection');
+    }
+  }
+  logger.info(
+    { sessionName, expiredCount: expiredEntries.length, freshCount: freshEntries.length },
+    'transport resend expired stale entries before queue projection',
+  );
+  return snapshot;
+}
+
 /** Drop queued entries matching a predicate. Returns the number removed. */
 export function removeResendEntries(
   sessionName: string,
@@ -121,22 +505,95 @@ export function removeResendEntries(
     queues.set(sessionName, kept);
   }
   if (removed > 0) bumpTransportQueueRevision(sessionName);
+  if (removed > 0) {
+    for (const entry of list) {
+      if (predicate(entry)) {
+        if (!entry.clientMessageId) {
+          logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue drop skipped for resend entry without clientMessageId');
+          continue;
+        }
+        try {
+          getTransportQueueStore().drop(sessionName, entry.clientMessageId, 'user_cleared');
+        } catch (err) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite drop failed for removed resend entry');
+        }
+      }
+    }
+  }
   return removed;
 }
 
 /** Drop every queued entry for a session. Used by /stop, /clear, session delete. */
-export function clearResend(sessionName: string): void {
-  if (queues.has(sessionName)) bumpTransportQueueRevision(sessionName);
+export function clearResend(
+  sessionName: string,
+  reason: QueueResetReason | QueueDropReason = 'user_clear',
+): QueueSnapshot | undefined {
+  let snapshot: QueueSnapshot | undefined;
+  bumpTransportQueueRevision(sessionName);
+  // UNCONDITIONAL. This used to run only when the in-memory map still held the
+  // session, so runtime-written rows, post-drain rows and every row surviving a
+  // daemon restart were invisible to "clear" -- durable work a later same-named
+  // session could then drain.
+  try {
+    const store = getTransportQueueStore();
+    if (reason === 'user_clear' || reason === 'sqlite_restore' || reason === 'runtime_recreated' || reason === 'authority_corrupt_reinitialized') {
+      snapshot = store.reset(sessionName, reason);
+    } else {
+      snapshot = store.dropAll(sessionName, reason);
+      if (reason === 'session_removed') {
+        // dropAll deletes rows but PRESERVES queue_epoch/queue_authority_id, so a
+        // new session reusing this name inherited the removed session's authority.
+        // Removal must rotate it.
+        store.reset(sessionName, 'runtime_recreated');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, sessionName, reason }, 'transport queue sqlite clear failed for clearResend');
+  }
   queues.delete(sessionName);
+  return snapshot;
 }
 
 /** Drop every queued entry everywhere. Test helper. */
 export function clearAllResend(): void {
+  // Durable state is cleared for EVERY session that has any, not just the ones
+  // with a live memory mirror; outside VITEST this used to touch memory only.
+  try {
+    const store = getTransportQueueStore();
+    for (const sessionName of new Set([...queues.keys(), ...store.listSessionNames()])) {
+      try {
+        store.reset(sessionName, 'user_clear');
+      } catch (err) {
+        logger.warn({ err, sessionName }, 'transport queue sqlite clear failed for clearAllResend');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'transport queue store unavailable for clearAllResend');
+  }
   queues.clear();
   clearAllTransportQueueRevisions();
+  if (process.env.VITEST) resetTransportQueueStoreForTests();
 }
 
-export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
+/**
+ * The exact SQLite lease transferred with one resend row.  Dispatchers that
+ * stage the row in TransportSessionRuntime must pass this capability through;
+ * the runtime then owns the existing handoff instead of releasing/re-enqueuing
+ * the same clientMessageId through a second durable ownership cycle.
+ */
+export interface ResendHandoffOwnership {
+  clientMessageId: string;
+  handoffId: string;
+}
+
+export type ResendDispatcher = (
+  entry: ResendEntry,
+  ownership: ResendHandoffOwnership,
+) => Promise<unknown> | unknown;
+export const RESEND_DISPATCH_CONTROL = {
+  RETRY: 'retry',
+  STALE: 'stale',
+} as const;
 
 /**
  * Optional callback invoked once at the end of `drainResend` when one or more
@@ -155,12 +612,13 @@ export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknow
  */
 export type ResendExpireCallback = (info: { expiredCount: number }) => void;
 export type ResendDispatchFailureCallback = (info: { failedCount: number }) => void;
+export type ResendDeliveryCallback = (info: { deliveryFacts: QueueDeliveryFact[] }) => void;
 
 /**
- * Drain and dispatch. The internal queue is cleared BEFORE calling `dispatch`
- * so a dispatcher that wants to re-enqueue (e.g. still not really ready) can
- * do so safely. Expired entries are dropped. Failed dispatches are logged but
- * not retried — the next user action will resurface any real error.
+ * Drain and dispatch. Fresh entries first acquire a committed SQLite handoff
+ * lease. If the lease cannot be written, the in-memory holder is preserved and
+ * dispatch does not begin. Expired entries are removed only after their failed
+ * status commits.
  *
  * Returns the number of entries successfully dispatched.
  *
@@ -174,19 +632,65 @@ export async function drainResend(
   dispatch: ResendDispatcher,
   onExpired?: ResendExpireCallback,
   onDispatchFailed?: ResendDispatchFailureCallback,
+  onDelivered?: ResendDeliveryCallback,
+  /**
+   * The identity of the LIVE runtime asking to drain, captured when that runtime
+   * was constructed. It must be supplied by the caller and is never derived from
+   * the rows: reading it off the queued entry let the row authorise itself, so a
+   * same-named successor "proved" the previous instance's identity simply by
+   * draining its work. Absent identity drains only identity-less legacy rows.
+   */
+  recipient?: QueueRecipientIdentity | null,
 ): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
-  queues.delete(sessionName);
-  bumpTransportQueueRevision(sessionName);
 
   const now = Date.now();
+  const freshEntries = list.filter((entry) => now - entry.queuedAt <= RESEND_EXPIRY_MS);
+  const expiredEntries = list.filter((entry) => now - entry.queuedAt > RESEND_EXPIRY_MS);
+  const freshClientMessageIds = freshEntries.map((entry) => entry.clientMessageId).filter((id): id is string => typeof id === 'string' && id.length > 0);
+  if (freshClientMessageIds.length !== freshEntries.length) {
+    logger.warn({ sessionName }, 'transport resend drain blocked: entry missing clientMessageId');
+    return 0;
+  }
+  let handoffs = new Map<string, string>();
+  try {
+    const leased = getTransportQueueStore().markHandoffInFlight(
+      sessionName,
+      freshClientMessageIds,
+      RESEND_EXPIRY_MS,
+      now,
+      // Caller-supplied LIVE identity. A same-named successor leases nothing, so
+      // the drain aborts rather than delivering another instance's work.
+      recipient ?? null,
+    );
+    if (leased.length !== freshEntries.length) {
+      logger.warn({ sessionName, requested: freshEntries.length, leased: leased.length }, 'transport queue sqlite handoff lease incomplete for resend drain');
+      return 0;
+    }
+    handoffs = new Map(leased.map((item) => [item.entry.clientMessageId, item.handoffId]));
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport queue sqlite handoff mark failed for resend drain; preserving resend queue');
+    return 0;
+  }
+  queues.delete(sessionName);
+  bumpTransportQueueRevision(sessionName);
   let dispatched = 0;
   let expiredCount = 0;
   let failedCount = 0;
+  const retryEntries: ResendEntry[] = [];
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
+      if (!entry.clientMessageId) {
+        logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
+        continue;
+      }
       expiredCount += 1;
+      try {
+        getTransportQueueStore().markFailed(sessionName, entry.clientMessageId, 'expired', now);
+      } catch (err) {
+        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend entry');
+      }
       logger.info(
         { sessionName, commandId: entry.commandId, ageMs: now - entry.queuedAt },
         'transport resend entry expired — dropping without redelivery',
@@ -194,19 +698,89 @@ export async function drainResend(
       continue;
     }
     try {
-      await dispatch(entry);
+      const clientMessageId = entry.clientMessageId;
+      if (!clientMessageId) {
+        failedCount += 1;
+        logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
+        continue;
+      }
+      const handoffId = handoffs.get(clientMessageId);
+      if (!handoffId) {
+        failedCount += 1;
+        logger.warn({ sessionName, commandId: entry.commandId, clientMessageId }, 'transport resend dispatch missing committed handoff ownership');
+        continue;
+      }
+      // This is the only ownership transfer edge.  The durable row stays
+      // handoff_inflight while the callback either delivers it directly or
+      // stages it in the runtime under this exact capability.  Making the row
+      // queued before dispatch lets restore/reconnect rehydrate it a second
+      // time; forcing the runtime to acquire another lease parks APPEND rows.
+      const dispatchResult = await dispatch(entry, { clientMessageId, handoffId });
+      if (dispatchResult === RESEND_DISPATCH_CONTROL.RETRY) {
+        getTransportQueueStore().releaseHandoff(sessionName, handoffId, [clientMessageId]);
+        handoffs.delete(clientMessageId);
+        retryEntries.push(entry);
+        continue;
+      }
+      if (dispatchResult === RESEND_DISPATCH_CONTROL.STALE) {
+        // Stale lifecycle authority is not delivery. Delete the live row and
+        // private material without creating a delivery tombstone/evidence.
+        getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared', now, recipient ?? null);
+        handoffs.delete(clientMessageId);
+        continue;
+      }
+      if (dispatchResult !== 'queued' && dispatchResult !== 'appended') {
+        try {
+          const result = getTransportQueueStore().finalizeSentBatch(
+            sessionName,
+            [clientMessageId],
+            undefined,
+            undefined,
+            recipient ?? null,
+          );
+          if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
+        } catch (err) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+        }
+      }
+      // queued/appended means the runtime now owns this exact lease; sent was
+      // finalized above.  In either case the resend holder must never release
+      // or rehydrate the row again.
+      handoffs.delete(clientMessageId);
       dispatched++;
       logger.info(
-        { sessionName, commandId: entry.commandId },
-        'transport resend delivered after reconnect',
+        { sessionName, commandId: entry.commandId, dispatchResult },
+        dispatchResult === 'queued'
+          ? 'transport resend accepted into runtime queue after reconnect'
+          : 'transport resend delivered after reconnect',
       );
     } catch (err) {
       failedCount += 1;
+      const clientMessageId = entry.clientMessageId;
+      if (!clientMessageId) {
+        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed skipped for resend entry without clientMessageId');
+        continue;
+      }
+      try {
+        getTransportQueueStore().markFailed(sessionName, clientMessageId, 'dispatch_failed', now);
+        handoffs.delete(clientMessageId);
+      } catch (storeErr) {
+        logger.warn({ err: storeErr, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed failed for resend entry');
+      }
       logger.warn(
         { err, sessionName, commandId: entry.commandId },
         'transport resend dispatch failed — dropping entry to avoid loops',
       );
     }
+  }
+  if (retryEntries.length > 0) {
+    const concurrent = queues.get(sessionName) ?? [];
+    const retriedIds = new Set(retryEntries.map((entry) => entry.clientMessageId));
+    queues.set(sessionName, [
+      ...retryEntries,
+      ...concurrent.filter((entry) => !retriedIds.has(entry.clientMessageId)),
+    ]);
+    bumpTransportQueueRevision(sessionName);
   }
   if (expiredCount > 0 && onExpired) {
     try {

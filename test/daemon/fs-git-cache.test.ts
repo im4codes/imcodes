@@ -46,7 +46,27 @@ vi.mock('node:child_process', async () => {
   };
 });
 
+// The repo status / numstat reads spawn git through the exec helper (the daemon must not fork itself). This suite asserts on
+// those command lines through the recording `exec` mock the daemon used before, so exactly those two reads are routed to it
+// ([file, ...args] joined is the command); every other helper call keeps going to the mocked `execFile`.
+vi.mock('../../src/util/exec-helper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/util/exec-helper.js')>();
+  const isRepoRead = (file: string, args: readonly string[]) => file === 'git'
+    && ((args[0] === 'status' && args[1] === '--porcelain=v1') || (args[0] === 'diff' && args[1] === '--numstat'));
+  const routed = (fallback: (...p: any[]) => Promise<unknown>) => async (file: string, args: readonly string[] = [], options?: unknown) => {
+    if (!isRepoRead(file, args)) return fallback(file, args, options);
+    const promisified = (childProcess.exec as any)[Symbol.for('nodejs.util.promisify.custom')] as (command: string, options?: unknown) => Promise<{ stdout: string; stderr: string }>;
+    return promisified([file, ...args].join(' '), options);
+  };
+  return {
+    ...actual,
+    execFileOffMain: routed(actual.execFileOffMain as never),
+    execFileOffMainIdempotent: routed(actual.execFileOffMainIdempotent as never),
+  };
+});
+
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import * as sessionStore from '../../src/store/session-store.js';
 import { FsGitStatusWorkerPool, __setDefaultFsGitStatusWorkerPoolForTests, type FsGitStatusWorkerThreadLike } from '../../src/daemon/fs-git-status-pool.js';
 import type { FsGitStatusWorkerRequest, FsGitStatusWorkerResult } from '../../src/daemon/fs-git-status-worker-types.js';
 
@@ -574,11 +594,19 @@ describe('fs git cache handlers', () => {
       callback(null, '', '');
       return {} as any;
     });
+    let checkIgnoreStdin = '';
     mockExecFile.mockImplementation((file: any, args: any, options: any, callback: any) => {
       if (typeof options === 'function') callback = options;
-      if (file === 'git' && Array.isArray(args) && args.join(' ') === 'check-ignore -z -- dist src') {
-        callback(null, 'dist\0', '');
-        return {} as any;
+      if (file === 'git' && Array.isArray(args) && args.join(' ') === 'check-ignore -z --stdin') {
+        return {
+          stdin: {
+            on: vi.fn(),
+            end: (chunk: string) => {
+              checkIgnoreStdin = chunk;
+              callback(null, 'dist\0', '');
+            },
+          },
+        } as any;
       }
       callback(new Error(`unexpected command: ${file} ${Array.isArray(args) ? args.join(' ') : ''}`), '', '');
       return {} as any;
@@ -590,10 +618,11 @@ describe('fs git cache handlers', () => {
     expect((sent[0] as any).files).toEqual([
       { path: '/home/k/project/dist', code: '!!' },
     ]);
+    expect(checkIgnoreStdin).toBe('dist\0src\0');
     expect(mockExec.mock.calls[0]?.[0]).toBe('git status --porcelain=v1 -z -u');
     expect(mockExecFile).toHaveBeenCalledWith(
       'git',
-      ['check-ignore', '-z', '--', 'dist', 'src'],
+      ['check-ignore', '-z', '--stdin'],
       expect.objectContaining({ cwd: repoRoot }),
       expect.any(Function),
     );
@@ -622,6 +651,35 @@ describe('fs git cache handlers', () => {
 
     expect((sent.find((msg: any) => msg.requestId === 'status-forbidden') as any)?.error).toBe('forbidden_path');
     expect((sent.find((msg: any) => msg.requestId === 'diff-forbidden') as any)?.error).toBe('forbidden_path');
+  });
+
+  it('confines shared-session git status and diff to the owning project root', async () => {
+    const projectRoot = path.join(homedir(), 'project');
+    const outsideRoot = path.join(homedir(), 'other');
+    const outsideFile = path.join(outsideRoot, 'secret.ts');
+    const sessionSpy = vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_project_brain',
+      projectDir: projectRoot,
+    } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockStat.mockResolvedValue(makeStats('file', 10, 10));
+
+    try {
+      handleWebCommand({
+        type: 'fs.git_status', path: outsideRoot, requestId: 'status-session-outside', sessionName: 'deck_project_brain',
+      }, mockServerLink as any);
+      handleWebCommand({
+        type: 'fs.git_diff', path: outsideFile, requestId: 'diff-session-outside', sessionName: 'deck_project_brain',
+      }, mockServerLink as any);
+      await flushAsync();
+
+      expect((sent.find((msg: any) => msg.requestId === 'status-session-outside') as any)?.error).toBe('forbidden_path');
+      expect((sent.find((msg: any) => msg.requestId === 'diff-session-outside') as any)?.error).toBe('forbidden_path');
+      expect(mockExec).not.toHaveBeenCalled();
+      expect(mockExecFile).not.toHaveBeenCalled();
+    } finally {
+      sessionSpy.mockRestore();
+    }
   });
 
   it('returns worker_timeout once and ignores late git worker success', async () => {
@@ -1110,5 +1168,94 @@ describe('fs git cache handlers', () => {
 
     expect(mockExec).toHaveBeenCalledTimes(4);
     expect((sent.find((msg: any) => msg.requestId === 'write-1') as any)?.status).toBe('ok');
+  });
+
+  it('handles summaryOnly without numstat, isolates cache from full list, and reuses fresh stats cache', async () => {
+    const repoRoot = '/home/k/project';
+    setupRepoMocks(repoRoot);
+    mockExec.mockImplementation((command: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (command === 'git status --porcelain=v1 -z -u') {
+        callback(null, 'M  src/a.ts\0?? untracked.txt\0', '');
+        return {} as any;
+      }
+      if (command === 'git diff --numstat -z HEAD') {
+        callback(null, '2\t1\tsrc/a.ts\0', '');
+        return {} as any;
+      }
+      callback(null, '', '');
+      return {} as any;
+    });
+
+    // 1. summaryOnly runs only git status, returns empty files + exact totalCount
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'sum-1', includeStats: true, summaryOnly: true }, mockServerLink as any);
+    await flushAsync();
+    const sum1 = sent.find((msg: any) => msg.requestId === 'sum-1') as any;
+    expect(sum1.status).toBe('ok');
+    expect(sum1.files).toEqual([]);
+    expect(sum1.totalCount).toBe(2);
+    expect(sum1.truncated).toBe(true);
+    expect(mockExec.mock.calls.map((call) => call[0])).toEqual(['git status --porcelain=v1 -z -u']);
+
+    // 2. Subsequent full-list request does NOT get polluted by summary cache
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'full-1', includeStats: true }, mockServerLink as any);
+    await flushAsync();
+    const full1 = sent.find((msg: any) => msg.requestId === 'full-1') as any;
+    expect(full1.status).toBe('ok');
+    expect(full1.totalCount).toBe(2);
+    expect(full1.truncated).toBe(false);
+    expect(full1.files).toEqual([
+      { path: '/home/k/project/src/a.ts', code: 'M', additions: 2, deletions: 1 },
+      { path: '/home/k/project/untracked.txt', code: '??' },
+    ]);
+    expect(mockExec.mock.calls.map((call) => call[0])).toEqual([
+      'git status --porcelain=v1 -z -u',
+      'git status --porcelain=v1 -z -u',
+      'git diff --numstat -z HEAD',
+    ]);
+
+    // 3. Subsequent summaryOnly request reuses the fresh stats cache without re-running git
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'sum-2', includeStats: true, summaryOnly: true }, mockServerLink as any);
+    await flushAsync();
+    const sum2 = sent.find((msg: any) => msg.requestId === 'sum-2') as any;
+    expect(sum2.files).toEqual([]);
+    expect(sum2.totalCount).toBe(2);
+    expect(sum2.truncated).toBe(true);
+    expect(mockExec).toHaveBeenCalledTimes(3);
+  });
+
+  it('caps large git status responses at 1000 entries and reports totalCount', async () => {
+    const repoRoot = '/home/k/project';
+    setupRepoMocks(repoRoot);
+    const untracked = Array.from({ length: 1050 }, (_, idx) => `?? file-${idx}.txt`).join('\0');
+    const tracked = 'M  src/important.ts';
+    mockExec.mockImplementation((command: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (command === 'git status --porcelain=v1 -z -u') {
+        callback(null, `${untracked}\0${tracked}\0`, '');
+        return {} as any;
+      }
+      if (command === 'git diff --numstat -z HEAD') {
+        callback(null, '4\t0\tsrc/important.ts\0', '');
+        return {} as any;
+      }
+      callback(null, '', '');
+      return {} as any;
+    });
+
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'cap-1', includeStats: true }, mockServerLink as any);
+    await flushAsync();
+
+    const res = sent.find((msg: any) => msg.requestId === 'cap-1') as any;
+    expect(res.status).toBe('ok');
+    expect(res.totalCount).toBe(1051);
+    expect(res.truncated).toBe(true);
+    expect(res.files).toHaveLength(1000);
+    expect(res.files[0]).toEqual({
+      path: '/home/k/project/src/important.ts',
+      code: 'M',
+      additions: 4,
+      deletions: 0,
+    });
   });
 });

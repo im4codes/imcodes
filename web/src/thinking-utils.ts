@@ -7,9 +7,16 @@
  * Only assistant.text, user.message, and session.state=idle end thinking.
  * Tool calls, status updates, and other events are skipped (don't end thinking).
  */
-import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import {
+  TIMELINE_METADATA_EVENT_TYPES,
+  isAuthoritativeCleanIdlePayload,
+  isCancelIdlePayload,
+  isUserCancelStoppingPayload,
+  isWorkingSessionState,
+  reduceTimelineActivity,
+} from '../../shared/session-activity-types.js';
 
-const THINKING_SKIP_TYPES = new Set([
+const THINKING_SKIP_TYPES = new Set<string>([
   'agent.status',
   'usage.update',
   'tool.call',
@@ -17,7 +24,37 @@ const THINKING_SKIP_TYPES = new Set([
   'mode.state',
   'terminal.snapshot',
   'command.ack',
+  // Metadata/telemetry never ends a thinking sequence — see
+  // TIMELINE_METADATA_EVENT_TYPES.
+  ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
+
+// Non-content telemetry/state signals that should not erase a live agent.status
+// label (unlike tool.call / tool.result / ordinary assistant.text / user.message).
+const STATUS_SKIP_TYPES = new Set<string>([
+  'usage.update',
+  'mode.state',
+  'terminal.snapshot',
+  'command.ack',
+  ...TIMELINE_METADATA_EVENT_TYPES,
+]);
+
+function hasPrecedingUserCancelStop(
+  events: Array<{ type: string; payload?: Record<string, unknown> }>,
+  idleIndex: number,
+): boolean {
+  for (let j = idleIndex - 1; j >= 0; j--) {
+    const prev = events[j];
+    if (prev.type !== 'session.state') {
+      if (THINKING_SKIP_TYPES.has(prev.type)) continue;
+      return false;
+    }
+    if (isUserCancelStoppingPayload(prev.payload)) return true;
+    const prevState = String(prev.payload?.state ?? '');
+    if (isWorkingSessionState(prevState) || prevState === 'idle') return false;
+  }
+  return false;
+}
 
 export function getActiveThinkingTs(events: Array<{ type: string; ts: number; payload?: Record<string, unknown> }>): number | null {
   let thinkingTs: number | null = null;
@@ -32,7 +69,9 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
     // session.state: idle = agent finished (end thinking), running = skip (don't end thinking)
     if (e.type === 'session.state') {
       if (e.payload?.state === 'idle'
-        && isAuthoritativeCleanIdlePayload(e.payload)
+        && (isAuthoritativeCleanIdlePayload(e.payload)
+          || isCancelIdlePayload(e.payload)
+          || hasPrecedingUserCancelStop(events, i))
         && !reduceTimelineActivity(events.slice(0, i + 1)).active) break;
       continue;
     }
@@ -54,19 +93,43 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
  */
 /**
  * Extract active agent status label (e.g. "Reading file...") from the tail of events.
- * Returns the label of the last agent.status event if it's at the very end of the
- * event stream (only other agent.status events may follow it).
+ * Returns the label of the active agent.status event. Audit protocol events and
+ * memory-excluded automation notes are transparent: they describe the same
+ * active supervision operation and must not make its persistent footer status
+ * disappear. Ordinary user/assistant activity still terminates the lookup.
  */
 export function getActiveStatusText(events: Array<{ type: string; payload?: Record<string, unknown> }>): string | null {
+  let backgroundMonitorFallback: string | null = null;
+  let checkedLatestSessionState = false;
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === 'agent.status') {
       if (e.payload?.label) return String(e.payload.label);
       return null;
     }
-    if (e.type !== 'agent.status') break;
+    if (STATUS_SKIP_TYPES.has(e.type)) continue;
+    if (e.type === 'assistant.text' && e.payload?.automation === true && e.payload?.memoryExcluded === true) continue;
+    if (e.type === 'session.state') {
+      const state = typeof e.payload?.state === 'string' ? e.payload.state : '';
+      if (state === 'idle' || state === 'stopped') return null;
+      if (!checkedLatestSessionState && state !== 'started') {
+        checkedLatestSessionState = true;
+        const reasons = e.payload?.busyReasons;
+        if (
+          state === 'running'
+          && e.payload?.blockingWorkCount === 0
+          && Array.isArray(reasons)
+          && reasons.length > 0
+          && reasons.every((r) => r === 'background_monitor')
+        ) {
+          backgroundMonitorFallback = 'Running background task';
+        }
+      }
+      continue;
+    }
+    break;
   }
-  return null;
+  return backgroundMonitorFallback;
 }
 
 /**
@@ -82,21 +145,41 @@ export function hasActiveToolCall(events: Array<{ type: string; payload?: Record
  * This is more reliable than outer session store state for footer rendering,
  * because timeline updates can arrive before higher-level session snapshots settle.
  */
-export function getTailSessionState(
-  events: Array<{ type: string; payload?: Record<string, unknown> }>,
-): string | null {
+export interface TailSessionStateInfo {
+  state: string | null;
+  ts: number | null;
+}
+
+export function getTailSessionStateInfo(
+  events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>,
+): TailSessionStateInfo {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type !== 'session.state') continue;
     const state = e.payload?.state;
-    if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return 'running';
-    return typeof state === 'string' && state ? state : null;
+    const ts = typeof e.ts === 'number' && Number.isFinite(e.ts) ? e.ts : null;
+    // `started` is a lifecycle notification emitted when a daemon/session
+    // runtime is launched/restored. It is not evidence that a turn is active.
+    // Treating it as the latest live state makes the footer/controls disagree
+    // with the authoritative session snapshot after daemon restart: old
+    // history remains in the timeline, while a fresh `started` tail event is
+    // neither idle nor running. Skip it and keep looking for the last
+    // authoritative working/idle/error state.
+    if (state === 'started') continue;
+    if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return { state: 'running', ts };
+    return { state: typeof state === 'string' && state ? state : null, ts };
   }
-  return null;
+  return { state: null, ts: null };
+}
+
+export function getTailSessionState(
+  events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>,
+): string | null {
+  return getTailSessionStateInfo(events).state;
 }
 
 export function isRunningSessionState(sessionState: string | undefined): boolean {
-  return sessionState === 'running' || sessionState === 'queued';
+  return isWorkingSessionState(sessionState);
 }
 
 export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {

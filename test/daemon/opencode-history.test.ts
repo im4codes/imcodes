@@ -199,6 +199,32 @@ describe('opencode-history', () => {
     expect(events.every((event) => event.epoch === 999)).toBe(true);
   });
 
+  it('preserves complete OpenCode tool output text', () => {
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
+    const events = buildTimelineEventsFromOpenCodeExport('deck_oc_brain', {
+      info: { id: 's1' },
+      messages: [
+        {
+          info: { id: 'a1', role: 'assistant', time: { created: 110 } },
+          parts: [{
+            id: 'p-tool',
+            type: 'tool',
+            tool: 'bash',
+            state: {
+              status: 'completed',
+              input: { command: 'printf complete' },
+              output,
+              time: { start: 111, end: 112 },
+            },
+          }],
+        },
+      ],
+    }, 999);
+
+    expect(output.length).toBeGreaterThan(200);
+    expect(events.find((event) => event.type === 'tool.result')?.payload.output).toBe(output);
+  });
+
   it('emits hidden raw events plus file.change for normalized OpenCode edits', () => {
     const events = buildTimelineEventsFromOpenCodeExport('deck_oc_brain', {
       info: { id: 's1' },

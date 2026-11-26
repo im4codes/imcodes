@@ -1,5 +1,7 @@
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { SharedStateSummary } from './tab-sharing-ui.js';
+import type { SupervisionMode } from '@shared/supervision-config.js';
+import type { SupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
 
 export type Priority = 0 | 1 | 2 | 3;
 
@@ -27,17 +29,29 @@ export interface AutoFixTaskStatus {
   branch?: string;
   issueId?: string;
   startedAt: number;
+  /** Optional authoritative terminal timestamps from newer task payloads. */
+  finishedAt?: number;
+  endedAt?: number;
+  durationMs?: number;
   updatedAt: number;
   error?: string;
 }
 
 export interface SessionInfo {
+  incognito?: boolean;
   name: string;
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
   project: string;
   role: 'brain' | `w${number}`;
   agentType: string;
+  providerId?: string;
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
+  /** Local proof that a stale-turn acknowledgement observed the provider idle. */
+  authoritativeIdleAt?: number;
+  /** Last runtime activity generation applied to state/queue frames. */
+  activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike;
   error?: string | null;
   label?: string | null;
   userCreated?: boolean;
@@ -61,12 +75,30 @@ export interface SessionInfo {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
+  /** Codex pay-as-you-go usage credit balance — see shared/codex-credit-history.ts. */
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
+  /**
+   * Provider service tier for this session. Codex reports `priority` while its
+   * Fast mode is on, which costs plan usage at 1.5x and is set on the thread --
+   * so it survives every resume until something turns it back.
+   */
+  serviceTier?: string | null;
   contextNamespace?: SessionContextBootstrapState['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  /** Minimal owner-authoritative projection exposed to shared-tab readers. */
+  supervisionMode?: SupervisionMode | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
+  queueEpoch?: string;
+  queueAuthorityId?: string;
+  failedMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
+  /** Local queue settlement tombstones prevent equal-version stale snapshots from resurrecting sends. */
+  transportPendingSettledMessageIds?: string[];
   /** Newest pending-queue version the UI has applied for this session.
    *  Used to drop stale out-of-order snapshots. See transport-queue.ts. */
   transportPendingMessageVersion?: number;

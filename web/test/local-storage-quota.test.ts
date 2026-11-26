@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   FILE_BROWSER_SNAPSHOT_KEY_PREFIX,
   TIMELINE_SNAPSHOT_STORAGE_PREFIX,
+  safeSessionStorageGetItem,
+  safeSessionStorageSetItem,
   safeLocalStorageSetItem,
 } from '../src/local-storage-quota.js';
 
@@ -10,6 +12,7 @@ class FakeStorage implements Storage {
   setCalls = 0;
   alwaysThrow = false;
   throwFirstQuota = false;
+  maxTotalLength = Number.POSITIVE_INFINITY;
 
   get length(): number {
     return this.store.size;
@@ -34,6 +37,11 @@ class FakeStorage implements Storage {
   setItem(key: string, value: string): void {
     this.setCalls += 1;
     if (this.alwaysThrow || (this.throwFirstQuota && this.setCalls === 1)) {
+      throw new DOMException('localStorage quota exceeded', 'QuotaExceededError');
+    }
+    const previousLength = this.store.get(key)?.length ?? 0;
+    const totalLength = Array.from(this.store.values()).reduce((sum, item) => sum + item.length, 0);
+    if (totalLength - previousLength + value.length > this.maxTotalLength) {
       throw new DOMException('localStorage quota exceeded', 'QuotaExceededError');
     }
     this.store.set(key, value);
@@ -62,7 +70,7 @@ describe('safeLocalStorageSetItem', () => {
     });
   }
 
-  it('evicts volatile cache entries and retries quota-limited writes', () => {
+  it('evicts only the minimum lower-priority cache entries needed for a quota-limited write', () => {
     const storage = new FakeStorage();
     storage.setItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`, 'x'.repeat(100));
     storage.setItem(`${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`, 'y'.repeat(50));
@@ -75,8 +83,63 @@ describe('safeLocalStorageSetItem', () => {
 
     expect(storage.getItem('rcc_open_subs_deck_main')).toBe('["sub-1","sub-2"]');
     expect(storage.getItem('rcc_auth')).toBe('keep');
-    expect(storage.getItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`)).toBeNull();
+    // Timeline is the synchronous chat first-paint source, so the cheaper file
+    // browser snapshot goes first and a successful retry stops immediately.
+    expect(storage.getItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`)).toBe('x'.repeat(100));
     expect(storage.getItem(`${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`)).toBeNull();
+  });
+
+  it('never evicts another chat window snapshot to satisfy an unrelated write', () => {
+    const storage = new FakeStorage();
+    const snapshot = (ts: number, padding: number): string => JSON.stringify([{ ts, text: 'x'.repeat(padding) }]);
+    const oldestKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:oldest`;
+    const middleKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:middle`;
+    const newestKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:newest`;
+    storage.setItem(oldestKey, snapshot(1, 60));
+    storage.setItem(middleKey, snapshot(2, 60));
+    storage.setItem(newestKey, snapshot(3, 60));
+    const existingLength = [oldestKey, middleKey, newestKey]
+      .reduce((sum, key) => sum + (storage.getItem(key)?.length ?? 0), 0);
+    storage.maxTotalLength = existingLength + 10;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem('rcc_session', 'new-session-value')).toBe(false);
+
+    expect(storage.getItem(oldestKey)).not.toBeNull();
+    expect(storage.getItem(middleKey)).not.toBeNull();
+    expect(storage.getItem(newestKey)).not.toBeNull();
+    expect(storage.getItem('rcc_session')).toBeNull();
+  });
+
+  it('preserves the current and peer window snapshots when refreshing the current one exceeds quota', () => {
+    const storage = new FakeStorage();
+    const currentKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:current`;
+    const peerKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:peer`;
+    storage.setItem(currentKey, 'current-old');
+    storage.setItem(peerKey, 'peer-history');
+    storage.maxTotalLength = 'current-old'.length + 'peer-history'.length;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem(currentKey, 'current-new-and-larger', {
+      clearOwnTimelineSnapshotOnFailure: true,
+    })).toBe(false);
+    expect(storage.getItem(currentKey)).toBeNull();
+    expect(storage.getItem(peerKey)).toBe('peer-history');
+  });
+
+  it('does not evict another window file cache for a timeline write', () => {
+    const storage = new FakeStorage();
+    const timelineKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:current`;
+    const fileKey = `${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`;
+    storage.setItem(fileKey, 'peer-file-window');
+    storage.maxTotalLength = 'peer-file-window'.length;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem(timelineKey, 'timeline', {
+      clearOwnTimelineSnapshotOnFailure: true,
+    })).toBe(false);
+    expect(storage.getItem(timelineKey)).toBeNull();
+    expect(storage.getItem(fileKey)).toBe('peer-file-window');
   });
 
   it('returns false without throwing when storage is still unavailable', () => {
@@ -86,5 +149,58 @@ describe('safeLocalStorageSetItem', () => {
 
     expect(() => safeLocalStorageSetItem('rcc_open_subs_deck_main', '["sub-1"]')).not.toThrow();
     expect(safeLocalStorageSetItem('rcc_open_subs_deck_main', '["sub-1"]')).toBe(false);
+  });
+});
+
+describe('safeSessionStorageSetItem', () => {
+  let originalSessionStorage: Storage;
+
+  beforeEach(() => { originalSessionStorage = window.sessionStorage; });
+  afterEach(() => {
+    Object.defineProperty(window, 'sessionStorage', { value: originalSessionStorage, configurable: true });
+    originalSessionStorage.clear();
+  });
+
+  it('bounds an oversized draft after a quota failure without touching peer sessions', () => {
+    const storage = new FakeStorage();
+    storage.maxTotalLength = 80;
+    storage.setItem('rcc_draft_session:peer', 'peer draft');
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'x'.repeat(200), 32)).toBe(true);
+    expect(storage.getItem('rcc_draft_session:current')).toBe('x'.repeat(32));
+    expect(storage.getItem('rcc_draft_session:peer')).toBe('peer draft');
+  });
+
+  it('bounds an oversized draft even when the initial write has ample quota', () => {
+    const storage = new FakeStorage();
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'x'.repeat(200), 32)).toBe(true);
+    expect(storage.getItem('rcc_draft_session:current')).toBe('x'.repeat(32));
+  });
+
+  it('returns false without throwing when session storage remains full', () => {
+    const storage = new FakeStorage();
+    storage.maxTotalLength = 0;
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(() => safeSessionStorageSetItem('rcc_draft_session:current', 'draft')).not.toThrow();
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'draft')).toBe(false);
+    // The persisted write fails, but the current page retains a recoverable
+    // bounded copy instead of dropping the draft during a tab switch.
+    expect(safeSessionStorageGetItem('rcc_draft_session:current')).toBe('draft');
+    expect(storage.getItem('rcc_draft_session:peer')).toBeNull();
+  });
+
+  it('does not resurrect a fallback after readable storage has no draft key', () => {
+    const full = new FakeStorage();
+    full.maxTotalLength = 0;
+    Object.defineProperty(window, 'sessionStorage', { value: full, configurable: true });
+    expect(safeSessionStorageSetItem('rcc_draft_session:stale', 'draft')).toBe(false);
+
+    const fresh = new FakeStorage();
+    Object.defineProperty(window, 'sessionStorage', { value: fresh, configurable: true });
+    expect(safeSessionStorageGetItem('rcc_draft_session:stale')).toBeNull();
   });
 });

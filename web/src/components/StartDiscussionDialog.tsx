@@ -1,11 +1,11 @@
 import { useState, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { saveUserPref } from '../api.js';
+import { isSessionAgentTypeSelectable } from './session-agent-options.js';
 
 const AGENTS = [
   { id: 'claude-code', label: 'Claude Code', models: ['opus[1M]', 'sonnet'] },
   { id: 'codex', label: 'Codex', models: [] },
-  { id: 'gemini', label: 'Gemini', models: [] },
 ];
 
 interface Participant {
@@ -58,10 +58,14 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
   const [topic, setTopic] = useState('');
   const [cwd, setCwd] = useState(defaultCwd ?? '');
   const [participants, setParticipants] = useState<Participant[]>(
-    savedPrefs?.participants ?? [
+    (savedPrefs?.participants ?? [
       { roleId: 'critic', agentType: 'claude-code', model: 'opus[1M]' },
       { roleId: 'pragmatist', agentType: 'claude-code', model: 'sonnet' },
-    ],
+    ]).map((p) => (
+      !p.sessionName && !AGENTS.some((a) => a.id === p.agentType)
+        ? { ...p, agentType: 'claude-code', model: 'sonnet' }
+        : p
+    )),
   );
   const [verdictIdx, setVerdictIdx] = useState(savedPrefs?.verdictIdx ?? 0);
   const [maxRounds, setMaxRounds] = useState(savedPrefs?.maxRounds ?? 3);
@@ -246,8 +250,15 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
                           });
                         }}
                       >
-                        {AGENTS.map((a) => (
-                          <option key={a.id} value={a.id}>{a.label}</option>
+                        {AGENTS.filter((a) => isSessionAgentTypeSelectable(a.id) || a.id === p.agentType).map((a) => (
+                          <option
+                            key={a.id}
+                            value={a.id}
+                            disabled={!isSessionAgentTypeSelectable(a.id)}
+                            hidden={!isSessionAgentTypeSelectable(a.id)}
+                          >
+                            {a.label}
+                          </option>
                         ))}
                       </select>
 

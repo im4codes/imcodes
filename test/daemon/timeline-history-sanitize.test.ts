@@ -27,6 +27,27 @@ function event(overrides: Partial<TimelineEvent>): TimelineEvent {
 }
 
 describe('timeline history transport sanitization', () => {
+  it('filters already-persisted Claude synthetic seed assistant text from history payloads', () => {
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'synthetic-seed',
+        type: 'assistant.text',
+        payload: { text: 'No response requested.', streaming: false },
+      }),
+      event({
+        eventId: 'real-response',
+        type: 'assistant.text',
+        ts: 2,
+        seq: 2,
+        payload: { text: 'real response', streaming: false },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.eventId).toBe('real-response');
+    expect(result.events[0]?.payload.text).toBe('real response');
+  });
+
   it('preserves full chat text and streaming typewriter updates in history payloads', () => {
     const userText = `user:${'u'.repeat(80 * 1024)}`;
     const streamingText = `typing:${'t'.repeat(80 * 1024)}`;
@@ -53,6 +74,20 @@ describe('timeline history transport sanitization', () => {
     expect(JSON.stringify(result.events)).not.toContain('history truncated');
     expect(result.truncatedEvents).toBe(0);
     expect(result.detailRefs).toEqual([]);
+  });
+
+  it('preserves complete bounded audit findings for the collapsed delegation result card', () => {
+    const findings = `VERDICT: PASS\n${'- exact audit evidence\n'.repeat(350)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'delegation-audit-result',
+        type: 'delegation.reply',
+        payload: { result: findings, verdict: 'PASS' },
+      }),
+    ]);
+
+    expect(result.events[0]?.payload.result).toBe(findings);
+    expect(JSON.stringify(result.events[0])).not.toContain('[history truncated]');
   });
 
   it('caps large tool payloads before history responses leave the daemon', () => {
@@ -263,6 +298,50 @@ describe('timeline history transport sanitization', () => {
     expect(result.events[0]?.payload.detail).toMatchObject({
       summary: 'Newest progress',
       meta: { canonicalKey: 'claude:deck_hist:task-order' },
+    });
+  });
+
+  it('preserves token occupancy and provider context when newer inferred metadata shares the usage event id', () => {
+    const eventId = 'transport:deck_hist:msg-opencode:usage';
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 8,
+        payload: {
+          inputTokens: 22,
+          cacheTokens: 36_608,
+          outputTokens: 10,
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 200_000,
+          contextWindowSource: 'provider',
+          streaming: false,
+        },
+      }),
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 14,
+        payload: {
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 1_000_000,
+        },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]).toMatchObject({
+      seq: 14,
+      payload: {
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+      },
     });
   });
 
@@ -487,5 +566,76 @@ describe('timeline history transport sanitization', () => {
     expect(JSON.stringify(result.events[0])).not.toContain('SECRET');
     expect(JSON.stringify(result.events[0])).not.toContain('raw');
     expect(JSON.stringify(result.events[0])).not.toContain('description');
+  });
+
+  it('retains sdkSubagent model and agentName across minimal history payload replay', () => {
+    const oversized = event({
+      eventId: 'sdk-minimal-model-replay',
+      type: 'tool.call',
+      ts: 100,
+      seq: 10,
+      hidden: true,
+      payload: {
+        tool: 'Agent',
+        output: 'z'.repeat(20 * 1024),
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Antigravity sub-agent Codebase Researcher',
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+            canonicalKey: 'agy:parent:child-1',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            agentName: 'Codebase Researcher',
+            model: 'gemini-4-hydrogen-high',
+          },
+        },
+      },
+    });
+
+    const result = sanitizeTimelineHistoryEventsForTransport([oversized]);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.payload.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      meta: {
+        canonicalKey: 'agy:parent:child-1',
+        agentName: 'Codebase Researcher',
+        model: 'gemini-4-hydrogen-high',
+      },
+    });
+  });
+
+  it('preserves recent readable text messages when large tool outputs exceed maxResponseBytes', () => {
+    const texts = Array.from({ length: 24 }, (_, idx) => event({
+      eventId: `text-${idx}`,
+      type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+      ts: 100 + idx,
+      seq: idx + 1,
+      payload: { text: `conversation message ${idx}` },
+    }));
+    const hugeTools = Array.from({ length: 80 }, (_, idx) => event({
+      eventId: `tool-big-${idx}`,
+      type: 'tool.result',
+      ts: 1000 + idx,
+      seq: 100 + idx,
+      payload: { tool: 'Read', output: `T-${idx}-${'a'.repeat(8 * 1024)}` },
+    }));
+
+    const result = sanitizeTimelineHistoryEventsForTransport([...texts, ...hugeTools], {
+      maxResponseBytes: 96 * 1024,
+    });
+
+    const keptTextIds = result.events
+      .filter((e) => e.type === 'user.message' || e.type === 'assistant.text')
+      .map((e) => e.eventId);
+    expect(keptTextIds).toHaveLength(24);
+    expect(result.payloadBytes).toBeLessThanOrEqual(96 * 1024);
+    expect(result.droppedEvents).toBeGreaterThan(0);
+    expect(result.events.some((e) => e.eventId === 'tool-big-79')).toBe(true);
+    expect(result.contiguousFloorTs).toBeGreaterThan(1000);
   });
 });

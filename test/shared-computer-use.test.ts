@@ -1,0 +1,133 @@
+import { describe, expect, it } from 'vitest';
+import { DAEMON_COMMAND_TYPES } from '../shared/daemon-command-types.js';
+import { DAEMON_MSG } from '../shared/daemon-events.js';
+import {
+  COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+  computerUseDocs,
+  computerUseMaxTimeoutMs,
+  decodeComputerUseHttpEnvelope,
+  encodeComputerUseHttpEnvelope,
+  validateComputerUseFrame,
+  validateComputerUseResultFrame,
+} from '../shared/computer-use.js';
+import { isLocalComputerUseAlias } from '../shared/machine-reference.js';
+import { REMOTE_EXEC_MAX_TIMEOUT_MS, REMOTE_EXEC_MIN_TIMEOUT_MS } from '../shared/remote-exec.js';
+
+const correlationId = '1234567890abcdef';
+
+describe('computer-use shared protocol', () => {
+  it('recognizes only the stable local-host aliases', () => {
+    for (const alias of ['local', 'localhost', 'self', 'this', ' LOCAL ']) {
+      expect(isLocalComputerUseAlias(alias), alias).toBe(true);
+    }
+    for (const value of ['', 'workstation', '127.0.0.1', null, 1]) {
+      expect(isLocalComputerUseAlias(value), String(value)).toBe(false);
+    }
+  });
+
+  it('distinguishes the built-in CDP browser path from the integrated OCU desktop path', () => {
+    expect(computerUseDocs('browser')).toContain('machine=local');
+    expect(computerUseDocs('browser')).toContain('Pass includeImage=true only when visual evidence is needed');
+    expect(computerUseDocs('browser')).toContain('automation.cdpEndpoint');
+    expect(computerUseDocs('browser')).toContain('Playwright connect_over_cdp');
+    expect(computerUseDocs('browser')).toContain('127.0.0.1 only');
+    expect(computerUseDocs('browser')).toContain("browser_* is IM.codes' built-in CDP path");
+    expect(computerUseDocs('browser')).toContain('Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.');
+    expect(computerUseDocs('browser')).toContain('selector falls back to visible-text matching');
+    expect(computerUseDocs('browser')).toContain('invalid_selector');
+    expect(computerUseDocs('overview')).toContain('Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path');
+    expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
+  });
+
+  it('exposes accessibility_tree as a read-only OCU observation verb', () => {
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'accessibility_tree',
+      arguments: { app: 'Finder', maxNodes: 20, maxDepth: 4 },
+    })).toMatchObject({ ok: true });
+    expect(computerUseDocs('tools')).toContain('accessibility_tree');
+  });
+
+  it('documents the supported exec_remote timeoutMs while retaining a shell-native command deadline', () => {
+    const tools = computerUseDocs('tools');
+    const safety = computerUseDocs('safety');
+    expect(tools).toContain('maxNodes');
+    expect(tools).toContain('truncated: N nodes omitted');
+    expect(tools).toContain('only displayed element indexes');
+    expect(tools).toContain(`exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms`);
+    expect(tools).toContain('rejects the unknown timeout field');
+    expect(tools).not.toContain('exec_remote has no timeout argument');
+    expect(safety).toContain('timeoutMs');
+    expect(safety).toContain('rejects timeout');
+    expect(safety).toContain('shell-native timeout');
+  });
+
+  it('routes CLI intent away from GUI OCU without misreporting helper failure as authorization failure', () => {
+    const overview = computerUseDocs('overview');
+    const workflow = computerUseDocs('workflow');
+    expect(overview).toContain('CLI, executable, script, terminal command, or shell operation');
+    expect(overview).toContain('exec_remote');
+    expect(overview).toContain('never select OCU');
+    expect(overview).toContain('not that the machine is unauthorized or uncontrollable');
+    expect(workflow).toContain('Classify intent before selecting a tool');
+  });
+
+  it('validates strict request frames including shell_session1', () => {
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'shell_session1',
+      arguments: { command: 'whoami' },
+      timeoutMs: COMPUTER_USE_MIN_TIMEOUT_MS,
+    }).ok).toBe(true);
+    expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'nope' }).ok).toBe(false);
+    expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'list_apps', serverId: 'forged' })).toEqual({ ok: false, error: 'unknown_field:serverId' });
+    expect(computerUseMaxTimeoutMs('list_apps')).toBe(COMPUTER_USE_MAX_TIMEOUT_MS);
+    expect(computerUseMaxTimeoutMs('shell_session1')).toBe(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'shell_session1',
+      timeoutMs: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+    }).ok).toBe(true);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'shell_session1',
+      timeoutMs: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS + 1,
+    }).ok).toBe(false);
+    expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'list_apps', timeoutMs: COMPUTER_USE_MAX_TIMEOUT_MS + 1 }).ok).toBe(false);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'browser_open',
+      resourceOwner: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1' },
+    })).toMatchObject({ ok: true, value: { resourceOwner: { runtimeEpoch: 'epoch-1' } } });
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'browser_open',
+      resourceOwner: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', forged: true },
+    })).toEqual({ ok: false, error: 'invalid_resourceOwner' });
+  });
+
+  it('validates strict result frames and HTTP envelopes', () => {
+    const result = {
+      type: DAEMON_MSG.COMPUTER_USE_RESULT,
+      correlationId,
+      ok: true,
+      tool: 'list_apps',
+      content: [{ type: 'text', text: '[]' }],
+      durationMs: 1,
+    } as const;
+    expect(validateComputerUseResultFrame(result).ok).toBe(true);
+    expect(validateComputerUseResultFrame({ ...result, requestId: 'forged' }).ok).toBe(false);
+    const { type: _type, ...payload } = result;
+    const env = encodeComputerUseHttpEnvelope('completed', payload);
+    expect(decodeComputerUseHttpEnvelope(env).ok).toBe(true);
+    expect(decodeComputerUseHttpEnvelope({ ...env, outcome: 'completed', result: undefined }).ok).toBe(false);
+  });
+});

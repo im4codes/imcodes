@@ -25,12 +25,13 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
 
 vi.mock('../../src/api.js', () => ({
   downloadAttachment: vi.fn().mockResolvedValue(undefined),
+  downloadAttachmentToCenter: vi.fn().mockResolvedValue(undefined),
   previewAttachment: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { ChatView } from '../../src/components/ChatView.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
-import { downloadAttachment, previewAttachment } from '../../src/api.js';
+import { downloadAttachmentToCenter, previewAttachment } from '../../src/api.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: Record<string, unknown> }): TimelineEvent {
   return {
@@ -48,7 +49,8 @@ function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: 
 describe('ChatView attachment download', () => {
   afterEach(() => {
     cleanup();
-    vi.mocked(downloadAttachment).mockClear();
+    delete (globalThis as { __IMCODES_PC_APP__?: unknown }).__IMCODES_PC_APP__;
+    vi.mocked(downloadAttachmentToCenter).mockClear();
     vi.mocked(previewAttachment).mockClear();
   });
 
@@ -87,6 +89,58 @@ describe('ChatView attachment download', () => {
     const btn = screen.getByTitle('notes.txt');
     expect(btn).toBeDefined();
     expect(btn.textContent).toContain('notes.txt');
+  });
+
+  it('keeps attachment preview and download scoped to the shared session', async () => {
+    const events = [makeEvent({
+      sessionId: 'deck_project_brain',
+      type: 'user.message',
+      payload: {
+        text: 'shared image',
+        attachments: [{ id: 'shared-image.png', originalName: 'shared.png', mime: 'image/png' }],
+      },
+    })];
+    const { container } = render(
+      <ChatView events={events} loading={false} serverId="srv-1" sessionId="deck_project_brain" />,
+    );
+    const buttons = Array.from(container.querySelectorAll('.chat-attachment-row button'));
+
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(previewAttachment).toHaveBeenCalledWith(
+      'srv-1', 'shared-image.png', 'deck_project_brain',
+    ));
+    fireEvent.click(buttons[1]);
+    await waitFor(() => expect(downloadAttachmentToCenter).toHaveBeenCalledWith(
+      'srv-1', 'shared-image.png', 'shared.png', 'deck_project_brain', null,
+    ));
+  });
+
+  it('recovers the opaque upload handle from legacy daemon paths', async () => {
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: '#1:(/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png)',
+        attachments: [{
+          id: '/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png',
+          daemonPath: '/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png',
+          mime: 'image/png',
+          size: 2048,
+        }],
+      },
+    })];
+    const { container } = render(<ChatView events={events} loading={false} serverId="srv-215" />);
+    const buttons = Array.from(container.querySelectorAll('.chat-attachment-row button'));
+
+    expect(screen.getByTitle('image.png')).toBeDefined();
+    expect(container.textContent).not.toContain('/home/ai/.imcodes/uploads');
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(previewAttachment).toHaveBeenCalledWith(
+      'srv-215', 'f670d9589bc3d1b2647a7cd4a98efdeb',
+    ));
+    fireEvent.click(buttons[1]);
+    await waitFor(() => expect(downloadAttachmentToCenter).toHaveBeenCalledWith(
+      'srv-215', 'f670d9589bc3d1b2647a7cd4a98efdeb', 'image.png', undefined, null,
+    ));
   });
 
   it('falls back to id when originalName is missing', () => {
@@ -199,7 +253,10 @@ describe('ChatView attachment download', () => {
     expect(onPreviewFile.mock.calls[0][0].previewViewMode).not.toBe('html-render');
 
     fireEvent.click(buttons[2]);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./page.HTML');
+    // The daemon now resolves chat-referenced paths itself instead of the
+    // client pre-joining them with `workdir`, so the exact attachment
+    // daemonPath is sent as-is.
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./page.HTML', undefined, { chatFileReference: true });
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
@@ -248,9 +305,124 @@ describe('ChatView attachment download', () => {
 
     fireEvent.click(buttons[1]);
     await waitFor(() => {
-      expect(downloadAttachment).toHaveBeenCalledWith('srv-1', 'html-no-path');
+      expect(downloadAttachmentToCenter).toHaveBeenCalledWith('srv-1', 'html-no-path', 'upload.html', undefined, null);
     });
     expect(previewAttachment).not.toHaveBeenCalled();
     expect(onPreviewFile).not.toHaveBeenCalled();
+  });
+
+  it('opens the PC App save picker synchronously on click before passing the handle to downloadAttachmentToCenter', async () => {
+    const pickSaveFile = vi.fn(async () => ({
+      canceled: false as const,
+      handleId: 'h-att-1',
+      name: 'report.pdf',
+    }));
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = {
+      platform: 'win32',
+      isElectron: true,
+      downloads: {
+        pickSaveFile,
+        openWriter: vi.fn(),
+        writeChunk: vi.fn(),
+        closeWriter: vi.fn(),
+        abortWriter: vi.fn(),
+        getFileSize: vi.fn(),
+        revealFile: vi.fn(),
+      },
+    };
+
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: 'report',
+        attachments: [{ id: 'att-pdf-1', originalName: 'report.pdf', size: 1024 }],
+      },
+    })];
+    const { container } = render(
+      <ChatView events={events} loading={false} serverId="srv-1" sessionId="deck_main" />,
+    );
+    const dlBtn = container.querySelector('.chat-attachment-dl-btn') as HTMLButtonElement;
+    fireEvent.click(dlBtn);
+
+    // Must be called synchronously during the click turn before async api import settles
+    expect(pickSaveFile).toHaveBeenCalledTimes(1);
+    expect(pickSaveFile).toHaveBeenCalledWith({ suggestedName: 'report.pdf' });
+
+    await waitFor(() => {
+      expect(downloadAttachmentToCenter).toHaveBeenCalledWith(
+        'srv-1',
+        'att-pdf-1',
+        'report.pdf',
+        'deck_main',
+        expect.objectContaining({ handle: expect.objectContaining({ createWritable: expect.any(Function) }) }),
+      );
+    });
+  });
+
+  it('silently ignores save dialog cancellation without starting download or showing an error', async () => {
+    const pickSaveFile = vi.fn(async () => ({ canceled: true as const }));
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = {
+      platform: 'win32',
+      isElectron: true,
+      downloads: {
+        pickSaveFile,
+        openWriter: vi.fn(),
+        writeChunk: vi.fn(),
+        closeWriter: vi.fn(),
+        abortWriter: vi.fn(),
+        getFileSize: vi.fn(),
+      },
+    };
+
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: 'report',
+        attachments: [{ id: 'att-cancel', originalName: 'report.pdf', size: 1024 }],
+      },
+    })];
+    const { container } = render(<ChatView events={events} loading={false} serverId="srv-1" />);
+    fireEvent.click(container.querySelector('.chat-attachment-dl-btn') as HTMLButtonElement);
+
+    await waitFor(() => expect(pickSaveFile).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(downloadAttachmentToCenter).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-attachment-dl')?.textContent).not.toContain('\u{26A0}');
+  });
+
+  it('ignores reentrant clicks while the save picker is already open', async () => {
+    let resolvePicker!: (res: { canceled: false; handleId: string; name: string }) => void;
+    const pickSaveFile = vi.fn(() => new Promise<{ canceled: false; handleId: string; name: string }>((resolve) => {
+      resolvePicker = resolve;
+    }));
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = {
+      platform: 'win32',
+      isElectron: true,
+      downloads: {
+        pickSaveFile,
+        openWriter: vi.fn(),
+        writeChunk: vi.fn(),
+        closeWriter: vi.fn(),
+        abortWriter: vi.fn(),
+        getFileSize: vi.fn(),
+      },
+    };
+
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: 'report',
+        attachments: [{ id: 'att-reentry', originalName: 'report.pdf', size: 1024 }],
+      },
+    })];
+    const { container } = render(<ChatView events={events} loading={false} serverId="srv-1" />);
+    const dlBtn = container.querySelector('.chat-attachment-dl-btn') as HTMLButtonElement;
+
+    fireEvent.click(dlBtn);
+    fireEvent.click(dlBtn);
+    expect(pickSaveFile).toHaveBeenCalledTimes(1);
+
+    resolvePicker({ canceled: false, handleId: 'h-reentry', name: 'report.pdf' });
+    await waitFor(() => expect(downloadAttachmentToCenter).toHaveBeenCalledTimes(1));
   });
 });

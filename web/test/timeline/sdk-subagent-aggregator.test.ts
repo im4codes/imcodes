@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
+  makeAgySubagentCanonicalKey,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
@@ -68,8 +69,23 @@ function makeSessionStateEvent(eventId: string, state: string, ts = NOW - 500): 
 }
 
 describe('deriveSdkSubagentStatusRows', () => {
+  it('aggregates hidden AG ACP launch, bound child and completion into one panel row', () => {
+    const canonicalKey=makeAgySubagentCanonicalKey('parent','launch');
+    const meta=makeMeta({provider:SDK_SUBAGENT_PROVIDERS.AGY_SDK,providerKind:SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey,parentSessionId:'parent',parentItemId:'launch',agentPath:'launch',backgrounded:true});
+    const start=makeEvent('ag-call',meta,{hidden:true,seq:1,ts:NOW-300});
+    const bound=makeEvent('ag-call',{...meta,agentPath:'child'},{hidden:true,seq:2,ts:NOW-200});
+    const complete=makeEvent('ag-result',{...meta,agentPath:'child',active:false,terminal:true,normalizedStatus:SDK_SUBAGENT_STATUS.COMPLETE},
+      {hidden:true,type:'tool.result',seq:3,ts:NOW-100});
+    expect(deriveSdkSubagentStatusRows([start,bound],NOW).runningCount).toBe(1);
+    const result=deriveSdkSubagentStatusRows([start,bound,complete],NOW);
+    expect(result.runningCount).toBe(0);
+    expect(result.rows).toMatchObject([{canonicalKey,agentPath:'child',terminal:true,normalizedStatus:SDK_SUBAGENT_STATUS.COMPLETE}]);
+    expect(result.rows).toHaveLength(1);expect(result.diagnostics).toEqual([]);
+  });
+
   it('derives running rows from raw hidden events without transcript visibility state', () => {
-    const event = makeEvent('hidden-running', makeMeta({ taskId: 'task-1', model: 'haiku' }), { hidden: true });
+    const event = makeEvent('hidden-running', makeMeta({ taskId: 'task-1', taskType: 'local_bash', model: 'haiku' }), { hidden: true });
 
     const result = deriveSdkSubagentStatusRows([event], NOW, { terminalTtlMs: 300_000, maxTerminalRows: 5 });
 
@@ -82,6 +98,7 @@ describe('deriveSdkSubagentStatusRows', () => {
       active: true,
       model: 'haiku',
       taskId: 'task-1',
+      taskType: 'local_bash',
     }]);
     expect(result.diagnostics).toEqual([]);
   });
@@ -324,6 +341,43 @@ describe('deriveSdkSubagentStatusRows', () => {
     expect(result.rows.map((row) => row.receiverThreadId)).toEqual(['thread-a', 'thread-b']);
   });
 
+  it('marks Codex collaboration wrapper rows stale after a later assistant message', () => {
+    const running = makeEvent('codex-collab-running', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: 'codex:deck_main_brain:call-spawn',
+      parentItemId: 'call-spawn',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      receiverCount: 1,
+      runningChildCount: 1,
+      childStatusSummary: 'pendingInit:1',
+    }), { ts: NOW - 20_000 });
+    const assistantText: TimelineEvent = {
+      eventId: 'assistant-after-wrapper',
+      sessionId: 'deck_main_brain',
+      ts: NOW - 1_000,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: '已启动子代理。' },
+    };
+
+    const result = deriveSdkSubagentStatusRows([running, assistantText], NOW);
+
+    expect(result.runningCount).toBe(0);
+    expect(result.rows).toMatchObject([{
+      canonicalKey: 'codex:deck_main_brain:call-spawn',
+      normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+      active: false,
+      terminal: true,
+      eventId: 'assistant-after-wrapper',
+    }]);
+  });
+
   it('diagnostic/unknown terminal event deletes active row so runningCount drops to 0', () => {
     // P0 fix: when a diagnostic or unknown-status terminal event arrives for a canonicalKey
     // that already has an active row, the active row must be deleted so runningCount
@@ -399,5 +453,156 @@ describe('deriveSdkSubagentStatusRows', () => {
       eventId: 'malformed',
       diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
     }]);
+  });
+
+  it('keeps backgrounded AGY local_bash rows active across parent idle without colliding with native AGY_RUNTIME_AGENT subagents', () => {
+    const running = makeEvent('agy-bg-run', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      taskId: 'conv-1/task-1',
+      taskType: 'local_bash',
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 15_000, summary: 'bash ./sync.sh --all' });
+    const nativeSubagent = makeEvent('agy-sub-run', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:sub:child-1',
+      agentPath: 'child-1',
+      taskType: 'agent',
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 14_000, summary: 'Antigravity sub-agent child-1' });
+    const parentIdle: TimelineEvent = {
+      eventId: 'parent-idle',
+      sessionId: 'deck_main_brain',
+      ts: NOW - 10_000,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: { state: 'idle' },
+    };
+
+    const whileRunning = deriveSdkSubagentStatusRows([running, nativeSubagent, parentIdle], NOW);
+    expect(whileRunning.runningCount).toBe(2);
+    expect(whileRunning.rows).toMatchObject([
+      {
+        canonicalKey: 'agy:conv-1:bg_task-1',
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        taskType: 'local_bash',
+        backgrounded: true,
+        active: true,
+        terminal: false,
+      },
+      {
+        canonicalKey: 'agy:conv-1:sub:child-1',
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        taskType: 'agent',
+        backgrounded: true,
+        active: true,
+        terminal: false,
+      },
+    ]);
+
+    const finished = makeEvent('agy-bg-done', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      taskId: 'conv-1/task-1',
+      taskType: 'local_bash',
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { ts: NOW - 2_000, summary: 'bash ./sync.sh --all', output: 'Command exited with code 0.' });
+
+    const afterDone = deriveSdkSubagentStatusRows([running, nativeSubagent, parentIdle, finished], NOW);
+    expect(afterDone.runningCount).toBe(1);
+    expect(afterDone.rows).toMatchObject([
+      {
+        canonicalKey: 'agy:conv-1:sub:child-1',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+      },
+      {
+        canonicalKey: 'agy:conv-1:bg_task-1',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      },
+    ]);
+  });
+
+  it('preserves model and agentName across later events omitting them and across Claude runtime suppression', () => {
+    const startWithModel = makeEvent('agy-start', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:child-model',
+      agentName: 'Codebase Researcher',
+      model: 'gemini-4-hydrogen-high',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 10_000, seq: 1 });
+    const doneWithoutModel = makeEvent('agy-done', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:child-model',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { type: 'tool.result', ts: NOW - 2_000, seq: 2 });
+
+    const claudeFallback = makeEvent('claude-fb', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+      canonicalKey: 'claude:deck_main:runtime:tu-1',
+      parentToolUseId: 'tu-1',
+      agentName: 'Explore',
+      model: 'claude-haiku-4-5-20251001',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 5_000, seq: 3 });
+    const claudeTaskNoModel = makeEvent('claude-task', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+      canonicalKey: 'claude:deck_main:task-1',
+      parentToolUseId: 'tu-1',
+      taskId: 'task-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { type: 'tool.result', ts: NOW - 1_000, seq: 4 });
+
+    const result = deriveSdkSubagentStatusRows([
+      startWithModel,
+      doneWithoutModel,
+      claudeFallback,
+      claudeTaskNoModel,
+    ], NOW);
+
+    expect(result.rows).toMatchObject([
+      {
+        canonicalKey: 'claude:deck_main:task-1',
+        agentName: 'Explore',
+        model: 'claude-haiku-4-5-20251001',
+      },
+      {
+        canonicalKey: 'agy:conv-1:child-model',
+        agentName: 'Codebase Researcher',
+        model: 'gemini-4-hydrogen-high',
+      },
+    ]);
   });
 });

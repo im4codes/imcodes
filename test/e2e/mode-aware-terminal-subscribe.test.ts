@@ -107,7 +107,7 @@ class MockDaemonWs extends EventEmitter {
 function makeDaemonDb() {
   const tokenHash = sha256Hex('valid-token');
   return {
-    queryOne: async () => ({ token_hash: tokenHash }),
+    queryOne: async () => ({ token_hash: tokenHash, owner_status: 'active' }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},

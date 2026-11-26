@@ -1,0 +1,287 @@
+import { watch, type FSWatcher, createReadStream, statSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+
+export interface AgyTranscriptRow {
+  step_index: number; type: string; status: string; source?: string; content?: string; model?: string;
+  tool_calls?: Array<{ name?: string; args?: unknown }>;
+  input_tokens?: number; output_tokens?: number; cache_read_tokens?: number;
+}
+export interface AgyStepUsage {
+  stepIndex: number;
+  input_tokens?: number;
+  cache_read_tokens?: number;
+  output_tokens?: number;
+}
+export interface AgyTranscriptCursor {
+  incarnation: string;
+  byteOffset: number;
+}
+const BACKGROUND_TASK_RUNNING_RE = /Tool is running as a background task with task id:/i;
+const isFiniteNonNegative = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+export function isAgyCompactionTranscriptRow(row: AgyTranscriptRow): boolean {
+  if (row.status !== 'DONE' || typeof row.content !== 'string') return false;
+  const trimmed = row.content.trimStart();
+  return (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT' && trimmed.startsWith('<CONTEXT_SUMMARY>'))
+    || (row.type === 'CHECKPOINT' && row.source === 'SYSTEM' && trimmed.startsWith('# Resuming from a compaction'));
+}
+export function agyTranscriptFile(home: string, id: string): string | undefined {
+  if (!path.isAbsolute(home) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}$/.test(id)) return;
+  return path.join(home, '.gemini/antigravity-cli/brain', id, '.system_generated/logs/transcript_full.jsonl');
+}
+
+/** AG 1.5 ACP ends its stdout subscription at prompt RPC completion, even
+ * though its native engine keeps executing reactive child wakeups. Watch only
+ * this known owner's file; never poll or start a second native prompt. */
+export class AgyTranscriptBridge {
+  private watcher?: FSWatcher;
+  private fileWatcher?: FSWatcher;
+  private timer?: ReturnType<typeof setTimeout>;
+  private closed = false;
+  private reading?: Promise<void>;
+  private again = false;
+  private offset = 0;
+  private parsedBytes = 0;
+  private dev?: number;
+  private inode?: number;
+  private truncationEpoch = 0;
+  private partial = '';
+  private decoder = new StringDecoder('utf8');
+  private lastStep = -1;
+  private latestUsage?: AgyStepUsage;
+  private watched?: { dir: string; ino: number; dev: number };
+  private fileWatched?: { ino: number; dev: number };
+
+  constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, cursor?: AgyTranscriptCursor) => void) {}
+  get isClosed(): boolean { return this.closed; }
+  get latestStepUsage(): AgyStepUsage | undefined {
+    return this.latestUsage ? { ...this.latestUsage } : undefined;
+  }
+  currentCursor(): AgyTranscriptCursor | undefined {
+    try {
+      const s = statSync(this.file);
+      const dev = Number(s.dev);
+      const ino = Number(s.ino);
+      const size = Number(s.size);
+      const epoch = this.inode !== undefined && this.dev === dev && this.inode === ino
+        ? (size < this.offset ? this.truncationEpoch + 1 : this.truncationEpoch)
+        : 0;
+      return { incarnation: `${dev}:${ino}:${epoch}`, byteOffset: size };
+    } catch {
+      return undefined;
+    }
+  }
+  async resume(): Promise<void> { this.closed = false; await this.flush(); }
+
+  async start(replayExisting = false): Promise<void> {
+    // Baseline is read once (without replay callbacks) so rotation cannot
+    // replay an old SYSTEM_MESSAGE from a restored conversation.
+    await this.run(!replayExisting);
+  }
+
+  private closeFileWatcher(): void {
+    this.fileWatcher?.close();
+    this.fileWatcher = undefined;
+    this.fileWatched = undefined;
+  }
+
+  private async armFile(): Promise<boolean> {
+    if (this.closed) return false;
+    let info: Awaited<ReturnType<typeof stat>>;
+    try {
+      info = await stat(this.file);
+      if (!info.isFile()) {
+        this.closeFileWatcher();
+        return false;
+      }
+    } catch {
+      this.closeFileWatcher();
+      return false;
+    }
+    if (this.closed) return false;
+    let ino = Number(info.ino);
+    let dev = Number(info.dev);
+    if (this.fileWatcher && this.fileWatched?.ino === ino && this.fileWatched.dev === dev) {
+      return false;
+    }
+    this.closeFileWatcher();
+    try {
+      // Non-recursive file watch binds the kernel vnode directly (kqueue EVFILT_VNODE
+      // on macOS), bypassing fseventsd coalescing latency under heavy CI load.
+      const watcher = watch(this.file, { persistent: false }, (eventType) => {
+        if (eventType === 'rename' && this.fileWatcher === watcher) {
+          this.closeFileWatcher();
+        }
+        this.schedule();
+      });
+      watcher.on('error', () => {
+        if (this.fileWatcher === watcher) {
+          this.closeFileWatcher();
+        }
+      });
+      try {
+        const after = statSync(this.file);
+        if (!after.isFile() || Number(after.ino) !== ino || Number(after.dev) !== dev) {
+          watcher.close();
+          this.schedule();
+          return false;
+        }
+      } catch {
+        watcher.close();
+        return false;
+      }
+      this.fileWatcher = watcher;
+      this.fileWatched = { ino, dev };
+      return true;
+    } catch {
+      this.closeFileWatcher();
+      return false;
+    }
+  }
+
+  private async arm(): Promise<void> {
+    const target = path.dirname(this.file);
+    while (!this.closed) {
+      // Native session/new can return before its logs directory exists. Watch
+      // the nearest existing ancestor until creation, then narrow the watcher.
+      let dir = target;
+      let identity: Awaited<ReturnType<typeof stat>> | undefined;
+      while (true) {
+        try { const info = await stat(dir); if (info.isDirectory()) { identity = info; break; } } catch { /* descend on the next creation event */ }
+        const parent = path.dirname(dir); if (parent === dir) { this.closeFileWatcher(); return; } dir = parent;
+      }
+      if (this.closed || !identity) return;
+      if (dir !== target) this.closeFileWatcher();
+      if (dir === this.watched?.dir && Number(identity.ino) === this.watched.ino && Number(identity.dev) === this.watched.dev) {
+        if (dir === target) await this.armFile();
+        return;
+      }
+      this.watcher?.close(); this.watched = { dir, ino: Number(identity.ino), dev: Number(identity.dev) };
+      try {
+        const watcher = watch(
+          dir,
+          { persistent: false, recursive: process.platform === 'darwin' || process.platform === 'win32' },
+          () => this.schedule(),
+        );
+        this.watcher = watcher;
+        watcher.on('error', () => {
+          if (this.watcher === watcher) {
+            this.watcher.close();
+            this.watcher = undefined;
+            this.watched = undefined;
+          }
+        });
+        this.schedule();
+      } catch { this.watcher = undefined; this.watched = undefined; return; }
+      if (dir === target) {
+        await this.armFile();
+        return;
+      }
+    }
+  }
+  private schedule(): void {
+    if (this.closed || this.timer) return;
+    // Event coalescing gives native ACP frames precedence, not a polling loop.
+    this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, 60);
+    this.timer.unref?.();
+  }
+  flush(): Promise<void> {
+    return this.run(false);
+  }
+  private run(baseline: boolean): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (this.reading) {
+      if (!baseline) this.again = true;
+      return this.reading;
+    }
+    let first = baseline;
+    this.reading = (async () => {
+      do {
+        this.again = false;
+        const isBaseline = first;
+        first = false;
+        await this.arm();
+        await this.read(isBaseline);
+      } while (this.again && !this.closed);
+    })().finally(() => { this.reading = undefined; });
+    return this.reading;
+  }
+  private async read(baseline = false): Promise<void> {
+    try {
+      let s: Awaited<ReturnType<typeof stat>>;
+      try {
+        s = await stat(this.file);
+        if (!s.isFile()) {
+          this.closeFileWatcher();
+          return;
+        }
+      } catch {
+        this.closeFileWatcher();
+        return;
+      }
+      const dev = Number(s.dev);
+      const ino = Number(s.ino);
+      const size = Number(s.size);
+      if (!this.fileWatcher || this.fileWatched?.ino !== ino || this.fileWatched.dev !== dev) {
+        if (await this.armFile() && !this.closed) this.again = true;
+      }
+      if (this.inode === undefined || this.dev !== dev || this.inode !== ino) {
+        this.truncationEpoch = 0;
+        this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
+      } else if (size < this.offset) {
+        this.truncationEpoch += 1;
+        this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
+      }
+      this.dev = dev;
+      this.inode = ino;
+      if (size <= this.offset) return;
+      const incarnation = `${dev}:${ino}:${this.truncationEpoch}`;
+      const end = size;
+      for await (const bytes of createReadStream(this.file, { start: this.offset, end: end - 1, highWaterMark: 64 * 1024 })) {
+        if (this.closed) return;
+        this.partial += this.decoder.write(bytes as Buffer);
+        let lineEnd: number;
+        while ((lineEnd = this.partial.indexOf('\n')) >= 0) {
+          const line = this.partial.slice(0, lineEnd); this.partial = this.partial.slice(lineEnd + 1);
+          const rowByteEnd = this.parsedBytes + Buffer.byteLength(line, 'utf8') + 1;
+          this.parsedBytes = rowByteEnd;
+          let row: AgyTranscriptRow;
+          try { row = JSON.parse(line) as AgyTranscriptRow; } catch { continue; }
+          if (!Number.isSafeInteger(row.step_index) || row.step_index <= this.lastStep) continue;
+          const allowRunningBackgroundTask = row.type === 'GENERIC'
+            && row.status === 'RUNNING'
+            && BACKGROUND_TASK_RUNNING_RE.test(row.content ?? '');
+          if (row.status !== 'DONE' && !allowRunningBackgroundTask) continue;
+          this.lastStep = row.step_index;
+          if (isAgyCompactionTranscriptRow(row)) {
+            this.latestUsage = undefined;
+          } else if (
+            row.type === 'PLANNER_RESPONSE'
+            && row.status === 'DONE'
+            && (isFiniteNonNegative(row.input_tokens) || isFiniteNonNegative(row.cache_read_tokens))
+          ) {
+            this.latestUsage = {
+              stepIndex: row.step_index,
+              ...(isFiniteNonNegative(row.input_tokens) ? { input_tokens: row.input_tokens } : {}),
+              ...(isFiniteNonNegative(row.cache_read_tokens) ? { cache_read_tokens: row.cache_read_tokens } : {}),
+              ...(isFiniteNonNegative(row.output_tokens) ? { output_tokens: row.output_tokens } : {}),
+            };
+          }
+          if (!this.closed && !baseline) this.onRow(row, { incarnation, byteOffset: rowByteEnd });
+        }
+      }
+      this.offset = end;
+    } catch {
+      // Missing during creation/rotation is retried only on a filesystem event
+      // or explicit native boundary; no timer retry and no invented output.
+    }
+  }
+  close(): void {
+    this.closed = true;
+    this.watcher?.close(); this.watcher = undefined; this.watched = undefined;
+    this.closeFileWatcher();
+    if (this.timer) clearTimeout(this.timer); this.timer = undefined;
+  }
+}

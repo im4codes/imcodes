@@ -46,6 +46,9 @@ import {
   getResendCount,
 } from '../../src/daemon/transport-resend-queue.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
+import { deliverTransportResendEntry } from '../../src/agent/transport-resend-delivery.js';
+import { queuedUserMessageAttribution } from '../../src/agent/transport-queued-user-message.js';
+import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '../../shared/chat-message-origin.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 
 // Suppress timeline events — we don't assert on them here; transport
@@ -477,6 +480,56 @@ describe('transport message + queue integration (audit cae1de69-826)', () => {
       expect(runtimeA.sending).toBe(true);
       expect(runtimeB.sending).toBe(false);
       expect(mockB.provider.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('message origin survives the queue (chat alignment)', () => {
+    it('a queued daemon prompt drains with its system origin; a queued human message stays the human\'s', async () => {
+      const mock = makeMockProvider();
+      const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+      await runtime.initialize(defaultConfig);
+      runtime.send('first turn', 'busy-1');
+      await flushDispatch();
+
+      const drainedRows: Record<string, unknown>[] = [];
+      runtime.onDrain = (entries) => {
+        for (const entry of entries) drainedRows.push({ text: entry.text, ...queuedUserMessageAttribution(entry) });
+      };
+      expect(runtime.send('Auto Deliver: implement task 2', 'openspec-queued', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      })).toBe('queued');
+      expect(runtime.send('and also fix the header', 'human-queued')).toBe('queued');
+
+      mock.fireComplete('sess-1');
+      await flushDispatch();
+
+      const openspec = drainedRows.find((row) => row.text === 'Auto Deliver: implement task 2');
+      const human = drainedRows.find((row) => row.text === 'and also fix the header');
+      expect(classifyUserMessageOrigin(openspec)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      expect(classifyUserMessageOrigin(human)).toBe(CHAT_MESSAGE_ORIGINS.USER);
+    });
+
+    it('a resend-queued daemon prompt keeps its origin through drainResend and delivery', async () => {
+      const mock = makeMockProvider();
+      const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+      await runtime.initialize(defaultConfig);
+      runtime.send('first turn', 'busy-2');
+      await flushDispatch();
+
+      enqueueResend('deck_test_brain', {
+        text: 'P2P round 2 prompt', commandId: 'p2p-q1', clientMessageId: 'p2p-q1',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM, queuedAt: Date.now(),
+      });
+      const drained: Array<Record<string, unknown>> = [];
+      await drainResend('deck_test_brain', (entry) => {
+        drained.push({ text: entry.text, ...queuedUserMessageAttribution(entry) });
+        return deliverTransportResendEntry(runtime, entry);
+      });
+      // The resend drain's own row (runtime was busy, so it queued into the runtime) …
+      expect(classifyUserMessageOrigin(drained[0])).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      // … and the runtime copy that its later drain projects.
+      const runtimeCopy = runtime.pendingEntries.find((entry) => entry.clientMessageId === 'p2p-q1');
+      expect(runtimeCopy?.messageOrigin).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
     });
   });
 });

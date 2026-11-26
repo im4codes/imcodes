@@ -48,6 +48,8 @@ import {
   type DedicatedExecutionRoutingGlobalPreference,
 } from '../../shared/execution-clone.js';
 import logger from '../util/logger.js';
+import { assertDelegationAdmission, authorizedDelegationCandidates } from './delegation-admission.js';
+import { listSessions as listStoreSessions, type SessionRecord } from '../store/session-store.js';
 
 /** One unit of decomposed execution work routed to a single clone worker. */
 export interface WorkerTask {
@@ -109,6 +111,11 @@ export interface OrchestrateCloneWorkersOptions<TCollected = unknown> {
   outcomeOf?: (collected: TCollected) => WorkerOutcome;
   /** Injected clock (defaults to {@link Date.now}). */
   now?: () => number;
+  /**
+   * Session snapshot used for the delegation-admission check. Injected for
+   * tests; defaults to the live store.
+   */
+  listSessions?: () => SessionRecord[];
 }
 
 export interface OrchestrateCloneWorkersResult<TCollected = unknown> {
@@ -169,6 +176,50 @@ export async function orchestrateCloneWorkers<TCollected = unknown>(
   // NaN/missing/Infinity → the field default and clamps finite-out-of-bounds to
   // `[MIN,MAX]`, so every derived bound is finite. The `Math.max` floors are
   // kept only as harmless belt-and-suspenders.
+  // ── Delegation admission, BEFORE any clone exists ──────────────────────
+  //
+  // This pool is the busiest producer of delegated work in the daemon and it
+  // calls `createExecutionClone` directly -- it never passes through the send
+  // tool, so the gate enforced there did not apply to it at all. Every clone
+  // inherits its template's agentType, hence the template's provider account
+  // and the template's limit, so spawning one against a refused account
+  // produces a worker that cannot do anything and is then reaped as if it had
+  // merely been slow.
+  //
+  // Uses the SAME admission service as the send paths. A second copy of the
+  // rule here is precisely how this bypass came to exist.
+  //
+  // It throws rather than returning a per-task failure because by the time a
+  // task could report one, the clone would already have been created.
+  // Scope note: this gate answers QUOTA, not template existence. A template
+  // that is missing or ineligible is already rejected by `createExecutionClone`
+  // with a precise `template_ineligible`/`target_not_found`, and pre-empting
+  // that here would replace a specific diagnosis with a generic one. So an
+  // unknown template DEFERS to the existing validator; a known one is gated.
+  const admissionSessions = (opts.listSessions ?? listStoreSessions)();
+  const template = admissionSessions.find((s) => s.name === opts.templateSessionName);
+  if (template) {
+    assertDelegationAdmission(
+      admissionSessions,
+      [template],
+      // The SAME authorized-candidate resolver the send paths use, scoped to
+      // the run's owner. Filtering on project name alone -- which is what this
+      // did before -- handed the orchestrator its own session and any hidden
+      // execution clone in the project as things to try instead.
+      authorizedDelegationCandidates(
+        {
+          userId: opts.ownerSessionName,
+          sessionName: opts.ownerSessionName,
+          projectName: template.projectName ?? null,
+          projectRoot: null,
+        },
+        admissionSessions,
+      ),
+      now(),
+      { newWorkload: true },
+    );
+  }
+
   const pref = parseDedicatedExecutionRoutingPreference(opts.pref);
   const maxParallel = Math.max(1, pref.maxParallelClones);
   const maxQueued = Math.max(0, pref.maxQueuedClones);

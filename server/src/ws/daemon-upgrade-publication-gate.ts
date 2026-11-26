@@ -1,7 +1,15 @@
 import { DAEMON_UPGRADE_TARGET_LATEST } from '../../../shared/daemon-upgrade.js';
+import {
+  daemonR2ManifestUrl,
+  daemonR2TarballUrl,
+  parseDaemonR2Manifest,
+  resolveDaemonR2BaseUrl,
+  resolveDaemonR2Channel,
+} from '../../../shared/daemon-r2-package.js';
 
 const NPM_TARBALL_BASE_URL = 'https://registry.npmjs.org/imcodes/-/';
 const DEFAULT_RETRY_DELAYS_MS = [15_000, 30_000, 60_000, 120_000, 300_000] as const;
+const R2_PROBE_TIMEOUT_MS = 5_000;
 
 type ProbeStatus = 'available' | 'missing' | 'error';
 
@@ -34,7 +42,42 @@ export interface DaemonUpgradePublicationGateOptions {
   retryDelaysMs?: readonly number[];
 }
 
-async function defaultProbe(_targetVersion: string, tarballUrl: string): Promise<DaemonUpgradePublicationProbeResult> {
+async function probeR2Publication(targetVersion: string): Promise<DaemonUpgradePublicationProbeResult | null> {
+  const baseUrl = resolveDaemonR2BaseUrl(process.env);
+  if (!baseUrl) return null;
+  const channel = resolveDaemonR2Channel({ targetVersion });
+  const prefix = process.env.CONTROLLED_NODE_ARTIFACT_R2_PREFIX;
+  const manifestUrl = daemonR2ManifestUrl(baseUrl, channel, prefix);
+  const tgzUrl = daemonR2TarballUrl(baseUrl, channel, prefix);
+  if (!manifestUrl || !tgzUrl) return null;
+
+  try {
+    const manifestRes = await fetch(manifestUrl, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(R2_PROBE_TIMEOUT_MS),
+    });
+    if (!manifestRes.ok) return null;
+    const manifest = parseDaemonR2Manifest(await manifestRes.json());
+    if (!manifest || manifest.channel !== channel || manifest.version !== targetVersion) return null;
+    const headRes = await fetch(tgzUrl, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(R2_PROBE_TIMEOUT_MS),
+    });
+    if (headRes.status >= 200 && headRes.status < 300) {
+      return { status: 'available', statusCode: headRes.status };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function defaultProbe(targetVersion: string, tarballUrl: string): Promise<DaemonUpgradePublicationProbeResult> {
+  const r2Result = await probeR2Publication(targetVersion);
+  if (r2Result) return r2Result;
   try {
     const res = await fetch(tarballUrl, {
       method: 'HEAD',

@@ -6,6 +6,7 @@ import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from '@shared/feature-flags.js';
+import { DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL } from '@shared/shared-context-runtime-config.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -35,6 +36,7 @@ const listSharedDocumentBindingsMock = vi.fn();
 const createSharedDocumentBindingMock = vi.fn();
 const fetchSharedContextRuntimeConfigMock = vi.fn();
 const updateSharedContextRuntimeConfigMock = vi.fn();
+const patchSharedContextMemorySettingsMock = vi.fn();
 const getPersonalCloudMemoryMock = vi.fn();
 const getEnterpriseSharedMemoryMock = vi.fn();
 const deletePersonalCloudMemoryMock = vi.fn();
@@ -69,12 +71,14 @@ vi.mock('../../src/api.js', () => ({
   createSharedDocumentBinding: (...args: unknown[]) => createSharedDocumentBindingMock(...args),
   fetchSharedContextRuntimeConfig: (...args: unknown[]) => fetchSharedContextRuntimeConfigMock(...args),
   updateSharedContextRuntimeConfig: (...args: unknown[]) => updateSharedContextRuntimeConfigMock(...args),
+  patchSharedContextMemorySettings: (...args: unknown[]) => patchSharedContextMemorySettingsMock(...args),
   getPersonalCloudMemory: (...args: unknown[]) => getPersonalCloudMemoryMock(...args),
   getEnterpriseSharedMemory: (...args: unknown[]) => getEnterpriseSharedMemoryMock(...args),
   deletePersonalCloudMemory: (...args: unknown[]) => deletePersonalCloudMemoryMock(...args),
   deleteEnterpriseSharedMemory: (...args: unknown[]) => deleteEnterpriseSharedMemoryMock(...args),
 }));
 
+import { ApiError } from '../../src/api.js';
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
 
 async function flush() {
@@ -208,6 +212,24 @@ describe('SharedContextManagementPanel', () => {
         defaultPrimaryContextModel: 'sonnet',
       },
     });
+    patchSharedContextMemorySettingsMock.mockImplementation(async (_serverId: string, _patch: Record<string, unknown>, legacyFallback?: Record<string, unknown>) => ({
+      snapshot: {
+        persisted: legacyFallback ?? {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          enablePersonalMemorySync: true,
+        },
+        effective: legacyFallback ?? {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          enablePersonalMemorySync: true,
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'claude-code-sdk',
+        defaultPrimaryContextModel: 'sonnet',
+      },
+    }));
     getPersonalCloudMemoryMock.mockResolvedValue({
       stats: {
         totalRecords: 2,
@@ -423,23 +445,28 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
 
+    expect(screen.queryByLabelText('sharedContext.management.processingPrimaryBackend: qwen')).toBeNull();
+    expect(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: agy-sdk').textContent).toBe('antigravity (agy-sdk)');
+    expect(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: opencode-sdk').textContent).toBe('opencode-sdk');
+
     const primaryBackend = screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk');
-    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen');
+    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend: agy-sdk');
     fireEvent.click(primaryBackend);
     fireEvent.click(backupBackend);
     await flush();
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('gemini-3.8-flash-low');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
     });
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
+      modelSelectionMode: 'manual',
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.4',
+      primaryContextModel: DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
       primaryContextPreset: undefined,
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen3-coder-plus',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -450,8 +477,42 @@ describe('SharedContextManagementPanel', () => {
       },
       enablePersonalMemorySync: false,
     }));
-    expect(screen.getAllByLabelText('model:codex-sdk:gpt-5.4').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('pre-fills memory processing with the Codex Luna primary and Claude Haiku backup when unconfigured', async () => {
+    const snapshot = {
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-6-luna',
+      primaryContextPreset: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+      enablePersonalMemorySync: false,
+    };
+    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: snapshot,
+        effective: snapshot,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+
+    expect(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk')).toBeDefined();
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
+    expect(screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk')).toBeDefined();
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('haiku');
   });
 
   it('loads and saves the message recall threshold from memory settings', async () => {
@@ -471,22 +532,28 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
     });
 
-    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
-      primaryContextBackend: 'claude-code-sdk',
-      primaryContextModel: 'sonnet',
-      primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
-      backupContextPreset: undefined,
-      memoryRecallMinScore: 0.36,
-      memoryScoringWeights: {
-        similarity: 0.4,
-        recency: 0.25,
-        frequency: 0.15,
-        project: 0.2,
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledWith(
+      'srv-1',
+      { memoryRecallMinScore: 0.36 },
+      {
+        modelSelectionMode: 'manual',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        primaryContextPreset: undefined,
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-6-luna',
+        backupContextPreset: undefined,
+        memoryRecallMinScore: 0.36,
+        memoryScoringWeights: {
+          similarity: 0.4,
+          recency: 0.25,
+          frequency: 0.15,
+          project: 0.2,
+        },
+        enablePersonalMemorySync: false,
       },
-      enablePersonalMemorySync: false,
-    }));
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
   });
 
   it('shows advanced scoring controls only after toggling and saves custom weights', async () => {
@@ -512,22 +579,35 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[1]);
     });
 
-    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
-      primaryContextBackend: 'claude-code-sdk',
-      primaryContextModel: 'sonnet',
-      primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
-      backupContextPreset: undefined,
-      memoryRecallMinScore: 0.4,
-      memoryScoringWeights: {
-        similarity: 0.4762,
-        recency: 0.1905,
-        frequency: 0.1429,
-        project: 0.1905,
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledWith(
+      'srv-1',
+      {
+        memoryScoringWeights: {
+          similarity: 0.4762,
+          recency: 0.1905,
+          frequency: 0.1429,
+          project: 0.1905,
+        },
       },
-      enablePersonalMemorySync: false,
-    }));
+      {
+        modelSelectionMode: 'manual',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        primaryContextPreset: undefined,
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-6-luna',
+        backupContextPreset: undefined,
+        memoryRecallMinScore: 0.4,
+        memoryScoringWeights: {
+          similarity: 0.4762,
+          recency: 0.1905,
+          frequency: 0.1429,
+          project: 0.1905,
+        },
+        enablePersonalMemorySync: false,
+      },
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
   });
 
   it('renders a shortened server label in the header but keeps the full server scope in processing details', async () => {
@@ -552,17 +632,46 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: agy-sdk'));
     });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gemini-3.8-flash-low');
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: opencode-sdk'));
+    });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('opencode/big-pickle');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: claude-code-sdk'));
+    });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('haiku');
   });
 
-  it('allows selecting a backup model directly from backend-specific chips', async () => {
+  it('forces Codex-backed memory processing without a preset to gpt-6-luna', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await waitFor(() => {
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
+    });
+
+    const primaryModel = await screen.findByLabelText('primary:model') as HTMLSelectElement;
+    expect(primaryModel.value).toBe(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
+    expect([...primaryModel.options].map((option) => option.value)).toContain('gpt-6-luna');
+    expect([...primaryModel.options].map((option) => option.value)).toContain('gpt-5.4');
+  });
+
+  it('allows selecting a backup model from the backend-specific dropdown', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
@@ -571,14 +680,11 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: agy-sdk'));
     });
-    const qwenChip = await screen.findByLabelText('model:qwen:qwen3-coder-plus');
-    await act(async () => {
-      fireEvent.click(qwenChip);
-    });
-
-    expect(qwenChip.getAttribute('aria-pressed')).toBe('true');
+    const agyModel = await screen.findByLabelText('backup:model') as HTMLSelectElement;
+    fireEvent.change(agyModel, { target: { value: 'gemini-4-hydrogen-high' } });
+    expect(agyModel.value).toBe('gemini-4-hydrogen-high');
   });
 
   it('preloads a backend-appropriate backup model as soon as the backup backend changes', async () => {
@@ -589,19 +695,31 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
 
-    expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'false')).toBe(true);
-
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
+    await waitFor(() => {
+      expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
     });
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk'));
+    });
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('haiku');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: agy-sdk'));
+    });
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('gemini-3.8-flash-low');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: opencode-sdk'));
+    });
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('opencode/big-pickle');
   });
 
-  it('loads qwen presets from ws and persists the selected preset with its derived model', async () => {
+  it('loads codex-sdk presets from ws, persists the selected preset with its derived model, and restores gpt-6-luna when cleared', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
+      connected: true,
       send(message: Record<string, unknown>) {
         sent.push(message);
       },
@@ -623,7 +741,7 @@ describe('SharedContextManagementPanel', () => {
         handler({
           type: 'cc.presets.list_response',
           presets: [
-            { name: 'Qwen Team', env: { ANTHROPIC_MODEL: 'qwen-team-model' } },
+            { name: 'Codex Team', env: { ANTHROPIC_MODEL: 'codex-team-model' } },
           ],
         });
       }
@@ -636,32 +754,91 @@ describe('SharedContextManagementPanel', () => {
     await flush();
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
     });
 
-    // Preset chip — the old `<select>` was replaced with a chip button labeled
-    // `{idPrefix}:preset:{name}` so the selector is discoverable and testable
-    // without needing combo-box semantics.
-    const presetChip = await screen.findByLabelText('primary:preset:Qwen Team');
+    const presetSelect = await screen.findByLabelText('primary:preset') as HTMLSelectElement;
+    fireEvent.input(presetSelect, { target: { value: 'Codex Team' } });
+    await waitFor(() => {
+      expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Codex Team');
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('codex-team-model');
+    });
+
+    const modelRequest = await waitFor(() => {
+      const request = sent.find((message) => (
+        message.type === 'transport.list_models'
+        && message.agentType === 'codex-sdk'
+        && message.ccPreset === 'Codex Team'
+      ));
+      expect(request).toBeDefined();
+      return request!;
+    });
     await act(async () => {
-      fireEvent.click(presetChip);
+      for (const handler of messageHandlers) {
+        handler({
+          type: 'transport.models_response',
+          requestId: modelRequest.requestId,
+          agentType: 'codex-sdk',
+          ccPreset: 'Codex Team',
+          models: [
+            { id: 'codex-team-model' },
+            { id: 'codex-team-model-v2' },
+          ],
+          defaultModel: 'codex-team-model',
+        });
+      }
     });
+    const primaryModel = screen.getByLabelText('primary:model') as HTMLSelectElement;
+    await waitFor(() => {
+      expect([...primaryModel.options].some((option) => option.value === 'codex-team-model-v2')).toBe(true);
+    });
+    fireEvent.input(primaryModel, { target: { value: 'codex-team-model-v2' } });
+    expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Codex Team');
 
-    // Clicking the preset chip should mark it active AND mirror the preset's
-    // ANTHROPIC_MODEL onto the built-in model highlight so the saved payload
-    // carries the correct model identifier.
-    expect(presetChip.getAttribute('aria-pressed')).toBe('true');
+    updateSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: {
+          modelSelectionMode: 'manual',
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'codex-team-model-v2',
+          primaryContextPreset: 'Codex Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+          enablePersonalMemorySync: false,
+        },
+        effective: {
+          modelSelectionMode: 'manual',
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'codex-team-model-v2',
+          primaryContextPreset: 'Codex Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+          enablePersonalMemorySync: false,
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
     });
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
-      primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen-team-model',
-      primaryContextPreset: 'Qwen Team',
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'codex-team-model-v2',
+      primaryContextPreset: 'Codex Team',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -672,6 +849,130 @@ describe('SharedContextManagementPanel', () => {
       },
       enablePersonalMemorySync: false,
     }));
+
+    // Clearing the preset on codex-sdk immediately forces the model back to gpt-6-luna.
+    fireEvent.input(screen.getByLabelText('primary:preset'), { target: { value: '' } });
+    await waitFor(() => {
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
+    });
+  });
+
+  it('preserves a persisted codex-sdk preset and custom model when HTTP snapshot resolves before WS presets arrive', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      connected: true,
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+    const presetSnapshot = {
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'codex-custom-model',
+      primaryContextPreset: 'Codex Team',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+      enablePersonalMemorySync: false,
+    };
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue({
+      snapshot: {
+        persisted: presetSnapshot,
+        effective: presetSnapshot,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    // Switch to Processing tab BEFORE cc.presets.list_response has arrived: HTTP snapshot resolves first,
+    // and persisted preset + custom model must remain intact while WS presets are still loading.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+    await flush();
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('codex-custom-model');
+
+    // Now WS presets arrive late containing the saved preset.
+    await act(async () => {
+      for (const handler of messageHandlers) {
+        handler({
+          type: 'cc.presets.list_response',
+          presets: [
+            { name: 'Codex Team', env: { ANTHROPIC_MODEL: 'codex-custom-model' } },
+          ],
+        });
+      }
+    });
+    expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Codex Team');
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('codex-custom-model');
+
+    // Save an unrelated setting in Memory tab -> sends narrow patch + preserves saved Codex preset and custom model.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    const savedPresetSnapshot = { ...presetSnapshot, memoryRecallMinScore: 0.45 };
+    patchSharedContextMemorySettingsMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: savedPresetSnapshot,
+        effective: savedPresetSnapshot,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    const thresholdInput = await screen.findByLabelText('sharedContext.management.memoryRecallThresholdLabel') as HTMLInputElement;
+    fireEvent.input(thresholdInput, { target: { value: '0.45', valueAsNumber: 0.45 } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledWith(
+      'srv-1',
+      { memoryRecallMinScore: 0.45 },
+      {
+        modelSelectionMode: 'manual',
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'codex-custom-model',
+        primaryContextPreset: 'Codex Team',
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-6-luna',
+        backupContextPreset: undefined,
+        memoryRecallMinScore: 0.45,
+        memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        enablePersonalMemorySync: false,
+      },
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // Once the server authoritatively responds with an updated list missing the deleted preset,
+    // cleanup drops the removed preset and resets codex-sdk back to gpt-6-luna.
+    await act(async () => {
+      for (const handler of messageHandlers) {
+        handler({
+          type: 'cc.presets.list_response',
+          presets: [],
+        });
+      }
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
   });
 
   it('loads local, cloud, and enterprise memory views and saves personal sync settings', async () => {
@@ -788,9 +1089,14 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(toggle);
     });
 
-    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', expect.objectContaining({
-      enablePersonalMemorySync: true,
-    })));
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledWith(
+      'srv-1',
+      { enablePersonalMemorySync: true },
+      expect.objectContaining({
+        enablePersonalMemorySync: true,
+      }),
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
   });
 
   it('auto-scopes personal memory to the selected project and explains cloud-only personal memory', async () => {
@@ -967,6 +1273,111 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabPreferences'));
     });
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
+  });
+
+  describe('a failed load names the request and its cause instead of a bare "API 404: not_found"', () => {
+    const notFound = () => new ApiError(404, 'not_found');
+    const makeWs = () => {
+      const sent: Array<Record<string, unknown>> = [];
+      return {
+        sent,
+        ws: {
+          send(message: Record<string, unknown>) { sent.push(message); },
+          onMessage() { return () => undefined; },
+        },
+      };
+    };
+
+    it('the memory tab keeps every section that loaded when the others answer 404 (older server / server the account does not own / left enterprise)', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      getEnterpriseSharedMemoryMock.mockRejectedValue(notFound());
+      const { ws, sent } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+
+      // Each failed request is its own line, in the cause's words, never the raw code.
+      await waitFor(() => {
+        const sections = [...document.querySelectorAll('[data-load-error]')].map((node) => node.getAttribute('data-load-error')).sort();
+        expect(sections).toEqual(['enterpriseMemory', 'runtimeConfig']);
+      });
+      expect(screen.getAllByText('sharedContext.management.loadError.not_found')).toHaveLength(2);
+      expect(document.body.textContent).not.toContain('API 404');
+      // The requests that did not fail still ran and rendered: the local query was sent
+      // and the personal cloud memory (called BEFORE the failing enterprise one) is on screen.
+      expect(sent.some((message) => message.type === MEMORY_WS.PERSONAL_QUERY)).toBe(true);
+      expect(getPersonalCloudMemoryMock).toHaveBeenCalled();
+      expect(document.querySelector('[data-load-error="cloudMemory"]')).toBeNull();
+    });
+
+    it('a failing personal cloud request does not stop the enterprise memory from loading', async () => {
+      getPersonalCloudMemoryMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      await waitFor(() => expect(document.querySelector('[data-load-error="cloudMemory"]')).not.toBeNull());
+      expect(document.querySelector('[data-load-error="enterpriseMemory"]')).toBeNull();
+    });
+
+    it('a load error is shown only on the tabs that display what failed', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.processing')); });
+      await waitFor(() => expect(document.querySelector('[data-load-error="runtimeConfig"]')).not.toBeNull());
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
+
+    it('a remembered enterprise the account no longer belongs to is replaced, not queried (it can only answer 404)', async () => {
+      getTeamMock.mockImplementation(async (id: string) => {
+        if (id === 'gone-team') throw notFound();
+        return { id, name: 'Acme', myRole: 'owner', members: [] };
+      });
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel enterpriseId="gone-team" serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      expect(getEnterpriseSharedMemoryMock.mock.calls.some((call) => call[0] === 'gone-team')).toBe(false);
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
+  });
+
+  it('shows local memory as unavailable instead of rendering zero counts', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage(handler: (message: unknown) => void) { handlers.add(handler); return () => handlers.delete(handler); },
+    };
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+    await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+    const query = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(query).toBeDefined();
+    await act(async () => {
+      for (const handler of handlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: query?.requestId,
+        stats: {
+          totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0,
+          durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0,
+          dirtyTargetCount: 0, pendingJobCount: 0, localUnavailable: true,
+        },
+        records: [], pendingRecords: [], projects: [],
+      });
+    });
+    expect(await screen.findByText('sharedContext.management.memoryLocalStatusUnavailable')).toBeDefined();
+    const processedTab = screen.getByText('sharedContext.management.memoryTabLocalProcessed').closest('button');
+    expect(processedTab?.querySelector('span')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryProcessedEmptyPending')).toBeNull();
   });
 
   it('surfaces manual memory save validation instead of silently ignoring clicks', async () => {
@@ -1740,5 +2151,505 @@ describe('SharedContextManagementPanel', () => {
     });
   });
 
+  it('toggles Auto and Manual model selection mode, switches to Manual on manual edits, and preserves Auto across personal sync toggles', async () => {
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue({
+      snapshot: {
+        persisted: {
+          modelSelectionMode: 'auto',
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'gpt-6-luna',
+          primaryContextPreset: undefined,
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        effective: {
+          modelSelectionMode: 'auto',
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'gpt-6-luna',
+          primaryContextPreset: undefined,
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    // Toggling personal memory sync on the Memory tab must preserve modelSelectionMode: 'auto'.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
+    });
+    const toggle = await screen.findByRole('switch');
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-1',
+      { enablePersonalMemorySync: true },
+      expect.objectContaining({
+        modelSelectionMode: 'auto',
+        enablePersonalMemorySync: true,
+      }),
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // Switch to Processing tab and verify Auto mode UI state.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    const autoBtn = await screen.findByLabelText('sharedContext.management.processingModeAuto');
+    const manualBtn = screen.getByLabelText('sharedContext.management.processingModeManual');
+    expect(autoBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(manualBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(screen.getByText('sharedContext.management.processingModeAutoHint')).toBeDefined();
+
+    // Selecting a different primary backend automatically switches the mode to 'manual'.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: claude-code-sdk'));
+    });
+    expect(manualBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(autoBtn.getAttribute('aria-pressed')).toBe('false');
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenLastCalledWith('srv-1', expect.objectContaining({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+    })));
+
+    // Clicking Auto switches back to 'auto' and persists 'auto'.
+    await act(async () => {
+      fireEvent.click(autoBtn);
+    });
+    expect(autoBtn.getAttribute('aria-pressed')).toBe('true');
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenLastCalledWith('srv-1', expect.objectContaining({
+      modelSelectionMode: 'auto',
+    })));
+  });
+
+  it('does not submit uncommitted Manual model edits when saving personal sync, recall threshold, or scoring weights, and preserves Manual codex-sdk gpt-5.4', async () => {
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue({
+      snapshot: {
+        persisted: {
+          modelSelectionMode: 'auto',
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'MiniMax-M2.7',
+          primaryContextPreset: 'Claude Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        effective: {
+          modelSelectionMode: 'auto',
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'MiniMax-M2.7',
+          primaryContextPreset: 'Claude Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          backupContextPreset: undefined,
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    updateSharedContextRuntimeConfigMock.mockImplementation(async (_serverId: string, payload: Record<string, unknown>) => ({
+      snapshot: {
+        persisted: payload,
+        effective: payload,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    }));
+
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    // Edit model draft to Manual Codex gpt-5.4 (primary & backup), WITHOUT clicking Processing Save.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: codex-sdk'));
+    });
+    const primaryModelSelect = await screen.findByLabelText('primary:model');
+    const backupModelSelect = await screen.findByLabelText('backup:model');
+    await act(async () => {
+      fireEvent.input(primaryModelSelect, { target: { value: 'gpt-5.4' } });
+      fireEvent.input(backupModelSelect, { target: { value: 'gpt-5.6' } });
+    });
+    expect((screen.getByLabelText('sharedContext.management.processingModeManual')).getAttribute('aria-pressed')).toBe('true');
+
+    // Switch to Memory tab and save all 3 memory controls -> must keep persisted Auto + Claude Team preset!
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
+    });
+    const toggle = await screen.findByRole('switch');
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-1',
+      { enablePersonalMemorySync: true },
+      expect.objectContaining({
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'MiniMax-M2.7',
+        primaryContextPreset: 'Claude Team',
+        enablePersonalMemorySync: true,
+      }),
+    ));
+
+    const thresholdInput = screen.getByLabelText('sharedContext.management.memoryRecallThresholdLabel') as HTMLInputElement;
+    fireEvent.input(thresholdInput, { target: { value: '0.52', valueAsNumber: 0.52 } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-1',
+      { memoryRecallMinScore: 0.52 },
+      expect.objectContaining({
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'MiniMax-M2.7',
+        primaryContextPreset: 'Claude Team',
+        memoryRecallMinScore: 0.52,
+      }),
+    ));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryAdvancedScoringShow'));
+    });
+    const simInput = await screen.findByLabelText('sharedContext.management.memoryWeightSimilarity') as HTMLInputElement;
+    fireEvent.input(simInput, { target: { value: '0.5', valueAsNumber: 0.5 } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[1]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-1',
+      {
+        memoryScoringWeights: expect.objectContaining({
+          similarity: expect.any(Number),
+        }),
+      },
+      expect.objectContaining({
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'MiniMax-M2.7',
+        primaryContextPreset: 'Claude Team',
+      }),
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // Returning to Processing tab still shows the uncommitted Manual gpt-5.4/gpt-5.6 draft, and saving it sends Manual + gpt-5.4/gpt-5.6!
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    expect((screen.getByLabelText('sharedContext.management.processingModeManual')).getAttribute('aria-pressed')).toBe('true');
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-5.4');
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('gpt-5.6');
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenLastCalledWith('srv-1', expect.objectContaining({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
+    })));
+  });
+
+  it('blocks memory-side saves while runtime config GET is pending or failed, then enables and preserves persisted Manual + preset once loaded', async () => {
+    const manualSnapshot = {
+      snapshot: {
+        persisted: {
+          modelSelectionMode: 'manual',
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'MiniMax-M2.7',
+          primaryContextPreset: 'Claude Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        effective: {
+          modelSelectionMode: 'manual',
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'MiniMax-M2.7',
+          primaryContextPreset: 'Claude Team',
+          backupContextBackend: 'codex-sdk',
+          backupContextModel: 'gpt-6-luna',
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.45,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    };
+    let resolvePending!: (value: unknown) => void;
+    fetchSharedContextRuntimeConfigMock.mockImplementation(() => new Promise((resolve) => {
+      resolvePending = resolve;
+    }));
+
+    const { rerender } = render(<SharedContextManagementPanel serverId="srv-1" />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryAdvancedScoringShow'));
+    });
+
+    // 1. While initial GET is pending: both recall threshold and weights save buttons are disabled and emit no PUTs.
+    const pendingSaveButtons = screen.getAllByText('sharedContext.management.processingSave') as HTMLButtonElement[];
+    expect(pendingSaveButtons).toHaveLength(2);
+    expect(pendingSaveButtons[0].disabled).toBe(true);
+    expect(pendingSaveButtons[1].disabled).toBe(true);
+    await act(async () => {
+      fireEvent.click(pendingSaveButtons[0]);
+      fireEvent.click(pendingSaveButtons[1]);
+    });
+    expect(patchSharedContextMemorySettingsMock).not.toHaveBeenCalled();
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // 2. Resolve srv-1 GET, then switch to srv-2 with a failing GET -> clears stale snapshot and keeps saves blocked.
+    await act(async () => {
+      resolvePending(manualSnapshot);
+    });
+    await flush();
+
+    fetchSharedContextRuntimeConfigMock.mockRejectedValue(new Error('network_down'));
+    await act(async () => {
+      rerender(<SharedContextManagementPanel serverId="srv-2" />);
+    });
+    await flush();
+
+    const failedSaveButtons = screen.getAllByText('sharedContext.management.processingSave') as HTMLButtonElement[];
+    expect(failedSaveButtons).toHaveLength(2);
+    expect(failedSaveButtons[0].disabled).toBe(true);
+    expect(failedSaveButtons[1].disabled).toBe(true);
+    await act(async () => {
+      fireEvent.click(failedSaveButtons[0]);
+      fireEvent.click(failedSaveButtons[1]);
+    });
+    expect(patchSharedContextMemorySettingsMock).not.toHaveBeenCalled();
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // 3. Recover on srv-2 -> saving recall and weights sends narrow single-field patches without model fields.
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue(manualSnapshot);
+    patchSharedContextMemorySettingsMock.mockResolvedValue(manualSnapshot);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await flush();
+
+    const enabledSaveButtons = screen.getAllByText('sharedContext.management.processingSave') as HTMLButtonElement[];
+    expect(enabledSaveButtons).toHaveLength(2);
+    expect(enabledSaveButtons[0].disabled).toBe(false);
+    expect(enabledSaveButtons[1].disabled).toBe(false);
+    await act(async () => {
+      fireEvent.click(enabledSaveButtons[0]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-2',
+      { memoryRecallMinScore: 0.45 },
+      expect.objectContaining({
+        modelSelectionMode: 'manual',
+        primaryContextPreset: 'Claude Team',
+      }),
+    ));
+    await act(async () => {
+      fireEvent.click(enabledSaveButtons[1]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenLastCalledWith(
+      'srv-2',
+      {
+        memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+      },
+      expect.objectContaining({
+        modelSelectionMode: 'manual',
+        primaryContextPreset: 'Claude Team',
+      }),
+    ));
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('sends only the changed memory setting from a stale Manual snapshot so concurrent Auto + preset writes are preserved and synced back', async () => {
+    // Client A loads Manual + Old Preset initially.
+    const initialStaleManual = {
+      snapshot: {
+        persisted: {
+          modelSelectionMode: 'manual' as const,
+          primaryContextBackend: 'claude-code-sdk' as const,
+          primaryContextModel: 'sonnet',
+          primaryContextPreset: 'Old Preset',
+          backupContextBackend: 'codex-sdk' as const,
+          backupContextModel: 'gpt-6-luna',
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        effective: {
+          modelSelectionMode: 'manual' as const,
+          primaryContextBackend: 'claude-code-sdk' as const,
+          primaryContextModel: 'sonnet',
+          primaryContextPreset: 'Old Preset',
+          backupContextBackend: 'codex-sdk' as const,
+          backupContextModel: 'gpt-6-luna',
+          enablePersonalMemorySync: false,
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+        },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk' as const,
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    };
+    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce(initialStaleManual);
+
+    // Client B has concurrently updated the server to Auto + Current Preset.
+    let serverPersisted: Record<string, unknown> = {
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M2.7',
+      primaryContextPreset: 'Current Preset',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-6-luna',
+      enablePersonalMemorySync: false,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+    };
+    patchSharedContextMemorySettingsMock.mockImplementation(async (_serverId: string, patch: Record<string, unknown>) => {
+      serverPersisted = { ...serverPersisted, ...patch };
+      return {
+        snapshot: {
+          persisted: serverPersisted,
+          effective: serverPersisted,
+          envPrimaryOverrideActive: false,
+          envBackupOverrideActive: false,
+          defaultPrimaryContextBackend: 'codex-sdk',
+          defaultPrimaryContextModel: 'gpt-6-luna',
+        },
+      };
+    });
+
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
+    });
+    const getsBeforeMemorySaves = fetchSharedContextRuntimeConfigMock.mock.calls.length;
+
+    // Save 1: toggle enablePersonalMemorySync -> sends ONLY { enablePersonalMemorySync: true }.
+    const toggle = await screen.findByRole('switch');
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledTimes(1));
+    expect(patchSharedContextMemorySettingsMock.mock.calls[0]?.[1]).toEqual({ enablePersonalMemorySync: true });
+    expect(serverPersisted).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextPreset: 'Current Preset',
+      enablePersonalMemorySync: true,
+    });
+
+    // Save 2: recall threshold -> sends ONLY { memoryRecallMinScore: 0.58 }.
+    const thresholdInput = screen.getByLabelText('sharedContext.management.memoryRecallThresholdLabel') as HTMLInputElement;
+    fireEvent.input(thresholdInput, { target: { value: '0.58', valueAsNumber: 0.58 } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledTimes(2));
+    expect(patchSharedContextMemorySettingsMock.mock.calls[1]?.[1]).toEqual({ memoryRecallMinScore: 0.58 });
+    expect(serverPersisted).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextPreset: 'Current Preset',
+      memoryRecallMinScore: 0.58,
+    });
+
+    // Save 3: scoring weights -> sends ONLY { memoryScoringWeights: ... }.
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryAdvancedScoringShow'));
+    });
+    const simInput = await screen.findByLabelText('sharedContext.management.memoryWeightSimilarity') as HTMLInputElement;
+    fireEvent.input(simInput, { target: { value: '0.5', valueAsNumber: 0.5 } });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[1]);
+    });
+    await waitFor(() => expect(patchSharedContextMemorySettingsMock).toHaveBeenCalledTimes(3));
+    expect(Object.keys(patchSharedContextMemorySettingsMock.mock.calls[2]?.[1] as Record<string, unknown>)).toEqual(['memoryScoringWeights']);
+    expect(serverPersisted).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextPreset: 'Current Preset',
+      memoryRecallMinScore: 0.58,
+    });
+    expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
+
+    // Verify no spurious extra GET happened and switching back to Processing reflects the server's merged Auto + Current Preset.
+    expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledTimes(getsBeforeMemorySaves);
+    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: serverPersisted,
+        effective: serverPersisted,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await flush();
+    expect((await screen.findByLabelText('sharedContext.management.processingModeAuto')).getAttribute('aria-pressed')).toBe('true');
+  });
 
 });

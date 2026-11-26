@@ -1,0 +1,1117 @@
+/**
+ * One-line install command — real PostgreSQL (testcontainers via integration-global).
+ *
+ * Covers the short install code end to end: minting, the script the pasted
+ * command fetches, the code working as a download credential, and the refusals
+ * that keep a URL-borne credential from being probed or outliving its ticket.
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import { execFile, execFileSync } from 'node:child_process';
+import { writeFile, mkdtemp, rm, chmod, readFile, symlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { randomBytes, createHash } from 'node:crypto';
+import { createDatabase, type Database } from '../src/db/client.js';
+import { runMigrations } from '../src/db/migrate.js';
+import { createUser } from '../src/db/queries.js';
+import {
+  controlledNodeInstallCommandRoutes,
+  createControlledNodeInstallCommandRoutes,
+} from '../src/routes/controlled-node-install.js';
+import { createArtifactCatalog } from '../src/services/controlled-node-artifact-catalog.js';
+import {
+  CONTROLLED_NODE_INSTALL_CODE_ALPHABET,
+  CONTROLLED_NODE_INSTALL_CODE_LENGTH,
+  CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_MAX_CONSUMES,
+  CONTROLLED_NODE_TICKET_TTL_MS,
+  isControlledNodeInstallCode,
+  normalizeControlledNodeInstallCode,
+} from '../../shared/controlled-node-artifacts.js';
+import {
+  controlledNodeInstallCommand,
+  renderControlledNodeInstallScript,
+} from '../src/services/controlled-node-install-command.js';
+
+let db: Database;
+const hex = (n: number) => randomBytes(n).toString('hex');
+const sha256 = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
+const SERVER_URL = 'https://im.example.test';
+const WINDOWS_SIGNER_SHA256 = '5aedf20057238b95a27f714a1c8d7b038f42a0233189625d2f2c1fa251870b9a';
+const WINDOWS_ARTIFACT = Buffer.from('signed-windows-artifact-fixture');
+
+beforeAll(async () => {
+  db = createDatabase(process.env.TEST_DATABASE_URL!);
+  await runMigrations(db);
+});
+afterAll(async () => { await db.close(); });
+
+function buildApp(routes = controlledNodeInstallCommandRoutes) {
+  const app = new Hono();
+  app.use('*', async (c, next) => {
+    (c as unknown as { env: Record<string, unknown> }).env = {
+      DB: db, SERVER_URL, NODE_ENV: 'production',
+    };
+    await next();
+  });
+  app.route('/i', routes);
+  return app;
+}
+
+async function windowsArtifactFixture(input: {
+  signerSha256?: string;
+} = {}): Promise<{ dir: string; sha256: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'imcodes-install-command-win-'));
+  const filename = 'imcodes-node.exe';
+  await writeFile(join(dir, filename), WINDOWS_ARTIFACT);
+  await writeFile(join(dir, `${filename}.manifest.json`), JSON.stringify({
+    schemaVersion: 1,
+    artifact: {
+      fileName: filename,
+      os: 'win32',
+      arch: 'x64',
+      size: WINDOWS_ARTIFACT.length,
+      sha256: sha256(WINDOWS_ARTIFACT),
+      ...(input.signerSha256 === undefined
+        ? { authenticodeSignerSha256: WINDOWS_SIGNER_SHA256 }
+        : input.signerSha256
+          ? { authenticodeSignerSha256: input.signerSha256 }
+          : {}),
+    },
+    build: { version: '2026.8.3752-dev.4196' },
+  }));
+  return { dir, sha256: sha256(WINDOWS_ARTIFACT) };
+}
+
+/** Seed an enrolment addressable by a known install code. */
+async function seedInstallCode(opts: {
+  code: string; os?: string; arch?: string; expiresInMs?: number; revoked?: boolean;
+  artifactSha256?: string;
+}): Promise<void> {
+  const now = Date.now();
+  const ownerUserId = `u_${hex(4)}`;
+  await createUser(db, ownerUserId);
+  await db.execute(
+    `INSERT INTO controlled_node_enrollments_v2
+       (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+        encrypted_code, consumed_count, max_consumes, ticket_expires_at,
+        expires_at, reusable, created_at, install_code_hash, revoked_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'test-only', 0, $7, $8, NULL, TRUE, $9, $10, $11)`,
+    [
+      sha256(hex(16)), sha256(hex(16)), ownerUserId,
+      opts.os ?? 'linux', opts.arch ?? 'x64', opts.artifactSha256 ?? sha256(hex(32)),
+      CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
+      now + (opts.expiresInMs ?? 60_000), now,
+      sha256(opts.code), opts.revoked ? now : null,
+    ],
+  );
+}
+
+function freshCode(): string {
+  let out = '';
+  for (let i = 0; i < CONTROLLED_NODE_INSTALL_CODE_LENGTH; i++) {
+    out += CONTROLLED_NODE_INSTALL_CODE_ALPHABET[i % CONTROLLED_NODE_INSTALL_CODE_ALPHABET.length];
+  }
+  // Vary the tail so parallel cases cannot collide on the unique index.
+  return out.slice(0, -4) + hex(2).toUpperCase().replace(/[ILOU]/g, '2');
+}
+
+describe('install code shape', () => {
+  it('omits the characters that are misread when dictated or retyped', () => {
+    for (const ambiguous of ['I', 'L', 'O', 'U']) {
+      expect(CONTROLLED_NODE_INSTALL_CODE_ALPHABET).not.toContain(ambiguous);
+    }
+  });
+
+  it('folds the mistakes those omissions invite', () => {
+    const code = freshCode();
+    expect(normalizeControlledNodeInstallCode(code.toLowerCase())).toBe(code);
+    // l→1, O→0 and a stray separator are all recoverable rather than fatal.
+    const typo = code.replace(/1/g, 'l').replace(/0/g, 'O');
+    expect(normalizeControlledNodeInstallCode(typo)).toBe(code);
+    expect(normalizeControlledNodeInstallCode(` ${code} `)).toBe(code);
+  });
+
+  it('rejects anything that is not exactly a code', () => {
+    expect(isControlledNodeInstallCode('')).toBe(false);
+    expect(isControlledNodeInstallCode('SHORT')).toBe(false);
+    expect(normalizeControlledNodeInstallCode('../../etc/passwd')).toBeNull();
+    expect(normalizeControlledNodeInstallCode(`${freshCode()}X`)).toBeNull();
+  });
+});
+
+describe('rendered installer script', () => {
+  const code = freshCode();
+
+  it('survives a truncated pipe by invoking on the last line', () => {
+    for (const os of ['linux', 'mac', 'win'] as const) {
+      const { body } = renderControlledNodeInstallScript({
+        serverUrl: SERVER_URL, installCode: code, os, arch: 'x64',
+        ...(os === 'win' ? { windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256 } : {}),
+      });
+      const invocation = os === 'win' ? 'Invoke-ImcodesInstall' : 'imcodes_install';
+      const lines = body.trimEnd().split('\n');
+      expect(lines[lines.length - 1]!.trim()).toBe(invocation);
+      // Defined before it is called: a cut-off download never reaches the call.
+      expect(body.indexOf(`function ${invocation}`) >= 0 || body.indexOf(`${invocation}() {`) >= 0).toBe(true);
+    }
+  });
+
+  it('elevates rather than telling the operator to start over', () => {
+    const posix = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'linux', arch: 'x64',
+    }).body;
+    expect(posix).toContain('id -u');
+    expect(posix).toContain('sudo sh');
+
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+    expect(win).toContain('-Verb RunAs');
+    // The new console must not close over the result before it can be read.
+    expect(win).toContain('-NoExit');
+    // A freshly downloaded exe is blocked by the Mark of the Web otherwise.
+    expect(win).toContain('Unblock-File');
+  });
+
+  it('installs and validates the ticket-bound self-signed publisher before executing the SEA', () => {
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL,
+      installCode: code,
+      os: 'win',
+      arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+
+    expect(win).toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    expect(win).toContain("$anchorStoreNames = @('TrustedPeople', 'TrustedPublisher')");
+    expect(win).toContain("foreach ($requiredStoreName in @('TrustedPeople', 'TrustedPublisher'))");
+    expect(win).toContain('Test-AnchoredCertificateInStore $requiredStoreName');
+    expect(win).toContain("throw ('release publisher trust installation did not anchor ' + $requiredStoreName)");
+    expect(win).toContain('X509Certificates.OpenFlags]::ReadWrite');
+    expect(win).toContain('SignatureStatus]::Valid');
+    expect(win).toContain("throw 'release signer does not match the compiled trust anchor'");
+    expect(win).toContain("throw 'release signer is not valid for code signing'");
+    expect(win).not.toContain('LocalMachine\\Root');
+
+    const unblock = win.indexOf('Unblock-File -LiteralPath $binary');
+    const signerPin = win.indexOf(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    const finalValidation = win.indexOf('$trusted = Get-AuthenticodeSignature');
+    const execute = win.indexOf('& $binary');
+    expect(unblock).toBeGreaterThan(-1);
+    expect(signerPin).toBeGreaterThan(unblock);
+    expect(finalValidation).toBeGreaterThan(signerPin);
+    expect(execute).toBeGreaterThan(finalValidation);
+  });
+
+  it('fails closed when a Windows signer pin is absent or non-canonical', () => {
+    const base = { serverUrl: SERVER_URL, installCode: code, os: 'win' as const, arch: 'x64' as const };
+    expect(() => renderControlledNodeInstallScript(base)).toThrow('invalid_windows_release_signer_sha256');
+    expect(() => renderControlledNodeInstallScript({
+      ...base,
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256.toUpperCase(),
+    })).toThrow('invalid_windows_release_signer_sha256');
+  });
+
+  /**
+   * The curl protocol flag must follow the scheme the URL policy allowed.
+   *
+   * `server-url.ts` deliberately admits loopback HTTP for development, but the
+   * script hardcoded `--proto '=https'`, which makes curl refuse outright with
+   * `Protocol "http" disabled`. The mint→download integration test cannot catch
+   * this: it calls the endpoints directly and never executes the shell.
+   */
+  it('pins curl to the scheme the origin actually uses', () => {
+    const https = renderControlledNodeInstallScript({
+      serverUrl: 'https://im.example.test', installCode: code, os: 'linux', arch: 'x64',
+    }).body;
+    expect(https).toContain("--proto '=https' --proto-redir '=https' --tlsv1.2");
+    expect(https).not.toContain("--proto '=http'");
+    // wget is the fallback when curl is absent and follows redirects too.
+    // `--https-only` only constrains recursive link following (no `-r` here),
+    // so it must NOT be relied on; `--max-redirect=0` is the real guarantee and
+    // applies to loopback HTTP as well, since our routes never redirect.
+    expect(https).not.toContain('--https-only');
+    expect(https).toContain('--max-redirect=0');
+    expect(https).toContain("grep -q -- '--max-redirect'");
+
+    for (const loopback of ['http://localhost', 'http://127.0.0.1:8787']) {
+      const body = renderControlledNodeInstallScript({
+        serverUrl: loopback, installCode: code, os: 'linux', arch: 'x64',
+      }).body;
+      const curlLines = body.split('\n').filter((line) => line.trimStart().startsWith('curl -fsSL'));
+      expect(curlLines.length).toBeGreaterThanOrEqual(3);
+      // Payload fetch and same-origin loopback HTTP download must pin http (otherwise curl aborts with Protocol "http" disabled).
+      expect(curlLines[0]).toContain("--proto '=http' --proto-redir '=http'");
+      expect(curlLines[0]).not.toContain("--proto '=https'");
+      expect(curlLines[0]).not.toContain('--tlsv1.2');
+      // External HTTPS artifact download MUST ALWAYS pin https/proto-redir=https regardless of origin scheme.
+      const httpsArtifactCurl = curlLines.find((line) => line.includes('--max-redirs 5'));
+      expect(httpsArtifactCurl).toBeDefined();
+      expect(httpsArtifactCurl).toContain("--proto '=https' --proto-redir '=https' --tlsv1.2");
+      const httpArtifactCurl = curlLines.find((line) => line.includes('--max-redirs 0') && line !== curlLines[0]);
+      expect(httpArtifactCurl).toBeDefined();
+      expect(httpArtifactCurl).toContain("--proto '=http' --proto-redir '=http'");
+      expect(httpArtifactCurl).not.toContain("--proto '=https'");
+      // The redirect pin is scheme-independent: our routes never redirect.
+      expect(body).not.toContain('--https-only');
+      expect(body).toContain('--max-redirect=0');
+      expect(body).toContain(loopback);
+    }
+  });
+
+  it('refuses to render anything it has not validated', () => {
+    expect(() => renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: "X'; rm -rf /", os: 'linux', arch: 'x64',
+    })).toThrow('invalid_controlled_node_install_code');
+    expect(() => renderControlledNodeInstallScript({
+      serverUrl: 'https://evil.test/x?a=1', installCode: code, os: 'linux', arch: 'x64',
+    })).toThrow('invalid_controlled_node_install_server_url');
+    expect(() => controlledNodeInstallCommand('http://plain.test', code, 'linux'))
+      .toThrow('invalid_controlled_node_install_server_url');
+  });
+
+  it('names the platform it was minted for, so a wrong paste is caught', () => {
+    const linux = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'linux', arch: 'x64',
+    }).body;
+    expect(linux).toContain("imcodes_expect_os='linux'");
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'arm64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+    expect(win).toContain("$expectArch = 'ARM64'");
+  });
+
+  it('keeps install-payload pinned to 0 redirects while allowing bounded HTTPS-only redirects for external artifact downloads', () => {
+    for (const originUrl of [SERVER_URL, 'http://127.0.0.1:8787']) {
+      const linux = renderControlledNodeInstallScript({
+        serverUrl: originUrl, installCode: code, os: 'linux', arch: 'x64',
+      }).body;
+      expect(linux).toContain('curl -fsSL --max-redirs 0');
+      expect(linux).toContain("curl -fsSL --max-redirs 5 --proto '=https' --proto-redir '=https' --tlsv1.2");
+      expect(linux).not.toContain('--max-redirect=5');
+      expect(linux).toContain('imcodes_download_https_wget');
+      expect(linux).toContain('wget -S --max-redirect=0');
+      expect(linux).toContain('imcodes_check_https_url');
+    }
+
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+    expect(win).toContain('-Method Post -Body @{ ticket = $code } -UseBasicParsing -MaximumRedirection 0');
+    expect(win).toContain('[Uri]::TryCreate');
+    expect(win).toContain('$artifactUri.UserInfo');
+    expect(win).toContain("if ($nextUri.Scheme -cne 'https')");
+    expect(win).toContain('if ($nextUri.UserInfo)');
+    expect(win).toContain('if ($hop -ge 5)');
+  });
+});
+
+describe('GET /i/:code', () => {
+  it('serves a shell script for a live posix code', async () => {
+    const app = buildApp();
+    const code = freshCode();
+    await seedInstallCode({ code, os: 'linux' });
+
+    const res = await app.request(`/i/${code}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('imcodes_install');
+    expect(body).toContain(code);
+    expect(res.headers.get('cache-control')).toContain('no-store');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+  });
+
+  it('serves PowerShell for a windows code', async () => {
+    const fixture = await windowsArtifactFixture();
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain('Invoke-ImcodesInstall');
+      expect(body).toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('binds the rendered trust pin to the verified manifest signer, not a server constant', async () => {
+    const alternateSigner = 'd'.repeat(64);
+    const fixture = await windowsArtifactFixture({ signerSha256: alternateSigner });
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain(`$expected = '${alternateSigner}'`);
+      expect(body).not.toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses Windows scripts when the ticket SHA cannot bind the verified artifact', async () => {
+    const fixture = await windowsArtifactFixture();
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: 'f'.repeat(64) });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('not found\n');
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['missing', ''],
+    ['malformed', 'g'.repeat(64)],
+  ])('refuses Windows scripts with a %s manifest signer', async (_label, signerSha256) => {
+    const fixture = await windowsArtifactFixture({ signerSha256 });
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('not found\n');
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts the code as it would be retyped', async () => {
+    const app = buildApp();
+    const code = freshCode();
+    await seedInstallCode({ code, os: 'linux' });
+    const res = await app.request(`/i/${code.toLowerCase()}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('answers unknown, expired and revoked identically', async () => {
+    const app = buildApp();
+    const expired = freshCode();
+    const revoked = freshCode();
+    await seedInstallCode({ code: expired, expiresInMs: -1_000 });
+    await seedInstallCode({ code: revoked, revoked: true });
+
+    for (const code of [freshCode(), expired, revoked, 'not-a-code']) {
+      const res = await app.request(`/i/${code}`);
+      expect(res.status, `${code} must be indistinguishable`).toBe(404);
+      expect(await res.text()).toBe('not found\n');
+    }
+  });
+
+  it('does not consume the ticket, so probing cannot exhaust it', async () => {
+    const app = buildApp();
+    const code = freshCode();
+    await seedInstallCode({ code });
+    for (let i = 0; i < 5; i++) expect((await app.request(`/i/${code}`)).status).toBe(200);
+    const row = await db.queryOne<{ consumed_count: number }>(
+      'SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE install_code_hash = $1',
+      [sha256(code)],
+    );
+    expect(row?.consumed_count).toBe(0);
+  });
+});
+
+describe('delivery budget', () => {
+  it('gives the pasted command a lifetime and budget matching a fleet', () => {
+    const oneLiner = CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND;
+    const browser = CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
+    expect(CONTROLLED_NODE_TICKET_TTL_MS[oneLiner])
+      .toBeGreaterThan(CONTROLLED_NODE_TICKET_TTL_MS[browser]);
+    expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[oneLiner])
+      .toBeGreaterThan(CONTROLLED_NODE_TICKET_MAX_CONSUMES[browser]);
+    // Bounded, not unlimited: a leaked command cannot mint entries without end.
+    expect(Number.isFinite(CONTROLLED_NODE_TICKET_MAX_CONSUMES[oneLiner])).toBe(true);
+  });
+});
+
+
+/**
+ * Execute the generated installer for real against a loopback HTTP origin.
+ *
+ * The script-contract test above asserts which curl flags are emitted. This one
+ * asserts the flags actually work, which is the property that broke: the
+ * renderer emitted `--proto '=https'` for an origin the URL policy explicitly
+ * admits over plain HTTP, and curl aborts such a request with
+ * `Protocol "http" disabled` before it is ever sent. Neither the unit tests nor
+ * the mint→download integration test can see that, because both call the
+ * endpoints directly and never run the shell.
+ *
+ * `id` and `uname` are shimmed so a non-root macOS runner can exercise the
+ * download path; nothing else about the script is altered.
+ */
+/**
+ * The COPIED command is executed by a root shell, so its transport is part of
+ * the security boundary. `-L` without a protocol restriction follows an
+ * HTTPS→HTTP redirect and pipes cleartext into `sudo sh`; the inner download
+ * was pinned while this outer command was not, so the two drifted apart.
+ *
+ * The redirect refusal is proven executably here using an HTTP origin
+ * redirecting to HTTPS. That exercises the exact mechanism (`--proto-redir`
+ * rejecting a cross-scheme redirect) with no TLS server to stand up, and the
+ * scheme-specific values are pinned by contract alongside it.
+ */
+/**
+ * wget is a production fallback, so its redirect behaviour is part of the same
+ * security contract as curl's — and a string assertion cannot establish it.
+ * `--https-only` was accepted for a while precisely because only its presence
+ * was checked.
+ *
+ * Skipped where wget is absent (this developer host) and executed where it is
+ * present (CI's ubuntu runner), rather than asserting a behaviour nobody runs.
+ */
+function gnuWgetAvailable(): boolean {
+  try {
+    return execFileSync('sh', ['-c', "command -v wget >/dev/null 2>&1 && wget --help 2>&1 | grep -q -- '--max-redirect'"],
+      { timeout: 10_000 }) !== undefined;
+  } catch { return false; }
+}
+
+describe.skipIf(!gnuWgetAvailable())('wget fallback refuses redirects', () => {
+  let redirector: Server;
+  let origin: string;
+
+  beforeAll(async () => {
+    redirector = createServer((_req, res) => {
+      res.writeHead(302, { location: 'http://127.0.0.1:1/elsewhere', connection: 'close' });
+      res.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const a = redirector.address();
+    origin = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+  afterAll(async () => {
+    await new Promise<void>((resolve) => redirector.close(() => resolve()));
+  });
+
+  it('does not follow a redirect when pinned, and would without the pin', async () => {
+    const run = (cmd: string) => new Promise<number>((resolve) => {
+      execFile('sh', ['-c', cmd], { timeout: 20_000 }, (error) => resolve(error ? 1 : 0));
+    });
+    // Pinned: refuses at the 302 itself.
+    expect(await run(`wget -q --max-redirect=0 -O /dev/null ${origin}/start`)).toBe(1);
+    // Unpinned: follows the 302 and fails only at the unreachable target, which
+    // is a different failure — proving the pin is what stops it above.
+    const unpinnedStderr = await new Promise<string>((resolve) => {
+      execFile('sh', ['-c', `wget -O /dev/null ${origin}/start 2>&1 || true`], { timeout: 20_000 },
+        (_e, out) => resolve(String(out)));
+    });
+    expect(unpinnedStderr).toContain('127.0.0.1:1');
+  }, 40_000);
+});
+
+describe('the copied one-liner pins its own transport', () => {
+  let redirector: Server;
+  let httpOrigin: string;
+  let redirectTargetPort = 0;
+
+  beforeAll(async () => {
+    // Redirects cross-scheme, to https on this same plain-HTTP listener.
+    //
+    // The unpinned counterfactual therefore does NOT retrieve a payload — it
+    // dies in the TLS handshake. That is deliberate and the assertions below
+    // claim only what it proves: the two cases fail for DIFFERENT reasons, so
+    // the pinned failure is attributable to the protocol pin rather than to the
+    // redirect being broken. Proving retrieval would need a trusted TLS
+    // fixture, and adding `-k` to accept a self-signed certificate would change
+    // the very command under test.
+    redirector = createServer((_req, res) => {
+      res.writeHead(302, { location: `https://127.0.0.1:${redirectTargetPort}/followed`, connection: 'close' });
+      res.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const address = redirector.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    httpOrigin = `http://127.0.0.1:${port}`;
+    // Same server, http scheme — so an unpinned fetch reaches the payload while
+    // a scheme-pinned one still sees a cross-scheme (https) redirect and stops.
+    redirectTargetPort = port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => redirector.close(() => resolve()));
+  });
+
+  it('carries the same protocol pin as the download inside the script', () => {
+    const code = freshCode();
+    const https = controlledNodeInstallCommand('https://im.example.test', code, 'linux');
+    expect(https).toContain("--proto '=https'");
+    expect(https).toContain("--proto-redir '=https'");
+    expect(https).toContain('--tlsv1.2');
+    // The command and the script must not drift: both come from one helper.
+    const script = renderControlledNodeInstallScript({
+      serverUrl: 'https://im.example.test', installCode: code, os: 'linux', arch: 'x64',
+    }).body;
+    expect(script).toContain("--proto '=https' --proto-redir '=https' --tlsv1.2");
+
+    const loopback = controlledNodeInstallCommand('http://localhost', code, 'linux');
+    expect(loopback).toContain("--proto '=http'");
+    expect(loopback).not.toContain('https');
+
+    // PowerShell has no scheme switch, and /i/:code never redirects, so any 3xx
+    // is illegitimate and refused outright.
+    expect(controlledNodeInstallCommand('https://im.example.test', code, 'win'))
+      .toContain('-MaximumRedirection 0');
+  });
+
+  it('refuses a cross-scheme redirect instead of following it', async () => {
+    const code = freshCode();
+    const command = controlledNodeInstallCommand(httpOrigin, code, 'linux');
+    // Strip the `| sudo sh` tail: we are testing the fetch, not installing.
+    const fetchOnly = command.replace(/\s*\|\s*sudo sh\s*$/, '');
+    const pinnedOutput = await new Promise<string>((resolve) => {
+      execFile('sh', ['-c', `${fetchOnly} 2>&1 || true`], { timeout: 20_000 },
+        (_e, out) => resolve(String(out)));
+    });
+    // Not merely "it failed": the failure must be the protocol refusal itself.
+    // The wording is build-specific -- macOS curl says `Protocol "https"
+    // disabled (in redirect)`, GNU/Linux curl says `Protocol "https" not
+    // supported or disabled in libcurl` -- so match the stable part: exit code
+    // 1 (CURLE_UNSUPPORTED_PROTOCOL) naming the refused scheme.
+    expect(pinnedOutput).toMatch(/curl: \(1\) Protocol "https"/);
+
+    // Counterfactual: the same fetch WITHOUT the pin follows the redirect, so
+    // the assertion above is testing the pin and not some unrelated failure.
+    const unpinned = fetchOnly.replace(/--proto '=http' --proto-redir '=http' /, '');
+    expect(unpinned).not.toBe(fetchOnly);
+    const unpinnedOutput = await new Promise<string>((resolve) => {
+      execFile('sh', ['-c', `${unpinned} 2>&1 || true`], { timeout: 20_000 },
+        (_e, out) => resolve(String(out)));
+    });
+    // The counterfactual's whole job is to show the pinned failure above is
+    // caused by the pin. Without it curl accepts the cross-scheme redirect and
+    // proceeds to the target, failing later and differently (TLS, because the
+    // target is https on a plain listener) — never with a protocol refusal.
+    // Same portability caveat: asserting the absence of one build's exact
+    // wording would pass vacuously on the other build.
+    expect(unpinnedOutput).not.toMatch(/curl: \(1\) Protocol "https"/);
+    expect(unpinnedOutput).toMatch(/SSL|TLS|handshake|error:/i);
+  }, 40_000);
+});
+
+describe('generated installer runs against a loopback HTTP origin', () => {
+  const PAYLOAD = '#!/bin/sh\necho "ARGS=$*"\necho "STDIN=$(cat)"\necho INSTALLED-OK\n';
+  let server: Server;
+  let origin: string;
+  let dir: string;
+  let tamperNextDownload = false;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'imcodes-installer-exec-'));
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        if (req.method === 'POST' && (req.url ?? '').startsWith('/api/enroll/v2/install-payload') && body.includes('ticket=')) {
+          const json = JSON.stringify({
+            artifactUrl: `${origin}/api/enroll/v2/install-executable?token=mocktok`,
+            sha256: sha256(PAYLOAD),
+            sizeBytes: Buffer.byteLength(PAYLOAD),
+            abiProfile: 'modern',
+            enrollment: {
+              serverUrl: origin,
+              enrollToken: 'tok_loopback_secret',
+              ownerName: 'Alice { } "Desk"',
+            },
+          });
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(json)),
+            connection: 'close',
+          });
+          res.end(json);
+          return;
+        }
+        if (req.method === 'GET' && (req.url ?? '').startsWith('/api/enroll/v2/install-executable?token=mocktok')) {
+          const served = tamperNextDownload ? '#!/bin/sh\necho PWNED-INSTALLED-OK\n' : PAYLOAD;
+          tamperNextDownload = false;
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': String(Buffer.byteLength(served)),
+            connection: 'close',
+          });
+          res.end(served);
+          return;
+        }
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'content-length': '16',
+          connection: 'close',
+        });
+        res.end('{"error":"nope"}');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    origin = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Bounded run: a hang fails the test rather than stalling the suite. */
+  function runScript(script: string, abi: { glibc?: string; kernel?: string; glibcxx?: string; arch?: string } = {}): Promise<{ stdout: string; stderr: string; code: number }> {
+    return new Promise((resolve) => {
+      const path = join(dir, 'installer.sh');
+      const lib = join(dir, 'test-libstdcpp');
+      // Explicit Linux ABI fixture, not the old uname shim that returned Linux
+      // even for -m/-r. The renderer's detection and real grep/awk still run.
+      const rendered = script.replace('/lib64/libstdc++.so.6', `'${lib}'`);
+      const commands = `id() { echo 0; }\nuname() { case "$1" in -m) echo '${abi.arch ?? 'x86_64'}';; -r) echo '${abi.kernel ?? '6.8.0'}';; *) echo Linux;; esac; }\ngetconf() { echo 'glibc ${abi.glibc ?? '2.35'}'; }\n`;
+      void writeFile(lib, `GLIBCXX_${abi.glibcxx ?? '3.4.21'}`).then(() => writeFile(path, commands + rendered)).then(() => {
+        execFile('sh', [path], { timeout: 20_000, encoding: 'utf8' }, (error, stdout, stderr) => {
+          resolve({
+            stdout: String(stdout),
+            stderr: String(stderr),
+            code: error ? Number((error as NodeJS.ErrnoException & { code?: number }).code ?? 1) : 0,
+          });
+        });
+      });
+    });
+  }
+
+  it.each([
+    { glibc: '2.16' }, { kernel: '3.9.0' }, { glibcxx: '3.4.18' },
+    { arch: 'aarch64' }, { glibc: 'malformed' },
+  ])('refuses below-minimum or wrong-platform ABI %j before executing any bytes', async (abi) => {
+    const { body } = renderControlledNodeInstallScript({ serverUrl: origin, installCode: freshCode(), os: 'linux', arch: 'x64' });
+    const run = await runScript(body, abi);
+    expect(run.code).not.toBe(0);
+    expect(run.stdout).not.toContain('INSTALLED-OK');
+    expect(run.stdout).not.toContain('downloading');
+  });
+
+  it('downloads and executes the artifact over plain loopback HTTP', async () => {
+    const code = freshCode();
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: origin, installCode: code, os: 'linux', arch: 'x64',
+    });
+    expect(body).not.toContain('tok_loopback_secret');
+    expect(body).toContain('install --enroll-stdin');
+    const run = await runScript(body);
+    expect(run.stderr).not.toContain('Protocol "http" disabled');
+    expect(run.stdout).toContain('ARGS=install --enroll-stdin');
+    expect(run.stdout).toContain('STDIN=');
+    expect(run.stdout).toContain('"enrollToken":"tok_loopback_secret"');
+    expect(run.stdout).toContain('"ownerName":"Alice { } \\"Desk\\""');
+    expect(run.stdout).toContain('INSTALLED-OK');
+    expect(run.code).toBe(0);
+  }, 40_000);
+
+  it('refuses to execute a binary whose sha256 does not match the payload', async () => {
+    const code = freshCode();
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: origin, installCode: code, os: 'linux', arch: 'x64',
+    });
+    tamperNextDownload = true;
+    const run = await runScript(body);
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain('checksum mismatch');
+    expect(run.stdout).not.toContain('PWNED-INSTALLED-OK');
+  }, 40_000);
+
+  it('would have aborted before the request with the HTTPS-only flag', async () => {
+    const code = freshCode();
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: origin, installCode: code, os: 'linux', arch: 'x64',
+    });
+    // Reintroduce exactly the defect and confirm this harness detects it.
+    // replaceAll, not replace: the flag string also appears in the non-root
+    // hint line, so a single-occurrence replace patched the echo and left the
+    // real curl call pinned — the script then still succeeded and this test
+    // silently stopped reintroducing anything.
+    const broken = body.replaceAll(
+      "--proto '=http' --proto-redir '=http'",
+      "--proto '=https' --proto-redir '=https' --tlsv1.2",
+    );
+    // Guard the guard, on the invocation that actually performs the download
+    // rather than on the script as a whole.
+    const curlLine = (text: string): string =>
+      text.split('\n').find((line) => line.trimStart().startsWith('curl -fsSL')) ?? '';
+    expect(curlLine(broken)).not.toBe(curlLine(body));
+    expect(curlLine(broken)).toContain("--proto '=https'");
+    const run = await runScript(broken);
+    expect(run.stdout).not.toContain('INSTALLED-OK');
+    expect(run.code).not.toBe(0);
+  }, 40_000);
+});
+
+describe('HTTPS redirect security boundaries in POSIX curl and wget branches', () => {
+  const PAYLOAD_BIN = '#!/bin/sh\necho "INSTALLED-OK"\n';
+  let workDir: string;
+  let server: Server;
+  let httpOrigin: string;
+  let nextArtifactUrl = 'https://cdn.example.test/start';
+
+  function resolveCommand(cmd: string): string | null {
+    try {
+      return execFileSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf8' }).trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function buildMinimalBinDir(targetDir: string, includeCommands: string[]): Promise<void> {
+    await Promise.all(
+      includeCommands.map(async (cmd) => {
+        const resolved = resolveCommand(cmd);
+        if (resolved) {
+          await symlink(resolved, join(targetDir, cmd)).catch(() => {});
+        }
+      }),
+    );
+  }
+
+  const POSIX_UTIL_NAMES = [
+    'sh', 'dash', 'awk', 'sed', 'grep', 'cat', 'rm', 'chmod', 'mktemp',
+    'cut', 'sort', 'tail', 'sha256sum', 'shasum', 'openssl',
+  ];
+
+  beforeAll(async () => {
+    workDir = await mkdtemp(join(tmpdir(), 'imcodes-redirect-sec-'));
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        if (req.method === 'POST' && (req.url ?? '').startsWith('/api/enroll/v2/install-payload') && body.includes('ticket=')) {
+          const json = JSON.stringify({
+            artifactUrl: nextArtifactUrl,
+            sha256: sha256(PAYLOAD_BIN),
+            sizeBytes: Buffer.byteLength(PAYLOAD_BIN),
+            abiProfile: 'modern',
+            enrollment: {
+              serverUrl: httpOrigin,
+              enrollToken: 'tok_sec_test',
+              ownerName: 'SecTest',
+            },
+          });
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(json)),
+            connection: 'close',
+          });
+          res.end(json);
+          return;
+        }
+        res.writeHead(404, { 'content-length': '0', connection: 'close' });
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    httpOrigin = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  function shellsToTest(): string[] {
+    const shells = ['/bin/sh'];
+    if (existsSync('/bin/dash')) shells.push('/bin/dash');
+    return shells;
+  }
+
+  async function runInstallerWithShim(input: {
+    shell: string;
+    binDir: string;
+    extraEnv?: Record<string, string>;
+  }): Promise<{ stdout: string; stderr: string; code: number }> {
+    const scriptPath = join(workDir, `installer-${hex(4)}.sh`);
+    const libPath = join(workDir, 'test-libstdcpp');
+    await writeFile(libPath, 'GLIBCXX_3.4.21');
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: httpOrigin,
+      installCode: freshCode(),
+      os: 'linux',
+      arch: 'x64',
+    });
+    const rendered = body.replace('/lib64/libstdc++.so.6', `'${libPath}'`);
+    const shims = `id() { echo 0; }\nuname() { case "$1" in -m) echo 'x86_64';; -r) echo '6.8.0';; *) echo Linux;; esac; }\ngetconf() { echo 'glibc 2.35'; }\n`;
+    await writeFile(scriptPath, shims + rendered);
+    return await new Promise((resolve) => {
+      execFile(
+        input.shell,
+        [scriptPath],
+        {
+          timeout: 20_000,
+          encoding: 'utf8',
+          env: {
+            PATH: input.binDir,
+            TMPDIR: workDir,
+            ...input.extraEnv,
+          },
+        },
+        (error, stdout, stderr) => {
+          resolve({
+            stdout: String(stdout),
+            stderr: String(stderr),
+            code: error ? Number((error as NodeJS.ErrnoException & { code?: number }).code ?? 1) : 0,
+          });
+        },
+      );
+    });
+  }
+
+  it('curl HTTPS artifact download always passes --proto-redir=https even when serverUrl is HTTP, and rejects credentialed initial HTTPS URLs', async () => {
+    const curlBinDir = await mkdtemp(join(workDir, 'curl-bin-'));
+    await buildMinimalBinDir(curlBinDir, POSIX_UTIL_NAMES);
+    const realCurl = resolveCommand('curl');
+    expect(realCurl).toBeTruthy();
+
+    const argvLogPath = join(workDir, 'curl-argv.json');
+    const curlShimHelper = join(workDir, 'curl-shim.mjs');
+    await writeFile(curlShimHelper, `
+      import { execFileSync } from 'node:child_process';
+      import { writeFileSync, appendFileSync } from 'node:fs';
+      const args = process.argv.slice(2);
+      const outIdx = args.indexOf('-o');
+      const outPath = outIdx >= 0 ? args[outIdx + 1] : '';
+      const url = args.find((a) => a.startsWith('http://') || a.startsWith('https://')) || '';
+      if (url.startsWith('https://')) {
+        appendFileSync(process.env.CURL_ARGV_LOG, JSON.stringify(args) + '\\n');
+        writeFileSync(outPath, ${JSON.stringify(PAYLOAD_BIN)});
+        process.exit(0);
+      }
+      const res = execFileSync(${JSON.stringify(realCurl)}, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      if (!outPath) process.stdout.write(res);
+    `);
+    await writeFile(
+      join(curlBinDir, 'curl'),
+      `#!/bin/sh\nexec "${process.execPath}" "${curlShimHelper}" "$@"\n`,
+    );
+    await chmod(join(curlBinDir, 'curl'), 0o755);
+
+    for (const shell of shellsToTest()) {
+      await writeFile(argvLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/releases/imcodes-node';
+      const ok = await runInstallerWithShim({
+        shell,
+        binDir: curlBinDir,
+        extraEnv: { CURL_ARGV_LOG: argvLogPath },
+      });
+      expect(ok.code, `${shell} stderr: ${ok.stderr}`).toBe(0);
+      expect(ok.stdout).toContain('INSTALLED-OK');
+      const recordedCalls = (await readFile(argvLogPath, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as string[]);
+      expect(recordedCalls.length).toBe(1);
+      const artifactCurlArgs = recordedCalls[0]!;
+      expect(artifactCurlArgs).toContain('--max-redirs');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--max-redirs') + 1]).toBe('5');
+      expect(artifactCurlArgs).toContain('--proto');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--proto') + 1]).toBe('=https');
+      expect(artifactCurlArgs).toContain('--proto-redir');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--proto-redir') + 1]).toBe('=https');
+      expect(artifactCurlArgs).toContain('--tlsv1.2');
+
+      // Credential-bearing initial HTTPS artifact URL must be refused BEFORE invoking curl.
+      await writeFile(argvLogPath, '');
+      nextArtifactUrl = 'https://user:pass@cdn.example.test/releases/imcodes-node';
+      const credRefused = await runInstallerWithShim({
+        shell,
+        binDir: curlBinDir,
+        extraEnv: { CURL_ARGV_LOG: argvLogPath },
+      });
+      expect(credRefused.code).not.toBe(0);
+      expect(credRefused.stderr).toContain('refused non-HTTPS artifact URL');
+      expect(credRefused.stdout).not.toContain('INSTALLED-OK');
+      expect((await readFile(argvLogPath, 'utf8')).trim()).toBe('');
+    }
+  }, 40_000);
+
+  it('wget HTTPS artifact download uses --max-redirect=0 + bounded loop and refuses HTTP downgrades, credential redirects, and >5 hops across sh and dash', async () => {
+    const wgetBinDir = await mkdtemp(join(workDir, 'wget-bin-'));
+    await buildMinimalBinDir(wgetBinDir, POSIX_UTIL_NAMES);
+    const wgetHelper = join(workDir, 'wget-shim.mjs');
+    const routesPath = join(workDir, 'wget-routes.json');
+    const urlLogPath = join(workDir, 'wget-urls.log');
+
+    await writeFile(wgetHelper, `
+      import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+      import http from 'node:http';
+      const args = process.argv.slice(2);
+      if (args.includes('--help')) {
+        process.stdout.write('GNU Wget mock\\n  --max-redirect=COUNT\\n');
+        process.exit(0);
+      }
+      const outIdx = args.indexOf('-O');
+      const outPath = outIdx >= 0 ? args[outIdx + 1] : '';
+      const url = args.find((a) => a.startsWith('http://') || a.startsWith('https://')) || '';
+      const postArg = args.find((a) => a.startsWith('--post-data='));
+      if (postArg && url.startsWith('http://')) {
+        const parsed = new URL(url);
+        const bodyData = postArg.slice('--post-data='.length);
+        const req = http.request(
+          { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname + parsed.search, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(bodyData) } },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+              writeFileSync(outPath, Buffer.concat(chunks));
+              process.exit(res.statusCode && res.statusCode < 400 ? 0 : 8);
+            });
+          },
+        );
+        req.on('error', () => process.exit(4));
+        req.end(bodyData);
+      } else {
+        appendFileSync(process.env.WGET_URL_LOG, url + '\\n');
+        // Must pin redirects to 0 on every wget invocation
+        if (!args.includes('--max-redirect=0')) {
+          process.stderr.write('ERROR: --max-redirect=0 missing\\n');
+          process.exit(2);
+        }
+        const routes = JSON.parse(readFileSync(process.env.WGET_ROUTES, 'utf8'));
+        const route = routes[url];
+        if (!route) {
+          process.stderr.write('  HTTP/1.1 404 Not Found\\r\\n\\r\\n');
+          process.exit(8);
+        }
+        if (route.status >= 300 && route.status < 400) {
+          process.stderr.write(\`  HTTP/1.1 \${route.status} Found\\r\\n  Location: \${route.location}\\r\\n\\r\\nMaximum redirections exceeded.\\n\`);
+          process.exit(8);
+        }
+        writeFileSync(outPath, route.body ?? '');
+        process.exit(0);
+      }
+    `);
+    await writeFile(
+      join(wgetBinDir, 'wget'),
+      `#!/bin/sh\nexec "${process.execPath}" "${wgetHelper}" "$@"\n`,
+    );
+    await chmod(join(wgetBinDir, 'wget'), 0o755);
+
+    for (const shell of shellsToTest()) {
+      // 1. HTTPS -> http:// downgrade MUST be refused and http:// target NEVER requested.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/start';
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'http://evil.example.test/downgrade.bin' },
+        'http://evil.example.test/downgrade.bin': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const downgrade = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(downgrade.code).not.toBe(0);
+      expect(downgrade.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect(downgrade.stdout).not.toContain('INSTALLED-OK');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 2. HTTPS -> HTTP:// uppercase downgrade MUST be refused.
+      await writeFile(urlLogPath, '');
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'HTTP://evil.example.test/upper.bin' },
+      }));
+      const upperDowngrade = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(upperDowngrade.code).not.toBe(0);
+      expect(upperDowngrade.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 3. HTTPS -> credential-bearing redirect MUST be refused and NEVER requested.
+      await writeFile(urlLogPath, '');
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'https://user:pass@evil.example.test/cred.bin' },
+      }));
+      const credRedirect = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(credRedirect.code).not.toBe(0);
+      expect(credRedirect.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 4. Initial credential-bearing URL MUST be refused BEFORE invoking wget.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://user:pass@cdn.example.test/start';
+      const initialCred = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(initialCred.code).not.toBe(0);
+      expect(initialCred.stderr).toContain('refused non-HTTPS artifact URL');
+      expect((await readFile(urlLogPath, 'utf8')).trim()).toBe('');
+
+      // 5. >5 HTTPS redirects MUST be rejected cleanly.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/hop0';
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/hop0': { status: 302, location: 'https://cdn.example.test/hop1' },
+        'https://cdn.example.test/hop1': { status: 302, location: 'https://cdn.example.test/hop2' },
+        'https://cdn.example.test/hop2': { status: 302, location: 'https://cdn.example.test/hop3' },
+        'https://cdn.example.test/hop3': { status: 302, location: 'https://cdn.example.test/hop4' },
+        'https://cdn.example.test/hop4': { status: 302, location: 'https://cdn.example.test/hop5' },
+        'https://cdn.example.test/hop5': { status: 302, location: 'https://cdn.example.test/hop6' },
+        'https://cdn.example.test/hop6': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const tooMany = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(tooMany.code).not.toBe(0);
+      expect(tooMany.stderr).toContain('too many artifact redirects');
+      const requested = (await readFile(urlLogPath, 'utf8')).trim().split('\n');
+      expect(requested).toHaveLength(6); // hop0..hop5
+      expect(requested).not.toContain('https://cdn.example.test/hop6');
+
+      // 6. Valid multi-hop HTTPS redirect chain (relative path + protocol-relative) MUST succeed.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://github.com/org/repo/releases/download/v1/imcodes-node';
+      await writeFile(routesPath, JSON.stringify({
+        'https://github.com/org/repo/releases/download/v1/imcodes-node': { status: 302, location: '/intermediate/artifact' },
+        'https://github.com/intermediate/artifact': { status: 302, location: '//objects.githubusercontent.com/final/bin' },
+        'https://objects.githubusercontent.com/final/bin': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const valid = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(valid.code, `${shell} valid stderr: ${valid.stderr}`).toBe(0);
+      expect(valid.stdout).toContain('INSTALLED-OK');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual([
+        'https://github.com/org/repo/releases/download/v1/imcodes-node',
+        'https://github.com/intermediate/artifact',
+        'https://objects.githubusercontent.com/final/bin',
+      ]);
+    }
+  }, 40_000);
+});

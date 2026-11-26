@@ -11,7 +11,6 @@ vi.mock('../../src/util/logger.js', () => ({
 // Import after mocks
 import * as jsonl from '../../src/daemon/jsonl-watcher.js';
 import * as codex from '../../src/daemon/codex-watcher.js';
-import * as gemini from '../../src/daemon/gemini-watcher.js';
 
 describe('Watcher File Claiming (Isolation)', () => {
   describe('jsonl-watcher', () => {
@@ -52,18 +51,6 @@ describe('Watcher File Claiming (Isolation)', () => {
 
     it('stopWatching on unknown session does not throw', () => {
       expect(() => codex.stopWatching('no-such-session')).not.toThrow();
-    });
-  });
-
-  describe('gemini-watcher', () => {
-    it('preClaimFile is idempotent for same session', () => {
-      const file = '/tmp/session-test.json';
-      gemini.preClaimFile('session-y', file);
-      gemini.preClaimFile('session-y', file); // re-claim: no-op
-    });
-
-    it('stopWatching on unknown session does not throw', () => {
-      expect(() => gemini.stopWatching('no-such-session')).not.toThrow();
     });
   });
 });

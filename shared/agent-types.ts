@@ -1,50 +1,106 @@
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
+
 export const SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
+  'claude-code-cli-sdk',
   'claude-code',
   'codex-sdk',
+  'qoder-sdk',
   'codex',
   'copilot-sdk',
   'cursor-headless',
+  'opencode-sdk',
   'opencode',
-  'gemini-sdk',
-  'gemini',
+  'grok-sdk',
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
+  'deepseek-harness',
+  'pi',
+  'muse-code-sdk',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'shell',
   'script',
 ] as const;
 
 export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 
-export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
+export const CLAUDE_CODE_CLI_SDK_AGENT_TYPE = 'claude-code-cli-sdk' as const;
+export const CLAUDE_CODE_SDK_AGENT_TYPES = ['claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE] as const;
+export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
+export const MUSE_CODE_FAMILY = ['muse-code-sdk'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   'codex-sdk',
+  'qoder-sdk',
   'copilot-sdk',
   'cursor-headless',
-  'gemini-sdk',
+  'opencode-sdk',
+  'grok-sdk',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
+  'deepseek-harness',
+  'pi',
+  'muse-code-sdk',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'qwen',
   'openclaw',
 ] as const;
-export const PROCESS_SESSION_AGENT_TYPES = ['claude-code', 'codex', 'opencode', 'gemini', 'shell', 'script'] as const;
+export const PROCESS_SESSION_AGENT_TYPES = ['claude-code', 'codex', 'opencode', 'shell', 'script'] as const;
+export const RAW_COMMAND_SESSION_AGENT_TYPES = ['shell', 'script'] as const;
+export const REMOVED_SESSION_AGENT_TYPES = ['gemini', 'gemini-sdk'] as const;
 
 export function isSessionAgentType(value: string): value is SessionAgentType {
   return (SESSION_AGENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isRemovedSessionAgentType(value: string): boolean {
+  return (REMOVED_SESSION_AGENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isProcessSessionAgentType(value: string): value is typeof PROCESS_SESSION_AGENT_TYPES[number] {
+  return (PROCESS_SESSION_AGENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isSubSessionRecord(record: { name: string; parentSession?: string | null }): boolean {
+  return record.name.startsWith('deck_sub_') || Boolean(record.parentSession);
+}
+
+export function unsupportedAgentTypeError(agentType: string): Error {
+  return new Error(`Unsupported or removed agent type '${agentType}'. Switch to a supported agent type in session settings.`);
 }
 
 export function isClaudeCodeFamily(value: string): value is typeof CLAUDE_CODE_FAMILY[number] {
   return (CLAUDE_CODE_FAMILY as readonly string[]).includes(value);
 }
 
+export function isClaudeCodeSdkAgentType(value: string | undefined): value is typeof CLAUDE_CODE_SDK_AGENT_TYPES[number] {
+  return !!value && (CLAUDE_CODE_SDK_AGENT_TYPES as readonly string[]).includes(value);
+}
+
 export function isCodexFamily(value: string): value is typeof CODEX_FAMILY[number] {
   return (CODEX_FAMILY as readonly string[]).includes(value);
 }
 
+export function isMuseCodeFamily(value: string): value is typeof MUSE_CODE_FAMILY[number] {
+  return (MUSE_CODE_FAMILY as readonly string[]).includes(value);
+}
+
 export function isTransportSessionAgentType(value: string): value is typeof TRANSPORT_SESSION_AGENT_TYPES[number] {
   return (TRANSPORT_SESSION_AGENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isRawCommandSessionAgentType(value: string): value is typeof RAW_COMMAND_SESSION_AGENT_TYPES[number] {
+  return (RAW_COMMAND_SESSION_AGENT_TYPES as readonly string[]).includes(value);
 }
 
 export function getSessionRuntimeType(value: string): 'transport' | 'process' {

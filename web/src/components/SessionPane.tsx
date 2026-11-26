@@ -6,30 +6,40 @@
  * Extracted from app.tsx as part of the sidebar-redesign refactor (task 1.5).
  */
 
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
-import { useTimeline } from '../hooks/useTimeline.js';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
-import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
+import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
+import { dispatchSessionSend } from '../session-send-transport.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
-import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { isShareScopedState } from '../tab-sharing-ui.js';
+import { focusComposerElement } from '../keyboard-shortcuts.js';
+import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
+import { usePendingTaskQuote, type PendingTaskQuotePayload } from '../hooks/usePendingTaskQuote.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -50,6 +60,11 @@ const IDLE_HISTORY_STATUS = {
 
 export interface SessionPaneProps {
   serverId: string;
+  /** Report the trailing pending ask.question (or null) so the app can
+   *  re-surface it in the dedicated question dialog from history. */
+  onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
+  /** Submit an inline timeline answer for a trailing ask.question event. */
+  onAskAnswer?: (toolUseId: string, answer: string) => boolean | void;
   session: SessionInfo;
   sessions: SessionInfo[];
   subSessions: Array<{
@@ -88,14 +103,16 @@ export interface SessionPaneProps {
   /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Called with the terminal diff applier for this session. */
-  onDiff?: (apply: (diff: TerminalDiff) => void) => void;
+  onDiff?: (apply: (diff: TerminalDiff) => void) => void | (() => void);
   /** Called with the terminal history applier for this session. */
   onHistory?: (apply: (content: string) => void) => void;
 
   // ── Action callbacks ────────────────────────────────────────────────────────
   onStopProject?: (project: string) => void;
+  /** Restart this session when terminal recovery is exhausted. */
+  onRestart?: () => void;
   onRenameSession?: () => void;
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   sessionPinned?: boolean;
   stopBlockedByPinned?: boolean;
@@ -106,20 +123,40 @@ export interface SessionPaneProps {
   onAfterAction?: () => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
+  /** Open a Remote Desktop window by nodeId or serverId. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
   onMobileFileBrowserClose?: () => void;
+  /** Open Controlled Nodes management (forwarded to SessionControls -> FileBrowser -> DocShareDialog). */
+  onOpenNodeGroups?: () => void;
   /** Text to prefill into the input when a navigation action carries a quote. */
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
   onPendingPrefillApplied?: () => void;
+  /** Task-jump quote card to attach above the composer when arriving from Task Mode. */
+  pendingTaskQuote?: PendingTaskQuotePayload | null;
+  /** Called after pendingTaskQuote has been attached to the composer. */
+  onPendingTaskQuoteConsumed?: (nonce: number) => void;
+  /** Pending shared files/text from external app share target modal. */
+  pendingSharedUpload?: PendingSharedSessionUpload | null;
+  /** Called after pendingSharedUpload has been consumed by the target session composer. */
+  onPendingSharedUploadConsumed?: (id: string) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 export function SessionPane({
   serverId,
+  onPendingQuestion,
+  onAskAnswer,
   session,
   sessions,
   subSessions,
@@ -138,6 +175,7 @@ export function SessionPane({
   onDiff,
   onHistory,
   onStopProject,
+  onRestart,
   onRenameSession,
   onSettings,
   onShareSession,
@@ -148,19 +186,37 @@ export function SessionPane({
   onTransportConfigSaved,
   onAfterAction,
   onPreviewFile,
+  onOpenLocalWebPreview,
+  onCloudDocClick,
+  onRemoteDesktopClick,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
+  onOpenNodeGroups,
   pendingPrefillText,
   onPendingPrefillApplied,
+  pendingTaskQuote,
+  onPendingTaskQuoteConsumed,
+  pendingSharedUpload,
+  onPendingSharedUploadConsumed,
   onVersionSensitiveAction,
+  canManageFileShares = true,
 }: SessionPaneProps) {
+  recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(session.sharedState);
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
-  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const [composerText, setComposerText] = useState('');
-  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
+  const {
+    state: executionCloneLaunchState,
+    launch: launchExecutionClones,
+  } = useExecutionCloneLaunch({
+    ws,
+    connected,
+    sessionName,
+    ownerSessionName: sessionName,
+  });
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -172,22 +228,51 @@ export function SessionPane({
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    historyGap: timelineHistoryGap,
+    loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
-    isActiveSession: isActive,
+    incognito: session.incognito,
+    // A focused sub-session window owns keyboard/recovery focus while it is
+    // open. Keep this main pane mounted and subscribed, but do not let it join
+    // the same global resume broadcast and double the foreground work.
+    isActiveSession: keyboardActive ?? isActive,
+    isVisible: isActive,
+    subscriptionMode: isActive ? 'full' : 'summary',
+    bootstrapWhenVisible: true,
     disableHistory: !hasChatTimeline,
+    authoritativeSessionState: session.state,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
+  // Re-surface a still-pending agent question in the dedicated dialog from
+  // timeline history (e.g. opened from a push notification / after reload).
+  useEffect(() => {
+    if (!isActive || !onPendingQuestion) return;
+    onPendingQuestion(sessionName, findTrailingAskQuestion(timelineEvents));
+  }, [isActive, onPendingQuestion, sessionName, timelineEvents]);
+
   // ── Quotes ────────────────────────────────────────────────────────────────
   const [quotes, setQuotes] = useState<string[]>([]);
+  const [taskQuote, setTaskQuote] = useState<string | null>(null);
   const addQuote = useCallback((text: string) => {
     setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
   }, []);
   const removeQuote = useCallback((index: number) => {
     setQuotes((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+  const clearTaskQuote = useCallback(() => {
+    setTaskQuote(null);
   }, []);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
@@ -197,7 +282,7 @@ export function SessionPane({
   const timelineEventsRef = useRef(timelineEvents);
   timelineEventsRef.current = timelineEvents;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
-    if (!ws || !connected) return;
+    if (!ws && !serverId) return;
     const failedEvent = timelineEventsRef.current.find(
       (e) => e.type === 'user.message'
         && e.payload.failed === true
@@ -212,12 +297,19 @@ export function SessionPane({
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', {
+      // Retry replays the ORIGINAL send verbatim: `resendExtra` already carries
+      // the alias A′ map resolved when the user first composed it, so we must
+      // NOT re-resolve here (Cx1-2/Cx1-3) — re-resolving against the current
+      // list could change or leak values.
+      dispatchSessionSend(ws, serverId, {
         sessionName,
         text,
         ...(resendExtra ?? {}),
         commandId: newCommandId,
+      }, (err) => {
+        markOptimisticFailed(newCommandId, err instanceof Error ? err.message : String(err || 'Send failed'));
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -225,7 +317,7 @@ export function SessionPane({
       ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
       ...(resendExtra ? { resendExtra } : {}),
     });
-  }, [connected, retryOptimisticMessage, sessionName, ws]);
+  }, [markOptimisticFailed, retryOptimisticMessage, serverId, sessionName, ws]);
 
   // ── Usage & thinking state ──────────────────────────────────────────────────
   const lastUsage = useMemo(() => extractLatestUsage(timelineEvents), [timelineEvents]);
@@ -248,11 +340,31 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
-  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
+  const pendingUserSend = useMemo(() => hasPendingUserSend(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
+  const timelineLastEventTs =
+    timelineEvents.length > 0 ? (timelineEvents[timelineEvents.length - 1]?.ts ?? null) : null;
+  const activeTimelineTurn = useMemo(() => (
+    session.authoritativeIdleAt != null
+      && timelineLastEventTs != null
+      && timelineLastEventTs <= session.authoritativeIdleAt
+      ? false
+      : hasActiveTimelineTurn(timelineEvents)
+  ), [session.authoritativeIdleAt, timelineEvents, timelineLastEventTs]);
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
-    () => getTailSessionState(timelineEvents) ?? session.state ?? null,
-    [timelineEvents, session.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: session.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+      authoritativeIdleAt: session.authoritativeIdleAt,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.authoritativeIdleAt, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent
@@ -288,20 +400,32 @@ export function SessionPane({
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
   const inputRef = useRef<HTMLDivElement>(null);
+  usePendingTaskQuote(isActive, pendingTaskQuote, onPendingTaskQuoteConsumed, setTaskQuote, inputRef);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
-    if (!onInputRef) return;
     if (isActive) {
-      // SessionControls is now mounted — inputRef.current will be set after first render.
-      // Use rAF to ensure the DOM ref is populated before registering.
-      const id = requestAnimationFrame(() => { onInputRef(inputRef.current); });
-      return () => cancelAnimationFrame(id);
-    } else {
-      onInputRef(null);
+      if (inputRef.current && inputRef.current.isConnected) {
+        onInputRefRef.current?.(inputRef.current);
+        return undefined;
+      }
+      if (typeof requestAnimationFrame === 'function') {
+        const id = requestAnimationFrame(() => {
+          const el = inputRef.current;
+          onInputRefRef.current?.(el && el.isConnected ? el : null);
+        });
+        return () => cancelAnimationFrame(id);
+      }
       return undefined;
     }
-  }, [isActive, onInputRef]);
+    onInputRefRef.current?.(null);
+    return undefined;
+  }, [isActive]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
 
   // ── Scroll to bottom in whichever view is active ────────────────────────────
   const scrollToBottom = useCallback(() => {
@@ -339,53 +463,12 @@ export function SessionPane({
   const handleRunExecutionClones = useCallback(() => {
     const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
-    const commandId = globalThis.crypto?.randomUUID?.()
-      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setExecutionClonesBusy(true);
-    try {
-      ws.sendExecutionClones({
-        sessionName,
-        text,
-        commandId,
-        dedicatedExecutionRouting: {
-          enabled: true,
-          templateSessionName: executionRouting.templateSessionName,
-          maxParallelClones: executionRouting.limits.maxParallelClones,
-          maxQueuedClones: executionRouting.limits.maxQueuedClones,
-          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
-          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
-        },
-      });
-    } finally {
-      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
-    }
-  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sessionName, ws]);
-
-  const handleSyncMemorySummaries = useCallback(async () => {
-    if (!ws || !connected || syncingMemorySummaries) return;
-    setSyncingMemorySummaries(true);
-    try {
-      const text = await buildMemorySummarySyncMessage(
-        t,
-        session.contextNamespace?.projectId ?? null,
-        undefined,
-        { sources: [localPersonalMemorySummarySource(ws)] },
-      );
-      if (!text) return;
-      const commandId = globalThis.crypto?.randomUUID?.()
-        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      ws.sendSessionCommand('send', { sessionName, text, commandId });
-      if (hasChatTimeline) {
-        addOptimisticUserMessage(text, commandId);
-        scrollToBottom();
-      }
-    } catch {
-      // Keep the footer button non-intrusive; a failed sync should not block
-      // normal chat controls or surface stale memory as if it were sent.
-    } finally {
-      setSyncingMemorySummaries(false);
-    }
-  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, sessionName, syncingMemorySummaries, t, ws]);
+    launchExecutionClones({
+      text,
+      templateSessionName: executionRouting.templateSessionName,
+      ...executionRouting.limits,
+    });
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
@@ -406,26 +489,28 @@ export function SessionPane({
     >
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
       <div
-        key={`term-${sessionName}`}
+        key={`term-${serverId}:${sessionName}`}
         style={{ display: terminalVisible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
       >
-        <TerminalView
-          sessionName={sessionName}
-          ws={ws}
-          connected={connected}
-          active={terminalVisible}
-          onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
-          onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
-          onFocusFn={onFocusFn}
-          onFitFn={onFitFn}
-          onScrollBottomFn={handleTermScrollFn}
-          mobileInput={session.agentType === 'shell'}
-        />
+        {terminalVisible && <TerminalView
+            sessionName={sessionName}
+            ws={ws}
+            connected={connected}
+            active={terminalVisible}
+            onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
+            onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
+            onFocusFn={onFocusFn}
+            onFitFn={onFitFn}
+            onScrollBottomFn={handleTermScrollFn}
+            mobileInput={session.agentType === 'shell'}
+            onRestart={onRestart}
+          />}
       </div>
 
       {/* Chat view: only rendered when active + in chat mode */}
       {chatVisible && (
         <ChatView
+          visible={isActive}
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
@@ -434,17 +519,28 @@ export function SessionPane({
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
+          historyGap={timelineHistoryGap}
+          onLoadMessageContext={loadMessageContext}
           sessionId={sessionName}
+          sessions={sessions}
           sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
           onViewRepo={onViewRepo}
           onPreviewFile={onPreviewFile}
+          onOpenLocalWebPreview={onOpenLocalWebPreview}
+          onCloudDocClick={onCloudDocClick}
+          onRemoteDesktopClick={onRemoteDesktopClick}
           ws={connected ? ws : null}
           serverId={serverId}
+          scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
+          readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
+          canManageFileShares={effectiveCanManageFileShares}
           onQuote={addQuote}
           agentType={session.agentType}
           onResendFailed={handleResendFailed}
+          onAskAnswer={onAskAnswer}
+          messagePinsEnabled
         />
       )}
 
@@ -455,26 +551,28 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
+          wsClient={ws}
+          connected={connected}
           modelOverride={resolveEffectiveSessionModel(session, effectiveDetectedModel, lastUsage?.model)}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
+          codexCreditsBalance={session.codexCreditsBalance}
+          codexCreditsUnlimited={session.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
           transportActivityDetail={transportActivityDetail}
           sessionError={session.error}
           now={thinkingNow}
-          onSyncMemorySummaries={handleSyncMemorySummaries}
-          syncMemorySummariesBusy={syncingMemorySummaries}
-          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
           onRunExecutionClones={handleRunExecutionClones}
-          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesBusy={executionCloneLaunchState.phase === 'pending'}
           runExecutionClonesDisabled={
-            executionClonesBusy
+            executionCloneLaunchState.phase === 'pending'
             || !connected
             || !ws
             || !hasValidExecutionTemplate
@@ -482,6 +580,7 @@ export function SessionPane({
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
+          runExecutionClonesFeedback={executionCloneLaunchState}
         />
       )}
 
@@ -489,6 +588,7 @@ export function SessionPane({
       {isActive && (
         <SessionControls
           ws={ws}
+          connected={connected}
           activeSession={controlsSession}
           inputRef={inputRef}
           onAfterAction={onAfterAction}
@@ -517,12 +617,15 @@ export function SessionPane({
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+              ...(meta?.queueAppend ? { queueAppend: true } : {}),
             });
             if (meta?.commandId && meta.localFailure) {
               markOptimisticFailed(meta.commandId, meta.localFailure);
             }
             scrollToBottom();
           }}
+          onRemoveOptimisticMessage={removeOptimisticMessage}
+          onSendFailed={markOptimisticFailed}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
@@ -537,19 +640,26 @@ export function SessionPane({
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
           activeTransportTurn={activeTimelineTurn}
+          transportTimelineEvents={timelineEvents}
           keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
+          onOpenNodeGroups={onOpenNodeGroups}
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
           fileDropTargetRef={fileDropTargetRef}
           quotes={quotes}
           onRemoveQuote={removeQuote}
+          taskQuote={taskQuote}
+          onRemoveTaskQuote={clearTaskQuote}
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
+          pendingSharedUpload={pendingSharedUpload}
+          onPendingSharedUploadConsumed={onPendingSharedUploadConsumed}
           onVersionSensitiveAction={onVersionSensitiveAction}
           onComposerTextChange={setComposerText}
+          canManageFileShares={effectiveCanManageFileShares}
         />
       )}
     </div>

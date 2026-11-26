@@ -1,43 +1,66 @@
 /**
  * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
-import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
-import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { getSessionAgentGroups, getSessionAgentLabel, isSessionAgentTypeSelectable, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { ModelCombobox } from './ModelCombobox.js';
+import { usePresetModelSelection } from '../hooks/usePresetModelSelection.js';
 import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
   createDefaultCcPresetDraft,
+  DEFAULT_CC_PRESET_BASE_URL,
+  DEFAULT_CC_PRESET_MODEL,
+  DEFAULT_OPENAI_PRESET_BASE_URL,
+  DEFAULT_OPENAI_PRESET_MODEL,
   type CcPresetEntry,
   type CcPresetDraft,
 } from './cc-preset-form.js';
 import {
   CC_PRESET_MSG,
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
 } from '@shared/cc-presets.js';
-import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
-import { loadCodexModelPreference } from '../codex-model-preference.js';
+import { AGY_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions, resolveCodexAutoDefaultModel } from '../../../src/shared/models/options.js';
+import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
+import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
 
+/** Upper bound on how many identical sub-sessions one launch can request at once. */
+const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
-const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
+const AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
-  width: 'calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
-  maxWidth: 380,
+  width: 'calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
+  maxWidth: 660,
   minWidth: 0,
   boxSizing: 'border-box',
   // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
@@ -47,7 +70,12 @@ const responsiveDialogStyle = {
 
 interface Props {
   ws: WsClient | null;
+  serverId?: string;
   defaultCwd?: string;
+  /** Optional consumer-owned filter. The ordinary launcher remains unchanged. */
+  allowedAgentTypes?: readonly string[];
+  /** Lets a caller place the reused launcher above another modal. */
+  overlayClassName?: string;
   isProviderConnected: (id: string) => boolean;
   getRemoteSessions: (providerId: string) => RemoteSession[];
   refreshSessions: (providerId: string) => void;
@@ -58,20 +86,37 @@ interface Props {
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
+export function resolveDefaultSubSessionType(allowedAgentTypes?: readonly string[]): string {
+  if (!allowedAgentTypes || allowedAgentTypes.length === 0) {
+    return AGY_SDK_PROVIDER_ID;
+  }
+  const selectableAllowed = allowedAgentTypes.filter(isSessionAgentTypeSelectable);
+  if (selectableAllowed.includes(AGY_SDK_PROVIDER_ID)) {
+    return AGY_SDK_PROVIDER_ID;
+  }
+  return selectableAllowed[0] ?? AGY_SDK_PROVIDER_ID;
+}
+
+export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTypes, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
-  const [type, setType] = useState('claude-code-sdk');
-  const [lastUnlockedType, setLastUnlockedType] = useState('claude-code-sdk');
+  const initialType = useMemo(() => resolveDefaultSubSessionType(allowedAgentTypes), [allowedAgentTypes]);
+  const [type, setType] = useState(initialType);
+  const [lastUnlockedType, setLastUnlockedType] = useState(initialType);
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const cwd = defaultCwd ?? '';
   const [label, setLabel] = useState('');
+  const [countInput, setCountInput] = useState('1');
   const [scriptCmd, setScriptCmd] = useState('');
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
   const [thinking, setThinking] = useState<TransportEffortLevel>('high');
-  const [requestedModel, setRequestedModel] = useState('');
+  const [requestedModel, setRequestedModel] = useState(() => (
+    initialType === AGY_SDK_PROVIDER_ID ? (loadAgyModelPreference() || AGY_DEFAULT_MODEL_ID) : ''
+  ));
+  const [incognito, setIncognito] = useState(false);
+  const canIncognito = !!ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(SESSION_INCOGNITO_CAPABILITY) && !ws?.isDaemonCapabilityStale?.();
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -86,6 +131,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState('');
+  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState('');
   const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
@@ -98,6 +144,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
   const applyPresetDraft = (draft: CcPresetDraft) => {
     setNewPresetName(draft.name);
+    setNewPresetAuthType(draft.authType);
     setNewPresetBaseUrl(draft.baseUrl);
     setNewPresetToken(draft.token);
     setNewPresetModel(draft.model);
@@ -108,6 +155,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   };
   const buildCurrentPresetDraft = (): CcPresetDraft => ({
     name: newPresetName,
+    authType: newPresetAuthType,
     baseUrl: newPresetBaseUrl,
     token: newPresetToken,
     model: newPresetModel,
@@ -125,7 +173,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     return preset;
   };
   const selectType = (nextType: string) => {
-    if (customProviderSdk && nextType !== 'qwen') return;
+    if (!isSessionAgentTypeSelectable(nextType)) return;
+    if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
+    if (incognito && !supportsSessionIncognito(nextType)) return;
+    if (nextType !== type) {
+      if (nextType === AGY_SDK_PROVIDER_ID) {
+        setRequestedModel(loadAgyModelPreference() || AGY_DEFAULT_MODEL_ID);
+      } else {
+        setRequestedModel('');
+      }
+    }
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
     setPresetError('');
@@ -134,9 +191,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCustomProviderSdk(enabled);
     setPresetError('');
     if (enabled) {
-      if (type !== 'qwen') setLastUnlockedType(type);
-      setType('qwen');
+      if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) {
+        setLastUnlockedType(type);
+        setRequestedModel('');
+        setType('claude-code-sdk');
+      }
       return;
+    }
+    if (lastUnlockedType !== type) {
+      if (lastUnlockedType === AGY_SDK_PROVIDER_ID) {
+        setRequestedModel(loadAgyModelPreference() || AGY_DEFAULT_MODEL_ID);
+      } else {
+        setRequestedModel('');
+      }
     }
     setType(lastUnlockedType);
   };
@@ -144,7 +212,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     () => ccPresets.find((preset) => preset.name === ccPreset),
     [ccPreset, ccPresets],
   );
-  const qwenPresetModels = useMemo(
+  const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
@@ -178,6 +246,26 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
   const agentGroups = getSessionAgentGroups('sub-session');
+  const allowedAgentTypeSet = useMemo(
+    () => allowedAgentTypes ? new Set(allowedAgentTypes.filter(isSessionAgentTypeSelectable)) : null,
+    [allowedAgentTypes],
+  );
+
+  useEffect(() => {
+    if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
+    const fallback = allowedAgentTypeSet.has(AGY_SDK_PROVIDER_ID)
+      ? AGY_SDK_PROVIDER_ID
+      : allowedAgentTypeSet.values().next().value;
+    if (fallback) {
+      setType(fallback);
+      setLastUnlockedType(fallback);
+      if (fallback === AGY_SDK_PROVIDER_ID) {
+        setRequestedModel(loadAgyModelPreference() || AGY_DEFAULT_MODEL_ID);
+      } else {
+        setRequestedModel('');
+      }
+    }
+  }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
   // Load saved shell preference from server
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
@@ -238,33 +326,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (type !== 'qwen') setType('qwen');
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) setType('claude-code-sdk');
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
-  useEffect(() => {
-    if (type !== 'qwen') return;
-    const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? '') : '';
-    setRequestedModel((current) => {
-      if (qwenPresetModels.length === 0) {
-        return current || fallbackModel;
-      }
-      if (
-        fallbackModel
-        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
-        && current !== fallbackModel
-        && qwenPresetModels.includes(fallbackModel)
-      ) {
-        return fallbackModel;
-      }
-      if (!current || !qwenPresetModels.includes(current)) {
-        return qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0];
-      }
-      return current;
-    });
-  }, [type, qwenPresetModels, selectedCcPreset]);
+  // A bind-mode OpenClaw launch connects to one specific EXISTING external
+  // session, so repeating it does not mean "N sessions" -- it always launches
+  // exactly one, regardless of the quantity field.
+  const canLaunchMultiple = !(type === 'openclaw' && ocMode === 'bind');
+  const launchCount = canLaunchMultiple
+    ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
+    : 1;
 
+  const canStartType = isSessionAgentTypeSelectable(type) && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
+  const incognitoBlocked = incognito && (!canIncognito || !supportsSessionIncognito(type));
   const handleStart = () => {
+    if (!canStartType || incognitoBlocked) return;
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
       setPresetError(t('new_session.custom_provider_preset_required'));
@@ -276,14 +353,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
-      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), desc ? { description: desc } : undefined);
+      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), {
+        ...(desc ? { description: desc } : {}),
+        ...(launchCount > 1 ? { launchCount } : {}),
+      });
       return;
     }
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc, thinking }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking };
+          : {
+            ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking,
+            ...(launchCount > 1 ? { launchCount } : {}),
+          };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -293,39 +376,78 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
+    if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
-    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
+    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) {
+      extra.requestedModel = requestedModel.trim();
+      if (type === AGY_SDK_PROVIDER_ID) {
+        saveAgyModelPreference(requestedModel.trim());
+      }
+    }
+    if (type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'muse-code-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if (incognito) extra.incognito = true;
+    if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
-  const thinkingLevels = type === 'claude-code-sdk'
+  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
+  const creationTargetScope = serverId?.trim()
+    || (ws as { getServerId?: () => string } | null)?.getServerId?.()?.trim()
+    || ws?.getDaemonCapabilitySnapshot?.()?.daemonId?.trim()
+    || undefined;
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
+    undefined,
+    creationTargetScope,
+  );
+  const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
+  const thinkingLevels = (type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE)
     ? CLAUDE_SDK_EFFORT_LEVELS
     : type === 'codex-sdk'
-      ? CODEX_SDK_EFFORT_LEVELS
+      ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
       : type === 'copilot-sdk'
         ? COPILOT_SDK_EFFORT_LEVELS
-        : type === 'qwen'
-          ? QWEN_EFFORT_LEVELS
-          : type === 'openclaw'
-            ? OPENCLAW_THINKING_LEVELS
-            : [];
-  const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+        : type === 'muse-code-sdk'
+          ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
+          : type === 'qwen'
+            ? QWEN_EFFORT_LEVELS
+            : type === 'pi'
+              ? PI_EFFORT_LEVELS
+            : type === 'openclaw'
+              ? OPENCLAW_THINKING_LEVELS
+              : [];
+  const supportsCcPreset = type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type);
+  const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
     ? t('new_session.custom_provider_preset')
     : type === 'qwen'
       ? t('new_session.compatible_api_via_qwen')
       : t('new_session.api_provider');
-  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
-  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
-  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  useEffect(() => {
+    if ((type !== 'codex-sdk' && type !== 'muse-code-sdk') || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
+    if (clamped && clamped !== thinking) setThinking(clamped);
+  }, [selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, thinking, type]);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
-    type === 'qwen' && selectedCcPreset
-      ? qwenPresetModels
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
+      ? mergeModelSuggestions(
+          selectedPresetModels,
+          transportModels.models.map((model) => model.id),
+        )
     : transportModels.models.length > 0
-      ? (type === 'gemini-sdk'
-        ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+      ? (type === 'codex-sdk'
+          ? transportModels.models.map((model) => model.id)
+        : type === 'muse-code-sdk'
+          ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === AGY_SDK_PROVIDER_ID
+          ? transportModels.models.map((model) => model.id)
+        : type === CODEBUDDY_PROVIDER_IDS.CHINA
+          ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+          ? mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -333,58 +455,151 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'
           ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+        : type === 'muse-code-sdk'
+          ? [...MUSE_SDK_MODEL_SUGGESTIONS]
+        : type === AGY_SDK_PROVIDER_ID
+          ? [...AGY_SDK_MODEL_SUGGESTIONS]
         : type === 'qwen'
-            ? qwenPresetModels
-            : type === 'gemini-sdk'
-              ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+            ? selectedPresetModels
+            : type === CODEBUDDY_PROVIDER_IDS.CHINA
+                ? [...CODEBUDDY_CHINA_MODEL_FALLBACK]
+                : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+                  ? [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK]
               : []
-  ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
+  ), [transportModels.models, type, selectedPresetModels, selectedCcPreset]);
+
+  usePresetModelSelection({
+    agentType: type,
+    preset: selectedCcPreset,
+    suggestions: modelSuggestions,
+    setRequestedModel,
+  });
+
+  const codexModelManuallySelectedRef = useRef(false);
+  const lastCodexTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
+  useEffect(() => {
+    const nextTarget = serverId?.trim() || ws || null;
+    if (lastCodexTargetRef.current && nextTarget && lastCodexTargetRef.current !== nextTarget) {
+      codexModelManuallySelectedRef.current = false;
+      if (type === 'codex-sdk' && !selectedCcPreset) setRequestedModel('');
+    }
+    lastCodexTargetRef.current = nextTarget;
+  }, [serverId, selectedCcPreset, type, ws]);
 
   useEffect(() => {
-    if (type !== 'codex-sdk') return;
+    if (type !== 'codex-sdk' || selectedCcPreset) {
+      codexModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (codexModelManuallySelectedRef.current && trimmed) return trimmed;
+      return resolveCodexAutoDefaultModel(modelSuggestions, transportModels.defaultModel) ?? '';
+    });
+  }, [type, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(type)) return;
+    setRequestedModel((current) => {
+      const preferred = type === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (type !== 'muse-code-sdk') return;
     setRequestedModel((current) => {
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const stored = loadCodexModelPreference();
-      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
-      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
-        return transportModels.defaultModel;
+      const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  const agyModelManuallySelectedRef = useRef(false);
+  useEffect(() => {
+    if (type !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
       }
-      return trimmed;
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
   return (
-    <div class="dialog-overlay">
-      <div class="dialog" style={responsiveDialogStyle}>
+    <div class={`dialog-overlay${overlayClassName ? ` ${overlayClassName}` : ''}`}>
+      <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
-          <span>New Sub-Session</span>
+          <span>{t('subsessionBar.new_sub_session')}</span>
           <button class="dialog-close" onClick={onClose}>×</button>
         </div>
 
         <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           {/* Type selection */}
           <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Type</div>
-            <div class="subsession-type-groups">
-              {agentGroups.map((group) => (
-                <div key={group.id} class="subsession-type-group">
-                  <div class="subsession-type-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
-                  <div class="subsession-type-grid">
-                    {group.items.map((choice) => (
-                      <button
-                        key={choice.id}
-                        class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
-                        disabled={customProviderSdk && choice.id !== 'qwen'}
-                        onClick={() => selectType(choice.id)}
-                      >
-                        <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
-                      </button>
-                    ))}
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.type')}</div>
+            <div class="session-agent-groups">
+              {agentGroups.map((group) => {
+                const allowedItems = allowedAgentTypeSet
+                  ? group.items.filter((choice) => allowedAgentTypeSet.has(choice.id))
+                  : group.items;
+                const visibleItems = customProviderSdk
+                  ? allowedItems.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  : allowedItems;
+                if (visibleItems.length === 0) return null;
+                return (
+                  <div key={group.id} class="session-agent-group">
+                    <div class="session-agent-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                    <div class="session-agent-grid">
+                      {visibleItems.map((choice) => (
+                        <button
+                          key={choice.id}
+                          type="button"
+                          class={`session-agent-card${type === choice.id ? ' active' : ''}`}
+                          data-agent-type={choice.id}
+                          // Hidden choices (e.g. qwen) stay real DOM nodes --
+                          // just invisible and out of the tab/accessibility
+                          // order -- rather than being omitted from
+                          // visibleItems, so the underlying data/behavior
+                          // stays fully intact for any test still querying
+                          // it directly. A hidden choice that was explicitly
+                          // allow-listed via allowedAgentTypes (e.g. the
+                          // supervision-pool worker-type picker, which still
+                          // legitimately offers qwen as a backend) is a
+                          // deliberate exception and renders normally. Unavailable Claude CLI SDK
+                          // is never restored by an allow-list.
+                          style={(choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id))) ? { display: 'none' } : undefined}
+                          disabled={!isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                          aria-pressed={type === choice.id}
+                          onClick={() => selectType(choice.id)}
+                        >
+                          <span class="session-agent-card-icon" aria-hidden="true">{choice.icon}</span>
+                          <span>{getSessionAgentLabel(t, choice)}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
+            <SdkModeRecommendation agentType={type} />
             <div style={{ marginTop: 10 }}>
               <label
                 style={{
@@ -432,7 +647,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 {t('new_session.custom_provider_sdk_help')}
               </div>
             </div>
-            <QwenCodingPlanHint selected={type === 'qwen'} />
+            <QwenCodingPlanHint selected={customProviderSdk || type === 'qwen'} />
           </div>
 
           {/* Script command (only for script type) */}
@@ -565,7 +780,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           )}
 
           {/* CC env preset selector + editor */}
-          {supportsCcPreset && (
+          {showCcPresetControls && (
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
@@ -588,11 +803,71 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 10, fontSize: 11 }}>
                   <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
                   {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
+                  <div style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 9, color: '#64748b', marginBottom: 2 }}>API Protocol</div>
+                    <div style={{ display: 'flex', gap: 12 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="anthropic"
+                          checked={newPresetAuthType === 'anthropic'}
+                          onChange={() => {
+                            setNewPresetAuthType('anthropic');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        Anthropic Compatible
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="openai"
+                          checked={newPresetAuthType === 'openai'}
+                          onChange={() => {
+                            setNewPresetAuthType('openai');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        OpenAI Compatible
+                      </label>
+                    </div>
+                  </div>
                   {[
                     { label: 'Preset Name', envKey: '', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
-                    { label: 'API Base URL', envKey: 'ANTHROPIC_BASE_URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
-                    { label: 'API Key', envKey: 'ANTHROPIC_AUTH_TOKEN', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
-                    { label: 'Model', envKey: 'ANTHROPIC_MODEL', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                    {
+                      label: 'API Base URL',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL',
+                      ph: newPresetAuthType === 'openai' ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
+                      val: newPresetBaseUrl,
+                      set: setNewPresetBaseUrl,
+                    },
+                    {
+                      label: 'API Key',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_AUTH_TOKEN',
+                      ph: 'your-api-key',
+                      val: newPresetToken,
+                      set: setNewPresetToken,
+                      type: 'password' as const,
+                    },
+                    {
+                      label: 'Model',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_MODEL' : 'ANTHROPIC_MODEL',
+                      ph: newPresetAuthType === 'openai' ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
+                      val: newPresetModel,
+                      set: setNewPresetModel,
+                    },
                   ].map(({ label, envKey, ph, val, set, type }) => (
                     <div key={label} style={{ marginBottom: 4 }}>
                       <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}{envKey && <span style={{ color: '#334155', marginLeft: 4 }}>{envKey}</span>}</div>
@@ -709,7 +984,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (
-                  <option key={level} value={level}>{formatEffortLevel(level)}</option>
+                  <option key={level} value={level}>{formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}</option>
                 ))}
               </select>
             </div>
@@ -718,11 +993,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {type === 'qwen' && modelSuggestions.length > 0 ? (
+              {((type === 'qwen' || type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) || (Boolean(selectedCcPreset) && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) && modelSuggestions.length > 0 ? (
                 <select
                   class="input"
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLSelectElement).value)}
+                  onInput={(e) => {
+                    const val = (e.target as HTMLSelectElement).value;
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    if (type === 'codex-sdk' && !selectedCcPreset) {
+                      codexModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
+                    setRequestedModel(val);
+                  }}
                   style={{ width: '100%' }}
                 >
                   {modelSuggestions.map((model) => (
@@ -730,22 +1012,36 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   ))}
                 </select>
               ) : (
-                <input
-                  class="input"
-                  type="text"
-                  list={`sub-session-model-options-${type}`}
+                <ModelCombobox
+                  className="input"
+                  id={`sub-session-model-${type}`}
+                  options={modelSuggestions}
                   placeholder={t('session.supervision.selectModel')}
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                  onChange={(val) => {
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    if (type === 'codex-sdk' && !selectedCcPreset) {
+                      codexModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
+                    setRequestedModel(val);
+                  }}
                   style={{ width: '100%' }}
                 />
               )}
-              {modelSuggestions.length > 0 && (
-                <datalist id={`sub-session-model-options-${type}`}>
-                  {modelSuggestions.map((model) => (
-                    <option key={model} value={model} />
-                  ))}
-                </datalist>
+              {type === 'grok-sdk' && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.grok_prerequisite_error', { error: transportModels.error })}
+                </div>
+              )}
+              {type === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.hermes_prerequisite_error', { error: transportModels.error })}
+                </div>
+              )}
+              {type === AGY_SDK_PROVIDER_ID && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.agy_prerequisite_error', { error: transportModels.error })}
+                </div>
               )}
             </div>
           )}
@@ -780,6 +1076,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             />
           </div>
 
+          {/* Quantity: launch several identical sub-sessions at once */}
+          {canLaunchMultiple && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('new_session.launch_count')}</div>
+              <input
+                class="input"
+                type="number"
+                min={1}
+                max={MAX_SUB_SESSION_LAUNCH_COUNT}
+                value={countInput}
+                onInput={(e) => setCountInput((e.target as HTMLInputElement).value)}
+                style={{ width: 120 }}
+                aria-label={t('new_session.launch_count')}
+              />
+              {launchCount > 1 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+                  {t('new_session.launch_count_hint', { count: launchCount })}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Description / persona */}
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.description')}</div>
@@ -794,9 +1112,23 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           </div>
         </div>
 
+        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
+          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
+            <input
+              type="checkbox"
+              checked={incognito}
+              disabled={!canIncognito}
+              onChange={(event) => setIncognito(event.currentTarget.checked)}
+            />
+            <span>🕶️ {t('session.incognito')}</span>
+          </label>
+          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
+          {(!canIncognito || (incognito && !supportsSessionIncognito(type))) && <p role="status">{t('session.incognito_unsupported')}</p>}
+        </div>
+
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button class="btn btn-primary" onClick={handleStart}>Launch</button>
+          <button class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`} onClick={handleStart} disabled={!canStartType || incognitoBlocked}>Launch</button>
         </div>
       </div>
     </div>

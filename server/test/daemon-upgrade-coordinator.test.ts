@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { DAEMON_UPGRADE_DELIVERY_STATUS } from '../../shared/daemon-upgrade.js';
+import { DAEMON_UPGRADE_DELIVERY_STATUS, DAEMON_UPGRADE_FORCE_FIELD } from '../../shared/daemon-upgrade.js';
 import { DaemonUpgradeCoordinator } from '../src/ws/daemon-upgrade-coordinator.js';
 import {
   DaemonUpgradePublicationGate,
   daemonUpgradeTarballUrl,
+  defaultProbe,
   type DaemonUpgradePublicationProbeResult,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 
@@ -23,7 +24,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     );
   });
 
-  it('does not send daemon.upgrade until the target tarball is published, then caches the success', async () => {
+  it('does not send a manual daemon.upgrade until the target tarball is published, then caches the success', async () => {
     vi.useFakeTimers();
     const targetVersion = '2026.4.905-dev.877';
     const probe = vi.fn<[], Promise<DaemonUpgradePublicationProbeResult>>()
@@ -38,7 +39,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
 
     const result = coordinator.request({
       targetVersion,
-      source: 'auto',
+      source: 'manual',
       isDaemonReady: () => true,
       isStillCurrent: () => true,
       send: (message) => sent.push(message),
@@ -59,14 +60,12 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     await vi.advanceTimersByTimeAsync(100);
     await flushPromises();
     expect(probe).toHaveBeenCalledTimes(2);
-    expect(sent).toEqual([]);
 
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
     expect(sent).toEqual([{
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: expect.any(String),
       targetVersion,
+      source: 'manual',
     }]);
 
     const nextCoordinator = new DaemonUpgradeCoordinator(gate);
@@ -113,5 +112,476 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
 
     expect(sent).toHaveLength(1);
   });
+
+  it('bypasses npm publication for controlled-node image artifacts', () => {
+    const probe = vi.fn<[], Promise<DaemonUpgradePublicationProbeResult>>()
+      .mockResolvedValue({ status: 'missing', statusCode: 404 });
+    const coordinator = new DaemonUpgradeCoordinator(new DaemonUpgradePublicationGate({
+      probe: async () => probe(),
+      retryDelaysMs: [100],
+    }));
+    const sent: Record<string, unknown>[] = [];
+
+    const result = coordinator.request({
+      targetVersion: '2026.7.1234-dev.5',
+      source: 'manual',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      send: (message) => sent.push(message),
+    });
+
+    expect(result.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toEqual([{
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      upgradeId: expect.any(String),
+      targetVersion: '2026.7.1234-dev.5',
+      source: 'manual',
+    }]);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('does not retry a blocked upgrade without a new explicit request', async () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const daemonReady = vi.fn(() => true);
+    const stillCurrent = vi.fn(() => true);
+
+    const result = coordinator.request({
+      source: 'manual',
+      isDaemonReady: daemonReady,
+      isStillCurrent: stillCurrent,
+      send: (message) => sent.push(message),
+      now: 0,
+    });
+
+    expect(result.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(1);
+    expect(coordinator.request({ source: 'manual', isDaemonReady: daemonReady, isStillCurrent: stillCurrent, send: (message) => sent.push(message) }).deliveryStatus)
+      .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+  });
+
+  it('keeps the same lifecycle pending and retries immediately after a legacy daemon restart', async () => {
+    vi.useFakeTimers();
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    let ready = true;
+    const base = {
+      targetVersion: '2026.8.3409-dev.3847',
+      source: 'manual' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+    };
+
+    const first = coordinator.request({ ...base, now: 0 });
+    expect(sent).toHaveLength(1);
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      expect(coordinator.prepareRetryAfterDaemonRestart(5_001 + cycle)).toBe(true);
+      expect(coordinator.prepareRetryAfterDaemonRestart(5_101 + cycle)).toBe(false);
+
+      ready = false;
+      const reconnect = coordinator.request({ ...base, now: 5_201 + cycle });
+      expect(reconnect).toMatchObject({
+        upgradeId: first.upgradeId,
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
+      });
+
+      ready = true;
+      const flushed = coordinator.flushPending({
+        skipPublicationGate: true,
+        isDaemonReady: () => ready,
+        isStillCurrent: () => true,
+        send: base.send,
+      });
+      expect(flushed).toMatchObject({
+        upgradeId: first.upgradeId,
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+      });
+      expect(sent).toHaveLength(cycle + 2);
+    }
+  });
+
+  it('terminally blocks only that target until manual override', async () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const targetVersion = '2026.7.3192-dev.3593';
+    const request = {
+      targetVersion,
+      source: 'manual' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+      now: 0,
+    };
+
+    expect(coordinator.request(request).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.blockTargetAfterTerminalFailure(targetVersion, 1)).toBe(true);
+
+    expect(sent).toHaveLength(1);
+    expect(coordinator.request({ ...request, source: 'auto', now: 5_001 })).toMatchObject({
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
+      reason: 'terminal_install_failure',
+    });
+
+    expect(coordinator.request({
+      ...request,
+      source: 'manual',
+      now: 5_002,
+    }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('keeps an offline manual lifecycle authoritative over reconnect auto traffic', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const targetVersion = '2026.7.3192-dev.3593';
+    let ready = false;
+    const base = {
+      targetVersion,
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+    };
+
+    const manual = coordinator.request({ ...base, source: 'manual' });
+    expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+
+    const authAuto = coordinator.request({ ...base, source: 'auto' });
+    expect(authAuto).toMatchObject({
+      upgradeId: manual.upgradeId,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
+    });
+
+    ready = true;
+    const flushed = coordinator.flushPending({
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message) => sent.push(message),
+    });
+    expect(flushed).toMatchObject({
+      upgradeId: manual.upgradeId,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+    });
+    expect(sent).toEqual([{
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      upgradeId: manual.upgradeId,
+      targetVersion,
+      source: 'manual',
+    }]);
+  });
+
+  it('identifies an older failure superseded by a newer manual lifecycle', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const targetVersion = '2026.7.3192-dev.3593';
+    coordinator.blockTargetAfterTerminalFailure(targetVersion, 1);
+    const manual = coordinator.request({
+      targetVersion,
+      source: 'manual',
+      skipPublicationGate: true,
+      isDaemonReady: () => false,
+      send: () => {},
+      now: 2,
+    });
+
+    expect(coordinator.isTerminalFailureSupersededByManual(targetVersion, 'older-upgrade')).toBe(true);
+    expect(coordinator.isTerminalFailureSupersededByManual(targetVersion, manual.upgradeId)).toBe(false);
+    expect(coordinator.hasManualLifecycleForTarget(targetVersion)).toBe(true);
+  });
+
+  it('allows a fresh manual lifecycle when the requested target version changes', async () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.blockTargetAfterTerminalFailure('2026.7.3192-dev.3593', 0);
+
+    expect(coordinator.request({
+      targetVersion: '2026.7.3193-dev.3594',
+      source: 'manual',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message) => sent.push(message),
+      now: 1,
+    }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+
+    expect(sent).toHaveLength(1);
+  });
+
+  it('releases a terminal block so the same target can be offered again, and only that target', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const input = (now: number) => ({
+      targetVersion: '2026.7.3192-dev.3593',
+      source: 'auto' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+      now,
+    });
+    coordinator.blockTargetAfterTerminalFailure('2026.7.3192-dev.3593', 0);
+    expect(coordinator.request(input(1)).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF);
+
+    expect(coordinator.releaseTerminalBlock('2026.7.9999-dev.1', 2)).toBe(false);
+    expect(coordinator.releaseTerminalBlock('not a version', 2)).toBe(false);
+    expect(coordinator.releaseTerminalBlock('2026.7.3192-dev.3593', 2)).toBe(true);
+    expect(coordinator.request(input(3)).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(1);
+    // Nothing left to release once the target is in flight.
+    expect(coordinator.releaseTerminalBlock('2026.7.3192-dev.3593', 4)).toBe(false);
+  });
+
+  it('reports a delivered lifecycle for its exact target only', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toBeNull();
+    coordinator.request({
+      targetVersion: '2026.7.3192-dev.3593',
+      source: 'auto',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: () => {},
+      now: 42,
+    });
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toEqual({ lastSentAt: 42 });
+    expect(coordinator.sentLifecycleFor('2026.7.3193-dev.3594')).toBeNull();
+    expect(coordinator.sentLifecycleFor(undefined)).toBeNull();
+    coordinator.prepareRetryAfterDaemonRestart(50);
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toBeNull();
+  });
 });
 
+describe('DaemonUpgradeCoordinator forced manual upgrades and automatic lifecycles', () => {
+  const TARGET = '2026.7.3192-dev.3593';
+  const send = (sent: Record<string, unknown>[], extra: Record<string, unknown> = {}) => ({
+    targetVersion: TARGET,
+    skipPublicationGate: true,
+    isDaemonReady: () => true,
+    isStillCurrent: () => true,
+    send: (message: Record<string, unknown>) => { sent.push(message); },
+    ...extra,
+  });
+
+  it('puts force on the wire only for a manual request that asked for it', () => {
+    const forced: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(forced), source: 'manual', force: true });
+    expect(forced[0]).toMatchObject({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+
+    const plain: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(plain), source: 'manual' });
+    expect(plain[0]).not.toHaveProperty(DAEMON_UPGRADE_FORCE_FIELD);
+
+    const auto: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(auto), source: 'auto', force: true });
+    expect(auto[0]).toMatchObject({ source: 'auto' });
+    expect(auto[0]).not.toHaveProperty(DAEMON_UPGRADE_FORCE_FIELD);
+  });
+
+  it('keeps an offline forced request forced when it is flushed later, and when an auto request is promoted onto it', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    expect(coordinator.request({ ...send(sent, { isDaemonReady: () => false }), source: 'manual', force: true }).deliveryStatus)
+      .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+    // The reconnect-driven auto probe must not demote it (source) nor strip the operator's force.
+    coordinator.request({ ...send(sent, { isDaemonReady: () => false }), source: 'auto' });
+    coordinator.flushPending({ ...send(sent), targetVersion: undefined } as never);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+  });
+
+  it('lets a manual request supersede an automatic command that is already out, instead of answering already_in_progress', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent.map((m) => m.source)).toEqual(['auto', 'manual']);
+    expect(coordinator.snapshot()).toMatchObject({ source: 'manual', status: 'sent' });
+    // ...and automatic traffic can never take a manual lifecycle back.
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.snapshot()).toMatchObject({ source: 'manual' });
+  });
+
+  it('lets a forced request outrank an unforced manual one that is already out, but not repeat an equal one', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'manual' });
+    expect(coordinator.request({ ...send(sent), source: 'manual' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('sends a deferred (pending_offline) lifecycle at the next request when the daemon is ready', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'auto' });
+    expect(coordinator.deferAfterTransientBlock()).toBe(true);
+    expect(coordinator.snapshot()).toMatchObject({ status: 'pending_offline' });
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('releases only a sent lifecycle after the daemon refused it', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.releaseSentLifecycle()).toBe(false);
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'manual' });
+    expect(coordinator.releaseSentLifecycle()).toBe(true);
+    expect(coordinator.snapshot()).toBeNull();
+    // A fresh request now starts a new lifecycle with a new id.
+    expect(coordinator.request({ ...send(sent), source: 'manual' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(new Set(sent.map((m) => m.upgradeId)).size).toBe(2);
+    coordinator.deferAfterTransientBlock();
+    expect(coordinator.releaseSentLifecycle()).toBe(false);
+  });
+});
+
+describe('DaemonUpgradeCoordinator rescue-restart preparation (latched legacy node)', () => {
+  const TARGET = '2026.9.4544-dev.5197';
+  const input = (sent: Record<string, unknown>[], over: Record<string, unknown> = {}) => ({
+    targetVersion: TARGET,
+    source: 'auto' as const,
+    skipPublicationGate: true,
+    isDaemonReady: () => true,
+    isStillCurrent: () => true,
+    send: (message: Record<string, unknown>) => { sent.push(message); },
+    ...over,
+  });
+
+  it('is reachable after the latch receipt already deferred the lifecycle (the production order since 6054fcac7)', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request(input(sent));
+    expect(coordinator.snapshot()?.status).toBe('sent');
+    // the node answered already_in_progress: a retryable gate, so the lifecycle is deferred FIRST ...
+    expect(coordinator.deferAfterTransientBlock(1)).toBe(true);
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    // ... and the old precondition (`sent`) can no longer hold:
+    expect(coordinator.prepareRetryAfterDaemonRestart(2)).toBe(false);
+    // the rescue-restart preparation does not depend on it, and leaves the lifecycle pending for the replacement
+    expect(coordinator.prepareForLatchRescueRestart(3)).toBe('prepared');
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    const flushed = coordinator.flushPending({ ...input(sent), source: undefined, targetVersion: undefined } as never);
+    expect(flushed).toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT, targetVersion: TARGET });
+    expect(sent).toHaveLength(2);
+  });
+
+  it('puts a delivered lifecycle back to pending so the replacement generation is offered the upgrade at once', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const first = coordinator.request(input(sent));
+    expect(coordinator.prepareForLatchRescueRestart(5)).toBe('prepared');
+    expect(coordinator.snapshot()).toMatchObject({ upgradeId: first.upgradeId, status: 'pending_offline' });
+    expect(coordinator.sentLifecycleFor(TARGET)).toBeNull();
+  });
+
+  it('is idempotent: a retry in the same generation, or an already pending lifecycle, is still prepared', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request(input(sent, { isDaemonReady: () => false }));
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    for (let i = 0; i < 3; i += 1) expect(coordinator.prepareForLatchRescueRestart(i)).toBe('prepared');
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+  });
+
+  it('has nothing to hold when there is no lifecycle: the automatic trigger creates one on re-authentication', () => {
+    expect(new DaemonUpgradeCoordinator().prepareForLatchRescueRestart(1)).toBe('prepared');
+  });
+
+  it('refuses only a terminally blocked target: its own failure backoff owns the next attempt', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    coordinator.blockTargetAfterTerminalFailure(TARGET, 1);
+    expect(coordinator.prepareForLatchRescueRestart(2)).toBe('blocked');
+    expect(coordinator.snapshot()?.status).toBe('terminal_blocked');
+  });
+
+  it('is unchanged for the other callers: prepareRetryAfterDaemonRestart still needs a delivered lifecycle', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.prepareRetryAfterDaemonRestart(1)).toBe(false);
+    coordinator.request(input([]));
+    expect(coordinator.prepareRetryAfterDaemonRestart(2)).toBe(true);
+    expect(coordinator.prepareRetryAfterDaemonRestart(3)).toBe(false);
+  });
+});
+
+describe('defaultProbe R2-primary and npm fallback', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.USE_R2_ARTIFACT;
+  });
+
+  it('returns available immediately when R2 latest.json matches targetVersion and HEAD succeeds without hitting npm', async () => {
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const target = String(url);
+      calls.push(target);
+      if (target === 'https://dl.im.codes/dev/npm/latest.json') {
+        return new Response(JSON.stringify({
+          version: '2026.11.7090-dev.1',
+          channel: 'dev',
+          filename: 'imcodes-latest.tgz',
+          sha256: 'a'.repeat(64),
+          sizeBytes: 1234,
+        }), { status: 200 });
+      }
+      if (target === 'https://dl.im.codes/dev/npm/imcodes-latest.tgz') {
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${target}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await defaultProbe('2026.11.7090-dev.1', daemonUpgradeTarballUrl('2026.11.7090-dev.1'));
+    expect(res).toEqual({ status: 'available', statusCode: 200 });
+    expect(calls).toEqual([
+      'https://dl.im.codes/dev/npm/latest.json',
+      'https://dl.im.codes/dev/npm/imcodes-latest.tgz',
+    ]);
+  });
+
+  it('falls back to npm tarball HEAD when R2 manifest version mismatches or R2 is unavailable', async () => {
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const target = String(url);
+      calls.push(target);
+      if (target === 'https://dl.im.codes/master/npm/latest.json') {
+        return new Response(JSON.stringify({
+          version: '2026.11.9999',
+          channel: 'master',
+          filename: 'imcodes-latest.tgz',
+          sha256: 'b'.repeat(64),
+          sizeBytes: 1234,
+        }), { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const npmUrl = daemonUpgradeTarballUrl('2026.11.7090');
+    const res = await defaultProbe('2026.11.7090', npmUrl);
+    expect(res).toEqual({ status: 'missing', statusCode: 404 });
+    expect(calls).toEqual([
+      'https://dl.im.codes/master/npm/latest.json',
+      npmUrl,
+    ]);
+  });
+
+  it('skips R2 when USE_R2_ARTIFACT=false and probes npm directly', async () => {
+    process.env.USE_R2_ARTIFACT = 'false';
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      calls.push(String(url));
+      return new Response(null, { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const npmUrl = daemonUpgradeTarballUrl('2026.11.7090');
+    const res = await defaultProbe('2026.11.7090', npmUrl);
+    expect(res).toEqual({ status: 'available', statusCode: 200 });
+    expect(calls).toEqual([npmUrl]);
+  });
+});

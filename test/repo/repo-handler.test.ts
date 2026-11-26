@@ -43,6 +43,8 @@ import {
 } from '../../src/daemon/repo-handler.js';
 import { repoCache, RepoCache } from '../../src/repo/cache.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
+import { detectRepo } from '../../src/repo/detector.js';
 import {
   assertGitRepository,
   detectInProgressOperation,
@@ -115,6 +117,39 @@ describe('handleRepoCommand — input validation', () => {
     expect(serverLink.send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'repo.error', error: 'invalid_params' }),
     );
+  });
+
+  it('resolves the shared session-root sentinel from the daemon session registry', async () => {
+    handleRepoCommand(
+      {
+        type: REPO_MSG.DETECT,
+        requestId: 'shared-repo-detect',
+        projectDir: FS_SESSION_ROOT_PATH,
+        sessionName: 'deck_myproject_brain',
+      },
+      serverLink as any,
+    );
+
+    await vi.waitFor(() => {
+      expect(detectRepo).toHaveBeenCalledWith('/home/user/myproject');
+    });
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: REPO_MSG.DETECT_RESPONSE,
+      requestId: 'shared-repo-detect',
+      projectDir: '/home/user/myproject',
+    }));
+  });
+
+  it('rejects the session-root sentinel without a valid session binding', () => {
+    handleRepoCommand(
+      { type: REPO_MSG.DETECT, requestId: 'unbound-root', projectDir: FS_SESSION_ROOT_PATH },
+      serverLink as any,
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: REPO_MSG.ERROR,
+      requestId: 'unbound-root',
+      error: 'invalid_params',
+    }));
   });
 
   it('rejects invalid state value', () => {

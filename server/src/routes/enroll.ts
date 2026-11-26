@@ -1,0 +1,2899 @@
+import {
+  CONTROLLED_NODE_ABI_PROFILE_FIELD, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217, normalizeControlledNodeAbiProfile,
+  isControlledNodeAbiTarget, enrollmentAbiDigest, type ControlledNodeAbiProfile,
+} from '../../../shared/controlled-node-abi.js';
+import { activeUserExistsSql } from '../security/user-status.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import { enforceDaemonTokenRoute } from '../security/daemon-token-policy.js';
+import { Hono, type Context } from 'hono';
+import { isAllowedServerUrl } from '../security/server-url.js';
+import { controlledNodeInstallCommand } from '../services/controlled-node-install-command.js';
+import { compress } from 'hono/compress';
+import { z } from 'zod';
+import { lstat, open, readdir, type FileHandle } from 'node:fs/promises';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { join } from 'node:path';
+import type { Env, EnvConfig } from '../env.js';
+import type { Database } from '../db/client.js';
+import {
+  extractArtifactDistributionEnv,
+  resolveControlledNodeExternalArtifact,
+  type VerifyExternalArtifactIdentity,
+} from '../services/controlled-node-artifact-distribution.js';
+import { randomHex, sha256Hex, encryptBotConfig, decryptBotConfig } from '../security/crypto.js';
+import { logAudit } from '../security/audit.js';
+import { requireAuth } from '../security/authorization.js';
+import logger from '../util/logger.js';
+import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
+import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
+import {
+  NODE_ROLE,
+  encodeEnrollmentTrailer,
+  isEnrollmentNodeTokenHash,
+  sanitizeEnrollmentOwnerName,
+  type EnrollmentBlob,
+} from '../../../shared/remote-exec.js';
+import {
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
+  CONTROLLED_NODE_INSTALL_PAYLOAD_SUBPATH,
+  CONTROLLED_NODE_INSTALL_TICKET_FIELD,
+  type ControlledNodeInstallPayloadResponse,
+} from '../../../shared/controlled-node-install.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
+import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
+import {
+  MACHINE_HOST_LINK_ERROR,
+  classifyMachineTarget,
+  deriveDisplayName,
+} from '../../../shared/machine-reference.js';
+import { hostIdentitiesConflict, isOwnedHostDaemon } from '../services/controlled-node-host-link.js';
+import { isPlausibleServerId } from '../../../shared/controlled-node-host-link.js';
+import {
+  isCanonicalControlledNodePair,
+  CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
+  CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+  CONTROLLED_NODE_ARCH_ARM64,
+  CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
+  CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
+  CONTROLLED_NODE_OS_LINUX,
+  CONTROLLED_NODE_OS_MAC,
+  CONTROLLED_NODE_OS_WIN,
+  CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
+  controlledNodeComputerUseHelperFilename,
+  controlledNodeTicketTtlMs,
+  controlledNodeTicketMaxConsumes,
+  CONTROLLED_NODE_INSTALL_CODE_ALPHABET,
+  CONTROLLED_NODE_INSTALL_CODE_LENGTH,
+  isControlledNodeArtifactArch,
+  isControlledNodeArtifactCompatibleWithRuntime,
+  isControlledNodeArch,
+  isControlledNodeRuntimePair,
+  isControlledNodeOs,
+  isControlledNodeTicketDelivery,
+  isAideskLocalUiArtifactAsset,
+  isDaemonRuntimeArtifactAsset,
+  isDesktopReleaseManifestAsset,
+  isRemoteDesktopArtifactAsset,
+  controlledNodeDaemonRuntimeTarget,
+  normalizeControlledNodeArtifactPair,
+  type AideskLocalUiArtifactAsset,
+  type ControlledNodeArtifactArch,
+  type ControlledNodeOs,
+} from '../../../shared/controlled-node-artifacts.js';
+import {
+  AIDESK_LOCAL_UI_MANIFEST_FILENAME,
+  AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES,
+  AIDESK_LOCAL_UI_MAX_BYTES,
+  AIDESK_LOCAL_UI_NOTICES_FILENAME,
+  AIDESK_LOCAL_UI_NOTICES_MAX_BYTES,
+  AIDESK_LOCAL_UI_SIDECAR_TARGET,
+  aideskLocalUiArtifactRelativeDirectory,
+  aideskLocalUiExecutableFileName,
+} from '../../../shared/aidesk-local-ui-artifact.js';
+import {
+  REMOTE_DESKTOP_MACOS_ARCHITECTURES,
+  REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
+  REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+  encodeRemoteDesktopMacosComponentSetPrefix,
+  remoteDesktopMacosComponentSetFilename,
+  remoteDesktopMacosComponentSetSize,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
+  validateRemoteDesktopWorkerReleaseManifest,
+  type RemoteDesktopMacosArchitecture,
+  type RemoteDesktopMacosWorkerManifest,
+  validateRemoteDesktopLinuxWorkerManifest,
+} from '../../../shared/remote-desktop-worker.js';
+import {
+  createArtifactCatalog,
+  defaultArtifactCatalog,
+  openDaemonRuntimeArtifact,
+  openDesktopReleaseManifestArtifact,
+  openRemoteDesktopWorkerArtifact,
+  type ArtifactCatalog,
+  type ArtifactDescriptor,
+} from '../services/controlled-node-artifact-catalog.js';
+import {
+  insertControlledServerWithNodeId,
+  type SecureRandomBytes,
+} from '../services/controlled-node-identity.js';
+import { parseControlledNodeId } from '../../../shared/controlled-node-identity.js';
+import { buildControlledNodeBootstrapPage } from './controlled-node-bootstrap-page.js';
+
+function resolveTicketEncryptionKey(c: { env: Env }): string {
+  const key = c.env.BOT_ENCRYPTION_KEY;
+  if (!key) throw new Error('BOT_ENCRYPTION_KEY required for v2 ticket issuance');
+  return key;
+}
+
+type EnrollRouter = Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>;
+
+// Ticket lifetime and download budget now depend on how the ticket reaches the
+// target machine; both tables live in shared/ so Web and Server cannot disagree.
+const ATTEMPT_LEASE_MS = 30 * 1000;
+
+/**
+ * Generate an install code with rejection sampling.
+ *
+ * `byte % 32` would be uniform only because 256 divides evenly by 32; that is
+ * true today but silently stops being true if the alphabet is ever resized.
+ * Masking and rejecting keeps the distribution correct for any alphabet size.
+ */
+function randomInstallCode(): string {
+  const alphabet = CONTROLLED_NODE_INSTALL_CODE_ALPHABET;
+  const mask = (1 << Math.ceil(Math.log2(alphabet.length))) - 1;
+  let out = '';
+  while (out.length < CONTROLLED_NODE_INSTALL_CODE_LENGTH) {
+    for (const byte of randomBytes(32)) {
+      const index = byte & mask;
+      if (index < alphabet.length) {
+        out += alphabet[index];
+        if (out.length === CONTROLLED_NODE_INSTALL_CODE_LENGTH) break;
+      }
+    }
+  }
+  return out;
+}
+
+export function resolveCanonicalServerUrl(c: { req: { url: string }; env: Env }): string | null {
+  const envName = c.env.NODE_ENV ?? 'development';
+  const configured = c.env.SERVER_URL?.trim();
+  if (envName === 'production' && !configured) return null;
+  try {
+    const url = new URL(configured || new URL(c.req.url).origin);
+    if (url.username || url.password || url.search || url.hash) return null;
+    if (envName === 'production') {
+      if (url.protocol !== 'https:') return null;
+    } else if (!isAllowedServerUrl(url.origin)) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function checkOrigin(c: { req: { url: string }; env: Env }): { ok: true } | { ok: false; reason: string } {
+  return resolveCanonicalServerUrl(c)
+    ? { ok: true }
+    : { ok: false, reason: 'canonical_server_url_required' };
+}
+
+
+// ── POST /api/enroll/v2/ticket ──────────────────────────────────────────────
+
+const TICKET_BODY = z
+  .object({
+    version: z.literal(2),
+    os: z.string(),
+    arch: z.string(),
+    abiProfile: z.string().optional(),
+    /**
+     * The daemon whose machine this node is being enrolled on, when the enrolment
+     * is the "give this machine login-screen control" flow. Recorded so the
+     * browser can tell the two installs are one machine and keep pointing at a
+     * single entry.
+     */
+    /**
+     * Accepted and ignored.
+     *
+     * Enrolment binds a device to a user; a group is an association made
+     * afterwards. Nothing sends this any more, but the body schema is strict,
+     * so rejecting it would 400 every browser still running the previous
+     * bundle -- the server ships before the tab is reloaded, and that ordering
+     * is exactly how the last install outage happened.
+     */
+    teamId: z.string().trim().min(1).max(128).optional(),
+    hostServerId: z.string().min(1).max(128).optional(),
+    /**
+     * Omitted means the historical behaviour: a browser standing at the machine,
+     * with the short exposure window that allows.
+     */
+    delivery: z.enum(CONTROLLED_NODE_TICKET_DELIVERY_VALUES as readonly [string, ...string[]]).optional(),
+  })
+  .strict();
+
+export function createEnrollRoutes(
+  artifactCatalog: ArtifactCatalog = createArtifactCatalog(),
+  dependencies: { controlledNodeIdRandomBytes?: SecureRandomBytes } = {},
+): EnrollRouter {
+  const enrollRoutes: EnrollRouter = new Hono();
+
+  // Compress the streamed representation only when the client opts into gzip.
+  // The artifact remains an ordinary executable/helper on disk and all custom
+  // digest/size headers continue to describe the decoded bytes. Hono removes
+  // Content-Length for the encoded response and adds Vary: Accept-Encoding.
+  const compressArtifactDownload = compress({
+    encoding: CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+    threshold: 1024,
+    contentTypeFilter: (contentType) => contentType === 'application/octet-stream',
+  });
+  enrollRoutes.use('/v2/download', compressArtifactDownload);
+  enrollRoutes.use('/v2/node-artifact', compressArtifactDownload);
+  enrollRoutes.use(CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH, compressArtifactDownload);
+
+enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+
+  const userId = c.get('userId' as never) as string;
+  // Minting creates a durable, reusable installer identity. Unlike ordinary
+  // API reads, an old client is not allowed to omit its in-memory owner
+  // expectation: otherwise a cookie replaced by another tab could permanently
+  // bind every future install from this executable to the wrong account.
+  const expectedOwnerUserId = c.req.header(EXPECTED_USER_ID_HEADER)?.trim();
+  if (!expectedOwnerUserId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED }, 428);
+  }
+  if (expectedOwnerUserId !== userId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.CHANGED }, 409);
+  }
+  const body = await c.req.json().catch(() => null);
+  const parsed = TICKET_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { os, arch, hostServerId } = parsed.data;
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  const delivery = parsed.data.delivery && isControlledNodeTicketDelivery(parsed.data.delivery)
+    ? parsed.data.delivery
+    : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
+  if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch, abiProfile)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  if (hostServerId !== undefined) {
+    // Only over a daemon this same user owns: the host link decides which entry
+    // a browser will steer remote control to, so it must not be assignable to
+    // someone else's machine.
+    if (!await isOwnedHostDaemon(c.env.DB as Database, userId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.INVALID_HOST_SERVER }, 403);
+    }
+  }
+
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+
+  // Single-flight verification caches descriptors only; mint never borrows a
+  // stream handle that could later be closed underneath a download.
+  if (!abiProfile) return c.json({ error: 'invalid_body' }, 400);
+  // A stable remote link keeps the original owner/OS/CPU binding (including
+  // old servers' conflict target). Its explicitly requested ABI is a verified
+  // variant, not a new permission, fake arch or replacement of its old URL.
+  const ticketProfile = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? CONTROLLED_NODE_ABI_MODERN : abiProfile;
+  const v = await artifactCatalog.ensureVerified(dir, os, arch, ticketProfile);
+  if (!v.ok) return c.json({ error: 'executable_not_built', os, arch }, 503);
+  // Persist the descriptor so /v2/availability and downstream tooling can
+  // read it without re-hashing. Best-effort; not on the critical mint path.
+  await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
+
+  const abiVariants: Partial<Record<ControlledNodeAbiProfile, string>> = {};
+  let requestedDescriptor = v.descriptor;
+  if (os === CONTROLLED_NODE_OS_LINUX && arch === 'x64'
+    && (delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+      || delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK)
+    && ticketProfile === CONTROLLED_NODE_ABI_MODERN) {
+    const legacy = await artifactCatalog.ensureVerified(dir, os, arch, CONTROLLED_NODE_ABI_GLIBC217);
+    if (legacy.ok) {
+      abiVariants[CONTROLLED_NODE_ABI_GLIBC217] = legacy.descriptor.sha256;
+      if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) requestedDescriptor = legacy.descriptor;
+    } else if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) {
+      return c.json({ error: 'executable_not_built', os, arch, abiProfile }, 503);
+    }
+  }
+  const serverUrl = resolveCanonicalServerUrl(c);
+  if (!serverUrl) return c.json({ error: 'canonical_server_url_required' }, 403);
+
+  const enrollCode = randomHex(32);
+  const codeHash = sha256Hex(enrollCode);
+  const rawTicket = randomHex(32);
+  const ticketHash = sha256Hex(rawTicket);
+  // The pasted install command carries a short code instead of the 64-hex
+  // ticket: a ticket cannot be read off a phone screen or dictated, which is
+  // how a remote install is usually handed over. It is a second lookup key onto
+  // this same row, so it inherits the lease, budget and audit path unchanged.
+  const installCode = delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+    ? randomInstallCode()
+    : null;
+  const installCodeHash = installCode ? sha256Hex(installCode) : null;
+  const encryptionKey = resolveTicketEncryptionKey(c);
+  const encryptedCode = encryptBotConfig(
+    { enrollCode, codeHash, os, arch, serverUrl },
+    encryptionKey,
+  );
+
+  const now = Date.now();
+  const ttlMs = controlledNodeTicketTtlMs(delivery);
+  const ticketExpiresAt = ttlMs === null ? null : now + ttlMs;
+  const maxConsumes = controlledNodeTicketMaxConsumes(delivery);
+
+  const encryptedTicket = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? encryptBotConfig({ ticket: rawTicket }, encryptionKey)
+    : null;
+  const inserted = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? await (c.env.DB as Database).queryOne<{
+      id: string; ticket_hash: string; encrypted_ticket: string;
+    }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, encrypted_ticket, delivery, consumed_count,
+          max_consumes, ticket_expires_at, expires_at, reusable, created_at,
+          host_server_id, install_code_hash, abi_profile, abi_variants)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL, $13, $14::jsonb)
+       ON CONFLICT (owner_user_id, os, arch, (COALESCE(host_server_id, '')))
+         WHERE delivery = 'remote_link'
+           AND revoked_at IS NULL
+           AND encrypted_ticket IS NOT NULL
+       DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id,
+           abi_variants = controlled_node_enrollments_v2.abi_variants || EXCLUDED.abi_variants
+       RETURNING id, ticket_hash, encrypted_ticket`,
+      [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
+       encryptedCode, encryptedTicket, delivery, maxConsumes, now,
+       hostServerId ?? null, ticketProfile, JSON.stringify(abiVariants)],
+    )
+    : await (c.env.DB as Database).queryOne<{
+      id: string; ticket_hash: string; encrypted_ticket: string | null;
+    }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, encrypted_ticket, delivery, consumed_count,
+          max_consumes, ticket_expires_at, expires_at, reusable, created_at,
+          host_server_id, install_code_hash, abi_profile, abi_variants)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13, $14, $15::jsonb)
+       RETURNING id, ticket_hash, encrypted_ticket`,
+      [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
+       encryptedCode, delivery, maxConsumes, ticketExpiresAt, now,
+       hostServerId ?? null, installCodeHash, ticketProfile, JSON.stringify(abiVariants)],
+    );
+  if (!inserted) {
+    return c.json({ error: 'ticket_mint_failed' }, 500);
+  }
+
+  let issuedTicket = rawTicket;
+  if (delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK) {
+    try {
+      if (!inserted.encrypted_ticket) throw new Error('stable_remote_ticket_missing');
+      const decrypted = decryptBotConfig(inserted.encrypted_ticket, encryptionKey);
+      if (!/^[a-f0-9]{64}$/.test(decrypted.ticket ?? '')
+        || sha256Hex(decrypted.ticket) !== inserted.ticket_hash) {
+        throw new Error('stable_remote_ticket_corrupt');
+      }
+      issuedTicket = decrypted.ticket;
+    } catch {
+      return c.json({ error: 'ticket_mint_failed' }, 500);
+    }
+  }
+
+  // Fire-and-forget mint audit (event is non-state-bearing, post-commit).
+  logAudit({
+    userId,
+    action: 'enroll.v2.ticket.mint',
+    ip: (c.get('clientIp' as never) as string) ?? 'unknown',
+    details: {
+      ticketId: inserted.id, os, arch, artifactSha256: v.descriptor.sha256,
+      ticketExpiresAt, delivery,
+    },
+  }, c.env.DB).catch(() => {});
+
+  return c.json({
+    ticketId: inserted.id,
+    ticket: issuedTicket,
+    version: 2,
+    os,
+    arch,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+    filename: requestedDescriptor.filename,
+    sizeBytes: requestedDescriptor.sizeBytes,
+    sha256: requestedDescriptor.sha256,
+    maxConsumes,
+    expiresAt: ticketExpiresAt,
+    delivery,
+    ownerUserId: userId,
+    ...(installCode
+      ? {
+        installCode,
+        installCommand: controlledNodeInstallCommand(serverUrl, installCode, os),
+      }
+      : {}),
+  });
+});
+
+enrollRoutes.delete('/v2/ticket', requireAuth(), async (c) => {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+
+  const userId = c.get('userId' as never) as string;
+  const expectedOwnerUserId = c.req.header(EXPECTED_USER_ID_HEADER)?.trim();
+  if (!expectedOwnerUserId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED }, 428);
+  }
+  if (expectedOwnerUserId !== userId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.CHANGED }, 409);
+  }
+  const body = await c.req.json().catch(() => null);
+  const parsed = TICKET_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { os, arch, hostServerId } = parsed.data;
+  if (parsed.data.delivery !== CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    || !isControlledNodeOs(os)
+    || !isControlledNodeArtifactArch(arch)
+    || !isCanonicalControlledNodePair(os, arch, normalizeControlledNodeAbiProfile(parsed.data.abiProfile))) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const now = Date.now();
+  const revoked = await (c.env.DB as Database).queryOne<{ id: string }>(
+    `UPDATE controlled_node_enrollments_v2
+        SET revoked_at = $1
+      WHERE owner_user_id = $2
+        AND os = $3
+        AND arch = $4
+        AND host_server_id IS NOT DISTINCT FROM $5
+        AND delivery = 'remote_link'
+        AND encrypted_ticket IS NOT NULL
+        AND revoked_at IS NULL
+      RETURNING id`,
+    [now, userId, os, arch, hostServerId ?? null],
+  );
+  if (revoked) {
+    await logAudit({
+      userId,
+      action: CONTROLLED_NODE_ENROLL_AUDIT_ACTION.TICKET_REVOKE,
+      ip: (c.get('clientIp' as never) as string) ?? 'unknown',
+      details: { ticketId: revoked.id, os, arch, hostServerId: hostServerId ?? null },
+    }, c.env.DB);
+  }
+  return c.json({ revoked: revoked !== null });
+});
+
+// ── GET /api/enroll/v2/download (bearer) ───────────────────────────────────
+
+const BEARER_RE = /^Bearer\s+([A-Za-z0-9_-]{8,128})$/;
+const DOWNLOAD_BODY = z.object({ ticket: z.string().min(8).max(128), abiProfile: z.string().optional() }).strict();
+
+/** Pull ticket from JSON POST body first, then form-urlencoded, then Bearer. */
+async function readTicket(c: Context): Promise<string | null> {
+  const contentType = c.req.header('content-type') ?? '';
+  if (c.req.method === 'POST') {
+    if (contentType.includes('application/json')) {
+      const body = await c.req.json().catch(() => null);
+      const parsed = DOWNLOAD_BODY.safeParse(body);
+      if (parsed.success) return parsed.data.ticket;
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      const raw = await c.req.text();
+      const params = new URLSearchParams(raw);
+      const t = params.get(CONTROLLED_NODE_INSTALL_TICKET_FIELD);
+      if (t && t.length >= 8 && t.length <= 128 && /^[A-Za-z0-9_-]+$/.test(t)) return t;
+    }
+  }
+  const auth = c.req.header('Authorization') ?? '';
+  const m = BEARER_RE.exec(auth);
+  if (m && m[1]) return m[1];
+  return null;
+}
+
+async function preConsumeGate(c: Context): Promise<Response | null> {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+  if (c.req.header('range')) {
+    c.header('Content-Range', 'bytes */0');
+    return c.body(null as unknown as ArrayBuffer, 416);
+  }
+  return null;
+}
+
+// ── Reservation + transaction + FD lifecycle ────────────────────────────────
+
+interface DownloadCommit {
+  ticketId: string;
+  ownerUserId: string;
+  os: string;
+  arch: string;
+  artifactSha256: string;
+  abiProfile?: unknown;
+  abiVariants?: unknown;
+  delivery: string;
+  encryptedCode: string;
+  attemptId: string;
+  ip: string;
+}
+
+/**
+ * Reserve a bounded ticket slot, or a time/revocation-bounded remote-link
+ * attempt, in a short row-locked transaction.
+ */
+async function reserveAttempt(
+  db: Database,
+  ticketHash: string,
+  ip: string,
+  now: number,
+): Promise<DownloadCommit | null> {
+  return db.transaction(async (tx) => {
+    // Lock the parent row.
+    const candidate = await tx.queryOne<{
+      id: string; owner_user_id: string; os: string; arch: string;
+      artifact_sha256: string; encrypted_code: string; delivery: string; abi_profile?: unknown; abi_variants?: unknown;
+    }>(
+      // Either credential resolves the same row: the download ticket, or the
+      // short install code from a pasted command. Both are sha256 of a
+      // high-entropy secret and each column is unique, so they cannot collide.
+      `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code, delivery, abi_profile, abi_variants
+         FROM controlled_node_enrollments_v2
+        WHERE (ticket_hash = $1 OR install_code_hash = $1)
+          AND revoked_at IS NULL
+          AND (ticket_expires_at IS NULL OR ticket_expires_at > $2)
+          AND ${activeUserExistsSql('controlled_node_enrollments_v2.owner_user_id')}
+        FOR UPDATE`,
+      [ticketHash, now],
+    );
+    if (!candidate) return null;
+
+    // SQL NULL is the deliberate remote-link no-count-limit contract. Spell
+    // that branch out: relying on `count < NULL` would evaluate to UNKNOWN and
+    // reject a live link by accident.
+    const capacity = await tx.queryOne<{ admitted: boolean }>(
+      `SELECT (
+         enrollment.max_consumes IS NULL
+         OR enrollment.consumed_count + (
+              SELECT count(*)::int
+                FROM controlled_node_download_attempts AS attempt
+               WHERE attempt.ticket_id = enrollment.id
+                 AND attempt.state = 'reserved'
+                 AND attempt.lease_expires_at >= $2
+            ) < enrollment.max_consumes
+       ) AS admitted
+         FROM controlled_node_enrollments_v2 AS enrollment
+        WHERE enrollment.id = $1`,
+      [candidate.id, now],
+    );
+    if (!capacity?.admitted) return null;
+
+    const attemptInsert = await tx.queryOne<{ attempt_id: string }>(
+      `INSERT INTO controlled_node_download_attempts
+         (ticket_id, owner_user_id, state, lease_expires_at, consumed_count_after, last_consume_ip, created_at, updated_at)
+       VALUES ($1, $2, 'reserved', $3, $4, $5, $6, $6)
+       RETURNING attempt_id`,
+      [candidate.id, candidate.owner_user_id, now + ATTEMPT_LEASE_MS, 0, ip, now],
+    );
+    if (!attemptInsert) return null;
+
+    return {
+      ticketId: candidate.id,
+      ownerUserId: candidate.owner_user_id,
+      os: candidate.os,
+      arch: candidate.arch,
+      artifactSha256: candidate.artifact_sha256,
+      abiProfile: candidate.abi_profile,
+      abiVariants: candidate.abi_variants,
+      delivery: candidate.delivery,
+      encryptedCode: candidate.encrypted_code,
+      attemptId: attemptInsert.attempt_id,
+      ip,
+    };
+  });
+}
+
+/** Commit count + attempt + semantic consume audit atomically before bytes. */
+async function commitAttempt(db: Database, reservation: DownloadCommit, now: number): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    // Lock/revalidate the parent first. reserveAttempt uses the same lock
+    // order, so admission and commitment cannot oversubscribe max_consumes.
+    // Expiry and revocation remain authoritative for every mode. Only the
+    // consume threshold is absent for max_consumes=NULL remote links.
+    const parent = await tx.queryOne<{ consumed_count: number }>(
+      `UPDATE controlled_node_enrollments_v2
+          SET consumed_count = consumed_count + 1,
+              consumed_at = CASE
+                WHEN max_consumes IS NOT NULL AND consumed_count + 1 >= max_consumes THEN $2
+                ELSE consumed_at
+              END,
+              last_consume_ip = $3
+        WHERE id = $1
+          AND revoked_at IS NULL
+          AND (ticket_expires_at IS NULL OR ticket_expires_at > $2)
+          AND (max_consumes IS NULL OR consumed_count < max_consumes)
+        RETURNING consumed_count`,
+      [reservation.ticketId, now, reservation.ip],
+    );
+    if (!parent) return false;
+    const updated = await tx.execute(
+      `UPDATE controlled_node_download_attempts
+          SET state = 'committed', committed_at = $2, updated_at = $2,
+              consumed_count_after = $3
+        WHERE attempt_id = $1 AND state = 'reserved'`,
+      [reservation.attemptId, now, parent.consumed_count],
+    );
+    if (updated.changes !== 1) {
+      // Throw so the parent increment is rolled back with this transaction.
+      throw new Error('download_attempt_not_reserved');
+    }
+    await tx.execute(
+      `INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6)`,
+      [
+        randomHex(16),
+        reservation.ownerUserId,
+        'enroll.v2.ticket.consume',
+        JSON.stringify({
+          ticketId: reservation.ticketId,
+          attemptId: reservation.attemptId,
+          os: reservation.os,
+          arch: reservation.arch,
+          consumedCountAfter: parent.consumed_count,
+          artifactSha256: reservation.artifactSha256,
+        }),
+        reservation.ip,
+        now,
+      ],
+    );
+    return true;
+  });
+}
+
+/** Release a still-`reserved` attempt.
+ *  Idempotent and safe to call multiple times. Used for pre-stream
+ *  failures (decrypt, trailer, etc.) where the response has not begun. */
+async function releaseAttempt(
+  db: Database,
+  attemptId: string,
+  parentTicketId: string,
+  ip: string,
+  now: number,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const upd = await tx.queryOne<{ attempt_id: string; owner_user_id: string }>(
+      `UPDATE controlled_node_download_attempts
+          SET state = 'released', released_at = $2, updated_at = $2
+        WHERE attempt_id = $1 AND state = 'reserved'
+        RETURNING attempt_id, owner_user_id`,
+      [attemptId, now],
+    );
+    if (!upd) return; // already committed / released / expired; nothing to do
+    await tx.execute(
+      `INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6)`,
+      [
+        randomHex(16),
+        upd.owner_user_id,
+        'enroll.v2.ticket.release',
+        JSON.stringify({ ticketId: parentTicketId, attemptId, reason: 'pre_stream_failure' }),
+        ip,
+        now,
+      ],
+    );
+  });
+}
+
+/**
+ * Build the trailer + binary into one Web ReadableStream. A native pull/cancel
+ * adapter gives us an explicit close path for EOF, read error and client abort.
+ */
+function buildArtifactStream(
+  handle: FileHandle,
+  sizeBytes: number,
+  trailer: Buffer,
+  closeOnce: () => Promise<void>,
+  patch?: { offset: number; bytes: Buffer },
+): ReadableStream<Uint8Array> {
+  let position = 0;
+  let trailerSent = false;
+  const buffer = Buffer.alloc(64 * 1024);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (position < sizeBytes) {
+          const length = Math.min(buffer.length, sizeBytes - position);
+          const { bytesRead } = await handle.read(buffer, 0, length, position);
+          if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          const chunkStart = position;
+          position += bytesRead;
+          const chunk = Buffer.from(buffer.subarray(0, bytesRead));
+          if (patch) {
+            const overlapStart = Math.max(chunkStart, patch.offset);
+            const overlapEnd = Math.min(position, patch.offset + patch.bytes.length);
+            if (overlapStart < overlapEnd) {
+              patch.bytes.copy(
+                chunk,
+                overlapStart - chunkStart,
+                overlapStart - patch.offset,
+                overlapEnd - patch.offset,
+              );
+            }
+          }
+          controller.enqueue(chunk);
+          return;
+        }
+        if (!trailerSent) {
+          trailerSent = true;
+          controller.enqueue(Buffer.from(trailer));
+          return;
+        }
+        await closeOnce();
+        controller.close();
+      } catch (error) {
+        await closeOnce();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await closeOnce();
+    },
+  });
+}
+
+function buildBareArtifactStream(
+  handle: FileHandle,
+  sizeBytes: number,
+  closeOnce: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  let position = 0;
+  const buffer = Buffer.alloc(64 * 1024);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (position < sizeBytes) {
+          const length = Math.min(buffer.length, sizeBytes - position);
+          const { bytesRead } = await handle.read(buffer, 0, length, position);
+          if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          position += bytesRead;
+          controller.enqueue(Buffer.from(buffer.subarray(0, bytesRead)));
+          return;
+        }
+        await closeOnce();
+        controller.close();
+      } catch (error) {
+        await closeOnce();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await closeOnce();
+    },
+  });
+}
+
+function buildBufferArtifactStream(
+  bytes: Buffer,
+  closeOnce: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(Buffer.from(bytes));
+        return;
+      }
+      await closeOnce();
+      controller.close();
+    },
+    async cancel() {
+      await closeOnce();
+    },
+  });
+}
+
+// ── Consume + stream: reservation → pre-stream checks → committed → stream ─
+
+async function readDownloadAbiProfile(c: Context): Promise<{ valid: boolean; value?: string }> {
+  const queries = c.req.queries(CONTROLLED_NODE_ABI_PROFILE_FIELD) ?? [];
+  if (queries.length > 1) return { valid: false };
+  let value: unknown = queries[0];
+  if (c.req.method === 'POST') {
+    const type = c.req.header('content-type') ?? '';
+    if (type.includes('application/json')) {
+      const body = await c.req.json().catch(() => null);
+      if (body && Object.hasOwn(body, CONTROLLED_NODE_ABI_PROFILE_FIELD)) {
+        if (value !== undefined) return { valid: false };
+        value = body.abiProfile;
+      }
+    } else if (type.includes('application/x-www-form-urlencoded')) {
+      const params = new URLSearchParams(await c.req.text());
+      const profiles = params.getAll(CONTROLLED_NODE_ABI_PROFILE_FIELD);
+      if (profiles.length > 1 || (profiles.length > 0 && value !== undefined)) return { valid: false };
+      if (profiles.length) value = profiles[0];
+    }
+  }
+  return (value === undefined || typeof value === 'string') && normalizeControlledNodeAbiProfile(value) !== null
+    ? { valid: true, value } : { valid: false };
+}
+
+interface PreparedEnrollmentConsume {
+  ok: true;
+  now: number;
+  ip: string;
+  dir: string;
+  profile: ControlledNodeAbiProfile;
+  downloadOs: ControlledNodeOs;
+  downloadArch: ControlledNodeArtifactArch;
+  reservation: DownloadCommit;
+  descriptor: ArtifactDescriptor;
+  encryptionKey: string;
+  enrollmentBlob: EnrollmentBlob;
+}
+
+type PrepareEnrollmentConsumeResult = PreparedEnrollmentConsume | { ok: false; response: Response };
+
+async function prepareVerifiedEnrollmentConsume(
+  c: Context,
+  rawTicket: string,
+  rawProfile?: unknown,
+): Promise<PrepareEnrollmentConsumeResult> {
+  const ticketHash = sha256Hex(rawTicket);
+  const now = Date.now();
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+
+  // Step 1: pre-check via single-flight reservation. This also serializes
+  // concurrent requests for the same ticket via SELECT ... FOR UPDATE.
+  const reservation = await reserveAttempt(c.env.DB as Database, ticketHash, ip, now);
+  if (!reservation) {
+    return { ok: false, response: c.json({ error: 'invalid_or_expired_ticket' }, 401) };
+  }
+
+  // Step 2: single-flight hash + digest verification against the catalog.
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return { ok: false, response: c.json({ error: 'executable_dir_not_configured' }, 503) };
+  }
+  const profile = normalizeControlledNodeAbiProfile(rawProfile);
+  const pinnedDigest = profile ? enrollmentAbiDigest({
+    os: reservation.os, arch: reservation.arch, abiProfile: reservation.abiProfile,
+    sha256: reservation.artifactSha256, variants: reservation.abiVariants,
+    allowVariants: reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+      || reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  }, profile) : null;
+  if (!profile || !pinnedDigest) {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return { ok: false, response: c.json({ error: 'abi_profile_mismatch' }, 409) };
+  }
+  reservation.artifactSha256 = pinnedDigest;
+  const downloadTarget = normalizeControlledNodeArtifactPair(reservation.os, reservation.arch, profile);
+  if (!downloadTarget) {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return { ok: false, response: c.json({ error: 'unsupported_artifact' }, 500) };
+  }
+  const downloadOs: ControlledNodeOs = downloadTarget.os;
+  const downloadArch: ControlledNodeArtifactArch = downloadTarget.arch;
+  const v = await artifactCatalog.ensureVerified(dir, downloadOs, downloadArch, profile);
+  if (!v.ok) {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    logAudit({
+      userId: reservation.ownerUserId,
+      action: 'enroll.v2.artifact.digest_mismatch',
+      ip,
+      details: {
+        ticketId: reservation.ticketId, attemptId: reservation.attemptId,
+        os: reservation.os, arch: reservation.arch,
+        pinnedSha256: reservation.artifactSha256, actualSha256: v.actualSha,
+        reason: v.reason,
+      },
+    }, c.env.DB).catch(() => {});
+    return { ok: false, response: c.json({ error: 'artifact_digest_mismatch' }, 503) };
+  }
+  const stableRemoteLink = reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK;
+  if (!stableRemoteLink && v.descriptor.sha256 !== reservation.artifactSha256) {
+    // Stale manifest pin; release the slot and surface the mismatch.
+    artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return { ok: false, response: c.json({ error: 'artifact_digest_mismatch' }, 503) };
+  }
+  // A stable remote link is an owner credential, not a pin to one release.
+  // The catalog still verifies the current artifact before any authority is
+  // consumed; only the old mint-time digest comparison is omitted. Audit the
+  // exact verified bytes that are actually consumed below.
+  if (stableRemoteLink) reservation.artifactSha256 = v.descriptor.sha256;
+
+  // Step 3: cheap post-verify transforms. No stream descriptor is open yet.
+  let encryptionKey: string;
+  try {
+    encryptionKey = resolveTicketEncryptionKey(c);
+  } catch {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return { ok: false, response: c.json({ error: 'ticket_encryption_key_unavailable' }, 500) };
+  }
+  let enrollCode: string;
+  let serverUrl: string;
+  try {
+    const decrypted = decryptBotConfig(reservation.encryptedCode, encryptionKey);
+    enrollCode = decrypted.enrollCode;
+    serverUrl = decrypted.serverUrl;
+    if (!enrollCode || !serverUrl || !isAllowedServerUrl(serverUrl)) {
+      throw new Error('decrypted_ticket_payload_invalid');
+    }
+    if ((c.env.NODE_ENV ?? 'development') === 'production' && new URL(serverUrl).protocol !== 'https:') {
+      throw new Error('decrypted_ticket_server_url_insecure');
+    }
+  } catch {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    logAudit({
+      userId: reservation.ownerUserId,
+      action: 'enroll.v2.ticket.decrypt_failed',
+      ip,
+      details: {
+        ticketId: reservation.ticketId,
+        attemptId: reservation.attemptId,
+        os: reservation.os,
+        arch: reservation.arch,
+      },
+    }, c.env.DB).catch(() => {});
+    return { ok: false, response: c.json({ error: 'ticket_decrypt_failed' }, 500) };
+  }
+
+  // Name the person this machine is being bound to, so the consent screen can
+  // say whose account it is joining. Read from the ticket's owner rather than
+  // anything the caller supplies, and sanitized to a bounded single line.
+  const ownerRow = await (c.env.DB as Database).queryOne<{ display_name: string | null }>(
+    `SELECT u.display_name FROM controlled_node_enrollments_v2 e
+       JOIN users u ON u.id = e.owner_user_id
+      WHERE e.id = $1`,
+    [reservation.ticketId],
+  ).catch(() => null);
+  const ownerName = ownerRow?.display_name ? sanitizeEnrollmentOwnerName(ownerRow.display_name) : '';
+
+  return {
+    ok: true,
+    now,
+    ip,
+    dir,
+    profile,
+    downloadOs,
+    downloadArch,
+    reservation,
+    descriptor: v.descriptor,
+    encryptionKey,
+    enrollmentBlob: {
+      serverUrl,
+      enrollToken: enrollCode,
+      ...(profile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile: profile } : {}),
+      ...(ownerName ? { ownerName } : {}),
+    },
+  };
+}
+
+interface InstallExecutableTokenClaims {
+  os: ControlledNodeOs;
+  arch: ControlledNodeArtifactArch;
+  abiProfile: ControlledNodeAbiProfile;
+  sha256: string;
+  exp: number;
+}
+
+function mintInstallExecutableToken(claims: InstallExecutableTokenClaims, signingKey: string): string {
+  const payloadPart = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url');
+  const sigPart = createHmac('sha256', signingKey)
+    .update(`${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN}${payloadPart}`)
+    .digest('base64url');
+  return `${payloadPart}.${sigPart}`;
+}
+
+function verifyInstallExecutableToken(
+  rawToken: string,
+  signingKey: string,
+  now: number,
+): InstallExecutableTokenClaims | null {
+  const parts = rawToken.split('.');
+  if (parts.length !== 2) return null;
+  const [payloadPart, sigPart] = parts;
+  if (!payloadPart || !sigPart || !/^[A-Za-z0-9_-]+$/.test(payloadPart) || !/^[A-Za-z0-9_-]+$/.test(sigPart)) {
+    return null;
+  }
+  const expectedSig = createHmac('sha256', signingKey)
+    .update(`${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN}${payloadPart}`)
+    .digest();
+  const actualSig = Buffer.from(sigPart, 'base64url');
+  if (actualSig.length !== expectedSig.length || actualSig.toString('base64url') !== sigPart || !timingSafeEqual(expectedSig, actualSig)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadPart, 'base64url').toString('utf8')) as Partial<InstallExecutableTokenClaims>;
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    if (typeof parsed.exp !== 'number' || !Number.isFinite(parsed.exp) || parsed.exp <= now) return null;
+    if (typeof parsed.os !== 'string' || typeof parsed.arch !== 'string'
+      || !isControlledNodeOs(parsed.os) || !isControlledNodeArtifactArch(parsed.arch)) {
+      return null;
+    }
+    const abiProfile = normalizeControlledNodeAbiProfile(parsed.abiProfile);
+    if (!abiProfile || parsed.abiProfile !== abiProfile) return null;
+    if (!isCanonicalControlledNodePair(parsed.os, parsed.arch, abiProfile)) return null;
+    if (typeof parsed.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(parsed.sha256)) return null;
+    return {
+      os: parsed.os,
+      arch: parsed.arch,
+      abiProfile,
+      sha256: parsed.sha256,
+      exp: parsed.exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
+  const prepared = await prepareVerifiedEnrollmentConsume(c, rawTicket, rawProfile);
+  if (!prepared.ok) return prepared.response;
+
+  const { now, ip, dir, profile, downloadOs, downloadArch, reservation, descriptor, enrollmentBlob } = prepared;
+  const filename = descriptor.filename;
+  const actualSize = descriptor.sizeBytes;
+  let trailer: Buffer;
+  try {
+    trailer = encodeEnrollmentTrailer(enrollmentBlob);
+  } catch {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'enrollment_trailer_failed' }, 500);
+  }
+
+  const opened = await artifactCatalog.openPinned(dir, descriptor);
+  if (!opened) {
+    artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+
+  let streamSuffix = trailer;
+  let streamPatch: { offset: number; bytes: Buffer } | undefined;
+  if (downloadOs === CONTROLLED_NODE_OS_WIN) {
+    const header = Buffer.alloc(Math.min(actualSize, 4096));
+    const { bytesRead } = await opened.handle.read(header, 0, header.length, 0);
+    const personalization = bytesRead === header.length
+      ? buildWindowsAuthenticodeEnrollmentPlan(header, actualSize, trailer)
+      : null;
+    if (!personalization) {
+      await opened.close();
+      await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+      return c.json({ error: 'windows_artifact_authenticode_container_invalid' }, 503);
+    }
+    streamSuffix = personalization.certificateEntry;
+    streamPatch = {
+      offset: personalization.sizeFieldOffset,
+      bytes: personalization.patchedCertificateTableSize,
+    };
+  }
+
+  // Step 4: commit attempt + consume audit before response bytes. Audit/commit
+  // failure is pre-response, so close/release and return a retryable 503.
+  try {
+    const committed = await commitAttempt(c.env.DB as Database, reservation, now);
+    if (!committed) throw new Error('download_attempt_not_reserved');
+  } catch {
+    await opened.close();
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'ticket_consume_unavailable' }, 503);
+  }
+
+  const total = actualSize + streamSuffix.length;
+  c.header('Content-Length', String(total));
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', `attachment; filename="${filename}"`);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, profile);
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Accept-Ranges', 'none');
+
+  // Step 5: stream. safeCloseOnce guarantees a single FD close across the
+  // ReadableStream's normal end, stream error, and explicit cancellation.
+  const stream = buildArtifactStream(opened.handle, actualSize, streamSuffix, opened.close, streamPatch);
+  return c.body(stream as unknown as ReadableStream, 200);
+}
+
+function artifactDistributionEnv(c: Context): Partial<EnvConfig> {
+  return extractArtifactDistributionEnv((c.env ?? {}) as Partial<EnvConfig>);
+}
+
+async function maybeExternalArtifactRedirect(
+  c: Context,
+  dir: string,
+  isHead: boolean,
+  closeLocal: () => Promise<void>,
+  identity: VerifyExternalArtifactIdentity,
+  headers: {
+    filename: string;
+    sha256: string;
+    sizeBytes: number;
+    version?: string;
+    abiProfile?: ControlledNodeAbiProfile;
+    authenticodeSignerSha256?: string;
+    releaseManifestSha256?: string;
+    extraVary?: string;
+  },
+  envOverride?: Partial<EnvConfig>,
+): Promise<Response | null> {
+  if (isHead) return null;
+  if (c.req.header(CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT) !== CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN) {
+    return null;
+  }
+  const external = await resolveControlledNodeExternalArtifact(dir, envOverride ?? artifactDistributionEnv(c), identity);
+  if (!external) return null;
+
+  await closeLocal();
+  c.header('Location', external.url);
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header(
+    'Vary',
+    headers.extraVary
+      ? `${headers.extraVary}, ${CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT}`
+      : CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT,
+  );
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, headers.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(headers.sizeBytes));
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, headers.filename);
+  if (headers.version) c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, headers.version);
+  if (headers.abiProfile) c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, headers.abiProfile);
+  if (headers.authenticodeSignerSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256, headers.authenticodeSignerSha256);
+  }
+  if (headers.releaseManifestSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, headers.releaseManifestSha256);
+  }
+  return c.body(null, 302);
+}
+
+async function exchangeInstallPayload(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
+  const canonicalServerUrl = resolveCanonicalServerUrl(c);
+  if (!canonicalServerUrl) return c.json({ error: 'canonical_server_url_required' }, 403);
+
+  const prepared = await prepareVerifiedEnrollmentConsume(c, rawTicket, rawProfile);
+  if (!prepared.ok) return prepared.response;
+
+  const { now, ip, profile, downloadOs, downloadArch, reservation, descriptor, encryptionKey, enrollmentBlob } = prepared;
+  try {
+    const committed = await commitAttempt(c.env.DB as Database, reservation, now);
+    if (!committed) throw new Error('download_attempt_not_reserved');
+  } catch {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'ticket_consume_unavailable' }, 503);
+  }
+
+  const exeDir = process.env.IMCODES_NODE_EXE_DIR;
+  const external = exeDir
+    ? await resolveControlledNodeExternalArtifact(exeDir, artifactDistributionEnv(c), {
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+      os: downloadOs,
+      arch: downloadArch,
+      abiProfile: profile,
+      sha256: descriptor.sha256,
+      sizeBytes: descriptor.sizeBytes,
+      version: descriptor.version,
+      authenticodeSignerSha256: descriptor.authenticodeSignerSha256,
+    })
+    : null;
+  let artifactUrl: string;
+  if (external) {
+    artifactUrl = external.url;
+  } else {
+    const token = mintInstallExecutableToken(
+      {
+        os: downloadOs,
+        arch: downloadArch,
+        abiProfile: profile,
+        sha256: descriptor.sha256,
+        exp: now + CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
+      },
+      encryptionKey,
+    );
+    artifactUrl = `${canonicalServerUrl}${CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH}?${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+  }
+  const payload: ControlledNodeInstallPayloadResponse = {
+    artifactUrl,
+    sha256: descriptor.sha256,
+    sizeBytes: descriptor.sizeBytes,
+    abiProfile: profile,
+    ...(descriptor.authenticodeSignerSha256
+      ? { windowsAuthenticodeSignerSha256: descriptor.authenticodeSignerSha256 }
+      : {}),
+    enrollment: enrollmentBlob,
+  };
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  return c.json(payload, 200);
+}
+
+enrollRoutes.post(CONTROLLED_NODE_INSTALL_PAYLOAD_SUBPATH, async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const rawTicket = await readTicket(c);
+  if (!rawTicket) return c.json({ error: 'missing_ticket' }, 401);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_body' }, 400);
+  return exchangeInstallPayload(c, rawTicket, profile.value);
+});
+
+enrollRoutes.get(CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH, async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const rawToken = c.req.query(CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM);
+  if (!rawToken) return c.json({ error: 'missing_install_executable_token' }, 401);
+  let signingKey: string;
+  try {
+    signingKey = resolveTicketEncryptionKey(c);
+  } catch {
+    return c.json({ error: 'ticket_encryption_key_unavailable' }, 500);
+  }
+  const claims = verifyInstallExecutableToken(rawToken, signingKey, Date.now());
+  if (!claims) {
+    return c.json({ error: 'invalid_or_expired_install_executable_token' }, 401);
+  }
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) {
+    return c.json({ error: 'executable_dir_not_configured' }, 503);
+  }
+  const v = await artifactCatalog.ensureVerified(dir, claims.os, claims.arch, claims.abiProfile);
+  if (!v.ok || v.descriptor.sha256 !== claims.sha256) {
+    if (v.ok) artifactCatalog.invalidate(dir, claims.os, claims.arch, claims.abiProfile);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+  const opened = await artifactCatalog.openPinned(dir, v.descriptor);
+  if (!opened) {
+    artifactCatalog.invalidate(dir, claims.os, claims.arch, claims.abiProfile);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+  c.header('Content-Length', String(v.descriptor.sizeBytes));
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', `attachment; filename="${v.descriptor.filename}"`);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, claims.abiProfile);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, v.descriptor.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Accept-Ranges', 'none');
+  const stream = buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close);
+  return c.body(stream as unknown as ReadableStream, 200);
+});
+
+enrollRoutes.post('/v2/download', async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const rawTicket = await readTicket(c);
+  if (!rawTicket) return c.json({ error: 'missing_ticket' }, 401);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_body' }, 400);
+  return consumeAndStream(c, rawTicket, profile.value);
+});
+
+enrollRoutes.get('/v2/download', async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const auth = c.req.header('Authorization') ?? '';
+  const m = BEARER_RE.exec(auth);
+  if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_ticket' }, 401);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_query' }, 400);
+  return consumeAndStream(c, m[1], profile.value);
+});
+
+
+const NODE_ARTIFACT_QUERY = z.object({
+  serverId: z.string().min(1).max(128),
+  os: z.string(),
+  arch: z.string(),
+  abiProfile: z.string().optional(),
+  asset: z.enum([
+    CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
+  ])
+    .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
+}).strict();
+
+function controlledNodeRuntimePlatform(os: ControlledNodeOs): 'win32' | 'darwin' | 'linux' {
+  if (os === 'win') return 'win32';
+  if (os === 'mac') return 'darwin';
+  return 'linux';
+}
+
+/**
+ * Opens one regular file (never a symlink, never one that changes while it is opened) and hashes it through the pinned handle, so the
+ * hash that is announced is the content that is streamed. `maxBytes` bounds what the route will ever serve for this asset.
+ */
+async function openPinnedArtifactFile(
+  path: string,
+  filename: string,
+  maxBytes = Number.MAX_SAFE_INTEGER,
+): Promise<{
+  handle: FileHandle;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+} | null> {
+  let handle: FileHandle | null = null;
+  try {
+    const pathStat = await lstat(path);
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size <= 0 || pathStat.size > maxBytes) return null;
+    handle = await open(path, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size !== pathStat.size || stat.mtimeMs !== pathStat.mtimeMs || stat.ctimeMs !== pathStat.ctimeMs) {
+      await handle.close();
+      handle = null;
+      return null;
+    }
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < stat.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - position), position);
+      if (bytesRead <= 0) throw new Error('short_read');
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    let closed = false;
+    const pinned = handle;
+    handle = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename,
+      sizeBytes: stat.size,
+      sha256: hash.digest('hex'),
+    };
+  } catch {
+    await handle?.close().catch(() => {});
+    return null;
+  }
+}
+
+async function openComputerUseHelperArtifact(
+  dir: string,
+  os: ControlledNodeOs,
+  arch: ControlledNodeArtifactArch,
+) {
+  const filename = controlledNodeComputerUseHelperFilename(os);
+  return await openPinnedArtifactFile(join(dir, 'computer-use-helper', `${controlledNodeRuntimePlatform(os)}-${arch}`, filename), filename);
+}
+
+/**
+ * The Windows panel window host and its two small companions, from `<dir>/aidesk-local-ui/win32-x64/`. The route serves exactly these
+ * three fixed names for exactly that target: the asset picks the file, nothing in the request names a path, so it cannot be used to fetch
+ * anything else. Anything missing (or oversize, or a link) is simply "not published".
+ */
+async function openAideskLocalUiArtifact(dir: string, asset: AideskLocalUiArtifactAsset) {
+  const { os, arch } = AIDESK_LOCAL_UI_SIDECAR_TARGET;
+  const filename = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    ? aideskLocalUiExecutableFileName(os)
+    : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+      ? AIDESK_LOCAL_UI_MANIFEST_FILENAME
+      : AIDESK_LOCAL_UI_NOTICES_FILENAME;
+  const maxBytes = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    ? AIDESK_LOCAL_UI_MAX_BYTES
+    : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+      ? AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES
+      : AIDESK_LOCAL_UI_NOTICES_MAX_BYTES;
+  return await openPinnedArtifactFile(join(dir, aideskLocalUiArtifactRelativeDirectory(os, arch), filename), filename, maxBytes);
+}
+
+/**
+ * The Linux equivalent of openRemoteDesktopWorkerArtifact above, much
+ * smaller for the same reason downloadControlledNodeLinuxRemoteDesktopWorker
+ * (src/node/self-upgrade.ts) is: no code-signing authority to pin, no
+ * virtual-display sidecar, no legacy v1 manifest to serve. Same safety
+ * property kept: lstat (reject symlinks) -> open -> re-fstat and compare
+ * identity to the lstat result, so a swap between the two calls is refused
+ * rather than silently served.
+ */
+async function openLinuxRemoteDesktopWorkerArtifact(
+  dir: string,
+  asset: typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+): Promise<{
+  handle?: FileHandle;
+  bytes?: Buffer;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  version: string;
+} | null> {
+  const workerDir = join(dir, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+  const executablePath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+  const manifestFilename = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const manifestPath = join(workerDir, manifestFilename);
+  let executable: FileHandle | null = null;
+  let manifestHandle: FileHandle | null = null;
+  let requested: FileHandle | null = null;
+  try {
+    const [executablePathStat, manifestPathStat] = await Promise.all([
+      lstat(executablePath),
+      lstat(manifestPath),
+    ]);
+    if (!executablePathStat.isFile() || executablePathStat.isSymbolicLink()
+      || !manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0 || manifestPathStat.size > 64 * 1024) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile() || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    const rawManifest = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopLinuxWorkerManifest(JSON.parse(rawManifest.toString('utf8')));
+    if (!manifest || manifest.artifact.size !== executablePathStat.size) return null;
+
+    executable = await open(executablePath, 'r');
+    const executableStat = await executable.stat();
+    if (!executableStat.isFile() || executableStat.size !== executablePathStat.size
+      || executableStat.mtimeMs !== executablePathStat.mtimeMs
+      || executableStat.ctimeMs !== executablePathStat.ctimeMs) return null;
+    const executableHash = createHash('sha256');
+    const executableBuffer = Buffer.alloc(64 * 1024);
+    let executablePosition = 0;
+    while (executablePosition < executableStat.size) {
+      const { bytesRead } = await executable.read(
+        executableBuffer,
+        0,
+        Math.min(executableBuffer.length, executableStat.size - executablePosition),
+        executablePosition,
+      );
+      if (bytesRead <= 0) return null;
+      executableHash.update(executableBuffer.subarray(0, bytesRead));
+      executablePosition += bytesRead;
+    }
+    if (executableHash.digest('hex') !== manifest.artifact.sha256) return null;
+
+    const requestedPath = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePath : manifestPath;
+    const requestedPathStat = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePathStat : manifestPathStat;
+    requested = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executable
+      : await open(requestedPath, 'r');
+    if (requested === executable) executable = null;
+    const requestedStat = await requested.stat();
+    if (!requestedStat.isFile() || requestedStat.size !== requestedPathStat.size
+      || requestedStat.mtimeMs !== requestedPathStat.mtimeMs
+      || requestedStat.ctimeMs !== requestedPathStat.ctimeMs) return null;
+    const requestedHash = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? manifest.artifact.sha256
+      : createHash('sha256').update(rawManifest).digest('hex');
+    let closed = false;
+    const pinned = requested;
+    requested = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename: asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+        ? REMOTE_DESKTOP_LINUX_WORKER_FILENAME : manifestFilename,
+      sizeBytes: requestedStat.size,
+      sha256: requestedHash,
+      version: manifest.build.version,
+    };
+  } catch {
+    return null;
+  } finally {
+    await executable?.close().catch(() => {});
+    await manifestHandle?.close().catch(() => {});
+    await requested?.close().catch(() => {});
+  }
+}
+
+interface OpenedMacosRemoteDesktopComponentSet {
+  prefix: Buffer;
+  manifestBytes: Buffer;
+  handles: Readonly<Record<typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number], FileHandle>>;
+  manifest: RemoteDesktopMacosWorkerManifest;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  close: () => Promise<void>;
+}
+
+async function openMacosRemoteDesktopComponentSet(
+  dir: string,
+  arch: RemoteDesktopMacosArchitecture,
+): Promise<OpenedMacosRemoteDesktopComponentSet | null> {
+  const componentDirectory = join(dir, 'remote-desktop-worker', `darwin-${arch}`);
+  const manifestPath = join(componentDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME);
+  const handles = new Map<typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number], FileHandle>();
+  let manifestHandle: FileHandle | null = null;
+  let closed = false;
+  let completed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await Promise.all([
+      manifestHandle?.close().catch(() => {}),
+      ...[...handles.values()].map((handle) => handle.close().catch(() => {})),
+    ]);
+    handles.clear();
+    manifestHandle = null;
+  };
+  try {
+    const manifestPathStat = await lstat(manifestPath);
+    if (!manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0
+      || manifestPathStat.size > REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile()
+      || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    const manifestBytes = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopWorkerReleaseManifest(
+      JSON.parse(manifestBytes.toString('utf8')),
+      { os: 'darwin', arch },
+    );
+    if (!manifest || manifest.os !== 'darwin' || manifest.arch !== arch) return null;
+
+    // The validated manifest is the single component-name authority. Keep the
+    // directory admission set mechanically tied to the same canonical order
+    // used for hashing and streaming, so a newly shipped component cannot be
+    // silently rejected by a stale hand-maintained three-file list.
+    const componentNames = REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map(
+      (kind) => manifest.components[kind].fileName,
+    );
+    const expectedNames = new Set<string>([
+      REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+      ...componentNames,
+    ]);
+    if (expectedNames.size !== REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length + 1) return null;
+    const entries = await readdir(componentDirectory, { withFileTypes: true });
+    if (entries.length !== expectedNames.size
+      || entries.some((entry) => !entry.isFile() || !expectedNames.has(entry.name))) return null;
+
+    const prefix = Buffer.from(encodeRemoteDesktopMacosComponentSetPrefix(manifestBytes.length));
+    const archiveHash = createHash('sha256').update(prefix).update(manifestBytes);
+    for (const kind of REMOTE_DESKTOP_MACOS_COMPONENT_ORDER) {
+      const descriptor = manifest.components[kind];
+      const path = join(componentDirectory, descriptor.fileName);
+      const pathStat = await lstat(path);
+      if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size !== descriptor.size) return null;
+      const handle = await open(path, 'r');
+      handles.set(kind, handle);
+      const handleStat = await handle.stat();
+      if (!handleStat.isFile()
+        || handleStat.size !== pathStat.size
+        || handleStat.mtimeMs !== pathStat.mtimeMs
+        || handleStat.ctimeMs !== pathStat.ctimeMs) return null;
+      const componentHash = createHash('sha256');
+      const buffer = Buffer.alloc(64 * 1024);
+      let position = 0;
+      while (position < descriptor.size) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          0,
+          Math.min(buffer.length, descriptor.size - position),
+          position,
+        );
+        if (bytesRead <= 0) return null;
+        const bytes = buffer.subarray(0, bytesRead);
+        componentHash.update(bytes);
+        archiveHash.update(bytes);
+        position += bytesRead;
+      }
+      if (componentHash.digest('hex') !== descriptor.sha256) return null;
+    }
+    completed = true;
+    return {
+      prefix,
+      manifestBytes,
+      handles: Object.freeze(Object.fromEntries(handles) as Record<
+        typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number],
+        FileHandle
+      >),
+      manifest,
+      filename: remoteDesktopMacosComponentSetFilename(arch),
+      sizeBytes: remoteDesktopMacosComponentSetSize(manifest, manifestBytes.length),
+      sha256: archiveHash.digest('hex'),
+      close,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (!completed) await close();
+  }
+}
+
+function buildMacosRemoteDesktopComponentSetStream(
+  opened: OpenedMacosRemoteDesktopComponentSet,
+): ReadableStream<Uint8Array> {
+  const headers = [opened.prefix, opened.manifestBytes];
+  let headerIndex = 0;
+  let componentIndex = 0;
+  let componentPosition = 0;
+  const buffer = Buffer.alloc(64 * 1024);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (headerIndex < headers.length) {
+          controller.enqueue(Buffer.from(headers[headerIndex++]!));
+          return;
+        }
+        if (componentIndex < REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length) {
+          const kind = REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[componentIndex]!;
+          const size = opened.manifest.components[kind].size;
+          const { bytesRead } = await opened.handles[kind].read(
+            buffer,
+            0,
+            Math.min(buffer.length, size - componentPosition),
+            componentPosition,
+          );
+          if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          componentPosition += bytesRead;
+          controller.enqueue(Buffer.from(buffer.subarray(0, bytesRead)));
+          if (componentPosition === size) {
+            componentIndex += 1;
+            componentPosition = 0;
+          }
+          return;
+        }
+        await opened.close();
+        controller.close();
+      } catch (error) {
+        await opened.close();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await opened.close();
+    },
+  });
+}
+
+/**
+ * GET / HEAD /api/enroll/v2/node-artifact — runtime self-upgrade download (and
+ * lightweight metadata precheck) for an already-enrolled controlled node. Auth
+ * uses the node's existing server token; no user cookie, enrollment ticket, or
+ * fresh browser flow is required.
+ */
+enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
+  const isHead = c.req.method === 'HEAD';
+  if (c.req.header('range')) {
+    c.header('Content-Range', 'bytes */0');
+    return c.body(null as unknown as ArrayBuffer, 416);
+  }
+  const auth = c.req.header('Authorization') ?? '';
+  const m = BEARER_RE.exec(auth);
+  if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_token' }, 401);
+
+  const parsed = NODE_ARTIFACT_QUERY.safeParse({
+    serverId: c.req.query('serverId') ?? c.req.header(SERVER_ID_HEADER) ?? '',
+    os: c.req.query('os') ?? '',
+    arch: c.req.query('arch') ?? '',
+    abiProfile: c.req.query(CONTROLLED_NODE_ABI_PROFILE_FIELD),
+    asset: c.req.query('asset') ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+  });
+  if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
+  const { serverId, os, arch, asset } = parsed.data;
+  const requestedMacosComponentArch = asset
+      === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && os === 'mac'
+    && REMOTE_DESKTOP_MACOS_ARCHITECTURES.some((candidate) => candidate === arch)
+    ? arch as RemoteDesktopMacosArchitecture
+    : null;
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && requestedMacosComponentArch === null) {
+    return c.json({ error: 'invalid_query' }, 400);
+  }
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if ((c.req.queries(CONTROLLED_NODE_ABI_PROFILE_FIELD) ?? []).length > 1 || !abiProfile) return c.json({ error: 'invalid_query' }, 400);
+  const releaseTarget =
+    isDaemonRuntimeArtifactAsset(asset) || isDesktopReleaseManifestAsset(asset)
+      ? controlledNodeDaemonRuntimeTarget(os, arch)
+      : null;
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, arch, abiProfile);
+  if (isDaemonRuntimeArtifactAsset(asset)) {
+    if (!releaseTarget) return c.json({ error: 'invalid_query' }, 400);
+  } else if (isDesktopReleaseManifestAsset(asset)) {
+    if (!releaseTarget && !artifactTarget) return c.json({ error: 'invalid_query' }, 400);
+  } else if (!artifactTarget) {
+    return c.json({ error: 'invalid_query' }, 400);
+  }
+
+  const tokenHash = sha256Hex(m[1]);
+  const server = await (c.env.DB as Database).queryOne<{
+    id: string;
+    token_hash: string;
+    node_role: string | null;
+    revoked_at: number | null;
+    os: string | null;
+    arch: string | null;
+    abi_profile?: unknown;
+    owner_status: string | null;
+  }>(
+    `SELECT id, token_hash, node_role, revoked_at, os, arch, abi_profile,
+            (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
+       FROM servers WHERE id = $1`,
+    [serverId],
+  );
+  // Unknown, wrong-token and revoked answer identically. A distinct `revoked`
+  // reply confirmed to whoever holds the credential that it was once real, and
+  // contradicted the policy the central daemon-token resolver enforces.
+  if (!server || server.token_hash !== tokenHash || server.revoked_at != null) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
+  // The credential is genuine, so the reason can be named: a node acts as its owner, and a disabled owner's nodes download nothing.
+  if (!isUserStatusActive(server.owner_status)) {
+    return c.json({ error: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) }, 403);
+  }
+  enforceDaemonTokenRoute(c.req, server.id, server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL);
+  // A normal (FULL) daemon may fetch the remote-desktop bundle, and the runtime
+  // executable that carries its elevated helper.
+  //
+  // The worker is the same native binary a controlled node runs. The runtime is
+  // needed because a daemon's own code lives in a user-writable npm directory,
+  // and nothing user-writable may be what a LocalSystem service executes — so
+  // enabling login-screen control installs this signed, Authenticode-verified
+  // executable into a SYSTEM-owned directory and runs the helper out of that.
+  // Both cross the same trust boundary the daemon already accepts: this server
+  // can run commands on that machine through its own sessions.
+  //
+  // `node_role` is NULL on legacy daemon rows, so "not controlled" is the same
+  // test the daemon server list uses.
+  if (server.node_role !== NODE_ROLE.CONTROLLED
+    && !isRemoteDesktopArtifactAsset(asset)
+    && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE
+    && !isDaemonRuntimeArtifactAsset(asset)
+    && !isDesktopReleaseManifestAsset(asset)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (server.node_role === NODE_ROLE.CONTROLLED && isDaemonRuntimeArtifactAsset(asset)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && server.node_role !== null
+    && server.node_role !== NODE_ROLE.FULL
+    && server.node_role !== NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  // The OS is checked; the enrolled ARCH deliberately is not for macOS.
+  //
+  // The macOS controlled-node executable is universal, so the arch recorded at
+  // enrollment is `process.arch` of whichever slice happened to run the
+  // installer -- under Rosetta that is `x64` on an Apple Silicon Mac, and it is
+  // never corrected afterwards. Gating component downloads on it therefore
+  // barred a machine from the only components it can actually run, permanently
+  // and on the basis of something that is not a property of the machine at all.
+  //
+  // Nothing is lost by trusting the request: the node knows its own CPU when it
+  // asks, the manifest inside the set names its architecture, and the node
+  // rejects a set whose manifest or binaries do not match what it asked for.
+  // The worst a wrong request can achieve is a set its own verification
+  // refuses to install.
+  if (isDaemonRuntimeArtifactAsset(asset) || isDesktopReleaseManifestAsset(asset)) {
+    const reqOs = os === 'darwin' ? CONTROLLED_NODE_OS_MAC : os === 'win32' ? CONTROLLED_NODE_OS_WIN : os;
+    const srvOs = server.os === 'darwin' ? CONTROLLED_NODE_OS_MAC : server.os === 'win32' ? CONTROLLED_NODE_OS_WIN : server.os;
+    if ((srvOs && srvOs !== reqOs)
+      || (srvOs && server.arch && reqOs !== CONTROLLED_NODE_OS_MAC && server.arch !== arch)
+      || (!server.os && server.arch)) {
+      return c.json({ error: 'platform_mismatch' }, 403);
+    }
+    if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
+      || (isDaemonRuntimeArtifactAsset(asset) && abiProfile === CONTROLLED_NODE_ABI_GLIBC217)) {
+      return c.json({ error: 'abi_profile_mismatch' }, 409);
+    }
+  } else {
+    if ((server.os && server.arch
+        && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget!.os, artifactTarget!.arch, server.os, server.arch))
+      || (server.os && !server.arch && server.os !== artifactTarget!.os)
+      || (!server.os && server.arch)) {
+      return c.json({ error: 'platform_mismatch' }, 403);
+    }
+
+    if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
+      || (abiProfile === CONTROLLED_NODE_ABI_GLIBC217 && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE)) {
+      return c.json({ error: 'abi_profile_mismatch' }, 409);
+    }
+  }
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+  const normalizedManifestOs = os === 'darwin'
+    ? CONTROLLED_NODE_OS_MAC
+    : os === 'win32'
+      ? CONTROLLED_NODE_OS_WIN
+      : os;
+  if (isDesktopReleaseManifestAsset(asset)) {
+    const openedReleaseManifest = await openDesktopReleaseManifestArtifact(dir, releaseTarget);
+    if (openedReleaseManifest.status === 'not_published') {
+      return c.json({ error: 'desktop_release_manifest_not_published' }, 404);
+    }
+    if (openedReleaseManifest.status === 'invalid') {
+      return c.json({ error: 'desktop_release_manifest_invalid', reason: openedReleaseManifest.reason }, 503);
+    }
+    const manifestRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedReleaseManifest.close,
+      {
+        asset: CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
+        os: normalizedManifestOs,
+        arch,
+        sha256: openedReleaseManifest.sha256,
+        sizeBytes: openedReleaseManifest.sizeBytes,
+        version: openedReleaseManifest.version,
+      },
+      {
+        filename: openedReleaseManifest.filename,
+        sha256: openedReleaseManifest.sha256,
+        sizeBytes: openedReleaseManifest.sizeBytes,
+        version: openedReleaseManifest.version,
+      },
+    );
+    if (manifestRedirect) return manifestRedirect;
+    c.header('Content-Length', String(openedReleaseManifest.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedReleaseManifest.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedReleaseManifest.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedReleaseManifest.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedReleaseManifest.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedReleaseManifest.version);
+    if (isHead) {
+      await openedReleaseManifest.close();
+      return c.body(null, 200);
+    }
+    return c.body(buildBufferArtifactStream(openedReleaseManifest.bytes, openedReleaseManifest.close) as unknown as ReadableStream, 200);
+  }
+  if (isDaemonRuntimeArtifactAsset(asset)) {
+    const openedRuntime = await openDaemonRuntimeArtifact(
+      dir,
+      releaseTarget!,
+      asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST,
+    );
+    if (openedRuntime.status === 'not_published') {
+      return c.json({ error: 'daemon_runtime_not_published', target: releaseTarget }, 404);
+    }
+    if (openedRuntime.status === 'invalid') {
+      return c.json({ error: 'daemon_runtime_invalid', reason: openedRuntime.reason }, 503);
+    }
+    const runtimeIdentity = {
+      asset,
+      os: normalizedManifestOs,
+      arch,
+      sha256: openedRuntime.sha256,
+      sizeBytes: openedRuntime.sizeBytes,
+      version: openedRuntime.version,
+      authenticodeSignerSha256: openedRuntime.authenticodeSignerSha256,
+    };
+    const runtimeHeaders = {
+      filename: openedRuntime.filename,
+      sha256: openedRuntime.sha256,
+      sizeBytes: openedRuntime.sizeBytes,
+      version: openedRuntime.version,
+      authenticodeSignerSha256: openedRuntime.authenticodeSignerSha256,
+      releaseManifestSha256: openedRuntime.releaseManifestSha256,
+    };
+    let runtimeRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedRuntime.close,
+      runtimeIdentity,
+      runtimeHeaders,
+    );
+    if (!runtimeRedirect && !isHead && openedRuntime.externalOnly) {
+      const distEnv = artifactDistributionEnv(c);
+      if (!distEnv.CONTROLLED_NODE_ARTIFACT_GITHUB_REPO?.trim()) {
+        runtimeRedirect = await maybeExternalArtifactRedirect(
+          c,
+          dir,
+          isHead,
+          openedRuntime.close,
+          runtimeIdentity,
+          runtimeHeaders,
+          { ...distEnv, CONTROLLED_NODE_ARTIFACT_GITHUB_REPO: 'im4codes/imcodes' },
+        );
+      }
+    }
+    if (runtimeRedirect) return runtimeRedirect;
+    if (!isHead && (openedRuntime.externalOnly || (!openedRuntime.bytes && !openedRuntime.handle))) {
+      await openedRuntime.close();
+      return c.json({ error: 'daemon_runtime_external_artifact_required', target: releaseTarget }, 503);
+    }
+    c.header('Content-Length', String(openedRuntime.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedRuntime.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedRuntime.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedRuntime.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedRuntime.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedRuntime.version);
+    if (openedRuntime.authenticodeSignerSha256) {
+      c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256, openedRuntime.authenticodeSignerSha256);
+    }
+    if (openedRuntime.releaseManifestSha256) {
+      c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, openedRuntime.releaseManifestSha256);
+    }
+    if (isHead) {
+      await openedRuntime.close();
+      return c.body(null, 200);
+    }
+    const stream = openedRuntime.bytes
+      ? buildBufferArtifactStream(openedRuntime.bytes, openedRuntime.close)
+      : buildBareArtifactStream(openedRuntime.handle!, openedRuntime.sizeBytes, openedRuntime.close);
+    return c.body(stream as unknown as ReadableStream, 200);
+  }
+  if (!artifactTarget) return c.json({ error: 'invalid_query' }, 400);
+  if (isAideskLocalUiArtifactAsset(asset)) {
+    // Only the Windows x64 host exists; every other target (and anything not published) is "nothing to fetch", never an error to retry.
+    const target = AIDESK_LOCAL_UI_SIDECAR_TARGET;
+    const opened = artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === target.arch
+      ? await openAideskLocalUiArtifact(dir, asset)
+      : null;
+    if (!opened) return c.json({ error: 'aidesk_local_ui_not_published' }, 404);
+    const aideskRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      opened.close,
+      {
+        asset,
+        os: artifactTarget.os,
+        arch: artifactTarget.arch,
+        sha256: opened.sha256,
+        sizeBytes: opened.sizeBytes,
+      },
+      {
+        filename: opened.filename,
+        sha256: opened.sha256,
+        sizeBytes: opened.sizeBytes,
+      },
+    );
+    if (aideskRedirect) return aideskRedirect;
+    c.header('Content-Length', String(opened.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${opened.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, opened.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(opened.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, opened.filename);
+    if (isHead) {
+      await opened.close();
+      return c.body(null, 200);
+    }
+    return c.body(buildBareArtifactStream(opened.handle, opened.sizeBytes, opened.close) as unknown as ReadableStream, 200);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
+    const openedHelper = await openComputerUseHelperArtifact(dir, artifactTarget.os, artifactTarget.arch);
+    if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    const helperRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedHelper.close,
+      {
+        asset,
+        os: artifactTarget.os,
+        arch: artifactTarget.arch,
+        sha256: openedHelper.sha256,
+        sizeBytes: openedHelper.sizeBytes,
+      },
+      {
+        filename: openedHelper.filename,
+        sha256: openedHelper.sha256,
+        sizeBytes: openedHelper.sizeBytes,
+      },
+    );
+    if (helperRedirect) return helperRedirect;
+    c.header('Content-Length', String(openedHelper.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedHelper.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedHelper.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedHelper.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
+    if (isHead) {
+      await openedHelper.close();
+      return c.body(null, 200);
+    }
+    return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET) {
+    const requestedProtocol = c.req.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+    );
+    if (requestedProtocol !== String(REMOTE_DESKTOP_PROTOCOL_VERSION)) {
+      return c.json({ error: 'remote_desktop_protocol_unsupported' }, 409);
+    }
+    // The macOS worker is an independently published sidecar. Do not require
+    // the controlled-node executable in this directory to carry the same
+    // version: a stale daemon must still converge on a newer signed worker
+    // without taking a daemon upgrade first. The component-set manifest is
+    // validated and pinned by openMacosRemoteDesktopComponentSet below.
+    const openedSet = await openMacosRemoteDesktopComponentSet(
+      dir,
+      requestedMacosComponentArch!,
+    );
+    if (!openedSet) {
+      return c.json({
+        error: 'remote_desktop_worker_not_built',
+        os,
+        arch: requestedMacosComponentArch,
+      }, 503);
+    }
+    const macosSetRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedSet.close,
+      {
+        asset,
+        os: CONTROLLED_NODE_OS_MAC,
+        arch: requestedMacosComponentArch!,
+        sha256: openedSet.sha256,
+        sizeBytes: openedSet.sizeBytes,
+        version: openedSet.manifest.workerVersion,
+      },
+      {
+        filename: openedSet.filename,
+        sha256: openedSet.sha256,
+        sizeBytes: openedSet.sizeBytes,
+        version: openedSet.manifest.workerVersion,
+        extraVary: CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+      },
+    );
+    if (macosSetRedirect) return macosSetRedirect;
+    c.header('Content-Length', String(openedSet.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedSet.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Vary', CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedSet.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedSet.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedSet.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedSet.manifest.workerVersion);
+    if (isHead) {
+      await openedSet.close();
+      return c.body(null, 200);
+    }
+    return c.body(
+      buildMacosRemoteDesktopComponentSetStream(openedSet) as unknown as ReadableStream,
+      200,
+    );
+  }
+  if (isRemoteDesktopArtifactAsset(asset)) {
+    const isWindowsTarget = artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === 'x64';
+    const isLinuxTarget = artifactTarget.os === CONTROLLED_NODE_OS_LINUX && artifactTarget.arch === 'x64';
+    if (!isWindowsTarget && !isLinuxTarget) {
+      return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
+    }
+    // Linux has no virtual-display component (no separate display driver --
+    // it captures the real X11/Wayland output directly), so this asset only
+    // ever exists for Windows.
+    if (isLinuxTarget && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY) {
+      return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
+    }
+    const requestedProtocol = c.req.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+    );
+    const requestedProtocols = requestedProtocol?.split(',').map((value) => value.trim()) ?? [];
+    if (requestedProtocols.length > 0
+      && requestedProtocols.some((value) => value !== String(REMOTE_DESKTOP_PROTOCOL_VERSION))) {
+      return c.json({ error: 'remote_desktop_protocol_unsupported' }, 409);
+    }
+    // v1 nodes predate the request header and embed a strict v1 manifest
+    // validator. Give only those legacy manifest requests a v1-shaped view of
+    // the same hash-pinned v2 worker so they can make the one-hop upgrade.
+    // Linux never shipped a v1 worker, so it has no legacy manifest to serve.
+    const legacyManifest = isWindowsTarget
+      && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+      && requestedProtocol === undefined;
+    // The Linux asset set has no REMOTE_DESKTOP_VIRTUAL_DISPLAY component (no
+    // separate display driver -- Linux captures the real X11/Wayland output
+    // directly): openLinuxRemoteDesktopWorkerArtifact's own parameter type
+    // only accepts the worker + its manifest, so a Linux target requesting
+    // that asset fails to typecheck here rather than silently resolving
+    // through the wrong opener.
+    const openedWorker = isWindowsTarget
+      ? await openRemoteDesktopWorkerArtifact(dir, asset, legacyManifest)
+      // Unreachable given the guard above (already refused this asset for a
+      // Linux target), but narrows asset's type so the Linux opener's own
+      // narrower parameter type -- worker + manifest only, no virtual
+      // display -- typechecks instead of needing a cast.
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+        ? null
+        : await openLinuxRemoteDesktopWorkerArtifact(dir, asset);
+    if (!openedWorker) return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    if (!legacyManifest) {
+      const workerRedirect = await maybeExternalArtifactRedirect(
+        c,
+        dir,
+        isHead,
+        openedWorker.close,
+        {
+          asset,
+          os: artifactTarget.os,
+          arch: artifactTarget.arch,
+          sha256: openedWorker.sha256,
+          sizeBytes: openedWorker.sizeBytes,
+          version: openedWorker.version,
+        },
+        {
+          filename: openedWorker.filename,
+          sha256: openedWorker.sha256,
+          sizeBytes: openedWorker.sizeBytes,
+          version: openedWorker.version,
+          extraVary: CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+        },
+      );
+      if (workerRedirect) return workerRedirect;
+    }
+    c.header('Content-Length', String(openedWorker.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedWorker.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Vary', CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedWorker.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedWorker.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedWorker.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedWorker.version);
+    if (isHead) {
+      await openedWorker.close();
+      return c.body(null, 200);
+    }
+    const stream = openedWorker.bytes
+      ? buildBufferArtifactStream(openedWorker.bytes, openedWorker.close)
+      : buildBareArtifactStream(openedWorker.handle!, openedWorker.sizeBytes, openedWorker.close);
+    return c.body(stream as unknown as ReadableStream, 200);
+  }
+  const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
+  if (!v.ok) return c.json({ error: 'executable_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+  if (artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === 'x64') {
+    // Old deployed upgraders download the main executable first and used to
+    // treat a missing worker as optional. Refuse to publish the executable
+    // until the complete same-version Windows release unit is available, so
+    // those clients cannot converge the Node version while leaving stale media
+    // sidecars behind.
+    const workerRelease = await openRemoteDesktopWorkerArtifact(
+      dir,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    );
+    if (!workerRelease) {
+      return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    }
+    const workerVersionMatches = workerRelease.version === v.descriptor.version;
+    await workerRelease.close();
+    if (!workerVersionMatches) {
+      return c.json({ error: 'windows_release_version_mismatch' }, 503);
+    }
+  }
+  await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
+  let nodeReleaseManifestSha256: string | undefined;
+  if (abiProfile === CONTROLLED_NODE_ABI_MODERN) {
+    const nodeReleaseTarget = controlledNodeDaemonRuntimeTarget(
+      artifactTarget.os,
+      artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL ? CONTROLLED_NODE_ARCH_ARM64 : artifactTarget.arch,
+    );
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, nodeReleaseTarget);
+    if (releaseCheck.status === 'invalid') {
+      return c.json({ error: 'desktop_release_manifest_invalid', reason: releaseCheck.reason }, 503);
+    }
+    if (releaseCheck.status === 'ok') {
+      await releaseCheck.close();
+      const targetForCheck = nodeReleaseTarget;
+      if (targetForCheck) {
+        const entry = releaseCheck.manifest.targets[targetForCheck]?.components['imcodes-node'];
+        if (entry && (entry.sha256 !== v.descriptor.sha256 || entry.sizeBytes !== v.descriptor.sizeBytes || entry.version !== v.descriptor.version)) {
+          return c.json({ error: 'desktop_release_manifest_mismatch' }, 503);
+        }
+      }
+      nodeReleaseManifestSha256 = releaseCheck.sha256;
+    }
+  }
+  const opened = isHead ? null : await artifactCatalog.openPinned(dir, v.descriptor);
+  if (!isHead && !opened) {
+    artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+  const nodeRedirect = await maybeExternalArtifactRedirect(
+    c,
+    dir,
+    isHead,
+    opened ? opened.close : async () => {},
+    {
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+      os: artifactTarget.os,
+      arch: artifactTarget.arch,
+      abiProfile,
+      sha256: v.descriptor.sha256,
+      sizeBytes: v.descriptor.sizeBytes,
+      version: v.descriptor.version,
+      authenticodeSignerSha256: v.descriptor.authenticodeSignerSha256,
+    },
+    {
+      filename: v.descriptor.filename,
+      sha256: v.descriptor.sha256,
+      sizeBytes: v.descriptor.sizeBytes,
+      version: v.descriptor.version,
+      abiProfile,
+      authenticodeSignerSha256: v.descriptor.authenticodeSignerSha256,
+      releaseManifestSha256: nodeReleaseManifestSha256,
+    },
+  );
+  if (nodeRedirect) return nodeRedirect;
+
+  c.header('Content-Length', String(v.descriptor.sizeBytes));
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', `attachment; filename="${v.descriptor.filename}"`);
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Accept-Ranges', 'none');
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, v.descriptor.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, v.descriptor.filename);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, v.descriptor.version);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, abiProfile);
+  if (nodeReleaseManifestSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, nodeReleaseManifestSha256);
+  }
+  if (v.descriptor.authenticodeSignerSha256) {
+    c.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
+      v.descriptor.authenticodeSignerSha256,
+    );
+  }
+  if (isHead || !opened) {
+    return c.body(null, 200);
+  }
+  return c.body(buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close) as unknown as ReadableStream, 200);
+});
+
+// ── GET /api/enroll/v2/bootstrap (system-browser bridge) ──────────────────
+
+enrollRoutes.get('/v2/bootstrap', async (c) => {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+
+  const nonce = randomBytes(16).toString('base64');
+  c.header('Content-Type', 'text/html; charset=utf-8');
+  c.header('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+  c.header('Pragma', 'no-cache');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('Content-Security-Policy',
+    `default-src 'none'; ` +
+    `script-src 'nonce-${nonce}'; ` +
+    `style-src 'nonce-${nonce}'; ` +
+    `connect-src 'self'; ` +
+    `form-action 'self'; ` +
+    `base-uri 'none'; ` +
+    `frame-ancestors 'none'; ` +
+    `navigate-to 'self' blob:`,
+  );
+  c.header('X-Content-Type-Options', 'nosniff');
+  return c.body(buildControlledNodeBootstrapPage(nonce), 200);
+});
+
+const REDEEM_BODY = z
+  .object({
+    version: z.literal(2),
+    enrollToken: z.string().min(1).max(128),
+    installId: z.string().min(1).max(128),
+    nodeTokenHash: z.string().refine(isEnrollmentNodeTokenHash, 'invalid_node_token_hash'),
+    hostname: z.string().min(1).max(255),
+    os: z.string().min(1).max(64),
+    arch: z.string().min(1).max(16),
+    abiProfile: z.string().optional(),
+  })
+  .strict();
+
+async function insertControlledServer(
+  tx: Database,
+  serverId: string,
+  userId: string,
+  tokenHash: string,
+  hostname: string,
+  os: string,
+  arch: string,
+  hostServerId: string | null = null,
+  secureRandomBytes?: SecureRandomBytes,
+): Promise<{ nodeId: string; displayName: string }> {
+  const displayName = deriveDisplayName(hostname, os);
+  // No team is not a missing authorization domain, it is the narrowest one:
+  // `resolveServerRole` grants nobody but the owner until the owner associates
+  // the machine with a team. Refusing here instead forced every install to pick
+  // a sharing group before the thing to share existed.
+  const input = {
+    serverId,
+    userId,
+    teamId: null,
+    tokenHash,
+    displayName,
+    refName: null,
+    os,
+    arch,
+    hostServerId,
+    createdAt: Date.now(),
+  };
+  const nodeId = secureRandomBytes
+    ? await insertControlledServerWithNodeId(tx, input, secureRandomBytes)
+    : await insertControlledServerWithNodeId(tx, input);
+  return { nodeId, displayName };
+}
+
+type RedeemResult =
+  | { kind: 'created'; serverId: string; ticketId: string; userId: string; nodeId: string; displayName: string }
+  | { kind: 'idempotent'; serverId: string; ticketId: string; userId: string; nodeId: string; refName?: string; displayName: string }
+  | { kind: 'mismatch'; ticketId?: string }
+  | { kind: 'denied' };
+
+enrollRoutes.post('/v2/redeem', async (c) => {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = REDEEM_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { enrollToken, installId, nodeTokenHash, hostname, os, arch } = parsed.data;
+  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isControlledNodeRuntimePair(os, arch)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if (!abiProfile || !isControlledNodeAbiTarget(os, arch, abiProfile)) return c.json({ error: 'invalid_body' }, 400);
+  const codeHash = sha256Hex(enrollToken);
+
+  const now = Date.now();
+  let result: RedeemResult;
+  try {
+    result = await c.env.DB.transaction(async (tx) => {
+      const row = await tx.queryOne<{
+        id: string;
+        owner_user_id: string;
+        expires_at: string | null;
+        reusable: boolean;
+        revoked_at: string | null;
+        used_at: string | null;
+        redeemed_server_id: string | null;
+        install_id: string | null;
+        node_token_hash: string | null;
+        os: string;
+        arch: string;
+        host_server_id: string | null;
+        abi_profile?: unknown;
+        abi_variants?: unknown;
+        artifact_sha256: string;
+        delivery: string;
+      }>(
+        `SELECT id, owner_user_id, expires_at, reusable, revoked_at,
+                used_at, redeemed_server_id, host_server_id,
+                install_id, node_token_hash, os, arch, abi_profile, abi_variants, artifact_sha256, delivery
+           FROM controlled_node_enrollments_v2
+          WHERE code_hash = $1
+            AND ${activeUserExistsSql('controlled_node_enrollments_v2.owner_user_id')}
+          FOR UPDATE`,
+        [codeHash],
+      );
+      // A ticket stands for its owner: a disabled (or pending) owner's tickets redeem nothing, whatever their expiry.
+      if (!row) return { kind: 'denied' as const };
+      if (row.revoked_at != null) return { kind: 'denied' as const };
+      // A ticket with no group is the normal case: a machine belongs to whoever
+      // installs it, and groups are a later, separate decision. Denying here
+      // rejected every freshly minted link with a 401 -- the mint stopped
+      // requiring a group, and this gate was left behind.
+      if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
+        return { kind: 'denied' as const };
+      }
+      if (!isControlledNodeArtifactCompatibleWithRuntime(row.os, row.arch, os, arch)) {
+        return { kind: 'mismatch' as const, ticketId: row.id };
+      }
+
+      if (normalizeControlledNodeAbiProfile(row.abi_profile) !== abiProfile && !enrollmentAbiDigest({
+        os: row.os, arch: row.arch, abiProfile: row.abi_profile, sha256: row.artifact_sha256,
+        variants: row.abi_variants, allowVariants: row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+          || row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }, abiProfile)) return { kind: 'mismatch' as const, ticketId: row.id };
+      const existing = await tx.queryOne<{
+        node_token_hash: string;
+        redeemed_server_id: string;
+        node_id: string | null;
+        ref_name: string | null;
+        display_name: string | null;
+        abi_profile?: unknown;
+      }>(
+        `SELECT install.node_token_hash, install.redeemed_server_id,
+                server.node_id, server.ref_name, server.display_name, server.abi_profile
+           FROM controlled_node_enrollment_installs AS install
+           JOIN servers AS server ON server.id = install.redeemed_server_id
+          WHERE install.enrollment_id = $1 AND install.install_id = $2`,
+        [row.id, installId],
+      );
+      if (existing) {
+        if (existing.node_token_hash !== nodeTokenHash || normalizeControlledNodeAbiProfile(existing.abi_profile) !== abiProfile) {
+          return { kind: 'mismatch' as const, ticketId: row.id };
+        }
+        const existingNodeId = parseControlledNodeId(existing.node_id);
+        if (!existingNodeId) throw new Error('controlled_node_redeem_stored_node_id_invalid');
+        const legacyTarget = existing.ref_name == null
+          ? null
+          : classifyMachineTarget(existing.ref_name);
+        if (existing.ref_name != null && legacyTarget?.kind !== 'legacy_ref_name') {
+          throw new Error('controlled_node_redeem_stored_ref_name_invalid');
+        }
+        return {
+          kind: 'idempotent' as const,
+          serverId: existing.redeemed_server_id,
+          ticketId: row.id,
+          userId: row.owner_user_id,
+          nodeId: existingNodeId,
+          ...(legacyTarget ? { refName: legacyTarget.value } : {}),
+          displayName: existing.display_name ?? '',
+        };
+      }
+
+      // A legacy package remains single-use. Migration 059 backfills its
+      // original claim into the child table; this parent fallback also keeps a
+      // partially migrated row fail-closed instead of creating another node.
+      if (!row.reusable && row.used_at) {
+        return { kind: 'mismatch' as const, ticketId: row.id };
+      }
+
+      const reusedToken = await tx.queryOne<{ present: number }>(
+        `SELECT 1 AS present
+           FROM controlled_node_enrollment_installs
+          WHERE enrollment_id = $1 AND node_token_hash = $2`,
+        [row.id, nodeTokenHash],
+      );
+      if (reusedToken) return { kind: 'mismatch' as const, ticketId: row.id };
+
+      // R4 audit P0: mint-time authority is not enough. A ticket is a durable
+      // bearer, so between minting and redeeming, the owner may have been
+      // removed from the Desk or downgraded out of a managing role. Without
+      // this re-read a stale installer still enrols a new SYSTEM-capable node
+      // into a Desk its holder no longer administers.
+      //
+      // Deliberately placed AFTER the idempotent branch above: replaying an
+      // install that already produced a node returns that same node and grants
+      // nothing new, so it must keep working. Creating a NEW node is the act
+      // that needs current authority.
+      const serverId = randomHex(16);
+      const { nodeId, displayName } = await insertControlledServer(
+        tx, serverId, row.owner_user_id, nodeTokenHash, hostname, os, arch,
+        row.host_server_id,
+        dependencies.controlledNodeIdRandomBytes,
+      );
+      await tx.execute('UPDATE servers SET abi_profile = $2 WHERE id = $1', [serverId, abiProfile]);
+      await tx.execute(
+        `INSERT INTO controlled_node_enrollment_installs
+           (enrollment_id, install_id, node_token_hash, redeemed_server_id, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [row.id, installId, nodeTokenHash, serverId, now],
+      );
+
+      if (!row.reusable) {
+        const upd = await tx.execute(
+          `UPDATE controlled_node_enrollments_v2
+              SET used_at = $2,
+                  install_id = $3,
+                  node_token_hash = $4,
+                  redeemed_server_id = $5
+            WHERE id = $1
+              AND used_at IS NULL
+              AND reusable = FALSE
+              AND revoked_at IS NULL
+              AND expires_at > $2`,
+          [row.id, now, installId, nodeTokenHash, serverId],
+        );
+        if (upd.changes !== 1) throw new Error('concurrent_legacy_redeem');
+      }
+      return {
+        kind: 'created' as const,
+        serverId,
+        ticketId: row.id,
+        userId: row.owner_user_id,
+        nodeId,
+        displayName,
+      };
+    });
+  } catch (err) {
+    logger.error({ err }, 'controlled node v2 redeem failed');
+    return c.json({ error: 'redeem_failed' }, 500);
+  }
+
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  if (result.kind === 'denied') return c.json({ error: 'redeem_failed' }, 401);
+  if (result.kind === 'mismatch') {
+    // A real, already-claimed credential with a different installation identity
+    // is a conflict, not an unknown credential. Keep the response body generic
+    // and log only the server-generated ticket id — never either supplied secret
+    // or hash — so the distinction does not disclose credential material.
+    logger.warn({ ticketId: result.ticketId }, 'controlled node v2 redeem identity conflict');
+    return c.json({ error: 'redeem_failed' }, 409);
+  }
+  logAudit({
+    userId: result.userId,
+    action: result.kind === 'created' ? 'enroll.v2.redeem' : 'enroll.v2.redeem.idempotent',
+    ip,
+    details: {
+      ticketId: result.ticketId,
+      serverId: result.serverId,
+      os, arch, installId,
+    },
+  }, c.env.DB).catch(() => {});
+  return c.json({
+    serverId: result.serverId,
+    nodeId: result.nodeId,
+    ticketId: result.ticketId,
+    nodeRole: NODE_ROLE.CONTROLLED,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+    ...('refName' in result && result.refName ? { refName: result.refName } : {}),
+    displayName: result.displayName,
+    version: 2,
+  });
+});
+
+// ── GET /api/enroll/v2/availability ─────────────────────────────────────────
+//
+// Reads from the in-process catalog. The catalog itself only does the
+// expensive hash at most once per (dir, os, arch) and caches the
+// descriptor; this endpoint does no per-request disk IO beyond the cache
+// hit. Sidecar-free artifacts (file present but no `.manifest.json`) are
+// deliberately omitted — availability is a supply-chain trust boundary.
+
+enrollRoutes.get('/v2/availability', requireAuth(), async (c) => {
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) return c.json({ available: [], artifacts: [] });
+  const descriptors = await artifactCatalog.listAvailable(dir, c.env.DB as Database);
+  return c.json({
+    available: [...new Set(descriptors.map((d) => d.os))],
+    artifacts: descriptors.map((d) => ({
+      os: d.os,
+      arch: d.arch,
+      ...(d.abiProfile ? { abiProfile: d.abiProfile } : {}),
+      filename: d.filename,
+      sizeBytes: d.sizeBytes,
+      sha256: d.sha256,
+    })),
+  });
+});
+
+const DIRECT_ENROLL_BODY = z
+  .object({
+    installId: z.string().min(1).max(128),
+    nodeTokenHash: z.string().refine(isEnrollmentNodeTokenHash, 'invalid_node_token_hash'),
+    hostname: z.string().min(1).max(255),
+    os: z.string().min(1).max(64),
+    arch: z.string().min(1).max(16),
+    abiProfile: z.string().optional(),
+    hostServerId: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+enrollRoutes.post('/v2/direct', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = DIRECT_ENROLL_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { installId, nodeTokenHash, hostname, os, arch, hostServerId } = parsed.data;
+  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isControlledNodeRuntimePair(os, arch)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if (!abiProfile || !isControlledNodeAbiTarget(os, arch, abiProfile)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  if (hostServerId && !isPlausibleServerId(hostServerId)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const userId = c.get('userId' as never) as string;
+  const keyId = c.get('keyId' as never) as string | undefined;
+
+  if (hostServerId) {
+    const owned = await isOwnedHostDaemon(c.env.DB, userId, hostServerId);
+    if (!owned) {
+      return c.json({ error: 'host_server_not_owned' }, 403);
+    }
+  }
+
+  type DirectEnrollResult =
+    | { kind: 'created' | 'idempotent'; serverId: string; nodeId: string; displayName: string; hostServerId: string | null }
+    | { kind: 'forbidden_host' }
+    | { kind: 'conflict'; error: string };
+
+  let result: DirectEnrollResult;
+  try {
+    result = await c.env.DB.transaction(async (tx): Promise<DirectEnrollResult> => {
+      // Serialize concurrent direct enrollments for the same token hash (even across users or before a row exists).
+      await tx.queryOne(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0)) AS locked',
+        [`enroll:v2:direct:${nodeTokenHash}`],
+      );
+      const existing = await tx.queryOne<{
+        id: string;
+        user_id: string;
+        node_id: string | null;
+        display_name: string | null;
+        name: string;
+        node_role: string;
+        os: string | null;
+        arch: string | null;
+        abi_profile: unknown;
+        host_server_id: string | null;
+        revoked_at: number | null;
+      }>(
+        `SELECT id, user_id, node_id, display_name, name, node_role, os, arch, abi_profile, host_server_id, revoked_at
+         FROM servers
+         WHERE token_hash = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [nodeTokenHash],
+      );
+
+      if (existing) {
+        if (
+          existing.user_id !== userId
+          || existing.node_role !== NODE_ROLE.CONTROLLED
+          || existing.revoked_at !== null
+          || !existing.node_id
+          || existing.os !== os
+          || existing.arch !== arch
+          || normalizeControlledNodeAbiProfile(existing.abi_profile) !== abiProfile
+        ) {
+          return { kind: 'conflict', error: 'token_hash_conflict' };
+        }
+        if (hostServerId && existing.host_server_id && existing.host_server_id !== hostServerId) {
+          return { kind: 'conflict', error: 'host_server_conflict' };
+        }
+        let effectiveHostServerId = existing.host_server_id;
+        if (hostServerId && !existing.host_server_id) {
+          if (!(await isOwnedHostDaemon(tx, userId, hostServerId))) {
+            return { kind: 'forbidden_host' };
+          }
+          if (await hostIdentitiesConflict(tx, existing.id, hostServerId)) {
+            return { kind: 'conflict', error: 'host_identity_conflict' };
+          }
+          await tx.execute(
+            `UPDATE servers
+             SET host_server_id = NULL
+             WHERE host_server_id = $1 AND user_id = $2 AND node_role = 'controlled' AND id <> $3`,
+            [hostServerId, userId, existing.id],
+          );
+          await tx.execute(
+            'UPDATE servers SET host_server_id = $2 WHERE id = $1 AND user_id = $3',
+            [existing.id, hostServerId, userId],
+          );
+          effectiveHostServerId = hostServerId;
+        }
+        return {
+          kind: 'idempotent',
+          serverId: existing.id,
+          nodeId: existing.node_id,
+          displayName: existing.display_name ?? existing.name,
+          hostServerId: effectiveHostServerId ?? null,
+        };
+      }
+
+      if (hostServerId && !(await isOwnedHostDaemon(tx, userId, hostServerId))) {
+        return { kind: 'forbidden_host' };
+      }
+
+      const serverId = randomHex(16);
+      if (hostServerId) {
+        await tx.execute(
+          `UPDATE servers
+           SET host_server_id = NULL
+           WHERE host_server_id = $1 AND user_id = $2 AND node_role = 'controlled' AND id <> $3`,
+          [hostServerId, userId, serverId],
+        );
+      }
+
+      const { nodeId, displayName } = await insertControlledServer(
+        tx,
+        serverId,
+        userId,
+        nodeTokenHash,
+        hostname,
+        os,
+        arch,
+        hostServerId ?? null,
+        dependencies.controlledNodeIdRandomBytes,
+      );
+      await tx.execute('UPDATE servers SET abi_profile = $2 WHERE id = $1', [serverId, abiProfile]);
+      if (keyId) {
+        await tx.execute('UPDATE servers SET bound_with_key_id = $2 WHERE id = $1', [serverId, keyId]);
+      }
+
+      return {
+        kind: 'created',
+        serverId,
+        nodeId,
+        displayName,
+        hostServerId: hostServerId ?? null,
+      };
+    });
+  } catch (err) {
+    logger.error({ err, userId }, 'direct controlled-node enrollment failed');
+    return c.json({ error: 'enroll_failed' }, 500);
+  }
+
+  if (result.kind === 'forbidden_host') {
+    return c.json({ error: 'host_server_not_owned' }, 403);
+  }
+  if (result.kind === 'conflict') {
+    return c.json({ error: result.error }, 409);
+  }
+
+  const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
+  await logAudit({
+    userId,
+    action: result.kind === 'created' ? 'enroll.v2.direct' : 'enroll.v2.direct.idempotent',
+    ip,
+    details: {
+      serverId: result.serverId,
+      nodeId: result.nodeId,
+      installId,
+      os,
+      arch,
+      abiProfile,
+      hostServerId: result.hostServerId,
+    },
+  }, c.env.DB);
+
+  return c.json({
+    ok: true as const,
+    serverId: result.serverId,
+    nodeId: result.nodeId,
+    nodeRole: NODE_ROLE.CONTROLLED,
+    displayName: result.displayName,
+    idempotent: result.kind === 'idempotent',
+    hostServerId: result.hostServerId,
+  }, result.kind === 'created' ? 201 : 200);
+});
+
+  return enrollRoutes;
+}
+
+export const enrollRoutes = createEnrollRoutes(defaultArtifactCatalog);
+
+// ── Retention ────────────────────────────────────────────────────────────────
+
+export interface RetentionResult {
+  /** Total enrollments deleted (kept as `rows` for back-compat with existing callers). */
+  rows: number;
+  attempts: number;
+  enrollments: number;
+}
+
+export async function runEnrollmentRetention(
+  db: Database,
+  now: number = Date.now(),
+  batchSize: number = 500,
+): Promise<RetentionResult> {
+  const bounded = Math.max(1, Math.min(5_000, Math.trunc(batchSize)));
+  // Step 1: reclaim stale reservations. Reservations count against admission
+  // while live but do not increment consumed_count until commit, so lease
+  // expiry only needs an idempotent state transition.
+  let attemptsReleased = 0;
+  await db.transaction(async (tx) => {
+    const expired = await tx.query<{ attempt_id: string; ticket_id: string }>(
+      `SELECT attempt_id, ticket_id
+         FROM controlled_node_download_attempts
+        WHERE state = 'reserved' AND lease_expires_at < $1
+        LIMIT $2`,
+      [now, bounded],
+    );
+    for (const e of expired) {
+      const upd = await tx.queryOne<{ attempt_id: string }>(
+        `UPDATE controlled_node_download_attempts
+            SET state = 'released', released_at = $2, updated_at = $2
+          WHERE attempt_id = $1 AND state = 'reserved'
+          RETURNING attempt_id`,
+        [e.attempt_id, now],
+      );
+      if (!upd) continue;
+      attemptsReleased += 1;
+    }
+  });
+  const retentionCutoff = now - 7 * 24 * 60 * 60 * 1000;
+  // Step 2: reusable installer parents intentionally live indefinitely, so
+  // settled download-attempt rows need their own bounded cleanup instead of
+  // relying only on parent deletion.
+  await db.execute(
+    `WITH settled AS (
+       SELECT attempt_id
+         FROM controlled_node_download_attempts
+        WHERE state IN ('committed', 'released')
+          AND updated_at < $1
+        ORDER BY updated_at ASC
+        LIMIT $2
+     )
+     DELETE FROM controlled_node_download_attempts AS attempt
+      USING settled
+      WHERE attempt.attempt_id = settled.attempt_id`,
+    [retentionCutoff, bounded],
+  );
+
+  // Step 3: active reusable installers survive ticket expiry, consumption and
+  // every successful redemption. Legacy single-use rows retain the old bounded
+  // cleanup behavior; explicitly revoked installers are reaped after retention.
+  const enrollments = await db.execute(
+    `WITH expired AS (
+       SELECT id
+         FROM controlled_node_enrollments_v2
+        WHERE (revoked_at IS NOT NULL AND revoked_at < $1)
+           OR (
+             reusable = FALSE
+             AND (
+               (expires_at IS NOT NULL AND expires_at < $1)
+               OR (consumed_at IS NOT NULL AND consumed_at < $1)
+             )
+           )
+        ORDER BY COALESCE(revoked_at, expires_at, consumed_at, created_at) ASC
+        LIMIT $2
+     )
+     DELETE FROM controlled_node_enrollments_v2 AS enrollment
+      USING expired
+      WHERE enrollment.id = expired.id`,
+    [retentionCutoff, bounded],
+  );
+  return {
+    rows: enrollments.changes,
+    attempts: attemptsReleased,
+    enrollments: enrollments.changes,
+  };
+}

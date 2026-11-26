@@ -1,22 +1,86 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
+import { createPortal } from 'preact/compat';
+import { useEffect, useRef } from 'preact/hooks';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
+import { DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
+import { clearAllSupervisionTaskConsoleCaches } from '../src/supervision-task-console-cache.js';
+import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
+import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY,
+  SUBSESSION_DESKTOP_LAYOUT,
+  SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY,
+} from '../src/subsession-desktop-layout-preference.js';
+import {
+  TEAM_DISCUSSION_LAYOUT,
+  TEAM_DISCUSSION_LAYOUT_STORAGE_KEY,
+} from '../src/team-discussion-layout-preference.js';
+import { serverSessionStorageKey } from '../src/server-tab-state.js';
 
 const {
   apiFetchMock,
+  autoRegisterChatScrollState,
+  chatScrollMock,
+  clearApiKeyMock,
+  clearAuthKeyMock,
+  clearAuthKeyIdMock,
+  clearServerUrlMock,
+  configureApiKeyMock,
+  discoverSharedEntriesMock,
   fetchMeMock,
+  getAuthKeyMock,
+  getAuthKeyIdMock,
+  getServerUrlMock,
+  initializeServerScopedAuthMock,
+  listManagedSharesForServerMock,
   listP2pRunsMock,
+  nativeState,
+  openSharedEntryMock,
+  openSharedEntryOptionsMock,
   wsInstances,
   useSubSessionsState,
+  updateSubLocalMock,
+  authExpiredState,
+  loginAttemptState,
+  loginState,
+  syncedPrefs,
 } = vi.hoisted(() => ({
+  syncedPrefs: { enabled: false, get: vi.fn(), save: vi.fn() },
   apiFetchMock: vi.fn(),
+  autoRegisterChatScrollState: {
+    enabled: false,
+    mainCalls: [] as string[],
+    subCalls: [] as string[],
+    staleMainOnce: new Set<string>(),
+    staleSubOnce: new Set<string>(),
+    staleDelayMs: 25,
+  },
+  chatScrollMock: vi.fn(),
+  clearApiKeyMock: vi.fn(),
+  clearAuthKeyMock: vi.fn(async () => undefined),
+  clearAuthKeyIdMock: vi.fn(async () => undefined),
+  clearServerUrlMock: vi.fn(async () => undefined),
+  configureApiKeyMock: vi.fn(),
+  discoverSharedEntriesMock: vi.fn(),
   fetchMeMock: vi.fn(),
+  getAuthKeyMock: vi.fn(async () => null as string | null),
+  getAuthKeyIdMock: vi.fn(async () => null as string | null),
+  getServerUrlMock: vi.fn(async () => null as string | null),
+  initializeServerScopedAuthMock: vi.fn(async () => undefined),
+  listManagedSharesForServerMock: vi.fn(),
   listP2pRunsMock: vi.fn(),
+  nativeState: { value: false },
+  openSharedEntryMock: vi.fn(),
+  openSharedEntryOptionsMock: vi.fn(),
   wsInstances: [] as Array<{
     connected: boolean;
+    connectionAttemptInFlight: boolean;
+    options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void>;
     latencyHandler: ((ms: number) => void) | null;
     connect: ReturnType<typeof vi.fn>;
@@ -36,18 +100,34 @@ const {
     discussionList: ReturnType<typeof vi.fn>;
     discussionStop: ReturnType<typeof vi.fn>;
     askAnswer: ReturnType<typeof vi.fn>;
+    sendSessionMessage: ReturnType<typeof vi.fn>;
     repoDetect: ReturnType<typeof vi.fn>;
     resumeConnection: ReturnType<typeof vi.fn>;
     reconnectNow: ReturnType<typeof vi.fn>;
     onMessage(handler: (message: any) => void): () => void;
     onLatency(handler: ((ms: number) => void) | null): void;
+    onPongLiveness(handler: (() => void) | null): void;
     emit(message: any): void;
     emitLatency(ms: number): void;
+    emitPongLiveness(): void;
   }>,
   useSubSessionsState: {
     subSessions: [] as any[],
     visibleSubSessions: [] as any[],
     loadedServerId: null as string | null,
+  },
+  updateSubLocalMock: vi.fn(),
+  authExpiredState: {
+    handler: null as ((reason?: string) => void) | null,
+  },
+  loginAttemptState: {
+    pending: null as Promise<void> | null,
+    mode: 'native' as 'native' | 'web',
+    webReloads: 0,
+  },
+  loginState: {
+    userId: 'user-1',
+    baseUrl: 'http://localhost',
   },
 }));
 
@@ -55,10 +135,15 @@ function textComponent(name: string) {
   return () => name;
 }
 
+const auditStableT = vi.hoisted(() => (key: string, opt?: { defaultValue?: string }) => {
+  if (key === 'mobile_menu.change_server') return opt?.defaultValue ?? '⇄ Switch Cloud Server';
+  if (key === 'mobile_menu.home') return opt?.defaultValue ?? '← Home';
+  return key;
+});
 vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: vi.fn() },
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: auditStableT,
     i18n: { language: 'en', changeLanguage: vi.fn() },
   }),
 }));
@@ -75,18 +160,39 @@ vi.mock('../src/api.js', () => {
     }
   }
 
+  class SharedOpenTimeoutError extends Error {
+    constructor(message = 'Shared entry open timed out') {
+      super(message);
+      this.name = 'SharedOpenTimeoutError';
+    }
+  }
+
   return {
     ApiError,
+    getUserPref: (...args: unknown[]) => syncedPrefs.get(...args),
+    saveUserPref: (...args: unknown[]) => syncedPrefs.save(...args),
+    SharedOpenTimeoutError,
+    DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS: 15_000,
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
-    clearApiKey: vi.fn(),
+    clearApiKey: (...args: unknown[]) => clearApiKeyMock(...args),
     configure: vi.fn(),
-    configureApiKey: vi.fn(),
-    discoverSharedEntries: vi.fn(async () => []),
+    configureExpectedUserId: vi.fn(),
+    configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
+    discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
+    getApiBaseUrl: vi.fn(() => 'http://localhost'),
     getApiKey: vi.fn(() => 'api-key-1'),
+    sendSessionViaHttp: vi.fn(async () => ({ ok: true })),
+    listManagedSharesForServer: (...args: unknown[]) => listManagedSharesForServerMock(...args),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
     normalizeLocalWebPreviewPath: (path: string) => path.startsWith('/') ? path : `/${path}`,
-    onAuthExpired: vi.fn(),
+    openSharedEntry: (target: unknown, opts?: unknown) => {
+      openSharedEntryOptionsMock(target, opts);
+      return openSharedEntryMock(target);
+    },
+    onAuthExpired: (handler: (reason?: string) => void) => {
+      authExpiredState.handler = handler;
+    },
     refreshSessionIfStale: vi.fn(),
     startProactiveRefresh: vi.fn(),
     stopProactiveRefresh: vi.fn(),
@@ -94,26 +200,49 @@ vi.mock('../src/api.js', () => {
 });
 
 vi.mock('../src/native.js', () => ({
-  clearServerUrl: vi.fn(),
-  getServerUrl: vi.fn(async () => null),
-  isNative: vi.fn(() => false),
+  clearServerUrl: (...args: unknown[]) => clearServerUrlMock(...args),
+  getServerUrl: (...args: unknown[]) => getServerUrlMock(...args),
+  isNative: vi.fn(() => nativeState.value),
+}));
+
+vi.mock('@capacitor/status-bar', () => ({
+  StatusBar: {
+    setStyle: vi.fn(async () => undefined),
+    setBackgroundColor: vi.fn(async () => undefined),
+  },
+  Style: { Dark: 'DARK' },
+}));
+
+vi.mock('@capacitor/splash-screen', () => ({
+  SplashScreen: { hide: vi.fn(async () => undefined) },
 }));
 
 vi.mock('../src/biometric-auth.js', () => ({
-  clearAuthKey: vi.fn(async () => undefined),
-  getAuthKey: vi.fn(async () => null),
+  clearAuthKey: (...args: unknown[]) => clearAuthKeyMock(...args),
+  clearAuthKeyId: (...args: unknown[]) => clearAuthKeyIdMock(...args),
+  getAuthKey: (...args: unknown[]) => getAuthKeyMock(...args),
+  getAuthKeyId: (...args: unknown[]) => getAuthKeyIdMock(...args),
+  initializeServerScopedAuth: (...args: unknown[]) => initializeServerScopedAuthMock(...args),
 }));
 
 vi.mock('../src/push-notifications.js', () => ({
   initPushNotifications: vi.fn(async () => undefined),
   resetPushBadge: vi.fn(async () => undefined),
+  getLocalPushEnabledServers: vi.fn(() => null),
+  fetchPushNotificationSettings: vi.fn(async () => null),
+  subscribePushEnabledServers: vi.fn(() => () => {}),
+  commitPushEnabledServers: vi.fn(async () => true),
+  hasUnsyncedPushEnabledServerEdits: vi.fn(() => false),
 }));
 
 vi.mock('../src/ws-client.js', () => ({
   WsClient: class MockWsClient {
     connected = false;
+    connectionAttemptInFlight = false;
+    options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void> = [];
     latencyHandler: ((ms: number) => void) | null = null;
+    pongLivenessHandler: (() => void) | null = null;
     connect = vi.fn(() => { this.connected = true; });
     disconnect = vi.fn(() => { this.connected = false; });
     requestSessionList = vi.fn();
@@ -131,12 +260,35 @@ vi.mock('../src/ws-client.js', () => ({
     discussionList = vi.fn();
     discussionStop = vi.fn();
     askAnswer = vi.fn();
+    sendSessionMessage = vi.fn();
     repoDetect = vi.fn();
     resumeConnection = vi.fn();
     reconnectNow = vi.fn();
 
-    constructor() {
+    constructor(_baseUrl?: string, _serverId?: string, options?: { shareTarget?: unknown }) {
+      this.options = options;
       wsInstances.push(this);
+    }
+
+    // The real client always exposes the daemon capability snapshot; anything
+    // rendered from `daemon.hello` (remote control, for one) reads it on mount.
+    daemonCapabilitySnapshot: { capabilities: string[] } | null = null;
+    daemonCapabilityHandlers: Array<(snapshot: unknown) => void> = [];
+    getDaemonCapabilitySnapshot(): { capabilities: string[] } | null {
+      return this.daemonCapabilitySnapshot;
+    }
+
+    onDaemonCapabilitySnapshot(handler: (snapshot: unknown) => void): () => void {
+      this.daemonCapabilityHandlers.push(handler);
+      return () => {
+        this.daemonCapabilityHandlers = this.daemonCapabilityHandlers.filter((h) => h !== handler);
+      };
+    }
+
+    /** Announce a `daemon.hello` capability set, as the real client does. */
+    emitDaemonCapabilities(capabilities: string[]): void {
+      this.daemonCapabilitySnapshot = { capabilities };
+      for (const handler of [...this.daemonCapabilityHandlers]) handler(this.daemonCapabilitySnapshot);
     }
 
     onMessage(handler: (message: any) => void): () => void {
@@ -150,12 +302,20 @@ vi.mock('../src/ws-client.js', () => ({
       this.latencyHandler = handler;
     }
 
+    onPongLiveness(handler: (() => void) | null): void {
+      this.pongLivenessHandler = handler;
+    }
+
     emit(message: any): void {
       for (const handler of [...this.messageHandlers]) handler(message);
     }
 
     emitLatency(ms: number): void {
       this.latencyHandler?.(ms);
+    }
+
+    emitPongLiveness(): void {
+      this.pongLivenessHandler?.();
     }
   },
 }));
@@ -165,9 +325,10 @@ vi.mock('../src/hooks/useSubSessions.js', () => ({
     ...useSubSessionsState,
     create: vi.fn(async () => null),
     close: vi.fn(),
+    hydrateShared: vi.fn(),
     restart: vi.fn(),
     rename: vi.fn(),
-    updateLocal: vi.fn(),
+    updateLocal: updateSubLocalMock,
   }),
 }));
 
@@ -191,18 +352,31 @@ vi.mock('../src/hooks/usePref.js', () => ({
 
 vi.mock('../src/hooks/useSyncedPreference.js', async () => {
   const { useState } = await vi.importActual<typeof import('preact/hooks')>('preact/hooks');
+  const actual = await vi.importActual<typeof import('../src/hooks/useSyncedPreference.js')>('../src/hooks/useSyncedPreference.js');
   return {
-    useSyncedPreference: (_key: string, initial: unknown) => useState(initial),
+    useSyncedPreference: (_key: string, initial: unknown, debounce?: number, scope?: string) => {
+      if (syncedPrefs.enabled && (_key.startsWith('server_') || _key === 'keyboard_shortcuts_v1')) {
+        return actual.useSyncedPreference(_key, initial, debounce, scope);
+      }
+      const [value, setValue] = useState(initial);
+      return [value, setValue, true];
+    },
   };
 });
 
 vi.mock('../src/git-status-store.js', () => ({
   requestSharedChanges: vi.fn(),
+  requestSharedChangesCount: vi.fn(),
   useSharedGitChanges: () => [],
+  useSharedGitChangesCount: () => 0,
+  subscribeSharedChangesMeta: vi.fn(() => () => {}),
+  clearSharedChangesCache: vi.fn(),
 }));
 
 vi.mock('../src/watch-bridge.js', () => ({
   onWatchCommand: vi.fn(async () => vi.fn()),
+  resolveWatchApiKey: vi.fn(async () => null),
+  syncSnapshotToWatch: vi.fn(async () => undefined),
 }));
 
 vi.mock('../src/watch-projection.js', () => ({
@@ -224,8 +398,26 @@ vi.mock('../src/watch-projection.js', () => ({
 }));
 
 vi.mock('../src/hooks/useTimeline.js', () => ({
+  useTimeline: vi.fn(() => ({
+    events: [],
+    loading: false,
+    refreshing: false,
+    addOptimisticUserMessage: vi.fn(),
+    removeOptimisticMessage: vi.fn(),
+    markOptimisticFailed: vi.fn(),
+    retryOptimisticMessage: vi.fn(),
+    forceRefresh: vi.fn(),
+  })),
+  syncIncognitoTimelineSessions: vi.fn(),
+  registerIncognitoTimelineSession: vi.fn(),
+  registerNormalTimelineSession: vi.fn(),
+  forgetIncognitoTimelineSessions: vi.fn(),
+  isIncognitoTimelineSession: vi.fn(() => false),
+  getCachedTimelineEvents: vi.fn(() => []),
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
+  dispatchActiveTimelineRefresh: vi.fn(),
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
 }));
 
 vi.mock('../src/components/ErrorBoundary.js', () => ({
@@ -233,10 +425,72 @@ vi.mock('../src/components/ErrorBoundary.js', () => ({
 }));
 
 vi.mock('../src/components/LanguageSwitcher.js', () => ({ LanguageSwitcher: textComponent('language-switcher') }));
-vi.mock('../src/pages/LoginPage.js', () => ({ LoginPage: textComponent('login-page') }));
-vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
+vi.mock('../src/pages/LoginPage.js', () => ({
+  LoginPage: ({
+    onLogin,
+    onLoginSuccess,
+    beginAuthAttempt,
+    completionMode,
+    onChangeServer,
+    sessionNotStuck,
+  }: {
+    onLogin?: () => void;
+    onLoginSuccess: (userId: string, url: string) => void;
+    beginAuthAttempt?: () => { isCurrent: () => boolean; finish: () => void };
+    completionMode?: 'reload' | 'callback';
+    onChangeServer?: () => void | Promise<void>;
+    sessionNotStuck?: boolean;
+  }) => (
+    <div>
+      {sessionNotStuck && <span>login.session_not_stuck</span>}
+      <button
+        type="button"
+        onClick={async () => {
+          const attempt = beginAuthAttempt?.();
+          try {
+            if (loginAttemptState.pending) await loginAttemptState.pending;
+            if (attempt?.isCurrent() ?? true) {
+              if (loginAttemptState.mode === 'web') {
+                onLogin?.();
+                if (completionMode !== 'callback') {
+                  // Model the real Web LoginPage path: it owns the cookie login
+                  // and reloads directly; it does not call native onLoginSuccess.
+                  loginAttemptState.webReloads += 1;
+                }
+              } else {
+                onLoginSuccess(loginState.userId, loginState.baseUrl);
+              }
+            }
+          } finally {
+            attempt?.finish();
+          }
+        }}
+      >login-page</button>
+      {onChangeServer && (
+        <button type="button" onClick={() => void onChangeServer()}>
+          change-server
+        </button>
+      )}
+    </div>
+  ),
+}));
+vi.mock('../src/pages/ServerSetupPage.js', () => ({
+  ServerSetupPage: ({ onConnect }: { onConnect: (url: string) => void | Promise<void> }) => (
+    <button type="button" onClick={() => void onConnect('https://new-server.example')}>
+      server-setup-page
+    </button>
+  ),
+}));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
-vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
+vi.mock('../src/pages/DashboardPage.js', () => ({
+  DashboardPage: ({ sharedEntries = [], servers = [], onDeleteServer }: any) => (
+    <div>
+      <span>dashboard-page</span>
+      <span data-testid="dashboard-shared-count">{sharedEntries.length}</span>
+      {servers.map((server: any) => <button key={server.id} onClick={() => onDeleteServer?.(server)}>dashboard-delete-{server.id}</button>)}
+    </div>
+  ),
+}));
 vi.mock('../src/pages/DiscussionsPage.js', () => ({
   DiscussionsPage: ({ initialTab }: any) => (
     <div>
@@ -246,8 +500,8 @@ vi.mock('../src/pages/DiscussionsPage.js', () => ({
   ),
 }));
 vi.mock('../src/pages/RepoPage.js', () => ({
-  RepoPage: ({ onBack, onCiEvent }: any) => (
-    <div>
+  RepoPage: ({ onBack, onCiEvent, projectDir, sessionId }: any) => (
+    <div data-testid="mock-repo-page" data-project-dir={projectDir ?? ''} data-session-id={sessionId ?? ''}>
       repo-page
       <button onClick={() => onCiEvent?.({ status: 'failure', name: 'CI', failedJobName: 'test', failedStepName: 'unit' })}>repo-ci</button>
       <button onClick={onBack}>repo-back</button>
@@ -255,11 +509,38 @@ vi.mock('../src/pages/RepoPage.js', () => ({
   ),
 }));
 vi.mock('../src/pages/SettingsPage.js', () => ({
-  SettingsPage: ({ onBack, onDisplayNameChanged, onUserAuthUpdated }: any) => (
+  SettingsPage: ({ onBack, onDisplayNameChanged, onUserAuthUpdated, onChangeShortcutOverrides }: any) => (
     <div>
       settings-page
       <button onClick={() => onDisplayNameChanged?.('Grace')}>settings-display</button>
       <button onClick={() => onUserAuthUpdated?.({ username: 'grace', hasPassword: false })}>settings-auth</button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Alt+ArrowRight', serverNext: 'Alt+ArrowDown' })}>
+        settings-custom-shortcuts
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' })}>
+        settings-meta-tab-shortcuts
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Ctrl+Shift+Plus', serverNext: 'Shift+PageDown' })}>
+        settings-plus-shortcuts
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ secondary: { tabPrev: null } })}>
+        settings-clear-mac-ctrl-a
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabPrev: null, secondary: { tabPrev: 'Ctrl+ArrowLeft', tabNext: 'Ctrl+ArrowRight' } })}>
+        settings-win-dual-slots
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'alt'] })}>
+        settings-subsession-ctrl-alt
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'shift'] })}>
+        settings-subsession-ctrl-shift
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionCloseAll: 'Alt+Shift+x' })}>
+        settings-close-all-alt-shift-x
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ toggleTaskMode: 'Alt+t' })}>
+        settings-toggle-task-mode-alt-t
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -268,9 +549,10 @@ vi.mock('../src/pages/AdminPage.js', () => ({
   AdminPage: ({ onBack }: any) => <button onClick={onBack}>admin-page</button>,
 }));
 vi.mock('../src/pages/CronManager.js', () => ({
-  CronManager: ({ onBack, onNavigateSession, onViewDiscussion }: any) => (
+  CronManager: ({ onBack, onNavigateSession, onViewDiscussion, readOnly, sharedScope, sharedSessionName }: any) => (
     <div>
       cron-manager
+      <span data-testid="cron-manager-access" data-read-only={String(!!readOnly)} data-shared-scope={String(!!sharedScope)} data-shared-session={sharedSessionName ?? ''} />
       <button onClick={() => onNavigateSession?.('deck_alpha_brain', 'quote')}>cron-navigate</button>
       <button onClick={() => onViewDiscussion?.('disc-1')}>cron-discussion</button>
       <button onClick={onBack}>cron-back</button>
@@ -279,21 +561,46 @@ vi.mock('../src/pages/CronManager.js', () => ({
 }));
 
 vi.mock('../src/components/ServerIconBar.js', () => ({
-  ServerIconBar: ({ servers, onSelectServer, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
-    <div>
+  ServerIconBar: ({ servers, returnHintServerId, pinnedServerIds, onSelectServer, onOpenSharedEntry, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
+    <div data-testid="server-icon-bar" data-return-hint-server-id={returnHintServerId ?? ''}>
       server-icon-bar
       <button onClick={onSettings}>server-settings</button>
       <button onClick={onAdmin}>server-admin</button>
       <button onClick={onHome}>server-home</button>
       <button onClick={onToggleSidebar}>server-toggle-sidebar</button>
       <button onClick={() => onSelectServer?.(servers?.[0]?.id, servers?.[0]?.name)}>server-select</button>
+      {servers?.map((server: any) => (
+        <button
+          key={server.id}
+          data-testid={`server-icon-${server.id}`}
+          data-pinned={pinnedServerIds?.has(server.id) ? 'true' : 'false'}
+          data-status={server.status ?? ''}
+          data-last-heartbeat-at={server.lastHeartbeatAt == null ? '' : String(server.lastHeartbeatAt)}
+          onContextMenu={(e: MouseEvent) => {
+            e.preventDefault();
+            onServerContextMenu?.(server, 11, 22);
+          }}
+          onClick={() => {
+            if (server.isSharedIn) {
+              if (server.sharedEntry && onOpenSharedEntry) {
+                onOpenSharedEntry(server.sharedEntry);
+              }
+              return;
+            }
+            onSelectServer?.(server.id, server.name);
+          }}
+        >
+          server-select-{server.id}
+          <span>{server.name}</span>
+        </button>
+      ))}
       <button onClick={() => onServerContextMenu?.(servers?.[0], 11, 22)}>server-menu</button>
     </div>
   ),
 }));
 vi.mock('../src/components/Sidebar.js', () => ({
   Sidebar: ({ children, onDropPanel }: any) => (
-    <div>
+    <div data-testid="sidebar-panel">
       sidebar
       <button onClick={() => onDropPanel?.('subsession', 'sub-1')}>sidebar-drop</button>
       <button onClick={() => onDropPanel?.('subsession', 'sub-2')}>sidebar-drop-sub-2</button>
@@ -308,6 +615,11 @@ vi.mock('../src/components/SessionTree.js', () => ({
     <div>
       session-tree
       <button onClick={() => onSelectSession?.(sessions?.[0]?.name)}>tree-select-session</button>
+      {sessions?.map((session: any) => (
+        <button key={session.name} onClick={() => onSelectSession?.(session.name)}>
+          tree-select-session-{session.name}
+        </button>
+      ))}
       <button onClick={() => onSelectSubSession?.(subSessions?.[0])}>tree-select-sub</button>
       <button onClick={onNewSession}>tree-new-session</button>
       <button onClick={onNewSubSession}>tree-new-sub</button>
@@ -315,10 +627,18 @@ vi.mock('../src/components/SessionTree.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionTabs.js', () => ({
-  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
-    <div>
+  SessionTabs: ({ sessions, latencyMs, onSelect, onAlertDismiss, onNewSession, onStopProject, canStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
+    <div
+      data-testid="app-shell-session-tabs"
+      data-latency-ms={latencyMs == null ? '' : String(latencyMs)}
+      data-can-new-session={String(Boolean(onNewSession))}
+      data-can-stop-project={String(canStopProject !== false)}
+    >
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
+      {sessions?.map((session: any) => (
+        <button key={session.name} onClick={() => onSelect?.(session.name)}>tabs-select-{session.name}</button>
+      ))}
       <button onClick={() => onAlertDismiss?.(sessions?.[0]?.name)}>tabs-dismiss</button>
       <button onClick={onNewSession}>tabs-new-session</button>
       <button onClick={() => onStopProject?.()}>tabs-stop</button>
@@ -332,7 +652,9 @@ vi.mock('../src/components/SessionTabs.js', () => ({
 }));
 vi.mock('../src/components/SessionPane.js', () => ({
   SessionPane: ({
+    isActive,
     session,
+    mobileFileBrowserOpen,
     onAfterAction,
     onChatScrollFn,
     onDiff,
@@ -341,39 +663,123 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onHistory,
     onInputRef,
     onMobileFileBrowserClose,
+    onOpenNodeGroups,
     onPendingPrefillApplied,
+    pendingTaskQuote,
+    onPendingTaskQuoteConsumed,
+    onPreviewFile,
+    onOpenLocalWebPreview,
     onRenameSession,
     onScrollBottomFn,
     onSettings,
+    onShareSession,
     onStopProject,
     onTransportConfigSaved,
-  }: any) => (
-    <div>
+    onAskAnswer,
+  }: any) => {
+    const composerRef = useRef<HTMLDivElement>(null);
+    const onInputRefLatest = useRef(onInputRef);
+    onInputRefLatest.current = onInputRef;
+    useEffect(() => {
+      if (isActive) onInputRefLatest.current?.(composerRef.current);
+      else onInputRefLatest.current?.(null);
+      return () => onInputRefLatest.current?.(null);
+    }, [isActive]);
+    const onChatScrollFnLatest = useRef(onChatScrollFn);
+    onChatScrollFnLatest.current = onChatScrollFn;
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled) return;
+      onChatScrollFnLatest.current?.(() => {
+        autoRegisterChatScrollState.mainCalls.push(session.name);
+      });
+    }, [session.name]);
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled || !isActive) return undefined;
+      if (!autoRegisterChatScrollState.staleMainOnce.has(session.name)) return undefined;
+      autoRegisterChatScrollState.staleMainOnce.delete(session.name);
+      onChatScrollFnLatest.current?.(() => false);
+      const timer = window.setTimeout(() => {
+        onChatScrollFnLatest.current?.(() => {
+          autoRegisterChatScrollState.mainCalls.push(session.name);
+          return true;
+        });
+      }, autoRegisterChatScrollState.staleDelayMs);
+      return () => window.clearTimeout(timer);
+    }, [isActive, session.name]);
+    const receivedTaskQuotesRef = useRef<string[]>([]);
+    const consumedQuoteNonceRef = useRef<number | null>(null);
+    useEffect(() => {
+      if (!isActive || !pendingTaskQuote) return;
+      if (consumedQuoteNonceRef.current === pendingTaskQuote.nonce) return;
+      consumedQuoteNonceRef.current = pendingTaskQuote.nonce;
+      receivedTaskQuotesRef.current = [...receivedTaskQuotesRef.current, pendingTaskQuote.quote];
+      onPendingTaskQuoteConsumed?.(pendingTaskQuote.nonce);
+    }, [isActive, pendingTaskQuote, onPendingTaskQuoteConsumed]);
+    return (
+    <div
+      data-testid={`session-pane-${session.name}`}
+      data-is-active={String(Boolean(isActive))}
+      data-task-quotes={JSON.stringify(receivedTaskQuotesRef.current)}
+      data-mobile-fb-open={String(Boolean(mobileFileBrowserOpen))}
+      data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
+      data-session-state={session.state ?? ''}
+      data-supervision-mode={session.supervisionMode ?? ''}
+      data-share-target-kind={session.sharedState?.targetKind ?? ''}
+      data-can-share={String(Boolean(onShareSession))}
+      data-requested-model={session.requestedModel ?? ''}
+      data-active-model={session.activeModel ?? ''}
+      data-model-display={session.modelDisplay ?? ''}
+    >
       session-pane:{session.name}
+      <div
+        ref={composerRef}
+        class="controls-input"
+        contentEditable="true"
+        tabIndex={-1}
+        data-testid={`pane-composer-${session.name}`}
+      />
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
       <button onClick={() => onScrollBottomFn?.(vi.fn())}>pane-scroll-ref</button>
       <button onClick={() => onFocusFn?.(vi.fn())}>pane-focus-ref</button>
-      <button onClick={() => onChatScrollFn?.(vi.fn())}>pane-chat-ref</button>
+      <button onClick={() => onChatScrollFn?.(chatScrollMock)}>pane-chat-ref</button>
       <button onClick={() => onInputRef?.(document.createElement('div'))}>pane-input-ref</button>
       <button onClick={() => onDiff?.(vi.fn())}>pane-diff-ref</button>
       <button onClick={() => onHistory?.(vi.fn())}>pane-history-ref</button>
       <button onClick={onStopProject}>pane-stop</button>
       <button onClick={onRenameSession}>pane-rename</button>
+      {onAskAnswer && (
+        <button onClick={() => onAskAnswer('toolu_inline', 'inline answer')}>
+          pane-ask-inline-{session.name}
+        </button>
+      )}
       <button onClick={onSettings}>pane-settings</button>
       <button onClick={() => onTransportConfigSaved?.({ supervision: { mode: 'supervised' } })}>pane-config</button>
       <button onClick={onAfterAction}>pane-after-action</button>
       <button onClick={onMobileFileBrowserClose}>pane-close-mobile-files</button>
+      {mobileFileBrowserOpen && onOpenNodeGroups && (
+        <button onClick={onOpenNodeGroups}>pane-mobile-open-node-groups</button>
+      )}
       <button onClick={onPendingPrefillApplied}>pane-prefill-applied</button>
+      <button onClick={() => onPreviewFile?.({
+        path: '/home/ai/.imcodes/uploads/392836a75fc67a4ff38c2dcedc9afe32.png',
+        sessionName: session.name,
+      })}>pane-preview-upload</button>
+      <button onClick={() => onOpenLocalWebPreview?.({ port: 8787, path: '/docs?q=1#intro' })}>pane-preview-loopback</button>
     </div>
-  ),
+    );
+  },
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
+  SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY: 'rcc_subcard_collapsed_default_v2',
   SubSessionBar: ({
     onCollapsedChange,
     onNew,
     onOpen,
+    onCloseAllOpen,
+    onRestoreQuickClosed,
     onOpenMaximized,
+    onVisualOrderChange,
     onViewAutoDeliver,
     onViewCron,
     onViewDiscussions,
@@ -389,9 +795,76 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     onOpenSpecAutoStop,
     onOpenSpecAutoToggleCompact,
     onOpenSpecAutoHide,
+    desktopLayoutCapable,
+    collapsed,
+    desktopLayout,
+    onDesktopLayoutChange,
+    desktopDockSide,
+    onDesktopDockSideChange,
+    verticalRailHost,
+    teamDiscussionLayout,
+    onTeamDiscussionLayoutChange,
+    teamDiscussionRailHost,
+    daemonBadgeState,
   }: any) => (
-    <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
+    <div
+      data-testid="app-shell-subsession-bar"
+      data-running-discussions={String(totalRunningDiscussions)}
+      data-collapsed={String(collapsed)}
+      data-desktop-layout={desktopLayout}
+      data-desktop-dock-side={desktopDockSide}
+      data-team-discussion-layout={teamDiscussionLayout}
+      data-daemon-badge-state={daemonBadgeState ?? ''}
+    >
+      {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && subSessions.length > 0 && createPortal(
+        <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
+        verticalRailHost,
+      )}
+      {teamDiscussionRailHost
+        && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT
+        && discussions.length > 0
+        && createPortal(
+          <div data-testid="app-shell-team-discussion-rail">mock Team discussion rail</div>,
+          teamDiscussionRailHost,
+        )}
       sub-session-bar
+      {desktopLayoutCapable && onDesktopLayoutChange && (
+        <button
+          data-testid="app-shell-subsession-layout-toggle"
+          aria-label={desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL ? 'switch horizontal' : 'switch vertical'}
+          onClick={() => onDesktopLayoutChange(
+            desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+              ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL
+              : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+          )}
+        >layout-toggle</button>
+      )}
+      {desktopLayoutCapable
+        && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+        && onDesktopDockSideChange && (
+        <>
+          <button
+            data-testid="app-shell-subsession-dock-left"
+            onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+          >dock-left</button>
+          <button
+            data-testid="app-shell-subsession-dock-right"
+            onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+          >dock-right</button>
+        </>
+      )}
+      {desktopLayoutCapable && onTeamDiscussionLayoutChange && (
+        <>
+          <button
+            data-testid="app-shell-team-discussion-right"
+            onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.RIGHT)}
+          >team-right</button>
+          <button
+            data-testid="app-shell-team-discussion-bottom"
+            onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.BOTTOM)}
+          >team-bottom</button>
+        </>
+      )}
       {openSpecAutoProjection && (
         <div
           data-testid="app-shell-auto-deliver-runbar"
@@ -425,6 +898,9 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       {subSessions?.map((sub: any) => (
         <button key={sub.id} onClick={() => onOpen?.(sub.id)}>subbar-open-{sub.id}</button>
       ))}
+      <button onClick={onCloseAllOpen}>subbar-quick-close</button>
+      <button onClick={() => onRestoreQuickClosed?.(subSessions?.map((sub: any) => sub.id) ?? [])}>subbar-quick-restore</button>
+      <button onClick={() => onVisualOrderChange?.([...(subSessions ?? [])].reverse().map((sub: any) => sub.id))}>subbar-reverse-order</button>
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
       <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
@@ -437,15 +913,91 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, active, zIndex, onFocus, onViewRepo }: any) => (
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onInputRef, onChatScrollFn, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
+    const incomingViewer = !!sharedState
+      && sharedState.outgoing !== true
+      && sharedState.effectiveRole !== 'participant';
+    const subComposerRef = useRef<HTMLDivElement>(null);
+    const onInputRefLatest = useRef(onInputRef);
+    onInputRefLatest.current = onInputRef;
+    useEffect(() => {
+      if (visible) onInputRefLatest.current?.(subComposerRef.current);
+      else onInputRefLatest.current?.(null);
+      return () => onInputRefLatest.current?.(null);
+    }, [visible, active, sub?.viewMode]);
+    const onChatScrollFnLatest = useRef(onChatScrollFn);
+    onChatScrollFnLatest.current = onChatScrollFn;
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled || !sub?.id) return;
+      onChatScrollFnLatest.current?.(() => {
+        autoRegisterChatScrollState.subCalls.push(sub.id);
+      });
+    }, [sub?.id]);
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled || !visible || !sub?.id) return undefined;
+      if (!autoRegisterChatScrollState.staleSubOnce.has(sub.id)) return undefined;
+      autoRegisterChatScrollState.staleSubOnce.delete(sub.id);
+      onChatScrollFnLatest.current?.(() => false);
+      const timer = window.setTimeout(() => {
+        onChatScrollFnLatest.current?.(() => {
+          autoRegisterChatScrollState.subCalls.push(sub.id);
+          return true;
+        });
+      }, autoRegisterChatScrollState.staleDelayMs);
+      return () => window.clearTimeout(timer);
+    }, [visible, sub?.id]);
+    return (
     <div
+      class="subsession-window"
       data-testid={`sub-session-window-${sub?.id}`}
+      data-subsession-id={sub?.id}
+      data-view-mode={sub?.type === 'shell' ? 'terminal' : (sub?.viewMode ?? 'chat')}
       data-active={String(active)}
+      data-visible={String(visible)}
+      data-maximized={String(Boolean(maximized))}
+      data-task-pair-visit={taskPairPanelVisitKey ?? ''}
+      data-shared-outgoing={String(sharedState?.outgoing === true)}
+      data-share-role={sharedState?.effectiveRole ?? ''}
       style={{ zIndex }}
       onMouseDown={onFocus}
     >
       sub-session-window
+      <button type="button" class="subsession-mode-btn">sub-window-mode-btn-{sub?.id}</button>
+      <div
+        ref={subComposerRef}
+        class="controls-input"
+        contentEditable="true"
+        tabIndex={-1}
+        data-testid={`sub-window-controls-input-${sub?.id}`}
+      />
+      {onClosePairSplit && <button onClick={onClosePairSplit}>sub-window-close-split-{sub?.id}</button>}
+      <button onClick={onToggleMaximized}>sub-window-toggle-max-{sub?.id}</button>
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
+      <button onClick={() => onSettings?.({ surface: 'session' })}>sub-window-settings-{sub?.id}</button>
+      <input aria-label={`sub-window-composer-${sub?.id}`} disabled={incomingViewer} />
+      <button
+        disabled={incomingViewer}
+        onClick={() => ws?.sendSessionCommand?.(sub.sessionName, `message-for-${sub.id}`, {})}
+      >sub-window-send-{sub?.id}</button>
+      <button
+        onClick={() => onShareSession?.({
+          name: sub.sessionName,
+          project: sub.label ?? sub.sessionName,
+          role: 'w1',
+          agentType: sub.type,
+          state: sub.state,
+        }, sub.id)}
+      >sub-window-share-{sub?.id}</button>
+    </div>
+    );
+  },
+}));
+vi.mock('../src/components/ShareSessionDialog.js', () => ({
+  ShareSessionDialog: ({ onClose, onSharesChanged }: any) => (
+    <div>
+      share-session-dialog
+      <button onClick={onSharesChanged}>share-session-refresh</button>
+      <button onClick={onClose}>share-session-close</button>
     </div>
   ),
 }));
@@ -462,8 +1014,8 @@ vi.mock('../src/components/NewSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/StartSubSessionDialog.js', () => ({
-  StartSubSessionDialog: ({ onClose, onStart }: any) => (
-    <div>
+  StartSubSessionDialog: ({ onClose, onStart, allowedAgentTypes, overlayClassName }: any) => (
+    <div data-allowed-agent-types={allowedAgentTypes?.join(',') ?? ''} data-overlay-class={overlayClassName ?? ''}>
       start-sub-session-dialog
       <button onClick={() => void onStart?.('codex-sdk', '/bin/bash', '/work/alpha', 'Helper', {})}>start-sub-start</button>
       <button onClick={onClose}>start-sub-close</button>
@@ -471,10 +1023,34 @@ vi.mock('../src/components/StartSubSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionSettingsDialog.js', () => ({
-  SessionSettingsDialog: ({ onClose, onSaved }: any) => (
-    <div>
+  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision, requestedModel, activeModel, modelDisplay }: any) => (
+    <div
+      data-testid="session-settings-dialog"
+      data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}
+      data-supervision-mode={supervisionMode ?? ''}
+      data-can-control-supervision={String(Boolean(canControlAutomaticSupervision))}
+      data-requested-model={requestedModel ?? ''}
+      data-active-model={activeModel ?? ''}
+      data-model-display={modelDisplay ?? ''}
+    >
       session-settings-dialog
+      <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
+      <button onClick={() => onSaved?.({ requestedModel: 'gpt-5.6', activeModel: 'gpt-5.6', modelDisplay: 'gpt-5.6' })}>settings-model-confirmed</button>
+      <button onClick={() => onSaved?.({ type: 'agy-sdk', requestedModel: 'gemini-3.8-flash-high', activeModel: null, modelDisplay: null })}>settings-provider-switched</button>
+      <button onClick={onClose}>settings-close</button>
+    </div>
+  ),
+  SupervisionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision }: any) => (
+    <div
+      data-testid="session-settings-dialog"
+      data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}
+      data-supervision-mode={supervisionMode ?? ''}
+      data-can-control-supervision={String(Boolean(canControlAutomaticSupervision))}
+    >
+      session-settings-dialog
+      <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
+      <button onClick={() => onSaved?.({ transportConfig: {} })}>settings-save</button>
       <button onClick={onClose}>settings-close</button>
     </div>
   ),
@@ -489,8 +1065,29 @@ vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
 }));
 vi.mock('../src/components/StartDiscussionDialog.js', () => ({ StartDiscussionDialog: textComponent('start-discussion-dialog') }));
 vi.mock('../src/components/AskQuestionDialog.js', () => ({
-  AskQuestionDialog: ({ pending, onDismiss, onSubmit }: any) => (
-    <div>
+  resolveAskQuestionSource: (sessionName: string, sessions: any[], subSessions: any[]) => {
+    if (sessionName.startsWith('deck_sub_')) {
+      const sub = subSessions.find((s) => s.sessionName === sessionName);
+      const parent = sub?.parentSession ? sessions.find((s) => s.name === sub.parentSession) : undefined;
+      return {
+        kind: 'subsession' as const,
+        label: sub?.label || 'Worker',
+        ...(parent ? { parentLabel: parent.label || parent.project || 'Brain' } : {}),
+      };
+    }
+    const main = sessions.find((s) => s.name === sessionName);
+    return {
+      kind: 'tab' as const,
+      label: main?.label || main?.project || 'Brain',
+    };
+  },
+  AskQuestionDialog: ({ pending, sourceLabel, sourceParentLabel, sourceKind, onJumpToSession, onDismiss, onSubmit }: any) => (
+    <div
+      data-testid="ask-question-dialog"
+      data-source-label={sourceLabel ?? ''}
+      data-source-parent-label={sourceParentLabel ?? ''}
+      data-source-kind={sourceKind ?? ''}
+    >
       ask-question-dialog
       {pending?.questions?.map((question: any, index: number) => (
         <div key={index}>
@@ -501,6 +1098,7 @@ vi.mock('../src/components/AskQuestionDialog.js', () => ({
           ))}
         </div>
       ))}
+      {onJumpToSession && <button onClick={onJumpToSession}>ask-jump</button>}
       <button onClick={() => onSubmit?.('answer')}>ask-submit</button>
       <button onClick={onDismiss}>ask-dismiss</button>
     </div>
@@ -514,20 +1112,22 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
       <button onClick={onCancel}>delete-cancel</button>
     </div>
   ),
-  ServerContextMenu: ({ onClose, onDelete, onRename, onUpgrade, onUpgradeAll }: any) => (
+  ServerContextMenu: ({ pinned, onClose, onDelete, onRename, onUpgrade, onUpgradeAll, onTogglePin, onTogglePushMute }: any) => (
     <div>
       server-context-menu
-      <button onClick={onRename}>server-menu-rename</button>
-      <button onClick={onUpgrade}>server-menu-upgrade</button>
-      <button onClick={onUpgradeAll}>server-menu-upgrade-all</button>
-      <button onClick={onDelete}>server-menu-delete</button>
+      <button data-pinned={String(Boolean(pinned))} onClick={onTogglePin}>server-menu-pin</button>
+      {onTogglePushMute && <button onClick={onTogglePushMute}>server-menu-push-mute</button>}
+      {onRename && <button onClick={onRename}>server-menu-rename</button>}
+      {onUpgrade && <button onClick={onUpgrade}>server-menu-upgrade</button>}
+      {onUpgradeAll && <button onClick={onUpgradeAll}>server-menu-upgrade-all</button>}
+      {onDelete && <button onClick={onDelete}>server-menu-delete</button>}
       <button onClick={onClose}>server-menu-close</button>
     </div>
   ),
 }));
 vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ children, id, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
-    <div data-testid={`floating-panel-${id}`} style={{ zIndex }}>
+  FloatingPanel: ({ children, id, className, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
+    <div className={['floating-panel', className].filter(Boolean).join(' ')} data-testid={`floating-panel-${id}`} style={{ zIndex }}>
       floating-panel
       <button onClick={onFocus}>floating-focus</button>
       <button onClick={onPin}>floating-pin</button>
@@ -540,6 +1140,81 @@ vi.mock('../src/components/FloatingPanel.js', () => ({
 vi.mock('../src/components/SharedContextManagementPanel.js', () => ({
   SharedContextManagementPanel: ({ onEnterpriseChange }: any) => (
     <button onClick={() => onEnterpriseChange?.('ent-2')}>shared-context-management</button>
+  ),
+}));
+vi.mock('../src/components/ControlledNodesPanel.js', () => ({
+  ControlledNodesPanel: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: any) => (
+    <div>
+      <button onClick={() => onOpenRemoteDesktop?.({
+        serverId: 'desktop-1',
+        refName: 'desktop-ref',
+        displayName: 'Desktop One',
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        accessRole: 'owner',
+        capabilities: [],
+      })}>controlled-nodes-panel</button>
+      <button onClick={onOpenRemoteDesktopWall}>controlled-nodes-wall</button>
+      <button onClick={() => onConnectById?.('5123456789')}>controlled-nodes-connect-by-id</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
+  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: any) => (
+    <>
+      <button
+        data-testid="controlled-node-quick-trigger"
+        onClick={() => onOpenRemoteDesktop?.({
+          serverId: 'desktop-quick',
+          refName: 'desktop-quick-ref',
+          displayName: 'Desktop Quick',
+          os: 'win',
+          online: true,
+          execEnabled: true,
+          accessRole: 'owner',
+          capabilities: [],
+        })}
+      >controlled-node-quick-trigger</button>
+      <button
+        data-testid="controlled-node-quick-wall"
+        onClick={() => onOpenRemoteDesktopWall?.()}
+      >controlled-node-quick-wall</button>
+      <button
+        data-testid="controlled-node-quick-connect-by-id"
+        onClick={() => onConnectById?.()}
+      >controlled-node-quick-connect-by-id</button>
+    </>
+  ),
+}));
+vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
+  RemoteDesktopPanel: ({ onClose }: any) => (
+    <div data-testid="remote-desktop-panel">
+      remote-desktop-panel
+      <button onClick={onClose}>remote-desktop-close</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
+  RemoteDesktopWorkspace: ({ minimized, onCloseWorkspace, onMinimize, onRestore, zIndex, onFocus }: any) => (
+    <div data-testid="remote-desktop-workspace" style={{ zIndex }} onMouseDown={onFocus}>
+      remote-desktop-workspace
+      <span>remote-desktop-minimized:{String(Boolean(minimized))}</span>
+      <button onClick={onMinimize}>remote-desktop-minimize</button>
+      {minimized && <button onClick={onRestore}>remote-desktop-restore</button>}
+      <button onClick={onCloseWorkspace}>remote-desktop-close</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/RemoteDesktopWall.js', () => ({
+  REMOTE_DESKTOP_WALL_WINDOW_ID: 'remote-desktop-wall',
+  RemoteDesktopWall: ({ minimized, zIndex, onFocus, onClose, onConnectById }: any) => (
+    <div data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
+      remote-desktop-wall
+      <span>remote-desktop-wall-minimized:{String(Boolean(minimized))}</span>
+      <button onClick={() => onConnectById?.()}>remote-desktop-wall-connect-by-id</button>
+      <button onClick={() => onClose?.([])}>remote-desktop-wall-close</button>
+    </div>
   ),
 }));
 vi.mock('../src/components/ContextDiagnosticsPanel.js', () => ({
@@ -558,28 +1233,53 @@ vi.mock('../src/components/NewUserGuide.js', () => ({
 }));
 vi.mock('../src/components/P2pRingProgress.js', () => ({ P2pRingProgress: textComponent('p2p-ring-progress') }));
 vi.mock('../src/components/SidebarPinnedPanel.js', () => ({
-  SidebarPinnedPanel: ({ onResize, onUnpin }: any) => (
-    <div>
+  SidebarPinnedPanel: ({ panel, ctx, onResize, onUnpin }: any) => (
+    <div
+      data-testid={`sidebar-pinned-${panel?.id ?? 'unknown'}`}
+      data-panel-type={panel?.type ?? ''}
+      data-panel-server={panel?.props?.serverId ?? ''}
+      data-panel-project-dir={panel?.props?.projectDir ?? ''}
+      data-ctx-server={ctx?.serverId ?? ''}
+      data-ctx-sessions-loading={String(Boolean(ctx?.sessionsLoading))}
+      data-ctx-active-session={ctx?.activeSession ?? ''}
+      data-ctx-active-project-dir={ctx?.sessions?.find((s: any) => s.name === ctx?.activeSession)?.projectDir ?? ''}
+      data-ctx-sessions-count={String(ctx?.sessions?.length ?? 0)}
+    >
       sidebar-pinned-panel
       <button onClick={() => onResize?.(333)}>pinned-resize</button>
-      <button onClick={onUnpin}>pinned-unpin</button>
+      <button data-testid={`pinned-unpin-${panel?.id ?? 'unknown'}`} onClick={onUnpin}>pinned-unpin</button>
+      <button data-testid={`pinned-quote-${panel?.id ?? 'unknown'}`} onClick={() => ctx?.onQuote?.('quoted from pinned')}>pinned-quote</button>
+      {ctx?.onAskAnswer && panel?.props?.sessionName && (
+        <button
+          data-testid={`pinned-ask-inline-${String(panel.props.sessionName)}`}
+          onClick={() => ctx.onAskAnswer(String(panel.props.sessionName), 'toolu_pinned_inline', 'pinned inline answer')}
+        >
+          pinned-ask-inline
+        </button>
+      )}
     </div>
   ),
 }));
 vi.mock('../src/components/LocalWebPreviewPanel.js', () => ({
-  LocalWebPreviewPanel: ({ onDraftChange }: any) => (
-    <div>
+  LocalWebPreviewPanel: ({ port, path, onDraftChange }: any) => (
+    <div data-testid="local-web-preview" data-port={port} data-path={path}>
       local-web-preview
       <button onClick={() => onDraftChange?.({ port: '5173', path: '/app' })}>preview-draft</button>
     </div>
   ),
 }));
 vi.mock('../src/components/file-browser-lazy.js', () => ({
-  FileBrowser: ({ onClose, onConfirm, onPreviewStateChange }: any) => (
-    <div>
+  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onOpenNodeGroups, onPreviewStateChange, scopeToSessionRoot, readOnly, canShare }: any) => (
+    <div
+      data-testid={autoPreviewPath ? 'file-browser-preview' : 'file-browser'}
+      data-scope-to-session-root={String(!!scopeToSessionRoot)}
+      data-read-only={String(!!readOnly)}
+      data-can-share={String(canShare ?? true)}
+    >
       file-browser
       <button onClick={() => onConfirm?.(['/work/alpha/src/index.ts'])}>file-confirm</button>
       <button onClick={() => onPreviewStateChange?.({ path: '/work/alpha/src/index.ts', preview: { status: 'loaded' } })}>file-preview-state</button>
+      {onOpenNodeGroups && <button onClick={onOpenNodeGroups}>file-open-node-groups</button>}
       <button onClick={onClose}>file-close</button>
     </div>
   ),
@@ -624,6 +1324,33 @@ function sessionList() {
   };
 }
 
+function sharedMainOpenResult(
+  shareId: string,
+  activeDispatchId: string,
+  effectiveRole: 'viewer' | 'participant' = 'participant',
+) {
+  return {
+    server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+    target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    coverage: {
+      effectiveRole,
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: [shareId],
+      primaryShareId: shareId,
+      authorizedAt: Date.now(),
+    },
+    sessions: [{
+      sessionName: 'deck_beta_brain',
+      title: 'Shared Beta',
+      state: 'running',
+      agentType: 'codex-sdk',
+      activeDispatchId,
+    }],
+    subSessions: [],
+  };
+}
+
 async function getActiveWsClient() {
   await waitFor(() => {
     expect(wsInstances.some((instance) => instance.messageHandlers.length > 0)).toBe(true);
@@ -633,12 +1360,49 @@ async function getActiveWsClient() {
 
 beforeEach(() => {
   vi.resetModules();
+  syncedPrefs.enabled = false;
+  syncedPrefs.get.mockReset().mockResolvedValue(null);
+  syncedPrefs.save.mockReset().mockResolvedValue(undefined);
+  history.replaceState(null, '', '/');
   localStorage.clear();
   sessionStorage.clear();
   wsInstances.length = 0;
   useSubSessionsState.subSessions = [];
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
+  updateSubLocalMock.mockReset();
+  authExpiredState.handler = null;
+  loginAttemptState.pending = null;
+  loginAttemptState.mode = 'native';
+  loginAttemptState.webReloads = 0;
+  loginState.userId = 'user-1';
+  loginState.baseUrl = 'http://localhost';
+  nativeState.value = false;
+  autoRegisterChatScrollState.enabled = false;
+  autoRegisterChatScrollState.mainCalls = [];
+  autoRegisterChatScrollState.subCalls = [];
+  autoRegisterChatScrollState.staleMainOnce.clear();
+  autoRegisterChatScrollState.staleSubOnce.clear();
+  autoRegisterChatScrollState.staleDelayMs = 25;
+  chatScrollMock.mockReset();
+  clearApiKeyMock.mockReset();
+  clearAuthKeyMock.mockReset();
+  clearAuthKeyMock.mockResolvedValue(undefined);
+  clearAuthKeyIdMock.mockReset();
+  clearAuthKeyIdMock.mockResolvedValue(undefined);
+  clearServerUrlMock.mockReset();
+  clearServerUrlMock.mockResolvedValue(undefined);
+  configureApiKeyMock.mockReset();
+  getAuthKeyMock.mockReset();
+  getAuthKeyMock.mockResolvedValue(null);
+  getAuthKeyIdMock.mockReset();
+  getAuthKeyIdMock.mockResolvedValue(null);
+  getServerUrlMock.mockReset();
+  getServerUrlMock.mockResolvedValue(null);
+  initializeServerScopedAuthMock.mockReset();
+  initializeServerScopedAuthMock.mockResolvedValue(undefined);
+  listManagedSharesForServerMock.mockReset();
+  listManagedSharesForServerMock.mockResolvedValue([]);
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -647,6 +1411,10 @@ beforeEach(() => {
     has_password: true,
   });
   listP2pRunsMock.mockResolvedValue([]);
+  discoverSharedEntriesMock.mockReset();
+  discoverSharedEntriesMock.mockResolvedValue([]);
+  openSharedEntryMock.mockReset();
+  openSharedEntryOptionsMock.mockReset();
   apiFetchMock.mockImplementation(async (path: string) => {
     if (path === '/api/auth/user/me') return { id: 'user-1' };
     if (path === '/api/server') return serverList();
@@ -662,13 +1430,412 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function ensureMobileSidebarServerListExpanded(container: Element): void {
+  const toggleBtn = container.querySelector('.mobile-sidebar-header .mobile-sidebar-hdr-btn[title="Server bar"]') as HTMLButtonElement | null;
+  if (toggleBtn && !toggleBtn.classList.contains('active')) {
+    fireEvent.click(toggleBtn);
+  }
+}
+
 describe('App shell', () => {
+  it.each(['partial', 'empty', 'error'])('pin persistence: retains absent IDs through %s inventory and reload', async (inventory) => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const pinned = ['temporarily-absent', 'srv-1'];
+    localStorage.setItem('rcc_sync_user-1:server_pinned', JSON.stringify({ v: pinned, t: 100 }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        if (inventory === 'error') throw new Error('offline');
+        return inventory === 'empty' ? { servers: [] } : serverList();
+      }
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+    const { App } = await importApp();
+    const view = render(<App />);
+    await waitFor(() => expect(syncedPrefs.get.mock.calls.some(([key]) => key === 'server_pinned')).toBe(true));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(pinned);
+    expect(syncedPrefs.save.mock.calls.filter(([key, raw]) => key === 'server_pinned' && JSON.parse(raw).v.length !== 2)).toEqual([]);
+    view.unmount();
+    render(<App />);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(pinned);
+  }, 20_000);
+
+  it('pin persistence: preserves existing automatic ordinary-order initialization', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v).toEqual(['srv-1']));
+    expect(syncedPrefs.save.mock.calls.some(([key]) => key === 'server_pinned')).toBe(false);
+  }, 20_000);
+
+  it('pin persistence: explicit toggle preserves temporarily absent pins and permits unpin', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_sync_user-1:server_pinned', JSON.stringify({ v: ['temporarily-absent'], t: 100 }));
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-pin'));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(['temporarily-absent', 'srv-1']));
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-pin'));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(['temporarily-absent']));
+  }, 20_000);
+
+  it.each(['partial', 'empty', 'error'])('server_order persistence: retains unseen shared/offline IDs through %s inventory without pruning or empty-writing', async (inventory) => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const existingOrder = ['shared-other-window', 'srv-1', 'hidden-offline'];
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify({ v: existingOrder, t: 100 }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        if (inventory === 'error') throw new Error('offline');
+        return inventory === 'empty' ? { servers: [] } : serverList();
+      }
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(syncedPrefs.get.mock.calls.some(([key]) => key === 'server_order')).toBe(true));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order')!).v).toEqual(existingOrder);
+    expect(
+      syncedPrefs.save.mock.calls.filter(
+        ([key, raw]) => key === 'server_order' && JSON.stringify(JSON.parse(raw as string).v) !== JSON.stringify(existingOrder),
+      ),
+    ).toEqual([]);
+  }, 20_000);
+
+  it('server_order persistence: partial shared inventory + multi-window storage updates converge without stripping or ping-pong', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const sharedEntry = {
+      id: 'share-x',
+      serverId: 'srv-shared-x',
+      serverName: 'Shared Server X',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Tab X',
+      target: { kind: 'main', serverId: 'srv-shared-x', sessionName: 'deck_x_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared-x', name: 'Shared Server X', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-x'],
+        primaryShareId: 'share-x',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_x_brain',
+        title: 'Shared Tab X',
+        state: 'idle',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-open-x',
+        supervisionMode: 'supervised_audit',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    const entryLabel = await screen.findByText('Shared Tab X');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => {
+      const saved = JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v;
+      expect(saved).toEqual(['srv-1', 'srv-shared-x']);
+    });
+
+    // Window B (which only has owned srv-1 + shared srv-shared-y) writes ['srv-shared-y', 'srv-1']
+    syncedPrefs.save.mockClear();
+    const fromWindowB = { v: ['srv-shared-y', 'srv-1'], t: Date.now() + 500 };
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify(fromWindowB));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_user-1:server_order',
+        newValue: JSON.stringify(fromWindowB),
+      }));
+    });
+
+    // Window A preserves srv-shared-y and appends its own srv-shared-x (never stripping srv-shared-y!)
+    await waitFor(() => {
+      const converged = JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v;
+      expect(converged).toEqual(['srv-shared-y', 'srv-1', 'srv-shared-x']);
+    });
+
+    // Once converged, alternating storage events from Window B trigger zero additional saves (no ping-pong)
+    syncedPrefs.save.mockClear();
+    const convergedPayload = { v: ['srv-shared-y', 'srv-1', 'srv-shared-x'], t: Date.now() + 1000 };
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify(convergedPayload));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_user-1:server_order',
+        newValue: JSON.stringify(convergedPayload),
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(syncedPrefs.save.mock.calls.filter(([key]) => key === 'server_order')).toEqual([]);
+  }, 20_000);
+
+  it('deletes an offline server from the dashboard without a daemon connection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    let servers = [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }];
+    apiFetchMock.mockImplementation(async (path: string, options?: { method?: string }) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers };
+      if (path === '/api/server/srv-1' && options?.method === 'DELETE') { servers = []; return { ok: true }; }
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-home'));
+    fireEvent.click(await screen.findByText('dashboard-delete-srv-1'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/server/srv-1', { method: 'DELETE' });
+    expect(wsInstances.every((ws) => ws.sendSessionCommand.mock.calls.length === 0)).toBe(true);
+  }, 20_000);
+
+  it('deletes the selected offline server through its menu and does not auto-enter it again', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }] };
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-delete'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    expect(await screen.findByText('dashboard-page')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(localStorage.getItem('rcc_server')).toBeNull();
+    expect(localStorage.getItem('rcc_server_name')).toBeNull();
+    expect(localStorage.getItem('rcc_session')).toBeNull();
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+  }, 20_000);
+
+  it('keeps the offline deletion dialog and server visible on failure, then permits retry', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    let attempts = 0;
+    apiFetchMock.mockImplementation(async (path: string, options?: { method?: string }) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }] };
+      if (path === '/api/server/srv-1' && options?.method === 'DELETE') {
+        if (attempts++ === 0) throw new Error('database unavailable');
+        return { ok: true };
+      }
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-home'));
+    fireEvent.click(await screen.findByText('dashboard-delete-srv-1'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    await waitFor(() => expect(alert).toHaveBeenCalledOnce());
+    expect(screen.getByText('delete-server-dialog')).toBeTruthy();
+    expect(screen.getByText('dashboard-delete-srv-1')).toBeTruthy();
+    fireEvent.click(screen.getByText('delete-confirm'));
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+  }, 20_000);
+
+  it('keeps Safari viewport height bounded and corrects it on visual viewport scrolling', async () => {
+    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const originalClientHeight = Object.getOwnPropertyDescriptor(document.documentElement, 'clientHeight');
+    const visualViewport = new EventTarget() as EventTarget & {
+      height: number;
+      offsetTop: number;
+    };
+    visualViewport.height = 1_100;
+    visualViewport.offsetTop = 0;
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    Object.defineProperty(window, 'innerHeight', {
+      configurable: true,
+      value: 800,
+    });
+    Object.defineProperty(document.documentElement, 'clientHeight', {
+      configurable: true,
+      value: 780,
+    });
+
+    let view: ReturnType<typeof render> | null = null;
+    try {
+      const { App } = await importApp();
+      view = render(<App />);
+
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('780px');
+      });
+
+      visualViewport.height = 720;
+      visualViewport.dispatchEvent(new Event('scroll'));
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('720px');
+      });
+    } finally {
+      view?.unmount();
+      document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.style.removeProperty('--kbh');
+      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
+      else Reflect.deleteProperty(window, 'visualViewport');
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+      if (originalClientHeight) {
+        Object.defineProperty(document.documentElement, 'clientHeight', originalClientHeight);
+      } else {
+        Reflect.deleteProperty(document.documentElement, 'clientHeight');
+      }
+    }
+  }, 20_000);
+
+  it('keeps .kb-open and .input-focused active across Android adjustResize without double-lifting --kbh', async () => {
+    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const originalClientHeight = Object.getOwnPropertyDescriptor(document.documentElement, 'clientHeight');
+    const visualViewport = new EventTarget() as EventTarget & {
+      height: number;
+      offsetTop: number;
+    };
+    visualViewport.height = 900;
+    visualViewport.offsetTop = 0;
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: visualViewport });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 });
+    Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 900 });
+
+    const focusProbe = document.createElement('input');
+    document.body.appendChild(focusProbe);
+
+    let view: ReturnType<typeof render> | null = null;
+    try {
+      const { App } = await importApp();
+      view = render(<App />);
+
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('900px');
+      });
+
+      focusProbe.focus();
+      fireEvent.focusIn(focusProbe);
+
+      // Frame 1: visualViewport shrinks transiently before Android adjustResize catches up
+      visualViewport.height = 550;
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.classList.contains('kb-open')).toBe(true);
+        expect(document.documentElement.classList.contains('input-focused')).toBe(true);
+        expect(document.documentElement.style.getPropertyValue('--kbh')).toBe('350px');
+      });
+
+      // Frame 2: Android adjustResize shrinks innerHeight to 550 -> .kb-open stays true, --kbh drops to 0px (no double-lift)
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 550 });
+      Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 550 });
+      window.dispatchEvent(new Event('resize'));
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--kbh')).toBe('0px');
+        expect(document.documentElement.classList.contains('kb-open')).toBe(true);
+        expect(document.documentElement.classList.contains('input-focused')).toBe(true);
+      });
+
+      // Dismiss: both heights return to 900 -> .kb-open and .input-focused clear cleanly
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 });
+      Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 900 });
+      visualViewport.height = 900;
+      window.dispatchEvent(new Event('resize'));
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.classList.contains('kb-open')).toBe(false);
+        expect(document.documentElement.classList.contains('input-focused')).toBe(false);
+      });
+
+      // iOS Safari URL-bar collapse/restore (760/760 -> 810/460 -> 760/760):
+      // --kbh stays 350px while open and .kb-open/.input-focused do not stay stuck open on 760/760 restore.
+      focusProbe.blur();
+      fireEvent.focusOut(focusProbe);
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 760 });
+      Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 760 });
+      visualViewport.height = 760;
+      window.dispatchEvent(new Event('resize'));
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('760px');
+      });
+
+      focusProbe.focus();
+      fireEvent.focusIn(focusProbe);
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 810 });
+      Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 810 });
+      visualViewport.height = 460;
+      window.dispatchEvent(new Event('resize'));
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.classList.contains('kb-open')).toBe(true);
+        expect(document.documentElement.classList.contains('input-focused')).toBe(true);
+        expect(document.documentElement.style.getPropertyValue('--kbh')).toBe('350px');
+      });
+
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 760 });
+      Object.defineProperty(document.documentElement, 'clientHeight', { configurable: true, value: 760 });
+      visualViewport.height = 760;
+      window.dispatchEvent(new Event('resize'));
+      visualViewport.dispatchEvent(new Event('resize'));
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--kbh')).toBe('0px');
+        expect(document.documentElement.classList.contains('kb-open')).toBe(false);
+        expect(document.documentElement.classList.contains('input-focused')).toBe(false);
+      });
+    } finally {
+      view?.unmount();
+      focusProbe.remove();
+      document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
+      document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.style.removeProperty('--kbh');
+      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
+      else Reflect.deleteProperty(window, 'visualViewport');
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+      if (originalClientHeight) {
+        Object.defineProperty(document.documentElement, 'clientHeight', originalClientHeight);
+      } else {
+        Reflect.deleteProperty(document.documentElement, 'clientHeight');
+      }
+    }
+  }, 20_000);
+
   it('renders the login page when session verification fails', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-login-route',
+    );
     apiFetchMock.mockImplementation(async (path: string) => {
       if (path === '/api/auth/user/me') {
         const { ApiError } = await import('../src/api.js');
         throw new ApiError(401, 'expired');
       }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
       return {};
     });
 
@@ -676,7 +1843,740 @@ describe('App shell', () => {
     render(<App />);
 
     expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('remote_desktop.guest.title')).toBeNull();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/auth/user/me');
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-login-route',
+    );
+    // A 401 mount verification with no prior local auth state at all is the
+    // normal state of every ordinary logged-out visitor -- it must NOT be
+    // mistaken for a login that just completed and didn't stick, so no
+    // session-not-stuck message should ever appear here.
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('never shows a session-not-stuck message on a first cold-start reload for a visitor who never logged in', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('never shows a session-not-stuck message on a second consecutive reload for a visitor who never logged in', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('shows the session-not-stuck message once when a just-completed login does not survive reload', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('login.session_not_stuck')).toBeTruthy();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('shows the session-not-stuck message right away, not one reload late, when a stale local auth record also needs clearing', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // The flag must be consumed and the message shown in this same mount --
+    // not swallowed by the stale-`auth` clearAuthState branch and left to
+    // surface only on a later reload.
+    expect(await screen.findByText('login.session_not_stuck')).toBeTruthy();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('does not show the session-not-stuck message when a just-completed login does survive reload', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        return { id: 'user-1', username: 'alice' };
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(screen.queryByText('login-page')).toBeNull());
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('keeps and restores an explicit shared tab across an expired-auth login boundary', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let sessionVerificationExpired = true;
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        if (sessionVerificationExpired) {
+          sessionVerificationExpired = false;
+          const { ApiError } = await import('../src/api.js');
+          throw new ApiError(401, 'expired');
+        }
+        return { id: 'user-1' };
+      }
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue(
+      sharedMainOpenResult('share-after-login', 'dispatch-after-login'),
+    );
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+
+    fireEvent.click(login);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain',
+    });
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
+  it('ignores a stale logged-out mount verification failure after a fresh login', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-login-race',
+    );
+    let rejectInitialVerification!: (reason: unknown) => void;
+    const initialVerification = new Promise<never>((_resolve, reject) => {
+      rejectInitialVerification = reject;
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return initialVerification;
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue(
+      sharedMainOpenResult('share-login-race', 'dispatch-login-race'),
+    );
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+    fireEvent.click(login);
+
+    const { ApiError } = await import('../src/api.js');
+    await act(async () => {
+      rejectInitialVerification(new ApiError(401, 'stale logged-out verification'));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({ userId: 'user-1' });
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-login-race',
+    );
+  }, 20_000);
+
+  it('lets an explicit Web login claim authority before a stale mount verification succeeds', async () => {
+    let resolveInitialVerification!: (value: { id: string }) => void;
+    const initialVerification = new Promise<{ id: string }>((resolve) => {
+      resolveInitialVerification = resolve;
+    });
+    let resolveWebLogin!: () => void;
+    loginAttemptState.mode = 'web';
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveWebLogin = resolve;
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return initialVerification;
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+
+    // The user-auth attempt claims a new generation synchronously. The older
+    // mount verifier must not install its previous-cookie identity even if it
+    // resolves before the explicit Web login finishes and reloads.
+    await act(async () => {
+      resolveInitialVerification({ id: 'stale-cookie-user' });
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(loginAttemptState.webReloads).toBe(0);
+
+    await act(async () => {
+      resolveWebLogin();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(loginAttemptState.webReloads).toBe(1));
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+  }, 20_000);
+
+  it('drops a mount verification success that arrives after auth cleanup starts', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let resolveVerification!: (value: { id: string }) => void;
+    const verification = new Promise<{ id: string }>((resolve) => {
+      resolveVerification = resolve;
+    });
+    let resolveCredentialCleanup!: () => void;
+    let resolveKeyIdCleanup!: () => void;
+    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveCredentialCleanup = resolve;
+    }));
+    clearAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveKeyIdCleanup = resolve;
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return verification;
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+
+    act(() => authExpiredState.handler?.('expire while mount verification is pending'));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveVerification({ id: 'stale-success-user' });
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+
+    await act(async () => {
+      resolveCredentialCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith('http://localhost'));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveKeyIdCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('waits for an invalidated in-flight LoginPage attempt before deleting old credentials', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return new Promise(() => {});
+      return {};
+    });
+    let resolveLoginAttempt!: () => void;
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveLoginAttempt = resolve;
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+
+    act(() => authExpiredState.handler?.('cleanup during active login attempt'));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLoginAttempt();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('keeps login gated until overlapping auth cleanups finish out of order', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let resolveFirstCleanup!: () => void;
+    let resolveSecondCleanup!: () => void;
+    clearAuthKeyMock
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        resolveFirstCleanup = resolve;
+      }))
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        resolveSecondCleanup = resolve;
+      }));
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+    act(() => {
+      authExpiredState.handler?.('first overlapping cleanup');
+      authExpiredState.handler?.('second overlapping cleanup');
+    });
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveSecondCleanup();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+
+    await act(async () => {
+      resolveFirstCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(clearAuthKeyIdMock).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it('waits for an active native login and preserves its credentials before changing server', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    let resolveLoginAttempt!: () => void;
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveLoginAttempt = resolve;
+    });
+    let resolveServerCleanup!: () => void;
+    clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveServerCleanup = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+    fireEvent.click(screen.getByRole('button', { name: 'change-server' }));
+
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+    expect(clearServerUrlMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLoginAttempt();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalledTimes(1));
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveServerCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('server-setup-page')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+  }, 20_000);
+
+  it('keeps authenticated native server switching gated through server cleanup', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'https://old-server.example',
+    }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    let resolveServerCleanup!: () => void;
+    clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveServerCleanup = resolve;
+    }));
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(initializeServerScopedAuthMock).toHaveBeenCalledWith(
+        'https://old-server.example',
+      ));
+      await waitFor(() => expect(document.querySelector('.mobile-server-btn')).toBeTruthy());
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('⇄ Switch Cloud Server'));
+
+      await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalledTimes(1));
+      expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+      expect(localStorage.getItem('rcc_auth')).toBeNull();
+      expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        resolveServerCleanup();
+        await Promise.resolve();
+      });
+      expect(await screen.findByText('server-setup-page')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: originalUserAgent,
+      });
+    }
+  }, 20_000);
+
+  it('restores the selected native Cloud Server with its isolated saved session', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    getAuthKeyMock.mockImplementation(async (serverUrl?: string) => (
+      serverUrl === 'https://new-server.example' ? 'new-server-key' : null
+    ));
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'old-user',
+      baseUrl: 'https://old-server.example',
+    }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const activeKey = configureApiKeyMock.mock.calls.at(-1)?.[0];
+        return { id: activeKey === 'new-server-key' ? 'new-user' : 'old-user' };
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(document.querySelector('.mobile-server-btn')).toBeTruthy());
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('⇄ Switch Cloud Server'));
+      const setup = await screen.findByRole('button', { name: 'server-setup-page' });
+
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+      fireEvent.click(setup);
+
+      await waitFor(() => expect(getAuthKeyMock).toHaveBeenCalledWith('https://new-server.example'));
+      await waitFor(() => expect(configureApiKeyMock).toHaveBeenCalledWith('new-server-key'));
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toEqual({
+          userId: 'new-user',
+          baseUrl: 'https://new-server.example',
+        });
+      });
+      expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+      expect(apiFetchMock).not.toHaveBeenCalledWith(
+        expect.stringContaining('/api/auth/user/me/keys/'),
+        expect.anything(),
+      );
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: originalUserAgent,
+      });
+    }
+  }, 20_000);
+
+  it('deletes only the selected Cloud Server credential after an authoritative restore 401', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue(null);
+    getAuthKeyMock.mockImplementation(async (serverUrl?: string) => (
+      serverUrl === 'https://new-server.example' ? 'expired-server-key' : null
+    ));
+    const { ApiError } = await import('../src/api.js');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me' && configureApiKeyMock.mock.calls.at(-1)?.[0] === 'expired-server-key') {
+        // Match the production Bearer flow: apiFetch announces expiry before
+        // its rejected Promise reaches connectNativeServer's catch block.
+        authExpiredState.handler?.('selected server credential expired');
+        throw new ApiError(401, 'session_expired');
+      }
+      if (path === '/api/auth/user/me') return new Promise(() => {});
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const setup = await screen.findByRole('button', { name: 'server-setup-page' });
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+    fireEvent.click(setup);
+
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledWith('https://new-server.example'));
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith('https://new-server.example'));
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('revokes and deletes only the active Cloud Server credential on explicit logout', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://active-server.example');
+    getAuthKeyIdMock.mockResolvedValue('active-key-id');
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'active-user',
+      baseUrl: 'https://active-server.example',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'active-user' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click(await screen.findByText('Log Out'));
+
+    await waitFor(() => expect(getAuthKeyIdMock).toHaveBeenCalledWith(
+      'https://active-server.example',
+    ));
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/auth/user/me/keys/active-key-id',
+      { method: 'DELETE' },
+    ));
+    expect(clearAuthKeyMock).toHaveBeenCalledWith('https://active-server.example');
+    expect(clearAuthKeyIdMock).toHaveBeenCalledWith('https://active-server.example');
+    expect(clearAuthKeyMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+  }, 20_000);
+
+  it('clears stale shared session authority until re-open succeeds after auth expiry', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-auth-expiry',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+
+    let resolveReauthorizedOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock
+      .mockResolvedValueOnce(sharedMainOpenResult('share-auth-expiry', 'dispatch-old-identity'))
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveReauthorizedOpen = resolve;
+      }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const oldPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(oldPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-old-identity');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    expect(authExpiredState.handler).not.toBeNull();
+
+    act(() => authExpiredState.handler?.('expired during shared session'));
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-auth-expiry',
+    );
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    loginState.userId = 'user-2';
+    fireEvent.click(login);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    await act(async () => {
+      resolveReauthorizedOpen(sharedMainOpenResult('share-auth-expiry', 'dispatch-new-identity'));
+      await Promise.resolve();
+    });
+
+    const newPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(newPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-new-identity');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({ userId: 'user-2' });
+  }, 20_000);
+
+  it('discards a shared open response that settles after its auth generation expires', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-stale-open',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    let resolveOldOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    let resolveCredentialCleanup!: () => void;
+    let resolveKeyIdCleanup!: () => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOldOpen = resolve;
+    }));
+    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveCredentialCleanup = resolve;
+    }));
+    clearAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveKeyIdCleanup = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(authExpiredState.handler).not.toBeNull();
+    act(() => authExpiredState.handler?.('expired with open in flight'));
+    // clearAuthState is still blocked on credential I/O. The generation fence
+    // and old-authority UI revocation must already be effective synchronously,
+    // while fresh login stays unavailable until the unconditional deletion ends.
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+
+    await act(async () => {
+      resolveOldOpen(sharedMainOpenResult('share-stale-open', 'dispatch-must-not-render'));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-stale-open',
+    );
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    await act(async () => {
+      resolveCredentialCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith(
+      expect.stringContaining('http://localhost'),
+    ));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+
+    await act(async () => {
+      resolveKeyIdCleanup();
+      await Promise.resolve();
+    });
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(screen.queryByTestId('auth-credential-cleanup-gate')).toBeNull();
+    fireEvent.click(login);
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({
+        userId: 'user-1',
+      });
+    });
+    expect(clearAuthKeyMock).toHaveBeenCalledTimes(1);
+    expect(clearAuthKeyIdMock).toHaveBeenCalledTimes(1);
   }, 20_000);
 
   it('loads servers and renders the dashboard when no server is selected', async () => {
@@ -694,6 +2594,107 @@ describe('App shell', () => {
     expect(fetchMeMock).toHaveBeenCalled();
   }, 20_000);
 
+  it('lets a mobile admin open navigation and the admin page without an associated server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [] };
+        return {};
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'sidebar.expand' }));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      expect(screen.queryByTitle('sharedContext.management.title')).toBeNull();
+      expect(screen.queryByTitle('Server bar')).toBeNull();
+      expect(screen.queryByTitle('Session tabs')).toBeNull();
+      expect(screen.queryByText('session-tree')).toBeNull();
+      fireEvent.click(screen.getByTitle('admin.title'));
+
+      expect(await screen.findByText('admin-page')).toBeTruthy();
+      const overlay = screen.getByTestId('admin-page-overlay');
+      expect(overlay.style.display).toBe('flex');
+      expect(overlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
+      expect(overlay.style.overflow).toBe('hidden');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('lets a mobile user with no owned server open a shared session from the main shell', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const sharedEntry = {
+      id: 'share-zero-owned',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      target: { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      targetLabel: 'Shared Beta',
+    };
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [] };
+        return {};
+      });
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+      openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-zero-owned', 'dispatch-zero-owned'));
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      await waitFor(() => expect(screen.getByTestId('dashboard-shared-count').textContent).toBe('1'));
+      fireEvent.click(screen.getByRole('button', { name: 'sidebar.expand' }));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      ensureMobileSidebarServerListExpanded(view.container);
+      expect(view.container.querySelector('.mobile-sidebar-body')?.scrollHeight).toBeGreaterThanOrEqual(0);
+      fireEvent.click(screen.getByText('Shared Beta'));
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+      expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+      expect(screen.queryByText('dashboard-page')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('keeps the admin entry in mobile navigation when a server is selected', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      expect(screen.getByTitle('admin.title')).toBeTruthy();
+      expect(screen.getByTitle('sharedContext.management.title')).toBeTruthy();
+      expect(screen.getByText('session-tree')).toBeTruthy();
+      fireEvent.click(screen.getByTitle('admin.title'));
+      expect(await screen.findByText('admin-page')).toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('connects the selected server, merges session_list, and renders the session shell', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -708,8 +2709,2375 @@ describe('App shell', () => {
     expect(await screen.findByText('session-tabs')).toBeTruthy();
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
+    expect(screen.getByRole('button', { name: 'sharedContext.management.title' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'sharedContext.diagnostics.title' })).toBeNull();
     expect(ws.connect).toHaveBeenCalled();
+    expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
+    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    expect(await screen.findByText('featureAnnouncements.cloudDocs')).toBeTruthy();
+    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
   }, 20_000);
+
+  it('falls back to the first navigable tab when a saved server tab was removed', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_removed_brain');
+    localStorage.setItem('rcc_session', 'deck_removed_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            sessionList().sessions[0],
+            {
+              ...sessionList().sessions[0],
+              name: 'deck_disabled_w1',
+              role: 'worker',
+              state: 'stopped',
+            },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_removed_brain')).toBeNull();
+    // The fallback is shown but NOT recorded as the user's last tab: the memory
+    // of what they really had open stays, so it is restored if that tab returns.
+    expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_removed_brain');
+    expect(window.location.hash).toContain('/srv-1/deck_alpha_brain');
+  }, 20_000);
+
+  it.each([true, false])('defaults fresh and legacy collapsed=%s desktop sessions to left vertical button rail on the left of main', async (legacyExpanded) => {
+    if (legacyExpanded) {
+      localStorage.setItem('subsession_bar_collapsed', 'false');
+      localStorage.setItem('rcc_subcard_collapsed_default_v2', '1');
+    }
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.loadedServerId = 'srv-1';
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_1',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper 1',
+      type: 'codex-sdk',
+      state: 'idle',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    const { App } = await importApp();
+    render(<App />);
+    const bar = await screen.findByTestId('app-shell-subsession-bar');
+    const host = await screen.findByTestId('subsession-vertical-rail-host');
+    expect(host.classList.contains('subsession-vertical-rail-host-left')).toBe(true);
+    expect(host.dataset.dockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT);
+    const layout = host.parentElement!;
+    const children = Array.from(layout.children);
+    expect(children.indexOf(host)).toBeLessThan(children.indexOf(layout.querySelector('.main')!));
+    expect(bar.dataset.desktopLayout).toBe(SUBSESSION_DESKTOP_LAYOUT.VERTICAL);
+    expect(bar.dataset.desktopDockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT);
+    expect(bar.dataset.collapsed).toBe(String(!legacyExpanded));
+    expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBeNull();
+  }, 20_000);
+
+  it('preserves explicit horizontal/right overrides, persists both dock sides, and keeps each as a root flex child', async () => {
+    localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL }));
+    localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT }));
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.loadedServerId = 'srv-1';
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_1',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper 1',
+      type: 'codex-sdk',
+      state: 'idle',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    const toggle = await screen.findByTestId('app-shell-subsession-layout-toggle');
+    expect(screen.getByTestId('app-shell-subsession-bar').dataset.desktopLayout).toBe('horizontal');
+
+    fireEvent.click(toggle);
+
+    let host = await screen.findByTestId('subsession-vertical-rail-host');
+    expect(await screen.findByTestId('app-shell-subsession-vertical-rail')).toBeTruthy();
+    let layout = host.parentElement!;
+    let children = Array.from(layout.children);
+    expect(host.dataset.dockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT);
+    expect(children.indexOf(layout.querySelector('.main')!)).toBeLessThan(children.indexOf(host));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+    });
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT });
+
+    fireEvent.click(screen.getByTestId('app-shell-subsession-dock-left'));
+    await waitFor(() => expect(screen.getByTestId('subsession-vertical-rail-host').dataset.dockSide)
+      .toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT));
+    host = screen.getByTestId('subsession-vertical-rail-host');
+    layout = host.parentElement!;
+    children = Array.from(layout.children);
+    expect(children.indexOf(screen.getByTestId('sidebar-panel'))).toBeLessThan(children.indexOf(host));
+    expect(children.indexOf(host)).toBeLessThan(children.indexOf(layout.querySelector('.main')!));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      side: SUBSESSION_DESKTOP_DOCK_SIDE.LEFT,
+    });
+
+    view.unmount();
+    render(<App />);
+    host = await screen.findByTestId('subsession-vertical-rail-host');
+    expect(host.dataset.dockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT);
+    expect(screen.getByTestId('app-shell-subsession-bar').dataset.desktopLayout).toBe('vertical');
+
+    fireEvent.click(screen.getByTestId('app-shell-subsession-dock-right'));
+    await waitFor(() => expect(screen.getByTestId('subsession-vertical-rail-host').dataset.dockSide)
+      .toBe(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT));
+    host = screen.getByTestId('subsession-vertical-rail-host');
+    layout = host.parentElement!;
+    children = Array.from(layout.children);
+    expect(children.indexOf(layout.querySelector('.main')!)).toBeLessThan(children.indexOf(host));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT,
+    });
+  }, 20_000);
+
+  it('defaults Team discussions right at low height, then preserves a manual bottom choice', async () => {
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 640 });
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+      await act(async () => {
+        ws.emit({
+          type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+          run: {
+            id: 'run-team-rail',
+            status: 'running',
+            current_round: 1,
+            total_rounds: 2,
+            total_hops: 2,
+            active_phase: 'hop',
+            initiator_session: 'deck_alpha_brain',
+          },
+        });
+      });
+
+      let host = await screen.findByTestId('team-discussion-rail-host');
+      expect(await screen.findByTestId('app-shell-team-discussion-rail')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.RIGHT);
+      expect(localStorage.getItem(TEAM_DISCUSSION_LAYOUT_STORAGE_KEY)).toBeNull();
+      const layout = host.parentElement!;
+      expect(Array.from(layout.children).indexOf(layout.querySelector('.main')!))
+        .toBeLessThan(Array.from(layout.children).indexOf(host));
+
+      fireEvent.click(screen.getByTestId('app-shell-team-discussion-bottom'));
+      await waitFor(() => expect(screen.queryByTestId('team-discussion-rail-host')).toBeNull());
+      expect(JSON.parse(localStorage.getItem(TEAM_DISCUSSION_LAYOUT_STORAGE_KEY)!)).toEqual({
+        version: 1,
+        layout: TEAM_DISCUSSION_LAYOUT.BOTTOM,
+      });
+
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 500 });
+      window.dispatchEvent(new Event('resize'));
+      await waitFor(() => expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.BOTTOM));
+
+      view.unmount();
+      render(<App />);
+      const refreshedWs = await getActiveWsClient();
+      await act(async () => {
+        refreshedWs.emit({
+          type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+          run: {
+            id: 'run-team-rail-refresh',
+            status: 'running',
+            current_round: 1,
+            total_rounds: 1,
+            total_hops: 1,
+            initiator_session: 'deck_alpha_brain',
+          },
+        });
+      });
+      await screen.findByTestId('app-shell-p2p-discussion-p2p_run-team-rail-refresh');
+      expect(screen.queryByTestId('team-discussion-rail-host')).toBeNull();
+      expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.BOTTOM);
+    } finally {
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+    }
+  }, 20_000);
+
+  it.each([true, false])('keeps desktop preferences untouched while mobile uses its original layout (custom=%s)', async (custom) => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const saved = JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL });
+    const savedDockSide = JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT });
+    if (custom) {
+      localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, saved);
+      localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, savedDockSide);
+    }
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      await screen.findByTestId('app-shell-subsession-bar');
+
+      expect(screen.queryByTestId('app-shell-subsession-layout-toggle')).toBeNull();
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBe(custom ? saved : null);
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBe(custom ? savedDockSide : null);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('restores the task panel open state, persists close across refreshes, and retires the toolbar toggle button', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      open: true,
+      width: 584,
+    }));
+
+    const { App } = await importApp();
+    const first = render(<App />);
+
+    expect(await screen.findByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
+    const close = screen.getByRole('button', { name: 'common.close' });
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'supervision_task_console.title' })).toBeNull());
+    expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).open).toBe(false);
+
+    first.unmount();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+    expect(screen.queryByRole('complementary', { name: 'supervision_task_console.title' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
+  }, 20_000);
+
+  it('opens the session named by an all-pins navigation request', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    await waitFor(() => expect(view.container.textContent).toContain('session-pane:deck_alpha_brain'));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-beta',
+      serverId: 'srv-1',
+      sessionName: 'deck_beta_brain',
+      eventId: 'event-beta',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in Beta',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    await waitFor(() => expect(view.container.textContent).toContain('session-pane:deck_beta_brain'));
+  }, 20_000);
+
+  it('opens the sub-session window named by an all-pins navigation request', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-sub',
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_alpha_helper',
+      eventId: 'event-sub',
+      eventTs: 123,
+      eventType: 'user.message',
+      text: 'Pinned in Helper',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+  }, 20_000);
+
+  it('writes a confirmed model projection into sub-session local state', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-model',
+      sessionName: 'deck_sub_model_worker',
+      parentSession: 'deck_alpha_brain',
+      label: 'Model Worker',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      requestedModel: 'gpt-5.4',
+      activeModel: 'gpt-5.4',
+      modelDisplay: 'gpt-5.4',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    fireEvent.click(screen.getByText('subbar-open-sub-model'));
+    fireEvent.click(await screen.findByText('sub-window-settings-sub-model'));
+    const dialog = await screen.findByTestId('session-settings-dialog');
+    expect(dialog.getAttribute('data-requested-model')).toBe('gpt-5.4');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'settings-model-confirmed' }));
+
+    expect(updateSubLocalMock).toHaveBeenCalledWith('sub-model', expect.objectContaining({
+      requestedModel: 'gpt-5.6',
+      activeModel: 'gpt-5.6',
+      modelDisplay: 'gpt-5.6',
+    }));
+  }, 20_000);
+
+  it('clears the old main and sub-session active model as soon as a provider save succeeds', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-model', sessionName: 'deck_sub_model_worker', parentSession: 'deck_alpha_brain',
+      label: 'Model Worker', description: '', cwd: '/work/alpha', type: 'codex-sdk',
+      runtimeType: 'transport', requestedModel: 'gpt-5.4', activeModel: 'gpt-5.4',
+      modelDisplay: 'gpt-5.4', state: 'idle', serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    const { App } = await importApp();
+    render(<App />);
+    const ws = await getActiveWsClient();
+    await act(async () => ws.emit({
+      type: 'session_list', sessions: [{ ...sessionList().sessions[0], agentType: 'codex-sdk',
+        project: 'Alpha', activeModel: 'gpt-5.4', requestedModel: 'gpt-5.4', modelDisplay: 'gpt-5.4' }],
+    }));
+    const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(pane.getAttribute('data-active-model')).toBe('gpt-5.4');
+    fireEvent.click(within(pane).getByRole('button', { name: 'pane-settings' }));
+    fireEvent.click(within(await screen.findByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-provider-switched' }));
+    await waitFor(() => expect(pane.getAttribute('data-requested-model')).toBe('gemini-3.8-flash-high'));
+    expect(pane.getAttribute('data-active-model')).toBe('');
+    expect(pane.getAttribute('data-model-display')).toBe('');
+    fireEvent.click(within(screen.getByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-close' }));
+    fireEvent.click(screen.getByText('subbar-open-sub-model'));
+    fireEvent.click(await screen.findByText('sub-window-settings-sub-model'));
+    fireEvent.click(within(await screen.findByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-provider-switched' }));
+    expect(updateSubLocalMock).toHaveBeenCalledWith('sub-model', expect.objectContaining({
+      requestedModel: 'gemini-3.8-flash-high', activeModel: null, modelDisplay: null,
+    }));
+  }, 20_000);
+
+  it('fronts an already-open sub-session selected from another window pin list', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    const first = await screen.findByTestId('sub-session-window-sub-1');
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    const second = await screen.findByTestId('sub-session-window-sub-2');
+    await waitFor(() => expect(second.getAttribute('data-active')).toBe('true'));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-sub-front',
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_alpha_helper',
+      eventId: 'event-sub-front',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in the background helper window',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    await waitFor(() => {
+      const firstNow = screen.getByTestId('sub-session-window-sub-1');
+      const secondNow = screen.getByTestId('sub-session-window-sub-2');
+      expect(firstNow.getAttribute('data-active')).toBe('true');
+      expect(secondNow.getAttribute('data-active')).toBe('false');
+      expect(Number((firstNow as HTMLElement).style.zIndex)).toBeGreaterThan(Number((secondNow as HTMLElement).style.zIndex));
+    });
+  }, 20_000);
+
+  it('hides the source sub-session when its pin list navigates to a main session', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+    fireEvent.click(screen.getByText('pane-chat-ref'));
+    chatScrollMock.mockClear();
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-main-from-sub',
+      serverId: 'srv-1',
+      sessionName: 'deck_alpha_brain',
+      eventId: 'event-main-from-sub',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in the parent main session',
+      createdAt: 123,
+      updatedAt: 123,
+    }, 'deck_sub_alpha_helper'));
+
+    await waitFor(() => {
+      const hiddenSource = screen.getByTestId('sub-session-window-sub-1');
+      expect(hiddenSource.getAttribute('data-visible')).toBe('false');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      expect(chatScrollMock).not.toHaveBeenCalled();
+    });
+  }, 20_000);
+
+  it('opens controlled-node management above sub-session windows and re-fronts it from the sidebar', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+    fireEvent.click(await screen.findByText('controlled_nodes.title'));
+
+    const panel = await screen.findByTestId('floating-panel-controlled-nodes');
+    expect(panel.textContent).toContain('controlled-nodes-panel');
+    const panelZ = () => Number((panel as HTMLElement).style.zIndex);
+    const subZ = () => Number((subWindow as HTMLElement).style.zIndex);
+
+    await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.mouseDown(subWindow);
+    await waitFor(() => expect(subZ()).toBeGreaterThan(panelZ()));
+
+    fireEvent.click(screen.getByText('controlled_nodes.title'));
+    await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.click(screen.getByText('controlled-nodes-panel'));
+    expect(await screen.findByText('remote-desktop-workspace')).toBeTruthy();
+
+    const closeControlledNodes = Array.from(panel.querySelectorAll('button'))
+      .find((button) => button.textContent === 'floating-close');
+    expect(closeControlledNodes).toBeTruthy();
+    fireEvent.click(closeControlledNodes!);
+    await waitFor(() => expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull());
+    expect(screen.getByText('remote-desktop-workspace')).toBeTruthy();
+    expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
+    fireEvent.click(screen.getByText('remote-desktop-minimize'));
+    expect(await screen.findByText('remote-desktop-minimized:true')).toBeTruthy();
+    fireEvent.click(screen.getByText('remote-desktop-restore'));
+    expect(await screen.findByText('remote-desktop-minimized:false')).toBeTruthy();
+  }, 20_000);
+
+  it('keeps mobile remote desktop workspace above earlier floating surfaces', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(screen.getByText('subbar-discussions'));
+      const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const remoteDesktop = await screen.findByTestId('remote-desktop-workspace');
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        const remoteZ = Number((remoteDesktop as HTMLElement).style.zIndex);
+        expect(remoteZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('keeps mobile remote desktop wall above earlier floating surfaces', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(screen.getByText('subbar-discussions'));
+      const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      const wall = await screen.findByTestId('remote-desktop-wall');
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        const wallZ = Number((wall as HTMLElement).style.zIndex);
+        expect(wallZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('hides mobile chat chrome while remote desktop or wall is the active full-screen surface', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const layout = () => view.container.querySelector('.layout') as HTMLElement;
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+      const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const remoteDesktop = await screen.findByTestId('remote-desktop-workspace');
+
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
+        expect(Number((remoteDesktop as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
+      });
+
+      fireEvent.click(screen.getByText('remote-desktop-minimize'));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('contents');
+      });
+      fireEvent.click(screen.getByText('remote-desktop-restore'));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
+      });
+      fireEvent.click(screen.getByText('remote-desktop-close'));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('contents');
+      });
+
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      const wall = await screen.findByTestId('remote-desktop-wall');
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
+        expect(Number((wall as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
+      });
+      fireEvent.click(screen.getByText('remote-desktop-wall-close'));
+      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+
+      const css = readFileSync(process.cwd().split(/[\\/]/).pop() === 'web' ? 'src/styles.css' : 'web/src/styles.css', 'utf8');
+      expect(css).toMatch(/\.layout-mobile\.layout-mobile-remote-surface-active\s*>\s*\.main\s*{[^}]*display:\s*none/s);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('opens remote control from the sidebar chevron without opening node management', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    const triggers = await screen.findAllByTestId('controlled-node-quick-trigger');
+    expect(triggers.length).toBe(2);
+    fireEvent.click(triggers[0]!);
+    expect(await screen.findByText('remote-desktop-workspace')).toBeTruthy();
+    expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+  }, 20_000);
+
+  it('offers remote control once in the desktop sidebar, beside AI Desk, while retaining the toolbar entry', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    const ws = await getActiveWsClient();
+
+    const toolbar = () => view.container.querySelector('.desktop-view-toggle');
+    await waitFor(() => expect(toolbar()).toBeTruthy());
+    // Nothing claimed yet, so nothing offered.
+    expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+
+    await act(async () => {
+      // An offline daemon offers nothing, so it has to be heard from first.
+      ws.emit({
+        type: 'daemon.stats',
+        daemonVersion: '2026.8.1',
+        cpu: 1, memUsed: 1, memTotal: 2, load1: 0, load5: 0, load15: 0, uptime: 10,
+      });
+      ws.emitDaemonCapabilities([
+        'remote.desktop.windows.installable.v1',
+        'remote.desktop.windows.h264.v2',
+      ]);
+    });
+
+    // The desktop layout has no daemon status bar at all, so without this the
+    // button existed on mobile only.
+    await waitFor(() => expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeTruthy());
+    // Owner request: exactly one remote-desktop button in the sidebar, placed
+    // right after the AI Desk split button (not the old redundant footer one).
+    const sidebarButtons = Array.from(screen.getByTestId('sidebar-panel').querySelectorAll('.daemon-remote-desktop-btn'));
+    expect(sidebarButtons.length).toBe(1);
+    const aiDeskGroup = screen.getByTestId('sidebar-panel').querySelector('.controlled-nodes-shortcut-group');
+    expect(aiDeskGroup).toBeTruthy();
+    expect(aiDeskGroup!.compareDocumentPosition(sidebarButtons[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('keeps remote control out of the mobile sidebar footer while retaining the toolbar entry', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        // The production socket reports its connection asynchronously. The
+        // test double only flips its own field, while the footer is guarded by
+        // App's connection state.
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 28, memUsed: 1, memTotal: 2, load1: 2.78, load5: 0, load15: 0, uptime: 10,
+        });
+        ws.emitDaemonCapabilities([
+          'remote.desktop.windows.installable.v1',
+          'remote.desktop.windows.h264.v2',
+        ]);
+      });
+
+      await waitFor(() => expect(
+        view.container.querySelector('.mobile-server-actions .daemon-remote-desktop-btn'),
+      ).toBeTruthy());
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const footer = await waitFor(() => {
+        const openSidebar = view.container.querySelector('.mobile-sidebar-overlay.open');
+        expect(openSidebar).toBeTruthy();
+        const value = openSidebar?.querySelector('.mobile-sidebar-footer');
+        expect(value).toBeTruthy();
+        return value!;
+      });
+
+      expect(footer.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+      // The far-right watch button is the existing Watch Bridge snapshot sync;
+      // it is not the requested remote-control entry and must remain.
+      await waitFor(() => expect(
+        footer.querySelector('.mobile-sidebar-watch-sync')?.textContent,
+      ).toBe('⌚'));
+      expect(footer.querySelector('.mobile-sidebar-daemon-status')?.textContent).toContain('CPU 28% · Load 2.78');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('keeps the daemon numbers when liveness-only and number-less frames arrive, and shows the busy hint from liveness', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+      const footerStatus = async () => {
+        if (!view.container.querySelector('.mobile-sidebar-overlay.open')) {
+          fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        }
+        return waitFor(() => {
+          const node = view.container.querySelector('.mobile-sidebar-overlay.open .mobile-sidebar-daemon-status');
+          expect(node).toBeTruthy();
+          return node!;
+        });
+      };
+
+      await act(async () => {
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        // Liveness before any full stats: placeholders, never NaN.
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 3, mainEventLoopBlockedMs: 40, mainEventLoopBusy: false });
+      });
+      const early = (await footerStatus()).textContent ?? '';
+      expect(early).toContain('CPU — · Load —');
+      expect(early).not.toContain('NaN');
+
+      await act(async () => {
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 28, memUsed: 1, memTotal: 2, load1: 2.78, load5: 0, load15: 0, uptime: 10,
+        });
+      });
+      await waitFor(async () => expect((await footerStatus()).textContent).toContain('CPU 28% · Load 2.78'));
+
+      // The link worker reports the main thread stuck: the hint appears, the
+      // numbers stay.
+      await act(async () => {
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 5, mainEventLoopBlockedMs: 30_000, mainEventLoopBusy: true });
+      });
+      await waitFor(async () => expect((await footerStatus()).textContent).toContain('CPU 28% · Load 2.78 · Busy 30000ms'));
+
+      // What an older server sent for the same heartbeat: stats with no numbers.
+      await act(async () => {
+        ws.emit({ type: 'daemon.stats', daemonVersion: '2026.9.4508-dev' });
+      });
+      const after = (await footerStatus()).textContent ?? '';
+      expect(after).toContain('CPU 28% · Load 2.78 · Busy 30000ms');
+      expect(after).not.toContain('NaN');
+
+      // Recovery is reported by the next liveness frame.
+      await act(async () => {
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 2, mainEventLoopBlockedMs: 10, mainEventLoopBusy: false });
+      });
+      await waitFor(async () => {
+        const text = (await footerStatus()).textContent ?? '';
+        expect(text).toContain('CPU 28% · Load 2.78');
+        expect(text).not.toContain('Busy');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(true);
+      expect(view.container.querySelector('[title="sharedContext.management.title"]')).toBeTruthy();
+      expect(view.container.querySelector('[title="sharedContext.diagnostics.title"]')).toBeNull();
+      expect(view.container.textContent).not.toContain('DBG');
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });
+      expect(controlledNodesButton.classList.contains('mobile-server-menu-controlled-nodes')).toBe(true);
+      fireEvent.click(controlledNodesButton);
+
+      const panel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(panel.textContent).toContain('controlled-nodes-panel');
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('keeps the final server reachable in a long narrow mobile menu', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    const servers = Array.from({ length: 24 }, (_, index) => ({
+      id: `srv-${index + 1}`,
+      name: index === 0 ? 'Alpha Server' : `Server ${index + 1}`,
+      status: 'online',
+      lastHeartbeatAt: Date.now(),
+      createdAt: Date.now(),
+      daemonVersion: '2026.5.11',
+    }));
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers };
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      const menuPanel = await waitFor(() => {
+        const panel = view.container.querySelector('.mobile-server-menu');
+        expect(panel).toBeTruthy();
+        return panel as HTMLElement;
+      });
+      const menu = within(menuPanel).getByText('Server 24');
+      expect(menuPanel.querySelectorAll('.mobile-server-menu-item')).toHaveLength(26);
+
+      Object.defineProperties(menuPanel, {
+        clientHeight: { configurable: true, value: 228 },
+        scrollHeight: { configurable: true, value: 1_200 },
+      });
+      menuPanel.scrollTop = menuPanel.scrollHeight - menuPanel.clientHeight;
+      fireEvent.scroll(menuPanel);
+      expect(menuPanel.scrollTop + menuPanel.clientHeight).toBe(menuPanel.scrollHeight);
+      expect(menuPanel.contains(menu)).toBe(true);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    ws.requestSessionList.mockClear();
+    await act(async () => {
+      ws.emit({ type: 'daemon.reconnected' });
+    });
+
+    expect(ws.requestSessionList).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
+  it('releases a main session stuck "working" when the daemon answers an append with the stale-turn error (older daemon), and leaves an accepted ack alone', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'running',
+          runtimeType: 'transport',
+        }],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('running');
+    });
+
+    // The new daemon hands a deferred append to the session queue and acks it
+    // as accepted: that must not flip anything.
+    await act(async () => {
+      ws.emit({ type: 'command.ack', commandId: 'append-1', status: 'accepted', session: 'deck_alpha_brain' });
+    });
+    expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('running');
+
+    // An older daemon still answers with the stale-turn error. The browser must
+    // not stay "working" with queued rows behind a turn that is gone.
+    ws.requestSessionList.mockClear();
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        commandId: 'append-2',
+        status: 'error',
+        error: 'The active turn already finished',
+        session: 'deck_alpha_brain',
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('idle');
+    });
+    expect(ws.requestSessionList).toHaveBeenCalled();
+  }, 20_000);
+
+  describe('the last opened tab of each server is restored (per-server memory)', () => {
+    const SERVERS = ['srv-1', 'srv-2'] as const;
+    const SESSIONS: Record<string, string[]> = {
+      'srv-1': ['deck_alpha_brain', 'deck_alpha_notes', 'deck_alpha_review'],
+      'srv-2': ['deck_gamma_brain', 'deck_gamma_ops'],
+    };
+
+    function listFor(serverId: string) {
+      return SESSIONS[serverId].map((name) => ({
+        name,
+        project_name: name.replace(/^deck_/, '').split('_')[0],
+        role: 'brain',
+        agent_type: 'codex-sdk',
+        agent_version: '5.0',
+        state: 'running',
+        project_dir: `/work/${name}`,
+        runtime_type: 'process',
+        label: name,
+        description: 'tab',
+      }));
+    }
+
+    function installApi(overrides: { sessions?: (serverId: string) => Promise<unknown> | undefined } = {}) {
+      apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+        // A real page reload destroys the old document and aborts its requests;
+        // honoring the signal keeps an unmounted instance from acting late.
+        const settle = async <T,>(value: T | Promise<T>): Promise<T> => {
+          const result = await value;
+          if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
+          return result;
+        };
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            ...serverList(),
+            servers: SERVERS.map((id) => ({
+              id, name: `Server ${id}`, status: 'online', lastHeartbeatAt: Date.now(), createdAt: Date.now(), daemonVersion: '2026.5.11',
+            })),
+          };
+        }
+        const match = /^\/api\/server\/([^/]+)\/sessions$/.exec(path);
+        if (match) {
+          const custom = overrides.sessions?.(match[1]!);
+          if (custom) return settle(custom);
+          return settle({ sessions: listFor(match[1]!) });
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+    }
+
+    function seedLogin(serverId: string) {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', serverId);
+    }
+
+    /** A full page reload keeps the URL hash and both storages, and nothing else. */
+    async function reloadApp(App: () => any) {
+      cleanup();
+      wsInstances.length = 0;
+      return render(<App />);
+    }
+
+    /** The one main session the app currently has selected. */
+    const activePaneName = (): string | null => {
+      const active = Array.from(document.querySelectorAll('[data-testid^="session-pane-"][data-is-active="true"]'));
+      expect(active.length).toBeLessThanOrEqual(1);
+      return active[0]?.getAttribute('data-testid')?.replace('session-pane-', '') ?? null;
+    };
+    const expectActive = async (name: string) => {
+      await waitFor(() => expect(activePaneName()).toBe(name));
+    };
+
+    it('switching to another server and back returns to the last opened tab, each server remembering its own', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+
+      // Away to srv-2 (the app reloads into it) and open ITS second tab.
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_gamma_ops'));
+      await expectActive('deck_gamma_ops');
+
+      // Back to srv-1: its last tab, not its first / Brain.
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await reloadApp(App);
+      await expectActive('deck_alpha_notes');
+
+      // And srv-2 still remembers its own.
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_ops');
+    }, 30_000);
+
+    it('a plain reload with no hash returns to the last tab of the remembered server', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_review'));
+      await expectActive('deck_alpha_review');
+
+      history.replaceState(null, '', window.location.pathname);
+      sessionStorage.clear(); // a brand-new browser tab / returning from the background
+      await reloadApp(App);
+
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    it('restores the last tab even when the REST list fails and only the websocket session_list arrives', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      installApi({ sessions: () => Promise.reject(new Error('rest unavailable')) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const ws = wsInstances[0];
+      await act(async () => {
+        ws.emit({
+          type: 'session_list',
+          sessions: listFor('srv-1').map((s) => ({
+            name: s.name, project: s.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+          })),
+        });
+      });
+
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    const wsSessionList = (serverId: string) => ({
+      type: 'session_list',
+      sessions: listFor(serverId).map((row) => ({
+        name: row.name, project: row.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+      })),
+    });
+
+    it('a server-only hash (what a server switch writes) with a failed REST list still restores the tab from the websocket list', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      history.replaceState(null, '', '#/srv-1');
+      installApi({ sessions: () => Promise.reject(new Error('rest unavailable')) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(activePaneName()).toBeNull();
+
+      await act(async () => { wsInstances[0].emit(wsSessionList('srv-1')); });
+
+      await expectActive('deck_alpha_review');
+      // Restoring is not a new choice: the memory is untouched and still correct.
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_review');
+    }, 30_000);
+
+    it('booting into a server before its tab is resolved never erases the remembered tab', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_notes');
+      history.replaceState(null, '', '#/srv-1');
+      let releaseRest!: () => void;
+      const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+      installApi({ sessions: async () => { await restGate; return { sessions: listFor('srv-1') }; } });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // Nothing is selected yet; the memory must survive this window.
+      expect(activePaneName()).toBeNull();
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+
+      await act(async () => { releaseRest(); await Promise.resolve(); });
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('leaving a server with nothing selected keeps what was remembered for it', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_notes');
+      history.replaceState(null, '', '#/srv-1');
+      installApi({ sessions: () => new Promise(() => { /* never resolves: still loading */ }) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      // The daemon reports no tab at all (e.g. it is still starting): nothing to select.
+      await act(async () => { wsInstances[0].emit({ type: 'session_list', sessions: [] }); });
+      expect(activePaneName()).toBeNull();
+
+      fireEvent.click(await screen.findByText('server-select-srv-2'));
+
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+    }, 30_000);
+
+    it('a fallback tab is shown but never recorded as the last tab; the remembered one returns when it exists again', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_gone');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain'); // explicit fallback, no error
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_gone');
+
+      // The tab comes back (e.g. the session was recreated): it is restored.
+      SESSIONS['srv-1'] = ['deck_alpha_brain', 'deck_alpha_gone', 'deck_alpha_review'];
+      try {
+        // Later, in a fresh browser tab (no hash / tab route): the memory decides.
+        history.replaceState(null, '', window.location.pathname);
+        sessionStorage.clear();
+        await reloadApp(App);
+        await expectActive('deck_alpha_gone');
+      } finally {
+        SESSIONS['srv-1'] = ['deck_alpha_brain', 'deck_alpha_notes', 'deck_alpha_review'];
+      }
+    }, 30_000);
+
+    it('migrates an older build\'s single global tab: it becomes the server\'s memory and survives a server switch', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_review'); // all an older build ever stored
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_review');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_review');
+
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_brain');
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await reloadApp(App);
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    it('a global tab left by ANOTHER server is ignored when the server being entered does not have it', async () => {
+      seedLogin('srv-2');
+      localStorage.setItem('rcc_session', 'deck_alpha_review'); // belongs to srv-1
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_gamma_brain');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-2'))).toBeNull(); // the fallback is not remembered
+    }, 30_000);
+
+    it('entering with no server selected returns to the last server and tab instead of the most recently active one', async () => {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      // No rcc_server (e.g. after a re-login): the remembered-tab index knows where the user was.
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_ops');
+      localStorage.setItem('rcc_session_index_v1', JSON.stringify(['srv-2', 'srv-1']));
+      installApi();
+      const baseApi = apiFetchMock.getMockImplementation()!;
+      apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+        if (path.startsWith('/api/watch/sessions')) {
+          const serverId = new URL(path, 'http://x').searchParams.get('serverId');
+          // srv-1 has the freshest activity; srv-2's remembered tab is older.
+          return serverId === 'srv-1'
+            ? { sessions: [{ serverId, sessionName: 'deck_alpha_review', previewUpdatedAt: Date.now() }] }
+            : { sessions: [{ serverId, sessionName: 'deck_gamma_ops', previewUpdatedAt: Date.now() - 86_400_000 }, { serverId, sessionName: 'deck_gamma_brain', previewUpdatedAt: Date.now() - 90_000_000 }] };
+        }
+        return baseApi(path, init);
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_gamma_ops');
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+    }, 30_000);
+
+    it('a tab the user clicked before the late restore finished is not overridden by it', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      let releaseRest!: () => void;
+      const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+      installApi({
+        sessions: async () => { await restGate; return { sessions: listFor('srv-1') }; },
+      });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const ws = wsInstances[0];
+      await act(async () => {
+        ws.emit({
+          type: 'session_list',
+          sessions: listFor('srv-1').map((s) => ({
+            name: s.name, project: s.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+          })),
+        });
+      });
+
+      // The tabs are visible; the user picks one before the REST restore lands.
+      fireEvent.click(await screen.findByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      await act(async () => { releaseRest(); await Promise.resolve(); });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(activePaneName()).toBe('deck_alpha_notes');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+    }, 30_000);
+
+    it('switches owned servers in-app without reloading, preserves loading spinner while sessions load, and restores each server tab', async () => {
+      seedLogin('srv-1');
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      expect(wsInstances.length).toBe(1);
+
+      // Switch to srv-2 in-app (no reloadApp): ws1 disconnects, ws2 starts, shell stays interactive, loading spinner shows while srv-2 REST/WS loads
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(wsInstances[0].disconnect).toHaveBeenCalledTimes(1);
+        expect(wsInstances.length).toBe(2);
+      });
+      expect(screen.getByTestId('server-icon-bar')).toBeTruthy();
+      expect(screen.queryByText('common.reconnecting')).toBeNull();
+      expect(activePaneName()).toBeNull();
+      expect(view.container.querySelector('.spinner')).toBeTruthy();
+
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+      expect(view.container.querySelector('.spinner')).toBeNull();
+
+      fireEvent.click(screen.getByText('tabs-select-deck_gamma_ops'));
+      await expectActive('deck_gamma_ops');
+
+      // Switch back to srv-1 in-app -> restores remembered deck_alpha_notes
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await waitFor(() => expect(wsInstances[1].disconnect).toHaveBeenCalledTimes(1));
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('resets subSessions, pendingQuestion, daemonStats, and context menu cleanly across server switch', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      installApi();
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      const ws1 = await getActiveWsClient();
+
+      // Surface server-1 sub-session, ask-question card, daemon stats, and server context menu
+      expect(screen.getByText('subbar-open-sub-1')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu'));
+      expect(screen.getByText('server-context-menu')).toBeTruthy();
+
+      await act(async () => {
+        ws1.emit({
+          type: 'timeline.event',
+          event: {
+            type: 'ask.question',
+            sessionId: 'deck_alpha_brain',
+            payload: {
+              toolUseId: 'q-srv-1',
+              questions: [{ header: 'H1', question: 'Question on srv-1?', options: [] }],
+            },
+          },
+        });
+        ws1.emit({
+          type: DAEMON_STATS_MSG,
+          daemonVersion: '2026.5.99',
+          uptimeSec: 120,
+          cpuPct: 12,
+          memUsedMb: 256,
+          memTotalMb: 1024,
+        });
+      });
+      expect(screen.getByText('Question on srv-1?')).toBeTruthy();
+
+      // Switch to srv-2 while loadedServerId still points to srv-1: old server state must vanish immediately
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => expect(ws1.disconnect).toHaveBeenCalled());
+      expect(screen.queryByText('Question on srv-1?')).toBeNull();
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+      expect(screen.queryByText('subbar-open-sub-1')).toBeNull();
+      expect(view.container.querySelector('.daemon-stats-card')).toBeNull();
+    }, 30_000);
+
+    it('does not render or flash the desktop vertical rail with zero or unsettled sub-sessions across session and server switches', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = null;
+      useSubSessionsState.subSessions = [{
+        id: 'sub-unsettled',
+        sessionName: 'deck_sub_alpha_unsettled',
+        parentSession: 'deck_alpha_brain',
+        label: 'Unsettled Helper',
+        type: 'codex-sdk',
+        state: 'idle',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      let gateSrv2Sessions = false;
+      let releaseSrv2Sessions!: () => void;
+      const srv2SessionsGate = new Promise<void>((resolve) => { releaseSrv2Sessions = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (gateSrv2Sessions && serverId === 'srv-2') await srv2SessionsGate;
+          return { sessions: listFor(serverId) };
+        },
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      // Unsettled server scope (loadedServerId === null) must never render the vertical rail host
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Settling with 0 visible sub-sessions also keeps the vertical rail host unmounted
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [];
+      useSubSessionsState.visibleSubSessions = [];
+      view.rerender(<App />);
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Creating a stable sub-session mounts the vertical rail host cleanly
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      view.rerender(<App />);
+      expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-vertical-rail')).toBeTruthy();
+
+      // Switching sessions on the same server to a session with 0 sub-sessions unmounts the rail immediately
+      useSubSessionsState.visibleSubSessions = [];
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Switching back to deck_alpha_brain mounts it again, then switching to srv-2 never flashes even while loadedServerId is stale/null
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+      await expectActive('deck_alpha_brain');
+      expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+
+      // Switching to srv-2 while sessions API is still pending (activeSession === null) must never flash the rail,
+      // even if listSubSessions resolves first (loadedServerId === 'srv-2' with rawVisibleSubSessions non-empty)
+      gateSrv2Sessions = true;
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      useSubSessionsState.loadedServerId = 'srv-2';
+      view.rerender(<App />);
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      useSubSessionsState.subSessions = [];
+      useSubSessionsState.visibleSubSessions = [];
+      releaseSrv2Sessions();
+      await expectActive('deck_gamma_brain');
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+    }, 30_000);
+
+    it('closes mobile sidebar and mobile server menu immediately when switching servers on mobile', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        seedLogin('srv-1');
+        installApi();
+        const { App } = await importApp();
+        const view = render(<App />);
+
+        await expectActive('deck_alpha_brain');
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        ensureMobileSidebarServerListExpanded(view.container);
+
+        const mobileSrv2 = Array.from(view.container.querySelectorAll('.mobile-sidebar-panel .server-item'))
+          .find((el) => el.textContent?.includes('Server srv-2')) as HTMLElement;
+        expect(mobileSrv2).toBeTruthy();
+        fireEvent.click(mobileSrv2);
+
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+        await expectActive('deck_gamma_brain');
+
+        // Also verify MobileServerMenu closes immediately when selecting srv-1
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        const menuSrv1 = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'))
+          .find((el) => el.textContent?.includes('Server srv-1')) as HTMLElement;
+        fireEvent.click(menuSrv1);
+
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeNull());
+        await expectActive('deck_alpha_brain');
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
+    it('hides mobile sidebar server list by default and persists explicit Server bar toggle across remount', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        seedLogin('srv-1');
+        installApi();
+        const { App } = await importApp();
+
+        // 1. Fresh install (unset mobile_hide_server_bar): server list hidden, button inactive, tab bar unaffected
+        let view = render(<App />);
+        await expectActive('deck_alpha_brain');
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+
+        const getServerBarBtn = () => view.container.querySelector('.mobile-sidebar-header .mobile-sidebar-hdr-btn[title="Server bar"]') as HTMLButtonElement;
+        const getTabBarBtn = () => view.container.querySelector('.mobile-sidebar-header .mobile-sidebar-hdr-btn[title="Session tabs"]') as HTMLButtonElement;
+
+        expect(getServerBarBtn()).toBeTruthy();
+        expect(getServerBarBtn().classList.contains('active')).toBe(false);
+        expect(getServerBarBtn().getAttribute('aria-pressed')).toBe('false');
+        expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item')).toHaveLength(0);
+        expect(getTabBarBtn().classList.contains('active')).toBe(true);
+        expect(screen.getByText('session-tree')).toBeTruthy();
+
+        // 2. Toggle Server bar on -> reveals server list, sets .active, writes '0' to localStorage
+        fireEvent.click(getServerBarBtn());
+        await waitFor(() => expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item').length).toBeGreaterThan(0));
+        expect(getServerBarBtn().classList.contains('active')).toBe(true);
+        expect(getServerBarBtn().getAttribute('aria-pressed')).toBe('true');
+        expect(localStorage.getItem('mobile_hide_server_bar')).toBe('0');
+
+        // 3. Remount / reload -> stays visible because '0' is persisted
+        view.unmount();
+        view = render(<App />);
+        await expectActive('deck_alpha_brain');
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        expect(getServerBarBtn().classList.contains('active')).toBe(true);
+        expect(getServerBarBtn().getAttribute('aria-pressed')).toBe('true');
+        expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item').length).toBeGreaterThan(0);
+
+        // 4. Toggle Server bar off again -> hides server list and writes '1' to localStorage
+        fireEvent.click(getServerBarBtn());
+        await waitFor(() => expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item')).toHaveLength(0));
+        expect(getServerBarBtn().classList.contains('active')).toBe(false);
+        expect(getServerBarBtn().getAttribute('aria-pressed')).toBe('false');
+        expect(localStorage.getItem('mobile_hide_server_bar')).toBe('1');
+
+        // 5. Remount with '1' persisted -> starts hidden
+        view.unmount();
+        view = render(<App />);
+        await expectActive('deck_alpha_brain');
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        expect(getServerBarBtn().classList.contains('active')).toBe(false);
+        expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item')).toHaveLength(0);
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
+    it('handles restricted localStorage errors gracefully when loading or toggling mobile sidebar server list', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      const origGetItem = Storage.prototype.getItem;
+      const origSetItem = Storage.prototype.setItem;
+      try {
+        seedLogin('srv-1');
+        installApi();
+        vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+          if (key === 'mobile_hide_server_bar') throw new DOMException('SecurityError', 'SecurityError');
+          return origGetItem.call(this, key);
+        });
+        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+          if (key === 'mobile_hide_server_bar') throw new DOMException('SecurityError', 'SecurityError');
+          return origSetItem.call(this, key, value);
+        });
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await expectActive('deck_alpha_brain');
+
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        const serverBarBtn = view.container.querySelector('.mobile-sidebar-header .mobile-sidebar-hdr-btn[title="Server bar"]') as HTMLButtonElement;
+        expect(serverBarBtn.classList.contains('active')).toBe(false);
+        expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item')).toHaveLength(0);
+
+        fireEvent.click(serverBarBtn);
+        await waitFor(() => expect(view.container.querySelectorAll('.mobile-sidebar-body .server-item').length).toBeGreaterThan(0));
+        expect(serverBarBtn.classList.contains('active')).toBe(true);
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
+    it('defaults mobile server dropdown to Servers on every open and connects direct remote desktop nodes from the Remote tab', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      const { __resetMachinesForTests } = await import('../src/hooks/useMachines.js');
+      const { REMOTE_DESKTOP_CAPABILITY } = await import('@shared/remote-desktop.js');
+      __resetMachinesForTests();
+      try {
+        seedLogin('srv-1');
+        installApi();
+        const prevImpl = apiFetchMock.getMockImplementation()!;
+        apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+          if (path === '/api/machines') {
+            return {
+              machines: [
+                {
+                  serverId: 'rd-win',
+                  nodeId: '1000000101',
+                  refName: 'win-desk',
+                  displayName: 'Studio Desktop',
+                  os: 'windows',
+                  online: true,
+                  execEnabled: true,
+                  accessRole: 'owner',
+                  capabilities: [REMOTE_DESKTOP_CAPABILITY],
+                },
+                {
+                  serverId: 'rd-off',
+                  nodeId: '1000000102',
+                  refName: 'off-box',
+                  displayName: 'Offline Laptop',
+                  os: 'macos',
+                  online: false,
+                  execEnabled: true,
+                  accessRole: 'owner',
+                  capabilities: [],
+                },
+              ],
+            };
+          }
+          return prevImpl(path, init);
+        });
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await expectActive('deck_alpha_brain');
+
+        // 1. Open menu -> Servers tab active by default, AI Desk on the left, 2 icon-only SVG tabs on the right
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        const serversTab = screen.getByTestId('mobile-menu-tab-servers');
+        const remoteTab = screen.getByTestId('mobile-menu-tab-remote');
+        expect(serversTab.getAttribute('aria-selected')).toBe('true');
+        expect(serversTab.querySelector('svg')).toBeTruthy();
+        expect((serversTab.textContent ?? '').trim()).toBe('');
+        expect(serversTab.getAttribute('aria-label')).toBeTruthy();
+        expect(remoteTab.getAttribute('aria-selected')).toBe('false');
+        expect(remoteTab.querySelector('svg')).toBeTruthy();
+        expect((remoteTab.textContent ?? '').trim()).toBe('');
+        expect(remoteTab.getAttribute('aria-label')).toBeTruthy();
+        expect(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server').length).toBeGreaterThan(0);
+
+        // 2. Switch to Remote tab, close via backdrop, reopen -> MUST reset back to Servers tab
+        fireEvent.click(screen.getByTestId('mobile-menu-tab-remote'));
+        await waitFor(() => expect(screen.getByTestId('mobile-menu-panel-remote')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-remote').getAttribute('aria-selected')).toBe('true');
+
+        fireEvent.click(view.container.querySelector('.mobile-server-backdrop')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeNull());
+
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-servers').getAttribute('aria-selected')).toBe('true');
+        expect(screen.queryByTestId('mobile-menu-panel-remote')).toBeNull();
+
+        // 3. Switch to Remote tab, offline node does nothing, online eligible node opens Remote Desktop & closes dropdown
+        fireEvent.click(screen.getByTestId('mobile-menu-tab-remote'));
+        const offlineNode = await screen.findByTestId('mobile-remote-node-rd-off');
+        expect(offlineNode.getAttribute('aria-disabled')).toBe('true');
+        fireEvent.click(offlineNode);
+        expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+        expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+
+        const onlineNode = await screen.findByTestId('mobile-remote-node-rd-win');
+        expect(onlineNode.getAttribute('aria-disabled')).toBeNull();
+        fireEvent.click(onlineNode);
+        await waitFor(() => expect(screen.getByTestId('remote-desktop-workspace')).toBeTruthy());
+        expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+
+        // 4. Reopening dropdown after closing via node select ALSO resets to Servers tab
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-servers').getAttribute('aria-selected')).toBe('true');
+        expect(screen.getByTestId('mobile-menu-tab-remote').getAttribute('aria-selected')).toBe('false');
+      } finally {
+        __resetMachinesForTests();
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
+    it('ignores delayed REST responses and closing WS events across rapid A -> B -> A switches', async () => {
+      seedLogin('srv-2');
+      let srv1RestCount = 0;
+      let releaseFirstSrv1!: () => void;
+      const firstSrv1Gate = new Promise<void>((resolve) => { releaseFirstSrv1 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-1') {
+            srv1RestCount += 1;
+            if (srv1RestCount === 1) {
+              await firstSrv1Gate;
+              return { sessions: listFor('srv-1').slice(0, 1) };
+            }
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_gamma_brain');
+      const initialWs = wsInstances[0];
+
+      // Rapidly switch B -> A (first srv-1 REST hangs), then back A -> B before first srv-1 resolves
+      fireEvent.click(await screen.findByText('server-select-srv-1'));
+      await waitFor(() => expect(srv1RestCount).toBe(1));
+      const ws1 = wsInstances[1];
+      expect(screen.getByTestId('server-icon-bar')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await expectActive('deck_gamma_brain');
+      const ws2 = wsInstances[2];
+
+      // Closing WS A event firing late cannot inject srv-1 question or sessions into srv-2
+      await act(async () => {
+        initialWs.emit(wsSessionList('srv-2'));
+        ws1.emit({
+          type: 'timeline.event',
+          event: {
+            type: 'ask.question',
+            sessionId: 'deck_alpha_brain',
+            payload: { toolUseId: 'q-stale-ws1', questions: [{ header: 'Stale', question: 'Stale WS1 question?', options: [] }] },
+          },
+        });
+        ws1.emit(wsSessionList('srv-1'));
+      });
+      expect(screen.queryByText('Stale WS1 question?')).toBeNull();
+      expect(activePaneName()).toBe('deck_gamma_brain');
+
+      // Rapidly switch B -> A (second A REST completes with all 3 tabs)
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await expectActive('deck_alpha_brain');
+      expect(screen.getByText('tabs-select-deck_alpha_notes')).toBeTruthy();
+
+      // Late closing WS B event & first A REST settling late must both be ignored
+      await act(async () => {
+        ws2.emit(wsSessionList('srv-2'));
+        releaseFirstSrv1();
+        await Promise.resolve();
+      });
+      expect(screen.queryByText('tabs-select-deck_gamma_brain')).toBeNull();
+      expect(screen.getByText('tabs-select-deck_alpha_notes')).toBeTruthy();
+      expect(activePaneName()).toBe('deck_alpha_brain');
+    }, 30_000);
+
+    it('keeps active session intact on already-active owned server click and clears shared UI when returning from share', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const sharedEntry = {
+        id: 'share-ret-1',
+        serverId: 'srv-shared',
+        serverName: 'Shared Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Shared Beta',
+        target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+      openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(sharedEntry.id, 'dispatch-shared'));
+
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+
+      // Clicking already-active owned srv-1 must NOT wipe activeSession or disconnect WS
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      expect(wsInstances.length).toBe(1);
+      expect(wsInstances[0].disconnect).not.toHaveBeenCalled();
+      expect(activePaneName()).toBe('deck_alpha_notes');
+
+      // Open shared entry -> shows shared pane + shared-return-guide
+      fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+      await expectActive('deck_beta_brain');
+      expect(screen.getByTestId('shared-return-guide')).toBeTruthy();
+
+      // Return to owned server via shared-return-guide button -> clears shared state in-app without reload
+      fireEvent.click(screen.getByTestId('shared-return-guide').querySelector('.shared-return-guide-return')!);
+      expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('isolates server-bound and follow-current pinned panels across server switch without dropping srv-1 pins', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      // Wait for auto-pinned follow-current panels on srv-1
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain')).toBeTruthy();
+        expect(screen.getByTestId('sidebar-pinned-cronmanager:deck_alpha_brain')).toBeTruthy();
+      });
+
+      // Pin repopage, local-web-preview, shared-context-management, and subsession on srv-1
+      fireEvent.click(screen.getByText('subbar-repo'));
+      const repoWin = await screen.findByTestId('floating-panel-repo');
+      fireEvent.click(within(repoWin).getByText('floating-pin'));
+      await waitFor(() => expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeTruthy());
+
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-preview-loopback'));
+      const previewWin = await screen.findByTestId('floating-panel-local-web-preview-srv-1');
+      fireEvent.click(within(previewWin).getByText('floating-pin'));
+      const previewPin = await screen.findByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro');
+      expect(previewPin).toBeTruthy();
+
+      fireEvent.click(screen.getByText('sharedContext.management.title'));
+      const scMgmtWin = await screen.findByTestId('floating-panel-shared-context-management');
+      fireEvent.click(within(scMgmtWin).getByText('floating-pin'));
+      expect(await screen.findByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('sidebar-drop'));
+      expect(await screen.findByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeTruthy();
+
+      // Switch to srv-2 while srv-2 REST is pending: server-bound pins hide, follow-current pins see sessionsLoading=true
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain').getAttribute('data-ctx-server')).toBe('srv-2');
+      });
+      expect(screen.queryByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeNull();
+      expect(screen.queryByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro')).toBeNull();
+      expect(screen.queryByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeNull();
+
+      for (const id of ['filebrowser:deck_alpha_brain', 'repopage:deck_alpha_brain', 'cronmanager:deck_alpha_brain']) {
+        const el = screen.getByTestId(`sidebar-pinned-${id}`);
+        expect(el.getAttribute('data-ctx-server')).toBe('srv-2');
+        expect(el.getAttribute('data-ctx-sessions-loading')).toBe('true');
+        expect(el.getAttribute('data-ctx-active-session')).toBe('');
+        expect(el.getAttribute('data-ctx-sessions-count')).toBe('0');
+      }
+
+      // Release srv-2 REST: follow-current pins bind to srv-2 sessions; server-bound srv-1 pins stay hidden
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+
+      for (const id of ['filebrowser:deck_alpha_brain', 'repopage:deck_alpha_brain', 'cronmanager:deck_alpha_brain']) {
+        const el = screen.getByTestId(`sidebar-pinned-${id}`);
+        expect(el.getAttribute('data-ctx-server')).toBe('srv-2');
+        expect(el.getAttribute('data-ctx-sessions-loading')).toBe('false');
+        expect(el.getAttribute('data-ctx-active-session')).toBe('deck_gamma_brain');
+        expect(el.getAttribute('data-ctx-active-project-dir')).toBe('/work/deck_gamma_brain');
+      }
+
+      // Unpinning repopage on srv-2 opens srv-2's RepoPage (/work/deck_gamma_brain), never srv-1's /work/deck_alpha_brain
+      fireEvent.click(screen.getByTestId('pinned-unpin-repopage:deck_alpha_brain'));
+      await waitFor(() => expect(screen.queryByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeNull());
+      const reopenedRepo = await screen.findByTestId('mock-repo-page');
+      expect(reopenedRepo.getAttribute('data-project-dir')).toBe('/work/deck_gamma_brain');
+      expect(reopenedRepo.getAttribute('data-session-id')).toBe('deck_gamma_brain');
+
+      // Switch back to srv-1 -> srv-1 server-bound pins reappear intact, and reopened srv-2 RepoPage resets
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await expectActive('deck_alpha_brain');
+      expect(screen.queryByTestId('mock-repo-page')).toBeNull();
+      expect(screen.getByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeTruthy();
+      expect(screen.getByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro')).toBeTruthy();
+      expect(screen.getByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeTruthy();
+    }, 30_000);
+
+    it('closes server-scoped overlays and dialogs cleanly when switching servers in-app', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+
+      // Open server-scoped overlays/dialogs on srv-1
+      fireEvent.click(screen.getByText('subbar-repo'));
+      expect(await screen.findByTestId('floating-panel-repo')).toBeTruthy();
+      fireEvent.click(screen.getByText('subbar-cron'));
+      expect(await screen.findByTestId('floating-panel-cron')).toBeTruthy();
+      fireEvent.click(screen.getByText('sharedContext.management.title'));
+      expect(await screen.findByTestId('floating-panel-shared-context-management')).toBeTruthy();
+      fireEvent.click(screen.getByText('tabs-new-session'));
+      expect(await screen.findByText('new-session-dialog')).toBeTruthy();
+      fireEvent.click(screen.getByText('subbar-new'));
+      expect(await screen.findByText('start-sub-session-dialog')).toBeTruthy();
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-preview-loopback'));
+      expect(await screen.findByTestId('local-web-preview')).toBeTruthy();
+
+      // Switch to srv-2 -> all srv-1 overlays/dialogs reset cleanly
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await expectActive('deck_gamma_brain');
+
+      expect(screen.queryByTestId('floating-panel-repo')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-shared-context-management')).toBeNull();
+      expect(screen.queryByText('new-session-dialog')).toBeNull();
+      expect(screen.queryByText('start-sub-session-dialog')).toBeNull();
+      expect(screen.queryByTestId('local-web-preview')).toBeNull();
+    }, 30_000);
+
+    it('never opens stale srv-1 overlays when unpinning follow-current panels during loading or on a non-empty target server without project_dir', async () => {
+      seedLogin('srv-1');
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+            return {
+              sessions: [{
+                name: 'deck_gamma_brain',
+                project_name: 'Gamma',
+                role: 'brain',
+                agent_type: 'codex-sdk',
+                agent_version: '5.0',
+                state: 'running',
+              }],
+            };
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain')).toBeTruthy();
+        expect(screen.getByTestId('sidebar-pinned-cronmanager:deck_alpha_brain')).toBeTruthy();
+      });
+
+      fireEvent.click(screen.getByText('subbar-repo'));
+      const repoWin = await screen.findByTestId('floating-panel-repo');
+      fireEvent.click(within(repoWin).getByText('floating-pin'));
+      await waitFor(() => expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeTruthy());
+
+      // Switch to srv-2 and unpin filebrowser + cronmanager while srv-2 is still loading
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain').getAttribute('data-ctx-sessions-loading')).toBe('true');
+      });
+
+      fireEvent.click(screen.getByTestId('pinned-unpin-filebrowser:deck_alpha_brain'));
+      fireEvent.click(screen.getByTestId('pinned-unpin-cronmanager:deck_alpha_brain'));
+      expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+
+      // Finish loading srv-2 with a non-empty session lacking project_dir -> unpinned windows stay closed and repopage unpin must not fall back to srv-1 /work/deck_alpha_brain
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+      expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+
+      fireEvent.click(screen.getByTestId('pinned-unpin-repopage:deck_alpha_brain'));
+      await waitFor(() => expect(screen.queryByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeNull());
+      expect(screen.queryByTestId('mock-repo-page')).toBeNull();
+    }, 30_000);
+
+    it('cross-server deck:navigate lands on the exact target main tab without page reload even when destination server remembers another tab', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_brain');
+
+      let resolveSrv2!: (value: { sessions: ReturnType<typeof listFor> }) => void;
+      const srv2Promise = new Promise<{ sessions: ReturnType<typeof listFor> }>((resolve) => {
+        resolveSrv2 = resolve;
+      });
+      installApi({
+        sessions: (serverId) => (serverId === 'srv-2' ? srv2Promise : undefined),
+      });
+
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+
+      // Tap push notification targeting srv-2 / deck_gamma_ops (not srv-2's remembered deck_gamma_brain).
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-2', session: 'deck_gamma_ops' },
+        }));
+      });
+
+      await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+      expect(localStorage.getItem('rcc_push_target')).toBeNull();
+
+      // Even if a WS session_list arrives first and REST resolves after, pendingNav must hold deck_gamma_ops.
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      const srv2Ws = wsInstances[wsInstances.length - 1]!;
+      await act(async () => {
+        srv2Ws.emit(wsSessionList('srv-2'));
+      });
+      await expectActive('deck_gamma_ops');
+
+      await act(async () => {
+        resolveSrv2({ sessions: listFor('srv-2') });
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_ops');
+    }, 30_000);
+
+    it('cross-server deck:navigate targeting a sub-session activates parent main tab and opens the sub-session window once loaded', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_brain');
+
+      let resolveSrv2!: (value: { sessions: ReturnType<typeof listFor> }) => void;
+      const srv2Promise = new Promise<{ sessions: ReturnType<typeof listFor> }>((resolve) => {
+        resolveSrv2 = resolve;
+      });
+      installApi({
+        sessions: (serverId) => (serverId === 'srv-2' ? srv2Promise : undefined),
+      });
+
+      const srv2Sub = {
+        id: 'sub-gamma-1',
+        sessionName: 'deck_sub_gamma_1',
+        parentSession: 'deck_gamma_ops',
+        label: 'Gamma Helper',
+        description: 'Helper',
+        cwd: '/work/gamma',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-2',
+      };
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await expectActive('deck_alpha_brain');
+
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-2', session: 'deck_sub_gamma_1' },
+        }));
+      });
+
+      // Destination main sessions load before sub-sessions finish hydrating.
+      await act(async () => {
+        resolveSrv2({ sessions: listFor('srv-2') });
+        await Promise.resolve();
+      });
+      // Remembered tab deck_gamma_brain must NOT steal focus before sub-sessions arrive.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(activePaneName()).not.toBe('deck_gamma_brain');
+
+      // Sub-sessions arrive asynchronously on srv-2.
+      useSubSessionsState.subSessions = [srv2Sub];
+      useSubSessionsState.visibleSubSessions = [srv2Sub];
+      useSubSessionsState.loadedServerId = 'srv-2';
+      view.rerender(<App />);
+
+      await expectActive('deck_gamma_ops');
+      expect(await screen.findByTestId('sub-session-window-sub-gamma-1')).toBeTruthy();
+    }, 30_000);
+
+    it('same-server deck:navigate dismisses Task Mode and Dashboard and activates the target tab', async () => {
+      seedLogin('srv-1');
+      installApi();
+
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+
+      // 1) Task Mode open -> notification brings deck_alpha_review to foreground
+      fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-1', session: 'deck_alpha_review' },
+        }));
+      });
+
+      await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+      await expectActive('deck_alpha_review');
+
+      // 2) Dashboard open -> notification switches back to srv-1 / deck_alpha_notes
+      fireEvent.click(screen.getByText('server-home'));
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-1', session: 'deck_alpha_notes' },
+        }));
+      });
+
+      await waitFor(() => expect(screen.queryByText('dashboard-page')).toBeNull());
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('Task Mode cross-server jump lands on the exact target tab instead of the server remembered tab', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_brain');
+
+      let resolveSrv2!: (value: { sessions: ReturnType<typeof listFor> }) => void;
+      const srv2Promise = new Promise<{ sessions: ReturnType<typeof listFor> }>((resolve) => {
+        resolveSrv2 = resolve;
+      });
+
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            ...serverList(),
+            servers: SERVERS.map((id) => ({
+              id, name: `Server ${id}`, status: 'online', lastHeartbeatAt: Date.now(), createdAt: Date.now(), daemonVersion: '2026.5.11',
+            })),
+          };
+        }
+        if (path === '/api/server/srv-1/sessions') return { sessions: listFor('srv-1') };
+        if (path === '/api/server/srv-2/sessions') return srv2Promise;
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        if (path.startsWith('/api/global-tasks/ws-ticket')) throw new Error('offline');
+        if (path.startsWith('/api/global-tasks')) {
+          return {
+            tasks: [{
+              serverId: 'srv-2',
+              serverName: 'Server srv-2',
+              serverOnline: true,
+              projectName: 'gamma',
+              brainSession: 'deck_gamma_ops',
+              brainLabel: 'Gamma Ops',
+              taskId: 'tsk_jump_1',
+              title: 'Jump to Gamma Ops',
+              status: 'working',
+              flags: [],
+              round: 1,
+              checklist: { total: 1, implemented: 0, audited: 0 },
+              createdAt: 1000,
+              updatedAt: 2000,
+              isTerminal: false,
+              needsAttention: false,
+            }],
+            brains: [],
+            servers: [
+              { id: 'srv-1', name: 'Server srv-1', online: true },
+              { id: 'srv-2', name: 'Server srv-2', online: true },
+            ],
+            ts: 2000,
+          };
+        }
+        return {};
+      });
+
+      const { App } = await importApp();
+      const { globalTaskModeStore } = await import('../src/global-task-mode-store.js');
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+
+      fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      await act(async () => {
+        await globalTaskModeStore.fetchSnapshotHttp();
+      });
+
+      const card = await screen.findByTestId('task-mode-card-tsk_jump_1');
+      fireEvent.click(card);
+      const jumpBtn = await screen.findByTestId('task-mode-jump-tsk_jump_1');
+      fireEvent.click(jumpBtn);
+
+      await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+      await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+
+      await act(async () => {
+        resolveSrv2({ sessions: listFor('srv-2') });
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_ops');
+    }, 30_000);
+
+    it('falls back cleanly when notification targets a deleted session and lets latest rapid notification win', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_brain');
+
+      let resolveSrv2!: (value: { sessions: ReturnType<typeof listFor> }) => void;
+      const srv2Promise = new Promise<{ sessions: ReturnType<typeof listFor> }>((resolve) => {
+        resolveSrv2 = resolve;
+      });
+      installApi({
+        sessions: (serverId) => (serverId === 'srv-2' ? srv2Promise : undefined),
+      });
+
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_review');
+
+      // 1) Deleted session on srv-2 -> clears pendingNav and falls back cleanly to srv-2's remembered tab.
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-2', session: 'deck_gamma_deleted' },
+        }));
+      });
+      await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+      await act(async () => {
+        resolveSrv2({ sessions: listFor('srv-2') });
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+
+      // 2) Rapid back-to-back notifications -> latest wins.
+      let resolveSrv2Second!: (value: { sessions: ReturnType<typeof listFor> }) => void;
+      const srv2SecondPromise = new Promise<{ sessions: ReturnType<typeof listFor> }>((resolve) => {
+        resolveSrv2Second = resolve;
+      });
+      let srv2Fetches = 0;
+      installApi({
+        sessions: (serverId) => {
+          if (serverId !== 'srv-2') return undefined;
+          srv2Fetches += 1;
+          return srv2SecondPromise;
+        },
+      });
+      // Switch back to srv-1 first so we can race srv-2 then srv-1.
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await expectActive('deck_alpha_review');
+
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-2', session: 'deck_gamma_brain' },
+        }));
+        window.dispatchEvent(new CustomEvent('deck:navigate', {
+          detail: { serverId: 'srv-2', session: 'deck_gamma_ops' },
+        }));
+      });
+      await waitFor(() => expect(srv2Fetches).toBeGreaterThanOrEqual(1));
+      await act(async () => {
+        resolveSrv2Second({ sessions: listFor('srv-2') });
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_ops');
+    }, 30_000);
+  });
 
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -749,6 +5117,13 @@ describe('App shell', () => {
     await waitFor(() => expect(wsInstances.length).toBe(1));
     const ws = wsInstances[0];
     expect(await screen.findByText('session-tabs')).toBeTruthy();
+
+    // The production client announces connection asynchronously. The mock's
+    // connect() only flips its own field, so drive the app-level connected
+    // state explicitly before asserting subscription side effects.
+    await act(async () => {
+      ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+    });
 
     await waitFor(() => {
       expect(ws.subscribeTransportSession).toHaveBeenCalledWith('deck_sub_alpha_sdk', { replayHistory: false });
@@ -820,6 +5195,168 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('restores scoped team discussion cards immediately when returning to a main tab before visible sub-sessions refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSub = {
+      id: 'sub-alpha-a1',
+      sessionName: 'deck_sub_alpha_a1',
+      parentSession: 'deck_alpha_brain',
+      label: 'A1',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    const betaSub = {
+      id: 'sub-beta-b1',
+      sessionName: 'deck_sub_beta_b1',
+      parentSession: 'deck_beta_brain',
+      label: 'B1',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [alphaSub, betaSub];
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: {
+          id: 'run-alpha-sub-only',
+          status: 'running',
+          mode_key: 'discuss',
+          current_round: 1,
+          total_rounds: 1,
+          total_hops: 1,
+          active_phase: 'hop',
+          current_target_session: 'deck_sub_alpha_a1',
+          all_nodes: [
+            { label: 'A1', agentType: 'codex-sdk', status: 'running', phase: 'hop' },
+          ],
+        },
+      });
+    });
+    expect(await screen.findByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeTruthy();
+
+    ws.p2pListDiscussions.mockClear();
+    ws.p2pStatus.mockClear();
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeNull();
+    });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_beta_brain' });
+    expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_beta_brain' });
+
+    ws.p2pListDiscussions.mockClear();
+    ws.p2pStatus.mockClear();
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeTruthy();
+    });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
+    expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
+  }, 20_000);
+
+  it('keeps a sub-session fullscreen state scoped to its main tab when switching tabs', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSub = {
+      id: 'sub-alpha-fullscreen',
+      sessionName: 'deck_sub_alpha_fullscreen',
+      parentSession: 'deck_alpha_brain',
+      label: 'Alpha child',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    const betaSub = {
+      id: 'sub-beta-fullscreen',
+      sessionName: 'deck_sub_beta_fullscreen',
+      parentSession: 'deck_beta_brain',
+      label: 'Beta child',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [alphaSub, betaSub];
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(await screen.findByText('subbar-open-sub-alpha-fullscreen'));
+    const alphaWindow = await screen.findByTestId('sub-session-window-sub-alpha-fullscreen');
+    fireEvent.click(screen.getByText('sub-window-toggle-max-sub-alpha-fullscreen'));
+    await waitFor(() => expect(alphaWindow.getAttribute('data-maximized')).toBe('true'));
+    expect(localStorage.getItem('rcc_maximized_subs_srv-1_deck_alpha_brain')).toBe(JSON.stringify(['sub-alpha-fullscreen']));
+
+    localStorage.setItem('rcc_open_subs_deck_beta_brain', JSON.stringify(['sub-beta-fullscreen']));
+    localStorage.setItem('rcc_maximized_subs_srv-1_deck_beta_brain', '{malformed');
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen')).toBeTruthy());
+    expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen').getAttribute('data-maximized')).toBe('false');
+
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-alpha-fullscreen').getAttribute('data-maximized')).toBe('true'));
+    expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen').getAttribute('data-maximized')).toBe('false');
+  }, 20_000);
+
   it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-05-31T12:00:00Z'));
@@ -845,6 +5382,17 @@ describe('App shell', () => {
       expect(wsInstances.some((instance) => instance.reconnectNow.mock.calls.some((call) => call[0] === true))).toBe(true);
 
       const activeWs = wsInstances.find((instance) => instance.reconnectNow.mock.calls.length > 0) ?? ws;
+      const callsBeforeSlowHandshake = activeWs.reconnectNow.mock.calls.length;
+      activeWs.connectionAttemptInFlight = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(activeWs.reconnectNow).toHaveBeenCalledTimes(callsBeforeSlowHandshake);
+      activeWs.connectionAttemptInFlight = false;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(activeWs.reconnectNow.mock.calls.length).toBeGreaterThan(callsBeforeSlowHandshake);
       act(() => {
         activeWs.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
       });
@@ -1090,6 +5638,99 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('restores open sub-session windows from the tab-local hash session after refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    // Simulate another browser tab having most recently written the shared
+    // fallback while this tab remains on Alpha through its own URL hash.
+    localStorage.setItem('rcc_session', 'deck_other_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    localStorage.setItem('rcc_open_subs_deck_other_brain', JSON.stringify(['sub-other']));
+    history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+    expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+    expect(localStorage.getItem('rcc_open_subs_deck_other_brain')).toBe(JSON.stringify(['sub-other']));
+  }, 20_000);
+
+  it('keeps this browser tab on its tab-local server and session when another tab changed the shared fallback', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    // localStorage represents the most recently used route in another browser
+    // tab. This tab's URL is its independent, authoritative navigation state.
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const { writeHashState } = await import('../src/hooks/useHashState.js');
+    writeHashState('srv-2', 'deck_beta_brain');
+    // A reload/navigation boundary may reach the SPA without the hash. The
+    // tab-local snapshot must still beat another page's shared fallback.
+    history.replaceState(null, '', '/');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            ...serverList().servers,
+            {
+              id: 'srv-2',
+              name: 'Beta Server',
+              status: 'online',
+              lastHeartbeatAt: Date.now(),
+              createdAt: Date.now(),
+              daemonVersion: '2026.8.25',
+            },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [{
+            name: 'deck_beta_brain',
+            project_name: 'Beta',
+            role: 'brain',
+            agent_type: 'codex-sdk',
+            state: 'running',
+            project_dir: '/work/beta',
+            runtime_type: 'transport',
+            label: 'Beta Brain',
+          }],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/server/srv-2/sessions',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(window.location.hash).toBe('#/srv-2/deck_beta_brain');
+  }, 20_000);
+
   it('toggles a mobile bottom sub-session button open and closed', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
@@ -1131,6 +5772,82 @@ describe('App shell', () => {
 
       await waitFor(() => {
         expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('activates exactly the mobile window targeted by a notification tap', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+        {
+          id: 'sub-2',
+          sessionName: 'deck_sub_alpha_reviewer',
+          parentSession: 'deck_alpha_brain',
+          label: 'Reviewer',
+          description: 'Reviewer session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+
+      // Start on the second full-screen sub-session overlay.
+      fireEvent.click(screen.getByText('subbar-open-sub-2'));
+      expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+
+      // A notification for the first sub-session must replace, not merely add
+      // to, the mobile open set. Both overlays have the same mobile z-index,
+      // so retaining sub-2 would let DOM order cover the requested target.
+      act(() => window.dispatchEvent(new CustomEvent('deck:navigate', {
+        detail: { serverId: 'srv-1', session: 'deck_sub_alpha_helper' },
+      })));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
+        expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+      });
+
+      // A notification for the parent main chat must also dismiss the mobile
+      // full-screen sub-session overlay so the requested chat is visible.
+      act(() => window.dispatchEvent(new CustomEvent('deck:navigate', {
+        detail: { serverId: 'srv-1', session: 'deck_alpha_brain' },
+      })));
+
+      await waitFor(() => {
+        // Quick collapse intentionally retains the live chat node to avoid a
+        // cold remount, but it must no longer cover the main-session target.
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
         expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
       });
     } finally {
@@ -1572,11 +6289,463 @@ describe('App shell', () => {
     });
 
     fireEvent.click(screen.getByText('ask-submit'));
-    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer', { toolUseId: 'auto-run-1:needs-human:2' });
     expect(screen.queryByText('ask-question-dialog')).toBeNull();
   }, 20_000);
 
-  it('closes all open sub-session windows when clicking the active main session tab', async () => {
+  it('opens AskQuestionDialog and pushes durable notification for raw "Run ask_question" tool.call events', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_sub_alpha_hidden');
+
+    const { App } = await importApp();
+    const { watchProjectionStore } = await import('../src/watch-projection.js');
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          id: 'evt-agy-run-ask',
+          ts: Date.now(),
+          sessionId: 'deck_alpha_brain',
+          type: 'tool.call',
+          payload: {
+            tool: 'Run ask_question',
+            toolCallId: 'tc-agy-live-1',
+            input: {
+              question: 'Select deployment mode?',
+              options: ['Canary', 'Full'],
+            },
+          },
+        },
+      });
+    });
+
+    expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+    expect(screen.getByText('Select deployment mode?')).toBeTruthy();
+    await waitFor(() => {
+      expect(vi.mocked(watchProjectionStore.pushDurableEvent)).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'ask.question',
+        session: 'deck_alpha_brain',
+        serverId: 'srv-1',
+        message: 'Select deployment mode?',
+      }));
+    });
+  }, 20_000);
+
+  describe('AskUserQuestion answer delivery', () => {
+    const askEvent = (toolUseId: string) => ({
+      type: 'timeline.event',
+      event: {
+        id: `evt-${toolUseId}`,
+        ts: Date.now(),
+        sessionId: 'deck_alpha_brain',
+        type: 'ask.question',
+        payload: { toolUseId, waitMs: 60_000, questions: [{ question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }] }] },
+      },
+    });
+
+    async function openQuestion(toolUseId: string) {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+      await act(async () => { ws.emit(askEvent(toolUseId)); });
+      expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+      return ws;
+    }
+
+    it('keeps the card open when the answer could not leave the browser', async () => {
+      const ws = await openQuestion('toolu_offline');
+      ws.askAnswer.mockReturnValue({ ok: false, reason: 'not_connected' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer', { toolUseId: 'toolu_offline' });
+      // Not dismissed: the user can retry once the connection is back.
+      expect(screen.queryByText('ask-question-dialog')).toBeTruthy();
+      expect(await screen.findByText('askQuestion.answerNotSent')).toBeTruthy();
+    }, 20_000);
+
+    it('shows the preserved answer and offers to resend it when the daemon refuses it', async () => {
+      const ws = await openQuestion('toolu_refused');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-refused' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-refused', status: 'error', error: 'ask_answer_delivery_failed', session: 'deck_alpha_brain' });
+      });
+      const failed = await screen.findByTestId('ask-answer-failed');
+      expect(failed.textContent).toContain('answer');
+      expect(failed.textContent).toContain('askQuestion.answerFailed.failed');
+
+      fireEvent.click(screen.getByText('askQuestion.answerFailed.sendAsMessage'));
+      expect(ws.sendSessionMessage).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+      expect(screen.queryByTestId('ask-answer-failed')).toBeNull();
+    }, 20_000);
+
+    it('does not offer a resend when another device already answered the question', async () => {
+      const ws = await openQuestion('toolu_second');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-second' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-second', status: 'error', error: 'ask_answer_already_answered', session: 'deck_alpha_brain' });
+      });
+      expect(await screen.findByText('askQuestion.answerFailed.already_answered')).toBeTruthy();
+      expect(screen.queryByText('askQuestion.answerFailed.sendAsMessage')).toBeNull();
+    }, 20_000);
+
+    it('stays quiet when the daemon confirms the answer', async () => {
+      const ws = await openQuestion('toolu_ok');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-ok' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-ok', status: 'accepted', session: 'deck_alpha_brain', delivery: 'in_place' });
+      });
+      expect(screen.queryByTestId('ask-answer-failed')).toBeNull();
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+    }, 20_000);
+
+    it("closes this device's card when the answer's timeline echo names the question (answered elsewhere)", async () => {
+      const ws = await openQuestion('toolu_elsewhere');
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-echo',
+            ts: Date.now(),
+            sessionId: 'deck_alpha_brain',
+            type: 'user.message',
+            payload: { text: 'B', askToolUseId: 'toolu_elsewhere', askAnswerCommandId: 'ans-other-device' },
+          },
+        });
+      });
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+    }, 20_000);
+
+    it('suppresses AskQuestionDialog when already viewing that session in chat mode and routes inline answers through ws.askAnswer', async () => {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      localStorage.setItem('rcc_viewModes', JSON.stringify({ deck_alpha_brain: 'chat' }));
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        ws.emit(askEvent('toolu_same_session'));
+      });
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-inline' });
+      fireEvent.click(screen.getByText('pane-ask-inline-deck_alpha_brain'));
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'inline answer', { toolUseId: 'toolu_inline' });
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-other-session',
+            ts: Date.now(),
+            sessionId: 'deck_beta_brain',
+            type: 'ask.question',
+            payload: { toolUseId: 'toolu_other_session', waitMs: 60_000, questions: [{ question: 'Pick one', options: [{ label: 'A' }] }] },
+          },
+        });
+      });
+      expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+    }, 20_000);
+
+    it('suppresses AskQuestionDialog on desktop for transport main sessions without rcc_viewModes and routes inline answers', async () => {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return serverList();
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [{
+              ...sessionList().sessions[0],
+              agent_type: 'agy-sdk',
+              runtime_type: 'transport',
+            }],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        ws.emit(askEvent('toolu_transport_desktop'));
+      });
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-transport-inline' });
+      fireEvent.click(screen.getByText('pane-ask-inline-deck_alpha_brain'));
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'inline answer', { toolUseId: 'toolu_inline' });
+    }, 20_000);
+
+    it('suppresses AskQuestionDialog for visible pinned sub-session panels on desktop and threads onAskAnswer through ctx', async () => {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByText('sidebar-drop')).toBeTruthy();
+      fireEvent.click(screen.getByText('sidebar-drop'));
+      expect(await screen.findByTestId('pinned-ask-inline-deck_sub_alpha_helper')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-pinned-sub',
+            ts: Date.now(),
+            sessionId: 'deck_sub_alpha_helper',
+            type: 'ask.question',
+            payload: { toolUseId: 'toolu_pinned_sub', waitMs: 60_000, questions: [{ question: 'Pinned question?', options: [{ label: 'Yes' }] }] },
+          },
+        });
+      });
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-pinned-inline' });
+      fireEvent.click(screen.getByTestId('pinned-ask-inline-deck_sub_alpha_helper'));
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_sub_alpha_helper', 'pinned inline answer', { toolUseId: 'toolu_pinned_inline' });
+    }, 20_000);
+
+    it('shows cross-tab source label without hijacking the active tab, jumps on click, and auto-closes when switching to target tab', async () => {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return serverList();
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { ...sessionList().sessions[0], agent_type: 'agy-sdk', runtime_type: 'transport' },
+              {
+                name: 'deck_beta_brain',
+                project_name: 'Beta',
+                role: 'brain',
+                agent_type: 'claude-code',
+                agent_version: '2.0',
+                state: 'running',
+                project_dir: '/work/beta',
+                runtime_type: 'transport',
+                label: 'Beta Tab',
+                description: 'Beta main session',
+              },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      // Cross-tab ask.question from Beta must NOT yank the user out of Alpha.
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-beta-ask-1',
+            ts: Date.now(),
+            sessionId: 'deck_beta_brain',
+            type: 'ask.question',
+            payload: { toolUseId: 'toolu_beta_1', waitMs: 60_000, questions: [{ question: 'Beta question?', options: [{ label: 'Go' }] }] },
+          },
+        });
+      });
+
+      const dialog = await screen.findByTestId('ask-question-dialog');
+      expect(dialog.getAttribute('data-source-kind')).toBe('tab');
+      expect(dialog.getAttribute('data-source-label')).toBe('Beta Tab');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Clicking "Go to chat" switches to Beta, closes modal, and leaves inline card interactive.
+      fireEvent.click(screen.getByText('ask-jump'));
+      await waitFor(() => expect(screen.queryByTestId('ask-question-dialog')).toBeNull());
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-beta-inline' });
+      fireEvent.click(screen.getByText('pane-ask-inline-deck_beta_brain'));
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_beta_brain', 'inline answer', { toolUseId: 'toolu_inline' });
+
+      // Switch back to Alpha and trigger another Beta modal, then switch manually via SessionTree -> auto-closes modal.
+      fireEvent.click(screen.getByText('tree-select-session-deck_alpha_brain'));
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-beta-ask-2',
+            ts: Date.now(),
+            sessionId: 'deck_beta_brain',
+            type: 'ask.question',
+            payload: { toolUseId: 'toolu_beta_2', waitMs: 60_000, questions: [{ question: 'Second Beta question?', options: [{ label: 'Yes' }] }] },
+          },
+        });
+      });
+      expect(await screen.findByTestId('ask-question-dialog')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('tree-select-session-deck_beta_brain'));
+      await waitFor(() => expect(screen.queryByTestId('ask-question-dialog')).toBeNull());
+    }, 20_000);
+
+    it('shows parent › sub-session label for hidden sub-sessions and jumps to open the sub-session window', async () => {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return serverList();
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [{ ...sessionList().sessions[0], agent_type: 'agy-sdk', runtime_type: 'transport' }],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-hidden',
+          sessionName: 'deck_sub_alpha_hidden',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper Worker',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-hidden-sub',
+            ts: Date.now(),
+            sessionId: 'deck_sub_alpha_hidden',
+            type: 'ask.question',
+            payload: { toolUseId: 'toolu_hidden_sub', waitMs: 60_000, questions: [{ question: 'Worker question?', options: [{ label: 'Proceed' }] }] },
+          },
+        });
+      });
+
+      const dialog = await screen.findByTestId('ask-question-dialog');
+      expect(dialog.getAttribute('data-source-kind')).toBe('subsession');
+      expect(dialog.getAttribute('data-source-parent-label')).toBe('Alpha Brain');
+      expect(dialog.getAttribute('data-source-label')).toBe('Helper Worker');
+
+      fireEvent.click(screen.getByText('ask-jump'));
+      await waitFor(() => expect(screen.queryByTestId('ask-question-dialog')).toBeNull());
+      const subWindow = await screen.findByTestId('sub-session-window-sub-hidden');
+      expect(subWindow.getAttribute('data-visible')).toBe('true');
+    }, 20_000);
+
+    it('auto-closes AskQuestionDialog when an obscuring settings overlay closes to reveal the active session', async () => {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return serverList();
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [{
+              ...sessionList().sessions[0],
+              agent_type: 'agy-sdk',
+              runtime_type: 'transport',
+            }],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      // Open Settings overlay so active chat view is obscured
+      fireEvent.click(screen.getByText('server-settings'));
+      expect(await screen.findByText('settings-back')).toBeTruthy();
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-alpha-obscured',
+            ts: Date.now(),
+            sessionId: 'deck_alpha_brain',
+            type: 'ask.question',
+            payload: {
+              toolUseId: 'toolu_alpha_obscured',
+              waitMs: 60_000,
+              questions: [{ question: 'Obscured session question?', options: [{ label: 'Proceed' }] }],
+            },
+          },
+        });
+      });
+
+      expect(await screen.findByTestId('ask-question-dialog')).toBeTruthy();
+
+      // Closing Settings reveals deck_alpha_brain and must auto-close AskQuestionDialog
+      fireEvent.click(screen.getByText('settings-back'));
+      await waitFor(() => expect(screen.queryByTestId('ask-question-dialog')).toBeNull());
+    }, 20_000);
+  });
+
+  it('quick-collapses and restores all sub-session windows without unmounting their chat state', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -1620,12 +6789,25 @@ describe('App shell', () => {
       expect(second.getAttribute('data-active')).toBe('true');
     });
 
-    fireEvent.click(screen.getByText('tabs-select'));
+    fireEvent.click(screen.getByText('subbar-quick-close'));
 
     await waitFor(() => {
-      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
-      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBe(first);
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBe(second);
+      expect(first.getAttribute('data-visible')).toBe('false');
+      expect(second.getAttribute('data-visible')).toBe('false');
       expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+    });
+
+    // The arrow's bulk restore uses the exact retained nodes instead of
+    // reconstructing two timelines concurrently (the production blank-pane
+    // race reported by users).
+    fireEvent.click(screen.getByText('subbar-quick-restore'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBe(first);
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBe(second);
+      expect(first.getAttribute('data-visible')).toBe('true');
+      expect(second.getAttribute('data-visible')).toBe('true');
     });
   }, 20_000);
 
@@ -1674,6 +6856,126 @@ describe('App shell', () => {
     expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
   }, 20_000);
 
+  it('keeps both open sub-session window instances mounted while switching main tabs', async () => {
+    // Regression: main SessionPane components stay mounted across tab switches,
+    // but floating sub-session windows used to be filtered out by
+    // visibleSubSessions. Returning to a main tab rebuilt both ChatViews at
+    // once; their cache/IDB bootstrap raced and one window intermittently
+    // rendered blank until a manual refresh. The exact DOM nodes must survive
+    // the round trip — hidden while inactive, visible again on return.
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-a1', 'sub-a2']));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSubs = ['a1', 'a2'].map((suffix) => ({
+      id: `sub-${suffix}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    const betaSub = {
+      id: 'sub-b1',
+      sessionName: 'deck_sub_beta_b1',
+      parentSession: 'deck_beta_brain',
+      label: 'B1',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [...alphaSubs, betaSub];
+    useSubSessionsState.visibleSubSessions = alphaSubs;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    const firstA = await screen.findByTestId('sub-session-window-sub-a1');
+    const secondA = await screen.findByTestId('sub-session-window-sub-a2');
+    expect(firstA.getAttribute('data-visible')).toBe('true');
+    expect(secondA.getAttribute('data-visible')).toBe('true');
+
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(await screen.findByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => {
+      expect(firstA.getAttribute('data-visible')).toBe('false');
+      expect(secondA.getAttribute('data-visible')).toBe('false');
+    });
+
+    useSubSessionsState.visibleSubSessions = alphaSubs;
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-a1')).toBe(firstA);
+      expect(screen.getByTestId('sub-session-window-sub-a2')).toBe(secondA);
+      expect(firstA.getAttribute('data-visible')).toBe('true');
+      expect(secondA.getAttribute('data-visible')).toBe('true');
+    });
+  }, 20_000);
+
+  it('isolates split executor panel visits from auditor, third window, task switches and split exit', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = ['a', 'b', 'c'].map((suffix, index) => ({
+      id: `sub-${index + 1}`, sessionName: `deck_sub_alpha_${suffix}`, parentSession: 'deck_alpha_brain',
+      label: 'Same label', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1',
+    }));
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    const { App } = await importApp(); render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    await screen.findByText('session-tabs');
+    for (const id of ['sub-1', 'sub-2', 'sub-3']) fireEvent.click(screen.getByText(`subbar-open-${id}`));
+    await screen.findByTestId('sub-session-window-sub-3');
+    const visit = (id: string) => screen.getByTestId(`sub-session-window-${id}`).getAttribute('data-task-pair-visit');
+    const split = (taskId: string, action = 'open') => act(() => window.dispatchEvent(new CustomEvent('deck:pair-split', {
+      detail: { taskId, executor: 'deck_sub_alpha_a', auditor: 'deck_sub_alpha_b', action },
+    })));
+    for (const taskId of ['task-A', 'task-B', 'task-A']) {
+      split(taskId);
+      await waitFor(() => expect(visit('sub-1')).toBe(taskId));
+      expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+      act(() => window.dispatchEvent(new Event('resize')));
+      expect(visit('sub-1')).toBe(taskId);
+    }
+    for (const roleId of ['sub-1', 'sub-2']) {
+      split('task-A');
+      await waitFor(() => expect(visit('sub-1')).toBe('task-A'));
+      expect(screen.getByText('sub-window-close-split-sub-1')).toBeTruthy();
+      expect(screen.getByText('sub-window-close-split-sub-2')).toBeTruthy();
+      expect(screen.queryByText('sub-window-close-split-sub-3')).toBeNull();
+      fireEvent.click(screen.getByText(`sub-window-close-split-${roleId}`));
+      await waitFor(() => expect(visit('sub-1')).toBe(''));
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+      expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-visible')).toBe('true');
+      expect(screen.queryByText('sub-window-close-split-sub-1')).toBeNull();
+      expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+    }
+  });
+
   it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {
     // Regression: opening a 3rd (or Nth) window left it inactive (dashed accent,
     // un-closable) because the active sub was re-derived from the mutable window
@@ -1706,18 +7008,146 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-3'));
 
     // The just-opened sub-3 is active; the earlier two are open but inactive.
+    // Windows mount one animation frame apart (useProgressiveMount), so wait
+    // for all three to exist before comparing their active flags — otherwise
+    // this races the mount schedule rather than testing it.
     await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
       expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
     });
     expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');
     expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-active')).toBe('false');
 
-    // Re-activating an older window flips active over to it (and only it).
+    const windowDomOrder = () => screen.getAllByTestId(/^sub-session-window-sub-/)
+      .map((node) => node.getAttribute('data-testid'));
+    const orderBeforeFocusChange = windowDomOrder();
+
+    // Re-activating an older window flips active over to it (and only it), but
+    // must not move either live window in the DOM. Reordering keyed siblings
+    // makes Blink/WebKit re-anchor the chat scrollers and visibly jolts the
+    // window that just lost focus.
     fireEvent.mouseDown(screen.getByTestId('sub-session-window-sub-1'));
     await waitFor(() => {
       expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('true');
     });
     expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
+    expect(windowDomOrder()).toEqual(orderBeforeFocusChange);
+  }, 20_000);
+
+  it('keeps the third outgoing shared window writable and exactly routed across role and subscription refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const makeSubs = () => ['a', 'b', 'c'].map((suffix, index) => ({
+      id: `sub-${index + 1}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    const outgoingShares = (role: 'viewer' | 'participant') => makeSubs().map((sub, index) => ({
+      id: `share-${index + 1}`,
+      targetUserId: `recipient-${index + 1}`,
+      targetUserDisplayName: `Recipient ${index + 1}`,
+      role,
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'srv-1', subSessionId: sub.id },
+    }));
+    useSubSessionsState.subSessions = makeSubs();
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    listManagedSharesForServerMock.mockResolvedValue(outgoingShares('viewer'));
+
+    const { App } = await importApp();
+    render(<App />);
+    const ws = await getActiveWsClient();
+    await waitFor(() => expect(listManagedSharesForServerMock).toHaveBeenCalledWith('srv-1'));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    fireEvent.click(screen.getByText('subbar-open-sub-3'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-shared-outgoing')).toBe('true');
+    });
+    const thirdComposer = screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement;
+    expect(thirdComposer.disabled).toBe(false);
+    fireEvent.click(screen.getByText('sub-window-send-sub-3'));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith(
+      'deck_sub_alpha_c',
+      'message-for-sub-3',
+      {},
+    );
+
+    // Recreate the hook snapshots like a background sub-session subscription
+    // refresh, and refresh the managed grants at the same time. Neither fresh
+    // object identities nor a recipient role change may turn the owner's third
+    // composer into an incoming viewer surface or move focus away from it.
+    useSubSessionsState.subSessions = makeSubs();
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    listManagedSharesForServerMock.mockResolvedValue(outgoingShares('participant'));
+    fireEvent.click(screen.getByText('sub-window-share-sub-3'));
+    fireEvent.click(await screen.findByText('share-session-refresh'));
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'process',
+        }],
+      });
+    });
+
+    await waitFor(() => {
+      const third = screen.getByTestId('sub-session-window-sub-3');
+      expect(third.getAttribute('data-active')).toBe('true');
+      expect(third.getAttribute('data-shared-outgoing')).toBe('true');
+      expect(third.getAttribute('data-share-role')).toBe('participant');
+      expect((screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement).disabled).toBe(false);
+    });
+    fireEvent.click(screen.getByText('sub-window-send-sub-3'));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith(
+      'deck_sub_alpha_c',
+      'message-for-sub-3',
+      {},
+    );
+
+    // The inverse authority boundary remains fail-closed: when the parent is
+    // an incoming viewer surface rather than an outgoing owner grant, every
+    // child composer is read-only, including the focused third window.
+    listManagedSharesForServerMock.mockResolvedValue([]);
+    fireEvent.click(screen.getByText('share-session-refresh'));
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'process',
+          sharedState: { status: 'active', effectiveRole: 'viewer' },
+        }],
+      });
+    });
+    await waitFor(() => {
+      expect((screen.getByLabelText('sub-window-composer-sub-1') as HTMLInputElement).disabled).toBe(true);
+      expect((screen.getByLabelText('sub-window-composer-sub-2') as HTMLInputElement).disabled).toBe(true);
+      expect((screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement).disabled).toBe(true);
+    });
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {
@@ -1751,6 +7181,13 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('file-preview-state'));
     fireEvent.click(screen.getByText('file-close'));
 
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    const previewFb = await screen.findByTestId('file-browser-preview');
+    expect(previewFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(previewFb.getAttribute('data-can-share')).toBe('true');
+    expect(previewFb.getAttribute('data-read-only')).toBe('false');
+    fireEvent.click(screen.getByText('file-close'));
+
     fireEvent.click(screen.getByText('subbar-repo'));
     expect(await screen.findByText('repo-page')).toBeTruthy();
     fireEvent.click(screen.getByText('repo-ci'));
@@ -1773,6 +7210,11 @@ describe('App shell', () => {
     fireEvent.click(screen.getAllByTitle('localWebPreview.title')[0]);
     expect(await screen.findByText('local-web-preview')).toBeTruthy();
     fireEvent.click(screen.getByText('preview-draft'));
+
+    fireEvent.click(screen.getByText('pane-preview-loopback'));
+    const loopbackPreview = await screen.findByTestId('local-web-preview');
+    expect(loopbackPreview.getAttribute('data-port')).toBe('8787');
+    expect(loopbackPreview.getAttribute('data-path')).toBe('/docs?q=1#intro');
 
     for (const label of [
       'pane-fit-ref',
@@ -1864,6 +7306,11 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('server-settings'));
     expect(await screen.findByText('settings-page')).toBeTruthy();
+    const settingsOverlay = screen.getByTestId('settings-page-overlay');
+    expect(settingsOverlay.style.display).toBe('flex');
+    expect(settingsOverlay.style.flexDirection).toBe('column');
+    expect(settingsOverlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
+    expect(settingsOverlay.style.overflow).toBe('hidden');
     fireEvent.click(screen.getByText('settings-display'));
     fireEvent.click(screen.getByText('settings-auth'));
     fireEvent.click(screen.getByText('settings-back'));
@@ -1881,6 +7328,12 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('pane-settings'));
     expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('settings-pool-add'));
+    const poolLauncher = await screen.findByText('start-sub-session-dialog');
+    expect(poolLauncher.getAttribute('data-allowed-agent-types')).toBe('claude-code-sdk,codex-sdk,agy-sdk,opencode-sdk,openclaw');
+    expect(poolLauncher.getAttribute('data-overlay-class')).toBe('session-settings-child-overlay');
+    expect(screen.getByText('session-settings-dialog').getAttribute('data-child-dialog-open')).toBe('true');
+    fireEvent.click(screen.getByText('start-sub-close'));
     fireEvent.click(screen.getByText('settings-save'));
     fireEvent.click(screen.getByText('settings-close'));
 
@@ -1900,4 +7353,6494 @@ describe('App shell', () => {
 
     expect(view.container.textContent).toContain('sub-session-bar');
   }, 30_000);
+
+  it('guides the user back to their previous server after opening shared content', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-1',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-1'],
+        primaryShareId: 'share-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-open-1',
+        supervisionMode: 'supervised_audit',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const ownServerWsCount = wsInstances.length;
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toEqual({
+      version: 1,
+      entryId: 'share-1',
+      serverId: 'srv-shared',
+      targetKey: 'main:srv-shared:deck_beta_brain',
+    });
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-1');
+    });
+    const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
+    expect(sharedPane.getAttribute('data-supervision-mode')).toBe('supervised_audit');
+    expect(sharedPane.getAttribute('data-share-target-kind')).toBe('main');
+    expect(sharedPane.getAttribute('data-can-share')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-new-session')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-stop-project')).toBe('false');
+    fireEvent.click(within(sharedPane).getByRole('button', { name: 'pane-settings' }));
+    const settings = await screen.findByTestId('session-settings-dialog');
+    expect(settings.getAttribute('data-supervision-mode')).toBe('supervised_audit');
+    expect(settings.getAttribute('data-can-control-supervision')).toBe('true');
+    fireEvent.click(within(settings).getByRole('button', { name: 'settings-close' }));
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
+    await waitFor(() => expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true));
+    const sharedWs = wsInstances.findLast((instance) => instance.options?.shareTarget === sharedEntry.target)!;
+    await waitFor(() => expect(sharedWs.messageHandlers.length).toBeGreaterThan(0));
+    act(() => {
+      sharedWs.emit({
+        type: 'command.ack',
+        commandId: 'dispatch-live-2',
+        status: 'accepted',
+        session: 'deck_beta_brain',
+        activeDispatchId: 'dispatch-live-2',
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-active-dispatch-id')).toBe('dispatch-live-2');
+    });
+    const guide = await screen.findByTestId('shared-return-guide');
+    expect(guide.textContent).toContain('share.sharedWithMe.guideReturn');
+    expect(guide.textContent).toContain('share.sharedWithMe.guideDismiss');
+    expect(screen.getByTestId('server-icon-bar').getAttribute('data-return-hint-server-id')).toBe('srv-1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
+    expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+    expect(screen.getByText('server-select-srv-1')).toBeTruthy();
+  }, 20_000);
+
+  it.each([false, true])('retains the previous shared server after dismiss and inventory refresh (mobile=%s)', async (mobile) => {
+    const originalUserAgent = navigator.userAgent;
+    if (mobile) Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const entries = ['local', 'other'].map((id) => ({
+        id: `share-${id}`, serverId: `srv-${id}`, serverName: id === 'local' ? '本机' : 'Other Server',
+        role: 'participant', status: 'active', targetLabel: `Project ${id}`,
+        target: { kind: 'main', serverId: `srv-${id}`, sessionName: `deck_${id}_brain` },
+      }));
+      discoverSharedEntriesMock.mockResolvedValue(entries);
+      openSharedEntryMock.mockImplementation(async (target: typeof entries[number]['target']) => ({
+        ...sharedMainOpenResult(`share-${target.serverId.slice(4)}`, 'dispatch-nav'),
+        server: { id: target.serverId, name: entries.find((entry) => entry.serverId === target.serverId)!.serverName,
+          status: 'online', lastHeartbeatAt: Date.now() },
+        target,
+        sessions: [{ sessionName: target.sessionName, title: target.sessionName, state: 'running', agentType: 'codex-sdk' }],
+      }));
+      const { App } = await importApp();
+      const view = render(<App />);
+      const openProject = async (label: string) => {
+        if (mobile) {
+          fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+          await waitFor(() => expect(screen.getByTitle('Server bar')).toBeTruthy());
+          ensureMobileSidebarServerListExpanded(view.container);
+        }
+        fireEvent.click((await screen.findByText(label)).closest('button')!);
+      };
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await openProject('Project local');
+      await screen.findByTestId('session-pane-deck_local_brain');
+      await openProject('Project other');
+      await screen.findByTestId('session-pane-deck_other_brain');
+      fireEvent.click(within(screen.getByTestId('shared-return-guide')).getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
+      expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+      const refresh = intervals.mock.calls.find(([, ms]) => ms === 30_000)![0] as () => void;
+      await act(async () => { refresh(); await Promise.resolve(); });
+      if (mobile) {
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        const menu = view.container.querySelector('.mobile-server-menu')!;
+        expect(within(menu as HTMLElement).getByText('本机', { selector: '.mobile-server-menu-name' })).toBeTruthy();
+        expect(within(menu as HTMLElement).getByText('Alpha Server', { selector: '.mobile-server-menu-name' })).toBeTruthy();
+      } else {
+        expect(screen.getByText('server-select-srv-local')).toBeTruthy();
+        expect(screen.getByText('server-select-srv-1')).toBeTruthy();
+      }
+      // The preserved entry remains navigation only: revisiting must ask for share coverage again.
+      const count = openSharedEntryMock.mock.calls.length;
+      await navigateExternally('/#/srv-local/deck_local_brain?shared=share-local');
+      await waitFor(() => expect(openSharedEntryMock.mock.calls.length).toBe(count + 1));
+      expect(await screen.findByTestId('session-pane-deck_local_brain')).toBeTruthy();
+      discoverSharedEntriesMock.mockResolvedValue(entries.filter((entry) => entry.id !== 'share-local'));
+      if (mobile) {
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        ensureMobileSidebarServerListExpanded(view.container);
+      }
+      fireEvent.click(screen.getAllByRole('button', { name: 'share.sharedWithMe.refresh' })[0]!);
+      await waitFor(() => expect(screen.queryByText('Project local')).toBeNull());
+      if (mobile) {
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        expect(view.container.querySelector('.mobile-server-menu')!.textContent).not.toContain('本机');
+      } else {
+        expect(screen.queryByText('server-select-srv-local')).toBeNull();
+      }
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('gives a shared-server participant owner operations while keeping every re-share entry absent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-server-operator',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [sharedEntry.id],
+        primaryShareId: sharedEntry.id,
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        supervisionMode: 'supervised_audit',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Whole Shared Server')).closest('button')!);
+
+    const pane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(pane.getAttribute('data-share-target-kind')).toBe('server');
+    expect(pane.getAttribute('data-can-share')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-new-session')).toBe('true');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-stop-project')).toBe('true');
+
+    // The ordinary server-management menu is available for the delegated
+    // operator. Share/invite is intentionally absent from both this menu and
+    // the session surface above.
+    fireEvent.click(screen.getByText('server-menu'));
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    expect(screen.queryByText('share-session-dialog')).toBeNull();
+  }, 20_000);
+
+  it('keeps an explicit server choice authoritative after a shared route has settled', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-settled-switch',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(
+      'share-settled-switch',
+      'dispatch-settled-switch',
+    ));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-settled-switch');
+    });
+
+    fireEvent.click(screen.getByTestId('shared-return-guide').querySelector('.shared-return-guide-return')!);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({
+      serverId: 'srv-1',
+      sessionName: 'deck_alpha_brain',
+      sharedEntryId: null,
+    });
+  }, 20_000);
+
+  it('does not let a pending shared open undo Back to dashboard', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-back',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'server-home' }));
+    expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-back', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(screen.getByText('dashboard-page')).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+    expect(wsInstances.some((instance) => instance.options?.shareTarget)).toBe(false);
+  }, 20_000);
+
+  /**
+   * RED — the existing guards cover "Back to dashboard" and "Logout", but not
+   * the case the user actually reports: while a shared open is still in flight,
+   * explicitly navigating to ANOTHER AUTHORIZED SERVER must win.
+   *
+   * Both the URL and the canonical selection have to land on the newer
+   * destination. Asserting only one of them would let a stale write move the
+   * other half and still pass.
+   */
+  it('does not let a pending shared open undo selecting another authorized server', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-switch',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    // The user changes their mind and picks one of their own servers while the
+    // shared open is still pending.
+    fireEvent.click(screen.getByRole('button', { name: 'server-select' }));
+    await waitFor(() => expect(window.location.hash).toContain('srv-1'));
+
+    // The stale shared open now settles.
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-switch', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+
+    // URL must stay on the user's newer destination...
+    expect(window.location.hash).toContain('srv-1');
+    expect(window.location.hash).not.toContain('srv-shared');
+    // ...and so must the canonical selection: no shared pane, no share-scoped
+    // socket resurrected by the late response.
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readTabRouteState().serverId).not.toBe('srv-shared');
+  }, 20_000);
+
+  it('does not let a pending shared open undo Logout while the logout request is pending', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-logout',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    let resolveLogout!: () => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/auth/logout') {
+        return new Promise<void>((resolve) => { resolveLogout = resolve; });
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/auth/logout', { method: 'POST' }));
+
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-logout', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(wsInstances.some((instance) => instance.options?.shareTarget)).toBe(false);
+
+    await act(async () => {
+      resolveLogout();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+  }, 20_000);
+
+  /**
+   * RED — an external URL change must not be silently reverted.
+   *
+   * `writeHashState` publishes routes with `history.replaceState`, and nothing
+   * in web/src subscribes to `popstate` or `hashchange` (verified: zero matches
+   * across the source tree). So when the URL changes underneath the app — the
+   * user edits the address bar, follows a direct link into the same tab, or the
+   * browser restores a session — the app never learns about it, while the
+   * unconditional hash-sync effect at app.tsx:1606 keeps republishing the
+   * in-memory selection.
+   *
+   * Net effect for a user sitting in a shared session: navigating to another
+   * authorized server by URL is undone, and the tab snaps back to the shared
+   * session. That is exactly the reported regression, and it needs no reload
+   * and no restore race to happen.
+   */
+  it('does not revert an explicit direct-URL navigation to another authorized server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-direct-url',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-direct-url', 'dispatch-direct-url'));
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // The user navigates this tab to one of their OWN servers by URL.
+    await act(async () => {
+      history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    // The URL itself survives — the hash-sync effect only republishes when the
+    // in-memory selection changes, so it does not stomp an external edit.
+    expect(window.location.hash).toContain('srv-1');
+
+    // But the app must actually FOLLOW that navigation. Nothing in web/src
+    // subscribes to popstate/hashchange, so the shared pane stays mounted and
+    // the tab keeps talking to the shared server while the address bar claims
+    // otherwise. A URL that no longer describes the session on screen is the
+    // user-visible half of "it forced me back to the shared session".
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'the shared pane is still mounted after the user navigated away by URL',
+    ).toBeNull();
+    expect(
+      screen.queryByTestId('session-pane-deck_alpha_brain'),
+      'the app did not follow the explicit URL navigation to the owned server',
+    ).not.toBeNull();
+  }, 20_000);
+
+  const navigateExternally = async (hash: string) => {
+    await act(async () => {
+      history.replaceState(null, '', hash);
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await Promise.resolve(); });
+  };
+
+  it('lets an explicit session click retire an older shared-route promise', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const serverEntry = {
+      id: 'share-whole-server',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    const lateEntry = {
+      id: 'share-late-session-route',
+      serverId: 'srv-late',
+      serverName: 'Late Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Late Session',
+      target: { kind: 'main', serverId: 'srv-late', sessionName: 'deck_late_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([serverEntry, lateEntry]);
+    let resolveLate!: (value: unknown) => void;
+    openSharedEntryMock.mockImplementation((target: { kind: string; serverId: string }) => {
+      if (target.serverId === 'srv-late') {
+        return new Promise((resolve) => { resolveLate = resolve; });
+      }
+      return Promise.resolve({
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: serverEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [serverEntry.id],
+          primaryShareId: serverEntry.id,
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+          { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+        ],
+        subSessions: [],
+      });
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Whole Shared Server')).closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-whole-server',
+    ));
+    fireEvent.click(screen.getByText('subbar-cron'));
+    const cronAccess = await screen.findByTestId('cron-manager-access');
+    expect(cronAccess.getAttribute('data-read-only')).toBe('false');
+    expect(cronAccess.getAttribute('data-shared-scope')).toBe('true');
+    fireEvent.click(screen.getByText('cron-back'));
+
+    await navigateExternally('/#/srv-late/deck_late_brain?shared=share-late-session-route');
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(lateEntry.target));
+
+    fireEvent.click(screen.getByText('tabs-select-deck_gamma_brain'));
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_gamma_brain?shared=share-whole-server',
+    ));
+
+    await act(async () => {
+      resolveLate({
+        server: { id: 'srv-late', name: 'Late Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: lateEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [lateEntry.id],
+          primaryShareId: lateEntry.id,
+          authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_late_brain', title: 'Late Session', state: 'running', agentType: 'codex-sdk' }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain?shared=share-whole-server');
+    expect(screen.queryByTestId('session-pane-deck_late_brain')).toBeNull();
+  }, 20_000);
+
+  it('retires a main-share route when the desktop SessionTree selects another session on that server', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-main-desktop',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      ...sharedMainOpenResult(sharedEntry.id, 'dispatch-main-desktop'),
+      sessions: [
+        { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+        { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+      ],
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-main-desktop',
+    ));
+
+    fireEvent.click(screen.getByText('tree-select-session-deck_gamma_brain'));
+
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain'));
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({
+      serverId: 'srv-shared',
+      sessionName: 'deck_gamma_brain',
+      sharedEntryId: null,
+    });
+    await waitFor(() => expect(wsInstances.at(-1)?.options?.shareTarget ?? null).toBeNull());
+  }, 20_000);
+
+  it('makes the mobile SessionTree click outrank a stale shared open and closes its sidebar', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const serverEntry = {
+        id: 'share-mobile-server',
+        serverId: 'srv-shared',
+        serverName: 'Shared Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Whole Mobile Server',
+        target: { kind: 'server', serverId: 'srv-shared' },
+      } as const;
+      const lateEntry = {
+        id: 'share-mobile-late',
+        serverId: 'srv-late',
+        serverName: 'Late Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Late Mobile Session',
+        target: { kind: 'main', serverId: 'srv-late', sessionName: 'deck_late_brain' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([serverEntry, lateEntry]);
+      let resolveLate!: (value: unknown) => void;
+      openSharedEntryMock.mockImplementation((target: { serverId: string }) => {
+        if (target.serverId === 'srv-late') {
+          return new Promise((resolve) => { resolveLate = resolve; });
+        }
+        return Promise.resolve({
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: serverEntry.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [serverEntry.id], primaryShareId: serverEntry.id, authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+            { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        });
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-toggle')).toBeTruthy());
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      ensureMobileSidebarServerListExpanded(view.container);
+      fireEvent.click((await screen.findByText('Whole Mobile Server')).closest('button')!);
+      await waitFor(() => expect(window.location.hash).toBe(
+        '#/srv-shared/deck_beta_brain?shared=share-mobile-server',
+      ));
+
+      await navigateExternally('/#/srv-late/deck_late_brain?shared=share-mobile-late');
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(lateEntry.target));
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      fireEvent.click(screen.getByText('tree-select-session-deck_gamma_brain'));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+      await waitFor(() => expect(window.location.hash).toBe(
+        '#/srv-shared/deck_gamma_brain?shared=share-mobile-server',
+      ));
+
+      await act(async () => {
+        resolveLate({
+          server: { id: 'srv-late', name: 'Late Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: lateEntry.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [lateEntry.id], primaryShareId: lateEntry.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_late_brain', title: 'Late Session', state: 'running', agentType: 'codex-sdk' }],
+          subSessions: [],
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain?shared=share-mobile-server');
+      expect(screen.queryByTestId('session-pane-deck_late_brain')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('treats duplicate hashchange/popstate for one navigation as a single idempotent move', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-idem',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-idem', 'dispatch-idem'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    const openCallsAfterRestore = openSharedEntryMock.mock.calls.length;
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    // Fire the pair again for the SAME route: must be a no-op.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    // No extra share-open was attempted by the repeated events.
+    expect(openSharedEntryMock.mock.calls.length).toBe(openCallsAfterRestore);
+  }, 20_000);
+
+  it('fails closed on an unauthorized route and does not keep the privileged shared pane', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-unauth',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-unauth', 'dispatch-unauth'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // A server this account has neither ownership of nor a share for.
+    await navigateExternally('/#/srv-not-mine/deck_secret');
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a privileged shared pane survived a route that does not authorize it',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_secret')).toBeNull();
+  }, 20_000);
+
+  /**
+   * RED — opening a share must not turn its server into an owned one.
+   *
+   * `handleOpenSharedEntry` merges the shared server into `servers`
+   * ([nextServer, ...prev]), so after one successful open that id is
+   * indistinguishable from a server this account actually owns. Any ownership
+   * check written as `servers.find(...)` therefore starts returning a hit for a
+   * shared server, and a later visit to that route takes the owned branch and
+   * never calls /api/shares/open — the coverage check is skipped entirely, so a
+   * revoked or expired share still renders.
+   *
+   * The assertion that matters is the AUTHORITY CALL, not the pane: checking
+   * only that a pane is absent is satisfied by merely having navigated
+   * elsewhere, which is how the previous version of this test passed while the
+   * bypass was live.
+   */
+  it('re-checks share authority when revisiting a previously opened shared server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-revoked',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-revoked', 'dispatch-revoked'));
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // Leave for an owned server. srv-shared is now sitting in `servers`.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // The share is revoked server-side.
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('share_revoked'));
+
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-revoked');
+
+    expect(
+      openSharedEntryMock.mock.calls.length,
+      'revisiting a shared route must re-run the /api/shares/open coverage check exactly once',
+    ).toBe(1);
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a revoked share must not render',
+    ).toBeNull();
+  }, 20_000);
+
+  it('re-checks authority for a viewer role revisit, and fails closed when it expires', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-viewer',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-viewer', 'dispatch-viewer'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('share_expired'));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-viewer');
+
+    expect(openSharedEntryMock.mock.calls.length).toBe(1);
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+  }, 20_000);
+
+  it('re-checks authority for a cross-user share id on a previously opened server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-mine',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-mine', 'dispatch-mine'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // Someone else's share id, aimed at a server this tab has already opened.
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('not_covered'));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-someone-else');
+
+    expect(
+      openSharedEntryMock.mock.calls.length,
+      'a foreign share id must still be adjudicated by the server, exactly once',
+    ).toBe(1);
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+  }, 20_000);
+
+  it('does not let a late authority result for an abandoned shared route render', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-race',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValueOnce(sharedMainOpenResult('share-race', 'dispatch-race'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // Revisit the shared route but hold the authority response open...
+    let resolveLate!: (v: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((r) => { resolveLate = r; }));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-race');
+    expect(openSharedEntryMock.mock.calls.length).toBe(1);
+
+    // ...and move away again before it settles.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await act(async () => {
+      resolveLate?.(sharedMainOpenResult('share-race', 'dispatch-race-late'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a late authority result for an abandoned route must not render',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).not.toBeNull();
+  }, 20_000);
+
+  it('converges on the final route through a rapid A to B to A sequence', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-rapid',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-rapid', 'dispatch-rapid'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-rapid');
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(window.location.hash).toContain('srv-1');
+  }, 20_000);
+
+  it('does not let a late share-open settle over a newer external navigation', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-late',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveLate!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockResolvedValueOnce(sharedMainOpenResult('share-late', 'dispatch-late'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // Navigate back to the shared route, but hold the share-open open.
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => { resolveLate = resolve; }));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-late');
+    // ...then move on to an owned server before it settles.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    await act(async () => {
+      resolveLate?.(sharedMainOpenResult('share-late', 'dispatch-late-2'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a stale share-open won over a newer explicit navigation',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).not.toBeNull();
+  }, 20_000);
+
+  it('restores a shared tab from the URL hash instead of falling back to an owned tab', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 584 }));
+    const sharedEntry = {
+      id: 'share-refresh-1',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    let resolveSharedEntries!: (entries: unknown[]) => void;
+    discoverSharedEntriesMock.mockImplementation(() => new Promise((resolve) => {
+      resolveSharedEntries = resolve;
+    }));
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-refresh-1'],
+        primaryShareId: 'share-refresh-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-refresh-1',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/server'));
+    await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain');
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveSharedEntries([sharedEntry]);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target);
+    const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-refresh-1');
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-refresh-1');
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+    await waitFor(() => {
+      expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
+    });
+    expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' }).getAttribute('data-read-only')).toBe('false');
+    expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+  }, 20_000);
+
+  it('keeps the shared-main task console visible but read-only for a viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 584 }));
+    const sharedEntry = {
+      id: 'share-task-console-viewer',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Shared Viewer Brain',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(
+      'share-task-console-viewer',
+      'dispatch-task-console-viewer',
+      'viewer',
+    ));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click((await screen.findByText('Shared Viewer Brain')).closest('button')!);
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' }).getAttribute('data-read-only')).toBe('true');
+    });
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
+  }, 20_000);
+
+  it('restores the exact shared tab after refresh even when its server is also in the server list', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-refresh-exact');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-shared');
+    localStorage.setItem('rcc_server_name', 'Shared Server');
+    localStorage.setItem('rcc_session', 'deck_beta_brain');
+    const sharedEntry = {
+      id: 'share-refresh-exact',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    const otherEntry = {
+      id: 'share-refresh-server',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([otherEntry, sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-refresh-exact'],
+        primaryShareId: 'share-refresh-exact',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-refresh-exact',
+      }],
+      subSessions: [],
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            ...serverList().servers,
+            {
+              id: 'srv-shared',
+              name: 'Shared Server',
+              status: 'online',
+              lastHeartbeatAt: Date.now(),
+              createdAt: Date.now(),
+              daemonVersion: '2026.8.24',
+            },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      if (path === '/api/server/srv-shared/sessions') return sessionList();
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target);
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+    await waitFor(() => {
+      expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
+    });
+  }, 20_000);
+
+  it('restores an explicit shared URL even when the shared inventory is temporarily empty', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-url-only');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-url-only'],
+        primaryShareId: 'share-url-only',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-url-only',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'main',
+      serverId: 'srv-shared',
+      sessionName: 'deck_beta_brain',
+    }));
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-url-only');
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
+  it('keeps the explicit shared URL instead of jumping home when restore temporarily fails', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-retry');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockRejectedValue(new Error('temporary shared restore failure'));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('temporary shared restore failure')).toBeTruthy();
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-retry');
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
+  it('does not wait for shared-entry discovery when the hash points to an owned server', async () => {
+    history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockImplementation(() => new Promise(() => {}));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    await waitFor(() => expect(wsInstances.some((instance) => !instance.options?.shareTarget)).toBe(true));
+    expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it('unblocks switching between shared entries: clicking entry B supersedes in-flight entry A and opens B', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entrySlow = {
+      id: 'share-slow-a',
+      serverId: 'srv-slow',
+      serverName: 'Slow Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Slow Workspace',
+      target: { kind: 'main', serverId: 'srv-slow', sessionName: 'deck_slow_brain' },
+    } as const;
+
+    const entryBeta = {
+      id: 'share-settled-switch',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+
+    discoverSharedEntriesMock.mockResolvedValue([entrySlow, entryBeta]);
+
+    let resolveSlow!: (val: unknown) => void;
+    openSharedEntryMock.mockImplementation((target: any) => {
+      if (target.serverId === 'srv-slow') {
+        return new Promise((resolve) => {
+          resolveSlow = resolve;
+        });
+      }
+      if (target.serverId === 'srv-shared') {
+        return Promise.resolve(sharedMainOpenResult('share-settled-switch', 'dispatch-settled-switch'));
+      }
+      return Promise.reject(new Error(`unknown target: ${JSON.stringify(target)}`));
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const slowBtn = (await screen.findByText('Slow Workspace')).closest('button')!;
+
+    // 1. Click Slow Workspace: initiates open, in flight
+    fireEvent.click(slowBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(entrySlow.target));
+    const slowCall = openSharedEntryOptionsMock.mock.calls.find(([t]) => t === entrySlow.target);
+    const slowSignal = (slowCall?.[1] as { signal?: AbortSignal })?.signal;
+    expect(slowSignal?.aborted).toBe(false);
+
+    // 2. User clicks Shared Beta while Slow Workspace is still in flight:
+    // Slow in-flight request is aborted, generation is bumped, and Shared Beta opens!
+    const betaBtn = (await screen.findByText('Shared Beta')).closest('button')!;
+    fireEvent.click(betaBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(entryBeta.target));
+    expect(slowSignal?.aborted).toBe(true);
+
+    // Verify Shared Beta session pane is displayed and URL updated
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-settled-switch');
+    });
+
+    // 3. Resolve Slow Workspace late: must NOT override Shared Beta
+    await act(async () => {
+      resolveSlow({
+        server: { id: 'srv-slow', name: 'Slow Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: entrySlow.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-slow-a'],
+          primaryShareId: 'share-slow-a',
+          authorizedAt: Date.now(),
+        },
+        sessions: [{
+          sessionName: 'deck_slow_brain',
+          title: 'Slow Session',
+          state: 'running',
+          agentType: 'codex-sdk',
+          activeDispatchId: 'dispatch-slow',
+        }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('session-pane-deck_slow_brain')).toBeNull();
+    expect(screen.getByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-settled-switch');
+  }, 20_000);
+
+  it('debounces duplicate clicks on the exact same in-flight shared entry', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entryBeta = {
+      id: 'share-debounced',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entryBeta]);
+
+    let resolveBeta!: (val: unknown) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveBeta = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const betaBtn = (await screen.findByText('Shared Beta')).closest('button')!;
+    fireEvent.click(betaBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    // Second click on the exact same entry while in-flight is debounced
+    fireEvent.click(betaBtn);
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+
+    // Settle
+    await act(async () => {
+      resolveBeta(sharedMainOpenResult('share-debounced', 'dispatch-debounced'));
+      await Promise.resolve();
+    });
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+  }, 20_000);
+
+  it('recovers from shared entry open timeout, displays localized error, and unblocks subsequent opens', async () => {
+    const { SharedOpenTimeoutError } = await import('../src/api.js');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entrySlow = {
+      id: 'share-timeout-slow',
+      serverId: 'srv-slow',
+      serverName: 'Slow Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Slow Workspace',
+      target: { kind: 'main', serverId: 'srv-slow', sessionName: 'deck_slow_brain' },
+    } as const;
+    const entryBeta = {
+      id: 'share-settled-beta',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entrySlow, entryBeta]);
+
+    openSharedEntryMock.mockImplementation((target: any) => {
+      if (target.serverId === 'srv-slow') {
+        return Promise.reject(new SharedOpenTimeoutError('Shared entry open timed out'));
+      }
+      if (target.serverId === 'srv-shared') {
+        return Promise.resolve(sharedMainOpenResult('share-settled-beta', 'dispatch-settled-beta'));
+      }
+      return Promise.reject(new Error(`unexpected target: ${JSON.stringify(target)}`));
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const slowBtn = (await screen.findByText('Slow Workspace')).closest('button')!;
+    const betaBtn = (await screen.findByText('Shared Beta')).closest('button')!;
+
+    fireEvent.click(slowBtn);
+
+    // Timeout error is formatted with localized key share.sharedWithMe.openTimeout
+    expect(await screen.findByText('share.sharedWithMe.openTimeout')).toBeTruthy();
+
+    // User is NOT stuck! Clicking Shared Beta now succeeds immediately
+    fireEvent.click(betaBtn);
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+  }, 20_000);
+
+  it('aborts in-flight shared open request when navigating to owned server, dashboard, or logout', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entrySlow = {
+      id: 'share-abort-test',
+      serverId: 'srv-slow',
+      serverName: 'Slow Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Slow Workspace',
+      target: { kind: 'main', serverId: 'srv-slow', sessionName: 'deck_slow_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entrySlow]);
+
+    openSharedEntryMock.mockImplementation(() => new Promise(() => {}));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const slowBtn = (await screen.findByText('Slow Workspace')).closest('button')!;
+    fireEvent.click(slowBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(entrySlow.target));
+
+    const call1 = openSharedEntryOptionsMock.mock.calls.find(([t]) => t === entrySlow.target);
+    const signal1 = (call1?.[1] as { signal?: AbortSignal })?.signal;
+    expect(signal1?.aborted).toBe(false);
+
+    // User clicks owned server
+    fireEvent.click(screen.getByRole('button', { name: 'server-select' }));
+    await waitFor(() => expect(signal1?.aborted).toBe(true));
+  }, 20_000);
+
+  it('a late external-route result cannot undo a newer shared menu choice', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const a = { id: 'share-audit-a', serverId: 'srv-slow', serverName: 'Slow Server', role: 'participant', status: 'active', targetLabel: 'Audit Slow A', target: { kind: 'main', serverId: 'srv-slow', sessionName: 'deck_slow_brain' } } as const;
+    const b = { id: 'share-audit-b', serverId: 'srv-shared', serverName: 'Shared Server', role: 'participant', status: 'active', targetLabel: 'Audit Fast B', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' } } as const;
+    discoverSharedEntriesMock.mockResolvedValue([a, b]);
+    let finishA!: (x: unknown) => void;
+    openSharedEntryMock.mockImplementation((t: any) => t.serverId === 'srv-slow' ? new Promise(r => { finishA = r; }) : Promise.resolve(sharedMainOpenResult(b.id, 'dispatch-b')));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByText('Audit Fast B');
+    await navigateExternally('/#/srv-slow/deck_slow_brain?shared=share-audit-a');
+    expect(openSharedEntryMock).toHaveBeenCalledWith(a.target);
+    fireEvent.click(screen.getByText('Audit Fast B').closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await act(async () => {
+      finishA({
+        server: { id: 'srv-slow', name: 'Slow Server' },
+        target: a.target,
+        coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: [a.id], primaryShareId: a.id, authorizedAt: Date.now() },
+        sessions: [{ sessionName: 'deck_slow_brain', state: 'running', agentType: 'codex-sdk' }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.location.hash, 'new explicit B selection must survive old A completion').toBe('#/srv-shared/deck_beta_brain?shared=share-audit-b');
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).not.toBeNull();
+  }, 20_000);
+
+  it('same share id with a different preferred session is a new route intent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const a = { id: 'share-audit-whole', serverId: 'srv-shared', serverName: 'Shared Server', role: 'participant', status: 'active', targetLabel: 'Audit Whole Server', target: { kind: 'server', serverId: 'srv-shared' } } as const;
+    discoverSharedEntriesMock.mockResolvedValue([a]);
+    openSharedEntryMock.mockImplementation(() => new Promise(() => {}));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByText('Audit Whole Server');
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-audit-whole');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    const firstSignal = (openSharedEntryOptionsMock.mock.calls[0][1] as any).signal;
+    await navigateExternally('/#/srv-shared/deck_gamma_brain?shared=share-audit-whole');
+    expect(firstSignal.aborted).toBe(true);
+    expect(openSharedEntryMock, 'different preferred session must start its own authorized open').toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it('audit-tag-only-visited must never dispatch an ordinary server selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const entry = {
+      id: 'audit-main-only',
+      serverId: 'srv-shared',
+      serverName: 'Scoped shared server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Audit restricted tab',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('audit-main-only', 'audit-dispatch'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    fireEvent.click((await screen.findByText('Audit restricted tab')).closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await waitFor(() => expect(window.location.hash).toContain('shared=audit-main-only'));
+    const count = openSharedEntryMock.mock.calls.length;
+    const row = screen.queryByText('server-select-srv-shared');
+    if (row) {
+      fireEvent.click(row);
+      expect(window.location.hash, 're-clicking a non-owned row must not clear its share proof and dispatch the ordinary reload path').toContain('shared=audit-main-only');
+      await waitFor(() => expect(openSharedEntryMock, 'non-owned navigation must preserve scoped share proof').toHaveBeenCalledTimes(count + 1));
+      expect(openSharedEntryMock.mock.calls.at(-1)?.[0]).toEqual(entry.target);
+    } else {
+      expect(screen.getByText('Audit restricted tab')).toBeTruthy();
+    }
+  }, 20_000);
+
+  it('owned server having a whole-server grant preserves owner identity and uses ordinary selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-2');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // srv-1 is owned (in default mock servers). Also grant whole-server share for srv-1:
+    const grant = {
+      id: 'share-owned-conflict',
+      serverId: 'srv-1',
+      serverName: 'Server 1 Shared',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Server 1 Shared Copy',
+      target: { kind: 'server', serverId: 'srv-1' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const { App } = await importApp();
+    render(<App />);
+    // Clicking srv-1 must use ordinary server selection (not openSharedEntry)
+    const srv1Btn = await screen.findByText('server-select-srv-1');
+    fireEvent.click(srv1Btn);
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it('multiple whole-server grants on same server stably pick participant over viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const viewerGrant = {
+      id: 'share-viewer-first',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Multi Server Viewer',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    const participantGrant = {
+      id: 'share-participant-better',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Multi Server Participant',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([viewerGrant, participantGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-multi-grant', name: 'Multi Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: participantGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [participantGrant.id],
+        primaryShareId: participantGrant.id,
+        authorizedAt: Date.now(),
+      },
+      sessions: [{ sessionName: 'deck_multi_brain', state: 'running', agentType: 'codex-sdk' }],
+      subSessions: [],
+    });
+    const { App } = await importApp();
+    render(<App />);
+    const sharedBtn = (await screen.findByText('Multi Server Participant')).closest('button')!;
+    fireEvent.click(sharedBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(participantGrant.target));
+  }, 20_000);
+
+  it('whole-to-restricted downgrade or failed discovery does not invent fake whole-server entries', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // Discovery fails or only returns restricted grant
+    discoverSharedEntriesMock.mockRejectedValue(new Error('discovery failure'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    // Only owned servers exist; no unowned server exists
+    expect(screen.queryByText('server-select-srv-shared')).toBeNull();
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile server dropdown opens full menu for owned server and pin-only menu for shared-in server (plus pin/unpin reorder & indicators)', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const sharedGrant = {
+        id: 'share-ctx-test',
+        serverId: 'srv-shared-ctx',
+        serverName: 'Shared Server Ctx',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Shared Server Ctx',
+        target: { kind: 'server', serverId: 'srv-shared-ctx' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([sharedGrant]);
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // 1. Open mobile server dropdown
+      const mobileBtn = await waitFor(() => {
+        const btn = view.container.querySelector('.mobile-server-btn');
+        if (!btn) throw new Error('no mobile-server-btn');
+        return btn;
+      });
+      fireEvent.click(mobileBtn);
+
+      // 2. Owned server contextmenu opens full management menu
+      const menu = view.container.querySelector('.mobile-server-menu')!;
+      const alphaBtn = within(menu as HTMLElement).getByText('Alpha Server').closest('button')!;
+      fireEvent.contextMenu(alphaBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      expect(screen.getByText('server-menu-pin')).toBeTruthy();
+      expect(screen.getByText('server-menu-rename')).toBeTruthy();
+      expect(screen.getByText('server-menu-upgrade')).toBeTruthy();
+      expect(screen.getByText('server-menu-delete')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+
+      // 3. Shared-in server contextmenu opens Pin-only menu without owner actions
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const menuAgain = view.container.querySelector('.mobile-server-menu')!;
+      const sharedItemBtn = within(menuAgain as HTMLElement).getByText('Shared Server Ctx').closest('button')!;
+      fireEvent.contextMenu(sharedItemBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      const pinBtn = screen.getByText('server-menu-pin');
+      expect(pinBtn.getAttribute('data-pinned')).toBe('false');
+      expect(screen.queryByText('server-menu-push-mute')).toBeNull();
+      expect(screen.queryByText('server-menu-rename')).toBeNull();
+      expect(screen.queryByText('server-menu-upgrade')).toBeNull();
+      expect(screen.queryByText('server-menu-upgrade-all')).toBeNull();
+      expect(screen.queryByText('server-menu-delete')).toBeNull();
+
+      // 4. Click Pin -> shared-in server moves to the top and shows pinned state in mobile dropdown and mobile drawer
+      fireEvent.click(pinBtn);
+      fireEvent.click(screen.getByText('server-menu-close'));
+
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      await waitFor(() => {
+        const pinnedMenuItems = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'));
+        expect(pinnedMenuItems[0]?.textContent).toContain('Shared Server Ctx');
+        expect(pinnedMenuItems[0]?.classList.contains('pinned')).toBe(true);
+      });
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      // Check mobile sidebar drawer shows server-item-pin and pin-only context menu on shared-in item
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      ensureMobileSidebarServerListExpanded(view.container);
+      const sharedDrawerBtn = await waitFor(() => {
+        const btns = Array.from(view.container.querySelectorAll('.mobile-sidebar-body .server-item'));
+        const shared = btns.find((el) => el.textContent?.includes('Shared Server Ctx'));
+        if (!shared) throw new Error('no shared drawer button');
+        expect(btns[0]).toBe(shared);
+        expect(shared.querySelector('.server-item-pin')?.textContent).toBe('📌');
+        return shared;
+      });
+      fireEvent.contextMenu(sharedDrawerBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      const unpinBtn = screen.getByText('server-menu-pin');
+      expect(unpinBtn.getAttribute('data-pinned')).toBe('true');
+      expect(screen.queryByText('server-menu-rename')).toBeNull();
+
+      // 5. Click Unpin -> restores original order
+      fireEvent.click(unpinBtn);
+      fireEvent.click(screen.getByText('server-menu-close'));
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      await waitFor(() => {
+        const restoredMenuItems = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'));
+        expect(restoredMenuItems.map((el) => el.textContent)).toEqual([
+          expect.stringContaining('Alpha Server'),
+          expect.stringContaining('Shared Server Ctx'),
+        ]);
+        expect(restoredMenuItems[1]?.classList.contains('pinned')).toBe(false);
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('desktop ServerIconBar opens pin-only context menu on shared-in server and moves it to top', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedGrant = {
+      id: 'share-desktop-pin',
+      serverId: 'srv-shared-desktop',
+      serverName: 'Desktop Shared',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Desktop Shared',
+      target: { kind: 'server', serverId: 'srv-shared-desktop' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedGrant]);
+    const { App } = await importApp();
+    const view = render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    const sharedIcon = await waitFor(() => view.getByTestId('server-icon-srv-shared-desktop'));
+    expect(sharedIcon.getAttribute('data-pinned')).toBe('false');
+    fireEvent.contextMenu(sharedIcon);
+
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    const pinBtn = screen.getByText('server-menu-pin');
+    expect(pinBtn.getAttribute('data-pinned')).toBe('false');
+    expect(screen.queryByText('server-menu-push-mute')).toBeNull();
+    expect(screen.queryByText('server-menu-rename')).toBeNull();
+    expect(screen.queryByText('server-menu-upgrade')).toBeNull();
+    expect(screen.queryByText('server-menu-upgrade-all')).toBeNull();
+    expect(screen.queryByText('server-menu-delete')).toBeNull();
+
+    fireEvent.click(pinBtn);
+    fireEvent.click(screen.getByText('server-menu-close'));
+    await waitFor(() => {
+      const iconButtons = Array.from(view.container.querySelectorAll('[data-testid^="server-icon-srv-"]'));
+      expect(iconButtons.map((el) => el.getAttribute('data-testid'))).toEqual([
+        'server-icon-srv-shared-desktop',
+        'server-icon-srv-1',
+      ]);
+      expect(view.getByTestId('server-icon-srv-shared-desktop').getAttribute('data-pinned')).toBe('true');
+    });
+
+    fireEvent.contextMenu(view.getByTestId('server-icon-srv-shared-desktop'));
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    const unpinBtn = screen.getByText('server-menu-pin');
+    expect(unpinBtn.getAttribute('data-pinned')).toBe('true');
+    fireEvent.click(unpinBtn);
+    fireEvent.click(screen.getByText('server-menu-close'));
+
+    await waitFor(() => {
+      const iconButtons = Array.from(view.container.querySelectorAll('[data-testid^="server-icon-srv-"]'));
+      expect(iconButtons.map((el) => el.getAttribute('data-testid'))).toEqual([
+        'server-icon-srv-1',
+        'server-icon-srv-shared-desktop',
+      ]);
+      expect(view.getByTestId('server-icon-srv-shared-desktop').getAttribute('data-pinned')).toBe('false');
+    });
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile sidebar drawer opens ServerContextMenu for owned server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // Open mobile drawer
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const sidebarServer = await waitFor(() => {
+        const item = view.container.querySelector('.server-list .server-item');
+        if (!item) throw new Error('no sidebar server item');
+        return item;
+      });
+      fireEvent.contextMenu(sidebarServer);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('audit-presence: fresh online grant recovers an older offline visited snapshot', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const now = Date.now();
+    const visited = { id: 'audit-presence-server', name: 'Presence Server', status: 'offline', lastHeartbeatAt: now - 120000 };
+    const grant = { id: 'audit-presence-grant', serverId: visited.id, serverName: visited.name, role: 'viewer', status: 'active', targetLabel: 'Presence Server', target: { kind: 'server', serverId: visited.id }, serverStatus: 'online', lastHeartbeatAt: now - 1000 } as const;
+    expect(projectUnifiedServerList([visited], [grant], new Set())[0].online, 'fresh authoritative recovery must not be latched offline by an older cached status').toBe(true);
+  });
+
+  it('audit-presence: an older poll cannot resurrect a grant removed by a later poll', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const grant = { id: 'audit-poll-grant', serverId: 'audit-shared-server', serverName: 'Audit Poll Shared', targetLabel: 'Audit Poll Shared', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-shared-server' }, serverStatus: 'online', lastHeartbeatAt: Date.now() } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp(); render(<App />);
+    await screen.findByText('Audit Poll Shared');
+    let resolveOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { resolveOld = resolve; });
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await waitFor(() => expect(screen.queryByText('Audit Poll Shared')).toBeNull());
+    await act(async () => { resolveOld([grant]); await oldPromise; await Promise.resolve(); });
+    expect(screen.queryByText('Audit Poll Shared'), 'late old active-grant response must not undo the newer revoke result').toBeNull();
+  }, 15000);
+
+  it('audit-presence: pending discovery from account A cannot populate account B', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    let resolveOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { resolveOld = resolve; });
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    const { App } = await importApp(); render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    loginState.userId = 'audit-user-B';
+    fetchMeMock.mockResolvedValue({ id: 'audit-user-B', is_admin: false });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'audit-user-B' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] }; return {};
+    });
+    fireEvent.click(login);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_auth')!).userId).toBe('audit-user-B'));
+    await waitFor(() => expect(discoverSharedEntriesMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    const grant = { id: 'audit-A-private', serverId: 'audit-A-private-server', serverName: 'Account A Private Share', targetLabel: 'Account A Private Share', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-A-private-server' } };
+    await act(async () => { resolveOld([grant]); await oldPromise; await Promise.resolve(); });
+    expect(screen.queryByText('Account A Private Share'), 'old account response must not leak its share name and navigation into the new account').toBeNull();
+  }, 15000);
+
+  it('audit-presence: transient discovery network failure preserves last known good shared entries', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const grant = { id: 'audit-resilient-grant', serverId: 'audit-resilient-server', serverName: 'Audit Resilient Shared', targetLabel: 'Audit Resilient Shared', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-resilient-server' }, serverStatus: 'online', lastHeartbeatAt: Date.now() } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp(); render(<App />);
+    await screen.findByText('Audit Resilient Shared');
+
+    // Subsequent background poll fails with network error
+    discoverSharedEntriesMock.mockRejectedValueOnce(new Error('network error'));
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    await act(async () => { refresh(); await Promise.resolve(); });
+
+    // Server must still be present and not wiped to empty
+    expect(screen.queryByText('Audit Resilient Shared')).toBeTruthy();
+  }, 15000);
+
+  it('audit-presence: mobile server menu toolbar binds real callbacks and respects native platform gating', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    try {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+
+      // 1. Non-native web mode: Switch Cloud Server is suppressed, Home and AI Desk function
+      nativeState.value = false;
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      const mobileBtn = view.container.querySelector('.mobile-server-btn');
+      expect(mobileBtn).toBeTruthy();
+      fireEvent.click(mobileBtn!);
+
+      // Menu is open
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      expect(view.container.querySelector('.mobile-server-menu-home')).toBeTruthy();
+      expect(view.container.querySelector('.mobile-server-menu-change')).toBeNull(); // suppressed in non-native
+      const aiDeskBtn = view.container.querySelector('.mobile-server-menu-controlled-nodes');
+      expect(aiDeskBtn).toBeTruthy();
+
+      // Tap AI Desk closes menu and opens controlled nodes floating panel
+      fireEvent.click(aiDeskBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+
+      // Open menu again, test Home button closes menu and navigates to dashboard
+      fireEvent.click(mobileBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      const homeBtn = view.container.querySelector('.mobile-server-menu-home');
+      expect(homeBtn).toBeTruthy();
+      fireEvent.click(homeBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+      expect(localStorage.getItem('rcc_server')).toBeNull(); // cleared by handleBackToDashboard
+
+      cleanup();
+
+      // 2. Native mode: Switch Cloud Server is present and executes real credential/picker reset
+      nativeState.value = true;
+      getServerUrlMock.mockResolvedValue('http://localhost');
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const nativeView = render(<App />);
+      await waitFor(() => expect(nativeView.container.querySelector('.mobile-server-btn')).toBeTruthy());
+      const nativeMobileBtn = nativeView.container.querySelector('.mobile-server-btn');
+      fireEvent.click(nativeMobileBtn!);
+
+      expect(nativeView.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      const changeServerBtn = nativeView.container.querySelector('.mobile-server-menu-change');
+      expect(changeServerBtn).toBeTruthy();
+
+      // Tap Switch Cloud Server closes menu and triggers change server
+      fireEvent.click(changeServerBtn!);
+      expect(nativeView.container.querySelector('.mobile-server-menu')).toBeNull();
+      await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalled());
+    } finally {
+      nativeState.value = false;
+      getServerUrlMock.mockResolvedValue(null);
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20000);
+
+  it('audit-r2: actual markServerOffline event must beat the preceding grant observation', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const { markServerOffline } = await import('../src/server-online-state.js');
+    const now = Date.now();
+    const live = { id: 'audit-r2-shared', name: 'R2 Shared', status: 'online', lastHeartbeatAt: now - 5000 };
+    const grant = {
+      id: 'r2-grant',
+      serverId: live.id,
+      serverName: live.name,
+      targetLabel: live.name,
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'server', serverId: live.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: live.lastHeartbeatAt,
+    } as const;
+    const offline = markServerOffline([live], live.id)[0];
+    expect(offline.status).toBe('offline');
+    expect(
+      projectUnifiedServerList([offline], [grant], new Set())[0].presence,
+      'a real explicit offline event cannot be hidden by the prior same-heartbeat grant',
+    ).toBe('offline');
+  });
+
+  it('audit-r2: a silent replacement must finish an aborted foreground discovery loading lifecycle', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    let finishOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { finishOld = resolve; });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp();
+    const view = render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    await waitFor(() => expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(false));
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    fireEvent.click(view.container.querySelector('.shared-entries-refresh')!);
+    await waitFor(() => expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(true));
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(true);
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await act(async () => { finishOld([]); await oldPromise; await Promise.resolve(); });
+    await waitFor(() => expect(
+      view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled,
+      'latest valid silent completion must release loading/loaded state inherited from its foreground predecessor',
+    ).toBe(false));
+  }, 15000);
+
+  it('audit-r2: fresh online grant recovers offline server after markServerOffline', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const { markServerOffline } = await import('../src/server-online-state.js');
+    const now = Date.now();
+    const live = { id: 'audit-recover-shared', name: 'Recover Shared', status: 'online', lastHeartbeatAt: now - 10000 };
+    const offline = markServerOffline([live], live.id, now - 5000)[0];
+    const freshGrant = {
+      id: 'fresh-grant',
+      serverId: live.id,
+      serverName: live.name,
+      targetLabel: live.name,
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'server', serverId: live.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 1000,
+      statusObservedAt: now - 1000,
+    } as const;
+    const projected = projectUnifiedServerList([offline], [freshGrant], new Set());
+    expect(projected[0].presence).toBe('online');
+    expect(projected[0].online).toBe(true);
+  });
+
+  it('audit-r3-legacy: opening a share with missing presence does not invent a daemon heartbeat', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const grant = {
+        id: 'legacy-open',
+        serverId: 'srv-shared',
+        serverName: 'Legacy Shared',
+        targetLabel: 'Legacy Shared',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'server', serverId: 'srv-shared' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([grant]);
+      openSharedEntryMock.mockResolvedValue({
+        ...sharedMainOpenResult(grant.id, 'legacy-open-dispatch', 'viewer'),
+        server: { id: 'srv-shared', name: 'Legacy Shared', status: null, lastHeartbeatAt: null },
+        target: grant.target,
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const initialRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Legacy Shared').closest('button')!;
+      expect(initialRow.querySelector('.mobile-server-menu-dot-unknown')).toBeTruthy();
+      fireEvent.click(initialRow);
+      await screen.findByTestId('session-pane-deck_beta_brain');
+      expect(openSharedEntryMock).toHaveBeenCalledWith(grant.target);
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const visitedRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Legacy Shared').closest('button')!;
+      expect(visitedRow.querySelector('.mobile-server-menu-dot-unknown'), 'a successful share authorization with null presence is not a daemon heartbeat and must remain unknown').toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+
+  it('audit-r3-positive: opening a share with genuine heartbeat transitions to online', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const grant = {
+        id: 'live-open',
+        serverId: 'srv-shared-live',
+        serverName: 'Live Shared',
+        targetLabel: 'Live Shared',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'server', serverId: 'srv-shared-live' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([grant]);
+      openSharedEntryMock.mockResolvedValue({
+        ...sharedMainOpenResult(grant.id, 'live-open-dispatch', 'viewer'),
+        server: { id: 'srv-shared-live', name: 'Live Shared', status: 'online', lastHeartbeatAt: Date.now() },
+        target: grant.target,
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const initialRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Live Shared').closest('button')!;
+      expect(initialRow.querySelector('.mobile-server-menu-dot-unknown')).toBeTruthy();
+      fireEvent.click(initialRow);
+      await screen.findByTestId('session-pane-deck_beta_brain');
+      expect(openSharedEntryMock).toHaveBeenCalledWith(grant.target);
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const visitedRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Live Shared').closest('button')!;
+      expect(visitedRow.querySelector('.mobile-server-menu-dot-online'), 'a successful share authorization with genuine heartbeat transitions to online').toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+
+  it('wires FileBrowser onOpenNodeGroups to open ControlledNodesPanel floating window', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('picker.files'));
+    const fbPanel = await screen.findByTestId('floating-panel-filebrowser');
+    fireEvent.click(within(fbPanel).getByText('file-open-node-groups'));
+
+    const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+    expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
+  }, 15000);
+
+  it('closes mobile file browser overlay and opens ControlledNodesPanel via NodeGroupsNavContext', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+    });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(pane.getAttribute('data-mobile-fb-open')).toBe('false');
+
+      fireEvent.click(screen.getByTitle('Files'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('true'));
+
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-mobile-open-node-groups'));
+
+      const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('false'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+});
+
+describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote focus', () => {
+  beforeEach(() => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+  });
+
+  it('navigates tabs in visual SessionTabs order (pinned + tab_order) and servers via non-Mac Alt+IKJL while .controls-input has focus, without intercepting Ctrl+W/S/A/D', async () => {
+    // Visual order should be: deck_gamma_brain (pinned), deck_beta_brain (first in tab_order), deck_alpha_brain
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_gamma_brain');
+    localStorage.setItem('rcc_tab_pinned', JSON.stringify(['deck_gamma_brain']));
+    localStorage.setItem('rcc_tab_order', JSON.stringify(['deck_beta_brain', 'deck_alpha_brain', 'deck_gamma_brain']));
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+      // Ctrl+w / Ctrl+d MUST NOT intercept on Windows/Linux (avoids closing/conflicting with browser tabs)
+      const ctrlWEvt = new KeyboardEvent('keydown', { key: 'w', code: 'KeyW', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(ctrlWEvt);
+      expect(ctrlWEvt.defaultPrevented).toBe(false);
+      const ctrlDEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(ctrlDEvt);
+      expect(ctrlDEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Alt+i/k/j/l defer properly inside .xterm, .remote-desktop-canvas, <input>, [contenteditable], and [data-shortcut-recording] on Windows/Linux
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermInput = document.createElement('textarea');
+      xtermInput.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermInput);
+      document.body.appendChild(xtermWrap);
+      xtermInput.focus();
+      const xtermAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      xtermInput.dispatchEvent(xtermAltL);
+      expect(xtermAltL.defaultPrevented).toBe(false);
+      xtermWrap.remove();
+
+      const rdCanvas = document.createElement('canvas');
+      rdCanvas.className = 'remote-desktop-canvas';
+      rdCanvas.tabIndex = 0;
+      document.body.appendChild(rdCanvas);
+      rdCanvas.focus();
+      const rdAltK = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      rdCanvas.dispatchEvent(rdAltK);
+      expect(rdAltK.defaultPrevented).toBe(false);
+      rdCanvas.remove();
+
+      const plainInput = document.createElement('input');
+      document.body.appendChild(plainInput);
+      plainInput.focus();
+      const inputAltJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      plainInput.dispatchEvent(inputAltJ);
+      expect(inputAltJ.defaultPrevented).toBe(false);
+      plainInput.remove();
+
+      const ceDiv = document.createElement('div');
+      ceDiv.contentEditable = 'true';
+      ceDiv.tabIndex = 0;
+      document.body.appendChild(ceDiv);
+      ceDiv.focus();
+      const ceAltI = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      ceDiv.dispatchEvent(ceAltI);
+      expect(ceAltI.defaultPrevented).toBe(false);
+      ceDiv.remove();
+
+      const recBtn = document.createElement('button');
+      recBtn.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recBtn);
+      recBtn.focus();
+      const recAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      recBtn.dispatchEvent(recAltL);
+      expect(recAltL.defaultPrevented).toBe(false);
+      recBtn.remove();
+
+      gammaComposer.focus();
+
+      // Alt+l from inside .controls-input switches to next visual tab (deck_beta_brain) & calls preventDefault()
+      const { isHoverPreviewSuppressed } = await import('../src/hover-preview-gate.js');
+      expect(isHoverPreviewSuppressed()).toBe(false);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 400, clientY: 220 })); });
+
+      const rightEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(rightEvt);
+      expect(rightEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+
+      // Same-coordinate synthetic move after tab switch keeps suppression active until pointer moves.
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 400, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 402, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
+
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+
+      // Alt+j wraps/steps back to deck_gamma_brain
+      const leftEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(leftEvt);
+      expect(leftEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 403, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+      // Alt+k switches to next server (srv-2 -> deck_delta_brain), auto-focuses its composer, and suppresses hover previews
+      const downEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(downEvt);
+      expect(downEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 404, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
+
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+
+      // Alt+i switches back to srv-1
+      const upEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(upEvt);
+      expect(upEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy());
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('supports macOS Alt+IKJL primary and Ctrl+W/S/A/D secondary defaults, independent secondary clear, blocking guards, and custom overrides', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Secondary Ctrl+d / Ctrl+a defaults work on macOS and show pressed secondary keycaps in watermark
+      const ctrlDEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(ctrlDEvt);
+      expect(ctrlDEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'D']);
+
+      const betaComposerForCtrlA = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposerForCtrlA));
+      const ctrlAEvt = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      betaComposerForCtrlA.dispatchEvent(ctrlAEvt);
+      expect(ctrlAEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'A']);
+
+      // Legacy Ctrl+ArrowRight and Meta+Shift+ArrowRight should NOT trigger under unified Alt+IKJL + Ctrl+WSAD defaults
+      const ctrlArrowEvt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(ctrlArrowEvt);
+      expect(ctrlArrowEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      const metaShiftRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(metaShiftRight);
+      expect(metaShiftRight.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // macOS unified Option/Alt+l triggers tabNext inside composer
+      const altL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(altL);
+      expect(altL.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Non-editable sidebar/button focus also responds to Option+j dead-key (tabPrev via window capture)
+      const settingsBtn = screen.getByText('server-settings');
+      settingsBtn.focus();
+      const altJDead = new KeyboardEvent('keydown', { key: 'Dead', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      settingsBtn.dispatchEvent(altJDead);
+      expect(altJDead.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Switch to beta so subsequent guards verify non-switching
+      const altLAgain = new KeyboardEvent('keydown', { key: '¬', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(altLAgain);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Blocking guard: terminal xterm element does NOT intercept
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermInput = document.createElement('textarea');
+      xtermInput.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermInput);
+      document.body.appendChild(xtermWrap);
+      xtermInput.focus();
+      const termEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      xtermInput.dispatchEvent(termEvt);
+      expect(termEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      xtermWrap.remove();
+
+      // Blocking guard: non-composer text input does NOT intercept
+      const plainInput = document.createElement('input');
+      plainInput.type = 'text';
+      document.body.appendChild(plainInput);
+      plainInput.focus();
+      const inputEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      plainInput.dispatchEvent(inputEvt);
+      expect(inputEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      plainInput.remove();
+
+      // Blocking guard: shortcut recording button does NOT intercept
+      const recBtn = document.createElement('button');
+      recBtn.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recBtn);
+      recBtn.focus();
+      const recEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      recBtn.dispatchEvent(recEvt);
+      expect(recEvt.defaultPrevented).toBe(false);
+      recBtn.remove();
+
+      // Open Settings -> Alt+j is blocked while Settings overlay is open -> customize explicit Meta+ArrowLeft/Right override
+      fireEvent.click(screen.getByText('server-settings'));
+      expect(screen.getByText('settings-page')).toBeTruthy();
+
+      const whileSettingsEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(whileSettingsEvt);
+      expect(whileSettingsEvt.defaultPrevented).toBe(false);
+
+      fireEvent.click(screen.getByText('settings-meta-tab-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      // Explicit custom Meta+ArrowLeft/Right override still works immediately (while unmapped Alt+j does not)
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      betaComposer.focus();
+      const unmappedAltJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(unmappedAltJ);
+      expect(unmappedAltJ.defaultPrevented).toBe(false);
+
+      const customMetaLeft = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(customMetaLeft);
+      expect(customMetaLeft.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Further customize to Alt+ArrowRight -> switches immediately from alpha -> beta
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-custom-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const alphaComposerAgain = screen.getByTestId('pane-composer-deck_alpha_brain');
+      alphaComposerAgain.focus();
+      const customAltRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', altKey: true, bubbles: true, cancelable: true });
+      alphaComposerAgain.dispatchEvent(customAltRight);
+      expect(customAltRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Clearing ONLY macOS secondary Ctrl+a stops intercepting Ctrl+A while keeping Option+J working
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-clear-mac-ctrl-a'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const betaComposerClearedCtrlA = screen.getByTestId('pane-composer-deck_beta_brain');
+      betaComposerClearedCtrlA.focus();
+      const clearedCtrlA = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      betaComposerClearedCtrlA.dispatchEvent(clearedCtrlA);
+      expect(clearedCtrlA.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+
+      const keptAltJ = new KeyboardEvent('keydown', { key: '∆', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposerClearedCtrlA.dispatchEvent(keptAltJ);
+      expect(keptAltJ.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'J']);
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('auto-focuses SubSessionWindow composer on desktop, skips auto-focus on mobile, and focuses composer on pinned-panel quote', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-focus-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-focus-1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Focus Worker',
+        type: 'codex',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_sync_sidebar_pinned_panels', JSON.stringify({
+      t: 10,
+      v: [{ id: 'pin-sub-1', type: 'subsession', serverId: 'srv-1', props: { sessionName: 'deck_sub_sub-focus-1', serverId: 'srv-1' } }],
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Clicking pinned-quote from sidebar button appends quote and returns focus to active composer
+    const pinnedQuoteBtn = await screen.findByTestId('pinned-quote-filebrowser:deck_alpha_brain');
+    pinnedQuoteBtn.focus();
+    fireEvent.click(pinnedQuoteBtn);
+    expect(alphaComposer.textContent).toContain('> quoted from pinned');
+    expect(document.activeElement).toBe(alphaComposer);
+
+    // Opening sub-session window on desktop auto-focuses sub-window composer .controls-input
+    fireEvent.click(screen.getByText('subbar-open'));
+    const subComposer = await screen.findByTestId('sub-window-controls-input-sub-focus-1');
+    await waitFor(() => expect(document.activeElement).toBe(subComposer));
+
+    cleanup();
+
+    // Mobile: auto-focus and desktop keyboard shortcuts MUST NOT trigger
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+    });
+    try {
+      const mobileMod = await importApp();
+      render(<mobileMod.App />);
+      const mobileComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(document.activeElement).not.toBe(mobileComposer);
+
+      const mobileRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      document.dispatchEvent(mobileRight);
+      expect(mobileRight.defaultPrevented).toBe(false);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+
+  it('refocuses main composer after visiting a terminal sub-session and returning, and recovers focus once after an overlay blocks target switch', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-term-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-term-1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Terminal Worker',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Open terminal-mode subwindow -> composer is NOT focused and terminal retains focus across polling renders
+    fireEvent.click(screen.getByText('subbar-open'));
+    const subRoot = await screen.findByTestId('sub-session-window-sub-term-1');
+    expect(subRoot.getAttribute('data-view-mode')).toBe('terminal');
+    const termInput = document.createElement('textarea');
+    termInput.className = 'xterm-helper-textarea';
+    subRoot.appendChild(termInput);
+    termInput.focus();
+    expect(document.activeElement).toBe(termInput);
+
+    // Emit WS session_list polling update while terminal subwindow stays open -> terminal keeps focus
+    act(() => {
+      wsInstances[wsInstances.length - 1]?.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code', state: 'running' },
+          { name: 'deck_beta_brain', project: 'beta', role: 'brain', agentType: 'codex-sdk', state: 'idle' },
+        ],
+      });
+    });
+    expect(document.activeElement).toBe(termInput);
+
+    // Click main tab deck_alpha_brain -> closes subwindow and refocuses main composer
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => expect(subRoot.getAttribute('data-visible')).toBe('false'));
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // While staying on deck_alpha_brain, if user focuses another control, polling must NOT steal focus back
+    const tabBtn = screen.getByText('tabs-select-deck_beta_brain');
+    const unrelatedBtn = screen.getByText('server-toggle-sidebar');
+    unrelatedBtn.focus();
+    expect(document.activeElement).toBe(unrelatedBtn);
+    act(() => {
+      wsInstances[wsInstances.length - 1]?.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code', state: 'idle' },
+          { name: 'deck_beta_brain', project: 'beta', role: 'brain', agentType: 'codex-sdk', state: 'idle' },
+        ],
+      });
+    });
+    expect(document.activeElement).toBe(unrelatedBtn);
+
+    // Blocked-target recovery: open a modal overlay -> switch to deck_beta_brain while blocked -> close modal -> beta composer focuses
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+
+    fireEvent.click(tabBtn);
+    await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    expect(document.activeElement).toBe(modalInput);
+
+    modal.remove();
+    const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+    await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+  }, 15000);
+
+  it('persists Ctrl+Shift++ and Shift+PageDown shortcut overrides across reload and uses them to navigate tabs and servers', async () => {
+    syncedPrefs.enabled = true;
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await screen.findByTestId('pane-composer-deck_alpha_brain');
+
+      // Configure Ctrl+Shift+Plus for tabNext and Shift+PageDown for serverNext via SettingsPage
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-plus-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      // Simulate reload with persisted keyboard_shortcuts_v1 preference intact
+      cleanup();
+      const reloadedMod = await importApp();
+      render(<reloadedMod.App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Press Ctrl+Shift++ (`key: '+'`, `code: 'Equal'`) inside composer -> navigates to deck_beta_brain
+      const plusEvt = new KeyboardEvent('keydown', { key: '+', code: 'Equal', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(plusEvt);
+      expect(plusEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      const sessionHud = screen.getByTestId('server-switch-watermark');
+      expect(sessionHud.getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Ctrl', 'Shift', '+']);
+
+      // Press Shift+PageDown inside composer -> switches server to srv-2
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+      const pageDownEvt = new KeyboardEvent('keydown', { key: 'PageDown', code: 'PageDown', shiftKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(pageDownEvt);
+      expect(pageDownEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+      const customKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
+      expect(customKeycaps).toEqual(['Shift', 'PgDn']);
+    } finally {
+      syncedPrefs.enabled = false;
+    }
+  }, 15000);
+
+  it('opens and focuses numbered sub-session composer via configurable modifiers + 1..9 and closes all via modifier + 0', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-quick-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_quick_1',
+        parentSession: 'deck_alpha_brain',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        label: 'First Sub',
+        state: 'idle',
+      },
+      {
+        id: 'sub-quick-2',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_quick_2',
+        parentSession: 'deck_alpha_brain',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        label: 'Second Sub',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+      // Ctrl+0 when none open: prevents default and stays a clean no-op
+      const emptyCloseEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(emptyCloseEvt);
+      expect(emptyCloseEvt.defaultPrevented).toBe(true);
+      expect(screen.queryByTestId('sub-session-window-sub-quick-1')).toBeNull();
+
+      // Ctrl+1 from main composer -> opens sub-quick-1 and auto-focuses sub-quick-1 composer
+      const open1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(open1Evt);
+      expect(open1Evt.defaultPrevented).toBe(true);
+      const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-quick-1');
+      await waitFor(() => expect(document.activeElement).toBe(sub1Input));
+
+      // Ctrl+2 while sub-quick-1 composer is focused -> opens sub-quick-2 and auto-focuses sub-quick-2 composer
+      const open2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      sub1Input.dispatchEvent(open2Evt);
+      expect(open2Evt.defaultPrevented).toBe(true);
+      const sub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => expect(document.activeElement).toBe(sub2Input));
+
+      // Re-pressing Ctrl+2 toggles sub-quick-2 closed (minimized) and returns focus to sub1Input
+      const toggleClose2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      sub2Input.dispatchEvent(toggleClose2Evt);
+      expect(toggleClose2Evt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(sub1Input);
+      });
+
+      // Re-pressing Ctrl+2 opens & auto-focuses sub-quick-2 again
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      const reopenedSub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reopenedSub2Input);
+      });
+
+      // Blocking guards: IME composing / active shortcut recording must NOT fire Ctrl+0
+      const imeEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(imeEvt);
+      expect(imeEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-quick-1')).toBeTruthy();
+
+      const recorder = document.createElement('button');
+      recorder.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorder);
+      const recEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      recorder.dispatchEvent(recEvt);
+      expect(recEvt.defaultPrevented).toBe(false);
+      recorder.remove();
+
+      // Ctrl+0 inside .xterm-helper-textarea DOES trigger return-to-main-window and minimizes open sub-sessions
+      const xterm = document.createElement('div');
+      xterm.className = 'xterm';
+      const xtermArea = document.createElement('textarea');
+      xtermArea.className = 'xterm-helper-textarea';
+      xterm.appendChild(xtermArea);
+      document.body.appendChild(xterm);
+      xtermArea.focus();
+      const termEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      xtermArea.dispatchEvent(termEvt);
+      expect(termEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+      });
+      xterm.remove();
+
+      // Re-open sub-quick-1 and sub-quick-2 before testing Ctrl+0 from sub-session composer
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('true'));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      const sub2Reopened = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true'));
+
+      // Ctrl+0 closes all open sub-session windows and prevents default
+      sub2Reopened.focus();
+      const closeAllEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      sub2Input.dispatchEvent(closeAllEvt);
+      expect(closeAllEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+      });
+
+      // Reverse visual order -> Ctrl+1 now opens sub-quick-2 and focuses its input
+      fireEvent.click(screen.getByText('subbar-reverse-order'));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      const reorderedFirstInput = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reorderedFirstInput);
+      });
+
+      // Customize subSessionCloseAll to Alt+Shift+x -> plain Ctrl+0 stops triggering, Alt+Shift+x closes all
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-close-all-alt-shift-x'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const plainCtrl0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(plainCtrl0);
+      expect(plainCtrl0.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+
+      const customCloseAllEvt = new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(customCloseAllEvt);
+      expect(customCloseAllEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false'));
+
+      // Configure Ctrl+Shift -> Ctrl+Shift+Digit1 (key '!') toggles open and then toggles closed again
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-subsession-ctrl-shift'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const ctrlShift1 = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlShift1);
+      expect(ctrlShift1.defaultPrevented).toBe(true);
+      const reopenedInput = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reopenedInput);
+      });
+
+      const ctrlShift1Close = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlShift1Close);
+      expect(ctrlShift1Close.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+        expect(document.activeElement).toBe(mainInput);
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('triggers subSessionCloseAll in Remote Desktop (windowed & fullscreen), Remote Desktop Wall, and floating panel inputs, minimizing supported windows and closing overlays while keeping nav shortcuts blocked', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      { id: 'sub-rd-1', sessionName: 'deck_sub_rd_1', parentSession: 'deck_alpha_brain', label: 'RD1', description: '', cwd: '/work/alpha', type: 'claude-code', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const originalPlatform = navigator.platform;
+    const origFsEl = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    const origExitFs = Object.getOwnPropertyDescriptor(document, 'exitFullscreen');
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Linux x86_64' });
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+      // Open sub-session, ControlledNodes -> RemoteDesktopWorkspace + RemoteDesktopWall, and CloudDocs
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-rd-1').getAttribute('data-visible')).toBe('true'));
+
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const rdWorkspace = await screen.findByTestId('remote-desktop-workspace');
+      expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      expect(await screen.findByTestId('remote-desktop-wall')).toBeTruthy();
+      expect(screen.getByText('remote-desktop-wall-minimized:false')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('desktop-cloud-docs-btn'));
+      expect(await screen.findByTestId('floating-panel-cloud-docs')).toBeTruthy();
+
+      // Inside Remote Desktop surface / fullscreen: Alt+k and Ctrl+1 remain blocked, while Ctrl+0 exits fullscreen, minimizes RD + Wall + sub-sessions, and closes CloudDocs + ControlledNodes
+      const rdSurface = document.createElement('canvas');
+      rdSurface.className = 'remote-desktop-canvas';
+      rdSurface.setAttribute('data-remote-desktop-surface', 'true');
+      rdSurface.tabIndex = 0;
+      rdWorkspace.appendChild(rdSurface);
+      rdSurface.focus();
+
+      const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: rdWorkspace });
+      Object.defineProperty(document, 'exitFullscreen', { configurable: true, value: exitFullscreen });
+
+      const navInRdEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(navInRdEvt);
+      expect(navInRdEvt.defaultPrevented).toBe(false);
+
+      const quickSubInRdEvt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(quickSubInRdEvt);
+      expect(quickSubInRdEvt.defaultPrevented).toBe(false);
+
+      const ctrl0InFullscreenRd = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(ctrl0InFullscreenRd);
+      expect(ctrl0InFullscreenRd.defaultPrevented).toBe(true);
+      expect(exitFullscreen).toHaveBeenCalledTimes(1);
+
+      await waitFor(() => {
+        expect(screen.getByText('remote-desktop-minimized:true')).toBeTruthy();
+        expect(screen.getByText('remote-desktop-wall-minimized:true')).toBeTruthy();
+        expect(screen.getByTestId('sub-session-window-sub-rd-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect(screen.queryByTestId('floating-panel-cloud-docs')).toBeNull();
+        expect(document.activeElement).toBe(mainInput);
+      });
+
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: null });
+      rdSurface.remove();
+
+      // Customize subSessionCloseAll to Alt+Shift+x -> works inside a panel <input> too, while plain Ctrl+0 is ignored
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-close-all-alt-shift-x'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      fireEvent.click(screen.getByTestId('desktop-cloud-docs-btn'));
+      const cloudDocsReopened = await screen.findByTestId('floating-panel-cloud-docs');
+      const panelInput = document.createElement('input');
+      cloudDocsReopened.appendChild(panelInput);
+      panelInput.focus();
+
+      const plainCtrl0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      panelInput.dispatchEvent(plainCtrl0);
+      expect(plainCtrl0.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('floating-panel-cloud-docs')).toBeTruthy();
+
+      const customEvt = new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      panelInput.dispatchEvent(customEvt);
+      expect(customEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-cloud-docs')).toBeNull();
+        expect(document.activeElement).toBe(mainInput);
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+      if (origFsEl) Object.defineProperty(document, 'fullscreenElement', origFsEl);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+      if (origExitFs) Object.defineProperty(document, 'exitFullscreen', origExitFs);
+      else delete (document as { exitFullscreen?: () => Promise<void> }).exitFullscreen;
+    }
+  }, 15000);
+
+  it('toggles task-pair split view with Ctrl+Shift+1..9 by numbered task order, ignores non-splittable/recording/inputs, and keeps Ctrl+1 independent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      { id: 'sub-1', sessionName: 'deck_sub_alpha_a', parentSession: 'deck_alpha_brain', label: 'A', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+      { id: 'sub-2', sessionName: 'deck_sub_alpha_b', parentSession: 'deck_alpha_brain', label: 'B', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    clearAllSupervisionTaskConsoleCaches();
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Wait for SupervisionTaskPairSnapshotBridge to settle its initial disconnected/unavailable
+      // publication before injecting the test's synthetic snapshot; under slow CI coverage load
+      // that effect can otherwise run after line assignment and overwrite __imcodesTaskPairSnapshot.
+      await waitFor(() => {
+        expect((window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot?.authorityUnavailable).toBe(true);
+      });
+
+      const snapshot = {
+        authoritative: true,
+        serverId: 'srv-1',
+        tasks: [
+          { taskId: 'task-1', title: 'Primary Splittable', status: 'working', updatedAt: 10, pair: { status: 'working', executor: 'deck_sub_alpha_a', auditor: 'deck_sub_alpha_b' } },
+          { taskId: 'task-2', title: 'No Auditor Task', status: 'working', updatedAt: 20, pair: { status: 'working', executor: 'deck_sub_alpha_a', auditor: 'none' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      act(() => {
+        window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: snapshot }));
+      });
+
+      // Ctrl+Shift+Digit1 (key '!') inside active composer opens split view for #1 task
+      const openEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(openEvt);
+      expect(openEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('true');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('true');
+      });
+
+      // Ctrl+Shift+2 on auditor='none' task safely no-ops without closing active split or preventing default
+      const nonSplittableEvt = new KeyboardEvent('keydown', { key: '@', code: 'Digit2', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(nonSplittableEvt);
+      expect(nonSplittableEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+
+      // Blocked when arbitrary non-composer input is focused
+      const otherInput = document.createElement('input');
+      document.body.appendChild(otherInput);
+      otherInput.focus();
+      const inInputEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      otherInput.dispatchEvent(inInputEvt);
+      expect(inInputEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+      otherInput.remove();
+
+      // Blocked during active shortcut recording (data-shortcut-recording="true")
+      alphaComposer.focus();
+      const recorderEl = document.createElement('div');
+      recorderEl.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorderEl);
+      const whileRecordingEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(whileRecordingEvt);
+      expect(whileRecordingEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+      recorderEl.remove();
+
+      // Second Ctrl+Shift+Digit1 toggles split view closed
+      const closeEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(closeEvt);
+      expect(closeEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      });
+
+      // Plain Ctrl+1 still opens sub-session 1 cleanly without triggering split view
+      alphaComposer.focus();
+      const plainSub1 = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, shiftKey: false, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(plainSub1);
+      expect(plainSub1.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('true');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      });
+    } finally {
+      clearAllSupervisionTaskConsoleCaches();
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    }
+  }, 15000);
+
+  it('toggles Task Mode and Workspace via Ctrl+Shift+T, respects custom overrides, and ignores IME/recording/modals', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+    const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+
+    // 1. Default Ctrl+Shift+T enters Task Mode even from workspace composer
+    const enterEvt = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    mainInput.dispatchEvent(enterEvt);
+    expect(enterEvt.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy());
+
+    // 2. Open modal dialog (aria-modal="true") blocks toggle while open
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+
+    const blockedInModal = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    modalInput.dispatchEvent(blockedInModal);
+    expect(blockedInModal.defaultPrevented).toBe(false);
+    expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
+    modal.remove();
+
+    // 3. IME composition is ignored
+    const imeEvt = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      isComposing: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(imeEvt);
+    expect(imeEvt.defaultPrevented).toBe(false);
+    expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
+
+    // 4. Second Ctrl+Shift+T exits Task Mode back to Workspace
+    const exitEvt = new KeyboardEvent('keydown', {
+      key: 't',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(exitEvt);
+    expect(exitEvt.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+
+    // 5. Custom recorded shortcut Alt+t overrides Ctrl+Shift+T
+    fireEvent.click(screen.getByText('server-settings'));
+    fireEvent.click(await screen.findByText('settings-toggle-task-mode-alt-t'));
+    fireEvent.click(screen.getByText('settings-back'));
+
+    const oldCtrlShiftT = new KeyboardEvent('keydown', {
+      key: 'T',
+      code: 'KeyT',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(oldCtrlShiftT);
+    expect(oldCtrlShiftT.defaultPrevented).toBe(false);
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+
+    const customAltT = new KeyboardEvent('keydown', {
+      key: 't',
+      code: 'KeyT',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(customAltT);
+    expect(customAltT.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy());
+  }, 25000);
+
+  it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-guard-term',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-guard-term',
+        parentSession: 'deck_alpha_brain',
+        label: 'Terminal Sub',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+      {
+        id: 'sub-guard-chat',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-guard-chat',
+        parentSession: 'deck_alpha_brain',
+        label: 'Chat Sub',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'chat',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Open terminal subwindow -> focus its header chrome mode button -> Alt+l must NOT switch main tab on Win32
+      fireEvent.click(screen.getByText('subbar-open-sub-guard-term'));
+      const termRoot = await screen.findByTestId('sub-session-window-sub-guard-term');
+      expect(termRoot.getAttribute('data-view-mode')).toBe('terminal');
+      const headerBtn = screen.getByText('sub-window-mode-btn-sub-guard-term');
+      headerBtn.focus();
+      expect(document.activeElement).toBe(headerBtn);
+
+      const navFromHeader = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      headerBtn.dispatchEvent(navFromHeader);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Also when focus moves to document.body while terminal subwindow stays active -> main tab stays unchanged
+      headerBtn.blur();
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Open chat subwindow -> composer auto-focuses and Alt+l DOES navigate main tabs on Win32
+      fireEvent.click(screen.getByText('subbar-open-sub-guard-chat'));
+      const chatSubComposer = await screen.findByTestId('sub-window-controls-input-sub-guard-chat');
+      await waitFor(() => expect(document.activeElement).toBe(chatSubComposer));
+      const chatNavEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      chatSubComposer.dispatchEvent(chatNavEvt);
+      expect(chatNavEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('allows Alt+IKJL tab/server navigation, Ctrl+1 quick sub-session, and Ctrl+Shift+1 pair split while non-modal desktop FloatingPanel windows are open without stealing focus, while keeping modals/recording/xterm/text-inputs blocked', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-shell-bg',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_shell_bg',
+        parentSession: 'deck_alpha_brain',
+        label: 'Shell BG',
+        type: 'shell',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+      {
+        id: 'sub-chat-fg',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_chat_fg',
+        parentSession: 'deck_alpha_brain',
+        label: 'Chat FG',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    clearAllSupervisionTaskConsoleCaches();
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Open background shell sub-session first, then open non-modal desktop file browser FloatingPanel
+      fireEvent.click(screen.getByText('subbar-open-sub-shell-bg'));
+      expect((await screen.findByTestId('sub-session-window-sub-shell-bg')).getAttribute('data-visible')).toBe('true');
+
+      fireEvent.click(screen.getByTitle('picker.files'));
+      const fbPanel = await screen.findByTestId('floating-panel-filebrowser');
+      const fbButton = within(fbPanel).getByText('file-confirm');
+      const fbCheckbox = document.createElement('input');
+      fbCheckbox.type = 'checkbox';
+      fbPanel.appendChild(fbCheckbox);
+
+      // 1) Focus inside FloatingPanel button -> Alt+l switches tab without stealing focus back to underlying composer
+      fbButton.focus();
+      expect(document.activeElement).toBe(fbButton);
+      const tabNextEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      fbButton.dispatchEvent(tabNextEvt);
+      expect(tabNextEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(document.activeElement).toBe(fbButton);
+
+      // 2) Focus on non-text checkbox inside FloatingPanel -> Alt+j switches tab back without stealing focus
+      fbCheckbox.focus();
+      const tabPrevEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      fbCheckbox.dispatchEvent(tabPrevEvt);
+      expect(tabPrevEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(document.activeElement).toBe(fbCheckbox);
+
+      // 3) Quick sub-session Ctrl+2 and pair split Ctrl+Shift+1 work while FloatingPanel is open
+      const quickSub2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      fbButton.focus();
+      fbButton.dispatchEvent(quickSub2);
+      expect(quickSub2.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-chat-fg').getAttribute('data-visible')).toBe('true'));
+
+      await waitFor(() => {
+        expect((window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot?.authorityUnavailable).toBe(true);
+      });
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+        authoritative: true,
+        serverId: 'srv-1',
+        tasks: [
+          { taskId: 'task-fg-1', title: 'FG Split', status: 'working', updatedAt: 10, pair: { status: 'working', executor: 'deck_sub_shell_bg', auditor: 'deck_sub_chat_fg' } },
+        ],
+      };
+
+      fbButton.focus();
+      const pairSplitEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      fbButton.dispatchEvent(pairSplitEvt);
+      expect(pairSplitEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-shell-bg').getAttribute('data-task-pair-visit')).toBe('task-fg-1');
+        expect(screen.getByTestId('sub-session-window-sub-chat-fg').getAttribute('data-visible')).toBe('true');
+      });
+
+      // Focus inside .xterm still blocks Alt+l even while FloatingPanel is open
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermTa = document.createElement('textarea');
+      xtermTa.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermTa);
+      document.body.appendChild(xtermWrap);
+      xtermTa.focus();
+      const xtermBlockedEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      xtermTa.dispatchEvent(xtermBlockedEvt);
+      expect(xtermBlockedEvt.defaultPrevented).toBe(false);
+      xtermWrap.remove();
+
+      // Minimize open sub-sessions and close file browser, then test account-level FloatingPanel (ControlledNodes) across server switch:
+      // Alt+k switches server while keeping focus inside the open FloatingPanel without stealing focus to underlying composer
+      fbButton.focus();
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-shell-bg').getAttribute('data-visible')).toBe('false'));
+      fireEvent.click(within(fbPanel).getByText('file-close'));
+      await waitFor(() => expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull());
+
+      fireEvent.click(screen.getByText('controlled_nodes.title'));
+      const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      const nodesActionBtn = within(nodesPanel).getByText('controlled-nodes-panel');
+      nodesActionBtn.focus();
+      expect(document.activeElement).toBe(nodesActionBtn);
+
+      const srvNextEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      nodesActionBtn.dispatchEvent(srvNextEvt);
+      expect(srvNextEvt.defaultPrevented).toBe(true);
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      expect(screen.getByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      expect(document.activeElement).not.toBe(deltaComposer);
+
+      // 5) Real text input inside FloatingPanel, active shortcut recording, and real modal dialogs still block shortcuts
+      const panelTextInput = document.createElement('input');
+      panelTextInput.type = 'text';
+      nodesPanel.appendChild(panelTextInput);
+      panelTextInput.focus();
+      const blockedTextEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      panelTextInput.dispatchEvent(blockedTextEvt);
+      expect(blockedTextEvt.defaultPrevented).toBe(false);
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+      panelTextInput.remove();
+
+      const recorderEl = document.createElement('button');
+      recorderEl.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorderEl);
+      nodesActionBtn.focus();
+      const blockedRecEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      nodesActionBtn.dispatchEvent(blockedRecEvt);
+      expect(blockedRecEvt.defaultPrevented).toBe(false);
+      recorderEl.remove();
+
+      // Real modal (New Session dialog) still blocks shortcuts
+      fireEvent.click(screen.getByText('tabs-new-session'));
+      const modalEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(modalEvt);
+      expect(modalEvt.defaultPrevented).toBe(false);
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+      fireEvent.click(screen.getByText('new-session-close'));
+
+      // 6) Close FloatingPanel -> Alt+i switches back to srv-1 and focuses composer stably
+      fireEvent.click(within(nodesPanel).getByText('floating-close'));
+      await waitFor(() => expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull());
+      const mainBtn = screen.getByText('server-toggle-sidebar');
+      mainBtn.focus();
+      const srvPrevEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      mainBtn.dispatchEvent(srvPrevEvt);
+      expect(srvPrevEvt.defaultPrevented).toBe(true);
+      const backToAlphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(backToAlphaComposer), { timeout: 1000 });
+    } finally {
+      clearAllSupervisionTaskConsoleCaches();
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('shows centered translucent server switch watermark on keyboard shortcut switch without stale session bleed, keeps focus, resets on rapid switch, and auto-dismisses', async () => {
+    let resolveSrv2Sessions!: (value: { sessions: Array<Record<string, unknown>> }) => void;
+    const srv2SessionsDeferred = new Promise<{ sessions: Array<Record<string, unknown>> }>((resolve) => {
+      resolveSrv2Sessions = resolve;
+    });
+    let deferSrv2Once = true;
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        if (deferSrv2Once) {
+          deferSrv2Once = false;
+          return srv2SessionsDeferred;
+        }
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_gamma_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Switch to Server Two via Alt+k while srv-2 sessions are still loading
+      const downEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(downEvt);
+      expect(downEvt.defaultPrevented).toBe(true);
+
+      const hud = await screen.findByTestId('server-switch-watermark');
+      expect(hud.getAttribute('aria-hidden')).toBe('true');
+      expect(hud.getAttribute('data-switch-kind')).toBe('server');
+      expect(hud.className).toContain('is-server');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Alt', 'K']);
+      // Never leaks previous server's active session ('gamma') while switching
+      const loadingSessionText = screen.getByTestId('server-switch-watermark-session').textContent ?? '';
+      expect(loadingSessionText).not.toMatch(/gamma|alpha/i);
+
+      // Resolve srv-2 sessions -> HUD updates dynamically to target server's resolved session ('delta'), composer receives focus
+      await act(async () => {
+        resolveSrv2Sessions({
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('delta');
+      });
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+
+      // Rapid switch back to Server One via Alt+i updates the HUD & keycaps immediately and restarts the timer
+      const upEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(upEvt);
+      expect(upEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      });
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Alt', 'I']);
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
+      });
+
+      // Auto-dismisses after hold + exit (~1200ms)
+      await waitFor(() => {
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      }, { timeout: 3000 });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('does not show server switch watermark when switching servers via mouse click', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+    fireEvent.click(screen.getByText('server-select-srv-2'));
+    await screen.findByTestId('session-pane-deck_delta_brain');
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+  }, 15000);
+
+  it('displays macOS primary (⌥) and secondary (⌃) keycaps on server switch and stops Ctrl+S after secondary clear', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Secondary Ctrl+S switches server on macOS with ['⌃', 'S'] watermark
+      const ctrlS = new KeyboardEvent('keydown', { key: 's', code: 'KeyS', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(ctrlS);
+      expect(ctrlS.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'S']);
+
+      // Primary Alt+i switches back to Server One with ['⌥', 'I'] watermark
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+      const altI = new KeyboardEvent('keydown', { key: 'Dead', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(altI);
+      expect(altI.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'I']);
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('shows session switch watermark with platform keycaps on Win32 and macOS keyboard tab switches', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      const firstRender = render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Win32 Alt+L -> tabNext (deck_beta_brain) shows session watermark
+      const altL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(altL);
+      expect(altL.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      const winHud = screen.getByTestId('server-switch-watermark');
+      expect(winHud.getAttribute('aria-hidden')).toBe('true');
+      expect(winHud.getAttribute('data-switch-kind')).toBe('session');
+      expect(winHud.className).toContain('is-session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Alt', 'L']);
+
+      // Win32 Alt+J -> tabPrev (deck_alpha_brain) updates watermark and keeps composer focus
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+      const altJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(altJ);
+      expect(altJ.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Alt', 'J']);
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Win32 cleared primary + custom secondary slot fires cleanly and renders secondary keycaps
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-win-dual-slots'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const winClearedAltJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winClearedAltJ);
+      expect(winClearedAltJ.defaultPrevented).toBe(false);
+
+      const winCtrlRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winCtrlRight);
+      expect(winCtrlRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Ctrl', '→']);
+
+      const winBetaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(winBetaComposer));
+      const winCtrlLeft = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true, bubbles: true, cancelable: true });
+      winBetaComposer.dispatchEvent(winCtrlLeft);
+      expect(winCtrlLeft.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Ctrl', '←']);
+
+      firstRender.unmount();
+
+      // macOS dual defaults: both Alt+L/J (['⌥', 'L'/'J']) and Ctrl+D/A (['⌃', 'D'/'A']) navigate tabs with pressed-slot keycaps
+      window.location.hash = '';
+      localStorage.clear();
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+      render(<App />);
+
+      const macAlphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(macAlphaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      const ctrlD = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      macAlphaComposer.dispatchEvent(ctrlD);
+      expect(ctrlD.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'D']);
+
+      const macBetaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(macBetaComposer));
+      const macAltJ = new KeyboardEvent('keydown', { key: 'Dead', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      macBetaComposer.dispatchEvent(macAltJ);
+      expect(macAltJ.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'J']);
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('applies the colorful marquee border class to both desktop-cloud-docs-btn and mobile-cloud-docs-btn and keeps click/pressed toggle intact', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const desktopBtn = await screen.findByTestId('desktop-cloud-docs-btn');
+    const mobileBtn = await screen.findByTestId('mobile-cloud-docs-btn');
+
+    expect(desktopBtn.classList.contains('btn')).toBe(true);
+    expect(desktopBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(true);
+    expect(desktopBtn.classList.contains('mobile-cloud-docs-marquee-btn')).toBe(false);
+    expect(desktopBtn.getAttribute('style')).toBeNull();
+    expect(desktopBtn.getAttribute('aria-pressed')).toBe('false');
+
+    expect(mobileBtn.classList.contains('view-toggle')).toBe(true);
+    expect(mobileBtn.classList.contains('mobile-cloud-docs-marquee-btn')).toBe(true);
+    expect(mobileBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+    expect(mobileBtn.getAttribute('style')).toBeNull();
+    expect(mobileBtn.getAttribute('aria-pressed')).toBe('false');
+
+    fireEvent.click(mobileBtn);
+    await waitFor(() => {
+      expect(mobileBtn.getAttribute('aria-pressed')).toBe('true');
+      expect(desktopBtn.getAttribute('aria-pressed')).toBe('true');
+    });
+
+    fireEvent.click(desktopBtn);
+    await waitFor(() => {
+      expect(desktopBtn.getAttribute('aria-pressed')).toBe('false');
+      expect(mobileBtn.getAttribute('aria-pressed')).toBe('false');
+    });
+  }, 15000);
+
+  it('renders desktop-task-mode-btn right of Cloud Docs and mobile-task-mode-btn left of Cloud Docs with breathing border, toggles pure task mode without WS when closed, and deactivates background SessionPane while open', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const desktopTaskBtn = await screen.findByTestId('desktop-task-mode-btn');
+    const mobileTaskBtn = await screen.findByTestId('mobile-task-mode-btn');
+    const desktopCloudBtn = screen.getByTestId('desktop-cloud-docs-btn');
+    const mobileCloudBtn = screen.getByTestId('mobile-cloud-docs-btn');
+
+    expect(desktopTaskBtn.classList.contains('global-task-mode-entry-btn')).toBe(true);
+    expect(desktopTaskBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+    expect(desktopTaskBtn.classList.contains('mobile-cloud-docs-marquee-btn')).toBe(false);
+    expect(mobileTaskBtn.classList.contains('global-task-mode-entry-btn')).toBe(true);
+    expect(mobileTaskBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+    expect(mobileTaskBtn.classList.contains('mobile-cloud-docs-marquee-btn')).toBe(false);
+
+    // Relative DOM placement: desktop task mode immediately follows Cloud Docs; mobile task mode precedes Cloud Docs
+    expect(desktopCloudBtn.nextElementSibling).toBe(desktopTaskBtn);
+    expect(mobileTaskBtn.nextElementSibling).toBe(mobileCloudBtn);
+
+    // Closed by default: GlobalTaskModeView is not mounted, no /api/global-tasks/ws-ticket call, and background SessionPane is active
+    expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+    expect(apiFetchMock.mock.calls.some((c) => String(c[0]).includes('/api/global-tasks/ws-ticket'))).toBe(false);
+    const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(pane.getAttribute('data-is-active')).toBe('true');
+
+    // Open Task Mode -> mounts overlay and marks background SessionPane inactive to prevent duplicate TTS
+    fireEvent.click(desktopTaskBtn);
+    expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+    expect(screen.getByTestId('global-task-mode-view')).toBeTruthy();
+    expect(pane.getAttribute('data-is-active')).toBe('false');
+    await waitFor(() => {
+      expect(apiFetchMock.mock.calls.some((c) => String(c[0]).includes('/api/global-tasks/ws-ticket'))).toBe(true);
+    });
+
+    // Exit Task Mode -> unmounts overlay and restores active SessionPane
+    fireEvent.click(screen.getByTestId('task-mode-exit-btn'));
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+    expect(pane.getAttribute('data-is-active')).toBe('true');
+  }, 15000);
+
+  it('routes task context cleanly across a server switch from Task Mode Open session without attaching to the old server pane', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { globalTaskModeStore } = await import('../src/global-task-mode-store.js');
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+    fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+    expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+    await act(async () => {
+      (globalTaskModeStore as unknown as { setState: (patch: Record<string, unknown>) => void }).setState({
+        loading: false,
+        connected: true,
+        connecting: false,
+        servers: [
+          { id: 'srv-1', name: 'Server One', online: true },
+          { id: 'srv-2', name: 'Server Two', online: true },
+        ],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-2',
+            serverName: 'Server Two',
+            serverOnline: true,
+            projectName: 'delta',
+            brainSession: 'deck_delta_brain',
+            brainLabel: 'Delta',
+            taskId: 'tsk_cross_srv',
+            title: 'Cross-server task sync',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: 1000,
+            updatedAt: 2000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    fireEvent.click(await screen.findByTestId('task-mode-card-tsk_cross_srv'));
+    fireEvent.click(await screen.findByTestId('task-mode-jump-tsk_cross_srv'));
+
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+    const deltaPane = await screen.findByTestId('session-pane-deck_delta_brain');
+    await waitFor(() => expect(deltaPane.getAttribute('data-is-active')).toBe('true'));
+    await waitFor(() => {
+      expect(deltaPane.getAttribute('data-task-quotes')).toContain('Cross-server task sync');
+    });
+    expect(deltaPane.getAttribute('data-task-quotes')).not.toContain('tsk_cross_srv');
+    expect(alphaPane.getAttribute('data-task-quotes')).toBe('[]');
+  }, 15000);
+
+  it('drops pending task quote when an unresolved cross-server jump is cancelled before destination hydration', async () => {
+    let srv2FetchCount = 0;
+    let resolveFirstSrv2!: (value: unknown) => void;
+    const baseImpl = apiFetchMock.getMockImplementation();
+    apiFetchMock.mockImplementation(async (path: string, ...rest: unknown[]) => {
+      if (path === '/api/server/srv-2/sessions') {
+        srv2FetchCount += 1;
+        if (srv2FetchCount === 1) {
+          return await new Promise((resolve) => {
+            resolveFirstSrv2 = resolve;
+          });
+        }
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      return baseImpl ? await (baseImpl as (...a: unknown[]) => Promise<unknown>)(path, ...rest) : {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { globalTaskModeStore } = await import('../src/global-task-mode-store.js');
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+    fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+    expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+    await act(async () => {
+      (globalTaskModeStore as unknown as { setState: (patch: Record<string, unknown>) => void }).setState({
+        loading: false,
+        connected: true,
+        connecting: false,
+        servers: [
+          { id: 'srv-1', name: 'Server One', online: true },
+          { id: 'srv-2', name: 'Server Two', online: true },
+        ],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-2',
+            serverName: 'Server Two',
+            serverOnline: true,
+            projectName: 'delta',
+            brainSession: 'deck_delta_brain',
+            brainLabel: 'Delta',
+            taskId: 'tsk_cancelled_jump',
+            title: 'Cancelled cross-server task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: 1000,
+            updatedAt: 2000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    fireEvent.click(await screen.findByTestId('task-mode-card-tsk_cancelled_jump'));
+    fireEvent.click(await screen.findByTestId('task-mode-jump-tsk_cancelled_jump'));
+    await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+    await waitFor(() => expect(srv2FetchCount).toBe(1));
+
+    // User cancels the pending cross-server jump by manually switching back to srv-1
+    fireEvent.click(screen.getByText('server-select-srv-1'));
+    await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+    expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-task-quotes')).toBe('[]');
+
+    // Unblock stale response and manually open srv-2 -> deck_delta_brain without Task Mode
+    await act(async () => {
+      resolveFirstSrv2({
+        sessions: [
+          { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+        ],
+      });
+    });
+    fireEvent.click(screen.getByText('server-select-srv-2'));
+
+    const deltaPane = await screen.findByTestId('session-pane-deck_delta_brain');
+    await waitFor(() => expect(deltaPane.getAttribute('data-is-active')).toBe('true'));
+    expect(deltaPane.getAttribute('data-task-quotes')).toBe('[]');
+  }, 15000);
+
+  it('persists and restores Task Mode across app update reload, native cold restart, and clears on exit/shared routes', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const origLocation = window.location;
+    const reloadMock = vi.fn();
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: {
+        ...origLocation,
+        origin: origLocation.origin,
+        pathname: origLocation.pathname,
+        hash: origLocation.hash,
+        href: origLocation.href,
+        reload: reloadMock,
+      },
+    });
+
+    try {
+      const { App } = await importApp();
+      const firstMount = render(<App />);
+      const desktopTaskBtn = await screen.findByTestId('desktop-task-mode-btn');
+      fireEvent.click(desktopTaskBtn);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      // Trigger app update notice and click Refresh while in Task Mode
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent('imcodes:app-update-required', {
+          detail: { reason: 'build_mismatch', currentBuildId: 'b2', loadedBuildId: 'b1' },
+        }));
+      });
+      const refreshBtn = await screen.findByText('appUpdate.refresh');
+      fireEvent.click(refreshBtn);
+
+      expect(reloadMock).toHaveBeenCalledTimes(1);
+      expect(sessionStorage.getItem('imcodes:task-mode-open')).toBe('1');
+      expect(JSON.parse(sessionStorage.getItem('imcodes:reload-intent')!).showTaskMode).toBe(true);
+      firstMount.unmount();
+
+      // Simulated browser reload in the same tab restores directly into Task Mode
+      vi.resetModules();
+      const { App: ReloadedApp } = await importApp();
+      const secondMount = render(<ReloadedApp />);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      // Exiting Task Mode clears persisted state so subsequent reload opens Workspace
+      fireEvent.click(screen.getByTestId('task-mode-exit-btn'));
+      await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+      expect(sessionStorage.getItem('imcodes:task-mode-open')).toBeNull();
+      expect(JSON.parse(sessionStorage.getItem('imcodes:reload-intent')!).showTaskMode).toBeUndefined();
+      secondMount.unmount();
+
+      vi.resetModules();
+      const { App: WorkspaceApp } = await importApp();
+      const thirdMount = render(<WorkspaceApp />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+      thirdMount.unmount();
+
+      // Native OTA cold-start (fresh sessionStorage, persisted localStorage) restores Task Mode,
+      // unless opening an explicit ?shared= deep link
+      sessionStorage.clear();
+      nativeState.value = true;
+      getServerUrlMock.mockResolvedValue('http://localhost');
+      getAuthKeyMock.mockResolvedValue('secret-key');
+      localStorage.setItem('imcodes:task-mode-open', '1');
+
+      vi.resetModules();
+      const { App: NativeOtaApp } = await importApp();
+      const fourthMount = render(<NativeOtaApp />);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+      fourthMount.unmount();
+
+      // Explicit ?shared= route overrides Task Mode persistence
+      sessionStorage.clear();
+      nativeState.value = false;
+      localStorage.setItem('imcodes:task-mode-open', '1');
+      sessionStorage.setItem('imcodes:task-mode-open', '1');
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: {
+          ...origLocation,
+          origin: origLocation.origin,
+          pathname: origLocation.pathname,
+          hash: '#/srv-1/deck_alpha_brain?shared=share-entry-1',
+          href: `${origLocation.origin}${origLocation.pathname}#/srv-1/deck_alpha_brain?shared=share-entry-1`,
+          reload: reloadMock,
+        },
+      });
+      vi.resetModules();
+      const { App: SharedApp } = await importApp();
+      render(<SharedApp />);
+      await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+      expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: origLocation });
+    }
+  }, 20000);
+
+  it('switches servers (up/down) and tabs (left/right, multi-step) via mobile 1-finger long-press swipes with watermark HUD', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: string,
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+    const dispatchLongPressSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      await act(async () => {
+        target.dispatchEvent(mkTouchEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkTouchEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkTouchEvent('touchend', [], [move]));
+      });
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+      // 1-finger long-press + swipe Right (step 1: 80px) -> tabNext (deck_beta_brain) + watermark ['→']
+      await dispatchLongPressSwipe(
+        alphaPane,
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 160, clientY: 202 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→']);
+
+      // 1-finger long-press + swipe Left (step 1: -80px) -> tabPrev (deck_alpha_brain) + watermark ['←']
+      const betaPane = screen.getByTestId('session-pane-deck_beta_brain');
+      await dispatchLongPressSwipe(
+        betaPane,
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 202 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←']);
+
+      // Multi-step: 1-finger long-press + swipe Right (step 2: +112px >= 100px) -> jumps straight alpha -> gamma + watermark ['→', '×2']
+      await dispatchLongPressSwipe(
+        screen.getByTestId('session-pane-deck_alpha_brain'),
+        { identifier: 1, clientX: 60, clientY: 200 },
+        { identifier: 1, clientX: 172, clientY: 202 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×2']);
+
+      // Multi-step back: 1-finger long-press + swipe Left (step 2: -112px) -> jumps straight gamma -> alpha + watermark ['←', '×2']
+      await dispatchLongPressSwipe(
+        screen.getByTestId('session-pane-deck_gamma_brain'),
+        { identifier: 1, clientX: 220, clientY: 200 },
+        { identifier: 1, clientX: 108, clientY: 200 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←', '×2']);
+
+      // 1-finger long-press + swipe Down -> serverNext (Server Two) + watermark ['↓']
+      await dispatchLongPressSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 122, clientY: 240 },
+      );
+      await screen.findByTestId('session-pane-deck_delta_brain');
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
+
+      // Single-tab server (srv-2 has only deck_delta_brain): Left/Right safely no-ops
+      await dispatchLongPressSwipe(
+        view.container,
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 202 },
+      );
+      expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
+
+      // 1-finger long-press + swipe Up -> serverPrev (Server One) + watermark ['↑']
+      await dispatchLongPressSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 118, clientY: 180 },
+      );
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↑']);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('blocks mobile gesture navigation on 2-finger touches, open sidebar, blocking modal/settings, normal 1-finger scroll, pinch, and desktop', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: string,
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+    const dispatchLongPressTouches = async (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      await act(async () => {
+        target.dispatchEvent(mkTouchEvent('touchstart', start, start));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkTouchEvent('touchmove', move, move));
+        target.dispatchEvent(mkTouchEvent('touchend', [], move));
+      });
+    };
+
+    try {
+      // Desktop (!isMobile) ignores 1-finger long-press swipe completely
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      {
+        const { App } = await importApp();
+        const desktopView = render(<App />);
+        const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        desktopView.unmount();
+      }
+
+      // Mobile guards
+      const originalUserAgent = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        const { App } = await importApp();
+        const mobileView = render(<App />);
+        const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+        // Normal 1-finger scroll (no long-press delay) ignored
+        await act(async () => {
+          alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 200, clientY: 200 }]));
+          alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+          alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        });
+        // 2-finger swipe (disabled!) & pinch/spread completely ignored
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+        );
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 140, clientY: 200 }, { identifier: 2, clientX: 160, clientY: 200 }],
+          [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 200, clientY: 200 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+
+        // Blocking DOM dialog -> 1-finger long-press swipe Down blocked
+        const modal = document.createElement('div');
+        modal.setAttribute('role', 'dialog');
+        document.body.appendChild(modal);
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 120, clientY: 160 }],
+          [{ identifier: 1, clientX: 122, clientY: 240 }],
+        );
+        expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        modal.remove();
+
+        // Open mobile sidebar -> 1-finger long-press swipe Right blocked
+        fireEvent.click(mobileView.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+        // Close mobile sidebar by selecting current session, then verify mobile file browser overlay blocks 1-finger long-press swipe Down
+        fireEvent.click(screen.getByText('tree-select-session-deck_alpha_brain'));
+        await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+
+        fireEvent.click(mobileView.container.querySelector('.view-toggle[title="Files"]')!);
+        await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('true'));
+        await dispatchLongPressTouches(
+          mobileView.container,
+          [{ identifier: 1, clientX: 120, clientY: 160 }],
+          [{ identifier: 1, clientX: 122, clientY: 240 }],
+        );
+        expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15000);
+
+  it('F1/F2: completes fast coalesced touchend swipes after long-press and blocks open VoiceOverlay / mobile-server-menu', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchCoalescedSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      subThresholdMove: { identifier: number; clientX: number; clientY: number },
+      endChanged: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start[];
+          changedTouches: typeof start[];
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [subThresholdMove], [subThresholdMove]));
+        target.dispatchEvent(mkEvent('touchend', [], [endChanged]));
+      });
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // F2: open VoiceOverlay DOM -> 1-finger long-press swipe inside its textarea does NOT navigate or show watermark
+      const voiceBackdrop = document.createElement('div');
+      voiceBackdrop.className = 'voice-overlay-backdrop';
+      const voiceOverlay = document.createElement('div');
+      voiceOverlay.className = 'voice-overlay';
+      const voiceTa = document.createElement('textarea');
+      voiceOverlay.appendChild(voiceTa);
+      document.body.appendChild(voiceBackdrop);
+      document.body.appendChild(voiceOverlay);
+
+      await dispatchCoalescedSwipe(
+        voiceTa,
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 118, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
+      );
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      voiceOverlay.remove();
+      voiceBackdrop.remove();
+
+      // F2: open .mobile-server-menu -> 1-finger long-press swipe Down is blocked
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      await dispatchCoalescedSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 238 },
+        { identifier: 1, clientX: 120, clientY: 280 },
+      );
+      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+
+      // F1: fast coalesced touchend swipe Right (move=38px, end=85px) -> switches to deck_beta_brain
+      await dispatchCoalescedSwipe(
+        alphaPane,
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 118, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+
+      // F1: fast coalesced touchend swipe Down (move=40px, end=80px) -> switches to Server Two
+      await dispatchCoalescedSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 240 },
+        { identifier: 1, clientX: 120, clientY: 280 },
+      );
+      await screen.findByTestId('session-pane-deck_delta_brain');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('F3: mobile 1-finger navigation safely no-ops for <=1 server or <=1 tab regardless of dashboard, null, or stale selection', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start[];
+          changedTouches: typeof start[];
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
+    };
+
+    let mockSessions: Array<Record<string, unknown>> = [
+      { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+    ];
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') return { sessions: mockSessions };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      // Case 1: Single server + single tab with stale saved session -> Up/Down/Left/Right all no-op without watermark
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'stale_deleted_session');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      await dispatchSwipe(
+        alphaPane,
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 290 },
+      );
+      await dispatchSwipe(
+        alphaPane,
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
+      );
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Case 2: Enter dashboard via real mobile Home button (clears rcc_server -> null selection) with 1 server -> Down/Up must stay on dashboard
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const homeBtn = view.container.querySelector('.mobile-server-menu-home')!;
+      fireEvent.click(homeBtn);
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      expect(localStorage.getItem('rcc_server')).toBeNull();
+
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 290 },
+      );
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 290 },
+        { identifier: 1, clientX: 120, clientY: 200 },
+      );
+      expect(screen.getByText('dashboard-page')).toBeTruthy();
+      expect(localStorage.getItem('rcc_server')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('F3: mobile 1-finger navigation safely no-ops for zero tabs with stale selection', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start[];
+          changedTouches: typeof start[];
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'stale_tab');
+      const { App } = await importApp();
+      const emptyView = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+      await act(async () => {
+        wsInstances[0].connectedHandler?.();
+        wsInstances[0].emit({ type: 'session_list', daemon: 'srv-1', sessions: [] });
+      });
+      await waitFor(() => expect(emptyView.container.querySelector('.mobile-server-btn-name')?.textContent).toBe('Alpha Server'));
+      await dispatchSwipe(
+        emptyView.container,
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
+      );
+      await dispatchSwipe(
+        emptyView.container,
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 115, clientY: 200 },
+      );
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('uses desktop shell with persistent sidebar on native Capacitor iOS-on-Mac and updates reactively on imcodes:native-host', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('http://localhost');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const prevCapacitor = (globalThis as { Capacitor?: unknown }).Capacitor;
+    const prevHost = (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+    const prevUA = navigator.userAgent;
+    const prevMaxTouch = navigator.maxTouchPoints;
+
+    try {
+      (globalThis as { Capacitor?: unknown }).Capacitor = {
+        isNativePlatform: () => true,
+        getPlatform: () => 'ios',
+      };
+      // Start with an iPad-like UA + 0 touch points before native host signal arrives
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+      });
+      Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: 0 });
+      delete (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      // Before native host arrives with iPad UA and coarse pointer, shell starts mobile
+      expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(true);
+      expect(view.container.querySelector('.mobile-sidebar-overlay')).toBeTruthy();
+
+      // Native Swift host signals isiOSAppOnMac + native WKWebView pageZoom applied
+      (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__ = {
+        isMacDesktop: true,
+        pageZoomApplied: true,
+      };
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent('imcodes:native-host'));
+      });
+
+      await waitFor(() => {
+        expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(false);
+      });
+      expect(view.container.querySelector('.mobile-sidebar-overlay')).toBeNull();
+      expect(screen.getByTestId('desktop-cloud-docs-btn')).toBeTruthy();
+      expect(document.documentElement.classList.contains('native-ios-mac')).toBe(false);
+    } finally {
+      if (prevCapacitor === undefined) delete (globalThis as { Capacitor?: unknown }).Capacitor;
+      else (globalThis as { Capacitor?: unknown }).Capacitor = prevCapacitor;
+      if (prevHost === undefined) delete (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+      else (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__ = prevHost;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: prevUA });
+      Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: prevMaxTouch });
+    }
+  }, 15000);
+
+  it('cycles keyboard shortcuts across 1 owned + 1 shared-in full server, shows HUD for shared server & tabs, and returns cleanly', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedServerEntry = {
+      id: 'share-srv-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Beta',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Beta',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+
+    let resolveSharedOpen!: (value: unknown) => void;
+    openSharedEntryMock.mockImplementation(() => new Promise((resolve) => {
+      resolveSharedOpen = resolve;
+    }));
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      // Wait for shared discovery to project srv-shared into unifiedServers
+      await screen.findByText('server-select-srv-shared');
+
+      // Press Alt+k (serverNext) with 1 owned + 1 shared-in server -> switches to srv-shared
+      const nextEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(nextEvt);
+      expect(nextEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+      const pendingHud = await screen.findByTestId('server-switch-watermark');
+      expect(pendingHud.getAttribute('data-switch-kind')).toBe('server');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Beta');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).not.toMatch(/alpha/i);
+
+      await act(async () => {
+        resolveSharedOpen({
+          server: { id: 'srv-shared', name: 'Shared Beta', status: 'active', lastHeartbeatAt: Date.now() },
+          target: sharedServerEntry.target,
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-srv-2'],
+            primaryShareId: 'share-srv-2',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_shared_one', title: 'Shared One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+            { sessionName: 'deck_shared_two', title: 'Shared Two', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+          ],
+          subSessions: [],
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Shared One');
+      });
+      const sharedOneComposer = await screen.findByTestId('pane-composer-deck_shared_one');
+      await waitFor(() => expect(document.activeElement).toBe(sharedOneComposer));
+
+      // Tab switching inside shared-in full server shows session watermark with server name
+      const tabNextEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      sharedOneComposer.dispatchEvent(tabNextEvt);
+      expect(tabNextEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_shared_two').getAttribute('data-is-active')).toBe('true');
+      });
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Beta');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Shared Two');
+
+      const sharedTwoComposer = await screen.findByTestId('pane-composer-deck_shared_two');
+      // Press Alt+i (serverPrev) -> switches back to owned Alpha Server via handleSelectServer
+      const prevEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      sharedTwoComposer.dispatchEvent(prevEvt);
+      expect(prevEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server');
+      });
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+      expect(alphaPane.getAttribute('data-share-target-kind')).toBe('');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('toggles mobile 1-finger long-press vertical swipes between 1 owned server and 1 shared-in server', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start[];
+          changedTouches: typeof start[];
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedServerEntry = {
+      id: 'share-mob-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Mobile',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Mobile',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Mobile', status: 'active', lastHeartbeatAt: Date.now() },
+      target: sharedServerEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-mob-2'],
+        primaryShareId: 'share-mob-2',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_shared_mob', title: 'Shared Mob Tab', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+      ],
+      subSessions: [],
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(view.container.querySelectorAll('.mobile-server-btn')).toHaveLength(1));
+      // Wait for shared entry projection to include srv-shared in unifiedServers
+      await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // 1-finger long-press swipe Down -> switches owned srv-1 -> shared srv-shared
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 120, clientY: 250 },
+      );
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Mobile'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
+      await screen.findByTestId('session-pane-deck_shared_mob');
+
+      // 1-finger long-press swipe Up -> switches shared srv-shared -> owned srv-1
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
+      );
+
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↑']);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('suppresses watermark on restricted main-tab shares while allowing Alt+k/i fallback into unifiedServers', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const restrictedEntry = {
+      id: 'share-restricted-1',
+      serverId: 'srv-restricted',
+      serverName: 'Restricted Host',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Restricted Main',
+      target: { kind: 'main' as const, serverId: 'srv-restricted', sessionName: 'deck_restricted_main' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([restrictedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-restricted', name: 'Restricted Host', status: 'active', lastHeartbeatAt: Date.now() },
+      target: restrictedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-restricted-1'],
+        primaryShareId: 'share-restricted-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_restricted_main', title: 'Restricted Main', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+      ],
+      subSessions: [],
+    });
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const entryBtn = (await screen.findByText('Restricted Main')).closest('button')!;
+      fireEvent.click(entryBtn);
+
+      const restrictedPane = await screen.findByTestId('session-pane-deck_restricted_main');
+      expect(restrictedPane.getAttribute('data-share-target-kind')).toBe('main');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Even if a restricted target is not in unifiedServers or wraps at the end, Alt+k cycles cleanly to srv-1
+      const restrictedComposer = await screen.findByTestId('pane-composer-deck_restricted_main');
+      await waitFor(() => expect(document.activeElement).toBe(restrictedComposer));
+      const evt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      restrictedComposer.dispatchEvent(evt);
+      expect(evt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      });
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('deduplicates 3 shared sessions on 1 remote server into 1 virtual server when cycling Alt+k / Alt+i across owned + whole-server + merged shared-session servers', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const wholeShare = {
+      id: 'share-whole',
+      serverId: 'srv-whole',
+      serverName: 'Whole Remote',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Whole Remote',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-whole' },
+    };
+    const subShareOne = {
+      id: 'share-sub-1',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Sub One',
+      target: { kind: 'subsession' as const, serverId: 'srv-virtual', sessionName: 'deck_sub_1', subSessionId: 'sub1' },
+    };
+    const mainShare = {
+      id: 'share-main-best',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'viewer' as const,
+      status: 'active' as const,
+      targetLabel: 'Main Session',
+      target: { kind: 'main' as const, serverId: 'srv-virtual', sessionName: 'deck_virt_main' },
+    };
+    const subShareTwo = {
+      id: 'share-sub-2',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'viewer' as const,
+      status: 'active' as const,
+      targetLabel: 'Sub Two',
+      target: { kind: 'subsession' as const, serverId: 'srv-virtual', sessionName: 'deck_sub_2', subSessionId: 'sub2' },
+    };
+
+    discoverSharedEntriesMock.mockResolvedValue([wholeShare, subShareOne, mainShare, subShareTwo]);
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.serverId === 'srv-whole') {
+        return {
+          server: { id: 'srv-whole', name: 'Whole Remote', status: 'active', lastHeartbeatAt: Date.now() },
+          target,
+          coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-whole'], primaryShareId: 'share-whole', authorizedAt: Date.now() },
+          sessions: [{ sessionName: 'deck_whole_one', title: 'Whole One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+          subSessions: [],
+        };
+      }
+      return {
+        server: { id: 'srv-virtual', name: 'Virtual Cluster', status: 'active', lastHeartbeatAt: Date.now() },
+        target,
+        coverage: { effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-main-best'], primaryShareId: 'share-main-best', authorizedAt: Date.now() },
+        sessions: [{ sessionName: 'deck_virt_main', title: 'Main Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+        subSessions: [],
+      };
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      // Only 1 virtual server button is projected for the 3 shared grants on srv-virtual
+      await screen.findByText('server-select-srv-whole');
+      expect(screen.getAllByText('Virtual Cluster').length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText(/server-select-srv-virtual/)).toHaveLength(1);
+
+      // Step 1: srv-1 -> srv-whole
+      alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(wholeShare.target));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Whole Remote'));
+      const wholeComposer = await screen.findByTestId('pane-composer-deck_whole_one');
+
+      // Step 2: srv-whole -> srv-virtual (opens representative main grant, displays serverName 'Virtual Cluster')
+      wholeComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(mainShare.target));
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Virtual Cluster');
+      });
+      await screen.findByTestId('session-pane-deck_virt_main');
+
+      // Step 3: Pressing Alt+k from srv-virtual jumps directly back to srv-1 (NOT cycling 3 times through subShareOne/subShareTwo!)
+      const virtPane = await screen.findByTestId('session-pane-deck_virt_main');
+      virtPane.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it.each(['server', 'main', 'subsession'] as const)(
+    'preserves and updates ServerSwitchWatermark when 1-finger long-press swiping from mobile Home/dashboard onto slow async %s share',
+    async (shareKind) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const dispatchSwipe = async (
+        target: EventTarget,
+        start: { identifier: number; clientX: number; clientY: number },
+        move: { identifier: number; clientX: number; clientY: number },
+      ) => {
+        const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+          const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+            touches: typeof start[];
+            changedTouches: typeof start[];
+          };
+          Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+          Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+          return evt;
+        };
+        await act(async () => {
+          target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+          vi.advanceTimersByTime(400);
+          target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+          target.dispatchEvent(mkEvent('touchend', [], [move]));
+        });
+      };
+
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [serverList().servers[0]] };
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      const target = shareKind === 'server'
+        ? { kind: 'server' as const, serverId: 'srv-dash-shared' }
+        : shareKind === 'main'
+          ? { kind: 'main' as const, serverId: 'srv-dash-shared', sessionName: 'deck_shared_dash' }
+          : { kind: 'subsession' as const, serverId: 'srv-dash-shared', sessionName: 'deck_sub_dash', subSessionId: 'subdash' };
+      const sharedEntry = {
+        id: `share-dash-${shareKind}`,
+        serverId: 'srv-dash-shared',
+        serverName: 'Shared Dash Remote',
+        role: 'participant' as const,
+        status: 'active' as const,
+        targetLabel: shareKind === 'server' ? 'Shared Dash Remote' : 'Dash Tab',
+        lastHeartbeatAt: Date.now(),
+        target,
+      };
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+
+      let resolveOpen!: (value: unknown) => void;
+      openSharedEntryMock.mockImplementation(() => new Promise((resolve) => {
+        resolveOpen = resolve;
+      }));
+
+      const originalUserAgent = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+        localStorage.setItem('rcc_server', 'srv-1');
+        localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await screen.findByTestId('session-pane-deck_alpha_brain');
+        await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+
+        // Enter Home / dashboard explicitly via mobile menu Home button
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        fireEvent.click(view.container.querySelector('.mobile-server-menu-home')!);
+        expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+        // 1-finger long-press swipe Up (serverPrev) from Home hits unifiedServers tail (srv-dash-shared)
+        await dispatchSwipe(
+          view.container,
+          { identifier: 1, clientX: 120, clientY: 260 },
+          { identifier: 1, clientX: 120, clientY: 160 },
+        );
+
+        await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(target));
+        const pendingHud = await screen.findByTestId('server-switch-watermark');
+        expect(pendingHud.getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Dash Remote');
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).not.toMatch(/alpha/i);
+
+        await act(async () => {
+          resolveOpen({
+            server: { id: 'srv-dash-shared', name: 'Shared Dash Remote', status: 'active', lastHeartbeatAt: Date.now() },
+            target,
+            coverage: {
+              effectiveRole: 'participant',
+              historyCutoffAt: 0,
+              nextCoverageRecheckAt: null,
+              coveringShareIds: [sharedEntry.id],
+              primaryShareId: sharedEntry.id,
+              authorizedAt: Date.now(),
+            },
+            sessions: [
+              { sessionName: 'deck_shared_dash', title: 'Dash Main Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+            ],
+            subSessions: shareKind === 'subsession'
+              ? [{ subSessionId: 'subdash', sessionName: 'deck_sub_dash', parentSessionName: 'deck_shared_dash', title: 'Dash Sub', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null }]
+              : [],
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+          expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Dash Remote');
+          expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Dash Main Session');
+        });
+        await screen.findByTestId('session-pane-deck_shared_dash');
+      } finally {
+        vi.useRealTimers();
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      }
+    },
+    15000,
+  );
+
+  it('clears pending dashboard ServerSwitchWatermark cleanly on share error and blocks stale late resolve after switching away', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start[];
+          changedTouches: typeof start[];
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedEntry = {
+      id: 'share-dash-err',
+      serverId: 'srv-dash-err',
+      serverName: 'Shared Err Host',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Err Host',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-dash-err' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+
+    let rejectOpen!: (err: Error) => void;
+    let resolveStaleOpen!: (value: unknown) => void;
+    let attempt = 0;
+    openSharedEntryMock.mockImplementation(() => new Promise((resolve, reject) => {
+      attempt += 1;
+      if (attempt === 1) rejectOpen = reject;
+      else resolveStaleOpen = resolve;
+    }));
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      fireEvent.click(view.container.querySelector('.mobile-server-menu-home')!);
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+      // Attempt 1: pending HUD appears from dashboard, then request rejects -> HUD clears and stays on dashboard
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
+      );
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+      expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
+
+      await act(async () => {
+        rejectOpen(new Error('Share denied'));
+      });
+      await waitFor(() => expect(screen.queryByTestId('server-switch-watermark')).toBeNull());
+      expect(screen.getByText('dashboard-page')).toBeTruthy();
+
+      // Attempt 2: pending shared open from dashboard, then swipe Down synchronously selects owned srv-1 -> abort + late resolve ignored
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
+      );
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(2));
+      expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
+
+      await dispatchSwipe(
+        view.container,
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 120, clientY: 250 },
+      );
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // Late resolution of superseded shared open must NOT overwrite owned srv-1 or revive Shared Err Host HUD
+      await act(async () => {
+        resolveStaleOpen({
+          server: { id: 'srv-dash-err', name: 'Shared Err Host', status: 'active', lastHeartbeatAt: Date.now() },
+          target: sharedEntry.target,
+          coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-dash-err'], primaryShareId: 'share-dash-err', authorizedAt: Date.now() },
+          sessions: [{ sessionName: 'deck_err_sess', title: 'Err Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+          subSessions: [],
+        });
+      });
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server');
+      expect(screen.queryByTestId('session-pane-deck_err_sess')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('shows multi-level 4-direction MobileSwipeHud on 1-finger long-press, switches multi-step by distance, and ignores bottom drag/scroll surfaces', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+
+      // 1) Bottom control/scroll surfaces never open HUD or switch sessions
+      for (const selector of ['.controls-wrapper', '.shortcuts-row', '.subsession-bar', '.tab-bar']) {
+        const el = view.container.querySelector(selector);
+        if (!el) continue;
+        await act(async () => {
+          el.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 500 }]));
+          vi.advanceTimersByTime(400);
+          el.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 160, clientY: 500 }]));
+        });
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+        await act(async () => {
+          el.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 160, clientY: 500 }]));
+        });
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      }
+
+      // 2) Long-press + drag 1 finger on session pane shows multi-level 4-direction HUD before threshold without switching yet
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 112, clientY: 200 }]));
+      });
+
+      const hud = screen.getByTestId('mobile-swipe-hud');
+      expect(hud.getAttribute('data-direction')).toBe('right');
+      expect(hud.getAttribute('data-armed')).toBe('false');
+      expect(hud.getAttribute('data-step')).toBe('0');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-up')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-down')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-left')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-active')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('Server Two');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').textContent).toBe('Server Two');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('gamma');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-2').textContent).toBe('beta');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('beta');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-2').textContent).toBe('gamma');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 3) Drag past step 1 threshold (60px) -> step=1 armed, then step 2 (110px) -> step=2 armed, STILL does not switch mid-drag
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 140, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('1');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').getAttribute('data-selected')).toBe('true');
+
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 190, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('2');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-2').getAttribute('data-selected')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 4) Pull back below threshold before lifting -> disarms and does NOT switch on release
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 100, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('false');
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 100, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // 5) Drag past threshold and touchcancel -> clears HUD without switching
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 160, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchcancel', []));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 6) Drag past step 2 threshold (110px) and release -> clears HUD and jumps straight to deck_gamma_brain
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 190, clientY: 200 }]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 190, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×2']);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('switches tabs ±3 in App via 1-finger long-press drag distance on a 4-tab server', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: 'touchstart' | 'touchmove' | 'touchend',
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+      // Right +3: alpha -> delta (155px >= 144px step-3 threshold)
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 60, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 215, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-direction')).toBe('right');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('3');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-3').textContent).toBe('delta');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-3').getAttribute('data-selected')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 215, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('delta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×3']);
+
+      // Left -3: delta -> alpha (-155px)
+      const deltaPane = screen.getByTestId('session-pane-deck_delta_brain');
+      await act(async () => {
+        deltaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 240, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        deltaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 85, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-direction')).toBe('left');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('3');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-3').textContent).toBe('alpha');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-3').getAttribute('data-selected')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true');
+
+      await act(async () => {
+        deltaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 85, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←', '×3']);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it.each([
+    { direction: 'down' as const, step: 2, dy: 115, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-3', expectedServerName: 'Server Three', expectedSession: 'deck_s3_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 2, dy: -115, startServerId: 'srv-3', startSession: 'deck_s3_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+    { direction: 'down' as const, step: 3, dy: 160, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-4', expectedServerName: 'Server Four', expectedSession: 'deck_s4_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 3, dy: -160, startServerId: 'srv-4', startSession: 'deck_s4_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+    { direction: 'down' as const, step: 5, dy: 250, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-6', expectedServerName: 'Server Six', expectedSession: 'deck_s6_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 5, dy: -250, startServerId: 'srv-6', startSession: 'deck_s6_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+  ])(
+    'switches servers $direction ×$step ($startServerId -> $expectedServerId) in App via 1-finger long-press drag distance on tall viewport (>=800px)',
+    async ({ direction, step, dy, startServerId, startSession, expectedServerId, expectedServerName, expectedSession, arrow }) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const mkTouchEvent = (
+        type: 'touchstart' | 'touchmove' | 'touchend',
+        touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+        changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+      ) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof touches;
+          changedTouches: typeof touches;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+
+      const servers = [
+        { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-3', name: 'Server Three', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-4', name: 'Server Four', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-5', name: 'Server Five', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-6', name: 'Server Six', status: 'online', lastHeartbeatAt: Date.now() },
+      ];
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers };
+        const match = /^\/api\/server\/(srv-\d+)\/sessions$/.exec(path);
+        if (match) {
+          const num = match[1].replace('srv-', '');
+          return {
+            sessions: [
+              { name: `deck_s${num}_brain`, project_name: `s${num}`, role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: `/work/s${num}`, state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      const originalUserAgent = navigator.userAgent;
+      const originalInnerHeightDesc = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+      try {
+        localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+        localStorage.setItem('rcc_server', startServerId);
+        localStorage.setItem('rcc_session', startSession);
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await screen.findByTestId(`session-pane-${startSession}`);
+        await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+
+        await act(async () => {
+          view.container.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 140, clientY: 400 }]));
+          vi.advanceTimersByTime(400);
+          view.container.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 140, clientY: 400 + dy }]));
+        });
+
+        const hud = screen.getByTestId('mobile-swipe-hud');
+        expect(hud.getAttribute('data-direction')).toBe(direction);
+        expect(hud.getAttribute('data-armed')).toBe('true');
+        expect(hud.getAttribute('data-step')).toBe(String(step));
+        const selectedTarget = screen.getByTestId(`mobile-swipe-hud-dir-target-${direction}-${step}`);
+        expect(selectedTarget.textContent).toBe(expectedServerName);
+        expect(selectedTarget.getAttribute('data-selected')).toBe('true');
+        // Must NOT switch mid-drag during touchmove
+        expect(screen.getByTestId(`session-pane-${startSession}`).getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId(`session-pane-${expectedSession}`)).toBeNull();
+
+        await act(async () => {
+          view.container.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 140, clientY: 400 + dy }]));
+        });
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+
+        await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe(expectedServerName));
+        expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual([arrow, `×${step}`]);
+        const nextPane = await screen.findByTestId(`session-pane-${expectedSession}`);
+        expect(nextPane.getAttribute('data-is-active')).toBe('true');
+        expect(localStorage.getItem('rcc_server')).toBe(expectedServerId);
+      } finally {
+        vi.useRealTimers();
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+        if (originalInnerHeightDesc) Object.defineProperty(window, 'innerHeight', originalInnerHeightDesc);
+      }
+    },
+    15000,
+  );
+
+  it('opens connect-by-id in-app above mobile panels without window.open or URL mutation and closes back cleanly', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    const openSpy = vi.spyOn(window, 'open');
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    window.history.replaceState({}, '', '/');
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+
+      // 1) Open from mobile header quick menu -> mounts RemoteDesktopGuestAccess overlay cleanly.
+      const quickConnectBtns = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickConnectBtns[quickConnectBtns.length - 1]!);
+      expect(openSpy).not.toHaveBeenCalled();
+
+      const overlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(overlay).toBeTruthy();
+      expect(Number(overlay.style.zIndex)).toBeGreaterThanOrEqual(20000);
+      expect(window.location.pathname).toBe('/');
+
+      fireEvent.click(overlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+
+      // 2) Open from RemoteDesktopWall -> mounts above wall (zIndex 20000 > 7000) and returns to wall on exit.
+      const wallBtns = await screen.findAllByTestId('controlled-node-quick-wall');
+      fireEvent.click(wallBtns[wallBtns.length - 1]!);
+      const wall = await screen.findByTestId('remote-desktop-wall');
+      fireEvent.click(screen.getByRole('button', { name: 'remote-desktop-wall-connect-by-id' }));
+      expect(openSpy).not.toHaveBeenCalled();
+      const wallOverlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(wallOverlay).toBeTruthy();
+      expect(Number(wallOverlay.style.zIndex)).toBeGreaterThan(Number((wall as HTMLElement).style.zIndex || 7000));
+      fireEvent.click(wallOverlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+      expect(screen.getByTestId('remote-desktop-wall')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'remote-desktop-wall-close' }));
+
+      // 3) Open from ControlledNodesPanel saved device -> pre-fills publicNodeId and sits above FloatingPanel.
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });
+      fireEvent.click(controlledNodesButton);
+      const panelConnectBtn = await screen.findByRole('button', { name: 'controlled-nodes-connect-by-id' });
+      const panelFloating = panelConnectBtn.closest('.floating-panel') as HTMLElement | null;
+      fireEvent.click(panelConnectBtn);
+      expect(openSpy).not.toHaveBeenCalled();
+      const panelOverlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(panelOverlay).toBeTruthy();
+      if (panelFloating?.style.zIndex) {
+        expect(Number(panelOverlay.style.zIndex)).toBeGreaterThan(Number(panelFloating.style.zIndex));
+      }
+      expect((panelOverlay.querySelector('input[inputmode="numeric"]') as HTMLInputElement).value).toBe('5123456789');
+      expect(window.location.pathname).toBe('/');
+      fireEvent.click(panelOverlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+    } finally {
+      openSpy.mockRestore();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('prevents a stale embedded guest onWebLogin /me response from restoring auth after Logout and still updates host auth when current', async () => {
+    loginAttemptState.mode = 'web';
+    let meCallCount = 0;
+    let resolveDelayedGuestMe!: (me: { id: string; r2RelayEnabled?: boolean }) => void;
+    let resolveSecondGuestMe!: (me: { id: string; r2RelayEnabled?: boolean }) => void;
+
+    const { ApiError } = await import('../src/api.js');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        meCallCount += 1;
+        if (meCallCount === 1) return { id: 'user-1', r2RelayEnabled: false };
+        if (meCallCount === 2) {
+          return new Promise<{ id: string; r2RelayEnabled?: boolean }>((resolve) => {
+            resolveDelayedGuestMe = resolve;
+          });
+        }
+        return new Promise<{ id: string; r2RelayEnabled?: boolean }>((resolve) => {
+          resolveSecondGuestMe = resolve;
+        });
+      }
+      if (path === '/api/remote-desktop/unattended-password/proof') {
+        throw new ApiError(401, 'auth_required');
+      }
+      if (path === '/api/auth/logout') return {};
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+
+      // 1) Positive control: embedded web login updates host auth in-memory and keeps overlay + prefilled ID
+      const view1 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const quickBtns1 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns1[quickBtns1.length - 1]!);
+      const overlay1 = view1.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay1.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5987654321' } });
+      fireEvent.input(overlay1.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+
+      await waitFor(() => expect(meCallCount).toBe(2));
+      expect((await screen.findByLabelText(/public_id/) as HTMLInputElement).value).toBe('5987654321');
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'user-2', r2RelayEnabled: true });
+      });
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('user-2');
+      });
+      expect(view1.container.querySelector('.remote-desktop-guest-overlay')).toBeTruthy();
+      expect((screen.getByLabelText(/public_id/) as HTMLInputElement).value).toBe('5987654321');
+      expect(loginAttemptState.webReloads).toBe(0);
+      view1.unmount();
+
+      // 2) Negative control: delayed onWebLogin /me settles AFTER exit + explicit Log Out -> must NOT restore auth
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      meCallCount = 0;
+      const wsBeforeView2 = wsInstances.length;
+      const view2 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(wsBeforeView2));
+      const quickBtns2 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns2[quickBtns2.length - 1]!);
+      const overlay2 = view2.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay2.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5123456789' } });
+      fireEvent.input(overlay2.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(2));
+
+      fireEvent.click(view2.container.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view2.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+      await waitFor(() => expect(localStorage.getItem('rcc_auth')).toBeNull());
+      expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'user-1', r2RelayEnabled: true });
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(localStorage.getItem('rcc_auth')).toBeNull();
+      expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+      view2.unmount();
+
+      // 3) Negative control: stale /me #1 settles AFTER newer auth attempt /me #2 starts -> only #2 commits
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      meCallCount = 0;
+      const wsBeforeView3 = wsInstances.length;
+      const view3 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(wsBeforeView3));
+      const quickBtns3 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns3[quickBtns3.length - 1]!);
+      const overlay3 = view3.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay3.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5123456789' } });
+      fireEvent.input(overlay3.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(2));
+
+      // Trigger a second embedded login attempt while the first /me is still pending
+      fireEvent.input(overlay3.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-456' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(3));
+
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'stale-user', r2RelayEnabled: false });
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('user-1');
+
+      await act(async () => {
+        resolveSecondGuestMe({ id: 'fresh-user', r2RelayEnabled: true });
+      });
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('fresh-user');
+      });
+      view3.unmount();
+    } finally {
+      loginAttemptState.mode = 'native';
+      loginAttemptState.webReloads = 0;
+    }
+  }, 20_000);
+
+  it('omits Online/version from mobile top-right .mobile-server-actions and passes daemonBadgeState to SubSessionBar', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+
+      await waitFor(() => expect(view.container.querySelector('.mobile-server-actions')).toBeTruthy());
+      const topActions = view.container.querySelector('.mobile-server-actions')!;
+      expect(topActions.querySelector('.badge')).toBeNull();
+      expect(topActions.textContent ?? '').not.toContain('Online');
+      expect(topActions.textContent ?? '').not.toContain('Connecting');
+      expect(topActions.textContent ?? '').not.toContain('Daemon Offline');
+      expect(topActions.textContent ?? '').not.toMatch(/v\d+\/\d+\s+\d{2}:\d{2}/);
+
+      const barBefore = await screen.findByTestId('app-shell-subsession-bar');
+      expect(['connecting', 'offline']).toContain(barBefore.getAttribute('data-daemon-badge-state'));
+
+      await act(async () => {
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 10, memUsed: 1, memTotal: 2, load1: 0.5, load5: 0, load15: 0, uptime: 10,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-daemon-badge-state')).toBe('online');
+      });
+      expect(topActions.querySelector('.badge')).toBeNull();
+      expect(topActions.textContent ?? '').not.toContain('Online');
+      expect(topActions.textContent ?? '').not.toMatch(/v\d+\/\d+\s+\d{2}:\d{2}/);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('grants whole-server participant full unscoped FileBrowser/file-preview without Share', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    history.replaceState(null, '', '/#/srv-shared?shared=share-srv-part');
+    const serverGrant = {
+      id: 'share-srv-part',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([serverGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: serverGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-srv-part'],
+        primaryShareId: 'share-srv-part',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'idle',
+        agentType: 'codex-sdk',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    fireEvent.click(screen.getByTitle('picker.files'));
+    const desktopFb = await screen.findByTestId('file-browser');
+    expect(desktopFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(desktopFb.getAttribute('data-read-only')).toBe('false');
+    expect(desktopFb.getAttribute('data-can-share')).toBe('false');
+    fireEvent.click(screen.getByText('file-close'));
+
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    const previewFb = await screen.findByTestId('file-browser-preview');
+    expect(previewFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(previewFb.getAttribute('data-read-only')).toBe('false');
+    expect(previewFb.getAttribute('data-can-share')).toBe('false');
+  }, 20_000);
+
+  it('keeps tab-share viewer file-preview scoped, readOnly, and without Share', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-tab-view');
+    const tabGrant = {
+      id: 'share-tab-view',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Tab Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([tabGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: tabGrant.target,
+      coverage: {
+        effectiveRole: 'viewer',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-tab-view'],
+        primaryShareId: 'share-tab-view',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Tab Beta',
+        state: 'idle',
+        agentType: 'codex-sdk',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    const tabPreviewFb = await screen.findByTestId('file-browser-preview');
+    expect(tabPreviewFb.getAttribute('data-scope-to-session-root')).toBe('true');
+    expect(tabPreviewFb.getAttribute('data-read-only')).toBe('true');
+    expect(tabPreviewFb.getAttribute('data-can-share')).toBe('false');
+  }, 20_000);
+
+  it('preserves composer focus across >100ms delayed server switch hydration, rapid repeats, and async task-pair mounts', async () => {
+    let resolveSrv2!: (v: unknown) => void;
+    const srv2Deferred = new Promise((r) => { resolveSrv2 = r; });
+    let resolveSrv3!: (v: unknown) => void;
+    const srv3Deferred = new Promise((r) => { resolveSrv3 = r; });
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-3', name: 'Server Three', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') return srv2Deferred;
+      if (path === '/api/server/srv-3/sessions') return srv3Deferred;
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Rapid consecutive Alt+k switches (<50ms apart): srv-1 -> srv-2 -> srv-3
+    alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+
+    // Simulate >150ms delayed /sessions response for srv-3 (and stale srv-2 resolving before or after)
+    await new Promise((r) => setTimeout(r, 160));
+    await act(async () => {
+      resolveSrv2({
+        sessions: [
+          { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+        ],
+      });
+      resolveSrv3({
+        sessions: [
+          { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+        ],
+      });
+    });
+
+    const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+    await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+    // Async TaskPairStatusPanel / supervision:task-pairs arrival causing a transient blur to body must re-assert focus to gammaComposer
+    act(() => {
+      gammaComposer.blur();
+      document.body.focus();
+      const snapshot = {
+        authoritative: true,
+        serverId: 'srv-3',
+        tasks: [
+          { taskId: 'task-3', title: 'Async Task Bar', status: 'working', updatedAt: 100, pair: { status: 'working', executor: 'deck_sub_g1', auditor: 'none' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: snapshot }));
+    });
+    await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+    // User focusing/clicking another control cancels the switch guard and never steals focus back
+    const unrelatedBtn = screen.getByText('server-toggle-sidebar');
+    fireEvent.pointerDown(unrelatedBtn);
+    unrelatedBtn.focus();
+    expect(document.activeElement).toBe(unrelatedBtn);
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: { authoritative: true, serverId: 'srv-3', tasks: [] },
+      }));
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(document.activeElement).toBe(unrelatedBtn);
+  }, 20_000);
+
+  it('preserves target composer focus when switching via serverNext to a delayed shared server', async () => {
+    let resolveSharedOpen!: (v: unknown) => void;
+    const sharedOpenDeferred = new Promise((r) => { resolveSharedOpen = r; });
+
+    const sharedServerEntry = {
+      id: 'share-srv-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Beta',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+    openSharedEntryMock.mockReturnValue(sharedOpenDeferred);
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Alpha Server', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+    await screen.findByText('server-select-srv-shared');
+
+    alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+
+    await new Promise((r) => setTimeout(r, 150));
+    await act(async () => {
+      resolveSharedOpen({
+        server: { id: 'srv-shared', name: 'Shared Beta', status: 'active', lastHeartbeatAt: Date.now() },
+        target: sharedServerEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-srv-2'],
+          primaryShareId: 'share-srv-2',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_shared_one', title: 'Shared One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+        ],
+        subSessions: [],
+      });
+    });
+
+    const sharedComposer = await screen.findByTestId('pane-composer-deck_shared_one');
+    await waitFor(() => expect(document.activeElement).toBe(sharedComposer));
+
+    act(() => {
+      sharedComposer.blur();
+      document.body.focus();
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: { authoritative: true, serverId: 'srv-shared', tasks: [] },
+      }));
+    });
+    await waitFor(() => expect(document.activeElement).toBe(sharedComposer));
+  }, 20_000);
+
+  it('remounts SessionPane cleanly when switching between servers with identical session names', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions' || path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_shared_brain', project_name: 'shared', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/shared', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_shared_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const paneSrv1 = await screen.findByTestId('session-pane-deck_shared_brain');
+    const server2Btn = await screen.findByText('server-select-srv-2');
+    fireEvent.click(server2Btn);
+
+    await waitFor(() => {
+      const paneSrv2 = screen.getByTestId('session-pane-deck_shared_brain');
+      expect(paneSrv2).not.toBe(paneSrv1);
+    });
+  }, 20_000);
+
+  it('opens SettingsPage via imcodes:open-settings event and Cmd+, / Ctrl+, shortcuts while respecting IME and shortcut recording', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Alpha Server', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const platformSpy = vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel');
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+
+      // 1. Desktop PC App menu event opens Settings
+      act(() => {
+        window.dispatchEvent(new CustomEvent('imcodes:open-settings'));
+      });
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+      fireEvent.click(screen.getByText('settings-back'));
+      await waitFor(() => expect(screen.queryByTestId('settings-page-overlay')).toBeNull());
+
+      // 2. IME composition & active shortcut recording must not open Settings
+      const imeEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, isComposing: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(imeEvt);
+      expect(imeEvt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('settings-page-overlay')).toBeNull();
+
+      const recorder = document.createElement('button');
+      recorder.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorder);
+      const recordingEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, bubbles: true, cancelable: true });
+      recorder.dispatchEvent(recordingEvt);
+      expect(recordingEvt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('settings-page-overlay')).toBeNull();
+      recorder.remove();
+
+      // 3. Direct Cmd+, on macOS opens Settings from composer without leaking character input
+      const macEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(macEvt);
+      expect(macEvt.defaultPrevented).toBe(true);
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+      fireEvent.click(screen.getByText('settings-back'));
+      await waitFor(() => expect(screen.queryByTestId('settings-page-overlay')).toBeNull());
+
+      // 4. Ctrl+, on non-macOS opens Settings directly
+      platformSpy.mockReturnValue('Win32');
+      const winEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winEvt);
+      expect(winEvt.defaultPrevented).toBe(true);
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+    } finally {
+      platformSpy.mockRestore();
+    }
+  }, 20_000);
+
+  it('auto-scrolls target chat to bottom on shortcut server switch (including delayed session hydration), tab switch, sub-session quick focus, and return to main window', async () => {
+    // Prior fake-timer tests in this file leave jsdom's requestAnimationFrame unreliable after vi.useRealTimers();
+    // restore a working timer-backed rAF for this test and clean up in afterEach/restoreAllMocks.
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => window.setTimeout(() => cb(Date.now()), 16));
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => window.clearTimeout(id));
+    autoRegisterChatScrollState.enabled = true;
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        // Simulate network latency past initial rAF so delayed SessionPane registration consumes pending scroll
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-scroll-1',
+        sessionName: 'deck_sub_scroll_1',
+        parentSession: 'deck_alpha_brain',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        label: 'Sub 1',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaInput));
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
+      // Allow initial settle rAF to complete before resetting call log
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      // Clear initial load calls before testing shortcut switches
+      autoRegisterChatScrollState.mainCalls = [];
+      autoRegisterChatScrollState.subCalls = [];
+
+      // 1) Shortcut tab switch (Alt+l) -> beta tab chat scrolls to bottom even if initial fn is stale (returns false) and re-registers after >100ms (past 4 rAFs)
+      autoRegisterChatScrollState.staleDelayMs = 110;
+      autoRegisterChatScrollState.staleMainOnce.add('deck_beta_brain');
+      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      const betaInput = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_beta_brain'), { timeout: 5000 });
+
+      // Switch back to alpha (Alt+j)
+      autoRegisterChatScrollState.mainCalls = [];
+      betaInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
+
+      // 2) Shortcut sub-session open/focus (Ctrl+1) -> sub-scroll-1 scrolls to bottom even with delayed (>100ms) registration; Ctrl+0 closes all and scrolls main back to bottom
+      autoRegisterChatScrollState.subCalls = [];
+      autoRegisterChatScrollState.staleSubOnce.add('sub-scroll-1');
+      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-scroll-1', undefined, { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.subCalls).toContain('sub-scroll-1'), { timeout: 5000 });
+
+      autoRegisterChatScrollState.mainCalls = [];
+      sub1Input.dispatchEvent(new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
+
+      // 3) Pinned message locate still respects scrollToBottom: false (must NOT force scroll to bottom, even with delayed re-registration)
+      autoRegisterChatScrollState.mainCalls = [];
+      autoRegisterChatScrollState.staleMainOnce.add('deck_beta_brain');
+      const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+      act(() => requestMessagePinNavigation({
+        id: 'pin-check',
+        serverId: 'srv-1',
+        sessionName: 'deck_beta_brain',
+        eventId: 'evt-pin',
+        eventTs: 100,
+        eventType: 'assistant.text',
+        text: 'Pinned',
+        createdAt: 100,
+        updatedAt: 100,
+      }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(autoRegisterChatScrollState.mainCalls).not.toContain('deck_beta_brain');
+
+      // 4) Shortcut server switch (Alt+k) with delayed /api/server/srv-2/sessions -> deck_delta_brain auto-scrolls once mounted
+      autoRegisterChatScrollState.mainCalls = [];
+      const betaAfterPin = await screen.findByTestId('pane-composer-deck_beta_brain');
+      betaAfterPin.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await screen.findByTestId('session-pane-deck_delta_brain', undefined, { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_delta_brain'), { timeout: 5000 });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 30_000);
+
+  it('scrolls target main and restored open/focused sub-sessions on shortcut server switch and cancels stale scroll on rapid A -> B -> C switch', async () => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => window.setTimeout(() => cb(Date.now()), 16));
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => window.clearTimeout(id));
+    autoRegisterChatScrollState.enabled = true;
+
+    let resolveSrv2!: (value: unknown) => void;
+    let resolveSrv3!: (value: unknown) => void;
+    const srv2Promise = new Promise((resolve) => { resolveSrv2 = resolve; });
+    const srv3Promise = new Promise((resolve) => { resolveSrv3 = resolve; });
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-3', name: 'Server Three', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_srv1_brain', project_name: 'srv1', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/s1', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') return srv2Promise;
+      if (path === '/api/server/srv-3/sessions') return srv3Promise;
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const srv3Sub = {
+      id: 'sub-srv3-1',
+      sessionName: 'deck_sub_srv3_1',
+      parentSession: 'deck_srv3_brain',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      label: 'Srv3 Sub 1',
+      state: 'idle',
+      serverId: 'srv-3',
+    };
+    useSubSessionsState.subSessions = [];
+    useSubSessionsState.visibleSubSessions = [];
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_srv1_brain');
+    localStorage.setItem('rcc_open_subs_deck_srv3_brain', JSON.stringify(['sub-srv3-1']));
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      const srv1Composer = await screen.findByTestId('pane-composer-deck_srv1_brain');
+      await waitFor(() => expect(document.activeElement).toBe(srv1Composer));
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_srv1_brain'), { timeout: 5000 });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      autoRegisterChatScrollState.mainCalls = [];
+      autoRegisterChatScrollState.subCalls = [];
+
+      // Rapid A -> B -> C switch: Alt+k to srv-2, immediately Alt+k again to srv-3 before srv-2 resolves
+      srv1Composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+
+      // Stale srv-2 resolves first — must NOT steal active view or trigger srv-2 scroll
+      await act(async () => {
+        resolveSrv2({
+          sessions: [
+            { name: 'deck_srv2_brain', project_name: 'srv2', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/s2', state: 'idle' },
+          ],
+        });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(autoRegisterChatScrollState.mainCalls).not.toContain('deck_srv2_brain');
+
+      // Now target srv-3 resolves -> first main sessions arrive while sub-sessions are still hydrating,
+      // then sub-sessions finish loading asynchronously (loadedServerId='srv-3') -> BOTH main AND restored sub-session scroll to bottom
+      await act(async () => {
+        resolveSrv3({
+          sessions: [
+            { name: 'deck_srv3_brain', project_name: 'srv3', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/s3', state: 'idle' },
+          ],
+        });
+      });
+
+      await screen.findByTestId('session-pane-deck_srv3_brain', undefined, { timeout: 5000 });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      useSubSessionsState.subSessions = [srv3Sub];
+      useSubSessionsState.visibleSubSessions = [srv3Sub];
+      useSubSessionsState.loadedServerId = 'srv-3';
+      view.rerender(<App />);
+      await screen.findByTestId('sub-session-window-sub-srv3-1', undefined, { timeout: 5000 });
+      await waitFor(() => {
+        expect(autoRegisterChatScrollState.mainCalls).toContain('deck_srv3_brain');
+        expect(autoRegisterChatScrollState.subCalls).toContain('sub-srv3-1');
+      }, { timeout: 5000 });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 30_000);
+
+  it('refreshes owned server heartbeat via onPongLiveness even when latency sample is suppressed, while preserving offline guard', async () => {
+    const staleHeartbeatAt = Date.now() - 120_000;
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: staleHeartbeatAt },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_srv1_brain', project_name: 'srv1', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/s1', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_srv1_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const srvIcon = await screen.findByTestId('server-icon-srv-1');
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const ws = wsInstances[wsInstances.length - 1];
+
+    expect(srvIcon.getAttribute('data-last-heartbeat-at')).toBe(String(staleHeartbeatAt));
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-latency-ms')).toBe('');
+
+    // Simulate correlated pong suppressed as an anomalous RTT spike: only onPongLiveness fires.
+    await act(async () => {
+      ws.emitPongLiveness();
+    });
+
+    const refreshedHeartbeat = Number(screen.getByTestId('server-icon-srv-1').getAttribute('data-last-heartbeat-at'));
+    expect(refreshedHeartbeat).toBeGreaterThan(staleHeartbeatAt);
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-latency-ms')).toBe('');
+
+    // Normal RTT update updates latencyMs without regressing heartbeat
+    await act(async () => {
+      ws.emitLatency(29);
+      ws.emitPongLiveness();
+    });
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-latency-ms')).toBe('29');
+
+    // Explicit daemon.offline must NOT be promoted back online by subsequent pong liveness
+    await act(async () => {
+      ws.emit({ type: 'daemon.offline' });
+      ws.emitPongLiveness();
+    });
+    expect(screen.getByTestId('server-icon-srv-1').getAttribute('data-status')).toBe('offline');
+  });
 });

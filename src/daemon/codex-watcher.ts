@@ -5,19 +5,21 @@
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
 import { join, basename } from 'path';
 import { homedir } from 'os';
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-const execAsync = promisify(exec);
+import { execFileOffMain } from '../util/exec-helper.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { buildSessionBootstrapContext, buildCodexMemoryEntry, readProcessedMemoryItems } from './memory-inject.js';
+import { buildSessionBootstrapContextWithItems, buildCodexMemoryEntry } from './memory-inject.js';
+import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
+import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
 import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import { updateSessionState } from '../store/session-store.js';
+import { getCodexHome, codexSessionDir, recentCodexSessionDirs, findCodexRolloutPathByUuid, extractCodexRolloutUuid } from '../util/codex-rollout-path.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
+import { extractAskQuestionsFromToolInput } from '../../shared/ask-question-normalize.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -48,7 +50,7 @@ async function upsertCodexThread(uuid: string, cwd: string, rolloutPath: string,
     `  cwd = '${esc(cwd)}', model_provider = 'openai', source = 'cli',`,
     `  rollout_path = '${esc(rolloutPath)}', updated_at = ${now}, cli_version = '${esc(cliVersion)}';`,
   ].join(' ');
-  await execAsync(`sqlite3 ${JSON.stringify(dbPath)} ${JSON.stringify(sql)}`);
+  await execFileOffMain('sqlite3', [dbPath, sql]);
   logger.info({ uuid, cwd }, 'codex-watcher: upserted thread into SQLite');
 }
 
@@ -57,7 +59,7 @@ let _codexVersion: string | null = null;
 async function getCodexVersion(): Promise<string> {
   if (_codexVersion) return _codexVersion;
   try {
-    const { stdout } = await execAsync('codex --version');
+    const { stdout } = await execFileOffMain('codex', ['--version']);
     _codexVersion = stdout.trim().replace(/^codex-cli\s+/, '');
   } catch {
     _codexVersion = '0.113.0';
@@ -67,21 +69,10 @@ async function getCodexVersion(): Promise<string> {
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
 
-function codexSessionDir(d: Date): string {
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  return join(homedir(), '.codex', 'sessions', String(yyyy), mm, dd);
-}
-
-function recentSessionDirs(): string[] {
-  const dirs: string[] = [];
-  for (let i = 0; i < 30; i++) {
-    const d = new Date(Date.now() - i * 86_400_000);
-    dirs.push(codexSessionDir(d));
-  }
-  return dirs;
-}
+// codexSessionDir / recentCodexSessionDirs / findCodexRolloutPathByUuid /
+// extractCodexRolloutUuid live in ../util/codex-rollout-path.ts (shared with the
+// codex-sdk transport). This file uses recentCodexSessionDirs() only for
+// discovering FRESH files by mtime/cwd; id lookups go through the shared finder.
 
 // ── JSONL matching ─────────────────────────────────────────────────────────────
 
@@ -146,7 +137,7 @@ async function findLatestRollout(
 async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
   let latestPath: string | null = null;
   let latestMtime = -1;
-  for (const dir of recentSessionDirs()) {
+  for (const dir of recentCodexSessionDirs()) {
     const found = await findLatestRollout(dir, projectDir, false, sessionName, currentUuid);
     if (!found || found === currentPath) continue;
     try {
@@ -172,7 +163,32 @@ function normalizePath(p: string): string {
 const finalAnswerBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
 const sessionStates = new Map<string, 'running' | 'idle'>();
 const historyReplaySessions = new Set<string>();
+const askQuestionCallIdsBySession = new Map<string, Set<string>>();
+const ASK_QUESTION_CALL_IDS_LIMIT = 200;
 const FINAL_ANSWER_DEBOUNCE_MS = 600;
+
+function rememberAskQuestionCallId(sessionName: string, callId: string): void {
+  if (!callId) return;
+  let ids = askQuestionCallIdsBySession.get(sessionName);
+  if (!ids) {
+    ids = new Set();
+    askQuestionCallIdsBySession.set(sessionName, ids);
+  }
+  ids.add(callId);
+  if (ids.size > ASK_QUESTION_CALL_IDS_LIMIT) {
+    const oldest = ids.values().next().value;
+    if (oldest !== undefined) ids.delete(oldest);
+  }
+}
+
+function consumeAskQuestionCallId(sessionName: string, callId: string): boolean {
+  if (!callId) return false;
+  const ids = askQuestionCallIdsBySession.get(sessionName);
+  if (!ids) return false;
+  const matched = ids.delete(callId);
+  if (ids.size === 0) askQuestionCallIdsBySession.delete(sessionName);
+  return matched;
+}
 
 function flushFinalAnswer(sessionName: string): void {
   const buf = finalAnswerBuffers.get(sessionName);
@@ -205,6 +221,7 @@ export function resetParseStateForTests(): void {
   for (const { timer } of finalAnswerBuffers.values()) clearTimeout(timer);
   finalAnswerBuffers.clear();
   sessionStates.clear();
+  askQuestionCallIdsBySession.clear();
 }
 
 export function parseLine(sessionName: string, line: string, model?: string): void {
@@ -222,6 +239,22 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     if (pl.type === 'function_call') {
       emitSessionState(sessionName, 'running');
       const name = String(pl.name ?? 'tool');
+      if (name === 'request_user_input') {
+        const questions = extractAskQuestionsFromToolInput(pl.arguments);
+        if (questions.length > 0) {
+          const callId = pl.call_id !== undefined && pl.call_id !== null
+            ? String(pl.call_id)
+            : pl.id !== undefined && pl.id !== null
+              ? String(pl.id)
+              : '';
+          rememberAskQuestionCallId(sessionName, callId);
+          timelineEmitter.emit(sessionName, 'ask.question', {
+            toolUseId: callId,
+            questions,
+          }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
+          return;
+        }
+      }
       let input = pl.arguments ?? '';
       try {
         const args = JSON.parse(pl.arguments ?? '{}');
@@ -230,9 +263,13 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       } catch {}
       timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'function_call_output') {
+      const callId = pl.call_id !== undefined && pl.call_id !== null ? String(pl.call_id) : '';
+      if (consumeAskQuestionCallId(sessionName, callId)) {
+        return;
+      }
       const errMsg = pl.error;
       const output = !errMsg && typeof pl.output === 'string' && pl.output.trim()
-        ? (pl.output.length > 200 ? pl.output.slice(0, 197) + '...' : pl.output)
+        ? pl.output
         : undefined;
       timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'reasoning') {
@@ -242,7 +279,7 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     } else if (pl.type === 'custom_tool_call') {
       emitSessionState(sessionName, 'running');
       const name = String(pl.name ?? 'tool');
-      const input = typeof pl.input === 'string' ? pl.input.slice(0, 200) : '';
+      const input = typeof pl.input === 'string' ? pl.input : '';
       timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'custom_tool_call_output') {
       let error: string | undefined;
@@ -250,9 +287,8 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       try {
         const out = JSON.parse(pl.output ?? '{}');
         if (out.metadata?.exit_code && out.metadata.exit_code !== 0) error = `exit ${out.metadata.exit_code}`;
-        // Extract truncated output text for display
-        const text = typeof out.output === 'string' ? out.output.trim() : '';
-        if (!error && text) output = text.length > 200 ? text.slice(0, 197) + '...' : text;
+        const text = typeof out.output === 'string' ? out.output : '';
+        if (!error && text.trim()) output = text;
       } catch {}
       timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'web_search_call') {
@@ -406,8 +442,7 @@ export function isFileClaimedByOther(sessionName: string, filePath: string): boo
 }
 
 export function extractUuidFromPath(p: string): string | null {
-  const m = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(p);
-  return m ? m[1] : null;
+  return extractCodexRolloutUuid(p);
 }
 
 /**
@@ -417,7 +452,7 @@ export function extractUuidFromPath(p: string): string | null {
 export async function extractNewRolloutUuid(workDir: string, launchTime: number, timeoutMs = 5000): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       let entries: string[];
       try { entries = await readdir(dir); } catch { continue; }
       for (const name of entries) {
@@ -439,15 +474,11 @@ export async function extractNewRolloutUuid(workDir: string, launchTime: number,
   return null;
 }
 
-/** Search recent session dirs for the rollout file containing the given UUID. */
-export async function findRolloutPathByUuid(uuid: string): Promise<string | null> {
-  for (const dir of recentSessionDirs()) {
-    let entries: string[];
-    try { entries = await readdir(dir); } catch { continue; }
-    const match = entries.find(e => e.includes(uuid) && e.endsWith('.jsonl'));
-    if (match) return join(dir, match);
-  }
-  return null;
+/** Locate the rollout file for a codex thread uuid (any age). Delegates to the
+ *  shared window/timezone-robust resolver so the CLI watcher and the codex-sdk
+ *  transport share one correct implementation. */
+export function findRolloutPathByUuid(uuid: string): Promise<string | null> {
+  return findCodexRolloutPathByUuid(uuid);
 }
 
 /**
@@ -460,7 +491,7 @@ export async function ensureSessionFile(uuid: string, cwd: string, sessionName?:
   if (existing) return existing;
 
   const now = new Date();
-  const dir = codexSessionDir(now);
+  const dir = codexSessionDir(getCodexHome(), now);
   await mkdir(dir, { recursive: true });
 
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -488,16 +519,18 @@ export async function ensureSessionFile(uuid: string, cwd: string, sessionName?:
 
   // Inject project memory so the agent starts with project context loaded.
   // Also required: `codex resume` needs at least one entry beyond session_meta.
-  const memory = legacyInjectionDisabled()
-    ? 'Shared context bootstrap deferred to runtime assembly.'
-    : await buildSessionBootstrapContext(cwd, basename(cwd));
+  const bootstrap = legacyInjectionDisabled()
+    ? { text: 'Shared context bootstrap deferred to runtime assembly.', items: [] }
+    : await buildSessionBootstrapContextWithItems(cwd, basename(cwd));
+  const memory = bootstrap.text;
   const lines = [meta, buildCodexMemoryEntry(memory, isoNow)];
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');
   logger.info({ uuid, filePath, hasMemory: !!memory }, 'codex-watcher: created bootstrapped session file');
 
   if (sessionName && !legacyInjectionDisabled()) {
-    const items = await readProcessedMemoryItems(basename(cwd));
+    const items = bootstrap.items;
+    recordSyncedSummaryFingerprints(sessionName, recentSummaryFingerprintsFromItems(items));
     const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
     if (payload) {
       timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
@@ -529,9 +562,9 @@ export async function startWatching(sessionName: string, workDir: string, model?
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
   startPoll(sessionName, state);
-  void watchDir(sessionName, state, state.workDir || codexSessionDir(new Date()));
+  void watchDir(sessionName, state, state.workDir || codexSessionDir(getCodexHome(), new Date()));
   void (async () => {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       if (state.stopped) return;
       const found = await findLatestRollout(dir, workDir);
       if (!found || state.stopped) continue;
@@ -590,7 +623,7 @@ export async function startWatchingById(sessionName: string, uuid: string, model
   // Helper: one pass over the recent-session dirs looking for a file whose
   // name contains the target uuid. Returns true when activation succeeds.
   const tryActivate = async (): Promise<boolean> => {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       try {
         const entries = await readdir(dir);
         const match = entries.find((e) => e.includes(uuid));
@@ -677,6 +710,7 @@ export function stopWatching(sessionName: string): void {
   watchers.delete(sessionName);
   unregisterWatcherControl(sessionName);
   sessionStates.delete(sessionName);
+  askQuestionCallIdsBySession.delete(sessionName);
   const finalAnswer = finalAnswerBuffers.get(sessionName);
   if (finalAnswer) {
     clearTimeout(finalAnswer.timer);
@@ -695,18 +729,30 @@ async function runSerializedCodexWork(
   sessionName: string,
   state: WatcherState,
   work: () => Promise<boolean>,
+  options: { coalesce?: boolean } = {},
 ): Promise<boolean> {
-  if (state.runningWork) {
-    state.rerunWork = true;
-    await state.runningWork.catch(() => false);
-    return !state.stopped;
+  const coalesce = options.coalesce ?? true;
+
+  if (coalesce) {
+    if (state.runningWork) {
+      state.rerunWork = true;
+      await state.runningWork.catch(() => false);
+      return !state.stopped;
+    }
+  } else {
+    while (state.runningWork) {
+      await state.runningWork.catch(() => false);
+      if (state.stopped) return false;
+    }
+    if (state.stopped) return false;
   }
 
   state.runningWork = (async () => {
     let result = await work();
     while (state.rerunWork && !state.stopped) {
       state.rerunWork = false;
-      result = (await refreshTrackedSessionInner(sessionName, state).catch(() => false)) || result;
+      const rerunResult = await refreshTrackedSessionInner(sessionName, state).catch(() => false);
+      if (coalesce) result = rerunResult || result;
     }
     return result;
   })().finally(() => {
@@ -739,7 +785,7 @@ async function refreshTrackedSessionInner(sessionName: string, state: WatcherSta
     claimedFiles.set(latestPath, sessionName);
     void watchDir(sessionName, state, state.workDir);
   } else if (uuid) {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       if (dir === state.workDir) continue;
       try {
         const entries = await readdir(dir);
@@ -766,7 +812,12 @@ async function refreshTrackedSessionInner(sessionName: string, state: WatcherSta
 export async function retrackLatestRollout(sessionName: string): Promise<boolean> {
   const state = watchers.get(sessionName);
   if (!state || state.stopped) return false;
-  return await runSerializedCodexWork(sessionName, state, () => retrackLatestRolloutInner(sessionName, state));
+  return await runSerializedCodexWork(
+    sessionName,
+    state,
+    () => retrackLatestRolloutInner(sessionName, state),
+    { coalesce: false },
+  );
 }
 
 async function retrackLatestRolloutInner(sessionName: string, state: WatcherState): Promise<boolean> {

@@ -1,3 +1,8 @@
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
+
 export interface AgentBadgeConfig {
   label: string;
   color: string;
@@ -7,27 +12,43 @@ export interface AgentBadgeConfig {
 export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'claude-code': { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
   'claude-code-sdk': { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
   'codex': { label: 'cx', color: '#d97706', autoLabelPrefix: 'Cx' },
   'codex-sdk': { label: 'cx', color: '#d97706', autoLabelPrefix: 'Cx' },
   'copilot-sdk': { label: 'co', color: '#2563eb', autoLabelPrefix: 'Co' },
   'cursor-headless': { label: 'cu', color: '#0ea5e9', autoLabelPrefix: 'Cu' },
+  'opencode-sdk': { label: 'oc', color: '#10b981', autoLabelPrefix: 'OC' },
   'opencode': { label: 'oc', color: '#059669', autoLabelPrefix: 'OC' },
   'openclaw': { label: 'oc', color: '#f97316', autoLabelPrefix: 'OC' },
   'qwen': { label: 'qw', color: '#0f766e', autoLabelPrefix: 'Qw' },
-  'gemini': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
-  'gemini-sdk': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
+  'grok-sdk': { label: 'gr', color: '#64748b', autoLabelPrefix: 'Gr' },
   'kimi-sdk': { label: 'km', color: '#8b5cf6', autoLabelPrefix: 'Km' },
+  [HERMES_AGENT_PROVIDER_ID]: { label: 'he', color: '#14b8a6', autoLabelPrefix: 'He' },
+  [AGY_SDK_PROVIDER_ID]: { label: 'ag', color: '#2563eb', autoLabelPrefix: 'Ag' },
+  'deepseek-harness': { label: 'ds', color: '#4d6bfe', autoLabelPrefix: 'Ds' },
+  pi: { label: 'pi', color: '#06b6d4', autoLabelPrefix: 'Pi' },
+  'muse-code-sdk': { label: 'mu', color: '#0081fb', autoLabelPrefix: 'Mu' },
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: { label: 'cb', color: '#22c55e', autoLabelPrefix: 'CB' },
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: { label: 'cb', color: '#38bdf8', autoLabelPrefix: 'CB' },
   'shell': { label: 'sh', color: '#475569', autoLabelPrefix: 'Sh' },
   'script': { label: 'sc', color: '#64748b', autoLabelPrefix: 'Sc' },
 };
 
 const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^claude-code-sdk(\d+)?$/i, prefix: 'CC' },
+  { pattern: /^claude-code-cli-sdk(\d+)?$/i, prefix: 'CC' },
   { pattern: /^codex-sdk(\d+)?$/i, prefix: 'Cx' },
   { pattern: /^copilot-sdk(\d+)?$/i, prefix: 'Co' },
   { pattern: /^cursor-headless(\d+)?$/i, prefix: 'Cu' },
-  { pattern: /^gemini-sdk(\d+)?$/i, prefix: 'Gm' },
+  { pattern: /^opencode-sdk(\d+)?$/i, prefix: 'OC' },
+  { pattern: /^grok-sdk(\d+)?$/i, prefix: 'Gr' },
   { pattern: /^kimi-sdk(\d+)?$/i, prefix: 'Km' },
+  { pattern: /^agy-sdk(\d+)?$/i, prefix: 'Ag' },
+  { pattern: /^deepseek-harness(\d+)?$/i, prefix: 'Ds' },
+  { pattern: /^pi(\d+)?$/i, prefix: 'Pi' },
+  { pattern: /^muse-code-sdk(\d+)?$/i, prefix: 'Mu' },
+  { pattern: /^codebuddy-cn(\d+)?$/i, prefix: 'CB' },
+  { pattern: /^codebuddy-international(\d+)?$/i, prefix: 'CB' },
 ];
 
 export function getAgentBadgeConfig(agentType: string | null | undefined): AgentBadgeConfig | null {

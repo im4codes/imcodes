@@ -1,0 +1,25 @@
+name: Build headless Linux compatibility executable
+description: Pinned community ABI runtime, same-runtime SEA, immutable manifest verification (no GUI or official-mirror fallback)
+inputs:
+  version:
+    description: Exact product version
+    required: true
+outputs:
+  artifact:
+    description: Canonical compatibility artifact filename
+    value: ${{ steps.profile.outputs.artifact }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve canonical compatibility filename
+      id: profile
+      shell: bash
+      run: node -e "require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,'artifact='+require('./shared/controlled-node-abi-profiles.json').GLIBC217.fileName+'\\n')"
+    - name: Guard thin-node dependency boundary
+      shell: bash
+      run: npm run check:node-exe-deps
+    - name: Build and verify pinned headless compatibility executable
+      shell: bash
+      env:
+        IMCODES_BUILD_VERSION: ${{ inputs.version }}
+      run: node scripts/build-node-compat-exe.mjs

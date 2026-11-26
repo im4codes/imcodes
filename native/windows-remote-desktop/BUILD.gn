@@ -1,0 +1,378 @@
+import("//webrtc.gni")
+import("libwebrtc-sdk.gni")
+
+# This directory is copied verbatim into a pinned libwebrtc checkout at
+# //third_party/imcodes_remote_desktop by build-worker.ps1.  The worker links
+# libwebrtc and Windows system media APIs into one immutable executable; it
+# never downloads executable code or codecs at runtime.
+rtc_executable("imcodes_remote_desktop_worker") {
+  configs += [ "//build/config/win:windowed" ]
+  sources = [
+    "display_capture.cc",
+    "display_capture.h",
+    "display_preferences.cc",
+    "display_preferences.h",
+    "input_injector.cc",
+    "input_injector.h",
+    "json_protocol.h",
+    "brand_logo_generated.h",
+    "consent_ipc.cc",
+    "consent_ipc.h",
+    "consent_prompt.cc",
+    "consent_prompt.h",
+    "local_indicator.cc",
+    "local_indicator.h",
+    "mf_h264_encoder.cc",
+    "mf_h264_encoder.h",
+    "privacy_ipc.cc",
+    "privacy_ipc.h",
+    "peer_session.cc",
+    "peer_session.h",
+    "pipe_ipc.cc",
+    "pipe_ipc.h",
+    "quality_ladder.h",
+    "unlock_secret.cc",
+    "unlock_secret.h",
+    "wasapi_loopback_capture.cc",
+    "wasapi_loopback_capture.h",
+    "worker_policy.cc",
+    "worker_policy.h",
+    "windows_platform_adapters.cc",
+    "windows_platform_adapters.h",
+    "virtual_display_controller.cc",
+    "virtual_display_controller.h",
+    "worker_main.cc",
+  ]
+
+  defines = imcodes_remote_desktop_defines
+  deps = imcodes_remote_desktop_deps +
+         [ "//third_party/imcodes_remote_desktop/common:remote_desktop_common" ]
+
+  libs = [
+    "d3d11.lib",
+    "dxgi.lib",
+    "gdi32.lib",
+    "mf.lib",
+    "mfplat.lib",
+    "mfuuid.lib",
+    "ole32.lib",
+    "oleaut32.lib",
+    "propsys.lib",
+    "advapi32.lib",
+    "crypt32.lib",
+    "shcore.lib",
+    "shell32.lib",
+    "user32.lib",
+    "swdevice.lib",
+    "wtsapi32.lib",
+    "wmcodecdspuuid.lib",
+    "uuid.lib",
+      "msimg32.lib",  # AlphaBlend for the indicator brand mark
+  ]
+}
+
+if (rtc_include_tests) {
+  rtc_test("display_capture_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_capture_unittest.cc",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
+    ]
+  }
+
+  rtc_test("quality_ladder_unittests") {
+    sources = [
+      "quality_ladder.h",
+      "quality_ladder_unittest.cc",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
+  rtc_test("input_injector_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_preferences.cc",
+      "display_preferences.h",
+      "input_injector.cc",
+      "input_injector.h",
+      "input_injector_unittest.cc",
+      "windows_platform_adapters.cc",
+      "windows_platform_adapters.h",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    # This target compiles display_capture.cc and windows_platform_adapters.cc,
+    # so it needs exactly what display_capture_unittests needs. Without libyuv
+    # in particular the build stops at
+    # `display_capture.cc: fatal error: 'libyuv/convert.h' file not found`,
+    # which is what a real `-RunNativeTests` run hits first.
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+      "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    # Same import libraries display_capture_unittests needs: this target
+    # compiles display_capture.cc and worker_policy.cc, whose DXGI and WTS
+    # calls are otherwise undefined at link
+    # (`lld-link: error: undefined symbol: WTSFreeMemory`).
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
+    ]
+  }
+
+  rtc_test("json_protocol_unittests") {
+    sources = [
+      "json_protocol.h",
+      "json_protocol_unittest.cc",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
+  rtc_test("local_management_ipc_unittests") {
+    sources = [ "local_management_ipc_unittest.cc" ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
+  rtc_test("windows_platform_adapters_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_preferences.cc",
+      "display_preferences.h",
+      "input_injector.cc",
+      "input_injector.h",
+      "windows_platform_adapters.cc",
+      "windows_platform_adapters.h",
+      "windows_platform_adapters_unittest.cc",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    # Compiles display_capture.cc, so it needs the same graph
+    # display_capture_unittests does; libyuv in particular.
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+      "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    # Same import libraries display_capture_unittests needs: this target
+    # compiles display_capture.cc and worker_policy.cc, whose DXGI and WTS
+    # calls are otherwise undefined at link
+    # (`lld-link: error: undefined symbol: WTSFreeMemory`).
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
+    ]
+  }
+
+  rtc_test("privacy_ipc_unittests") {
+    sources = [
+      "json_protocol.h",
+      "privacy_ipc.cc",
+      "privacy_ipc.h",
+      "privacy_ipc_unittest.cc",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
+  rtc_test("pipe_ipc_unittests") {
+    sources = [
+      "pipe_ipc.cc",
+      "pipe_ipc.h",
+      "pipe_ipc_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
+  }
+
+  rtc_test("worker_policy_unittests") {
+    sources = [
+      "worker_policy.cc",
+      "worker_policy.h",
+      "worker_policy_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
+    libs = [ "dxgi.lib", "wtsapi32.lib" ]
+  }
+
+  rtc_test("mf_h264_encoder_unittests") {
+    sources = [
+      "mf_h264_encoder.cc",
+      "mf_h264_encoder.h",
+      "mf_h264_encoder_unittest.cc",
+      "quality_ladder.h",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "IMCODES_REMOTE_DESKTOP_ENCODER_BENCHMARKS",
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [
+      "//api/environment",
+      "//api:make_ref_counted",
+      "//api/video:encoded_image",
+      "//api/video:video_frame",
+      "//api/video_codecs:scalability_mode",
+      "//api/video_codecs:video_codecs_api",
+      "//modules/video_coding:video_codec_interface",
+      "//rtc_base:logging",
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+      "//third_party/jsoncpp",
+    ]
+    libs = [
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "ole32.lib",
+      "oleaut32.lib",
+      "wmcodecdspuuid.lib",
+      "wtsapi32.lib",
+    ]
+  }
+
+  rtc_test("peer_session_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_preferences.cc",
+      "display_preferences.h",
+      "input_injector.cc",
+      "input_injector.h",
+      "json_protocol.h",
+      "mf_h264_encoder.cc",
+      "mf_h264_encoder.h",
+      "peer_session.cc",
+      "peer_session.h",
+      "peer_session_unittest.cc",
+      "quality_ladder.h",
+      "windows_platform_adapters.cc",
+      "windows_platform_adapters.h",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = imcodes_remote_desktop_defines
+    deps = imcodes_remote_desktop_deps + [
+             "//test:test_support",
+             "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+           ]
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "ole32.lib",
+      "oleaut32.lib",
+      "propsys.lib",
+      "advapi32.lib",
+      "crypt32.lib",
+      "shcore.lib",
+      "shell32.lib",
+      "user32.lib",
+      "swdevice.lib",
+      "wtsapi32.lib",
+      "wmcodecdspuuid.lib",
+    ]
+  }
+
+  rtc_test("wasapi_loopback_capture_unittests") {
+    sources = [
+      "wasapi_loopback_capture.cc",
+      "wasapi_loopback_capture.h",
+      "wasapi_loopback_capture_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+      "UNICODE",
+      "_UNICODE",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+    libs = [ "ole32.lib" ]
+  }
+}

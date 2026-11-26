@@ -49,6 +49,7 @@ export type SessionGroupCloneErrorCode =
   | 'idempotency_conflict'
   | 'server_commit_failed'
   | 'server_p2p_commit_failed'
+  | 'daemon_offline'
   | 'cancelled'
   | 'cleanup_required'
   | 'internal_error';
@@ -205,6 +206,7 @@ export interface SessionGroupCloneEvent {
   skippedOrchestrationRuns?: number;
   warnings?: SessionGroupCloneWarning[];
   errorCode?: SessionGroupCloneErrorCode;
+  missingCapability?: string;
   cleanupRequired?: boolean;
   cleanupResources?: SessionGroupCloneCleanupResource[];
   result?: SessionGroupCloneResult;

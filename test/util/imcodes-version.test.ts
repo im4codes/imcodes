@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { compareImcodesVersions, isLocalDevImcodesVersion, parseImcodesVersion } from '../../shared/imcodes-version.js';
+import {
+  compareImcodesVersions,
+  isImcodesVersionOutdated,
+  isLocalDevImcodesVersion,
+  parseImcodesVersion,
+} from '../../shared/imcodes-version.js';
 
 describe('imcodes version helpers', () => {
   it('parses stable and dev versions', () => {
@@ -28,5 +33,21 @@ describe('imcodes version helpers', () => {
   it('marks only 0.x.x builds as local dev builds', () => {
     expect(isLocalDevImcodesVersion('0.1.2')).toBe(true);
     expect(isLocalDevImcodesVersion('2026.4.905-dev.877')).toBe(false);
+  });
+});
+
+describe('isImcodesVersionOutdated', () => {
+  it('flags only a strictly older parseable version', () => {
+    expect(isImcodesVersionOutdated('2026.8.3400-dev.3800', '2026.8.3447-dev.3884')).toBe(true);
+    expect(isImcodesVersionOutdated('2026.8.3447-dev.3884', '2026.8.3447-dev.3884')).toBe(false);
+    expect(isImcodesVersionOutdated('2026.8.3500', '2026.8.3447-dev.3884')).toBe(false);
+  });
+
+  it('never invents an upgrade from missing or unparseable input', () => {
+    expect(isImcodesVersionOutdated(null, '2026.8.3447-dev.3884')).toBe(false);
+    expect(isImcodesVersionOutdated(undefined, '2026.8.3447-dev.3884')).toBe(false);
+    expect(isImcodesVersionOutdated('2026.8.3400-dev.3800', undefined)).toBe(false);
+    expect(isImcodesVersionOutdated('not a version', '2026.8.3447-dev.3884')).toBe(false);
+    expect(isImcodesVersionOutdated('2026.8.3400-dev.3800', 'nightly')).toBe(false);
   });
 });

@@ -6,7 +6,7 @@ import {
 } from '../../src/util/sharp-repair-script.js';
 
 describe('SHARP_REQUIRED_DEPS', () => {
-  // Anchored against sharp@0.34.5's actual `dependencies` field. If this
+  // Anchored against sharp@0.35.5's actual `dependencies` field. If this
   // ever drifts (e.g. sharp drops detect-libc) update both this constant
   // and the upgrade-time install to a matching sharp version.
   it('lists sharp itself plus each runtime dep that left empty placeholders in 2026.4', () => {
@@ -36,7 +36,7 @@ describe('buildBashSharpRepair', () => {
   });
 
   it('runs the nested npm install only when SHARP_BROKEN flag is set', () => {
-    const repairIdx = block.indexOf('install --no-save --ignore-scripts sharp@0.34.5');
+    const repairIdx = block.indexOf('install --no-save --ignore-scripts sharp@0.35.5');
     const guardIdx = block.indexOf('if [ "$SHARP_BROKEN" = "1" ]');
     expect(guardIdx).toBeGreaterThan(-1);
     expect(repairIdx).toBeGreaterThan(guardIdx);
@@ -101,7 +101,7 @@ describe('buildBatchSharpRepair', () => {
 
   it('runs the nested install only when SHARP_BROKEN flag is set', () => {
     const guardIdx = block.indexOf('if "!SHARP_BROKEN!"=="1"');
-    const installIdx = block.indexOf('install --no-save --ignore-scripts sharp@0.34.5');
+    const installIdx = block.indexOf('install --no-save --ignore-scripts sharp@0.35.5');
     expect(guardIdx).toBeGreaterThan(-1);
     expect(installIdx).toBeGreaterThan(guardIdx);
   });

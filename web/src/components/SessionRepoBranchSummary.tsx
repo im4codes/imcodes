@@ -4,13 +4,14 @@ import { useSessionRepoContext } from '../session-repo-context-store.js';
 interface Props {
   sessionId?: string | null;
   projectDir?: string | null;
+  serverId?: string | null;
   onOpenRepo?: () => void;
   className?: string;
 }
 
-export function SessionRepoBranchSummary({ sessionId, projectDir, onOpenRepo, className }: Props) {
+export function SessionRepoBranchSummary({ sessionId, projectDir, serverId, onOpenRepo, className }: Props) {
   const { t } = useTranslation();
-  const context = useSessionRepoContext(sessionId, projectDir);
+  const context = useSessionRepoContext(sessionId, projectDir, serverId);
   const branch = context?.currentBranch?.trim();
 
   if (!branch || !projectDir) return null;

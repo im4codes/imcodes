@@ -1,0 +1,7 @@
+"CFBundleDisplayName" = "Send to IM.codes";
+"share.notificationBody" = "Saved %d file(s). Tap to open IM.codes and send.";
+"share.notificationBodyText" = "Saved shared content. Tap to open IM.codes and send.";
+"share.openApp" = "Files saved. Tap the notification banner or open IM.codes to choose a server and session.";
+"share.openAppText" = "Content saved. Tap the notification banner or open IM.codes to choose a server and session.";
+"share.done" = "Done";
+"share.error" = "Could not import the shared content. Please try again.";

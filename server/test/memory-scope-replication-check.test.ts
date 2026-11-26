@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { activeUserAnswer } from './helpers/user-status.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import type { Env } from '../src/env.js';
@@ -9,6 +10,10 @@ import {
   MEMORY_FEATURE_CONFIG_PREF_KEY,
   MEMORY_FEATURE_FLAGS_BY_NAME,
 } from '../../shared/feature-flags.js';
+
+// Below-admission business tests: the private HTTP routes are no longer daemon grants.
+// Mock only the admission boundary; owner identity, namespace and DB isolation stay real.
+vi.mock('../src/security/daemon-token-policy.js', () => ({ enforceDaemonTokenRoute: vi.fn() }));
 
 function makeEnv(db: Database): Env {
   return {
@@ -33,27 +38,30 @@ function normalize(sql: string): string {
 
 function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
+  const queryLog: Array<{ sql: string; params: unknown[] }> = [];
+  const queryOneLog: Array<{ sql: string; params: unknown[] }> = [];
   const tokenHash = sha256Hex('daemon-token');
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      queryOneLog.push({ sql, params });
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
       if (s.includes('from user_preferences')) {
         const value = options.userPrefs?.[`${String(params[0])}:${String(params[1])}`];
         return value == null ? null : ({ value } as T);
       }
-      if (s.includes('select id, user_id from servers where token_hash = $1 and id = $2')) {
-        return params[0] === tokenHash && params[1] === 'srv-1'
-          ? ({ id: 'srv-1', user_id: 'owner-1' } as T)
-          : null;
-      }
-      if (s.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-        return params[0] === tokenHash && params[1] === 'srv-1'
-          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1' } as T)
+      // The daemon-token guard reads role and revocation together with the row,
+      // and matches on id first. A stub that omits node_role/revoked_at would
+      // make a controlled or revoked credential look like a full daemon.
+      if (s.includes('from servers where id = $1 and token_hash = $2')) {
+        return params[0] === 'srv-1' && params[1] === tokenHash
+          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T)
           : null;
       }
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      queryLog.push({ sql, params });
       const s = normalize(sql);
       if (s.includes('from owner_private_memories')) {
         return params[0] === 'owner-1'
@@ -69,10 +77,10 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
     exec: async () => {},
     close: async () => {},
   } as Database;
-  return { db, executeLog };
+  return { db, executeLog, queryLog, queryOneLog };
 }
 
-describe('user_private owner-only server replication', () => {
+describe('below-admission user_private owner-only server replication', () => {
   beforeEach(() => {
     process.env.IMCODES_MEM_FEATURE_USER_PRIVATE_SYNC = 'true';
   });
@@ -210,6 +218,28 @@ describe('user_private owner-only server replication', () => {
       results: [{ id: 'mem-1', scope: 'user_private', kind: 'preference', origin: 'user_note', preview: 'Use pnpm', updatedAt: 123 }],
       nextCursor: null,
     });
+  });
+
+  it('returns the same empty envelope for missing, null, and blank owner-private queries without reading PostgreSQL', async () => {
+    const { db, queryLog, queryOneLog } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    for (const body of [{}, { query: null }, { query: '' }, { query: '   ' }]) {
+      const beforeQueryCount = queryLog.length;
+      const beforeQueryOneCount = queryOneLog.length;
+      const res = await app.request('/api/server/srv-1/shared-context/owner-private/search', {
+        method: 'POST',
+        headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }, makeEnv(db));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ results: [], nextCursor: null });
+      expect(queryLog.length).toBe(beforeQueryCount);
+      expect(queryOneLog.slice(beforeQueryOneCount).some((entry) => normalize(entry.sql).includes('from user_preferences'))).toBe(false);
+    }
+
+    expect(queryLog.some((entry) => normalize(entry.sql).includes('from owner_private_memories'))).toBe(false);
   });
 
   it('persists canonical content_hash on processed projection replication', async () => {

@@ -39,10 +39,12 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => false,
+  getTailSessionStateInfo: () => ({ state: null, ts: null }),
   getTailSessionState: () => null,
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: () => ({
     events: [],
     refreshing: false,
@@ -77,6 +79,7 @@ vi.mock('../../src/git-status-store.js', async (importOriginal) => {
   return {
     ...actual,
     useSharedGitChanges: () => [],
+    useSharedGitChangesCount: () => 0,
   };
 });
 
@@ -120,10 +123,13 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 }
 
 const ws = {
+  onMessage: vi.fn(() => () => undefined),
   subscribeTerminal: vi.fn(),
   unsubscribeTerminal: vi.fn(),
   sendSnapshotRequest: vi.fn(),
   sendResize: vi.fn(),
+  getDaemonCapabilitySnapshot: vi.fn(() => null),
+  onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
 } as any;
 
 function renderWindow(props: Partial<Parameters<typeof SubSessionWindow>[0]> = {}) {
@@ -162,19 +168,74 @@ describe('SubSessionWindow maximize integration', () => {
     localStorage.clear();
   });
 
-  it('places an accessible maximize control immediately before minimize', async () => {
+  it('places close split in the titlebar without closing or stopping either session', () => {
+    const onClosePairSplit = vi.fn();
+    const onClose = vi.fn();
+    const onMinimize = vi.fn();
+    const onToggleMaximized = vi.fn();
+    const first = renderWindow();
+    expect(screen.queryByRole('button', { name: 'taskPair.panel_close_split' })).toBeNull();
+    first.unmount();
+    const { container } = renderWindow({ onClosePairSplit, onClose, onMinimize, onToggleMaximized });
+    const closeSplit = screen.getByRole('button', { name: 'taskPair.panel_close_split' });
+    expect(closeSplit.closest('.subsession-header')).toBe(container.querySelector('.subsession-header'));
+    fireEvent.mouseDown(closeSplit);
+    fireEvent.click(closeSplit);
+    expect(onClosePairSplit).toHaveBeenCalledTimes(1);
+    fireEvent.dblClick(closeSplit);
+    expect(onToggleMaximized).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onMinimize).not.toHaveBeenCalled();
+  });
+
+  it('keeps maximize accessible while the auxiliary minimize control is hidden', async () => {
     const onToggleMaximized = vi.fn();
     const { container } = renderWindow({ onToggleMaximized });
 
     const buttons = Array.from(container.querySelectorAll('.subsession-header button'));
     const maximize = screen.getByRole('button', { name: 'window.maximize' });
-    const minimize = screen.getByRole('button', { name: 'window.minimize' });
+    const minimize = container.querySelector('button[aria-label="window.minimize"]')!;
+    expect(minimize.hasAttribute('hidden')).toBe(true);
 
     expect(maximize.getAttribute('title')).toBe('window.maximize');
     expect(buttons.indexOf(maximize as HTMLButtonElement)).toBe(buttons.indexOf(minimize as HTMLButtonElement) - 1);
 
     fireEvent.click(maximize);
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+  });
+
+  it('toggles the same in-window maximize on a header double-click, but never from a header control', () => {
+    const onToggleMaximized = vi.fn();
+    const onFocus = vi.fn();
+    const { container } = renderWindow({ onToggleMaximized, onFocus });
+    const header = container.querySelector('.subsession-header') as HTMLElement;
+
+    fireEvent.dblClick(container.querySelector('.subsession-title') as HTMLElement);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+    expect(onFocus).toHaveBeenCalled();
+    // Second double-click is the restore: same handler, no separate state here.
+    fireEvent.dblClick(header);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+
+    // Controls keep their own behaviour.
+    fireEvent.dblClick(screen.getByRole('button', { name: 'window.maximize' }));
+    fireEvent.dblClick(screen.getByRole('button', { name: 'window.hide' }));
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+
+    // The window body is not chrome.
+    fireEvent.dblClick(container.querySelector('.subsession-window') as HTMLElement);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a header double-click without desktop layout capability or a toggle handler', () => {
+    const onToggleMaximized = vi.fn();
+    const first = renderWindow({ onToggleMaximized, desktopLayoutCapable: false });
+    fireEvent.dblClick(first.container.querySelector('.subsession-title') as HTMLElement);
+    expect(onToggleMaximized).not.toHaveBeenCalled();
+    first.unmount();
+
+    const second = renderWindow({});
+    expect(() => fireEvent.dblClick(second.container.querySelector('.subsession-title') as HTMLElement)).not.toThrow();
   });
 
   it('does not expose maximize controls when desktop layout capability is disabled', async () => {
@@ -220,7 +281,7 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.height).toBe('640px');
     expect(screen.getByRole('button', { name: 'window.restore' }).getAttribute('title')).toBe('window.restore');
     expect(screen.getByText('worker · claude-code-sdk')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'picker.files' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'picker.files', hidden: true })).toBeTruthy();
 
     view.rerender(
       <SubSessionWindow
@@ -347,7 +408,7 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.top).toBe('9px');
   });
 
-  it('clears maximized state before minimize, hide, and stop close paths', async () => {
+  it('clears maximized state before hide and stop close paths', async () => {
     const calls: string[] = [];
     const { container } = renderWindow({
       maximized: true,
@@ -358,10 +419,6 @@ describe('SubSessionWindow maximize integration', () => {
       getMaximizeBounds: () => ({ x: 0, y: 0, w: 800, h: 600 }),
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'window.minimize' }));
-    expect(calls).toEqual(['restore', 'minimize']);
-
-    calls.length = 0;
     fireEvent.click(screen.getByRole('button', { name: 'window.hide' }));
     expect(calls).toEqual(['restore', 'minimize']);
 

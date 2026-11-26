@@ -31,7 +31,7 @@ class MockWs extends EventEmitter {
 
 function makeDb(queryOne?: (sql: string, params?: unknown[]) => Promise<unknown>) {
   return {
-    queryOne: queryOne ?? (async () => ({ token_hash: 'valid-hash' })),
+    queryOne: queryOne ?? (async () => ({ token_hash: 'valid-hash', owner_status: 'active' })),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -93,7 +93,7 @@ describe('WsBridge memory management routing', () => {
 
   it('derives elevated memory management role from server membership instead of browser input', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active' };
       if (sql.includes('FROM team_members') && params?.[0] === 'team-1' && params?.[1] === 'user-a') {
         return { role: 'admin' };
       }
@@ -148,7 +148,7 @@ describe('WsBridge memory management routing', () => {
 
   it('serves memory feature state from the user-global online preference store instead of daemon-local state', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'user-a' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'user-a' };
       if (sql.includes('FROM user_preferences')) {
         expect(params).toEqual(['user-a', MEMORY_FEATURE_CONFIG_PREF_KEY]);
         return {
@@ -181,8 +181,8 @@ describe('WsBridge memory management routing', () => {
   it('persists memory feature toggles globally and applies them to every online daemon owned by the user', async () => {
     const writes: Array<{ userId: string; key: string; value: string }> = [];
     const db = makeDb(async (sql: string) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'user-a' };
-      if (sql.includes('SELECT user_id FROM servers WHERE id = $1')) return { user_id: 'user-a' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'user-a' };
+      if (/^\s*SELECT user_id\b[\s\S]*FROM servers\s+WHERE id = \$1/.test(sql)) return { user_id: 'user-a', owner_status: 'active', actor_status: 'active' };
       if (sql.includes('FROM user_preferences')) return { value: '{}' };
       return null;
     });
@@ -225,8 +225,8 @@ describe('WsBridge memory management routing', () => {
 
   it('does not apply a user-global memory feature toggle to daemons owned by other users', async () => {
     const makeOwnerDb = (ownerUserId: string) => makeDb(async (sql: string) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: ownerUserId };
-      if (sql.includes('SELECT user_id FROM servers WHERE id = $1')) return { user_id: ownerUserId };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: ownerUserId };
+      if (/^\s*SELECT user_id\b[\s\S]*FROM servers\s+WHERE id = \$1/.test(sql)) return { user_id: ownerUserId, owner_status: 'active', actor_status: 'active' };
       if (sql.includes('FROM user_preferences')) return { value: '{}' };
       return null;
     });
@@ -278,7 +278,7 @@ describe('WsBridge memory management routing', () => {
 
   it('does not treat generic projectId as canonicalRepoId for role derivation', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active' };
       if (sql.includes('shared_project_enrollments') && params?.[0] === 'repo-x') return { role: 'admin' };
       return null;
     });
@@ -294,7 +294,7 @@ describe('WsBridge memory management routing', () => {
 
   it('does not forward unverified canonical project hints as authorized bindings', async () => {
     const db = makeDb(async (sql: string) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active' };
       return null;
     });
     const { daemon, browserA } = await setup(db);
@@ -315,7 +315,7 @@ describe('WsBridge memory management routing', () => {
 
   it('binds canonical memory requests to local visible project directories for daemon-side identity verification', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active' };
       if (sql.includes('shared_project_enrollments')) return null;
       if (sql.includes('FROM sessions') && params?.[1] === '/work/repo') {
         return { name: 'deck_repo_brain' };
@@ -343,7 +343,7 @@ describe('WsBridge memory management routing', () => {
 
   it('forwards active enrolled canonical projects with server-derived workspace/org bindings', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active' };
       if (sql.includes('shared_project_enrollments') && params?.[0] === 'github.com/acme/repo' && params?.[1] === 'user-a') {
         return { role: 'member', workspace_id: 'workspace-1', enterprise_id: 'team-1' };
       }

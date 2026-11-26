@@ -36,11 +36,13 @@ describe('startup test-session cleanup', () => {
     listSessionsMock.mockResolvedValue([
       'deck_modeawaree2eabc123_brain',
       'deck_storecheckabc123_brain',
+      'deck_existing_brain',
       'deck_ccsdk_ab12cd_brain',
       'deck_realproj_brain',
     ]);
     getPaneCwdMock.mockImplementation(async (sessionName: string) => {
       if (sessionName === 'deck_ccsdk_ab12cd_brain') return '/tmp/ccsdk-main-e2e';
+      if (sessionName === 'deck_existing_brain') return '/tmp/existing-project';
       if (sessionName === 'deck_realproj_brain') return '/Users/me/src/realproj';
       return '/tmp';
     });
@@ -52,15 +54,17 @@ describe('startup test-session cleanup', () => {
     expect(killed).toEqual([
       'deck_modeawaree2eabc123_brain',
       'deck_storecheckabc123_brain',
+      'deck_existing_brain',
       'deck_ccsdk_ab12cd_brain',
     ]);
-    expect(killSessionMock).toHaveBeenCalledTimes(3);
+    expect(killSessionMock).toHaveBeenCalledTimes(4);
     expect(killSessionMock).toHaveBeenCalledWith('deck_modeawaree2eabc123_brain');
     expect(killSessionMock).toHaveBeenCalledWith('deck_storecheckabc123_brain');
     expect(killSessionMock).toHaveBeenCalledWith('deck_ccsdk_ab12cd_brain');
+    expect(killSessionMock).toHaveBeenCalledWith('deck_existing_brain');
     expect(killSessionMock).not.toHaveBeenCalledWith('deck_realproj_brain');
     expect(loggerInfoMock).toHaveBeenCalledWith(
-      expect.objectContaining({ count: 3 }),
+      expect.objectContaining({ count: 4 }),
       'Cleaned leaked test terminal sessions on startup',
     );
   });

@@ -22,9 +22,6 @@ async function resolveVersion(agentType: AgentType, shellBin?: string): Promise<
     case 'codex':
       command = 'codex --version';
       break;
-    case 'gemini':
-      command = 'gemini --version';
-      break;
     case 'opencode':
       command = 'opencode --version';
       break;

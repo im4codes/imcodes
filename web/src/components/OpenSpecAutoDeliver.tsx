@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { isValidP2pComboPipeline } from '@shared/p2p-modes.js';
 import { PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH } from '../constants/prefs.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import {
@@ -10,10 +11,12 @@ import {
   isOpenSpecAutoDeliverActiveProjection,
   isOpenSpecAutoDeliverTerminalStatus,
   materializedPresetLimits,
+  type OpenSpecAutoDeliverModuleScore,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { resolveTaskDurationMs } from '../util/tool-duration.js';
 import { comboModeLabel, useP2pCustomCombos } from './p2p-combos.js';
 
 export interface OpenSpecAutoDeliverLauncherProps {
@@ -79,7 +82,7 @@ const OVERALL_PROGRESS_PHASES = [
 ] as const;
 const OVERALL_PROGRESS_TOTAL = OVERALL_PROGRESS_PHASES.length + 1;
 const DETAILS_SIZE_STORAGE_KEY = 'rcc_openspec_auto_deliver_details_size';
-const DETAILS_DEFAULT_SIZE = { width: 720, height: 760 };
+const DETAILS_DEFAULT_SIZE = { width: 920, height: 780 };
 const DETAILS_MIN_SIZE = { width: 420, height: 360 };
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
@@ -124,8 +127,8 @@ function writeDetailsSizePreference(size: { width: number; height: number }): vo
   } catch { /* ignore */ }
 }
 
-function formatElapsed(ms: number): string {
-  const safe = Math.max(0, Math.floor(ms / 1000));
+function formatElapsed(ms: number | undefined): string {
+  const safe = Math.max(0, Math.floor((ms ?? 0) / 1000));
   const h = Math.floor(safe / 3600);
   const m = Math.floor((safe % 3600) / 60);
   const s = safe % 60;
@@ -354,11 +357,14 @@ function formatEvidenceSummary(summary: string | undefined, t: (key: string, opt
   return translateAutoDeliverMessage(summary, t);
 }
 
-function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number {
+function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number | undefined {
   if (projection.visibility !== 'full') return 0;
-  if (typeof projection.elapsedMs === 'number' && Number.isFinite(projection.elapsedMs)) return projection.elapsedMs;
-  if (typeof projection.startedAt === 'number' && Number.isFinite(projection.startedAt)) return now - projection.startedAt;
-  return 0;
+  return resolveTaskDurationMs({
+    durationMs: projection.elapsedMs,
+    startedAt: projection.startedAt,
+    now,
+    terminal: isOpenSpecAutoDeliverTerminalStatus(projection.status),
+  });
 }
 
 function progressPercentText(metric: ProgressMetric, t: TranslationFn): string {
@@ -469,13 +475,13 @@ export function OpenSpecAutoDeliverLauncher({
     || !Number.isInteger(implementationRounds)
     || implementationRounds < OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMin
     || implementationRounds > OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMax;
-  const incompatibleCombo = selectedTeamComboId !== OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO;
+  const incompatibleCombo = !isValidP2pComboPipeline(selectedTeamComboId);
   const validationError = !changeName
     ? 'openspec.auto.error.missing_change'
     : invalidRounds
       ? 'openspec.auto.error.invalid_rounds'
       : incompatibleCombo
-        ? 'openspec.auto.error.custom_combo_unsupported'
+        ? 'openspec.auto.error.combo_unsupported'
       : error;
   const handleTeamComboChange = (event: Event) => {
     setSelectedTeamComboId((event.target as HTMLSelectElement).value);
@@ -579,11 +585,6 @@ export function OpenSpecAutoDeliverLauncher({
               </select>
             </label>
           </div>
-          {incompatibleCombo && (
-            <div class="openspec-auto-warning-subtle" data-testid="openspec-auto-combo-warning">
-              {t('openspec.auto.error.custom_combo_unsupported')}
-            </div>
-          )}
           <label class="openspec-auto-checkbox">
             <input
               type="checkbox"
@@ -740,6 +741,67 @@ export function OpenSpecAutoDeliverRunBar({
   );
 }
 
+
+type AutoDeliverScoreItem = Pick<OpenSpecAutoDeliverModuleScore, 'module' | 'score' | 'maxScore' | 'max_score' | 'summary'>;
+
+function scoreMax(score?: AutoDeliverScoreItem | null): number {
+  const max = score?.maxScore ?? score?.max_score ?? 10;
+  return Number.isFinite(max) && max > 0 ? max : 10;
+}
+
+function scoreText(score?: AutoDeliverScoreItem | null): string {
+  if (!score) return '—';
+  return `${score.score}/${scoreMax(score)}`;
+}
+
+function scoreRating(score?: AutoDeliverScoreItem | null): number {
+  if (!score) return 0;
+  const max = scoreMax(score);
+  return Math.max(0, Math.min(5, Math.round((score.score / max) * 5)));
+}
+
+function findScoreByModule(scores: AutoDeliverScoreItem[], candidates: string[]): AutoDeliverScoreItem | null {
+  const normalizedCandidates = candidates.map((candidate) => candidate.toLowerCase());
+  return scores.find((score) => {
+    const moduleId = typeof score.module === 'string' ? score.module.toLowerCase() : '';
+    return normalizedCandidates.some((candidate) => moduleId === candidate || moduleId.includes(candidate));
+  }) ?? null;
+}
+
+function StarScore({ score }: { score?: AutoDeliverScoreItem | null }) {
+  const rating = scoreRating(score);
+  return (
+    <div class="openspec-auto-hero-stars" aria-label={score ? scoreText(score) : undefined}>
+      {[0, 1, 2, 3, 4].map((index) => (
+        <span class={index < rating ? 'is-active' : ''} key={index}>★</span>
+      ))}
+    </div>
+  );
+}
+
+function HeroScoreCard({
+  label,
+  score,
+  tone,
+  pendingLabel,
+}: {
+  label: string;
+  score?: AutoDeliverScoreItem | null;
+  tone: 'spec' | 'impl';
+  pendingLabel: string;
+}) {
+  return (
+    <div class={`openspec-auto-hero-score openspec-auto-hero-score-${tone}${score ? '' : ' openspec-auto-hero-score-pending'}`}>
+      <span class="openspec-auto-hero-score-label">{label}</span>
+      <div class="openspec-auto-hero-score-main">
+        <strong>{scoreText(score)}</strong>
+        <StarScore score={score} />
+      </div>
+      <small>{score?.summary || pendingLabel}</small>
+    </div>
+  );
+}
+
 function DetailRow({ label, value }: { label: string; value?: string | number | null }) {
   if (value === null || value === undefined || value === '') return null;
   return (
@@ -755,7 +817,7 @@ function ScoreGrid({
   t,
   keyPrefix,
 }: {
-  scores: Array<{ module?: string; score: number; maxScore?: number; max_score?: number; summary?: string }>;
+  scores: AutoDeliverScoreItem[];
   t: TranslationFn;
   keyPrefix: string;
 }) {
@@ -792,12 +854,49 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const canContinue = projection?.visibility === 'full' && projection.canContinue === true && !active;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
-  const finalScoreItems = useMemo(() => (
-    projection?.finalAfterRepair?.moduleScores
-    ?? (!projection?.auditBeforeRepair ? projection?.moduleScores ?? [] : [])
-  ), [projection?.auditBeforeRepair, projection?.finalAfterRepair, projection?.moduleScores]);
+  // `implementation` in a SPEC acceptance audit means artifact
+  // implementation-readiness, not completed product implementation. Only a
+  // final implementation-stage snapshot may populate the Final Impl card.
+  // Likewise, transient `moduleScores` are never final acceptance evidence.
+  const finalScoreItems = useMemo(
+    () => projection?.finalAfterRepair?.moduleScores ?? [],
+    [projection?.finalAfterRepair],
+  );
   const preRepairScoreItems = useMemo(() => projection?.auditBeforeRepair?.moduleScores ?? [], [projection?.auditBeforeRepair]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
+  const progress = projection ? computeOpenSpecAutoDeliverProgress(projection) : null;
+  const implementationHasStarted = (projection?.implementationPromptCount ?? 0) > 0
+    || stage === 'implementation_task_loop'
+    || stage === 'implementation_audit_repair'
+    || stage === 'commit_push'
+    || stage === 'passed';
+  const acceptedSpecScore = useMemo(() => {
+    const currentSnapshotScore = findScoreByModule(finalScoreItems, ['spec']);
+    if (currentSnapshotScore) return currentSnapshotScore;
+    if (!implementationHasStarted) return undefined;
+    const latestAcceptedSpecAudit = [...auditResults]
+      .reverse()
+      .find((result) => result.stage === 'spec_audit_repair' && result.verdict === 'PASS');
+    return findScoreByModule(latestAcceptedSpecAudit?.moduleScores ?? [], ['spec']);
+  }, [auditResults, finalScoreItems, implementationHasStarted]);
+  const displayedFinalScoreItems = useMemo(() => (
+    finalScoreItems.length > 0
+      ? finalScoreItems
+      : acceptedSpecScore ? [acceptedSpecScore] : []
+  ), [acceptedSpecScore, finalScoreItems]);
+  const finalSpecScore = acceptedSpecScore;
+  const finalImplementationScore = useMemo(() => (
+    projection?.finalAfterRepair?.stage === 'implementation_audit_repair'
+      ? findScoreByModule(finalScoreItems, ['implementation', 'impl', 'code'])
+      : undefined
+  ), [finalScoreItems, projection?.finalAfterRepair?.stage]);
+  const displayedVerdict = useMemo(() => {
+    if (!implementationHasStarted) return projection?.latestVerdict;
+    return [...auditResults]
+      .reverse()
+      .find((result) => result.stage === 'implementation_audit_repair')
+      ?.verdict;
+  }, [auditResults, implementationHasStarted, projection?.latestVerdict]);
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   const repairingFromAudit = stage === 'implementation_task_loop'
     && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
@@ -849,10 +948,53 @@ export function OpenSpecAutoDeliverDetailsPanel({
             </button>
           )}
         </div>
+        <div class="openspec-auto-hero" data-testid="openspec-auto-hero">
+          <div class="openspec-auto-hero-top">
+            <div>
+              <span>{t('openspec.auto.score_overview', { defaultValue: 'Score overview' })}</span>
+              <strong>{t(statusKey(status), status)} · {t(stageKey(stage), stage)}</strong>
+            </div>
+            <div class="openspec-auto-hero-chips">
+              <span>{t('openspec.auto.elapsed')} {elapsed}</span>
+              {projection.presetId && <span>{projection.presetId}</span>}
+            </div>
+          </div>
+          <div class="openspec-auto-hero-scores">
+            <HeroScoreCard
+              label={t('openspec.auto.final_spec_score', { defaultValue: t('openspec.auto.score_module.spec', { defaultValue: 'Spec' }) })}
+              score={finalSpecScore}
+              tone="spec"
+              pendingLabel={t('openspec.auto.score_pending', { defaultValue: 'Pending final audit' })}
+            />
+            <HeroScoreCard
+              label={t('openspec.auto.final_impl_score', { defaultValue: t('openspec.auto.score_module.implementation', { defaultValue: 'Implementation' }) })}
+              score={finalImplementationScore}
+              tone="impl"
+              pendingLabel={t('openspec.auto.score_pending', { defaultValue: 'Pending final audit' })}
+            />
+          </div>
+          {progress && (
+            <div class="openspec-auto-hero-progress">
+              <ProgressLine
+                label={t('openspec.auto.overall_progress')}
+                value={`${t('openspec.auto.progress_count', { current: progress.overall.current, total: progress.overall.total })} · ${t('openspec.auto.progress_percent', { percent: progress.overall.percent })}`}
+                percent={progress.overall.percent}
+              />
+              <ProgressLine
+                label={t('openspec.auto.current_stage_progress')}
+                value={`${t('openspec.auto.progress_count', { current: progress.currentStage.current, total: progress.currentStage.total })} · ${t('openspec.auto.progress_percent', { percent: progress.currentStage.percent })}`}
+                percent={progress.currentStage.percent}
+              />
+            </div>
+          )}
+          {latestMessage && (
+            <div class="openspec-auto-hero-message">
+              <span>{t('openspec.auto.latest_message')}</span>
+              <strong>{latestMessage}</strong>
+            </div>
+          )}
+        </div>
         <div class="openspec-auto-detail-grid">
-          <DetailRow label={t('openspec.auto.status_label')} value={t(statusKey(status), status)} />
-          <DetailRow label={t('openspec.auto.stage_label')} value={t(stageKey(stage), stage)} />
-          <DetailRow label={t('openspec.auto.elapsed')} value={elapsed} />
           <DetailRow label={t('openspec.auto.preset_label')} value={projection.presetId} />
           <DetailRow label={t('openspec.auto.owning_session')} value={projection.owningMainSessionName} />
           <DetailRow label={t('openspec.auto.launched_from')} value={projection.launchedFromSessionName} />
@@ -863,8 +1005,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.active_p2p')} value={projection.activeP2pRunId} />
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
-          <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
-          <DetailRow label={t('openspec.auto.latest_message')} value={latestMessage} />
+          <DetailRow label={t('openspec.auto.verdict')} value={displayedVerdict} />
           {projection.visibility === 'conflict' && (
             <DetailRow label={t('openspec.auto.conflict_summary')} value={translateAutoDeliverReason(projection.conflictReason, t)} />
           )}
@@ -921,10 +1062,10 @@ export function OpenSpecAutoDeliverDetailsPanel({
           {repairingFromAudit && preRepairScoreItems.length > 0 && (
             <div class="openspec-auto-detail-note">{t('openspec.auto.scores_pending_repair_rescore')}</div>
           )}
-          {finalScoreItems.length === 0 ? (
+          {displayedFinalScoreItems.length === 0 ? (
             <div class="openspec-auto-detail-note">{t('openspec.auto.scores_empty')}</div>
           ) : (
-            <ScoreGrid scores={finalScoreItems} t={t} keyPrefix="final-after-repair" />
+            <ScoreGrid scores={displayedFinalScoreItems} t={t} keyPrefix="final-after-repair" />
           )}
         </div>
         {(projection.latestRepairSummary || projection.evidence?.length) && (

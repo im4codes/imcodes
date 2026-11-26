@@ -1,0 +1,96 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from 'vitest';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const localesDir = resolve(__dirname, '../src/i18n/locales');
+const LOCALES = ['en', 'zh-CN', 'zh-TW', 'ja', 'ko', 'es', 'ru'] as const;
+
+function flattenLeafStrings(obj: unknown, prefix = ''): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return out;
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (typeof v === 'string') {
+      out[key] = v;
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      Object.assign(out, flattenLeafStrings(v, key));
+    }
+  }
+  return out;
+}
+
+describe('cloud_docs i18n translations across all 7 locales', () => {
+  const loaded = Object.fromEntries(
+    LOCALES.map((loc) => [
+      loc,
+      JSON.parse(readFileSync(resolve(localesDir, `${loc}.json`), 'utf8')) as {
+        cloud_docs?: Record<string, unknown>;
+        office_preview?: Record<string, unknown>;
+      },
+    ]),
+  );
+
+  const enLeaves = flattenLeafStrings(loaded.en.cloud_docs);
+  const enKeys = Object.keys(enLeaves).sort();
+  const enOfficeLeaves = flattenLeafStrings(loaded.en.office_preview);
+  const enOfficeKeys = Object.keys(enOfficeLeaves).sort();
+
+  it('defines non-empty cloud_docs and new office_preview error keys in en.json', () => {
+    expect(enKeys.length).toBeGreaterThan(30);
+    expect(enLeaves['title']).toBeTruthy();
+    expect(enLeaves['tabs.shared']).toBeTruthy();
+    expect(enLeaves['actions.share']).toBeTruthy();
+    expect(enLeaves['share.mode_team']).toBeTruthy();
+    expect(enLeaves['share.allow_download']).toBeTruthy();
+    expect(enLeaves['open_new_window']).toBeTruthy();
+    expect(enLeaves['window_blocked']).toBeTruthy();
+    expect(enLeaves['window_blocked_dismiss']).toBeTruthy();
+    expect(enLeaves['errors.server_offline']?.trim().length).toBeGreaterThan(0);
+    expect(enOfficeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
+  });
+
+  for (const locale of LOCALES) {
+    if (locale === 'en') continue;
+    it(`has exact cloud_docs and office_preview key parity and localized strings in ${locale}.json`, () => {
+      const leaves = flattenLeafStrings(loaded[locale].cloud_docs);
+      const keys = Object.keys(leaves).sort();
+      expect(keys).toEqual(enKeys);
+
+      const EXEMPT_UNIVERSAL_TERMS = new Set(['blank_type.md', 'blank_type.docx', 'blank_type.xlsx', 'blank_type.pptx']);
+      let untranslatedCount = 0;
+      for (const key of enKeys) {
+        expect(leaves[key]?.trim().length).toBeGreaterThan(0);
+        if (!EXEMPT_UNIVERSAL_TERMS.has(key) && leaves[key] === enLeaves[key]) {
+          untranslatedCount++;
+        }
+      }
+      expect(leaves['errors.server_offline']).not.toBe(enLeaves['errors.server_offline']);
+      // Every non-English locale should translate the vast majority of strings (no bulk English copy).
+      expect(untranslatedCount).toBeLessThanOrEqual(1);
+
+      const loadedLocale = loaded[locale] as {
+        cloud_docs?: Record<string, unknown>;
+        office_preview?: Record<string, unknown>;
+        session?: Record<string, unknown>;
+      };
+      const officeLeaves = flattenLeafStrings(loadedLocale.office_preview);
+      expect(Object.keys(officeLeaves).sort()).toEqual(enOfficeKeys);
+      expect(officeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
+      expect(officeLeaves['unavailable']).not.toBe(enOfficeLeaves['unavailable']);
+    });
+  }
+
+  it('includes & cloud docs shortcut hint in session.send_placeholder_desktop_shortcuts across all 7 locales', () => {
+    for (const locale of LOCALES) {
+      const data = loaded[locale] as { session?: { send_placeholder_desktop_shortcuts?: string } };
+      const hint = data.session?.send_placeholder_desktop_shortcuts;
+      expect(typeof hint).toBe('string');
+      expect(hint).toContain('{{placeholder}}\n');
+      for (const token of ['/', '#', '@', ';', '^', '%', '&']) {
+        expect(hint).toContain(token);
+      }
+    }
+  });
+});

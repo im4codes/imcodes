@@ -1,0 +1,291 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { FILE_RELAY_MODE, R2_RELAY_PHASE } from '@shared/r2-relay.js';
+import { saveFileRelayMode, readFileRelayMode, setServerR2RelayEnabled } from '../src/r2-relay-preference.js';
+import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected, downloadAttachment, uploadFile } from '../src/api.js';
+import { beginDownloadTransfer, getDownloadTransfers, __resetDownloadTransfersForTests, cancelDownloadTransfer,
+  reportR2Preparation, updateDownloadTransfer, reportDownloadTransferProgress, DOWNLOAD_TRANSFER_ROUTE, DOWNLOAD_TRANSFER_STATUS } from '../src/download-transfer-store.js';
+import { createDownloadTransferWiring } from '../src/download-transfer-wiring.js';
+const fetchMock = vi.fn();
+beforeEach(() => {
+  localStorage.clear(); configureExpectedUserId('user-a'); setServerR2RelayEnabled(true); fetchMock.mockReset();
+  vi.stubGlobal('fetch', fetchMock); vi.stubGlobal('Headers', new Response().headers.constructor);
+  __resetDownloadTransfersForTests();
+});
+afterEach(() => { __resetDownloadTransfersForTests(); setServerR2RelayEnabled(false); configureExpectedUserId(null); vi.unstubAllGlobals(); });
+describe('R2 user routing and progress', () => {
+  it('defaults to direct and does not request R2 or emit phases when disabled', async () => {
+    const progress = vi.fn();
+    expect(isR2RelaySelected()).toBe(false);
+    expect(await prepareR2AttachmentDownload('srv', 'abc', undefined, undefined, progress)).toBeNull();
+    expect(await tryUploadR2File('srv', new File(['x'], 'a.txt'))).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled(); expect(progress).not.toHaveBeenCalled();
+  });
+  it('keeps opt-in scoped to account and falls back unchanged for unconfigured/old server', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    expect(readFileRelayMode('user-b')).toBe(FILE_RELAY_MODE.DIRECT);
+    expect(readFileRelayMode(null)).toBe(FILE_RELAY_MODE.DIRECT);
+    expect(isR2RelaySelected()).toBe(true);
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 })).mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const progress = vi.fn();
+    expect(await prepareR2AttachmentDownload('srv', 'abc', undefined, undefined, progress)).toBeNull();
+    expect(await tryUploadR2File('srv', new File(['x'], 'a.txt'))).toBeNull();
+    expect(progress).not.toHaveBeenCalled();
+  });
+  it('consumes split NDJSON preparation/ETA and releases only the final signed GET', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    const progress = { phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 40, totalBytes: 100, speedBps: 20, etaSeconds: 3 };
+    const url = 'https://r2.example/signed-get';
+    const text = JSON.stringify(progress) + '\n' + JSON.stringify({ phase: R2_RELAY_PHASE.READY, url });
+    const bytes = new TextEncoder().encode(text);
+    fetchMock.mockResolvedValue(new Response(new ReadableStream({ start(c) { c.enqueue(bytes.slice(0, 15)); c.enqueue(bytes.slice(15)); c.close(); } })));
+    const callback = vi.fn();
+    expect(await prepareR2AttachmentDownload('srv', 'abc', 'deck_test_brain', undefined, callback)).toBe(url);
+    expect(callback).toHaveBeenCalledExactlyOnceWith(progress);
+    expect(fetchMock.mock.calls[0]![0]).toContain('/api/server/srv/r2-relay/downloads/abc?sessionName=deck_test_brain');
+  });
+  it('does not release a URL for failed or prematurely ended preparation', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ phase: R2_RELAY_PHASE.ERROR }) + '\n'))
+      .mockResolvedValueOnce(new Response(''));
+    await expect(prepareR2AttachmentDownload('srv', 'abc')).rejects.toThrow();
+    await expect(prepareR2AttachmentDownload('srv', 'abc')).rejects.toThrow();
+  });
+  it('uploads browser bytes directly to signed PUT then commits metadata with no app credentials on PUT', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    fetchMock.mockResolvedValueOnce(Response.json({ id: 'ticket', url: 'https://r2.example/signed-put' }))
+      .mockResolvedValueOnce(Response.json({ ok: true, attachment: { id: 'attachment' } }));
+    const open = vi.fn(); const send = vi.fn(); const headers = vi.fn();
+    class Xhr {
+      upload = {}; status = 200; onload?: () => void;
+      open = open; setRequestHeader = headers; abort = vi.fn();
+      send(file: File) { send(file); this.onload?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const file = new File([new Uint8Array([0, 255])], 'binary.bin');
+    expect((await tryUploadR2File('srv', file))?.attachment.id).toBe('attachment');
+    expect(open).toHaveBeenCalledWith('PUT', 'https://r2.example/signed-put');
+    expect(send).toHaveBeenCalledWith(file); expect(headers).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[1]![0]).toContain('/r2-relay/uploads/ticket/commit');
+  });
+  it('keeps default native-browser handoff working with a signal on older WebViews without AbortSignal.any', async () => {
+    const original = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    fetchMock.mockResolvedValue(Response.json({ token: 'download-token' }));
+    try {
+      await downloadAttachment('srv', 'abc', undefined, new AbortController().signal);
+      expect(click).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled(); // cookie-auth browser path requires no token request
+    } finally {
+      if (original) Object.defineProperty(AbortSignal, 'any', original);
+      click.mockRestore();
+    }
+  });
+
+  it('canceling a standalone R2 preparation row aborts its reader and never hands off the URL', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    let requestSignal: AbortSignal | undefined;
+    fetchMock.mockImplementation(async (_path, init) => {
+      requestSignal = init.signal;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 1, totalBytes: 10, speedBps: 1, etaSeconds: 9 }) + '\n'));
+        requestSignal!.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')), { once: true });
+      } }));
+    });
+    const pending = downloadAttachment('srv', 'abc');
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(getDownloadTransfers()).toHaveLength(1));
+    cancelDownloadTransfer(getDownloadTransfers()[0]!.id);
+    await assertion;
+    expect(requestSignal!.aborted).toBe(true); expect(click).not.toHaveBeenCalled();
+    click.mockRestore();
+  });
+
+  it('routes a selected R2 download before WebRTC and streams signed GET into the chosen destination', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    const progress = { phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 3, totalBytes: 3, speedBps: 1, etaSeconds: 0 };
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(progress) + '\n' + JSON.stringify({ phase: R2_RELAY_PHASE.READY, url: 'https://r2.example/signed-get' }) + '\n'))
+      .mockResolvedValueOnce(new Response(new Uint8Array([0, 255, 128]), { headers: { 'content-length': '3' } }));
+    const write = vi.fn(); const close = vi.fn(); const abort = vi.fn(); const callback = vi.fn();
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    await downloadPreviewWithDirectFallback({ ws: {} as never, serverId: 'srv', previewHandle: 'abc',
+      destination: { handle: { createWritable: async () => ({ write, close, abort }) } } as never, onProgress: callback });
+    expect(Array.from(write.mock.calls[0]![0] as Uint8Array)).toEqual([0, 255, 128]);
+    expect(close).toHaveBeenCalledTimes(1); expect(abort).not.toHaveBeenCalled();
+    expect(callback).toHaveBeenCalledWith(progress);
+    expect(callback).toHaveBeenLastCalledWith({ loadedBytes: 3, totalBytes: 3 });
+    expect(fetchMock.mock.calls[1]![0]).toBe('https://r2.example/signed-get');
+    expect(fetchMock.mock.calls[1]![1]).toMatchObject({ credentials: 'omit' });
+  });
+
+  it('routes a selected R2 upload before WebRTC and clears the upload retry identity on success', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    fetchMock.mockResolvedValueOnce(Response.json({ id: 'ticket', url: 'https://r2.example/signed-put' }))
+      .mockResolvedValueOnce(Response.json({ ok: true, attachment: { id: 'attachment' } }));
+    class Xhr {
+      upload = {}; status = 200; onload?: () => void;
+      open = vi.fn(); abort = vi.fn();
+      send() { this.onload?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    expect((await uploadFileWithDirectFallback({ ws: {} as never, serverId: 'srv', file: new File(['x'], 'r2.txt') })).attachment.id).toBe('attachment');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows preparation bytes/ETA, resets at GET, and ignores canceled owner progress', () => {
+    const { id } = beginDownloadTransfer('a.txt'); const wiring = createDownloadTransferWiring(id);
+    const progress = { phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 100, totalBytes: 100, speedBps: 50, etaSeconds: 0 };
+    wiring.onProgress(progress);
+    expect(getDownloadTransfers()[0]).toMatchObject({ route: DOWNLOAD_TRANSFER_ROUTE.R2, status: DOWNLOAD_TRANSFER_STATUS.PREPARING, loadedBytes: 100, etaSeconds: 0 });
+    updateDownloadTransfer(id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING, 1000);
+    reportDownloadTransferProgress(id, 20, 100, 2000);
+    expect(getDownloadTransfers()[0]).toMatchObject({ loadedBytes: 20, etaSeconds: null });
+    cancelDownloadTransfer(id);
+    reportR2Preparation(id, progress);
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.CANCELED);
+  });
+
+  it('aborts direct upload XHR synchronously when R2 is disabled by default', async () => {
+    expect(isR2RelaySelected()).toBe(false);
+    const instances: Xhr[] = [];
+    class Xhr {
+      upload = {};
+      aborted = false;
+      onabort?: () => void;
+      open = vi.fn();
+      setRequestHeader = vi.fn();
+      constructor() { instances.push(this); }
+      send = vi.fn();
+      abort() { this.aborted = true; this.onabort?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const controller = new AbortController();
+    const pending = uploadFile('srv', new File(['hello'], 'direct-cancel.txt'), undefined, 'cid-1', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(instances).toHaveLength(1);
+    expect(instances[0]!.aborted).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts in-flight R2 PUT XHR without committing when R2 relay is explicitly enabled', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    expect(isR2RelaySelected()).toBe(true);
+    fetchMock.mockResolvedValueOnce(Response.json({ id: 'ticket-cancel', url: 'https://r2.example/signed-put-cancel' }));
+    const instances: Xhr[] = [];
+    class Xhr {
+      upload = {};
+      aborted = false;
+      onabort?: () => void;
+      open = vi.fn();
+      setRequestHeader = vi.fn();
+      constructor() { instances.push(this); }
+      send = vi.fn();
+      abort() { this.aborted = true; this.onabort?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const controller = new AbortController();
+    const pending = uploadFile('srv', new File(['hello'], 'r2-cancel.txt'), undefined, 'cid-2', controller.signal);
+    await vi.waitFor(() => expect(instances).toHaveLength(1));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(instances[0]!.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toContain('/r2-relay/uploads');
+  });
+
+  it('disables R2 selection fail-closed when backend omits or disables r2RelayEnabled while preserving opt-in', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    expect(isR2RelaySelected()).toBe(true);
+
+    setServerR2RelayEnabled(false);
+    expect(isR2RelaySelected()).toBe(false);
+    expect(readFileRelayMode('user-a')).toBe(FILE_RELAY_MODE.R2);
+    expect(await prepareR2AttachmentDownload('srv', 'abc')).toBeNull();
+    expect(await tryUploadR2File('srv', new File(['x'], 'a.txt'))).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    setServerR2RelayEnabled(true);
+    expect(isR2RelaySelected()).toBe(true);
+  });
+
+  it('recovers R2 PUT and commit across background suspend without breaking abort or R2 commit errors', async () => {
+    const lifecycle = await import('../src/upload-suspend-wait.js');
+    lifecycle.resetUploadLifecycleForTests();
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+
+    const setVisibility = (state: 'visible' | 'hidden') => {
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => state,
+      });
+    };
+
+    try {
+      // 1) Transient XHR error during background -> waits for foreground resume and retries PUT + commit
+      fetchMock
+        .mockResolvedValueOnce(Response.json({ id: 'ticket-bg', url: 'https://r2.example/signed-put-bg' }))
+        .mockResolvedValueOnce(Response.json({ ok: true, attachment: { id: 'att-r2-bg' } }));
+
+      let putAttempt = 0;
+      class BackgroundRetryXhr {
+        upload = {};
+        status = 0;
+        onload?: () => void;
+        onerror?: () => void;
+        onabort?: () => void;
+        open = vi.fn();
+        setRequestHeader = vi.fn();
+        abort = vi.fn();
+        send() {
+          putAttempt += 1;
+          if (putAttempt === 1) {
+            setVisibility('hidden');
+            document.dispatchEvent(new Event('visibilitychange'));
+            this.status = 0;
+            queueMicrotask(() => this.onerror?.());
+            return;
+          }
+          this.status = 200;
+          queueMicrotask(() => this.onload?.());
+        }
+      }
+      vi.stubGlobal('XMLHttpRequest', BackgroundRetryXhr);
+
+      const pending = tryUploadR2File('srv', new File(['r2-bg'], 'r2-bg.bin'), undefined, 'cid-r2-bg');
+      await vi.waitFor(() => expect(putAttempt).toBe(1));
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      await expect(pending).resolves.toMatchObject({ ok: true, attachment: { id: 'att-r2-bg' } });
+      expect(putAttempt).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // 2) R2 commit HTTP 500 error in foreground throws ApiError immediately without spurious retry
+      fetchMock.mockReset();
+      fetchMock
+        .mockResolvedValueOnce(Response.json({ id: 'ticket-err', url: 'https://r2.example/signed-put-err' }))
+        .mockResolvedValueOnce(new Response('commit_failed', { status: 500 }));
+      class OkXhr {
+        upload = {};
+        status = 200;
+        onload?: () => void;
+        open = vi.fn();
+        abort = vi.fn();
+        send() { queueMicrotask(() => this.onload?.()); }
+      }
+      vi.stubGlobal('XMLHttpRequest', OkXhr);
+
+      await expect(tryUploadR2File('srv', new File(['err'], 'r2-err.bin'))).rejects.toMatchObject({
+        status: 500,
+        body: 'commit_failed',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      setVisibility('visible');
+      lifecycle.resetUploadLifecycleForTests();
+    }
+  });
+});

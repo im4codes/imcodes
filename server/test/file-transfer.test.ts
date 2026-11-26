@@ -1,6 +1,13 @@
+import { R2_RELAY_MSG, R2_RELAY_CAPABILITY, R2_RELAY_PHASE } from '../../shared/r2-relay.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
+import { FILE_TRANSFER_MSG, FILE_TRANSFER_PATH_HANDLE_CAPABILITY } from '../../shared/transport/file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+} from '../../shared/machine-direct-file-transfer.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -34,9 +41,20 @@ class MockWs extends EventEmitter {
   }
 }
 
-function makeDb(tokenHash: string) {
+class DeferredCloseMockWs extends MockWs {
+  override close(code?: number, reason?: string) {
+    this.closed = true;
+    this.readyState = 3;
+    this.closeCode = code;
+    this.closeReason = reason;
+    // Real `ws.close()` emits `close` later. Intentionally leave it pending so
+    // replacement invalidation cannot rely on the old socket's close handler.
+  }
+}
+
+function makeDb(tokenHash: string, nodeRole = 'full') {
   return {
-    queryOne: async () => ({ token_hash: tokenHash }),
+    queryOne: async () => ({ token_hash: tokenHash, owner_status: 'active', user_id: 'user-1', node_role: nodeRole, revoked_at: null }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -57,10 +75,10 @@ async function flushAsync() {
   for (let i = 0; i < 5; i++) await new Promise((r) => process.nextTick(r));
 }
 
-async function authDaemon(bridge: WsBridge, daemonWs: MockWs, db: ReturnType<typeof makeDb>) {
+async function authDaemon(bridge: WsBridge, daemonWs: MockWs, db: ReturnType<typeof makeDb>, capabilities?: string[]) {
   bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
   daemonWs.emit('message', Buffer.from(JSON.stringify({
-    type: 'auth', serverId: 'test', token: 'tok',
+    type: 'auth', serverId: 'test', token: 'tok', ...(capabilities ? { capabilities } : {}),
   })));
   await flushAsync();
 }
@@ -88,11 +106,178 @@ describe('WsBridge file transfer', () => {
     expect(bridge.isDaemonConnected()).toBe(true);
   });
 
+  it('routes R2 progress to its pending HTTP request, then settles only the matching done event', async () => {
+    const bridge = WsBridge.get(serverId); const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash'), [R2_RELAY_CAPABILITY]);
+    const progress = vi.fn();
+    const promise = bridge.sendFileTransferRequest('r2-1', { type: R2_RELAY_MSG.DOWNLOAD }, 5000, progress);
+    let settled = false; void promise.then(() => { settled = true; });
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.PROGRESS, downloadId: 'someone-else', loadedBytes: 99 })));
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.PROGRESS, downloadId: 'r2-1', phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 10, totalBytes: 20, etaSeconds: 1 })));
+    await flushAsync();
+    expect(progress).toHaveBeenCalledTimes(1); expect(settled).toBe(false);
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.DONE, downloadId: 'r2-1', size: 20, filename: 'a.txt' })));
+    await expect(promise).resolves.toMatchObject({ type: R2_RELAY_MSG.DONE, size: 20 });
+  });
+
   it('sendFileTransferRequest rejects when daemon offline', async () => {
     const bridge = WsBridge.get(serverId);
     await expect(
       bridge.sendFileTransferRequest('req1', { type: 'file.upload' }, 5000),
     ).rejects.toThrow('daemon_offline');
+  });
+
+  it('strictly resolves controlled-node path handles and never queues them through the generic sender', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash', 'controlled'), [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]);
+    expect(bridge.hasDaemonCapability(FILE_TRANSFER_PATH_HANDLE_CAPABILITY)).toBe(true);
+
+    const beforeGeneric = daemon.sentStrings.length;
+    bridge.sendToDaemon(JSON.stringify({ type: FILE_TRANSFER_MSG.PATH_HANDLE, requestId: 'generic', path: '/tmp/x' }));
+    expect(daemon.sentStrings).toHaveLength(beforeGeneric);
+
+    const promise = bridge.sendFileTransferRequest('path-1', {
+      type: FILE_TRANSFER_MSG.PATH_HANDLE,
+      requestId: 'path-1',
+      path: '/tmp/report.txt',
+    }, 5_000);
+    const droppedBefore = WsBridge.controlledInboundDropped;
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'path-1',
+      attachment: { injected: true },
+    })));
+    await flushAsync();
+    expect(WsBridge.controlledInboundDropped).toBe(droppedBefore + 1);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'path-1',
+      attachment: {
+        id: 'a'.repeat(32),
+        source: 'local',
+        serverId: '',
+        daemonPath: '/tmp/report.txt',
+        createdAt: new Date().toISOString(),
+        downloadable: true,
+      },
+    })));
+    await expect(promise).resolves.toMatchObject({ type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE });
+  });
+
+  it('strictly resolves controlled-node machine-direct terminals and drops generic bypasses', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash', 'controlled'), [
+      MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+      MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+    ]);
+    expect(bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY)).toBe(true);
+    expect(bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_FETCH_CAPABILITY)).toBe(true);
+    const before = daemon.sentStrings.length;
+    bridge.sendToDaemon(JSON.stringify({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST, requestId: 'r'.repeat(32) }));
+    expect(daemon.sentStrings).toHaveLength(before);
+    const promise = bridge.sendFileTransferRequest('r'.repeat(32), {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: 'r'.repeat(32),
+    }, 5_000);
+    const droppedBefore = WsBridge.controlledInboundDropped;
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      requestId: 'r'.repeat(32),
+      attachment: { injected: true },
+    })));
+    await flushAsync();
+    expect(WsBridge.controlledInboundDropped).toBe(droppedBefore + 1);
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      requestId: 'r'.repeat(32),
+      attachment: {
+        id: 'a'.repeat(32), source: 'upload', serverId: '', daemonPath: '/tmp/direct.txt',
+        originalName: 'direct.txt', size: 5, createdAt: new Date().toISOString(), downloadable: true,
+      },
+    })));
+    await expect(promise).resolves.toMatchObject({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE });
+
+    const fetchRequestId = 'f'.repeat(32);
+    bridge.sendToDaemon(JSON.stringify({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST, requestId: fetchRequestId }));
+    expect(daemon.sentStrings).toHaveLength(before + 1);
+    const fetchPromise = bridge.sendFileTransferRequest(fetchRequestId, {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: fetchRequestId,
+    }, 5_000);
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: fetchRequestId,
+      size: 5,
+      injected: true,
+    })));
+    await flushAsync();
+    expect(WsBridge.controlledInboundDropped).toBe(droppedBefore + 2);
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: fetchRequestId,
+      size: 5,
+    })));
+    await expect(fetchPromise).resolves.toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: fetchRequestId,
+      size: 5,
+    });
+  });
+
+  it('rejects duplicate correlation ids and invalidates machine-direct requests on daemon replacement', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new DeferredCloseMockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash', 'controlled'), [MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const requestId = 'g'.repeat(32);
+    const pending = bridge.sendFileTransferRequest(requestId, {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId,
+    }, 5_000);
+    await expect(bridge.sendFileTransferRequest(requestId, {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId,
+    }, 5_000)).rejects.toThrow('request_id_conflict');
+
+    const replacement = new MockWs();
+    bridge.handleDaemonConnection(replacement as never, makeDb('valid-hash', 'controlled'), {} as never);
+    await expect(pending).rejects.toThrow('daemon_disconnected');
+  });
+
+  it('does not dispatch to a replacement daemon generation after capability authorization', async () => {
+    const bridge = WsBridge.get(serverId);
+    const capableDaemon = new DeferredCloseMockWs();
+    await authDaemon(bridge, capableDaemon, makeDb('valid-hash', 'controlled'), [MACHINE_DIRECT_FILE_FETCH_CAPABILITY]);
+    const authorizedGeneration = bridge.daemonConnectionGeneration();
+
+    const replacement = new MockWs();
+    await authDaemon(bridge, replacement, makeDb('valid-hash', 'controlled'), []);
+    expect(bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_FETCH_CAPABILITY)).toBe(false);
+    const sentBefore = replacement.sentStrings.length;
+
+    await expect(bridge.sendFileTransferRequest('h'.repeat(32), {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: 'h'.repeat(32),
+    }, 5_000, undefined, authorizedGeneration)).rejects.toThrow('daemon_generation_changed');
+    expect(replacement.sentStrings).toHaveLength(sentBefore);
+  });
+
+  it('invalidates machine-direct requests immediately when a deferred-close daemon is kicked', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new DeferredCloseMockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash', 'controlled'), [MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const requestId = 'k'.repeat(32);
+    const pending = bridge.sendFileTransferRequest(requestId, {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId,
+    }, 5_000);
+
+    bridge.kickDaemon();
+
+    await expect(pending).rejects.toThrow('daemon_disconnected');
+    expect(bridge.isDaemonConnected()).toBe(false);
   });
 
   it('sendFileTransferRequest sends to daemon and resolves on upload_done', async () => {
@@ -239,6 +424,29 @@ describe('WsBridge file transfer', () => {
     const result = await promise;
     expect(result.type).toBe('file.download_error');
     expect(result.message).toBe('expired');
+  });
+
+  it('correlates daemon attachment deletion responses by requestId', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash'));
+
+    const promise = bridge.sendFileTransferRequest('delete-1', {
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-1',
+      attachmentId: 'abc123.txt',
+    }, 5000);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.DELETE_DONE,
+      requestId: 'delete-1',
+    })));
+    await flushAsync();
+
+    await expect(promise).resolves.toEqual({
+      type: FILE_TRANSFER_MSG.DELETE_DONE,
+      requestId: 'delete-1',
+    });
   });
 
   it('orphan responses are silently discarded', async () => {

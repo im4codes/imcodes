@@ -10,7 +10,7 @@
 //     the user can still force-interrupt the model with a different choice.
 
 /** How long the model pauses for an answer before self-continuing. */
-export const ASK_QUESTION_WAIT_MS = 60_000;
+export const ASK_QUESTION_WAIT_MS = 120_000;
 
 /** How long the card lingers AFTER the wait elapses (force-interrupt window). */
 export const ASK_QUESTION_RETENTION_MS = 120_000;

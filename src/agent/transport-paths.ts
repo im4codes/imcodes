@@ -1,6 +1,7 @@
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import type { ChildProcess } from 'node:child_process';
 
 export function normalizeTransportCwd(cwd?: string): string | undefined {
@@ -10,6 +11,20 @@ export function normalizeTransportCwd(cwd?: string): string | undefined {
     return absolute.replace(/\\/g, '/');
   }
   return path.resolve(cwd);
+}
+
+/** Canonical directory identity used when matching provider-owned sessions. */
+export function canonicalizeTransportCwd(cwd?: string): string | undefined {
+  const normalized = normalizeTransportCwd(cwd);
+  if (!normalized) return undefined;
+  let canonical = normalized;
+  try {
+    canonical = normalizeTransportCwd(realpathSync.native(normalized)) ?? normalized;
+  } catch {
+    // The project may be temporarily unavailable; the absolute normalized
+    // path is still the safest fail-closed identity available.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
 }
 
 /** Resolve a CLI binary name to an absolute path on Windows.
@@ -102,63 +117,397 @@ function getUnixClaudeInstallCandidates(): string[] {
   ]);
 }
 
-/** Locate the native `claude` binary that ships inside our own
- *  `@anthropic-ai/claude-agent-sdk` dependency. The SDK publishes the binary in
- *  a platform-specific sibling package (e.g. `@anthropic-ai/claude-agent-sdk-linux-x64`),
- *  so we resolve it from our dependency tree rather than trusting PATH — a daemon
- *  started by systemd/launchd has a sparse PATH that usually lacks `claude`. */
-function resolveBundledClaudeBinary(): string | undefined {
-  const platformPkg = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`;
-  const req = createRequire(import.meta.url);
-  // 1) Resolve the platform package directly.
-  try {
-    const pkgJson = req.resolve(`${platformPkg}/package.json`);
-    const candidate = path.join(path.dirname(pkgJson), 'claude');
-    if (existsSync(candidate)) return candidate;
-  } catch {
-    // platform package not resolvable from here — try via the main package
+function isAbsoluteSmart(filePath: string): boolean {
+  return path.isAbsolute(filePath) || path.win32.isAbsolute(filePath);
+}
+
+function hasPathSeparator(filePath: string): boolean {
+  return filePath.includes('/') || filePath.includes('\\');
+}
+
+function joinSmart(base: string, ...segments: string[]): string {
+  if (base.includes('\\') || /^[A-Za-z]:/.test(base)) {
+    return path.win32.join(base, ...segments);
   }
-  // 2) Resolve the main SDK, then its sibling platform package.
+  return path.join(base, ...segments);
+}
+
+function dirnameSmart(filePath: string): string {
+  if (filePath.includes('\\') || /^[A-Za-z]:/.test(filePath)) {
+    return path.win32.dirname(filePath);
+  }
+  return path.dirname(filePath);
+}
+
+function findPackageRootUpwards(entryFilePath: string, packageName: string): string | null {
+  let dir = dirnameSmart(entryFilePath);
+  while (true) {
+    const pkgJsonPath = joinSmart(dir, 'package.json');
+    if (existsSync(pkgJsonPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as { name?: unknown };
+        if (parsed.name === packageName) return dir;
+      } catch {
+        return dir;
+      }
+    }
+    const parent = dirnameSmart(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function resolveExportTargetPath(pkgJson: Record<string, unknown>, subpathKey: string): string | null {
+  const exportsField = pkgJson.exports;
+  if (!exportsField || typeof exportsField !== 'object') {
+    return subpathKey === '.' && typeof pkgJson.main === 'string' ? pkgJson.main : null;
+  }
+  const entry = (exportsField as Record<string, unknown>)[subpathKey];
+  if (typeof entry === 'string') return entry;
+  if (!entry || typeof entry !== 'object') return null;
+  const record = entry as Record<string, unknown>;
+  for (const condition of ['node', 'import', 'default', 'require']) {
+    const val = record[condition];
+    if (typeof val === 'string') return val;
+    if (val && typeof val === 'object') {
+      const nested = (val as Record<string, unknown>).default;
+      if (typeof nested === 'string') return nested;
+    }
+  }
+  return null;
+}
+
+/** Resolve the installed root directory of a package via Node's standard
+ *  module resolution (`import.meta.resolve`, `createRequire.resolve`, and
+ *  `require.resolve.paths` + `exports` target validation). */
+export function resolveNodePackageRoot(
+  specifier: string,
+  packageName = specifier,
+): string | null {
+  const checkSearchBase = (base: string): string | null => {
+    const candidate = joinSmart(base, ...packageName.split('/'));
+    const pkgJsonPath = joinSmart(candidate, 'package.json');
+    if (!existsSync(pkgJsonPath)) return null;
+    if (specifier === packageName) return candidate;
+    try {
+      const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as Record<string, unknown>;
+      const subpath = specifier.startsWith(`${packageName}/`)
+        ? `./${specifier.slice(packageName.length + 1)}`
+        : '.';
+      const target = resolveExportTargetPath(pkgJson, subpath);
+      if (target && existsSync(joinSmart(candidate, target))) {
+        return candidate;
+      }
+    } catch {
+      // Ignore malformed package.json and continue searching.
+    }
+    return null;
+  };
+
   try {
-    const mainPkgJson = req.resolve('@anthropic-ai/claude-agent-sdk/package.json');
-    const scopeDir = path.dirname(path.dirname(mainPkgJson)); // .../node_modules/@anthropic-ai
-    const candidate = path.join(scopeDir, `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude');
-    if (existsSync(candidate)) return candidate;
+    if (typeof import.meta.resolve === 'function') {
+      const resolvedUrl = import.meta.resolve(specifier);
+      if (resolvedUrl.startsWith('file:')) {
+        const resolvedPath = fileURLToPath(resolvedUrl);
+        if (existsSync(resolvedPath)) {
+          const root = findPackageRootUpwards(resolvedPath, packageName);
+          if (root) return root;
+        }
+      }
+    }
   } catch {
-    // give up — caller falls back to per-user locations / PATH
+    // Fall back to CJS / package.json exports inspection below.
+  }
+
+  try {
+    const req = createRequire(import.meta.url);
+    try {
+      const entry = req.resolve(specifier);
+      const root = findPackageRootUpwards(entry, packageName);
+      if (root) return root;
+    } catch {
+      // Specifier has no CJS entry or blocks `./package.json` export; check `resolve.paths` + package.json directly.
+    }
+
+    const searchPaths = req.resolve.paths(packageName) ?? [];
+    for (const base of searchPaths) {
+      const matched = checkSearchBase(base);
+      if (matched) return matched;
+    }
+  } catch {
+    // Package is not installed in the dependency tree.
+  }
+
+  return null;
+}
+
+export function isBundledClaudeBinaryFileSync(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  try {
+    const info = statSync(filePath);
+    if (!info.isFile()) return false;
+    if (platform === 'win32') return true;
+    accessSync(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface BundledClaudeCandidateOptions {
+  platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture | string;
+  env?: NodeJS.ProcessEnv;
+  resolvePackageRoot?: (specifier: string, packageName?: string) => string | null;
+}
+
+/** Discover platform-bundled native `claude` / `claude.exe` candidates inside
+ *  `@anthropic-ai/claude-agent-sdk` and its sibling platform packages, with an
+ *  explicit `NODE_PATH` native-asset fallback after standard resolution. */
+export function getBundledClaudeBinaryCandidates(opts: BundledClaudeCandidateOptions = {}): string[] {
+  const platform = opts.platform ?? process.platform;
+  const arch = opts.arch ?? process.arch;
+  const env = opts.env ?? process.env;
+  const resolvePkg = opts.resolvePackageRoot ?? ((spec, pkg) => resolveNodePackageRoot(spec, pkg));
+  const suffix = `${platform}-${arch}`;
+  const binName = platform === 'win32' ? 'claude.exe' : 'claude';
+  const candidates: string[] = [];
+  const pkgNames = platform === 'linux'
+    ? [`@anthropic-ai/claude-agent-sdk-${suffix}`, `@anthropic-ai/claude-agent-sdk-${suffix}-musl`]
+    : [`@anthropic-ai/claude-agent-sdk-${suffix}`];
+
+  for (const pkgName of pkgNames) {
+    const root = resolvePkg(pkgName, pkgName);
+    if (root) candidates.push(joinSmart(root, binName));
+  }
+  const mainRoot = resolvePkg('@anthropic-ai/claude-agent-sdk', '@anthropic-ai/claude-agent-sdk');
+  if (mainRoot) {
+    const scopeDir = dirnameSmart(mainRoot);
+    candidates.push(joinSmart(scopeDir, `claude-agent-sdk-${suffix}`, binName));
+  }
+  const allowNodePathFallback = !opts.resolvePackageRoot || opts.resolvePackageRoot === resolveNodePackageRoot;
+  if (allowNodePathFallback && typeof env.NODE_PATH === 'string' && env.NODE_PATH.trim()) {
+    const nodePathEntries = uniqueNonEmpty(
+      env.NODE_PATH.split(env.NODE_PATH.includes(';') ? ';' : path.delimiter),
+    );
+    for (const base of nodePathEntries) {
+      for (const pkgName of pkgNames) {
+        candidates.push(joinSmart(base, ...pkgName.split('/'), binName));
+      }
+    }
+  }
+  return uniqueNonEmpty(candidates);
+}
+
+/** Locate the native `claude` (`claude.exe` on Windows) binary that ships inside
+ *  `@anthropic-ai/claude-agent-sdk`'s platform-specific sibling package. */
+function resolveBundledClaudeBinary(
+  opts: BundledClaudeCandidateOptions & { isBinaryFile?: (filePath: string) => boolean } = {},
+): string | undefined {
+  const platform = opts.platform ?? process.platform;
+  const checkFile = opts.isBinaryFile ?? ((filePath: string) => isBundledClaudeBinaryFileSync(filePath, platform));
+  for (const candidate of getBundledClaudeBinaryCandidates({ ...opts, platform })) {
+    if (checkFile(candidate)) return candidate;
   }
   return undefined;
+}
+
+export interface ResolveClaudeCodePathOptions extends BundledClaudeCandidateOptions {
+  isBinaryFile?: (filePath: string) => boolean;
 }
 
 /** Resolve a CLI path suitable for passing to an SDK option like
  *  `pathToClaudeCodeExecutable`.
  *
- *  Windows: npm global installs expose `claude.cmd`; SDKs that spawn the path
- *  without `shell: true` need the underlying `.js`/`.exe`, so we convert shims
- *  and search common install dirs.
+ *  Windows: preserves explicit paths, resolves bundled native `claude.exe` for
+ *  the default `'claude'` binary name, then falls back to common install dirs /
+ *  PATH and unwraps npm `.cmd`/`.bat` shims to their `.js` entrypoints.
  *
  *  macOS/Linux: a daemon launched by systemd/launchd has a sparse PATH that
- *  usually lacks `claude`, which made the SDK fail with "Claude Code native
- *  binary not found at claude". So for the default name we resolve the binary
- *  bundled with our `@anthropic-ai/claude-agent-sdk` dependency, then common
- *  per-user install locations, and only fall back to a bare PATH lookup last.
- *  An explicit caller-provided name/path is always honoured as-is. */
-export function resolveClaudeCodePathForSdk(name = 'claude'): string {
-  if (process.platform === 'win32') {
+ *  usually lacks `claude`, so for default `'claude'` we resolve the bundled
+ *  binary, then common per-user install locations, then bare PATH lookup.
+ *  An explicit caller-provided name/path is always honoured. */
+export function resolveClaudeCodePathForSdk(
+  name = 'claude',
+  opts: ResolveClaudeCodePathOptions = {},
+): string {
+  const platform = opts.platform ?? process.platform;
+  const checkFile = opts.isBinaryFile ?? ((filePath: string) => isBundledClaudeBinaryFileSync(filePath, platform));
+  const isDefaultClaude = name === 'claude';
+
+  if (platform === 'win32') {
+    if (isAbsoluteSmart(name) || hasPathSeparator(name)) {
+      if (/\.(cmd|bat)$/i.test(name)) {
+        return parseNpmCmdShim(name) ?? name;
+      }
+      return name;
+    }
+    if (isDefaultClaude) {
+      const bundled = resolveBundledClaudeBinary({ ...opts, platform, isBinaryFile: checkFile });
+      if (bundled) return bundled;
+    }
     const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsClaudeInstallCandidates(name));
     if (/\.(cmd|bat)$/i.test(resolved)) {
       return parseNpmCmdShim(resolved) ?? resolved;
     }
     return resolved;
   }
-  if (name !== 'claude') return name;
-  const bundled = resolveBundledClaudeBinary();
+  if (!isDefaultClaude) return name;
+  const bundled = resolveBundledClaudeBinary({ ...opts, platform, isBinaryFile: checkFile });
   if (bundled) return bundled;
   for (const candidate of getUnixClaudeInstallCandidates()) {
+    if (checkFile(candidate)) return candidate;
+  }
+  return name;
+}
+
+function getWindowsAgyInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'antigravity-cli', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.gemini', 'antigravity-cli', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+/** Common per-user `agy` install locations on macOS/Linux, checked when the
+ *  daemon's (systemd/launchd) PATH is too sparse to contain `agy`. */
+function getUnixAgyInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.gemini', 'antigravity-cli', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.gemini', 'antigravity', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'agy') : undefined,
+    '/usr/local/bin/agy',
+    '/opt/homebrew/bin/agy',
+    '/usr/bin/agy',
+    '/bin/agy',
+  ]);
+}
+
+/** Resolve a CLI path for Google Antigravity (`agy`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.local/bin/agy.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveAgyPathForSdk(name = 'agy'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsAgyInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'agy') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixAgyInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixAgyInstallCandidates()) {
     if (existsSync(candidate)) return candidate;
   }
   return name;
 }
+
+function getUnixMuseCodeInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.muse', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'muse') : undefined,
+    '/usr/local/bin/muse',
+    '/opt/homebrew/bin/muse',
+    '/usr/bin/muse',
+    '/bin/muse',
+  ]);
+}
+
+/** Resolve a CLI path for Muse Code (`muse`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.local/bin/muse.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveMuseCodePathForSdk(name = 'muse'): string {
+  if (process.platform === 'win32') {
+    return name;
+  }
+  if (name !== 'muse') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixMuseCodeInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixMuseCodeInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+function getWindowsGrokInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const grokHome = process.env.GROK_HOME;
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    grokHome ? path.join(grokHome, 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'grok', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+function getUnixGrokInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  const grokHome = process.env.GROK_HOME;
+  return uniqueNonEmpty([
+    grokHome ? path.join(grokHome, 'bin', 'grok') : undefined,
+    home ? path.join(home, '.grok', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.local', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'grok') : undefined,
+    '/usr/local/bin/grok',
+    '/opt/homebrew/bin/grok',
+    '/usr/bin/grok',
+    '/bin/grok',
+  ]);
+}
+
+/** Resolve a CLI path for Grok (`grok`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.grok/bin or ~/.local/bin.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveGrokPathForSdk(name = 'grok'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsGrokInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'grok') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixGrokInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixGrokInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
 
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.
@@ -190,6 +539,10 @@ export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
   // Real binary (.exe / .com): use directly.
   if (/\.(exe|com)$/i.test(resolved)) {
     return { executable: resolved, prependArgs: [] };
+  }
+  // Node entrypoint (.js / .mjs / .cjs), e.g. unwrapped from an npm .cmd shim by resolveClaudeCodePathForSdk():
+  if (/\.(?:js|mjs|cjs)$/i.test(resolved)) {
+    return { executable: process.execPath, prependArgs: [resolved] };
   }
   // .cmd / .bat npm shim: parse out the underlying node script path.
   if (/\.(cmd|bat)$/i.test(resolved)) {

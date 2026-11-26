@@ -80,6 +80,7 @@ type MsgHandler = (msg: ServerMessage) => void;
 
 function makeWs() {
   return {
+    connected: true,
     fsWriteFile: vi.fn(() => 'req-' + Math.random().toString(36).slice(2, 8)),
   };
 }
@@ -125,7 +126,7 @@ describe('FileEditor', () => {
       expect(ws.fsWriteFile).toHaveBeenCalledWith(
         '/home/user/file.txt',
         'edited',
-        1700000000000,
+        { expectedMtime: 1700000000000 },
       );
     });
 
@@ -151,7 +152,7 @@ describe('FileEditor', () => {
       expect(ws.fsWriteFile).toHaveBeenCalledWith(
         '/file.txt',
         '',
-        1000,
+        { expectedMtime: 1000 },
       );
     });
   });
@@ -192,7 +193,7 @@ describe('FileEditor', () => {
       fireEvent.click(screen.getByText('fileBrowser.save'));
 
       // Should use the UPDATED mtime (2000), not stale (1000)
-      expect(ws.fsWriteFile).toHaveBeenCalledWith('/file.txt', 'edited', 2000);
+      expect(ws.fsWriteFile).toHaveBeenCalledWith('/file.txt', 'edited', { expectedMtime: 2000 });
     });
   });
 
@@ -320,6 +321,94 @@ describe('FileEditor', () => {
   });
 
   describe('timeout timer cleanup', () => {
+    it('clears saving when fsWriteFile throws synchronously', () => {
+      const ws = makeWs();
+      ws.fsWriteFile.mockImplementation(() => {
+        throw new Error('Message too large');
+      });
+      const { onMessage } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+
+      expect(ws.fsWriteFile).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('fileBrowser.fileTooLarge')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+      expect(screen.queryByText('fileBrowser.saving')).toBeNull();
+    });
+
+    it('does not enter saving when websocket is disconnected', () => {
+      const ws = makeWs();
+      ws.connected = false;
+      const { onMessage } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+
+      expect(ws.fsWriteFile).not.toHaveBeenCalled();
+      expect(screen.getByText('fileBrowser.saveTimeout')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+    });
+
+    it('clears saving when websocket disconnects while a write is pending', () => {
+      const ws = makeWs();
+      ws.fsWriteFile.mockReturnValue('req-disconnect');
+      const { onMessage, dispatch } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+      expect(screen.getByText('fileBrowser.saving')).toBeTruthy();
+
+      act(() => {
+        dispatch({
+          type: 'session.event',
+          event: 'disconnected',
+          session: '',
+          state: 'disconnected',
+          reason: 'socket_closed',
+        } as any);
+      });
+
+      expect(screen.getByText('fileBrowser.saveTimeout')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+    });
+
     it('clears timeout on successful response (no spurious timeout)', () => {
       vi.useFakeTimers();
       const ws = makeWs();

@@ -12,6 +12,12 @@ cd "$WORKDIR"
 # CPU-only unless a caller explicitly opts into a different setting.
 export npm_config_onnxruntime_node_install_cuda="${npm_config_onnxruntime_node_install_cuda:-skip}"
 
+# @qoder-ai/qoder-agent-sdk's postinstall downloads an external qodercli
+# archive and extracts an unsigned binary that Windows CI runners quarantine.
+# CI unit/build jobs never invoke the bundled qodercli binary, so skip the
+# external download by default while still honoring caller overrides.
+export QODER_SKIP_DOWNLOAD="${QODER_SKIP_DOWNLOAD:-1}"
+
 attempt=1
 while true; do
   echo "npm ci attempt ${attempt}/${MAX_ATTEMPTS} in ${WORKDIR}"
@@ -33,3 +39,16 @@ while true; do
   sleep "$sleep_for"
   attempt=$(( attempt + 1 ))
 done
+
+if [ -f package.json ] && grep -q '"node-datachannel"' package.json && [ ! -f node_modules/node-datachannel/package.json ]; then
+  echo "WARNING: optional dependency node-datachannel is missing after npm ci; attempting best-effort repair..." >&2
+  repair_root="$(pwd -W 2>/dev/null || printf '%s' "$PWD")"
+  repair_attempt=1
+  while [ "$repair_attempt" -le 2 ]; do
+    if node src/util/node-datachannel-repair.mjs "$repair_root" && [ -f node_modules/node-datachannel/package.json ]; then
+      echo "node-datachannel repair succeeded on attempt ${repair_attempt}"
+      break
+    fi
+    repair_attempt=$(( repair_attempt + 1 ))
+  done
+fi

@@ -32,6 +32,14 @@ describe('TimelineDB — memory fallback mode', () => {
     await db.open();
   });
 
+  it('never queues private events into disk or a future-retry memory fallback', async () => {
+    await db.putEvents([
+      makeEvent({ eventId: 'private', payload: { text: 'private-sentinel', incognito: true, memoryExcluded: true } }),
+      makeEvent({ eventId: 'ordinary', seq: 2 }),
+    ]);
+    expect((await db.getEvents('session-a', 1000)).map(event => event.eventId)).toEqual(['ordinary']);
+  });
+
   it('operates in memory-only mode when IndexedDB is unavailable', () => {
     expect(db.memoryOnly).toBe(true);
   });
@@ -96,6 +104,17 @@ describe('TimelineDB — memory fallback mode', () => {
 
     const results = await db.getEvents('session-a', 100);
     expect(results).toHaveLength(3);
+  });
+
+  it('collapses last-value signal churn while IndexedDB is unavailable', async () => {
+    await db.putEvents([
+      makeEvent({ eventId: 'state-old', seq: 1, type: 'session.state' }),
+      makeEvent({ eventId: 'state-new', seq: 2, type: 'session.state' }),
+    ]);
+
+    const results = await db.getRecentEvents('session-a');
+    expect(results.filter((event) => event.type === 'session.state').map((event) => event.eventId))
+      .toEqual(['state-new']);
   });
 
   it('putEvents with empty array is a no-op', async () => {

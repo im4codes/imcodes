@@ -1,25 +1,195 @@
+import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from './session-history.js';
+import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from './task-pair-suspension.js';
+import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS } from './task-pair-title-access.js';
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
+import { SEND_COMMAND_DESCRIPTION } from './send-command-mode.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from './feature-flags.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from './memory-mcp-feature-flags.js';
 import { MEMORY_MCP_SOURCE_FIELDS } from './memory-mcp-provenance.js';
 import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES } from './execution-clone.js';
+import {
+  NODE_ROLE,
+  ENROLLMENT_OSES,
+  type NodeRole,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
+  REMOTE_EXEC_MIN_TIMEOUT_MS,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+  REMOTE_EXEC_MAX_COMMAND_BYTES,
+  REMOTE_EXEC_OUTCOMES,
+  MACHINE_LIST_MAX_ITEMS,
+} from './remote-exec.js';
+import {
+  COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_DRAG_DURATION_MAX_MS,
+  COMPUTER_USE_DRAG_DURATION_MIN_MS,
+  COMPUTER_USE_MAX_ARGUMENT_BYTES,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+  COMPUTER_USE_OUTCOMES,
+  COMPUTER_USE_TOOLS,
+} from './computer-use.js';
+import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import {
+  TASK_PAIR_WORKSPACE_PARAMETER_DESCRIPTION,
+  TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+  TASK_PAIR_WORKSPACE_REQUESTS,
+  TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
+} from './task-pair-workspace.js';
+import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE, TASK_PAIR_ECONOMY_POOL_SHORT_RULE, TASK_PAIR_NON_CODE_NO_AUDIT_SHORT_RULE, TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE, TASK_PAIR_SPLIT_UNRELATED_RULE } from './task-pair.js';
+import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
+import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
+import {
+  MACHINE_TARGET_MAX,
+  MACHINE_TARGET_PATTERN,
+} from './machine-reference.js';
+import {
+  CONTROLLED_NODE_ID_LENGTH,
+  CONTROLLED_NODE_ID_PATTERN_SOURCE,
+} from './controlled-node-identity.js';
+import {
+  PEER_AUDIT_FINDINGS_BYTES,
+  PEER_AUDIT_VALIDATION_COUNT,
+  PEER_AUDIT_VALIDATION_ITEM_BYTES,
+  PEER_AUDIT_VALIDATION_KINDS,
+  PEER_AUDIT_VALIDATION_OUTCOMES,
+} from './peer-audit.js';
+import { CRON_COMPLETION_POLICY } from './cron-types.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_RESULT_BYTES,
+} from './agent-delegation.js';
+import {
+  SUPERVISION_CI_SMOKE_STATUSES,
+  SUPERVISION_MODES,
+  SUPERVISION_TASK_AUDIT_POLICIES,
+  SUPERVISION_TASK_CLASSIFICATIONS,
+  SUPERVISION_TASK_FILE_OPERATIONS,
+} from './supervision-config.js';
+import { TASK_PAIR_SUBSESSION_TERM_SHORT } from './task-pair.js';
+import {
+  SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS,
+  SUPERVISION_EXECUTION_POOL_KINDS,
+  SUPERVISION_NO_POOL_DEFAULT_EXECUTION,
+} from './supervision-execution-pool.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from './session-send-delivery.js';
+import {
+  SESSION_IDENTITY_MCP_TOOLS,
+  SESSION_IDENTITY_SCOPE_LIST,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_PAIR_MAX_CHARS,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
+} from './session-identity.js';
+import { SUPERVISION_MCP_RETIRED_MESSAGE, SUPERVISION_MCP_TOOLS } from './supervision-mcp-tools.js';
+import {
+  VERIFICATION_MACHINE_KIND_LIST,
+  VERIFICATION_MACHINE_MCP_TOOLS,
+  VERIFICATION_MACHINE_SCOPE_LIST,
+} from './verification-machine.js';
+import {
+  CALLBACK_MAX_METADATA_BYTES,
+  CALLBACK_MAX_RELATED_TASK_ID_CHARS,
+  CALLBACK_MAX_SOURCE_CHARS,
+  CALLBACK_MAX_SUMMARY_CHARS,
+  CALLBACK_MCP_TOOLS,
+  CALLBACK_UPDATE_STATUSES,
+} from './callback-types.js';
+export {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+};
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
   LIST_MEMORY_SUMMARIES: 'list_memory_summaries',
   GET_MEMORY_SOURCES: 'get_memory_sources',
+  ARCHIVE_MEMORY: 'archive_memory',
+  RESTORE_MEMORY: 'restore_memory',
+  DELETE_MEMORY: 'delete_memory',
+  UPDATE_MEMORY: 'update_memory',
+  MEMORY_FEEDBACK: 'memory_feedback',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
+  MEMORY_INJECTION_GET: 'memory_injection_get',
+  MEMORY_INJECTION_SET: 'memory_injection_set',
+  SESSION_IDENTITY_GET: SESSION_IDENTITY_MCP_TOOLS.GET,
+  SESSION_IDENTITY_SET: SESSION_IDENTITY_MCP_TOOLS.SET,
+  SESSION_IDENTITY_CLEAR: SESSION_IDENTITY_MCP_TOOLS.CLEAR,
+  SESSION_IDENTITY_REFRESH: SESSION_IDENTITY_MCP_TOOLS.REFRESH,
+  VERIFICATION_MACHINE_LIST: VERIFICATION_MACHINE_MCP_TOOLS.LIST,
+  VERIFICATION_MACHINE_SET: VERIFICATION_MACHINE_MCP_TOOLS.SET,
+  VERIFICATION_MACHINE_REMOVE: VERIFICATION_MACHINE_MCP_TOOLS.REMOVE,
+  VERIFICATION_MACHINE_VERIFY: VERIFICATION_MACHINE_MCP_TOOLS.VERIFY,
+  PEER_AUDIT_REPLY: 'peer_audit_reply',
+  DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
+  PAIR_LIST: 'pair_list',
+  PAIR_GET: 'pair_get',
+  PAIR_CREATE: 'pair_create',
+  PAIR_DISPATCH: 'pair_dispatch',
+  PAIR_CLOSE: 'pair_close',
+  PAIR_PAUSE: 'pair_pause',
+  PAIR_RESUME: 'pair_resume',
+  PAIR_REASSIGN: 'pair_reassign',
+  PAIR_NEXT_ROUND: 'pair_next_round',
+  PAIR_VERDICT: 'pair_verdict',
+  PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
+  PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
+  PAIR_WORKSPACE_GC: 'pair_workspace_gc',
+  PAIR_HISTORY: 'pair_history',
+  PAIR_DECISION_RECORD: 'pair_decision_record',
+  PAIR_DECISION_HISTORY: 'pair_decision_history',
+  SESSION_TEXT_HISTORY: 'session_history',
+  SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
+  SESSION_RESTART: 'session_restart',
+  SESSION_CLOSE: 'session_close',
+  SESSION_MODEL: 'session_model',
   SEND_MESSAGE: 'send_message',
+  SEND_IM_MESSAGE: 'send_im_message',
+  SUPERVISION_TASK_START: 'supervision_task_start',
+  SUPERVISION_TASK_UPDATE: 'supervision_task_update',
+  SUPERVISION_TASK_FINISH: 'supervision_task_finish',
+  SUPERVISION_INTEGRATION_PREFLIGHT: 'supervision_integration_preflight',
+  SUPERVISION_INTEGRATION_FINALIZE: 'supervision_integration_finalize',
+  SUPERVISION_TASK_FILE_EVENT: 'supervision_task_file_event',
+  PAIR_TASK_GET: 'pair_task_get',
+  PAIR_TASK_UPDATE: 'pair_task_update',
+  PAIR_TASK_CHECK: 'pair_task_check',
+  PAIR_RESOURCE_CLAIM: 'pair_resource_claim',
+  CALLBACK_UPDATE: CALLBACK_MCP_TOOLS.UPDATE,
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
+  CRON_CREATE_SELF: 'cron_create_self',
+  CRON_UPDATE_SELF: 'cron_update_self',
+  CRON_CANCEL_SELF: 'cron_cancel_self',
   CRON_CREATE: 'cron_create',
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
   CRON_DELETE: 'cron_delete',
+  CRON_PAUSE_SELF: 'cron_pause_self',
+  CRON_RESUME_SELF: 'cron_resume_self',
+  CRON_PAUSE: 'cron_pause',
+  CRON_RESUME: 'cron_resume',
+  // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
+  LIST_MACHINES: 'list_machines',
+  EXEC_REMOTE: 'exec_remote',
+  SEND_FILE_TO_MACHINE: 'send_file_to_machine',
+  FETCH_FILE_FROM_MACHINE: 'fetch_file_from_machine',
+  COMPUTER_USE_DOCS: 'computer_use_docs',
+  COMPUTER_USE_CALL: 'computer_use_call',
+  CLOUD_DOCS: 'cloud_docs',
 } as const;
+
+/** Structured pair close actions; lifecycle semantics are delegated to the marker state machine. */
+export const MEMORY_MCP_PAIR_CLOSE_ACTIONS = ['done', 'cancel'] as const;
+export type MemoryMcpPairCloseAction = typeof MEMORY_MCP_PAIR_CLOSE_ACTIONS[number];
 
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
 
@@ -27,17 +197,162 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
   MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
   MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+  MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
+  // Quick peer audits are a live, user-invoked channel; only the supervision
+  // task-path tools below are retired.
+  MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
+  MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+  MEMORY_MCP_TOOL_NAMES.PAIR_LIST,
+  MEMORY_MCP_TOOL_NAMES.PAIR_GET,
+  MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
+  MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
+  MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+  MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+  MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
+  MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC,
+  MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY,
+  MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+  MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+  MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
+  MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME,
+  MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+  MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
 ] as const satisfies readonly MemoryMcpToolName[];
+
+/**
+ * The pre-pairs supervision surface is retained only for decoding stored
+ * history and migration.  It is deliberately not part of the advertised MCP
+ * catalog.  Keep this list in one shared place so tools/list, discovery and
+ * direct-call retirement errors cannot drift apart.
+ */
+export const RETIRED_SUPERVISION_MCP_TOOL_NAMES = Object.freeze([
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
+  SUPERVISION_MCP_TOOLS.INTENT,
+  SUPERVISION_MCP_TOOLS.LIST,
+  SUPERVISION_MCP_TOOLS.GET,
+  SUPERVISION_MCP_TOOLS.RECOVER,
+  SUPERVISION_MCP_TOOLS.HOUSEKEEPING,
+] as const);
+export type RetiredSupervisionMcpToolName = typeof RETIRED_SUPERVISION_MCP_TOOL_NAMES[number];
+export const RETIRED_SUPERVISION_MCP_TOOL_SET: ReadonlySet<string> = new Set(RETIRED_SUPERVISION_MCP_TOOL_NAMES);
+export const RETIRED_SUPERVISION_MCP_MESSAGE = SUPERVISION_MCP_RETIRED_MESSAGE;
+
+export const SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS = [
+  'assignmentId', 'revision', 'auditAttemptId', 'auditRevision', 'verdict',
+  'integrationOwner', 'pushRemoteRef',
+] as const;
+
+export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
+  ...SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS,
+  'commitSha', 'pushResult',
+] as const;
+
+export const SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS = [
+  'ownedFiles', 'integrationManifest', 'stagedPaths', 'conflictedPaths',
+  'untrackedOtherOwnerPaths',
+] as const;
+
+/**
+ * Tools available ONLY to FULL nodes. A controlled node never advertises these
+ * (and structurally never even starts the memory MCP server) — the explicit gate
+ * here is the shared role check the spec requires (10.12).
+ */
+export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
+  MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+  MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+]);
+
+/** Whether a tool is available to a node of the given role. */
+export function isToolAvailableForRole(name: MemoryMcpToolName, role: NodeRole): boolean {
+  if (role === NODE_ROLE.CONTROLLED && FULL_ONLY_MCP_TOOLS.has(name)) return false;
+  return true;
+}
+
+/** The advertised tool-name list for a node of the given role (controlled excludes FULL-only tools). */
+export function advertisedMcpToolNames(role: NodeRole): readonly MemoryMcpToolName[] {
+  return MEMORY_MCP_TOOL_NAME_LIST.filter((name) => isToolAvailableForRole(name, role));
+}
+
+/**
+ * The pair tools through which Brain acts on a pair (decide, continue, re-brief
+ * it). Read-only tools (`pair_get`, `pair_list`, `pair_task_get`) are not here:
+ * looking at a pair is not deciding it.
+ */
+export const PAIR_BRAIN_ACTION_TOOL_NAMES: readonly string[] = [
+  MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
+  MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
+  MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+  MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+];
 
 export const MEMORY_MCP_CAPS = {
   SEARCH_MEMORY_DEFAULT_LIMIT: 20,
@@ -53,9 +368,20 @@ export const MEMORY_MCP_CAPS = {
   SEND_FILES_MAX_COUNT: 32,
   SEND_FILE_PATH_MAX_CHARS: 512,
   CRON_MIN_INTERVAL_MINUTES: 5,
+  CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES: 20,
+  CRON_SHORT_INTERVAL_REASON_MAX_CHARS: 500,
   CRON_EXPIRES_AT_MAX_DAYS: 90,
   CRON_LIST_MAX_LIMIT: 100,
 } as const;
+
+/** Local daemon ingress used by the stdio MCP child for exact-session restart. */
+export const MEMORY_MCP_SESSION_RESTART_HOOK_PATH = '/session/restart' as const;
+export const MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH = '/session/restart-batch' as const;
+/** Local daemon ingress for `session_close`; the daemon, not the MCP child, enforces who may close what. */
+export const MEMORY_MCP_SESSION_CLOSE_HOOK_PATH = '/session/close' as const;
+/** Local daemon ingress for the model tools (list / switch by exact session name). */
+export const MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH = '/session/models' as const;
+export const MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH = '/session/model' as const;
 
 export const MEMORY_MCP_DISABLED_FLAGS = {
   MEMORY_SURFACE: MCP_FEATURE_FLAGS_BY_NAME.memorySurface,
@@ -105,8 +431,12 @@ type JsonSchema = {
   readonly enum?: readonly unknown[];
   readonly minimum?: number;
   readonly maximum?: number;
+  readonly minLength?: number;
   readonly maxLength?: number;
+  readonly pattern?: string;
   readonly maxItems?: number;
+  readonly minItems?: number;
+  readonly anyOf?: readonly JsonSchema[];
 };
 
 export interface MemoryMcpToolContract {
@@ -147,10 +477,96 @@ const statusSchema = objectSchema({
   status: stringSchema('Machine status for the tool result.'),
 });
 
+const SEND_MESSAGE_INPUT_SCHEMA = objectSchema({
+  target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true; auto-provision requests also require a top-level idempotencyKey.'),
+  message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
+  emergency: booleanSchema('Optional emergency flag. When true, if the target session is busy and does not support in-flight turn append, the daemon automatically force-stops the target before delivering the message, ensuring immediate steering/interruption instead of waiting in the FIFO queue.'),
+  deliveryMode: {
+    type: 'string',
+    enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
+    description: 'append is the default direct inter-session mode with durable fallback; queue is explicit FIFO and never inserts into the active turn.',
+  },
+  files: {
+    type: 'array',
+    description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,
+    items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
+    maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
+  },
+  reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+  command: booleanSchema(SEND_COMMAND_DESCRIPTION),
+  task: {
+    ...objectSchema({
+      taskId: stringSchema('Existing visible task to append; missing or inaccessible ids never create work.'),
+      assignmentId: stringSchema('Exact existing implementer assignment for an unambiguous append.'),
+      topLevelTaskId: stringSchema('Optional top-level task id.'),
+      sliceId: stringSchema('Optional slice id.'),
+      classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
+      objective: stringSchema('Task objective/title.'),
+      acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
+      ownedFiles: { description: 'Optional attribution metadata; unusable values are ignored and never become an edit ACL or validation authority.' },
+      sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
+      dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
+      integrationOwner: stringSchema('Integration owner assignment/session reference.'),
+      baseRevision: stringSchema('Base revision.'),
+      currentRevision: stringSchema('Current revision.'),
+      auditAttemptId: stringSchema('Matching audit attempt id.'),
+      auditRevision: stringSchema('Matching audit revision.'),
+      auditPolicy: {
+        type: 'string',
+        enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+        description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
+      },
+      executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
+      autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
+      requestedExecutionType: objectSchema({
+        capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
+        agentType: stringSchema('Explicitly selected SDK agent type.'),
+        providerFamily: stringSchema('Canonical provider family.'),
+        runtimeType: { type: 'string', enum: ['process', 'transport'] },
+        model: stringSchema('Canonical selected model.'),
+        ccPresetId: stringSchema('Optional canonical Claude Code preset identity.', { minLength: 1 }),
+      }, [...SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS]),
+    }),
+    description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
+  },
+  identity: {
+    ...objectSchema({
+      content: stringSchema('Inline session-scoped Agent identity contract, up to 80,000 characters.'),
+      filePath: stringSchema('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for this session-scoped startup identity.', { maxLength: SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS }),
+    }),
+    anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+    description: 'Optional startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath. Different identity content is never silently reused as the same Agent session.',
+  },
+  audit: {
+    ...objectSchema({
+      kind: {
+        type: 'string',
+        enum: [AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT],
+        description: 'Exact supervision-audit purpose. Ordinary reply-enabled delegations must omit this object.',
+      },
+      attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
+      auditedSessionName: stringSchema('Exact session being audited, chosen by the Supervisor Brain. The daemon never infers it.'),
+      strictCrossVendor: booleanSchema('Set true only when the user explicitly requires cross-vendor and forbids same-family degradation.'),
+    }, ['kind', 'attemptId', 'auditedSessionName']),
+    description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
+  },
+  broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
+  idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
+  clone: {
+    ...objectSchema({
+      kind: { type: 'string', enum: [EXECUTION_CLONE_KIND], description: 'Must be the literal execution-clone kind discriminant.' },
+      ephemeral: booleanSchema('Must be true — managed execution clones are always ephemeral.'),
+      parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
+      parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
+    }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
+    description: 'Optional execution-clone request. Routes to a fresh ephemeral clone of the resolved target, never the target itself, and returns clone.target. Cannot be combined with broadcast.',
+  },
+}, ['message']);
+
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with ids, summaries, match kind, and a typed sourceLookup object that shows exactly how to fetch details. If a relevant summary may affect the answer but is not enough, call get_memory_sources with the returned sourceLookup fields. The query is text only; embeddings and vectors are computed internally when available.',
+    description: 'Search caller-bound memory by text (internally vectorized). Hits carry typed sourceLookup; use those fields for source expansion when needed.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
@@ -158,12 +574,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
       reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
-      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind, projectionId | observationId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup with a logical tool name, kind, and projectionId or observationId for exact source expansion; use the exact callable identifier from the current tool list.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
-    description: 'List recent processed memory summaries for the caller-bound project without requiring a text query. Use it when the user asks for recent task summaries, recent project context, or a compact memory digest; each returned item includes a compact ref plus sourceLookup so details can be fetched with get_memory_sources only when needed.',
+    description: 'List recent caller-project memory summaries without a query. Each item includes a compact ref and sourceLookup for optional source expansion.',
     inputSchema: objectSchema({
       projectionClass: { type: 'string', enum: ['recent_summary', 'durable_memory_candidate'], description: 'Optional processed memory class to list. Defaults to recent_summary for the newest task summaries; durable_memory_candidate lists promoted durable facts.' },
       limit: numberSchema(`Optional maximum summary count; defaults to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT }),
@@ -171,16 +587,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
       reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
-      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind: "projection", projectionId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup with a logical tool name, projection kind, and projectionId for exact source expansion; use the exact callable identifier from the current tool list.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source snippets for a projection id, observation id, or compact ref returned by memory search/startup memory. Use it after search_memory or when startup context gives a ref for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; missing or cross-namespace ids return an empty source list without revealing which case occurred.',
+    description: 'Expand projection id, observation id or compact ref from search/startup. Missing/cross-namespace: []. ambiguousRef: empty sources plus up to four candidates, candidateCount/truncated; not no memory. Choose a candidate id.',
     inputSchema: objectSchema({
-      projectionId: stringSchema('Projection id from search_memory.sourceLookup for projection hits. Caller identity and namespace are runtime-bound.'),
-      observationId: stringSchema('Observation id from search_memory.sourceLookup for observation hits. Caller identity and namespace are runtime-bound.'),
-      ref: stringSchema('Compact ref shown in search_memory results or startup memory, such as obs:abc123 or proj:abc123. It resolves after the ref was observed by this daemon and is cached locally across daemon restarts.'),
+      projectionId: stringSchema('Projection id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
+      observationId: stringSchema('Observation id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Compact ref shown in memory-search results or startup memory, such as obs:abc123 or proj:abc123. It resolves after the ref was observed by this daemon and is cached locally across daemon restarts.'),
       kind: { type: 'string', enum: ['projection', 'observation'], description: 'Optional lookup kind copied from sourceLookup; provide exactly one matching id.' },
     }),
     outputSchema: objectSchema({
@@ -188,67 +604,728 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       observationId: stringSchema('Requested observation id when expanding an observation hit.'),
       sources: { type: 'array', description: 'Source snippets visible to the caller namespace.', items: { type: 'object', additionalProperties: true } },
       projectionSource: { type: 'object', description: 'Processed projection summary snippet, included when available so callers can cite compacted memories even when raw source events are unavailable or less informative.', additionalProperties: true },
+      status: stringSchema('Result status.'),
+      ref: stringSchema('The compact ref that was expanded, echoed back.'),
+      sourceEventCount: { type: 'number', description: 'Number of source events backing the requested record.' },
+      partial: { type: 'boolean', description: 'Set when some source events could not be returned.' },
+      originServerId: stringSchema('Server that owns the record, when it was fetched remotely.'),
+      ambiguousRef: { type: 'boolean', description: 'Set when the supplied ref denotes more than one record, so `candidates` carries the matches instead of `sources` carrying one. Decide which candidate answers the question, then cite it by its own projectionId / observationId.' },
+      candidateCount: { type: 'number', description: 'How many records the ambiguous ref covers in total, which may exceed the expanded `candidates`.' },
+      truncated: { type: 'boolean', description: 'Set when `candidates` holds only part of candidateCount because expansion is bounded.' },
+      candidates: { type: 'array', description: 'Up to four of the records the ambiguous ref resolves to, each with its own id and expanded sources. Not necessarily exhaustive — compare against candidateCount / truncated.', items: { type: 'object', additionalProperties: true } },
     }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+    description: 'Archive a caller-project projection so search, recall, and startup context omit it. Identity and scope are runtime-bound; pass its projectionId or proj: ref.',
+    inputSchema: objectSchema({
+      projectionId: stringSchema('Projection id from memory search or recent-summary listing for the memory to archive. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact projection ref such as proj:abc123 returned by memory search or recent-summary listing. Do not combine with projectionId.'),
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY,
+    description: 'Restore an archived caller-project projection to search, recall, and startup context. Identity and scope are runtime-bound; pass its projectionId or proj: ref.',
+    inputSchema: objectSchema({
+      projectionId: stringSchema('Projection id for the archived memory to restore. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact projection ref such as proj:abc123. Do not combine with projectionId.'),
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
+    description: 'Permanently delete a caller-project memory record (projection or observation). Pass its projectionId, observationId, or compact ref (proj:… or obs:…). Synchronizes across sessions.',
+    inputSchema: objectSchema({
+      projectionId: stringSchema('Projection id for the memory to permanently delete. Caller identity and namespace are runtime-bound.'),
+      observationId: stringSchema('Observation id for the observation to permanently delete. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact ref such as proj:abc123 or obs:abc123. Do not combine with id parameters.'),
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY,
+    description: 'Correct a caller-project memory summary or text (projection or observation); identity, scope, owner, and project are runtime-bound and unchanged.',
+    inputSchema: objectSchema({
+      projectionId: stringSchema('Projection id for the memory to update. Caller identity and namespace are runtime-bound.'),
+      observationId: stringSchema('Observation id for the observation to update. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact ref such as proj:abc123 or obs:abc123. Do not combine with id parameters.'),
+      text: stringSchema('Replacement memory summary text. Must be non-empty after trimming.'),
+    }, ['text']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: {
+    name: MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
+    description: 'Record projection relevance. not_relevant archives it from future recall; relevant strengthens ranking. Identity and scope are runtime-bound.',
+    inputSchema: objectSchema({
+      projectionId: stringSchema('Projection id for the memory receiving feedback. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact projection ref such as proj:abc123. Do not combine with projectionId.'),
+      feedback: { type: 'string', enum: ['not_relevant', 'relevant'], description: 'Use not_relevant to stop future recall/search by archiving the memory; use relevant to strengthen ranking through hit-count metadata.' },
+      reason: stringSchema('Optional short human-readable reason for audit/debug context. It is not used for identity or authorization.'),
+    }, ['feedback']),
+    outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: {
     name: MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
-    description: 'Save an agent-learned observation as a candidate user-private memory. Use it for durable facts or decisions learned during work; result contains the observation id and fingerprint. Identity, scope, state, origin, and fingerprint are fixed by the runtime, not by arguments.',
+    description: 'Save a durable learned fact or decision into project memory with instant synchronization across sessions. Optionally supply replacesRef to obsolete/delete an outdated observation atomically.',
     inputSchema: objectSchema({
       content: stringSchema(`Required observation text, up to ${MEMORY_MCP_CAPS.OBSERVATION_CONTENT_MAX_BYTES} UTF-8 bytes.`),
       tags: { type: 'array', description: `Optional short tags; at most ${MEMORY_MCP_CAPS.OBSERVATION_TAGS_MAX_COUNT}, each at most ${MEMORY_MCP_CAPS.OBSERVATION_TAG_MAX_CHARS} characters.`, items: stringSchema('One caller-supplied tag label.', { maxLength: MEMORY_MCP_CAPS.OBSERVATION_TAG_MAX_CHARS }), maxItems: MEMORY_MCP_CAPS.OBSERVATION_TAGS_MAX_COUNT },
       turnId: stringSchema('Optional source turn or event id to associate with the observation.'),
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same observation.'),
+      replacesRef: stringSchema('Optional compact ref such as obs:abc123 or proj:abc123 to atomically delete/supersede when saving this observation.'),
     }, ['content']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: {
     name: MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
-    description: 'Save a user preference as an active user-private preference memory. Use it only for stable user instructions or preferences; this explicit path does not use text-prefix preference parsing.',
+    description: 'Save a stable user instruction or preference as active private preference memory; no text-prefix parsing.',
     inputSchema: objectSchema({
       text: stringSchema(`Required preference text, up to ${MEMORY_MCP_CAPS.PREFERENCE_MAX_BYTES} UTF-8 bytes.`),
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same preference.'),
     }, ['text']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET,
+    description: 'Read whether automatic memory injection (recent project memory / related past work, at session startup and before each message) is enabled for the caller\'s project. Managed Skills are a separate concept and are unaffected by this toggle. Defaults to enabled when never set.',
+    inputSchema: objectSchema({}),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      enabled: { type: 'boolean', description: 'Whether startup-memory auto-injection is currently enabled for the caller\'s project.' },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
+    description: 'Brain-only project-wide automatic memory injection toggle (startup/per-message recent memory and related past work). Covers Brain restarts and all sub-sessions; no per-sub-session setting. Managed Skills remain injected.',
+    inputSchema: objectSchema({
+      enabled: { type: 'boolean', description: 'true to enable (the default), false to disable startup-memory auto-injection for the whole project.' },
+    }, ['enabled']),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      enabled: { type: 'boolean', description: 'The value now in effect for the project.' },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+    description: 'Read the effective user/project/pair/session identity contract for the current or an exact same-project session, or by taskId. Identity is deterministic server-stored configuration, not fuzzy memory.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name or taskId. Omit for the current session.'),
+      taskId: stringSchema('Optional task ID for pair identity lookup.'),
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+    description: 'Set deterministic user/project/pair/session identity. User/project require Brain; pair allows executor/auditor/Brain. Exactly one of content/filePath. Explicit session files may be absolute on the daemon; user/project files stay project-confined. Only content syncs online.',
+    inputSchema: objectSchema({
+      identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, pair, or session.' },
+      target: stringSchema('Exact session name or taskId. Omit for the current session.'),
+      taskId: stringSchema('Optional task ID for pair scope; defaults to current session task.'),
+      content: stringSchema(`Inline identity contract: user scope up to ${SESSION_IDENTITY_USER_MAX_CHARS.toLocaleString('en-US')} characters, project up to ${SESSION_IDENTITY_PROJECT_MAX_CHARS.toLocaleString('en-US')}, pair up to ${SESSION_IDENTITY_PAIR_MAX_CHARS.toLocaleString('en-US')}, session up to ${SESSION_IDENTITY_SESSION_MAX_CHARS.toLocaleString('en-US')} characters. Limits are counted as Unicode code points, independent of UTF-8 or JSON transport size.`),
+      filePath: stringSchema('Identity document path. User/project scope requires a project-relative path; session scope also accepts an absolute daemon-host path. The daemon uploads content, never the local path.'),
+      expectedRevision: numberSchema('Deprecated compatibility field; ignored because identity saves are explicit last-write-wins operations.', { minimum: 0 }),
+      all: { type: 'boolean', description: 'Refresh affected sessions; defaults by scope.' },
+      append: { type: 'boolean', description: 'When true, appends content to the existing identity profile (separated by newlines) rather than overwriting.' },
+    }, ['identityScope']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+    description: 'Clear one deterministic Agent identity scope. Project/user writes require the project Brain, while pair writes allow the task executor, auditor, or Brain.',
+    inputSchema: objectSchema({
+      identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, pair, or session.' },
+      target: stringSchema('Exact session name or taskId. Omit for the current session.'),
+      taskId: stringSchema('Optional task ID for pair scope; defaults to current session task.'),
+      expectedRevision: numberSchema('Deprecated compatibility field; ignored because identity clears are explicit last-write-wins operations.', { minimum: 0 }),
+      all: { type: 'boolean', description: 'Refresh affected sessions; defaults by scope.' },
+    }, ['identityScope']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+    description: 'Refresh identity online; Brain-only all/targets fan-out reports each session and retries transient failures.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name; defaults to current.'),
+      all: { type: 'boolean', description: 'Brain-only: refresh the project.' },
+      targets: { type: 'array', maxItems: 50, items: stringSchema('Exact session name.'), description: 'Brain-only: refresh these sessions.' },
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+    description: 'List long-lived verification machines authorized for the current user and project. Records use stable IDs; aliases may be renamed without breaking references.',
+    inputSchema: objectSchema({
+      includeDisabled: { type: 'boolean', description: 'Include disabled records.' },
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+    description: 'Create or update a user/project verification-machine authorization. Controlled nodes bind their canonical nodeId; SSH binds an existing stable aliasId and never uploads credentials. Supply id to rename/update an existing record.',
+    inputSchema: objectSchema({
+      id: stringSchema('Stable 32-hex verificationMachineId. Omit only when creating.'),
+      verificationScope: { type: 'string', enum: [...VERIFICATION_MACHINE_SCOPE_LIST] },
+      alias: stringSchema('Mutable human-readable alias.'),
+      kind: { type: 'string', enum: [...VERIFICATION_MACHINE_KIND_LIST] },
+      target: stringSchema('Canonical controlled-node nodeId or stable aliasId.'),
+      enabled: { type: 'boolean' },
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['verificationScope', 'alias', 'kind', 'target']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+    description: 'Remove a verification-machine authorization by stable verificationMachineId.',
+    inputSchema: objectSchema({
+      id: stringSchema('Stable 32-hex verificationMachineId.'),
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['id']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
+    description: 'Non-destructively verify one authorized machine by stable ID. Controlled nodes recheck current access, online state and exec permission. SSH rechecks that the associated aliasId still exists; it does not test connectivity.',
+    inputSchema: objectSchema({ id: stringSchema('Stable 32-hex verificationMachineId.') }, ['id']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
+    description: 'Audit receipt (not task pairs); binds session/task/assignment/attempt/revision.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task id supplied by the audit brief.'),
+      assignmentId: stringSchema('Exact auditor assignment id supplied by the audit brief.'),
+      attemptId: stringSchema('Opaque attempt id supplied by the peer-audit brief.'),
+      revision: stringSchema('Exact audited revision supplied by the audit brief.'),
+      receiptKind: { type: 'string', enum: ['progress', 'final'], description: 'progress appends evidence; final records the current verdict.' },
+      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'Required for final receipts; omit for progress. PASS requires applicable executable evidence.' },
+      findings: stringSchema(`Concrete findings, at most ${PEER_AUDIT_FINDINGS_BYTES} UTF-8 bytes.`),
+      validations: {
+        type: 'array',
+        maxItems: PEER_AUDIT_VALIDATION_COUNT,
+        description: 'Bounded non-destructive validation evidence. PASS requires at least one passed item, or all applicable checks explicitly unavailable.',
+        items: objectSchema({
+          kind: { type: 'string', enum: [...PEER_AUDIT_VALIDATION_KINDS] },
+          label: stringSchema(`Validation label, at most ${PEER_AUDIT_VALIDATION_ITEM_BYTES} UTF-8 bytes.`),
+          outcome: { type: 'string', enum: [...PEER_AUDIT_VALIDATION_OUTCOMES] },
+          summary: stringSchema(`Exact bounded outcome/unavailability reason, at most ${PEER_AUDIT_VALIDATION_ITEM_BYTES} UTF-8 bytes.`),
+        }, ['kind', 'label', 'outcome', 'summary']),
+      },
+    }, ['taskId', 'assignmentId', 'attemptId', 'revision', 'receiptKind', 'findings', 'validations']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: {
+    name: MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
+    description: 'Submit an append-only reply. Daemon authenticates the current session against the durable delegation/assignment; no token.',
+    inputSchema: objectSchema({
+      delegationId: stringSchema('Opaque delegation id supplied by the reply-enabled brief.'),
+      result: stringSchema(`One complete delegation reply, at most ${AGENT_DELEGATION_REPLY_RESULT_BYTES} UTF-8 bytes.`),
+    }, ['delegationId', 'result']),
+    outputSchema: statusSchema,
+  },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable sibling sessions in the caller project that send_message may address. The current caller session and stopped sessions are excluded; if this returns no items, direct send_message cannot succeed until another sibling session is available. Use it to find another agent or peer session to delegate to or invite, for example "ask CC to audit", "invite a reviewer to discuss", or "ask another session to plan or implement"; optionally filter with the named agent/session hint, match by display label or target name, then copy the returned target field exactly into send_message. If no matching target is returned, report that no such running peer session is available. Labels are display-only metadata and are not valid MCP targets.',
+    description: 'List siblings; current caller session and stopped sessions are excluded; if this returns no items, none match. Omit executionPool for all; primary/economy filter canonical live pool members.',
     inputSchema: objectSchema({
-      query: stringSchema('Optional case-insensitive text filter over target display labels and names, such as "cc", "codex", "reviewer", or a session label mentioned by the user.'),
+      query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
+      executionPool: {
+        type: 'string',
+        enum: [...SUPERVISION_EXECUTION_POOL_KINDS],
+        description: 'Optional supervision pool filter. Omit to list every scoped/discoverable sibling for ordinary messaging. A legacy-unconfigured caller gets an empty result when a pool filter is requested.',
+      },
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      reason: stringSchema('Machine-readable reason for disabled/error results.'),
+      error: stringSchema('Sanitized error detail for error results.'),
+      executionPoolsState: {
+        type: 'string',
+        enum: ['configured', 'legacy_unconfigured'],
+        description: 'Caller execution-pool configuration state on an ok result.',
+      },
+      appliedExecutionPool: {
+        type: 'string',
+        enum: [...SUPERVISION_EXECUTION_POOL_KINDS],
+        description: 'Echoed only when the caller requested an executionPool filter.',
+      },
+      supervisionMode: {
+        type: 'string',
+        enum: [...SUPERVISION_MODES],
+        description: "Project's supervision mode, from its Brain session.",
+      },
+      autoAudit: {
+        type: 'boolean',
+        description: 'True when supervisionMode is supervised_audit.',
+      },
+      items: {
+        type: 'array',
+        description: 'Scoped target projections after optional pool, query, and limit filtering.',
+        items: objectSchema({
+          target: stringSchema('Exact target accepted by send_message.'),
+          label: { type: ['string', 'null'], description: 'Human display label when present.' },
+          sessionName: stringSchema('Canonical target session name.'),
+          role: stringSchema('Observed session role.'),
+          agentType: stringSchema('Observed runtime agent type.'),
+          model: stringSchema('Effective model when known.'),
+          status: stringSchema('Observed session runtime state.'),
+          lastActiveAt: numberSchema('Last observed session activity timestamp.'),
+          lastMessageAt: numberSchema('Latest participant-authored message timestamp, when observed.'),
+          lastToolCallAt: numberSchema('Latest provider tool-call timestamp, when observed.'),
+          openPairs: {
+            type: 'array',
+            description: 'Open task-pair memberships for this session, including role and current status.',
+            items: objectSchema({
+              taskId: stringSchema('Open pair task id.'),
+              role: { type: 'string', enum: ['brain', 'executor', 'auditor'] },
+              status: stringSchema('Current pair status.'),
+              round: numberSchema('Current audit round.'),
+              title: stringSchema('Pair title when present.'),
+            }, ['taskId', 'role', 'status', 'round']),
+          },
+          inOpenPair: booleanSchema('In open pair.'),
+          providerFamily: stringSchema('Observed provider family used by audit/task policy.'),
+          availability: stringSchema('Authoritative delegation availability.'),
+          eligiblePools: {
+            type: 'array',
+            items: { type: 'string', enum: [...SUPERVISION_EXECUTION_POOL_KINDS] },
+            description: 'Configured pools whose canonical identity constraints match this target. Absent for legacy-unconfigured callers.',
+          },
+          poolRole: {
+            type: ['string', 'null'],
+            enum: ['executor', 'auditor', 'both', null],
+            description: 'Pool role.',
+          },
+          poolRoles: {
+            type: 'object',
+            description: 'Role per pool.',
+            additionalProperties: { type: 'string', enum: ['executor', 'auditor', 'both'] },
+          },
+          dispatchMode: {
+            type: 'string',
+            enum: ['new_work', 'queue_only', 'unavailable'],
+            description: 'New-work disposition derived from availability.',
+          },
+          defaultExecution: {
+            type: 'string',
+            enum: [SUPERVISION_NO_POOL_DEFAULT_EXECUTION],
+            description: 'No-pool default candidate (same family, secondary tier).',
+          },
+          limitGroup: stringSchema('Provider quota group shared by sibling sessions.'),
+          replyCapable: booleanSchema('Whether the runtime supports structured replies.'),
+        }),
+      },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_LIST]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_LIST,
+    description: 'List the caller Brain\'s task pairs in one call, including running and queued pairs; optionally include recently finished pairs.',
+    inputSchema: objectSchema({
+      includeFinished: booleanSchema('Include recently finished pairs retained in the pair store.'),
+      limit: numberSchema('Optional maximum number of pairs to return.'),
+    }),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), pairs: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_GET,
+    description: 'Get one caller-Brain task pair with its brief and recent durable events.',
+    inputSchema: objectSchema({ taskId: stringSchema('Exact task-pair id.'), eventLimit: numberSchema('Optional maximum recent events.') }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), pair: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+    description: 'Brain-only: read recent text, calls, or summary history for both participants of one task pair. Uses the same bounded readers and redaction rules as session_history; auditor=none is reported as missing.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      role: { type: 'string', enum: ['executor', 'auditor'], description: 'Optional participant role; omit to read both.' },
+      kind: { type: 'string', enum: ['text', 'tool', 'summary'], description: 'History kind; defaults to text.' },
+      limit: numberSchema('Requested history count per participant; 1..200.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Resolved task-pair id.'), kind: stringSchema('Requested history kind.'), requested: numberSchema('Requested per-participant limit.'), participants: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+    description: 'Persist one participant or Brain decision for a task-pair round. The caller identity is recorded as author; retries with the same idempotencyKey are idempotent.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      kind: { type: 'string', enum: ['request', 'decision'], description: 'request from executor/auditor, or final decision from Brain; defaults to decision.' },
+      round: numberSchema('Audit/decision round (positive integer).'),
+      deliveryRound: { type: 'integer', minimum: 1, description: 'Delivery round; defaults to the current delivery round. Separate from the audit round.' },
+      question: { type: 'string', maxLength: 2000, description: 'Exact blocking question for the task card.' },
+      options: { type: 'array', maxItems: 8, items: objectSchema({ id: { type: 'string', minLength: 1, maxLength: 100 }, label: { type: 'string', minLength: 1, maxLength: 300 } }, ['id', 'label']), description: 'Concrete choices the user can select; free-text feedback is always available.' },
+      recommendation: { type: 'string', maxLength: 2000, description: 'Recommended option and trade-off.' },
+      requestId: stringSchema('Exact question record id this ruling answers; does not resume or close the pair.'),
+      selectedOptionId: stringSchema('Selected option id, if answering a structured question.'),
+      conclusion: stringSchema('Short decision conclusion.'),
+      summary: stringSchema('Bounded decision summary; do not include the full brief or logs.'),
+      related: { type: 'array', maxItems: 20, items: stringSchema('Optional related task or artifact reference.') },
+      idempotencyKey: stringSchema('Stable retry key for this decision write.'),
+    }, ['taskId', 'round', 'conclusion', 'summary']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), created: { type: 'boolean' }, decision: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
+    description: 'Brain-only: read bounded durable decisions for one task pair, or merge the recent decisions for two task pairs. Results are newest first with a stable timestamp/id tie-break.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      relatedTaskId: stringSchema('Optional second task-pair id.'),
+      taskIds: { type: 'array', minItems: 1, maxItems: 2, items: stringSchema('One or two exact task-pair ids.') },
+      limit: numberSchema('Maximum records: 20 for one task, 40 for two.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), decisions: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
+    description: 'Brain-only: do a quick read-only root-cause check and create a task pair directly without asking routine confirmation (short title required). Persists brief/assignments atomically with receipts; same idempotencyKey replays without duplicate creation/sends. Unnamed roles use the pool, else idle same-vendor secondary sub-sessions (creating missing ones up to cap, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE + ' ' + TASK_PAIR_NON_CODE_NO_AUDIT_SHORT_RULE + ' ' + TASK_PAIR_ECONOMY_POOL_SHORT_RULE + ' ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+    inputSchema: objectSchema({
+      taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
+      title: stringSchema('Short specific title in the owner UI language.', { minLength: 1 }),
+      brief: stringSchema('Complete Markdown brief: Goal, verified Proven files/logs, step-by-step Plan, checkable "- [ ][ ]" Acceptance + verification (required when audited), Boundaries.'),
+      dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Wait until these same-project tasks reach accepted done.' },
+      executor: stringSchema('Exact executor.'),
+      auditor: stringSchema('Exact auditor or "none" (default "none" for non-code/office tasks unless strict verification is needed).'),
+      executorModel: stringSchema('Explicit executor model.'),
+      auditorModel: stringSchema('Explicit auditor model.'),
+      createExecutor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
+      createAuditor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
+      executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Optional executor execution pool: pass "economy" for bounded low-risk/routine tasks (audited via primary pool); default "primary" for complex work.' },
+      workspace: { type: 'string', enum: [...TASK_PAIR_WORKSPACE_REQUESTS], description: TASK_PAIR_WORKSPACE_PARAMETER_DESCRIPTION },
+      idempotencyKey: stringSchema('Stable retry key for this create request.'),
+    }, ['title', 'brief']),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      taskId: stringSchema('Created task id.'),
+      state: stringSchema('Current pair state.'),
+      executionSelection: { type: 'object' },
+      deliveries: { type: 'array', items: { type: 'object' } },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
+    description: 'Brain-only structured dispatch of an existing queued pair. Queue admission and participant brief delivery are idempotent; repeated calls return replay receipts without duplicate sends.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing queued task-pair id.', { minLength: 1 }),
+      idempotencyKey: stringSchema('Stable retry key for this dispatch request.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Dispatched task id.'), state: stringSchema('Current pair state.'), deliveries: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+    description: 'Brain-only structured pair close. action=done accepts the audited result (force/accept) and optional output/dest; action=cancel preserves marker semantics. Replays with the same idempotencyKey are idempotent. Brief edits still use pair_task_update and checklist edits use pair_task_check; neither closes a pair. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE,
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
+      action: { type: 'string', enum: [...MEMORY_MCP_PAIR_CLOSE_ACTIONS], description: 'Terminal action.' },
+      force: booleanSchema('For done, accept an unaudited or otherwise held audited pair.'),
+      accept: booleanSchema('Alias for force=true on done; explicit Brain acceptance.'),
+      output: stringSchema('Optional deliverable path inside the pair workspace.'),
+      dest: stringSchema('Optional destination path inside the project.'),
+      integration: stringSchema('Optional integration=dismiss compatibility control for an already-done pair.'),
+      idempotencyKey: stringSchema('Stable retry key for this close request.'),
+    }, ['taskId', 'action']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Closed task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+    description: 'Brain: pause wakeups; preserve stage/material. Manual: pair_resume.',
+    inputSchema: objectSchema({ taskId: stringSchema('Existing pair id.'), mode: { type: 'string', enum: [...TASK_PAIR_PAUSE_MODES] }, dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Dependency mode requires same-project ids; accepted done unlocks. [] clears wait.' }, note: { type: 'string', maxLength: 2000, description: 'Reason.' } }, ['taskId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
+    description: 'Brain: resume an open pair; dependencies and capacity still apply.',
+    inputSchema: objectSchema({ taskId: stringSchema('Existing pair id.') }, ['taskId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+    description: 'Brain-only REASSIGN (state machine, queue, brief delivery, idempotency). Rejects open-pair reuse; obeys pool roles.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
+      executor: stringSchema('Exact replacement executor session.'),
+      auditor: stringSchema('Exact replacement auditor session, or none.'),
+      executorModel: stringSchema('Replacement executor model.'),
+      auditorModel: stringSchema('Replacement auditor model.'),
+      executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Replacement executor pool.' },
+      idempotencyKey: stringSchema('Stable retry key for this reassignment request.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Reassigned task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+    description: 'Brain-only structured NEXT_ROUND. The pair must be passed, terminal pairs are rejected, and base/note are persisted by the marker state machine. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing passed task-pair id.', { minLength: 1 }),
+      base: stringSchema('Optional 7-64 hex commit base.'),
+      note: stringSchema('Optional note for the new delivery round.'),
+      idempotencyKey: stringSchema('Stable retry key for this next-round request.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
+    description: 'Assigned-auditor structured PASS/REWORK verdict for a material-backed in_audit round. blocking and p0..p4 counts reuse the audit-convergence judgement and receipt rules; this never substitutes for READY_FOR_AUDIT material. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing material-backed in-audit task-pair id.', { minLength: 1 }),
+      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'Audit verdict.' },
+      blocking: stringSchema('Optional comma-separated blocking severities, e.g. P0,P1.'),
+      p0: numberSchema('Optional P0 finding count.', { minimum: 0 }),
+      p1: numberSchema('Optional P1 finding count.', { minimum: 0 }),
+      p2: numberSchema('Optional P2 finding count.', { minimum: 0 }),
+      p3: numberSchema('Optional P3 finding count.', { minimum: 0 }),
+      p4: numberSchema('Optional P4 finding count.', { minimum: 0 }),
+      idempotencyKey: stringSchema('Stable retry key for this verdict request.'),
+    }, ['taskId', 'verdict']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.'), judgement: stringSchema('Audit-convergence judgement.'), counts: { type: 'object', additionalProperties: { type: 'number' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
+    description: 'Set the caller Brain\'s durable task-pair concurrency limit. Every other pair change uses the pair_* tools.',
+    inputSchema: objectSchema({ maxConcurrency: numberSchema('Positive integer queue concurrency limit.') }, ['maxConcurrency']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), maxConcurrency: numberSchema('Stored concurrency limit.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
+    description: 'Get the caller Brain\'s durable task-pair concurrency limit.',
+    inputSchema: objectSchema({}),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), maxConcurrency: numberSchema('Stored concurrency limit.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC,
+    description: 'Brain-only cleanup of the workspaces of ENDED pairs now, without the 7-day wait. dryRun (default true) lists what would go. Never touches an open pair, uncommitted or unintegrated work.',
+    inputSchema: objectSchema({
+      dryRun: booleanSchema('Default true: only list. false removes.'),
+      minAgeHours: numberSchema('Only pairs that ended at least this long ago; default 0.'),
+      limit: numberSchema('Pairs examined per call, oldest end first; default 50.'),
+    }),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), dryRun: booleanSchema('Whether nothing was removed.'), entries: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY,
+    description: 'Read local texts, summaries or calls/results. sessionId: exact name/instance/provider ID; defaults to current. Same main-session tree only, siblings included. Raw stored content; truncation marked.',
+    inputSchema: objectSchema({ sessionId: stringSchema('Exact local session ID; omit for current.'), kind: { type: 'string', enum: [...SESSION_HISTORY_KINDS], description: 'text (default), summary, or tool (call/result JSON).' }, limit: { type: 'integer', minimum: 1, maximum: SESSION_TEXT_HISTORY_MAX_LIMIT, description: `Default ${SESSION_TEXT_HISTORY_DEFAULT_LIMIT}.` } }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+    description: 'Return only the bound caller runtime identity; model metadata is evidence, not authority.',
+    inputSchema: objectSchema({}),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+    description: 'Restart an exact existing current-project session; never creates one. Default resumes prior conversation. reset=true keeps the session but starts over.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      description: 'Restart one exact session, or submit a bounded batch. Batch items may carry an idempotencyKey.',
+      properties: {
+        target: stringSchema('Canonical session name; no label, wildcard, or broadcast.'),
+        reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
+        targets: { type: 'array', maxItems: 50, items: { type: 'object', additionalProperties: false, required: ['target'], properties: {
+          target: stringSchema('Canonical session name.'),
+          reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
+          idempotencyKey: stringSchema('Stable retry key for this target.'),
+        } } },
+        idempotencyKey: stringSchema('Stable retry key for this target.'),
+      },
+      anyOf: [{ required: ['target'] }, { required: ['targets'] }],
+    },
+    outputSchema: objectSchema({
+      status: stringSchema('Result status.'),
+      target: stringSchema('Accepted session name.'),
+      reset: booleanSchema('True for start-over.'),
+      scheduled: booleanSchema('True when accepted.'),
+    }, ['status', 'target', 'reset', 'scheduled']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
+    description: 'Close one exact sub-session of this project (soft: reopenable by the user). Creator or project Brain only; never a Brain, main session, clone or yourself. Refused while a pair is open, a turn runs (an unanswered question counts) or messages are queued; Brain-only force discards those, never unread receipts. Idempotent.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact sub-session name.'),
+      force: booleanSchema('Brain only: close despite open pair, running turn or queued messages.'),
+      confirmUserCreated: booleanSchema('Brain only: required for a user-created session.'),
+    }, ['target']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
+    description: 'Get or switch an exact session model and thinking level. Omit/empty both to list current model, thinking, and supported choices; set either or both to switch (model applies before thinking).',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name; default caller.'),
+      model: stringSchema('Model id to switch to; empty/omitted keeps the current model.'),
+      thinking: stringSchema('Thinking/effort level to switch to; empty/omitted keeps the current level.', { enum: [...TRANSPORT_EFFORT_LEVELS] }),
     }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Use this to ask, delegate to, or invite another caller-project sibling agent/session using the exact target value returned by send_list_targets, for example asking a CC session to audit something or inviting a reviewer to discuss. send_message delivers a plain text invite/request and does not start a structured Team/P2P discussion run by itself; if a structured discussion run is required, use the dedicated discussion-launch path instead. The caller session is not a valid target, and an empty send_list_targets result means there is no direct send target in scope. Optional files are sanitized path references under the caller project root, not file bytes; accepted sends return shared dispatch and message ids plus per-target delivery status.',
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. emergency=true auto-stops busy targets that cannot append. Returns status. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
+    inputSchema: SEND_MESSAGE_INPUT_SCHEMA,
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
+    description: 'Collision-safe alias of send_message (avoids host built-in send_message shadowing); identical schema and semantics. Send to an exact send_list_targets target; Callers and labels are invalid targets. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
+    inputSchema: SEND_MESSAGE_INPUT_SCHEMA,
+    outputSchema: statusSchema,
+  },
+
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET,
+    description: 'Read pair brief.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.') }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
+    description: 'Replace the complete pair brief, set a Brain-only title, or update legacy title viewer metadata. Participants use the same Pair access as owners; no separate title grant is required. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' }, titleViewerUserIds: { type: 'array', minItems: 1, maxItems: TASK_PAIR_TITLE_ACCESS_MAX_USERS, items: { type: 'string', minLength: 1, maxLength: TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS }, description: 'Brain only: update legacy title viewer metadata. Not required for Pair access or display.' } }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+    description: 'Update pair checklist only. Checklist changes never implicitly close or advance a pair; use pair_close or pair_verdict for lifecycle decisions.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), items: { type: 'array', items: { type: 'integer', minimum: 1 } }, box: { type: 'string', enum: ['implemented', 'audited'] }, checked: { type: 'boolean' } }, ['items', 'box', 'checked']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+    description: 'Claim or renew a shared external pair resource.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), resource: stringSchema('Canonical external resource.'), mode: { type: 'string', enum: ['exclusive', 'shared'] }, ttlMs: { type: 'integer', minimum: 60000, maximum: 86400000 }, renew: { type: 'boolean' } }, ['resource', 'mode']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
+    description: 'Update status and summary for a callback item (in_progress, done, ignored, failed), optionally linking relatedTaskId or metadata.',
     inputSchema: objectSchema({
-      target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
-      message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
-      files: {
-        type: 'array',
-        description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,
-        items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
-        maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
+      callbackId: stringSchema('Callback id (cb_...).'),
+      status: stringSchema('New callback status.', { enum: [...CALLBACK_UPDATE_STATUSES] }),
+      summary: { type: 'string', maxLength: CALLBACK_MAX_SUMMARY_CHARS, description: 'Concise handling summary.' },
+      source: { type: 'string', maxLength: CALLBACK_MAX_SOURCE_CHARS, description: 'Optional callback source guard (e.g. repo, webhook).' },
+      relatedTaskId: { type: 'string', maxLength: CALLBACK_MAX_RELATED_TASK_ID_CHARS, description: 'Optional related taskId (e.g. tsk_...).' },
+      metadata: { type: 'object', additionalProperties: true, description: `Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).` },
+    }, ['callbackId', 'status', 'summary']),
+    outputSchema: statusSchema,
+  },
+
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+    description: 'Start new supervised work or an authorized replacement. Active-task addenda must append and cannot mint an assignment.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Optional stable task id. Omit to let daemon generate one.'),
+      topLevelTaskId: stringSchema('Optional top-level task id. Defaults to taskId.'),
+      classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
+      role: { type: 'string', enum: ['coordinator', 'integration_owner', 'implementer', 'auditor'], description: 'Assignment role for the caller session.' },
+      objective: stringSchema('Short objective/title.'),
+      acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
+      scopeFiles: { description: 'Optional provenance paths; unusable values are ignored, never restrict edits, and are never an implementation ACL.' },
+      idempotencyKey: stringSchema('Retry key; replay returns the same taskId/assignmentId.'),
+    }, ['role', 'objective']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
+    description: 'Update the caller assignment; daemon lifecycle, revision, and audit gates remain authoritative.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      revision: stringSchema('Current/audit revision for stale-update rejection.'),
+      auditAttemptId: stringSchema('Matching audit attempt id, when updating audit state.'),
+      auditRevision: stringSchema('Matching audit revision.'),
+      verdict: stringSchema('Audit verdict when applicable.'),
+      blocker: stringSchema('Blocker reason when applicable.'),
+      externalRunId: stringSchema('External run id, e.g. CI run.'),
+      externalHeadSha: stringSchema('External run head SHA.'),
+      externalTaskId: stringSchema('External task/workflow id.'),
+    }, ['assignmentId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+    description: 'Finish only the caller assignment; prose evidence never finalizes an integration task.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Caller-bound assignment.'),
+      revision: stringSchema('Current revision.'),
+      evidence: stringSchema('Bounded legacy assignment evidence.'),
+    }, ['assignmentId', 'revision']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
+    description: 'Validate an exact audited integration before Git side effects; return its finalize token.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Integration owner assignment.'),
+      revision: stringSchema('Exact revision.'),
+      auditAttemptId: stringSchema('Exact audit attempt.'),
+      auditRevision: stringSchema('Exact audited revision.'),
+      verdict: { type: 'string', enum: ['PASS'] },
+      ownedFiles: { description: 'Optional attribution.' },
+      integrationManifest: { description: 'Optional attribution.' },
+      integrationOwner: stringSchema('Owner session.'),
+      pushRemoteRef: stringSchema('Destination remote ref.'),
+      stagedPaths: { description: 'Optional staged paths.' },
+      conflictedPaths: { description: 'Optional conflicts.' },
+      untrackedOtherOwnerPaths: { description: 'Optional foreign paths.' },
+      externalRunId: stringSchema('Exact CI run id.'),
+      externalHeadSha: stringSchema('Exact CI head SHA.', { pattern: '^[0-9a-f]{40}$' }),
+      externalTaskId: stringSchema('Exact CI task id.'),
+      ciResult: { type: 'string', enum: [...SUPERVISION_CI_SMOKE_STATUSES] },
+    }, SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS),
+    outputSchema: objectSchema({
+      status: stringSchema('Result.'),
+      preflightToken: stringSchema('Authority token.'),
+      refusals: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
+    description: 'Atomically finalize one exact audited integration. PASS plus exact Git/push evidence is the finalization authority; CI is optional descriptive smoke.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Caller-bound integration owner assignment.'),
+      revision: stringSchema('Exact combined revision.'),
+      auditAttemptId: stringSchema('Exact overall matching audit attempt.'),
+      auditRevision: stringSchema('Exact overall audited revision.'),
+      verdict: { type: 'string', enum: ['PASS'] },
+      ownedFiles: { description: 'Caller-reported attribution data; unusable values are ignored.' },
+      integrationManifest: { description: 'Caller-reported manifest data; unusable values are ignored.' },
+      integrationOwner: stringSchema('Canonical integration owner session.'),
+      preflightToken: stringSchema('Pre-Git authority token. Required for pushResult=pushed; an exact verified already_present backfill may omit it.', {
+        pattern: '^sha256:[a-f0-9]{64}$',
+      }),
+      commitSha: stringSchema('Exact pushed commit.', { pattern: '^[0-9a-f]{40}$' }),
+      pushResult: { type: 'string', enum: ['pushed', 'already_present'] },
+      pushRemoteRef: stringSchema('Exact pushed remote ref.'),
+      stagedPaths: { description: 'Caller-reported staged data; unusable values are ignored.' },
+      conflictedPaths: { description: 'Caller-reported conflict data; unusable values are ignored.' },
+      untrackedOtherOwnerPaths: { description: 'Caller-reported untracked data; unusable values are ignored.' },
+      externalRunId: stringSchema('Optional current-commit CI run id; required only when ciResult describes a queried run.'),
+      externalHeadSha: stringSchema('Optional queried CI run head SHA.', { pattern: '^[0-9a-f]{40}$' }),
+      externalTaskId: stringSchema('Optional external workflow id.'),
+      ciResult: {
+        type: 'string',
+        enum: [...SUPERVISION_CI_SMOKE_STATUSES],
+        description: 'Optional CI smoke state; every outcome including failure is descriptive and non-blocking.',
       },
-      reply: booleanSchema('Optional request for the target to reply to the runtime-bound caller session. Set true when you expect the target to respond or report back, such as audit/review requests or discussion invites; leave false for fire-and-forget notifications.'),
-      broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
-      idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
-      clone: {
-        ...objectSchema({
-          kind: { type: 'string', enum: [EXECUTION_CLONE_KIND], description: 'Must be the literal execution-clone kind discriminant.' },
-          ephemeral: booleanSchema('Must be true — managed execution clones are always ephemeral.'),
-          parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
-          parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
-        }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
-        description: 'Optional strict execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the resolved target template (never the target directly) and the result includes clone.target; broadcast is not allowed with clone.',
-      },
-    }, ['target', 'message']),
+      evidence: stringSchema('Bounded structured-finalization note.'),
+    }, SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
+    description: 'Record a caller-reported repository file event; new paths expand provenance without blocking, and no filesystem or Git scan is implied.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      filePath: stringSchema('Normalized repo-relative path.'),
+      operation: { type: 'string', enum: [...SUPERVISION_TASK_FILE_OPERATIONS], description: 'File operation.' },
+      beforeHash: stringSchema('Optional before content hash.'),
+      afterHash: stringSchema('Optional after content hash.'),
+      tool: stringSchema('Tool name, e.g. apply_patch/Edit/Write/shell.'),
+      source: stringSchema('Caller/tool source.'),
+      idempotencyKey: stringSchema('Retry key for duplicate caller-reported delivery.'),
+    }, ['assignmentId', 'filePath', 'operation']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_STOP,
-    description: 'Force-stop the active turn of a caller-project sibling session, using the exact target value returned by send_list_targets. Unlike send_message (which queues behind a busy session), this interrupts the session immediately: transport/SDK sessions cancel the in-flight turn on a priority lane, and terminal sessions receive an interrupt (ESC / Ctrl+C). Use it when a sibling is stuck or running the wrong work and a queued message will not reach it. The caller session is not a valid target. Queued user messages are preserved; only the currently active turn is interrupted.',
+    description: 'Stop an exact sibling active turn; queued messages remain and the caller is invalid.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session value. Required unless broadcast is true. For an ordinary peer, use the exact send_list_targets.target value. To stop an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may stop them. Always use the exact target name; never a label or agentType value.'),
       broadcast: booleanSchema('Optional project-scoped request to stop every sendable sibling session; unavailable for unscoped callers.'),
@@ -258,59 +1335,239 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: {
     name: MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
-    description: 'Destroy a dedicated execution-clone sub-session that you created via send_message with a clone request. Only the creator session may destroy its clone; the runtime resolves authorization. A replay after the clone is already gone returns target_not_found and never recreates it.',
+    description: 'Destroy an execution clone created by this session via send_message. Only its creator may destroy it; replay after removal returns target_not_found without recreating it.',
     inputSchema: objectSchema({
       target: stringSchema('Required exact execution-clone session name returned by the original clone send (result.clone.target).'),
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same destroy.'),
     }, ['target']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
+    name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; technical minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Task/execution supervision keepalive crons are fallback-only, never polling, default >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes (>=30m recommended for long tasks); intervals <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes require a non-empty shortIntervalReason.`,
+    inputSchema: objectSchema({
+      cronExpr: stringSchema(`Cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. For supervision/keepalive use >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes (>=30m recommended); intervals <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes require shortIntervalReason.`),
+      shortIntervalReason: stringSchema(`Required when cronExpr interval is <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes: explain why a shorter interval is genuinely needed instead of reactive wakeups or >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES}m.`),
+      message: stringSchema('Message delivered to the current session.'),
+      name: stringSchema('Optional job name; derived from message when omitted.'),
+      timezone: stringSchema('Optional cron timezone.'),
+      expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Lifecycle policy. recurring keeps the schedule after each occurrence; until_complete permits self-cancel only after the overall goal is complete.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+    }, ['cronExpr', 'message']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: {
+    name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+    description: 'Update current-session self-wakeup by id.',
+    inputSchema: objectSchema({
+      id: stringSchema('Current-session cron job id.'),
+      cronExpr: stringSchema(`Optional cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Updating to <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes requires shortIntervalReason; >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES}m (>=30m recommended) for supervision keepalive.`),
+      shortIntervalReason: stringSchema(`Required when updating cronExpr to <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes: explain why a shorter interval is genuinely needed instead of reactive wakeups or >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES}m.`),
+      message: stringSchema('Optional replacement message.'),
+      name: stringSchema('Optional replacement name.'),
+      timezone: stringSchema('Optional replacement timezone.'),
+      expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
+    }, ['id']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
+    name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+    description: 'Cancel self-wakeup; recurring needs force=true, while until_complete may self-cancel.',
+    inputSchema: objectSchema({
+      id: stringSchema('Exact job id; exclusive with name and all.'),
+      name: stringSchema('Unique exact job name; exclusive with id and all.'),
+      all: booleanSchema('Cancel all current-session jobs; exclusive with id and name.'),
+      force: booleanSchema('Required to delete recurring jobs. Use only when the user explicitly asked to remove the schedule.'),
+    }),
+    outputSchema: statusSchema,
+  },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
-    description: `Create a scheduled structured send job through the bound server. Use it for future reminders or delegated messages; caller identity and server binding are runtime-bound, actions must be structured sends, and the cron schedule must leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
+    description: `Schedule cross-session send; use cron_create_self for this session. Technical minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes; intervals <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes require shortIntervalReason.`,
     inputSchema: objectSchema({
-      name: stringSchema('Required human-readable scheduled job name.'),
-      cronExpr: stringSchema(`Required cron expression accepted by the cron service. The server rejects schedules whose next two runs are less than ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart, for example every-minute expressions such as "* * * * *".`),
-      projectName: stringSchema('Optional project name; when supplied it must equal the runtime-bound caller project.'),
-      targetRole: stringSchema('Optional source role for the scheduled job row when targetSessionName is omitted; defaults to the project brain session.'),
-      targetSessionName: stringSchema('Optional direct source session for the scheduled job row. For send actions, action.target is resolved as a sibling of this source session; the source cannot send to itself.'),
-      action: { type: 'object', description: 'Required structured send action with shape { type: "send", target, message, reply?, broadcast?, idempotencyKey? }. The target is resolved at execution time from the source session selected by targetSessionName or targetRole, so prefer an exact sibling session name from send_list_targets when available.', additionalProperties: true },
-      timezone: stringSchema('Optional cron timezone for schedule evaluation only. It does not change how expiresAt is parsed.'),
-      expiresAt: stringSchema(`Optional absolute expiration time as epoch milliseconds or an ISO timestamp with an explicit offset or Z suffix, no later than ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days from creation. Expiration prevents future dispatches after that instant; it does not retract messages already dispatched at or before the cutoff.`),
+      name: stringSchema('Job name.'),
+      cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes (intervals <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes require shortIntervalReason).`),
+      shortIntervalReason: stringSchema(`Required when cronExpr interval is <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes: explain why a shorter interval is genuinely needed instead of reactive wakeups or >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES}m.`),
+      projectName: stringSchema('Optional caller project.'),
+      targetRole: stringSchema('Optional source role; defaults to brain.'),
+      targetSessionName: stringSchema('Optional source session used to resolve the sibling target.'),
+      action: { type: 'object', description: 'Send action { type: "send", ... } with optional onlyWhenIdle; omitted defaults true for intervals <=15m.', additionalProperties: true },
+      timezone: stringSchema('Optional cron timezone.'),
+      expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy; defaults to recurring.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
     }, ['name', 'cronExpr', 'action']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_LIST,
-    description: 'List cron jobs visible to the bound user, server, and project. Use it to inspect scheduled work; limit is clamped to the shared maximum and results expose sanitized job fields.',
+    description: 'List scoped cron jobs.',
     inputSchema: objectSchema({
-      projectName: stringSchema('Optional project filter; when supplied it must equal the runtime-bound caller project.'),
-      limit: numberSchema(`Optional page size, clamped to ${MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }),
+      projectName: stringSchema('Optional caller-project filter.'),
+      limit: numberSchema(`Optional limit, up to ${MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }),
     }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
-    description: `Update an owned cron job through the bound server. Use it to change schedule fields or keep an MCP-created action as a structured send action; identity and server are runtime-bound, and replacement cron schedules must still leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
+    description: `Update cross-session cron; minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes (updating cronExpr to <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes requires shortIntervalReason).`,
     inputSchema: objectSchema({
-      id: stringSchema('Required cron job id to update.'),
-      name: stringSchema('Optional replacement human-readable scheduled job name.'),
-      cronExpr: stringSchema(`Optional replacement cron expression accepted by the cron service. The server rejects schedules whose next two runs are less than ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
-      projectName: stringSchema('Optional replacement project name; when supplied it must equal the runtime-bound caller project.'),
-      targetRole: stringSchema('Optional replacement source role stored on the scheduled job row when targetSessionName is omitted.'),
-      targetSessionName: stringSchema('Optional replacement direct source session stored on the scheduled job row. For send actions, action.target is resolved as a sibling of this source session.'),
-      action: { type: 'object', description: 'Optional structured send action replacement; non-send actions are not accepted for MCP writes. The send target is resolved from the scheduled source session selected by targetSessionName or targetRole.', additionalProperties: true },
-      timezone: stringSchema('Optional replacement cron timezone for schedule evaluation only. It does not change how expiresAt is parsed.'),
-      expiresAt: stringSchema(`Optional replacement absolute expiration time as epoch milliseconds or an ISO timestamp with an explicit offset or Z suffix, no later than ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days from update. Expiration prevents future dispatches after that instant; it does not retract already dispatched messages.`),
+      id: stringSchema('Job id.'),
+      name: stringSchema('Optional replacement name.'),
+      cronExpr: stringSchema(`Optional cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes (<${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes requires shortIntervalReason).`),
+      shortIntervalReason: stringSchema(`Required when updating cronExpr to <${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES} minutes: explain why a shorter interval is genuinely needed instead of reactive wakeups or >=${MEMORY_MCP_CAPS.CRON_AGENT_SHORT_INTERVAL_THRESHOLD_MINUTES}m.`),
+      projectName: stringSchema('Optional caller project.'),
+      targetRole: stringSchema('Optional source role.'),
+      targetSessionName: stringSchema('Optional source session used to resolve the sibling target.'),
+      action: { type: 'object', description: 'Optional send action; onlyWhenIdle skips busy recipients; omitted defaults true for intervals <=15m.', additionalProperties: true },
+      timezone: stringSchema('Optional replacement timezone.'),
+      expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
     }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
-    description: 'Delete an owned cron job by id through the bound server. Use it to cancel scheduled work; caller identity and server binding are runtime-bound.',
+    description: 'Delete cron by id; recurring jobs require force.',
     inputSchema: objectSchema({
-      id: stringSchema('Required cron job id to delete.'),
+      id: stringSchema('Job id.'),
+      force: booleanSchema('Required for agent deletion of a recurring job.'),
     }, ['id']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF, description: 'Pause a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF, description: 'Resume a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE, description: 'Pause a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME, description: 'Resume a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
+    name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+    description:
+      'Discover canonical controlled-node nodeIds or inspect advisory availability; do not call it as a preflight when an exact nodeId or ^^(nodeId) is known. Action routes check live state. FULL nodes only.',
+    inputSchema: objectSchema({
+      includeOffline: booleanSchema('Include offline and exec-disabled machines; default false. Presence is advisory.'),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      machines: {
+        type: 'array',
+        description: 'Controllable machines for the account.',
+        maxItems: MACHINE_LIST_MAX_ITEMS,
+        items: objectSchema({
+          name: stringSchema('Canonical controlled-node nodeId for machine tools and ^^(nodeId).', { minLength: CONTROLLED_NODE_ID_LENGTH, maxLength: CONTROLLED_NODE_ID_LENGTH, pattern: CONTROLLED_NODE_ID_PATTERN_SOURCE }),
+          displayName: stringSchema('Render-only display name (sanitized).'),
+          os: stringSchema('Canonical OS (win | mac | linux); advisory, absent if unknown.', { enum: [...ENROLLMENT_OSES] }),
+          online: booleanSchema('Advisory DB-heartbeat presence.'),
+          execEnabled: booleanSchema('Whether remote exec is enabled for this machine.'),
+          role: stringSchema('Node role; always "controlled" for controllable machines.', { enum: [NODE_ROLE.CONTROLLED] }),
+        }, ['name', 'online', 'execEnabled', 'role']),
+      },
+    }, ['status', 'machines']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
+    name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+    description:
+      'Run a shell/CLI command or executable (for example ipmitool.exe) on a controlled node in session 0/SYSTEM; such requests MUST use exec_remote, not GUI OCU. Use shell_session1 only for active-user semantics. Pass a canonical 10-digit nodeId or complete ^^(nodeId) without calling list_machines first; deprecated noncanonical legacy ref_name is migration-only. The command is private execution input: NEVER repeat or summarize its text in an assistant reply, delegation card, or dispatch claim; record only the task dispatch and bounded outcome facts. not_dispatched is retry-safe; dispatched_no_result may have run. FULL nodes only.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
+      shell: stringSchema(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`, { enum: [...REMOTE_EXEC_SHELLS] }),
+      timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`, { minimum: REMOTE_EXEC_MIN_TIMEOUT_MS, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
+    }, ['machine', 'command']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      outcome: stringSchema(`Discriminated outcome: ${REMOTE_EXEC_OUTCOMES.join(' | ')}.`, { enum: [...REMOTE_EXEC_OUTCOMES] }),
+      ok: booleanSchema('True when the process spawned and exited (any exit code) — inspect exitCode for command success; false on spawn error or timeout.'),
+      exitCode: { type: ['number', 'null'], description: 'Process exit code when the command ran; null on timeout/spawn failure.' },
+      stdout: stringSchema('Captured stdout (may be truncated).'),
+      stderr: stringSchema('Captured stderr (may be truncated).'),
+      timedOut: booleanSchema('True only for node_timeout.'),
+      truncated: booleanSchema('True when output hit the byte cap and was cut.'),
+      durationMs: numberSchema('Wall-clock duration in ms.', { minimum: 0 }),
+      error: stringSchema('Required non-empty detail for node_timeout/spawn_error; forbidden otherwise.', { minLength: 1 }),
+    }, ['status', 'outcome']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+    description: 'Direct→relay file send to a canonical 10-digit nodeId or ^^(nodeId), with deprecated noncanonical legacy ref_name compatibility only. Resolve without list_machines. Reports mode; Relay≤2GiB; unsafe/credential paths rejected.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      sourcePath: stringSchema(`Path ≤${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
+    }, ['machine', 'sourcePath']),
+    outputSchema: objectSchema({
+      status: stringSchema('', { enum: ['ok'] }),
+      machine: stringSchema(''),
+      remotePath: stringSchema(''),
+      attachmentId: stringSchema(''),
+      size: numberSchema('', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size', 'transport']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
+    name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+    description: 'Direct-then-relay file fetch from a canonical 10-digit nodeId or ^^(nodeId), without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. Reports mode; atomic commit; overwrite=false. FULL nodes only.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
+      destinationPath: stringSchema(`Explicit local destination path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
+      overwrite: booleanSchema('Replace an existing regular destination file; default false.'),
+    }, ['machine', 'sourcePath', 'destinationPath']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
+      machine: stringSchema('Resolved canonical nodeId or deprecated legacy ref_name.'),
+      destinationPath: stringSchema('Exact committed local destination path.'),
+      attachmentId: stringSchema('Relay attachment id or direct transfer id.'),
+      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('Actual mode.', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size', 'transport']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: {
+    name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+    description: 'Return one focused Computer Use documentation topic. FULL nodes only.',
+    inputSchema: objectSchema({
+      topic: stringSchema(`Documentation topic; one of ${COMPUTER_USE_DOC_TOPICS.join(', ')}.`, { enum: [...COMPUTER_USE_DOC_TOPICS] }),
+    }, ['topic']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      topic: stringSchema('Returned topic.', { enum: [...COMPUTER_USE_DOC_TOPICS] }),
+      text: stringSchema('Focused Computer Use guidance for this topic.'),
+    }, ['status', 'topic', 'text']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
+    name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    description: 'GUI/browser control. Do not use GUI OCU for a shell/CLI/executable request; use exec_remote or shell_session1 only for active-user semantics. A helper failure does not mean the machine is unauthorized or uncontrollable. Prefer browser_open/browser_snapshot. Pass canonical 10-digit nodeId or complete ^^(nodeId) marker without calling list_machines first; deprecated noncanonical legacy ref_name is compatibility-only. accessibility_tree read-only.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
+      arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`, additionalProperties: true },
+      timeoutMs: numberSchema(`Optional timeout in ms. GUI/browser methods allow [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]; shell_session1 allows [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS }),
+    }, ['machine', 'tool']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      outcome: stringSchema(`Discriminated outcome: ${COMPUTER_USE_OUTCOMES.join(' | ')}.`, { enum: [...COMPUTER_USE_OUTCOMES] }),
+      result: { type: 'object', description: 'Bounded Computer Use result content when the target method returned.', additionalProperties: true },
+    }, ['status', 'outcome']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: {
+    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    description: 'Run the unified Cloud Docs & ONLYOFFICE CLI (`imcodes cloud-docs`). Quick start: `["list"]`, `["list","--search","q"]`, `["read","<docId>"]`, `["docs"]`. Load full ONLYOFFICE DocBuilder/convert/upload/share manuals on demand via `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`. Mandatory in EVERY chat reply turn (turn 1, turn 2+, after rename/edit) and EVERY mention in a reply: cite `[CloudDoc: <name> | id=<docId>]` using latest name and `id=<docId>`; NEVER use bare filenames, `` `<name>` ``, `<name> (id=...)`, or `[<name>](/path)`. FULL-node only.',
+    inputSchema: objectSchema({
+      args: {
+        type: 'array',
+        description: 'Preferred CLI argv array (preserves Windows backslashes & spaces cleanly), e.g. ["list"] or ["builder","--type","docx","--name","Spec.docx","--script-file","C:\\work\\s.js"].',
+        items: { type: 'string' },
+      },
+      command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
+    }),
     outputSchema: statusSchema,
   },
 };
@@ -320,6 +1577,8 @@ export interface MemoryMcpErrorResult extends Record<string, unknown> {
   reason: MCPErrorReason;
   message?: string;
   recoverable: boolean;
+  retryAfterMs?: number;
+  retryAt?: number;
 }
 
 export interface MemoryMcpDisabledResult extends Record<string, unknown> {
@@ -330,12 +1589,14 @@ export interface MemoryMcpDisabledResult extends Record<string, unknown> {
   recoverable: true;
 }
 
-export function buildMcpErrorResult(reason: MCPErrorReason, message?: string): MemoryMcpErrorResult {
+export function buildMcpErrorResult(reason: MCPErrorReason, message?: string, details?: { retryAfterMs?: number; retryAt?: number }): MemoryMcpErrorResult {
   return {
     status: 'error',
     reason,
     ...(message ? { message } : {}),
     recoverable: isRecoverableMcpErrorReason(reason),
+    ...(details?.retryAfterMs !== undefined ? { retryAfterMs: details.retryAfterMs } : {}),
+    ...(details?.retryAt !== undefined ? { retryAt: details.retryAt } : {}),
   };
 }
 

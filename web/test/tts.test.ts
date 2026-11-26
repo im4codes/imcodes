@@ -1,0 +1,1219 @@
+/** @vitest-environment jsdom */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  nativePlatform: false,
+  pluginAvailable: false,
+  streamingPlugin: {} as Record<string, unknown>,
+  legacySpeech: {} as Record<string, unknown>,
+}));
+
+vi.mock('../src/native.js', () => ({
+  isNative: () => mocks.nativePlatform,
+}));
+
+vi.mock('@capacitor/core', () => ({
+  registerPlugin: () => mocks.streamingPlugin,
+}));
+
+vi.mock('@capgo/capacitor-speech-recognition', () => ({
+  SpeechRecognition: mocks.legacySpeech,
+}));
+
+class MockUtterance {
+  text: string;
+  lang = '';
+  rate = 1;
+  onend: (() => void) | null = null;
+  onerror: ((event: { error?: string }) => void) | null = null;
+  constructor(text: string) {
+    this.text = text;
+  }
+}
+
+describe('tts service', () => {
+  let spokenUtterances: MockUtterance[];
+  let cancelMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    localStorage.clear();
+    mocks.nativePlatform = false;
+    mocks.pluginAvailable = false;
+    mocks.streamingPlugin = {};
+    spokenUtterances = [];
+    cancelMock = vi.fn();
+    vi.stubGlobal('Capacitor', {
+      isNativePlatform: () => mocks.nativePlatform,
+      isPluginAvailable: () => mocks.pluginAvailable,
+    });
+    vi.stubGlobal('SpeechSynthesisUtterance', MockUtterance);
+    vi.stubGlobal('speechSynthesis', {
+      speak: vi.fn((u: MockUtterance) => {
+        spokenUtterances.push(u);
+      }),
+      cancel: cancelMock,
+    });
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const tts = await import('../src/tts.js');
+    await tts.__resetTtsForTests();
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it('cleans markdown prose while stripping fenced code blocks, urls, and hashes', async () => {
+    const { prepareTextForTts } = await import('../src/tts.js');
+    const input = [
+      '<!-- IMCODES_TASK STARTED tsk_1 -->',
+      '# Title Here',
+      '',
+      '> Quoted line with **bold** and `send_im_message` plus [Docs](https://example.com/a).',
+      '',
+      '```ts',
+      'const secret = 123;',
+      'console.log(secret);',
+      '```',
+      '',
+      'Commit e4d6e16e534fb232c02cae9a2f73db4b0de40fd7 at https://github.com/im4codes/imcodes is ready.',
+    ].join('\n');
+    const cleaned = prepareTextForTts(input);
+    expect(cleaned).not.toContain('const secret');
+    expect(cleaned).not.toContain('IMCODES_TASK');
+    expect(cleaned).not.toContain('https://');
+    expect(cleaned).not.toContain('e4d6e16e534fb232c02cae9a2f73db4b0de40fd7');
+    expect(cleaned).toContain('Title Here');
+    expect(cleaned).toContain('Quoted line with bold and send_im_message plus Docs.');
+    expect(cleaned).toContain('Commit at is ready.');
+
+    expect(prepareTextForTts('```js\nconst x = 1;\n```')).toBe('');
+    expect(prepareTextForTts('--- ***\n```\nunclosed code')).toBe('');
+  });
+
+  it('segments mixed Chinese/English text and bounds chunks by maxChunkChars', async () => {
+    const { segmentTextForTts } = await import('../src/tts.js');
+    const segments = segmentTextForTts('今天天气很好。 Everything is ready now! 日本語のテストです。', 'zh-CN');
+    expect(segments).toEqual([
+      { text: '今天天气很好。', lang: 'zh-CN' },
+      { text: 'Everything is ready now!', lang: 'en-US' },
+      { text: '日本語のテストです。', lang: 'ja-JP' },
+    ]);
+
+    const longSentence = `${'word '.repeat(60).trim()}, ${'tail '.repeat(60).trim()}.`;
+    const chunked = segmentTextForTts(longSentence, 'en-US', 120);
+    expect(chunked.length).toBeGreaterThan(2);
+    expect(chunked.every((seg) => seg.text.length <= 120 && seg.lang === 'en-US')).toBe(true);
+  });
+
+  it('persists and clamps auto-read and speech-rate preferences', async () => {
+    const {
+      getTtsAutoReadEnabled,
+      setTtsAutoReadEnabled,
+      getTtsSpeechRate,
+      setTtsSpeechRate,
+      subscribeTtsPreferences,
+      TTS_AUTO_READ_STORAGE_KEY,
+      TTS_SPEECH_RATE_STORAGE_KEY,
+    } = await import('../src/tts.js');
+
+    const listener = vi.fn();
+    const unsub = subscribeTtsPreferences(listener);
+    expect(getTtsAutoReadEnabled()).toBe(false);
+    expect(getTtsSpeechRate()).toBe(1.1);
+
+    setTtsAutoReadEnabled(true);
+    expect(getTtsAutoReadEnabled()).toBe(true);
+    expect(localStorage.getItem(TTS_AUTO_READ_STORAGE_KEY)).toBe('1');
+
+    setTtsSpeechRate(3.5);
+    expect(getTtsSpeechRate()).toBe(2);
+    expect(localStorage.getItem(TTS_SPEECH_RATE_STORAGE_KEY)).toBe('2');
+
+    setTtsSpeechRate(0.1);
+    expect(getTtsSpeechRate()).toBe(0.5);
+    expect(listener).toHaveBeenCalledTimes(3);
+    unsub();
+  });
+
+  it('speaks sequentially via Web speechSynthesis and stops cleanly', async () => {
+    const { speakText, stopSpeaking, getTtsState, subscribeTtsState } = await import('../src/tts.js');
+    const states: string[] = [];
+    const unsub = subscribeTtsState((s) => states.push(`${s.status}:${s.activeMessageId ?? ''}`));
+
+    const empty = await speakText('```ts\nconst onlyCode = true;\n```', { messageId: 'm0' });
+    expect(empty).toEqual({ started: false, reason: 'empty' });
+    expect(spokenUtterances).toHaveLength(0);
+
+    const res = await speakText('你好。 Hello world.', { messageId: 'm1', lang: 'zh-CN', rate: 1.25 });
+    expect(res).toEqual({ started: true });
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'm1', error: null });
+    expect(spokenUtterances).toHaveLength(1);
+    expect(spokenUtterances[0].lang).toBe('zh-CN');
+    expect(spokenUtterances[0].rate).toBe(1.25);
+
+    spokenUtterances[0].onend?.();
+    expect(spokenUtterances).toHaveLength(2);
+    expect(spokenUtterances[1].lang).toBe('en-US');
+
+    spokenUtterances[1].onend?.();
+    expect(getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+    expect(states).toEqual(['speaking:m1', 'idle:']);
+
+    await speakText('Another line', { messageId: 'm2' });
+    expect(getTtsState().status).toBe('speaking');
+    await stopSpeaking();
+    expect(cancelMock).toHaveBeenCalled();
+    expect(getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+    unsub();
+  });
+
+  it('prefers native StreamingSpeech TTS and falls back to Web speechSynthesis on old shells returning UNIMPLEMENTED', async () => {
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    let ttsListener: ((event: { status: string; message?: string }) => void) | null = null;
+    const nativeSpeak = vi.fn().mockResolvedValue(undefined);
+    const nativeStopSpeaking = vi.fn().mockResolvedValue(undefined);
+    mocks.streamingPlugin = {
+      speak: nativeSpeak,
+      stopSpeaking: nativeStopSpeaking,
+      addListener: vi.fn(async (_event: string, cb: (event: { status: string; message?: string }) => void) => {
+        ttsListener = cb;
+        return { remove: vi.fn().mockResolvedValue(undefined) };
+      }),
+    };
+
+    const { speakText, stopSpeaking, getTtsState } = await import('../src/tts.js');
+    const ok = await speakText('你好。 Hello.', { messageId: 'nat1', lang: 'zh-CN', rate: 1.5 });
+    expect(ok).toEqual({ started: true });
+    expect(nativeSpeak).toHaveBeenCalledTimes(1);
+    expect(nativeSpeak).toHaveBeenNthCalledWith(1, { text: '你好。', lang: 'zh-CN', rate: 1.5 });
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'nat1', error: null });
+
+    ttsListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(nativeSpeak).toHaveBeenCalledTimes(2));
+    expect(nativeSpeak).toHaveBeenNthCalledWith(2, { text: 'Hello.', lang: 'en-US', rate: 1.5 });
+    ttsListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(getTtsState().status).toBe('idle'));
+
+    // Old shell returning UNIMPLEMENTED falls back cleanly to Web speechSynthesis
+    nativeSpeak.mockRejectedValueOnce(Object.assign(new Error('not implemented'), { code: 'UNIMPLEMENTED' }));
+    const fallback = await speakText('Fallback text', { messageId: 'nat2' });
+    expect(fallback).toEqual({ started: true });
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['Fallback text']);
+
+    await stopSpeaking();
+    expect(nativeStopSpeaking).toHaveBeenCalled();
+    expect(getTtsState().status).toBe('idle');
+  });
+
+  it('surfaces real native TTS engine error cleanly without throwing', async () => {
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockRejectedValue(new Error('System TTS engine unavailable on this device')),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const { speakText, getTtsState } = await import('../src/tts.js');
+    const res = await speakText('Hello world', { messageId: 'err1' });
+    expect(res).toEqual({
+      started: false,
+      reason: 'error',
+      error: 'System TTS engine unavailable on this device',
+    });
+    expect(getTtsState()).toEqual({
+      status: 'idle',
+      activeMessageId: null,
+      error: 'System TTS engine unavailable on this device',
+    });
+  });
+
+  it('stops active native/web TTS when VoiceInput starts recording (pauseBackgroundAudio mutual exclusion)', async () => {
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    const nativeStopSpeaking = vi.fn().mockResolvedValue(undefined);
+    mocks.streamingPlugin = {
+      available: vi.fn().mockResolvedValue({ available: true }),
+      requestPermissions: vi.fn().mockResolvedValue({ speechRecognition: 'granted' }),
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+      addListener: vi.fn().mockResolvedValue({ remove: vi.fn().mockResolvedValue(undefined) }),
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: nativeStopSpeaking,
+    };
+
+    const tts = await import('../src/tts.js');
+    await tts.speakText('Reading aloud right now', { messageId: 'm-asr' });
+    expect(tts.isTtsSpeaking()).toBe(true);
+
+    const { startListening, stopListening } = await import('../src/components/VoiceInput.js');
+    const started = await startListening(() => {});
+    expect(started).toBe(true);
+    expect(cancelMock).toHaveBeenCalled();
+    expect(nativeStopSpeaking).toHaveBeenCalled();
+    expect(tts.isTtsSpeaking()).toBe(false);
+    await stopListening();
+  });
+
+  it('uses 1.1 default rate and compatible rate options while keeping legacy saved values valid', async () => {
+    const tts = await import('../src/tts.js');
+    expect(tts.TTS_DEFAULT_RATE).toBe(1.1);
+    expect(tts.TTS_RATE_OPTIONS).toEqual([0.9, 1.0, 1.1, 1.25, 1.5]);
+    expect(tts.getTtsSpeechRate()).toBe(1.1);
+
+    localStorage.setItem(tts.TTS_SPEECH_RATE_STORAGE_KEY, '0.8');
+    expect(tts.getTtsSpeechRate()).toBe(0.8);
+  });
+
+  it('folds file paths, filenames, file:// links, technical IDs, and SHAs while preserving normal words', async () => {
+    const { prepareTextForTts, segmentTextForTts } = await import('../src/tts.js');
+
+    expect(
+      prepareTextForTts('修改了 `web/src/tts.ts`、`web/src/styles.css` 和 `ChatView.tsx:4989-4998`。', 'zh-CN'),
+    ).toBe('修改了 相关文件。');
+
+    expect(
+      prepareTextForTts('Updated [tts.ts](file:///Users/k/repo/web/src/tts.ts#L10-L20) in `C:\\src\\app.tsx`.', 'en-US'),
+    ).toBe('Updated file in file.');
+
+    // Adjacent placeholders with `and` collapse into one
+    expect(
+      prepareTextForTts('Updated `web/src/tts.ts` and `web/src/styles.css` today.', 'en-US'),
+    ).toBe('Updated file today.');
+
+    // Pure file lists are skipped; inline prose keeps non-file lines
+    expect(
+      prepareTextForTts('构建已通过。\n- `web/src/tts.ts`\n- `web/src/styles.css`\n- `a8cc27b4b59b90a20560f1160d817f7d3e73914f`', 'zh-CN'),
+    ).toBe('构建已通过。');
+
+    expect(
+      prepareTextForTts('- `web/src/tts.ts`\n- `web/src/styles.css`\ntsk_6b8d2c468d (2315aa88f)', 'zh-CN'),
+    ).toBe('');
+
+    // Preserve technical product names, slashes in prose, normal words (including hex-letter words), and numbers
+    expect(
+      prepareTextForTts('iOS/Android 和 Node.js 与 React API 在 2026 年升级 #6794，defaced 不会误删。', 'zh-CN'),
+    ).toBe('iOS/Android 和 Node.js 与 React API 在 2026 年升级 6794，defaced 不会误删。');
+
+    // Empty parens after stripping IDs & natural operator replacements
+    expect(
+      prepareTextForTts('任务完成 (tsk_6b8d2c468d)，流程 A -> B => C::D && E || F', 'zh-CN'),
+    ).toBe('任务完成，流程 A, B, C D, E, F');
+
+    // Localized placeholders across remaining 5 locales
+    expect(prepareTextForTts('更新了 src/a.ts', 'zh-TW')).toBe('更新了 相關文件');
+    expect(prepareTextForTts('修正しました src/a.ts', 'ja-JP')).toBe('修正しました 関連ファイル');
+    expect(prepareTextForTts('수정됨 src/a.ts', 'ko-KR')).toBe('수정됨 관련 파일');
+    expect(prepareTextForTts('Actualizado src/a.ts', 'es-ES')).toBe('Actualizado archivo');
+    expect(prepareTextForTts('Обновлено src/a.ts', 'ru-RU')).toBe('Обновлено файл');
+
+    // Multi-line unpunctuated prose inserts natural pause punctuation when merging
+    const zhSegs = segmentTextForTts('第一项已完成\n第二项正在测试', 'zh-CN');
+    expect(zhSegs).toEqual([{ text: '第一项已完成。 第二项正在测试', lang: 'zh-CN' }]);
+    const enSegs = segmentTextForTts('First item finished\nSecond item running', 'en-US');
+    expect(enSegs).toEqual([{ text: 'First item finished. Second item running', lang: 'en-US' }]);
+  });
+
+  it('queries native TTS voice quality safely on native platforms and returns null on web', async () => {
+    {
+      const tts = await import('../src/tts.js');
+      expect(await tts.getNativeTtsVoiceQuality('zh-CN')).toBeNull();
+    }
+
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      getTtsVoiceQuality: vi.fn().mockResolvedValue({
+        quality: 'enhanced',
+        language: 'zh-CN',
+        voiceName: 'Tingting (Enhanced)',
+        voiceIdentifier: 'com.apple.voice.enhanced.zh-CN.Tingting',
+      }),
+    };
+    const nativeTts = await import('../src/tts.js');
+    expect(await nativeTts.getNativeTtsVoiceQuality('zh-CN')).toEqual({
+      quality: 'enhanced',
+      language: 'zh-CN',
+      voiceName: 'Tingting (Enhanced)',
+      voiceIdentifier: 'com.apple.voice.enhanced.zh-CN.Tingting',
+    });
+
+    const backend = await import('../src/voice-recognition-backend.js');
+    expect(backend.isSiriNativeVoiceIdentifier('com.apple.ttsbundle.siri_yu-shu_zh-CN_compact')).toBe(true);
+    expect(backend.isSiriNativeVoiceIdentifier('com.apple.voice.compact.zh-CN.Tingting')).toBe(false);
+    expect(backend.isHighQualityNativeTtsVoice({ quality: 'premium', language: 'zh-CN' })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({ quality: 'enhanced', language: 'zh-CN' })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceIdentifier: 'com.apple.ttsbundle.siri_yu-shu_zh-CN_compact',
+    })).toBe(true);
+    expect(backend.isHighQualityNativeTtsVoice({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceIdentifier: 'com.apple.voice.compact.zh-CN.Tingting',
+    })).toBe(false);
+  });
+
+  it('checks and opens native TTS settings safely with fallback on web, old shells, and UNIMPLEMENTED', async () => {
+    {
+      const tts = await import('../src/tts.js');
+      expect(tts.canOpenNativeTtsSettings()).toBe(false);
+      expect(await tts.openNativeTtsSettings()).toBe(false);
+    }
+
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+    };
+    {
+      const oldShellTts = await import('../src/tts.js');
+      expect(oldShellTts.canOpenNativeTtsSettings()).toBe(false);
+      expect(await oldShellTts.openNativeTtsSettings()).toBe(false);
+    }
+
+    vi.resetModules();
+    const openSpy = vi.fn()
+      .mockResolvedValueOnce({ opened: true })
+      .mockResolvedValueOnce({ opened: false })
+      .mockRejectedValueOnce({ code: 'UNIMPLEMENTED', message: 'not implemented' });
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      openTtsSettings: openSpy,
+    };
+    const nativeTts = await import('../src/tts.js');
+    expect(nativeTts.canOpenNativeTtsSettings()).toBe(true);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(true);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(false);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(false);
+    expect(openSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('queues auto-read items FIFO on web/native, caps queue size, and clears on manual interrupt or stop', async () => {
+    const {
+      speakText,
+      stopSpeaking,
+      getTtsState,
+      getTtsQueueLength,
+      setTtsAutoReadEnabled,
+      TTS_MAX_QUEUE_SIZE,
+    } = await import('../src/tts.js');
+
+    // 1. Web FIFO queue
+    const r1 = await speakText('First notice.', { messageId: 'q1', queue: true });
+    const r2 = await speakText('Second notice.', { messageId: 'q2', queue: true });
+    const r3 = await speakText('Third notice.', { messageId: 'q3', queue: true });
+    expect(r1).toEqual({ started: true });
+    expect(r2).toEqual({ started: true, queued: true });
+    expect(r3).toEqual({ started: true, queued: true });
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.']);
+    expect(getTtsQueueLength()).toBe(2);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q1', error: null });
+
+    spokenUtterances[0].onend?.();
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.', 'Second notice.']);
+    expect(getTtsQueueLength()).toBe(1);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q2', error: null });
+
+    spokenUtterances[1].onend?.();
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.', 'Second notice.', 'Third notice.']);
+    expect(getTtsQueueLength()).toBe(0);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q3', error: null });
+
+    spokenUtterances[2].onend?.();
+    expect(getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+
+    // 2. Bounded FIFO cap preserves bursts above 6 items (up to TTS_MAX_QUEUE_SIZE) and only drops oldest overflow past the cap
+    expect(TTS_MAX_QUEUE_SIZE).toBeGreaterThanOrEqual(64);
+    await speakText('Active item.', { messageId: 'cap-0', queue: true });
+    for (let i = 1; i <= TTS_MAX_QUEUE_SIZE + 3; i++) {
+      await speakText(`Queued ${i}.`, { messageId: `cap-${i}`, queue: true });
+    }
+    expect(getTtsQueueLength()).toBe(TTS_MAX_QUEUE_SIZE);
+    spokenUtterances[3].onend?.();
+    // Oldest kept item after cap-0 should be Queued 4 (dropped 1, 2, 3)
+    expect(spokenUtterances[4].text).toBe('Queued 4.');
+
+    // 3. Manual non-queued speakText interrupts active item AND clears queue
+    await speakText('Manual read now.', { messageId: 'manual-1' });
+    expect(getTtsQueueLength()).toBe(0);
+    expect(getTtsState().activeMessageId).toBe('manual-1');
+    expect(spokenUtterances.at(-1)?.text).toBe('Manual read now.');
+
+    // 4. setTtsAutoReadEnabled(false) and stopSpeaking() clear queue cleanly
+    await speakText('Queued before disable.', { messageId: 'q-dis', queue: true });
+    expect(getTtsQueueLength()).toBe(1);
+    setTtsAutoReadEnabled(false);
+    expect(getTtsQueueLength()).toBe(0);
+    await stopSpeaking();
+    expect(getTtsState().status).toBe('idle');
+
+    // 5. Native queue draining via stopped events
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    let nativeListener: ((event: { status: string; message?: string }) => void) | null = null;
+    const nativeSpeak = vi.fn().mockResolvedValue(undefined);
+    mocks.streamingPlugin = {
+      speak: nativeSpeak,
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      addListener: vi.fn(async (_event: string, cb: (event: { status: string; message?: string }) => void) => {
+        nativeListener = cb;
+        return { remove: vi.fn().mockResolvedValue(undefined) };
+      }),
+    };
+    const nativeTts = await import('../src/tts.js');
+    await nativeTts.speakText('Native first.', { messageId: 'nq1', queue: true });
+    await nativeTts.speakText('Native second.', { messageId: 'nq2', queue: true });
+    expect(nativeSpeak).toHaveBeenCalledTimes(1);
+    expect(nativeTts.getTtsQueueLength()).toBe(1);
+    nativeListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(nativeSpeak).toHaveBeenCalledTimes(2));
+    expect(nativeSpeak).toHaveBeenNthCalledWith(2, { text: 'Native second.', lang: 'en-US', rate: 1.1 });
+    nativeListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(nativeTts.getTtsState().status).toBe('idle'));
+  });
+});
+
+describe('server TTS playback', () => {
+  const realFetch = globalThis.fetch;
+  const realCreateObjectURL = URL.createObjectURL;
+  const realRevokeObjectURL = URL.revokeObjectURL;
+
+  beforeEach(async () => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const tts = await import('../src/tts.js');
+    await tts.__resetTtsForTests();
+    globalThis.fetch = realFetch;
+    URL.createObjectURL = realCreateObjectURL;
+    URL.revokeObjectURL = realRevokeObjectURL;
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it('plays segments sequentially with prefetch and revokes every blob URL on completion', async () => {
+    const createdUrls: string[] = [];
+    const revokedUrls: string[] = [];
+    let urlCounter = 0;
+    URL.createObjectURL = vi.fn(() => {
+      const url = `blob:mock/${++urlCounter}`;
+      createdUrls.push(url);
+      return url;
+    });
+    URL.revokeObjectURL = vi.fn((url: string) => {
+      revokedUrls.push(url);
+    });
+
+    interface MockAudioInstance {
+      src: string;
+      onended: (() => void) | null;
+      onerror: (() => void) | null;
+      play: ReturnType<typeof vi.fn>;
+      pause: ReturnType<typeof vi.fn>;
+    }
+    const audioInstances: MockAudioInstance[] = [];
+    class MockAudio {
+      src: string;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {});
+      pause = vi.fn();
+      constructor(src = '') {
+        this.src = src;
+        audioInstances.push(this);
+      }
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const fetchMock = vi.fn(async () => new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 }));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.setTtsMode('server');
+    const res = await tts.speakText('第一句中文。 Second sentence in English.', { messageId: 'srv-1', rate: 1.25 });
+    expect(res).toEqual({ started: true });
+    expect(tts.getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'srv-1', error: null });
+
+    // Segment 1 is played and segment 2 is prefetched
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(audioInstances).toHaveLength(1);
+    expect(audioInstances[0]!.src).toBe('blob:mock/1');
+
+    // Finish segment 1 -> revokes blob 1 and starts segment 2
+    audioInstances[0]!.onended?.();
+    await vi.waitFor(() => expect(audioInstances).toHaveLength(2));
+    expect(revokedUrls).toContain('blob:mock/1');
+    expect(audioInstances[1]!.src).toBe('blob:mock/2');
+
+    // Finish segment 2 -> revokes blob 2 and returns to idle
+    audioInstances[1]!.onended?.();
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+    expect(revokedUrls).toEqual(['blob:mock/1', 'blob:mock/2']);
+    expect(createdUrls).toEqual(['blob:mock/1', 'blob:mock/2']);
+  });
+
+  it('aborts active HTTP request on stopSpeaking() mid-fetch and cleans up playback', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/unused');
+    URL.revokeObjectURL = vi.fn();
+    vi.stubGlobal('Audio', class { play = vi.fn(async () => {}); pause = vi.fn(); });
+
+    let capturedSignal: AbortSignal | undefined;
+    globalThis.fetch = vi.fn((_url, init) => {
+      capturedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        capturedSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.setTtsMode('server');
+    const speakPromise = tts.speakText('Cancel while fetching.', { messageId: 'srv-abort' });
+    await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+    await tts.stopSpeaking();
+
+    const result = await speakPromise;
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(result).toEqual({ started: false, reason: 'superseded' });
+    expect(tts.getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('syncs server config without breaking when offline or unauthenticated', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      mode: 'server',
+      baseUrl: 'http://127.0.0.1:8880/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-a...wxyz',
+      model: 'kokoro',
+      voice: 'af_sky',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    const cfg = await tts.syncTtsConfigFromServer();
+    expect(cfg?.mode).toBe('server');
+    expect(tts.getTtsMode()).toBe('server');
+    expect(tts.isServerTtsConfigured()).toBe(true);
+  });
+
+  it('defaults to server when configured without explicit system choice, preserves explicit system override, and fetches voices', async () => {
+    const serverCfg = {
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'nova',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    };
+
+    // Unconfigured falls back to system
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      ...serverCfg,
+      mode: 'system',
+      serverDefaultConfigured: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+    let tts = await import('../src/tts.js');
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('system');
+
+    // Legacy non-explicit localStorage 'system' upgrades to 'server' once serverDefaultConfigured=true
+    vi.resetModules();
+    tts = await import('../src/tts.js');
+    globalThis.fetch = vi.fn(async (url) => {
+      if (String(url).includes('/voices')) {
+        return new Response(JSON.stringify({
+          voices: [{ id: 'nova', name: 'Nova' }, { id: 'alloy', name: 'Alloy' }],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify(serverCfg), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('server');
+
+    const voicesRes = await tts.fetchServerTtsVoices();
+    expect(voicesRes?.source).toBe('upstream');
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['nova', 'alloy']);
+
+    // Explicit user 'system' choice is NOT overwritten by subsequent syncTtsConfigFromServer()
+    tts.setTtsMode('system');
+    expect(tts.getTtsMode()).toBe('system');
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('system');
+  });
+
+  it('auto-resolves per-segment voices from /api/tts/voices + voicesByLang and degrades cleanly when /voices fails', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/lang');
+    URL.revokeObjectURL = vi.fn();
+    class MockAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {
+        queueMicrotask(() => this.onended?.());
+      });
+      pause = vi.fn();
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const speechBodies: Array<{ input: string; voice?: string; lang?: string }> = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      const u = String(url);
+      if (u.includes('/voices')) {
+        return new Response(JSON.stringify({
+          voices: [
+            { id: 'zh-CN-XiaoxiaoNeural', locale: 'zh-CN' },
+            { id: 'en-US-AriaNeural', locale: 'en-US' },
+            { id: 'ja-JP-NanamiNeural', locale: 'ja-JP' },
+            { id: 'es-ES-ElviraNeural', locale: 'es-ES' },
+          ],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      speechBodies.push(JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string });
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: { ja: 'ja-JP-KeitaNeural' },
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+
+    const res = await tts.speakText('中文一句。 English line! 日本語テスト。 Привет.', {
+      messageId: 'multi-lang',
+      lang: 'zh-CN',
+    });
+    expect(res).toEqual({ started: true });
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+
+    expect(speechBodies).toEqual([
+      { input: '中文一句。', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'zh-CN' },
+      { input: 'English line!', speed: 1.1, voice: 'en-US-AriaNeural', lang: 'en-US' },
+      { input: '日本語テスト。', speed: 1.1, voice: 'ja-JP-KeitaNeural', lang: 'ja-JP' },
+      { input: 'Привет.', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'ru-RU' },
+    ]);
+
+    // When /voices fails on a truly fresh uncached session, fallbackVoice still plays without blocking
+    localStorage.clear();
+    vi.resetModules();
+    const ttsFallback = await import('../src/tts.js');
+    const fallbackBodies: Array<{ input: string; voice?: string; lang?: string }> = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      if (String(url).includes('/voices')) {
+        return new Response('unavailable', { status: 503 });
+      }
+      fallbackBodies.push(JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string });
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    ttsFallback.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    const res2 = await ttsFallback.speakText('Hello world!', { messageId: 'fb-1', lang: 'en-US' });
+    expect(res2).toEqual({ started: true });
+    await vi.waitFor(() => expect(ttsFallback.getTtsState().status).toBe('idle'));
+    expect(fallbackBodies).toEqual([
+      { input: 'Hello world!', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'en-US' },
+    ]);
+  });
+
+  it('persists upstream voices in localStorage across reloads, coalesces concurrent fetches, invalidates on baseUrl change, and keeps upstream cache over transient preset fallbacks', async () => {
+    let voicesCalls = 0;
+    let resolveDelayedFetch!: (res: Response) => void;
+    globalThis.fetch = vi.fn((url) => {
+      if (String(url).includes('/voices')) {
+        voicesCalls += 1;
+        if (voicesCalls === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveDelayedFetch = resolve;
+          });
+        }
+        if (String(url).includes('refresh=1')) {
+          return Promise.resolve(new Response(JSON.stringify({
+            voices: [{ id: 'alloy', name: 'alloy' }],
+            source: 'preset',
+            endpointConfigured: true,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts-a.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+
+    // Concurrent calls share one in-flight fetch
+    const p1 = tts.fetchServerTtsVoices();
+    const p2 = tts.fetchServerTtsVoices();
+    await vi.waitFor(() => expect(voicesCalls).toBe(1));
+    resolveDelayedFetch(new Response(JSON.stringify({
+      voices: [
+        { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao', locale: 'zh-CN' },
+        { id: 'en-US-AriaNeural', name: 'Aria', locale: 'en-US' },
+      ],
+      source: 'upstream',
+      endpointConfigured: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(r2?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeTruthy();
+
+    // Reloading module hydrates persisted upstream list synchronously before any fetch
+    vi.resetModules();
+    const reloaded = await import('../src/tts.js');
+    const hydrated = reloaded.getCachedServerTtsVoices();
+    expect(hydrated?.source).toBe('upstream');
+    expect(hydrated?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+
+    // Transient preset fallback on forced refresh does NOT wipe persisted upstream voices
+    const forced = await reloaded.fetchServerTtsVoices({ forceRefresh: true });
+    expect(forced?.source).toBe('upstream');
+    expect(forced?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+
+    // Changing baseUrl invalidates cached voices cleanly
+    reloaded.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts-b.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(reloaded.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(reloaded.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+  });
+
+  it('invalidates memory, inFlight, and localStorage voice cache on apiKeyMasked / apiKeyFingerprint change for the same baseUrl', async () => {
+    let resolveKeyAFetch!: (res: Response) => void;
+    let fetchCount = 0;
+    globalThis.fetch = vi.fn((url) => {
+      if (String(url).includes('/voices')) {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return Promise.resolve(new Response(JSON.stringify({
+            voices: [{ id: 'voice-key-a', name: 'Key A Voice', locale: 'en-US' }],
+            source: 'upstream',
+            endpointConfigured: true,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        if (fetchCount === 2) {
+          return new Promise<Response>((resolve) => {
+            resolveKeyAFetch = resolve;
+          });
+        }
+        return Promise.resolve(new Response(JSON.stringify({
+          voices: [{ id: 'voice-key-b', name: 'Key B Voice', locale: 'en-US' }],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-a...1111',
+      apiKeyFingerprint: 'fp-alpha',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+
+    await tts.fetchServerTtsVoices();
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-a']);
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeTruthy();
+
+    // Rotate API key on the EXACT SAME baseUrl (different apiKeyMasked) -> immediate invalidation
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-b...2222',
+      apiKeyFingerprint: 'fp-beta',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(tts.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+
+    // Start an in-flight fetch under key B, then rotate to key C (same '****' mask, different fingerprint) mid-flight
+    const staleInFlight = tts.fetchServerTtsVoices();
+    await vi.waitFor(() => expect(fetchCount).toBe(2));
+
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: true,
+      apiKeyMasked: 'sk-b...2222',
+      apiKeyFingerprint: 'fp-gamma',
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(tts.getCachedServerTtsVoices()).toBeNull();
+
+    // A fresh fetch under key C must NOT share key B's abandoned inFlight promise
+    const keyCPromise = tts.fetchServerTtsVoices();
+    expect(keyCPromise).not.toBe(staleInFlight);
+    await vi.waitFor(() => expect(fetchCount).toBe(3));
+    const keyCRes = await keyCPromise;
+    expect(keyCRes?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+
+    // Resolving the abandoned key B fetch late MUST NOT overwrite key C's cache or localStorage
+    resolveKeyAFetch(new Response(JSON.stringify({
+      voices: [{ id: 'stale-key-a-poison', name: 'Stale' }],
+      source: 'upstream',
+      endpointConfigured: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await staleInFlight;
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+
+    // Cold reload with stale persisted cache from key C, then sync returns key D -> clears localStorage too
+    vi.resetModules();
+    const reloaded = await import('../src/tts.js');
+    expect(reloaded.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['voice-key-b']);
+    reloaded.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://shared-tts.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      apiKeyFingerprint: null,
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(reloaded.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(reloaded.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+  });
+
+  it('previewServerTtsVoice chooses language-matched sample text and aborts active preview on rapid switch', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/preview');
+    URL.revokeObjectURL = vi.fn();
+    class MockAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {
+        queueMicrotask(() => this.onended?.());
+      });
+      pause = vi.fn();
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const speechRequests: Array<{ input: string; voice?: string; lang?: string; speed?: number }> = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      speechRequests.push(JSON.parse(String(init?.body ?? '{}')));
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    const sampleJa = tts.resolveTtsPreviewSample({
+      voice: 'ja-JP-NanamiNeural',
+      availableVoices: [{ id: 'ja-JP-NanamiNeural', locale: 'ja-JP' }],
+    });
+    expect(sampleJa).toEqual({ langKey: 'ja', text: tts.TTS_PREVIEW_SAMPLE_TEXT.ja });
+
+    const res = await tts.previewServerTtsVoice({
+      voice: 'zh-CN-YunxiNeural',
+      rate: 1.25,
+      previewId: 'preview-yunxi',
+    });
+    expect(res).toEqual({ started: true });
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+    expect(speechRequests[0]).toEqual({
+      input: tts.TTS_PREVIEW_SAMPLE_TEXT['zh-CN'],
+      speed: 1.25,
+      voice: 'zh-CN-YunxiNeural',
+      lang: 'zh-CN',
+    });
+  });
+
+  it('chunkSegmentsForServerTts fast-starts chunk 0 <= 80 chars, packs remaining <= 220, preserves lang tags, and splits long unpunctuated clauses', async () => {
+    const tts = await import('../src/tts.js');
+
+    // Short <= 80 single sentence stays 1 chunk with zero split overhead
+    expect(tts.chunkSegmentsForServerTts([{ text: '你好，这是一条很短的语音测试消息。', lang: 'zh-CN' }])).toEqual([
+      { text: '你好，这是一条很短的语音测试消息。', lang: 'zh-CN' },
+    ]);
+
+    // Multi-sentence 500+ char mixed Chinese & English keeps chunk 0 <= 80 and subsequent <= 220 without losing characters
+    const longZh =
+      '这是第一句很短的开场白。'
+      + '第二句用来验证长段落分段后的后续分块打包长度上限与并发预取调度表现，同时包含足够多的汉字来保证整体分块超过两百二十字阈值。'
+      + '第三句继续补充更多细节信息确保总字数超过五百字并且仍然严格遵循二百二十字的分块预算，让后端合成和前端播放都更稳定。'
+      + '第四句讨论前端在收到第一段音频后立刻开始播放同时向后并发预取两段的设计思路，从而大幅降低长文本的等待延迟。'
+      + '第五句验证中文标点后面没有空格时也能精准切分句子而不会整段卡在一个请求里等待很久，尤其适合连续输出的技术回答。'
+      + '第六句检查超过三百字长文本在各种边界情况下依然能平稳顺畅地连续播报不卡顿，并且不会打断前后相邻的语言片段。'
+      + '第七句作为收尾确认所有分段文本完整无缺且语言标签维持不变。';
+    const longEn =
+      'First English sentence stays fast and concise while testing bilingual segment transitions. '
+      + 'Second English sentence checks decimal numbers like 3.14 and software version v1.2.3 do not break unexpectedly during segmentation. '
+      + 'Third English sentence pushes total length well past two hundred twenty characters so it must split cleanly into multiple chunks.';
+
+    const baseSegments = tts.segmentTextForTts(`${longZh}\n${longEn}`, 'zh-CN');
+    expect(baseSegments[0]!.text.length).toBeGreaterThan(280);
+
+    const serverChunks = tts.chunkSegmentsForServerTts(baseSegments);
+    expect(serverChunks.length).toBeGreaterThan(4);
+    expect(serverChunks[0]!.text).toBe('这是第一句很短的开场白。');
+    expect(serverChunks[0]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_FIRST_CHUNK_MAX_CHARS);
+    expect(serverChunks[0]!.lang).toBe('zh-CN');
+    for (let i = 1; i < serverChunks.length; i++) {
+      expect(serverChunks[i]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_CHUNK_MAX_CHARS);
+      expect(serverChunks[i]!.text.length).toBeGreaterThan(0);
+    }
+    const enChunks = serverChunks.filter((c) => c.lang === 'en-US');
+    expect(enChunks.length).toBeGreaterThanOrEqual(2);
+    expect(enChunks.some((c) => c.text.includes('3.14') && c.text.includes('v1.2.3'))).toBe(true);
+
+    // Single 300+ char sentence without period punctuation splits chunk 0 <= 80 on comma/space
+    const commaOnly300 = Array.from({ length: 22 }, (_, idx) => `第${idx + 1}个逗号分隔从句内容较长`).join('，');
+    expect(commaOnly300.length).toBeGreaterThan(300);
+    const clauseChunks = tts.chunkSegmentsForServerTts([{ text: commaOnly300, lang: 'zh-CN' }]);
+    expect(clauseChunks[0]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_FIRST_CHUNK_MAX_CHARS);
+    for (let i = 1; i < clauseChunks.length; i++) {
+      expect(clauseChunks[i]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_CHUNK_MAX_CHARS);
+    }
+    expect(clauseChunks.map((c) => c.text).join('')).toBe(commaOnly300);
+  });
+
+  it('speakText in server mode plays chunk 0 immediately, prefetches 2 chunks ahead concurrently, preserves voicesByLang, and aborts cleanly on stopSpeaking()', async () => {
+    let urlCounter = 0;
+    URL.createObjectURL = vi.fn(() => `blob:mock/stream-${++urlCounter}`);
+    URL.revokeObjectURL = vi.fn();
+
+    const audioInstances: Array<{ src: string; onended: (() => void) | null; onerror: (() => void) | null; pause: ReturnType<typeof vi.fn> }> = [];
+    class ControlledAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      pause = vi.fn();
+      play = vi.fn(async () => {});
+      constructor() {
+        audioInstances.push(this);
+      }
+    }
+    vi.stubGlobal('Audio', ControlledAudio);
+
+    const requests: Array<{ input: string; voice?: string; lang?: string; signal?: AbortSignal; resolve: (res: Response) => void }> = [];
+    globalThis.fetch = vi.fn((url, init) => {
+      const u = String(url);
+      if (u.includes('/voices')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          voices: [
+            { id: 'zh-CN-XiaoxiaoNeural', locale: 'zh-CN' },
+            { id: 'en-US-AriaNeural', locale: 'en-US' },
+          ],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string };
+      return new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal ?? undefined;
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        requests.push({ ...parsed, signal, resolve });
+      });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: { en: 'en-US-JennyNeural' },
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    await tts.fetchServerTtsVoices();
+
+    const longMixed =
+      '这是快速起播的第一句。'
+      + '第二句用来测试较长中文分块容量上限超过一百三十字后的拆分行为，'
+      + '所以这里补充更多自然语言描述确保单句长度达到一百四十字左右，'
+      + '这样它无法与下一段超长句子合并到同一个两百二十字符的请求分块中，'
+      + '从而保证系统会顺畅拆成多个中文语音块并验证多路并发预取调度效果，同时避免单次合成请求耗时过长影响首段衔接体验。'
+      + '第三句同样保持在一百四十字左右的长度范围之内，'
+      + '进一步说明当前端收到首句音频流之后会立刻开始播放，'
+      + '同时在后台并发预取后续两段语音内容避免播放衔接之间产生任何可感知的停顿延迟，确保用户在长篇回复下依然能获得接近实时流式的听觉反馈效果。'
+      + ' Fourth sentence switches cleanly to English for voice override validation.';
+
+    const speakPromise = tts.speakText(longMixed, { messageId: 'fast-stream-1' });
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]!.input).toBe('这是快速起播的第一句。');
+    expect(requests[0]!.voice).toBe('zh-CN-XiaoxiaoNeural');
+    expect(requests[0]!.lang).toBe('zh-CN');
+
+    // Resolve ONLY chunk 0 -> Audio.play() starts immediately and prefetches chunk 1 & chunk 2 concurrently (2 ahead)
+    requests[0]!.resolve(new Response(new Blob(['a0'], { type: 'audio/mpeg' }), { status: 200 }));
+    const res = await speakPromise;
+    expect(res).toEqual({ started: true });
+    expect(audioInstances).toHaveLength(1);
+    await vi.waitFor(() => expect(requests).toHaveLength(3));
+    expect(requests[1]!.lang).toBe('zh-CN');
+    expect(requests[2]!.lang).toBe('zh-CN');
+
+    // Finish chunk 0 after chunk 1 resolves -> chunk 1 plays and lookahead triggers remaining chunk 3 (with en-US Jenny override)
+    requests[1]!.resolve(new Response(new Blob(['a1'], { type: 'audio/mpeg' }), { status: 200 }));
+    await Promise.resolve();
+    audioInstances[0]!.onended?.();
+    await vi.waitFor(() => expect(audioInstances).toHaveLength(2));
+    await vi.waitFor(() => expect(requests.length).toBeGreaterThanOrEqual(4));
+    const englishReq = requests.find((r) => r.lang === 'en-US');
+    expect(englishReq?.voice).toBe('en-US-JennyNeural');
+
+    // Calling stopSpeaking() mid-stream aborts all remaining in-flight prefetches cleanly without unhandled rejections
+    const pendingSignals = requests.slice(2).map((r) => r.signal);
+    await tts.stopSpeaking();
+    expect(pendingSignals.every((s) => s?.aborted === true)).toBe(true);
+    expect(tts.getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+  });
+
+  it('stops active playback and suppresses new speakText calls until voice capture suppression clears', async () => {
+    const synth = { speak: vi.fn(), cancel: vi.fn() };
+    vi.stubGlobal('speechSynthesis', synth);
+    vi.stubGlobal('SpeechSynthesisUtterance', class {
+      text: string;
+      lang = '';
+      rate = 1;
+      onend: (() => void) | null = null;
+      onerror: ((ev: unknown) => void) | null = null;
+      constructor(text: string) { this.text = text; }
+    });
+
+    const tts = await import('../src/tts.js');
+    expect(tts.isTtsVoiceCaptureActive()).toBe(false);
+
+    const first = await tts.speakText('Initial playback', { messageId: 'm1', lang: 'en-US' });
+    expect(first).toEqual({ started: true });
+    expect(tts.getTtsState().status).toBe('speaking');
+
+    // Queue another item while speaking, then activate voice capture suppression.
+    const queued = await tts.speakText('Queued follow-up', { messageId: 'm2', lang: 'en-US', queue: true });
+    expect(queued).toEqual({ started: true, queued: true });
+    expect(tts.getTtsQueueLength()).toBe(1);
+
+    tts.setTtsVoiceCaptureActive(true);
+    expect(tts.isTtsVoiceCaptureActive()).toBe(true);
+    expect(tts.getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+    expect(tts.getTtsQueueLength()).toBe(0);
+    expect(synth.cancel).toHaveBeenCalled();
+
+    // New speakText calls while voice recognition is active return reason='suppressed' without queuing/playing.
+    synth.speak.mockClear();
+    const blocked = await tts.speakText('New message during dictation', { messageId: 'm3', lang: 'en-US', queue: true });
+    expect(blocked).toEqual({ started: false, reason: 'suppressed' });
+    expect(synth.speak).not.toHaveBeenCalled();
+    expect(tts.getTtsQueueLength()).toBe(0);
+
+    // Releasing suppression restores normal TTS playback.
+    tts.setTtsVoiceCaptureActive(false);
+    expect(tts.isTtsVoiceCaptureActive()).toBe(false);
+    const resumed = await tts.speakText('After voice recognition ends', { messageId: 'm4', lang: 'en-US' });
+    expect(resumed).toEqual({ started: true });
+    expect(synth.speak).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an in-flight server TTS synthesis if voice capture starts mid-fetch', async () => {
+    let fetchSignal: AbortSignal | undefined;
+    let resolveFetch!: (res: Response) => void;
+    globalThis.fetch = vi.fn((url, init) => {
+      if (String(url).includes('/voices')) {
+        return Promise.resolve(new Response(JSON.stringify({ voices: [], source: 'preset', endpointConfigured: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      fetchSignal = init?.signal;
+      return new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+
+    const speakPromise = tts.speakText('Async server speech', { messageId: 'srv-1', lang: 'en-US' });
+    await vi.waitFor(() => expect(fetchSignal).toBeDefined());
+
+    tts.setTtsVoiceCaptureActive(true);
+    expect(fetchSignal?.aborted).toBe(true);
+    resolveFetch(new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 }));
+
+    const result = await speakPromise;
+    expect(result.started).toBe(false);
+    expect(tts.getTtsState().status).toBe('idle');
+  });
+});

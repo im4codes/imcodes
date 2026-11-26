@@ -1,4 +1,4 @@
-import { homedir } from 'node:os';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { dirname, join } from 'node:path';
 import { mkdirSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -26,9 +26,10 @@ import { serializeContextNamespace, serializeContextTarget } from '../context/co
 import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
 import { computeFingerprint, normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
-import { countTokens } from '../context/tokenizer.js';
+import { countTokensFallback } from '../context/tokenizer.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
+import { assertMemoryDaemonEnabled, isMemoryDaemonEnabled } from './memory-daemon-switch.js';
 import { mergeSourceIds } from './source-id-merge.js';
 import { computeProjectionContentHash, projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import {
@@ -61,13 +62,32 @@ import {
 } from '../../shared/memory-observation.js';
 import { isMemoryOrigin, requireExplicitMemoryOrigin, type MemoryOrigin } from '../../shared/memory-origin.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import {
+  USAGE_ANALYTICS_SCHEMA_VERSION,
+  USAGE_FACT_STATUSES,
+  USAGE_SYNC_STATUSES,
+  computeTotalTokens,
+  createCanonicalUsagePayloadHash,
+  normalizeCostUsdMicros,
+  type UsageFact,
+  type UsageFactStatus,
+  type UsageMetadataCompleteness,
+  type UsagePrivacySafeDiagnostics,
+  type UsageSessionKind,
+  type UsageSyncStatus,
+} from '../../shared/usage-analytics.js';
+import {
+  CODEX_CREDIT_HISTORY_DEFAULT_LIMIT,
+  CODEX_CREDIT_HISTORY_MAX_LIMIT,
+  type CodexCreditSnapshot,
+} from '../../shared/codex-credit-history.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'shared-agent-context.sqlite');
+function defaultDbPath(): string { return join(resolveImcodesHome(), 'shared-agent-context.sqlite'); }
 const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 
 let db: DatabaseSyncInstance | null = null;
@@ -76,6 +96,39 @@ let stagedReconciledForPath: string | null = null;
 let materializationRepairRanForPath: string | null = null;
 let archiveBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 let archiveBackfillScheduledForPath: string | null = null;
+// Panel requests can arrive in a burst (stats, records and projects in the
+// same render, followed by a refresh). Keep a very short-lived per-filter
+// snapshot so repeated reads do not rescan a large historical table while
+// background maintenance is yielding. Writes naturally invalidate this via
+// the database path reset; the sub-second TTL bounds staleness for callers
+// that share a long-lived worker connection.
+const PANEL_READ_CACHE_TTL_MS = 250;
+const panelReadCache = new Map<string, { expiresAt: number; value: unknown }>();
+const PROCESSED_NOISE_BACKFILL_CURSOR_KEY = 'processed_noise_backfill_rowid';
+
+function panelCacheKey(kind: string, filters: unknown): string {
+  return `${kind}:${JSON.stringify(filters ?? {})}`;
+}
+
+function panelCacheGet<T>(kind: string, filters: unknown): T | undefined {
+  const key = panelCacheKey(kind, filters);
+  const entry = panelReadCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    panelReadCache.delete(key);
+    return undefined;
+  }
+  return entry.value as T;
+}
+
+function panelCacheSet(kind: string, filters: unknown, value: unknown): void {
+  if (panelReadCache.size >= 128) panelReadCache.clear();
+  panelReadCache.set(panelCacheKey(kind, filters), { expiresAt: Date.now() + PANEL_READ_CACHE_TTL_MS, value });
+}
+
+function clearPanelReadCache(): void {
+  panelReadCache.clear();
+}
 // Whether THIS module instance may schedule the archive-backfill timer. Default
 // enabled so tests, the CLI, and the context-store worker run it. The daemon
 // MAIN thread disables it once it spawns the context-store worker, so the
@@ -89,10 +142,11 @@ import {
   isArchiveBackfillSchedulingEnabled,
   resetArchiveBackfillSchedulingForTests,
 } from './archive-backfill-scheduling.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 export { setArchiveBackfillSchedulingEnabled } from './archive-backfill-scheduling.js';
 
 function getDbPath(): string {
-  return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || DEFAULT_DB_PATH;
+  return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || defaultDbPath();
 }
 
 
@@ -107,6 +161,9 @@ export const CONTEXT_META_SENTINELS = [
   'migration_namespace_observation_backfilled',
   'last_observation_repair_at',
   'migration_namespace_filter_columns_backfilled',
+  'usage_authority_id',
+  'memory_noise_purge_rowid',
+  'staged_reconcile_rowid',
 ] as const;
 
 export function tryAlter(database: DatabaseSyncInstance, sql: string): boolean {
@@ -210,6 +267,46 @@ function appendNamespaceFilterSql(
   }
 }
 
+/**
+ * Legacy databases gained `is_noise` with a NOT NULL DEFAULT 0, so a row that
+ * has not yet passed the resumable semantic backfill is indistinguishable from
+ * a confirmed non-noise row at the SQL level. Until the cursor reaches the end
+ * of the table, fence panel reads to the portion that has actually been
+ * classified. This prevents request-failure/noise rows from becoming visible
+ * (or inflating aggregates) during the backfill window. New databases mark the
+ * fence complete while empty; new writes compute `is_noise` synchronously and
+ * are therefore immediately visible. The fence is shared by all panel query
+ * paths so a future aggregate cannot accidentally bypass it.
+ */
+function appendProcessedNoiseVisibilitySql(
+  database: DatabaseSyncInstance,
+  conditions: string[],
+  params: (string | number)[],
+): void {
+  conditions.push('is_noise = 0');
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') === '1') return;
+  const cursor = Number(internalGetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY) ?? 0) || 0;
+  conditions.push('rowid <= ?');
+  params.push(cursor);
+}
+
+/** Keep the SQL candidate set bounded without requiring the whole query to be
+ * contiguous.  The final token-aware matcher still decides exact/trigram
+ * semantics; SQL only needs to admit rows containing at least one token. */
+function appendTextSearchSql(
+  conditions: string[],
+  params: (string | number)[],
+  normalizedQuery: string,
+): void {
+  const tokens = normalizedQuery.split(/\s+/).map((token) => token.trim()).filter(Boolean).slice(0, 16);
+  if (tokens.length === 0) return;
+  conditions.push(`(${tokens.map(() => '(summary LIKE ? OR content_json LIKE ?)').join(' OR ')})`);
+  for (const token of tokens) {
+    const pattern = `%${token}%`;
+    params.push(pattern, pattern);
+  }
+}
+
 function hasFilterValue(value: string | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -244,13 +341,16 @@ function backfillNamespaceFilterColumnsForTable(
   database: DatabaseSyncInstance,
   table: 'context_staged_events' | 'context_dirty_targets' | 'context_jobs' | 'context_processed_local',
   idColumn: 'id' | 'target_key',
+  limit = 256,
 ): number {
+  const cursorKey = `namespace_filter_cursor_${table}`;
+  const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0) || 0;
   const rows = database.prepare(`
-    SELECT ${idColumn} AS row_id, namespace_key
+    SELECT rowid, ${idColumn} AS row_id, namespace_key
     FROM ${table}
-    WHERE scope IS NULL
-       OR scope = ''
-  `).all() as Array<{ row_id: string; namespace_key: string }>;
+    WHERE rowid > ? AND (scope IS NULL OR scope = '')
+    ORDER BY rowid ASC LIMIT ?
+  `).all(cursor, limit) as Array<{ rowid: number; row_id: string; namespace_key: string }>;
   if (rows.length === 0) return 0;
   const update = database.prepare(`
     UPDATE ${table}
@@ -267,17 +367,18 @@ function backfillNamespaceFilterColumnsForTable(
     const result = update.run(...values, String(row.row_id)) as { changes?: number };
     updated += result.changes ?? 0;
   }
+  internalSetContextMeta(database, cursorKey, String(rows[rows.length - 1]!.rowid));
   return updated;
 }
 
-function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance): void {
+function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance, limit = 256): void {
   try {
-    database.exec('BEGIN IMMEDIATE');
+    database.exec('BEGIN');
     const updated =
-      backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id');
+      backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id', limit);
     if (updated > 0) {
       internalSetContextMeta(database, 'migration_namespace_filter_columns_backfilled', String(Date.now()));
     }
@@ -291,9 +392,25 @@ function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance): vo
   }
 }
 
+/** Advance normalized namespace columns without making startup proportional to
+ * the historical row count. */
+export function backfillNamespaceFilterColumnsBatch(limit = 256): void {
+  backfillNamespaceFilterColumnsForDb(ensureDb(), Math.max(1, Math.min(1000, Math.floor(limit))));
+}
+
+function initializeProcessedNoiseBackfillState(database: DatabaseSyncInstance): void {
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') !== undefined) return;
+  // A newly-created empty table has no legacy rows to classify. Marking it
+  // complete keeps normal test/CLI writes visible immediately; existing stores
+  // retain the conservative rowid fence until idle maintenance classifies them.
+  const row = database.prepare('SELECT 1 AS present FROM context_processed_local LIMIT 1').get() as { present?: number } | undefined;
+  if (!row) internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
+}
+
 function ensureDb(): DatabaseSyncInstance {
   const dbPath = getDbPath();
   if (db && currentDbPath === dbPath) return db;
+  assertNotRealImcodesPathInTests(dbPath, 'shared-agent-context.sqlite');
   mkdirSync(dirname(dbPath), { recursive: true });
   db = new DatabaseSync(dbPath);
   currentDbPath = dbPath;
@@ -379,6 +496,9 @@ function ensureDb(): DatabaseSyncInstance {
       hit_count INTEGER NOT NULL DEFAULT 0,
       last_used_at INTEGER,
       status TEXT NOT NULL DEFAULT 'active',
+      -- Computed once from the summary at write time.  Panel aggregates can
+      -- exclude legacy/noise rows in SQL without reparsing every summary.
+      is_noise INTEGER NOT NULL DEFAULT 0,
       -- Normalized feature-extraction embedding of the summary, encoded as
       -- little-endian Float32 bytes. NULL when the model was unavailable at
       -- write time; recall lazy-fills these on first read.
@@ -429,6 +549,21 @@ function ensureDb(): DatabaseSyncInstance {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_pinned_namespace ON context_pinned_notes(namespace_key);
+
+    -- ref → id map for the compact memory handles injected into agent context.
+    -- Durable so a handle still resolves after a daemon restart. Replaces a
+    -- whole-file JSON rewrite per registration whose failures were swallowed —
+    -- a full disk silently stopped persisting handles entirely.
+    CREATE TABLE IF NOT EXISTS memory_short_refs (
+      ref TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      id TEXT NOT NULL,
+      namespace_key TEXT NOT NULL DEFAULT '',
+      namespace_json TEXT,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY (ref, kind, id, namespace_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_short_refs_seen ON memory_short_refs(last_seen_at);
 
     CREATE TABLE IF NOT EXISTS context_replication_state (
       namespace_key TEXT PRIMARY KEY,
@@ -570,6 +705,60 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_turn_usage(session_name, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_model_created
       ON context_turn_usage(agent_type, model, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS context_turn_usage_sync (
+      turn_usage_rowid      INTEGER PRIMARY KEY REFERENCES context_turn_usage(id) ON DELETE CASCADE,
+      usage_authority_id    TEXT    NOT NULL,
+      usage_fact_id         TEXT    NOT NULL,
+      payload_hash          TEXT    NOT NULL,
+      sync_status           TEXT    NOT NULL,
+      retry_count           INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at_ms    INTEGER,
+      last_attempt_at_ms    INTEGER,
+      synced_at_ms          INTEGER,
+      last_error_reason     TEXT,
+      terminal_reason       TEXT,
+      metadata_completeness TEXT    NOT NULL,
+      created_at_ms         INTEGER NOT NULL,
+      updated_at_ms         INTEGER NOT NULL,
+      CHECK (sync_status IN (
+        'pending',
+        'retryable_failed',
+        'in_flight',
+        'accepted',
+        'duplicate',
+        'conflict_terminal',
+        'invalid_terminal',
+        'too_old_terminal',
+        'clock_skew_terminal',
+        'local_pruned_unsynced'
+      )),
+      CHECK (metadata_completeness IN ('complete', 'partial'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_usage_sync_fact
+      ON context_turn_usage_sync(usage_authority_id, usage_fact_id);
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_attempt
+      ON context_turn_usage_sync(sync_status, next_attempt_at_ms, created_at_ms);
+
+    -- Codex account-level pay-as-you-go usage credit balance, snapshotted
+    -- every time a real (non-cached) account/rateLimits/read refresh
+    -- happens (src/agent/codex-runtime-config.ts). Account-level, not
+    -- per-session -- one row per refresh, not per session. Distinct from the
+    -- rate-limit "reset credits" (shared/codex-reset-credits.ts), which are
+    -- never persisted (they're a live-fetched, on-demand action list).
+    CREATE TABLE IF NOT EXISTS codex_credit_snapshots (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      captured_at            INTEGER NOT NULL,
+      account_id             TEXT,
+      plan_type              TEXT,
+      balance                TEXT    NOT NULL,
+      has_credits            INTEGER NOT NULL,
+      unlimited              INTEGER NOT NULL,
+      five_hour_left_percent REAL,
+      weekly_left_percent    REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_codex_credit_snapshots_captured
+      ON codex_credit_snapshots(captured_at DESC);
   `);
   // Round-2 audit (0699ea64-3e6 finding A1): every daemon restart re-emits
   // historical `usage.update` events from JSONL replay (gemini-watcher's
@@ -578,6 +767,11 @@ function ensureDb(): DatabaseSyncInstance {
   // every restart. Partial index excludes legacy rows (event_id IS NULL) so
   // the migration is idempotent on existing databases.
   tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN event_id TEXT');
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN provider TEXT');
+  tryAlter(db, "ALTER TABLE context_turn_usage ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'main'");
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN parent_session_name TEXT');
+  tryAlter(db, "ALTER TABLE context_turn_usage ADD COLUMN metadata_completeness TEXT NOT NULL DEFAULT 'partial'");
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN cost_usd_micros INTEGER');
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_usage_event ON context_turn_usage(session_name, event_id) WHERE event_id IS NOT NULL'
   );
@@ -590,6 +784,7 @@ function ensureDb(): DatabaseSyncInstance {
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN summary_fingerprint TEXT');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN content_hash TEXT');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN origin TEXT');
+  tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN is_noise INTEGER NOT NULL DEFAULT 0');
   for (const table of ['context_staged_events', 'context_dirty_targets', 'context_jobs', 'context_processed_local']) {
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN scope TEXT`);
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN enterprise_id TEXT`);
@@ -597,6 +792,7 @@ function ensureDb(): DatabaseSyncInstance {
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN user_id TEXT`);
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN project_id TEXT`);
   }
+  initializeProcessedNoiseBackfillState(db);
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_proj_fp ON context_processed_local(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL');
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_scope_project
@@ -605,6 +801,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_processed_local(scope, user_id, project_id, status, class, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_project
       ON context_processed_local(project_id, status, class, updated_at DESC);
+    -- Created/advanced by the idle maintenance pass on large existing stores;
+    -- keeping this out of synchronous warmup avoids a first-start index scan.
     CREATE INDEX IF NOT EXISTS idx_context_staged_events_scope_project
       ON context_staged_events(scope, project_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_staged_events_scope_owner_project
@@ -650,15 +848,99 @@ function ensureDb(): DatabaseSyncInstance {
   }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
-    purgeMemoryNoiseProjections(db);
+    // Keep worker warmup bounded. Remaining legacy noise is removed by the
+    // worker's idle maintenance pass using the persisted rowid cursor.
+    purgeMemoryNoiseProjectionsBatchForDb(db);
     stagedReconciledForPath = dbPath;
   }
   if (materializationRepairRanForPath !== dbPath) {
-    repairMaterializationStateForDb(db, { now: Date.now() });
+    // Startup repair must not scan every historical projection before the
+    // worker can answer interactive RPCs.  A bounded pass is resumed by the
+    // normal idle maintenance loop; explicit repair callers retain the full
+    // sweep behavior by omitting this option.
+    repairMaterializationStateForDb(db, { now: Date.now(), pollutedScanLimit: 256, dirtyReferenceScanLimit: 256 });
     materializationRepairRanForPath = dbPath;
+  }
+  // A brand-new store has nothing to scan, so its summary-lookup indexes are
+  // created here for free; an existing (large) store gets them from the
+  // cursor-driven maintenance step instead of paying the build at startup.
+  if (!db.prepare('SELECT 1 FROM context_processed_local LIMIT 1').get()) {
+    for (const ddl of SUMMARY_LOOKUP_INDEX_DDL) db.exec(ddl);
   }
   scheduleArchiveBackfillIfNeeded(db, dbPath);
   return db;
+}
+
+/** Expressions the summary-lookup indexes are built on. The lookup queries MUST
+ * spell them identically or SQLite cannot use the index. */
+const SESSION_NAME_EXPR = "json_extract(content_json, '$.sessionName')";
+const TARGET_KIND_EXPR = "json_extract(content_json, '$.targetKind')";
+const PROCESSED_SESSION_SUMMARY_INDEX = 'idx_context_processed_local_session_summary';
+const PROCESSED_TARGET_KIND_SUMMARY_INDEX = 'idx_context_processed_local_target_kind_summary';
+const SUMMARY_LOOKUP_INDEX_DDL = [
+  `CREATE INDEX IF NOT EXISTS ${PROCESSED_SESSION_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${SESSION_NAME_EXPR}, updated_at DESC, status)`,
+  `CREATE INDEX IF NOT EXISTS ${PROCESSED_TARGET_KIND_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${TARGET_KIND_EXPR}, updated_at DESC, status)`,
+] as const;
+const NOT_ARCHIVED_SQL = "status NOT IN ('archived', 'archived_dedup')";
+
+/**
+ * Build optional maintenance indexes outside the synchronous warmup path.
+ * The worker invokes this only from its idle maintenance tick, after it has
+ * already announced readiness; a first start therefore cannot consume the
+ * RPC warmup budget while SQLite scans a large table.
+ */
+export function ensureContextStoreMaintenanceIndexes(): { created: number; done: boolean } {
+  const database = ensureDb();
+  const indexes = [
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel ON context_processed_local(scope, enterprise_id, workspace_id, user_id, project_id, status, is_noise, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_project_panel ON context_processed_local(project_id, status, is_noise, class, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel_owner ON context_processed_local(scope, user_id, status, is_noise, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel_owner_project ON context_processed_local(scope, user_id, status, is_noise, project_id, class, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created ON context_jobs(target_key, job_type, status, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated ON context_jobs(target_key, job_type, status, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated ON context_jobs(status, job_type, updated_at)',
+    'CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_created ON context_turn_usage_sync(sync_status, created_at_ms)',
+    // Per-target latest-summary lookups (run on every live event) and the 15 s
+    // master-summary sweep resolve through these expression indexes instead of
+    // json-parsing every summary row of a namespace. `class` leads so the
+    // un-namespaced GROUP BY sweep reads one contiguous, already-ordered range.
+    ...SUMMARY_LOOKUP_INDEX_DDL,
+  ];
+  const cursorKey = 'maintenance_indexes_cursor';
+  const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0);
+  const index = Math.max(0, Math.min(indexes.length, Math.trunc(cursor)));
+  if (index >= indexes.length) return { created: 0, done: true };
+  database.exec(indexes[index]!);
+  internalSetContextMeta(database, cursorKey, String(index + 1));
+  return { created: 1, done: index + 1 >= indexes.length };
+}
+
+/** Compute the noise bit once for legacy rows.  This is intentionally a small
+ * cursor pass: it runs from idle maintenance and never makes ensureDb/query
+ * latency proportional to the size of a historical store. */
+export function backfillProcessedNoiseBatch(limit = 256): { processed: number; done: boolean } {
+  const database = ensureDb();
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') === '1') {
+    return { processed: 0, done: true };
+  }
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const cursor = Number(internalGetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY) ?? 0) || 0;
+  const rows = database.prepare(`
+    SELECT rowid, summary FROM context_processed_local
+    WHERE rowid > ? ORDER BY rowid ASC LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; summary: string }>;
+  if (rows.length === 0) {
+    internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
+    clearPanelReadCache();
+    return { processed: 0, done: true };
+  }
+  const update = database.prepare('UPDATE context_processed_local SET is_noise = ? WHERE rowid = ?');
+  for (const row of rows) update.run(isMemoryNoiseSummary(row.summary) ? 1 : 0, row.rowid);
+  internalSetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY, String(rows[rows.length - 1]!.rowid));
+  const done = rows.length < safeLimit;
+  if (done) internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
+  clearPanelReadCache();
+  return { processed: rows.length, done };
 }
 
 function decodeTarget(row: Record<string, unknown>, namespace: ContextNamespace): ContextTargetRef {
@@ -1011,7 +1293,10 @@ function projectionContentHash(summary: string, content: unknown): string {
   return computeProjectionContentHash({ summary, content });
 }
 
-const ARCHIVE_BACKFILL_BATCH_SIZE = 1000;
+// Keep each low-lane migration slice below the interactive read budget. A
+// 1000-row synchronous transaction was enough to hold the worker for hundreds
+// of milliseconds on a large store, defeating priority scheduling.
+const ARCHIVE_BACKFILL_BATCH_SIZE = 32;
 const ARCHIVE_BACKFILL_CURSOR_KEY = 'migration_archive_backfill_cursor';
 
 type ArchiveBackfillCursor = { updatedAt: number; id: string };
@@ -1298,14 +1583,65 @@ function removeProjectionIdsFromReplicationState(database: DatabaseSyncInstance,
   }
 }
 
-function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
-  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
+const MEMORY_NOISE_PURGE_BATCH_SIZE = 256;
+const MEMORY_NOISE_PURGE_CURSOR_KEY = 'memory_noise_purge_rowid';
+
+interface NoisePurgeBatchResult {
+  deleted: number;
+  done: boolean;
+  nextCursor: number;
+}
+
+/**
+ * Remove legacy request-failure projections without loading the whole summary
+ * column into memory.  This is deliberately cursor-bounded: the old startup
+ * sweep selected every summary (hundreds of MB on a long-lived daemon), so a
+ * worker respawn repeatedly spent >5s in SQLite/JS and timed out all callers.
+ */
+function purgeMemoryNoiseProjectionsBatchForDb(
+  database: DatabaseSyncInstance,
+  limit = MEMORY_NOISE_PURGE_BATCH_SIZE,
+  persistCursor = true,
+  cursorOverride?: number,
+): NoisePurgeBatchResult {
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const cursorRaw = persistCursor ? internalGetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY) : undefined;
+  const cursor = cursorOverride ?? (cursorRaw && Number.isSafeInteger(Number(cursorRaw)) ? Number(cursorRaw) : 0);
+  const rows = database.prepare(`
+    SELECT rowid, id, summary
+    FROM context_processed_local
+    WHERE rowid > ?
+    ORDER BY rowid ASC
+    LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; id: string; summary: string }>;
+  const nextCursor = rows.length > 0 ? Number(rows[rows.length - 1].rowid) : cursor;
+  if (persistCursor && nextCursor !== cursor) {
+    internalSetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY, String(nextCursor));
+  }
+  const done = rows.length < safeLimit;
+
   const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
-  if (badIds.length === 0) return 0;
+  if (badIds.length === 0) return { deleted: 0, done, nextCursor };
   const placeholders = badIds.map(() => '?').join(', ');
   database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
   removeProjectionIdsFromReplicationState(database, badIds);
-  return badIds.length;
+  return { deleted: badIds.length, done, nextCursor };
+}
+
+function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
+  let deleted = 0;
+  let cursor = 0;
+  for (;;) {
+    const batch = purgeMemoryNoiseProjectionsBatchForDb(database, 1000, false, cursor);
+    deleted += batch.deleted;
+    cursor = batch.nextCursor;
+    if (batch.done) return deleted;
+  }
+}
+
+/** One bounded cleanup pass for the worker's idle maintenance loop. */
+export function purgeMemoryNoiseProjectionsBatch(limit = MEMORY_NOISE_PURGE_BATCH_SIZE): number {
+  return purgeMemoryNoiseProjectionsBatchForDb(ensureDb(), limit).deleted;
 }
 
 export function removeMemoryNoiseProjections(): number {
@@ -1320,6 +1656,10 @@ export interface MaterializationRepairOptions {
   failedJobsRetainPerTarget?: number;
   /** Never retain failed materialization jobs older than this window, except for the newest retained rows. */
   failedJobRetentionMs?: number;
+  /** Limit startup's polluted-projection scan; omitted means an unbounded repair pass. */
+  pollutedScanLimit?: number;
+  /** Limit startup's dirty-target reference scan; omitted means an unbounded repair pass. */
+  dirtyReferenceScanLimit?: number;
 }
 
 export interface MaterializationRepairStats {
@@ -1363,10 +1703,20 @@ function repairMaterializationStateForDb(
   database: DatabaseSyncInstance,
   options: MaterializationRepairOptions = {},
 ): MaterializationRepairStats {
+  // Repair mutates projection status/job visibility.  Invalidate the bounded
+  // panel/search snapshot before doing any work so callers cannot observe a
+  // pre-repair active row after it has been archived.
+  clearPanelReadCache();
   const now = options.now ?? Date.now();
   const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_JOB_MS;
   const failedJobsRetainPerTarget = Math.max(0, options.failedJobsRetainPerTarget ?? DEFAULT_FAILED_JOB_RETAIN_PER_TARGET);
   const failedJobRetentionMs = Math.max(0, options.failedJobRetentionMs ?? DEFAULT_FAILED_JOB_RETENTION_MS);
+  const pollutedScanLimit = options.pollutedScanLimit === undefined
+    ? undefined
+    : Math.max(1, Math.min(1000, Math.floor(options.pollutedScanLimit)));
+  const dirtyReferenceScanLimit = options.dirtyReferenceScanLimit === undefined
+    ? undefined
+    : Math.max(1, Math.min(1000, Math.floor(options.dirtyReferenceScanLimit)));
 
   const staleCutoff = now - staleRunningMs;
   const staleRunningResult = database.prepare(`
@@ -1384,7 +1734,8 @@ function repairMaterializationStateForDb(
     FROM context_dirty_targets d
     LEFT JOIN context_jobs j ON j.id = d.pending_job_id
     WHERE d.pending_job_id IS NOT NULL
-  `).all() as Array<{ target_key: string; pending_job_id: string | null; status: string | null }>;
+    ${dirtyReferenceScanLimit === undefined ? '' : 'LIMIT ?'}
+  `).all(...(dirtyReferenceScanLimit === undefined ? [] : [dirtyReferenceScanLimit])) as Array<{ target_key: string; pending_job_id: string | null; status: string | null }>;
   let dirtyPendingRefsCleared = 0;
   const clearDirtyStmt = database.prepare('UPDATE context_dirty_targets SET pending_job_id = NULL WHERE target_key = ?');
   for (const row of dirtyRows) {
@@ -1397,7 +1748,8 @@ function repairMaterializationStateForDb(
     SELECT id, summary, content_json
     FROM context_processed_local
     WHERE status = 'active'
-  `).all() as Array<{ id: string; summary: string; content_json: string }>;
+    ${pollutedScanLimit === undefined ? '' : 'LIMIT ?'}
+  `).all(...(pollutedScanLimit === undefined ? [] : [pollutedScanLimit])) as Array<{ id: string; summary: string; content_json: string }>;
   const pollutedIds = pollutedRows
     .filter(isPollutedFallbackProjection)
     .map((row) => row.id);
@@ -1466,6 +1818,7 @@ export function resetContextStoreForTests(): void {
   currentDbPath = null;
   stagedReconciledForPath = null;
   materializationRepairRanForPath = null;
+  clearPanelReadCache();
 }
 
 
@@ -1499,7 +1852,7 @@ export function archiveEventsForMaterializationForDb(database: DatabaseSyncInsta
       JSON.stringify(event.metadata ?? null),
       event.createdAt,
       archivedAt,
-      countTokens(content),
+      countTokensFallback(content),
     );
   }
 }
@@ -1590,6 +1943,27 @@ export function pruneArchive(retentionDays: number, now = Date.now()): { deleted
   return { deleted: result.changes ?? 0 };
 }
 
+/**
+ * Completed materialization jobs are historical bookkeeping, not an archive
+ * of user context.  Keep them under the same retention window as the event
+ * archive so a busy installation cannot grow this table without bound.  The
+ * status/type/updated index makes the daily sweep proportional to rows that
+ * are eligible for deletion rather than the whole job table.
+ */
+export function pruneCompletedMaterializationJobs(retentionDays: number, now = Date.now()): { deleted: number } {
+  if (retentionDays === -1) return { deleted: 0 };
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) return { deleted: 0 };
+  const database = ensureDb();
+  const cutoff = now - retentionDays * 86_400_000;
+  const result = database.prepare(`
+    DELETE FROM context_jobs
+    WHERE status = 'completed'
+      AND job_type IN ('materialize_session', 'materialize_project')
+      AND updated_at < ?
+  `).run(cutoff) as { changes?: number };
+  return { deleted: result.changes ?? 0 };
+}
+
 export function pruneArchiveIfDue(retentionDays: number, now = Date.now()): { deleted: number; skipped: boolean } {
   if (retentionDays === -1) return { deleted: 0, skipped: true };
   if (!Number.isFinite(retentionDays) || retentionDays < 1) {
@@ -1604,7 +1978,9 @@ export function pruneArchiveIfDue(retentionDays: number, now = Date.now()): { de
   const lastRaw = internalGetContextMeta(database, 'last_archive_sweep_at');
   const last = lastRaw ? Number(lastRaw) : Number.NaN;
   if (Number.isFinite(last) && now - last < 86_400_000) return { deleted: 0, skipped: true };
-  return { ...pruneArchive(retentionDays, now), skipped: false };
+  const archive = pruneArchive(retentionDays, now);
+  pruneCompletedMaterializationJobs(retentionDays, now);
+  return { ...archive, skipped: false };
 }
 
 // ── Compression-run telemetry ────────────────────────────────────────────────
@@ -1801,7 +2177,11 @@ export interface TurnUsageRecord {
    *  because some emitters (e.g. usage.update from `command-handler.ts`
    *  on model switch) only know `model`. */
   agentType?: string | null;
+  provider?: string | null;
   model?: string | null;
+  sessionKind?: UsageSessionKind;
+  parentSessionName?: string | null;
+  metadataCompleteness?: UsageMetadataCompleteness;
   inputTokens?: number;
   cacheTokens?: number;
   outputTokens?: number;
@@ -1817,6 +2197,513 @@ export interface TurnUsageRecord {
   eventId?: string | null;
 }
 
+export interface TurnUsageSyncRecord {
+  turnUsageRowid: number;
+  usageAuthorityId: string;
+  usageFactId: string;
+  payloadHash: string;
+  syncStatus: UsageSyncStatus;
+  retryCount: number;
+  nextAttemptAtMs: number | null;
+  lastAttemptAtMs: number | null;
+  syncedAtMs: number | null;
+  lastErrorReason: string | null;
+  terminalReason: string | null;
+  metadataCompleteness: UsageMetadataCompleteness;
+  createdAtMs: number;
+  updatedAtMs: number;
+  fact: UsageFact;
+}
+
+export interface TurnUsageSyncResultInput {
+  usageFactId: string;
+  status: UsageFactStatus;
+  reason?: string | null;
+}
+
+export interface TurnUsageSyncRequestFailureInput {
+  usageFactIds: string[];
+  retryable: boolean;
+  reason: string;
+  nextAttemptAtMs?: number | null;
+  now?: number;
+}
+
+const USAGE_AUTHORITY_META_KEY = 'usage_authority_id';
+const TERMINAL_USAGE_SYNC_STATUSES = new Set<UsageSyncStatus>([
+  'accepted',
+  'duplicate',
+  'conflict_terminal',
+  'invalid_terminal',
+  'too_old_terminal',
+  'clock_skew_terminal',
+  'local_pruned_unsynced',
+]);
+const PROTECTED_USAGE_SYNC_STATUSES = new Set<UsageSyncStatus>([
+  'pending',
+  'retryable_failed',
+  'in_flight',
+]);
+export const DEFAULT_USAGE_SYNC_IN_FLIGHT_LEASE_MS = 5 * 60 * 1000;
+
+export function getOrCreateUsageAuthorityId(): string {
+  const database = ensureDb();
+  const existing = internalGetContextMeta(database, USAGE_AUTHORITY_META_KEY);
+  if (existing) return existing;
+  const id = `usage-authority-${randomUUID()}`;
+  internalSetContextMeta(database, USAGE_AUTHORITY_META_KEY, id);
+  return id;
+}
+
+function getOrCreateUsageAuthorityIdForDb(database: DatabaseSyncInstance, now = Date.now()): string {
+  const existing = internalGetContextMeta(database, USAGE_AUTHORITY_META_KEY);
+  if (existing) return existing;
+  const id = `usage-authority-${randomUUID()}`;
+  internalSetContextMeta(database, USAGE_AUTHORITY_META_KEY, id, now);
+  return id;
+}
+
+function buildUsageFactFromRow(row: {
+  id: number;
+  created_at: number;
+  session_name: string;
+  session_kind: string | null;
+  parent_session_name: string | null;
+  metadata_completeness: string | null;
+  provider: string | null;
+  agent_type: string | null;
+  model: string | null;
+  input_tokens: number;
+  cache_tokens: number;
+  output_tokens: number;
+  context_window: number | null;
+  cost_usd_micros: number | null;
+  event_id: string | null;
+}, usageAuthorityId: string): UsageFact {
+  const inputTokens = Math.max(0, Math.trunc(row.input_tokens ?? 0));
+  const cacheTokens = Math.max(0, Math.trunc(row.cache_tokens ?? 0));
+  const outputTokens = Math.max(0, Math.trunc(row.output_tokens ?? 0));
+  const sessionKind: UsageSessionKind = row.session_kind === 'sub' ? 'sub' : 'main';
+  const metadataCompleteness: UsageMetadataCompleteness = row.metadata_completeness === 'complete' ? 'complete' : 'partial';
+  return {
+    usageFactId: `usage:${usageAuthorityId}:${row.id}`,
+    createdAtMs: row.created_at,
+    sessionName: row.session_name,
+    sessionKind,
+    parentSessionName: row.parent_session_name ?? null,
+    metadataCompleteness,
+    provider: row.provider ?? null,
+    agentType: row.agent_type ?? null,
+    model: row.model ?? null,
+    inputTokens,
+    cacheTokens,
+    outputTokens,
+    totalTokens: computeTotalTokens(inputTokens, cacheTokens, outputTokens),
+    contextWindow: row.context_window ?? null,
+    costUsdMicros: row.cost_usd_micros ?? null,
+    sourceEventId: row.event_id ?? null,
+  };
+}
+
+function readTurnUsageRow(database: DatabaseSyncInstance, rowid: number): Parameters<typeof buildUsageFactFromRow>[0] | null {
+  return database.prepare(`
+    SELECT
+      id,
+      created_at,
+      session_name,
+      session_kind,
+      parent_session_name,
+      metadata_completeness,
+      provider,
+      agent_type,
+      model,
+      input_tokens,
+      cache_tokens,
+      output_tokens,
+      context_window,
+      cost_usd_micros,
+      event_id
+    FROM context_turn_usage
+    WHERE id = ?
+  `).get(rowid) as Parameters<typeof buildUsageFactFromRow>[0] | undefined ?? null;
+}
+
+function ensureTurnUsageSyncMetadataForDb(database: DatabaseSyncInstance, rowid: number, now = Date.now()): TurnUsageSyncRecord | null {
+  const row = readTurnUsageRow(database, rowid);
+  if (!row) return null;
+  const usageAuthorityId = getOrCreateUsageAuthorityIdForDb(database, now);
+  const fact = buildUsageFactFromRow(row, usageAuthorityId);
+  const payloadHash = createCanonicalUsagePayloadHash(fact);
+  database.prepare(`
+    INSERT INTO context_turn_usage_sync (
+      turn_usage_rowid,
+      usage_authority_id,
+      usage_fact_id,
+      payload_hash,
+      sync_status,
+      retry_count,
+      next_attempt_at_ms,
+      metadata_completeness,
+      created_at_ms,
+      updated_at_ms
+    ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, ?)
+    ON CONFLICT(turn_usage_rowid) DO UPDATE SET
+      usage_authority_id = excluded.usage_authority_id,
+      usage_fact_id = excluded.usage_fact_id,
+      payload_hash = excluded.payload_hash,
+      metadata_completeness = excluded.metadata_completeness,
+      updated_at_ms = excluded.updated_at_ms,
+      -- If the fact's payload changed (a turn's usage was revised), re-open it
+      -- for sync so the new value uploads. Unchanged payload → keep the current
+      -- status (a synced/'accepted' row stays terminal → idempotent, no re-send).
+      -- usage_fact_id is stable per row, so the server updates the same fact.
+      sync_status = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 'pending' ELSE context_turn_usage_sync.sync_status END,
+      retry_count = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 0 ELSE context_turn_usage_sync.retry_count END,
+      next_attempt_at_ms = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN NULL ELSE context_turn_usage_sync.next_attempt_at_ms END
+  `).run(
+    rowid,
+    usageAuthorityId,
+    fact.usageFactId,
+    payloadHash,
+    fact.metadataCompleteness,
+    fact.createdAtMs,
+    now,
+  );
+  return readTurnUsageSyncRecordForDb(database, rowid);
+}
+
+export function ensureTurnUsageSyncMetadata(rowid: number): TurnUsageSyncRecord | null {
+  return ensureTurnUsageSyncMetadataForDb(ensureDb(), rowid);
+}
+
+function readTurnUsageSyncRecordForDb(database: DatabaseSyncInstance, rowid: number): TurnUsageSyncRecord | null {
+  const row = database.prepare(`
+    SELECT
+      s.turn_usage_rowid,
+      s.usage_authority_id,
+      s.usage_fact_id,
+      s.payload_hash,
+      s.sync_status,
+      s.retry_count,
+      s.next_attempt_at_ms,
+      s.last_attempt_at_ms,
+      s.synced_at_ms,
+      s.last_error_reason,
+      s.terminal_reason,
+      s.metadata_completeness,
+      s.created_at_ms,
+      s.updated_at_ms,
+      u.id,
+      u.created_at,
+      u.session_name,
+      u.session_kind,
+      u.parent_session_name,
+      u.provider,
+      u.agent_type,
+      u.model,
+      u.input_tokens,
+      u.cache_tokens,
+      u.output_tokens,
+      u.context_window,
+      u.cost_usd_micros,
+      u.event_id
+    FROM context_turn_usage_sync s
+    JOIN context_turn_usage u ON u.id = s.turn_usage_rowid
+    WHERE s.turn_usage_rowid = ?
+  `).get(rowid) as {
+    turn_usage_rowid: number;
+    usage_authority_id: string;
+    usage_fact_id: string;
+    payload_hash: string;
+    sync_status: UsageSyncStatus;
+    retry_count: number;
+    next_attempt_at_ms: number | null;
+    last_attempt_at_ms: number | null;
+    synced_at_ms: number | null;
+    last_error_reason: string | null;
+    terminal_reason: string | null;
+    metadata_completeness: UsageMetadataCompleteness;
+    created_at_ms: number;
+    updated_at_ms: number;
+    id: number;
+    created_at: number;
+    session_name: string;
+    session_kind: string | null;
+    parent_session_name: string | null;
+    provider: string | null;
+    agent_type: string | null;
+    model: string | null;
+    input_tokens: number;
+    cache_tokens: number;
+    output_tokens: number;
+    context_window: number | null;
+    cost_usd_micros: number | null;
+    event_id: string | null;
+  } | undefined;
+  if (!row) return null;
+  const fact = buildUsageFactFromRow({
+    id: row.id,
+    created_at: row.created_at,
+    session_name: row.session_name,
+    session_kind: row.session_kind,
+    parent_session_name: row.parent_session_name,
+    metadata_completeness: row.metadata_completeness,
+    provider: row.provider,
+    agent_type: row.agent_type,
+    model: row.model,
+    input_tokens: row.input_tokens,
+    cache_tokens: row.cache_tokens,
+    output_tokens: row.output_tokens,
+    context_window: row.context_window,
+    cost_usd_micros: row.cost_usd_micros,
+    event_id: row.event_id,
+  }, row.usage_authority_id);
+  return {
+    turnUsageRowid: row.turn_usage_rowid,
+    usageAuthorityId: row.usage_authority_id,
+    usageFactId: row.usage_fact_id,
+    payloadHash: row.payload_hash,
+    syncStatus: row.sync_status,
+    retryCount: row.retry_count,
+    nextAttemptAtMs: row.next_attempt_at_ms,
+    lastAttemptAtMs: row.last_attempt_at_ms,
+    syncedAtMs: row.synced_at_ms,
+    lastErrorReason: row.last_error_reason,
+    terminalReason: row.terminal_reason,
+    metadataCompleteness: row.metadata_completeness,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+    fact,
+  };
+}
+
+export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number } {
+  const database = ensureDb();
+  const newestUsage = database.prepare('SELECT id FROM context_turn_usage ORDER BY id DESC LIMIT 1').get() as { id: number } | undefined;
+  if (!newestUsage) return { backfilled: 0 };
+  const existingSync = database.prepare('SELECT turn_usage_rowid FROM context_turn_usage_sync WHERE turn_usage_rowid = ?').get(newestUsage.id);
+  if (existingSync) {
+    const uCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage').get() as { c: number }).c;
+    const sCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage_sync').get() as { c: number }).c;
+    if (uCount === sCount) return { backfilled: 0 };
+  }
+  const rows = database.prepare(`
+    SELECT u.id
+    FROM context_turn_usage u
+    LEFT JOIN context_turn_usage_sync s ON s.turn_usage_rowid = u.id
+    WHERE s.turn_usage_rowid IS NULL
+    -- Newest-first: create sync metadata for the most RECENT unsynced turns
+    -- first, so the current period reaches the server promptly and the older
+    -- backlog fills in behind it (was ASC → recent data starved for hours).
+    ORDER BY u.id DESC
+    LIMIT ?
+  `).all(Math.max(1, Math.min(5000, Math.trunc(limit)))) as Array<{ id: number }>;
+  let backfilled = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of rows) {
+      if (ensureTurnUsageSyncMetadataForDb(database, row.id)) {
+        backfilled += 1;
+      }
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { backfilled };
+}
+
+export function recoverStaleTurnUsageSyncInFlight(input: { now?: number; leaseMs?: number } = {}): { recovered: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const leaseMs = Math.max(1, Math.trunc(input.leaseMs ?? DEFAULT_USAGE_SYNC_IN_FLIGHT_LEASE_MS));
+  const staleBefore = now - leaseMs;
+  const result = database.prepare(`
+    UPDATE context_turn_usage_sync
+    SET sync_status = 'retryable_failed',
+        next_attempt_at_ms = NULL,
+        last_error_reason = 'in_flight_stale',
+        updated_at_ms = ?
+    WHERE sync_status = 'in_flight'
+      AND COALESCE(last_attempt_at_ms, updated_at_ms, created_at_ms) <= ?
+  `).run(now, staleBefore) as { changes?: number };
+  return { recovered: result.changes ?? 0 };
+}
+
+export function selectTurnUsageSyncBatch(input: { limit?: number; now?: number; inFlightLeaseMs?: number } = {}): TurnUsageSyncRecord[] {
+  const database = ensureDb();
+  const limit = Math.max(1, Math.min(500, Math.trunc(input.limit ?? 100)));
+  const now = input.now ?? Date.now();
+  backfillTurnUsageSyncMetadata(limit);
+  recoverStaleTurnUsageSyncInFlight({ now, leaseMs: input.inFlightLeaseMs });
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const rows = database.prepare(`
+      SELECT turn_usage_rowid
+      FROM context_turn_usage_sync
+      WHERE sync_status IN ('pending', 'retryable_failed')
+        AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+      -- Newest-first so live/recent turns upload immediately and never starve
+      -- behind a large historical backlog. Idempotent: only 'pending'/
+      -- 'retryable_failed' are ever selected — 'accepted' (and other terminal
+      -- statuses) are excluded, so a synced row is never re-sent; the server
+      -- additionally dedupes by (server_id, usage_fact_id).
+      ORDER BY created_at_ms DESC, turn_usage_rowid DESC
+      LIMIT ?
+    `).all(now, limit) as Array<{ turn_usage_rowid: number }>;
+    for (const row of rows) {
+      database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = 'in_flight',
+            last_attempt_at_ms = ?,
+            updated_at_ms = ?
+        WHERE turn_usage_rowid = ?
+      `).run(now, now, row.turn_usage_rowid);
+    }
+    database.exec('COMMIT');
+    return rows
+      .map((row) => readTurnUsageSyncRecordForDb(database, row.turn_usage_rowid))
+      .filter((row): row is TurnUsageSyncRecord => row !== null);
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export function recordTurnUsageSyncResults(input: { results: TurnUsageSyncResultInput[]; now?: number }): { updated: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  let updated = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const result of input.results) {
+      const mapped = mapUsageFactStatusToSyncStatus(result.status);
+      const runResult = database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = ?,
+            synced_at_ms = CASE WHEN ? IN ('accepted', 'duplicate') THEN ? ELSE synced_at_ms END,
+            terminal_reason = CASE WHEN ? NOT IN ('accepted', 'duplicate') THEN ? ELSE terminal_reason END,
+            last_error_reason = ?,
+            updated_at_ms = ?
+        WHERE usage_fact_id = ?
+      `).run(
+        mapped,
+        mapped,
+        now,
+        mapped,
+        result.reason ?? result.status,
+        result.reason ?? null,
+        now,
+        result.usageFactId,
+      ) as { changes?: number };
+      updated += runResult.changes ?? 0;
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { updated };
+}
+
+export function recordTurnUsageSyncRequestFailure(input: TurnUsageSyncRequestFailureInput): { updated: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const status: UsageSyncStatus = input.retryable ? 'retryable_failed' : 'invalid_terminal';
+  let updated = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const usageFactId of input.usageFactIds) {
+      const result = database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = ?,
+            retry_count = CASE WHEN ? = 'retryable_failed' THEN retry_count + 1 ELSE retry_count END,
+            next_attempt_at_ms = ?,
+            last_error_reason = ?,
+            terminal_reason = CASE WHEN ? = 'retryable_failed' THEN terminal_reason ELSE ? END,
+            updated_at_ms = ?
+        WHERE usage_fact_id = ?
+      `).run(
+        status,
+        status,
+        input.retryable ? input.nextAttemptAtMs ?? now + 60_000 : null,
+        input.reason,
+        status,
+        input.reason,
+        now,
+        usageFactId,
+      ) as { changes?: number };
+      updated += result.changes ?? 0;
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { updated };
+}
+
+export function getTurnUsageSyncDiagnostics(now = Date.now()): UsagePrivacySafeDiagnostics {
+  const database = ensureDb();
+  const counts = database.prepare(`
+    SELECT sync_status, count(*) AS count
+    FROM context_turn_usage_sync
+    GROUP BY sync_status
+  `).all() as Array<{ sync_status: UsageSyncStatus; count: number }>;
+  const byStatus = new Map(counts.map((row) => [row.sync_status, row.count]));
+  const lagRow = database.prepare(`
+    SELECT min(created_at_ms) AS oldest
+    FROM context_turn_usage_sync
+    WHERE sync_status IN ('pending', 'retryable_failed', 'in_flight')
+  `).get() as { oldest: number | null } | undefined;
+  const lastSuccessRow = database.prepare(`
+    SELECT max(synced_at_ms) AS last_success
+    FROM context_turn_usage_sync
+    WHERE sync_status IN ('accepted', 'duplicate')
+  `).get() as { last_success: number | null } | undefined;
+  const lastErrorRow = database.prepare(`
+    SELECT last_error_reason
+    FROM context_turn_usage_sync
+    WHERE last_error_reason IS NOT NULL
+    ORDER BY updated_at_ms DESC
+    LIMIT 1
+  `).get() as { last_error_reason: string | null } | undefined;
+  return {
+    pendingCount: (byStatus.get('pending') ?? 0) + (byStatus.get('in_flight') ?? 0),
+    retryCount: byStatus.get('retryable_failed') ?? 0,
+    syncLagMs: typeof lagRow?.oldest === 'number' ? Math.max(0, now - lagRow.oldest) : 0,
+    lastSuccessAtMs: lastSuccessRow?.last_success ?? undefined,
+    acceptedCount: byStatus.get('accepted') ?? 0,
+    duplicateCount: byStatus.get('duplicate') ?? 0,
+    conflictCount: byStatus.get('conflict_terminal') ?? 0,
+    invalidCount: (byStatus.get('invalid_terminal') ?? 0) + (byStatus.get('local_pruned_unsynced') ?? 0),
+    tooOldCount: byStatus.get('too_old_terminal') ?? 0,
+    clockSkewCount: byStatus.get('clock_skew_terminal') ?? 0,
+    lastErrorReason: lastErrorRow?.last_error_reason ?? undefined,
+  };
+}
+
+function mapUsageFactStatusToSyncStatus(status: UsageFactStatus): UsageSyncStatus {
+  switch (status) {
+    case 'accepted':
+      return 'accepted';
+    case 'duplicate':
+      return 'duplicate';
+    case 'conflict':
+      return 'conflict_terminal';
+    case 'invalid':
+      return 'invalid_terminal';
+    case 'too_old':
+      return 'too_old_terminal';
+    case 'clock_skew_too_far':
+      return 'clock_skew_terminal';
+  }
+}
+
 export function recordTurnUsage(input: TurnUsageRecord): void {
   // Skip rows that carry no token information at all — pure model-switch
   // events fire `usage.update` with only `{ model, contextWindow }` and would
@@ -1829,13 +2716,39 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
   }
   try {
     const database = ensureDb();
+    const createdAt = input.createdAt ?? Date.now();
+    const costUsdMicros = normalizeCostUsdMicros(input.costUsd ?? null);
+    const sessionKind = input.sessionKind ?? 'main';
+    const parentSessionName = input.parentSessionName ?? null;
+    const metadataCompleteness = input.metadataCompleteness ?? (sessionKind === 'sub' && !parentSessionName ? 'partial' : 'complete');
+    // Upsert on (session_name, event_id): a turn's FINAL usage can be re-emitted
+    // with corrected/grown numbers (same eventId). Overwriting the mutable
+    // fields — but NOT created_at — keeps the row current so the change re-syncs
+    // (see ensureTurnUsageSyncMetadataForDb, which re-opens sync on a hash
+    // change). A pure replay (identical values on restart) yields the same
+    // payload hash and is therefore a no-op / idempotent. Rows without an
+    // event_id don't match the partial unique index, so they always insert.
     database.prepare(`
-      INSERT OR IGNORE INTO context_turn_usage (
+      INSERT INTO context_turn_usage (
         created_at, session_name, agent_type, model,
-        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_name, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
+        agent_type = excluded.agent_type,
+        model = excluded.model,
+        input_tokens = excluded.input_tokens,
+        cache_tokens = excluded.cache_tokens,
+        output_tokens = excluded.output_tokens,
+        context_window = excluded.context_window,
+        cost_usd = excluded.cost_usd,
+        provider = excluded.provider,
+        session_kind = excluded.session_kind,
+        parent_session_name = excluded.parent_session_name,
+        metadata_completeness = excluded.metadata_completeness,
+        cost_usd_micros = excluded.cost_usd_micros
     `).run(
-      input.createdAt ?? Date.now(),
+      createdAt,
       input.sessionName,
       input.agentType ?? null,
       input.model ?? null,
@@ -1845,13 +2758,128 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
       input.contextWindow ?? null,
       input.costUsd ?? null,
       input.eventId ?? null,
+      input.provider ?? null,
+      sessionKind,
+      parentSessionName,
+      metadataCompleteness,
+      costUsdMicros,
     );
+    let rowid: number | null = null;
+    if (input.eventId) {
+      const existing = database.prepare(
+        'SELECT id FROM context_turn_usage WHERE session_name = ? AND event_id = ?',
+      ).get(input.sessionName, input.eventId) as { id: number } | undefined;
+      rowid = existing?.id ?? null;
+    } else {
+      const latest = database.prepare(
+        'SELECT id FROM context_turn_usage WHERE session_name = ? ORDER BY id DESC LIMIT 1',
+      ).get(input.sessionName) as { id: number } | undefined;
+      rowid = latest?.id ?? null;
+    }
+    if (rowid != null) {
+      ensureTurnUsageSyncMetadataForDb(database, rowid);
+    }
   } catch (err) {
     // Never break the timeline emitter — log + counter only.
     incrementCounter('mem.turn_usage.record_failed', {});
     warnOncePerHour('mem.turn_usage.record_failed', {
       err: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+type CodexCreditSnapshotRow = {
+  captured_at: number;
+  account_id: string | null;
+  plan_type: string | null;
+  balance: string;
+  has_credits: number;
+  unlimited: number;
+  five_hour_left_percent: number | null;
+  weekly_left_percent: number | null;
+};
+
+function codexCreditSnapshotFromRow(row: CodexCreditSnapshotRow): CodexCreditSnapshot {
+  return {
+    capturedAt: row.captured_at,
+    ...(row.account_id ? { accountId: row.account_id } : {}),
+    ...(row.plan_type ? { planType: row.plan_type } : {}),
+    balance: row.balance,
+    hasCredits: !!row.has_credits,
+    unlimited: !!row.unlimited,
+    ...(row.five_hour_left_percent != null ? { fiveHourLeftPercent: row.five_hour_left_percent } : {}),
+    ...(row.weekly_left_percent != null ? { weeklyLeftPercent: row.weekly_left_percent } : {}),
+  };
+}
+
+/**
+ * Record one Codex pay-as-you-go credit-balance snapshot. Best-effort, like
+ * `recordTurnUsage`: a recording failure MUST NOT throw into the caller's
+ * quota-refresh hot path.
+ *
+ * Deduplicates against the single latest row — an unchanged
+ * balance/hasCredits/unlimited triple (the common case: quota refreshes fire
+ * far more often than the balance actually changes) is skipped so idle
+ * periods don't spam identical rows on every refresh.
+ */
+export function recordCodexCreditSnapshot(
+  input: Omit<CodexCreditSnapshot, 'capturedAt'> & { capturedAt?: number },
+): void {
+  try {
+    const database = ensureDb();
+    const capturedAt = input.capturedAt ?? Date.now();
+    const latest = database.prepare(
+      'SELECT balance, has_credits, unlimited FROM codex_credit_snapshots ORDER BY id DESC LIMIT 1',
+    ).get() as { balance: string; has_credits: number; unlimited: number } | undefined;
+    const unchanged = !!latest
+      && latest.balance === input.balance
+      && !!latest.has_credits === input.hasCredits
+      && !!latest.unlimited === input.unlimited;
+    if (unchanged) return;
+    database.prepare(`
+      INSERT INTO codex_credit_snapshots (
+        captured_at, account_id, plan_type, balance, has_credits, unlimited,
+        five_hour_left_percent, weekly_left_percent
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      capturedAt,
+      input.accountId ?? null,
+      input.planType ?? null,
+      input.balance,
+      input.hasCredits ? 1 : 0,
+      input.unlimited ? 1 : 0,
+      input.fiveHourLeftPercent ?? null,
+      input.weeklyLeftPercent ?? null,
+    );
+  } catch (err) {
+    incrementCounter('mem.codex_credit_snapshot.record_failed', {});
+    warnOncePerHour('mem.codex_credit_snapshot.record_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Most recent Codex credit-balance snapshots, newest first. */
+export function listCodexCreditSnapshots(input: { limit?: number; sinceMs?: number } = {}): CodexCreditSnapshot[] {
+  try {
+    const database = ensureDb();
+    const limit = Math.max(1, Math.min(
+      CODEX_CREDIT_HISTORY_MAX_LIMIT,
+      Math.trunc(input.limit ?? CODEX_CREDIT_HISTORY_DEFAULT_LIMIT),
+    ));
+    const rows = (input.sinceMs != null
+      ? database.prepare(
+        'SELECT * FROM codex_credit_snapshots WHERE captured_at >= ? ORDER BY captured_at DESC, id DESC LIMIT ?',
+      ).all(input.sinceMs, limit)
+      : database.prepare(
+        'SELECT * FROM codex_credit_snapshots ORDER BY captured_at DESC, id DESC LIMIT ?',
+      ).all(limit)) as CodexCreditSnapshotRow[];
+    return rows.map(codexCreditSnapshotFromRow);
+  } catch (err) {
+    warnOncePerHour('mem.codex_credit_snapshot.list_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return [];
   }
 }
 
@@ -1923,7 +2951,24 @@ export function pruneTurnUsage(retentionDays: number, now = Date.now()): { delet
   const database = ensureDb();
   const cutoff = now - retentionDays * 86_400_000;
   const result = database.prepare(
-    'DELETE FROM context_turn_usage WHERE created_at < ?',
+    `DELETE FROM context_turn_usage
+     WHERE created_at < ?
+       AND (
+         id NOT IN (SELECT turn_usage_rowid FROM context_turn_usage_sync)
+         OR id IN (
+           SELECT turn_usage_rowid
+           FROM context_turn_usage_sync
+           WHERE sync_status IN (
+             'accepted',
+             'duplicate',
+             'conflict_terminal',
+             'invalid_terminal',
+             'too_old_terminal',
+             'clock_skew_terminal',
+             'local_pruned_unsynced'
+           )
+         )
+       )`,
   ).run(cutoff) as { changes?: number };
   internalSetContextMeta(database, 'last_turn_usage_sweep_at', String(now), now);
   return { deleted: result.changes ?? 0 };
@@ -2119,6 +3164,80 @@ export function listPinnedNotes(namespaceKey: string): PinnedNote[] {
   }));
 }
 
+export interface MemoryShortRefRow {
+  ref: string;
+  kind: string;
+  id: string;
+  namespaceKey: string;
+  namespaceJson: string | null;
+  lastSeenAt: number;
+}
+
+/** Persist memory handles. Batched into one transaction: the in-memory index
+ *  registers a whole injected block at once. */
+export function upsertMemoryShortRefs(rows: readonly MemoryShortRefRow[]): number {
+  if (rows.length === 0) return 0;
+  const database = ensureDb();
+  const statement = database.prepare(`
+    INSERT INTO memory_short_refs (ref, kind, id, namespace_key, namespace_json, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(ref, kind, id, namespace_key) DO UPDATE SET
+      namespace_json = excluded.namespace_json,
+      last_seen_at = excluded.last_seen_at
+  `);
+  // IMMEDIATE, like every other write transaction here: the worker and the
+  // startup cold-fallback path can both hold a write connection, and a deferred
+  // transaction upgrading to a write under WAL fails with SQLITE_BUSY instead of
+  // waiting for the lock.
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of rows) {
+      statement.run(row.ref, row.kind, row.id, row.namespaceKey, row.namespaceJson, row.lastSeenAt);
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch { /* a failing rollback must not mask the original error */ }
+    throw error;
+  }
+  return rows.length;
+}
+
+/** Newest-first so a bounded warm-load keeps the most recently used handles. */
+export function listMemoryShortRefs(limit?: number): MemoryShortRefRow[] {
+  const database = ensureDb();
+  const sql = 'SELECT * FROM memory_short_refs ORDER BY last_seen_at DESC'
+    + (typeof limit === 'number' && limit > 0 ? ' LIMIT ?' : '');
+  const statement = database.prepare(sql);
+  const rows = (typeof limit === 'number' && limit > 0 ? statement.all(limit) : statement.all()) as Array<Record<string, unknown>>;
+  return mapMemoryShortRefRows(rows);
+}
+
+/**
+ * Exact lookup used when another process persisted a handle after this
+ * process's in-memory short-ref index was populated. The primary key starts
+ * with `ref`, so this is an indexed point lookup rather than another warm-load.
+ */
+export function listMemoryShortRefsByRef(ref: string): MemoryShortRefRow[] {
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT * FROM memory_short_refs
+    WHERE ref = ?
+    ORDER BY last_seen_at DESC
+  `).all(ref) as Array<Record<string, unknown>>;
+  return mapMemoryShortRefRows(rows);
+}
+
+function mapMemoryShortRefRows(rows: Array<Record<string, unknown>>): MemoryShortRefRow[] {
+  return rows.map((row) => ({
+    ref: String(row.ref),
+    kind: String(row.kind),
+    id: String(row.id),
+    namespaceKey: String(row.namespace_key ?? ''),
+    namespaceJson: row.namespace_json == null ? null : String(row.namespace_json),
+    lastSeenAt: Number(row.last_seen_at),
+  }));
+}
+
 export function getStagedEvent(id: string): LocalContextEvent | undefined {
   const database = ensureDb();
   const row = database.prepare('SELECT * FROM context_staged_events WHERE id = ?').get(id) as Record<string, unknown> | undefined;
@@ -2292,7 +3411,7 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
 }
 
 export function countStagedTokens(target: ContextTargetRef): number {
-  return listContextEvents(target).reduce((sum, event) => sum + countTokens(event.content ?? ''), 0);
+  return listContextEvents(target).reduce((sum, event) => sum + countTokensFallback(event.content ?? ''), 0);
 }
 
 export function estimateStagedTokenUpperBound(target: ContextTargetRef): number {
@@ -2308,6 +3427,7 @@ export function estimateStagedTokenUpperBound(target: ContextTargetRef): number 
 }
 
 export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): LocalContextEvent {
+  clearPanelReadCache();
   const database = ensureDb();
   const event: LocalContextEvent = {
     id: input.id ?? randomUUID(),
@@ -2317,6 +3437,7 @@ export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'create
     metadata: input.metadata,
     createdAt: input.createdAt ?? Date.now(),
   };
+  if (!isMemoryDaemonEnabled()) return event;
   const namespaceKey = serializeContextNamespace(event.target.namespace);
   const targetKey = serializeContextTarget(event.target);
   const namespaceColumns = namespaceFilterColumnValues(event.target.namespace);
@@ -2419,6 +3540,7 @@ export function ingestContextEvent(
   computeTriggerData: boolean,
 ): IngestContextEventResult {
   const event = recordContextEvent(input);
+  if (!isMemoryDaemonEnabled()) return { event, stagedTokenUpperBound: 0 };
   if (!computeTriggerData) return { event, stagedTokenUpperBound: 0 };
   const dirtyTarget = listDirtyTargets(input.target.namespace).find(
     (entry) => entry.target.kind === input.target.kind && entry.target.sessionName === input.target.sessionName,
@@ -2497,14 +3619,16 @@ export function queryPendingContextEvents(filters: {
   const params: (string | number)[] = [];
   appendNamespaceFilterSql(conditions, params, filters);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? Math.min(100, Math.floor(filters.limit)) : 50;
+  const candidateLimit = normalizedQuery ? Math.min(1000, Math.max(limit * 4, 100)) : limit;
   const rows = database.prepare(`
     SELECT id, namespace_key, session_name, event_type, content, created_at
     FROM context_staged_events
     ${where}
     ORDER BY created_at DESC
-  `).all(...params) as Array<Record<string, unknown>>;
-  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
-  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+    LIMIT ?
+  `).all(...params, candidateLimit) as Array<Record<string, unknown>>;
   return rows
     .map((row) => {
       const namespace = parseNamespaceKey(String(row.namespace_key));
@@ -2531,6 +3655,8 @@ export function queryPendingContextEvents(filters: {
 }
 
 export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobType, trigger: ContextJobTrigger, now = Date.now()): ContextJobRecord {
+  assertMemoryDaemonEnabled();
+  clearPanelReadCache();
   const database = ensureDb();
   const targetKey = serializeContextTarget(target);
   const namespaceColumns = namespaceFilterColumnValues(target.namespace);
@@ -2582,6 +3708,28 @@ export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobT
 }
 
 /**
+ * Atomically claim a pending materialization job for execution.
+ *
+ * `enqueueContextJob` intentionally coalesces pending/running rows for the same
+ * target. Overlapping poll passes can therefore receive the same job. Only the
+ * caller that wins this pending -> running transition may read staged events
+ * and invoke the compressor; every later caller observes `false` and stops.
+ */
+export function claimContextJob(jobId: string, now = Date.now()): boolean {
+  clearPanelReadCache();
+  const database = ensureDb();
+  const result = database.prepare(`
+    UPDATE context_jobs
+    SET status = 'running',
+        updated_at = ?,
+        error = NULL,
+        attempt_count = attempt_count + 1
+    WHERE id = ? AND status = 'pending'
+  `).run(now, jobId) as { changes?: number };
+  return (result.changes ?? 0) === 1;
+}
+
+/**
  * Transaction-free body of {@link updateContextJob}: updates a context job row
  * directly on `database` with NO ensureDb. This function does not itself open a
  * transaction (the public wrapper did not either).
@@ -2596,6 +3744,7 @@ export function updateContextJobForDb(database: DatabaseSyncInstance, jobId: str
 }
 
 export function updateContextJob(jobId: string, status: ContextJobStatus, updates?: { error?: string; attemptIncrement?: boolean; now?: number }): void {
+  clearPanelReadCache();
   const database = ensureDb();
   updateContextJobForDb(database, jobId, status, updates);
 }
@@ -2657,6 +3806,7 @@ export function writeProcessedProjectionForDb(
   database: DatabaseSyncInstance,
   input: WriteProcessedProjectionInput,
 ): ProcessedContextProjection {
+  clearPanelReadCache();
   const now = Date.now();
   const canonicalNamespace = canonicalizeContextNamespace(input.namespace);
   const namespaceKey = serializeContextNamespace(canonicalNamespace);
@@ -2695,8 +3845,8 @@ export function writeProcessedProjectionForDb(
     database.prepare(`
       INSERT INTO context_processed_local (
         id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-        class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint, is_noise
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
       ON CONFLICT(id) DO UPDATE SET
         namespace_key = excluded.namespace_key,
         scope = excluded.scope,
@@ -2711,6 +3861,7 @@ export function writeProcessedProjectionForDb(
         content_hash = excluded.content_hash,
         origin = excluded.origin,
         updated_at = excluded.updated_at,
+        is_noise = excluded.is_noise,
         summary_fingerprint = NULL
     `).run(
       projection.id,
@@ -2724,6 +3875,7 @@ export function writeProcessedProjectionForDb(
       originForDb,
       projection.createdAt,
       projection.updatedAt,
+      isMemoryNoiseSummary(projection.summary) ? 1 : 0,
     );
     syncProjectionSourcesForDb(database, projection.id, projection.sourceEventIds);
     upsertProjectionObservationForDb(database, {
@@ -2755,8 +3907,8 @@ export function writeProcessedProjectionForDb(
   const row = database.prepare(`
     INSERT INTO context_processed_local (
       id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-      class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint, is_noise
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL DO UPDATE SET
       scope = excluded.scope,
       enterprise_id = excluded.enterprise_id,
@@ -2768,7 +3920,8 @@ export function writeProcessedProjectionForDb(
       content_json = excluded.content_json,
       content_hash = excluded.content_hash,
       origin = excluded.origin,
-      updated_at = excluded.updated_at
+      updated_at = excluded.updated_at,
+      is_noise = excluded.is_noise
     RETURNING id, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at
   `).get(
     projectionId,
@@ -2783,6 +3936,7 @@ export function writeProcessedProjectionForDb(
     createdAt,
     updatedAt,
     fingerprint,
+    isMemoryNoiseSummary(summaryForDb) ? 1 : 0,
   ) as { id: string; source_event_ids_json: string; summary: string; content_json: string; content_hash: string | null; origin: string | null; created_at: number; updated_at: number };
   const returnedIds = parseJson<string[]>(row.source_event_ids_json, mergedIds);
   const returnedOrigin = isMemoryOrigin(row.origin) ? row.origin : originForDb;
@@ -2814,6 +3968,7 @@ export function writeProcessedProjectionForDb(
 }
 
 export function writeProcessedProjection(input: WriteProcessedProjectionInput): ProcessedContextProjection {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
 
   // The explicit-id and fingerprint-upsert paths keep separate busy-retry
@@ -2894,6 +4049,7 @@ export interface MaterializationCommitResult {
  *  no lost/orphaned staged events). `compressWithSdk` runs BEFORE this, outside
  *  any transaction. */
 export function commitMaterialization(input: MaterializationCommitInput): MaterializationCommitResult {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   let lastBusyError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2931,6 +4087,7 @@ export function commitMaterialization(input: MaterializationCommitInput): Materi
 }
 
 export function ensureContextNamespace(input: CanonicalNamespaceInput | ContextNamespace, now = Date.now()): ContextNamespaceRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   return ensureContextNamespaceForDb(database, input, now);
 }
@@ -2953,7 +4110,14 @@ export function listContextNamespaces(filters: {
     .filter((row) => !filters.sessionTreeId || row.sessionTreeId === filters.sessionTreeId);
 }
 
+export function getContextNamespaceById(id: string): ContextNamespaceRow | null {
+  const database = ensureDb();
+  const row = database.prepare('SELECT * FROM context_namespaces WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  return row ? namespaceRowFromDb(row) : null;
+}
+
 export function writeContextObservation(input: ContextObservationInput): ContextObservationRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -2968,22 +4132,66 @@ export function writeContextObservation(input: ContextObservationInput): Context
 
 export function listContextObservations(filters: {
   namespaceId?: string;
+  namespaceIds?: readonly string[];
   scope?: MemoryScope;
   class?: ObservationClass;
   state?: ObservationState | readonly ObservationState[];
   projectionId?: string;
+  limit?: number;
 } = {}): ContextObservationRow[] {
+  const namespaceIds = filters.namespaceIds === undefined
+    ? undefined
+    : [...new Set(filters.namespaceIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const states = filters.state === undefined
+    ? undefined
+    : typeof filters.state === 'string'
+      ? [filters.state]
+      : [...new Set(filters.state)];
+  const limit = filters.limit === undefined
+    ? undefined
+    : Number.isFinite(filters.limit)
+      ? Math.max(0, Math.min(10_000, Math.floor(filters.limit)))
+      : 0;
+  if (namespaceIds?.length === 0 || states?.length === 0 || limit === 0) return [];
+
   const database = ensureDb();
-  const rows = database.prepare('SELECT * FROM context_observations ORDER BY updated_at DESC, id ASC').all() as Array<Record<string, unknown>>;
-  const states = Array.isArray(filters.state) ? new Set(filters.state) : undefined;
-  const state = typeof filters.state === 'string' ? filters.state : undefined;
-  return rows
-    .map(observationRowFromDb)
-    .filter((row) => !filters.namespaceId || row.namespaceId === filters.namespaceId)
-    .filter((row) => !filters.scope || row.scope === filters.scope)
-    .filter((row) => !filters.class || row.class === filters.class)
-    .filter((row) => !filters.state || (states ? states.has(row.state) : row.state === state))
-    .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+  const conditions: string[] = [];
+  const params: Array<string | number> = [];
+  if (filters.namespaceId) {
+    conditions.push('namespace_id = ?');
+    params.push(filters.namespaceId);
+  }
+  if (namespaceIds) {
+    conditions.push(`namespace_id IN (${namespaceIds.map(() => '?').join(',')})`);
+    params.push(...namespaceIds);
+  }
+  if (filters.scope) {
+    conditions.push('scope = ?');
+    params.push(filters.scope);
+  }
+  if (filters.class) {
+    conditions.push('class = ?');
+    params.push(filters.class);
+  }
+  if (states) {
+    conditions.push(`state IN (${states.map(() => '?').join(',')})`);
+    params.push(...states);
+  }
+  if (filters.projectionId) {
+    conditions.push('projection_id = ?');
+    params.push(filters.projectionId);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limitSql = limit === undefined ? '' : 'LIMIT ?';
+  if (limit !== undefined) params.push(limit);
+  const rows = database.prepare(`
+    SELECT *
+      FROM context_observations
+      ${where}
+     ORDER BY updated_at DESC, id ASC
+     ${limitSql}
+  `).all(...params) as Array<Record<string, unknown>>;
+  return rows.map(observationRowFromDb);
 }
 
 export function listStartupContextObservations(namespaceIds: readonly string[], limit: number): ContextObservationRow[] {
@@ -3030,6 +4238,7 @@ export function updateContextObservationText(input: {
   updatedByUserId?: string;
   now?: number;
 }): ContextObservationRow | null {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   const text = input.text.trim();
@@ -3147,6 +4356,7 @@ export function updateProcessedProjectionSummary(input: {
   updatedByUserId?: string;
   now?: number;
 }): ProcessedContextProjection | null {
+  clearPanelReadCache();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   const summary = input.summary.trim();
@@ -3190,6 +4400,7 @@ export function updateProcessedProjectionSummary(input: {
           content_hash = ?,
           updated_at = ?,
           summary_fingerprint = ?,
+          is_noise = ?,
           embedding = NULL,
           embedding_source = NULL
       WHERE id = ?
@@ -3199,6 +4410,7 @@ export function updateProcessedProjectionSummary(input: {
       projectionContentHash(summary, nextContent),
       now,
       nextSummaryFingerprint,
+      isMemoryNoiseSummary(summary) ? 1 : 0,
       input.projectionId,
     );
 
@@ -3250,6 +4462,7 @@ export function promoteContextObservation(input: {
   expectedFromScope?: MemoryScope;
   now?: number;
 }): ObservationPromotionAuditRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   if (!OBSERVATION_PROMOTION_ACTIONS.has(input.action)) {
@@ -3314,6 +4527,13 @@ export function deleteContextObservation(observationId: string): boolean {
   return ((result as { changes: number }).changes ?? 0) > 0;
 }
 
+export function activateContextObservation(observationId: string, now = Date.now()): boolean {
+  const database = ensureDb();
+  const result = database.prepare('UPDATE context_observations SET state = ?, updated_at = ? WHERE id = ?')
+    .run('active', now, observationId);
+  return ((result as { changes?: number }).changes ?? 0) > 0;
+}
+
 
 export interface ObservationRepairStats {
   namespacesBackfilled: number;
@@ -3326,7 +4546,7 @@ function backfillNamespacesAndObservationsForDb(
   options: { limit?: number; now?: number } = {},
 ): ObservationRepairStats {
   const now = options.now ?? Date.now();
-  const safeLimit = Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 1000)));
+  const safeLimit = Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 64)));
   const projectionRows = database.prepare(`
     SELECT id, namespace_key, class, source_event_ids_json, summary, content_json, origin, created_at, updated_at, summary_fingerprint
     FROM context_processed_local
@@ -3380,7 +4600,7 @@ function repairObservationStoreForDb(
     SELECT id, source_event_ids_json FROM context_processed_local
     WHERE id NOT IN (SELECT DISTINCT projection_id FROM context_projection_sources WHERE projection_id IS NOT NULL)
     LIMIT ?
-  `).all(Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 1000)))) as Array<{ id: string; source_event_ids_json: string }>;
+  `).all(Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 64)))) as Array<{ id: string; source_event_ids_json: string }>;
   let orphanProjectionSourcesRepaired = 0;
   for (const row of sourceRows) {
     const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);
@@ -3466,6 +4686,7 @@ export function saveProjectionEmbedding(
   embedding: Buffer,
   source: string,
 ): void {
+  if (!isMemoryDaemonEnabled()) return;
   const database = ensureDb();
   database.prepare(
     'UPDATE context_processed_local SET embedding = ?, embedding_source = ? WHERE id = ?',
@@ -3540,9 +4761,52 @@ export function countProjectionsMissingEmbedding(): number {
   return row?.n ?? 0;
 }
 
-export function listProcessedProjections(namespace: ContextNamespace, projectionClass?: ProcessedContextClass): ProcessedContextProjection[] {
+/** Narrowing options for {@link listProcessedProjections}. Every field is
+ * pushed into SQL so a large namespace is never materialised just to be
+ * filtered in JS (a 27k-row namespace cost ~600 ms + a huge structured clone
+ * per call). Omit the options object for the legacy "everything" behaviour. */
+export interface ListProcessedProjectionsOptions {
+  /** Only projections whose content.sessionName equals this. */
+  sessionName?: string;
+  /** Only projections updated strictly after this unix-ms. */
+  updatedAfter?: number;
+  /** Stop after this many (post noise-filter) projections. */
+  limit?: number;
+  /** Skip archived / archived_dedup rows. */
+  excludeArchived?: boolean;
+}
+
+export function listProcessedProjections(
+  namespace: ContextNamespace,
+  projectionClass?: ProcessedContextClass,
+  options?: ListProcessedProjectionsOptions,
+): ProcessedContextProjection[] {
   const database = ensureDb();
   const namespaceKey = serializeContextNamespace(namespace);
+  if (options && projectionClass) {
+    const clauses = ['namespace_key = ?', 'class = ?'];
+    const params: Array<string | number> = [namespaceKey, projectionClass];
+    if (typeof options.sessionName === 'string') {
+      clauses.push(`${SESSION_NAME_EXPR} = ?`);
+      params.push(options.sessionName);
+    }
+    if (typeof options.updatedAfter === 'number' && Number.isFinite(options.updatedAfter)) {
+      clauses.push('updated_at > ?');
+      params.push(options.updatedAfter);
+    }
+    if (options.excludeArchived) clauses.push(NOT_ARCHIVED_SQL);
+    const limit = typeof options.limit === 'number' && options.limit > 0 ? Math.floor(options.limit) : Infinity;
+    const out: ProcessedContextProjection[] = [];
+    for (const row of database.prepare(
+      `SELECT * FROM context_processed_local WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC`,
+    ).iterate(...params) as Iterable<Record<string, unknown>>) {
+      const projection = processedProjectionFromRow(row, namespace);
+      if (isMemoryNoiseSummary(projection.summary)) continue;
+      out.push(projection);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
   const rows = projectionClass
     ? database.prepare('SELECT * FROM context_processed_local WHERE namespace_key = ? AND class = ? ORDER BY updated_at DESC').all(namespaceKey, projectionClass)
     : database.prepare('SELECT * FROM context_processed_local WHERE namespace_key = ? ORDER BY updated_at DESC').all(namespaceKey);
@@ -3566,13 +4830,15 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
 export function hasProcessedProjectionsInNamespace(namespace: ContextNamespace): boolean {
   const database = ensureDb();
   const namespaceKey = serializeContextNamespace(namespace);
-  const rows = database.prepare(`
+  // Early exit on the first non-noise row instead of loading every summary.
+  for (const row of database.prepare(`
     SELECT summary
       FROM context_processed_local
      WHERE namespace_key = ?
-     ORDER BY updated_at DESC
-  `).all(namespaceKey) as Array<{ summary?: string }>;
-  return rows.some((row) => !isMemoryNoiseSummary(row.summary));
+  `).iterate(namespaceKey) as Iterable<{ summary?: string }>) {
+    if (!isMemoryNoiseSummary(row.summary)) return true;
+  }
+  return false;
 }
 
 export function listProcessedProjectionsByIds(namespace: ContextNamespace, projectionIds: readonly string[]): ProcessedContextProjection[] {
@@ -3599,40 +4865,44 @@ export function listProcessedProjectionsByIds(namespace: ContextNamespace, proje
   });
 }
 
-export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+/** Newest non-noise, non-archived summary timestamp of one class for a
+ * (namespace, target-column expression) pair. Walks the index in
+ * `updated_at DESC` order and stops at the first usable row, so the cost is
+ * O(rows skipped), never O(namespace). */
+function latestNonNoiseUpdatedAt(
+  namespaceKey: string,
+  projectionClass: 'recent_summary' | 'master_summary',
+  extraClauses: readonly string[],
+  extraParams: readonly string[],
+): number | undefined {
   const database = ensureDb();
-  const namespaceKey = serializeContextNamespace(target.namespace);
-  let rows: Array<Record<string, unknown>>;
-  if (target.kind === 'project') {
-    rows = database.prepare(`
-        SELECT updated_at, summary
-          FROM context_processed_local
-         WHERE namespace_key = ?
-           AND class = 'recent_summary'
-           AND status NOT IN ('archived', 'archived_dedup')
-           AND json_extract(content_json, '$.targetKind') = 'project'
-         ORDER BY updated_at DESC
-      `).all(namespaceKey) as Array<Record<string, unknown>>;
-  } else {
-    const sessionName = target.sessionName;
-    if (!sessionName) return undefined;
-    rows = database.prepare(`
-        SELECT updated_at, summary
-          FROM context_processed_local
-         WHERE namespace_key = ?
-           AND class = 'recent_summary'
-           AND status NOT IN ('archived', 'archived_dedup')
-           AND json_extract(content_json, '$.targetKind') = 'session'
-           AND json_extract(content_json, '$.sessionName') = ?
-         ORDER BY updated_at DESC
-      `).all(namespaceKey, sessionName) as Array<Record<string, unknown>>;
-  }
-  for (const row of rows as Array<{ updated_at: unknown; summary: unknown }>) {
+  const clauses = ['namespace_key = ?', 'class = ?', NOT_ARCHIVED_SQL, ...extraClauses];
+  for (const row of database.prepare(`
+    SELECT updated_at, summary
+      FROM context_processed_local
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY updated_at DESC
+  `).iterate(namespaceKey, projectionClass, ...extraParams) as Iterable<{ updated_at: unknown; summary: unknown }>) {
     if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
     const updatedAt = Number(row.updated_at);
     if (Number.isFinite(updatedAt)) return updatedAt;
   }
   return undefined;
+}
+
+export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+  const namespaceKey = serializeContextNamespace(target.namespace);
+  if (target.kind === 'project') {
+    return latestNonNoiseUpdatedAt(namespaceKey, 'recent_summary', [`${TARGET_KIND_EXPR} = 'project'`], []);
+  }
+  const sessionName = target.sessionName;
+  if (!sessionName) return undefined;
+  return latestNonNoiseUpdatedAt(
+    namespaceKey,
+    'recent_summary',
+    [`${TARGET_KIND_EXPR} = 'session'`, `${SESSION_NAME_EXPR} = ?`],
+    [sessionName],
+  );
 }
 
 export interface LatestRecentSummarySession {
@@ -3645,56 +4915,76 @@ export function listLatestRecentSummarySessions(limit = 1000): LatestRecentSumma
   const safeLimit = Math.max(0, Math.min(5000, Math.floor(limit)));
   if (safeLimit === 0) return [];
   const database = ensureDb();
-  const rows = database.prepare(`
+  // Until the maintenance step has built the covering index (first run after an
+  // upgrade) this GROUP BY degrades to a full-table json scan - 5.7 s cold on a
+  // 1 GB store, longer than the RPC budget. The sweep is periodic housekeeping,
+  // so report "nothing yet" and let a later poll run it on the index.
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(PROCESSED_SESSION_SUMMARY_INDEX)) return [];
+  // One covering-index GROUP BY yields the newest row per (namespace, session);
+  // the noise check then touches only that one candidate row per session, with
+  // a per-session early-exit fallback when the newest row is noise. This
+  // replaces a full-class scan + json parse of every summary every 15 s.
+  const groupStmt = database.prepare(`
     SELECT namespace_key,
-           summary,
-           json_extract(content_json, '$.sessionName') AS session_name,
-           updated_at
+           ${SESSION_NAME_EXPR} AS session_name,
+           MAX(updated_at) AS newest
       FROM context_processed_local
      WHERE class = 'recent_summary'
-       AND status NOT IN ('archived', 'archived_dedup')
-       AND json_extract(content_json, '$.sessionName') IS NOT NULL
-     ORDER BY updated_at DESC
-  `).all() as Array<Record<string, unknown>>;
-  const result: LatestRecentSummarySession[] = [];
-  const seen = new Set<string>();
-  for (const row of rows) {
-    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
-    const sessionName = typeof row.session_name === 'string' ? row.session_name : undefined;
-    const updatedAt = Number(row.updated_at);
-    if (!sessionName || !Number.isFinite(updatedAt)) continue;
-    const namespaceKey = String(row.namespace_key);
-    const key = `${namespaceKey}\0${sessionName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({
-      sessionName,
-      namespace: parseNamespaceKey(namespaceKey),
-      updatedAt,
-    });
-    if (result.length >= safeLimit) break;
+       AND ${NOT_ARCHIVED_SQL}
+       AND ${SESSION_NAME_EXPR} IS NOT NULL
+     GROUP BY namespace_key, session_name
+     ORDER BY newest DESC
+     LIMIT ? OFFSET ?
+  `);
+  const newestRowsStmt = database.prepare(`
+    SELECT summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+       AND class = 'recent_summary'
+       AND ${SESSION_NAME_EXPR} = ?
+       AND updated_at = ?
+       AND ${NOT_ARCHIVED_SQL}
+  `);
+  let result: LatestRecentSummarySession[] = [];
+  const pageSize = Math.min(safeLimit, 500);
+  paging: for (let offset = 0; ; offset += pageSize) {
+    const candidates = groupStmt.all(pageSize, offset) as Array<Record<string, unknown>>;
+    for (const row of candidates) {
+      if (typeof row.session_name !== 'string') continue;
+      const namespaceKey = String(row.namespace_key);
+      const newest = Number(row.newest);
+      if (!Number.isFinite(newest)) continue;
+      // Candidates arrive newest-first by RAW timestamp, and a noise fallback
+      // can only LOWER a session's timestamp - so once the result is full and
+      // the next candidate's raw newest is already below the current cut-off,
+      // no remaining candidate can enter the top `safeLimit`.
+      if (result.length >= safeLimit && newest < result[safeLimit - 1]!.updatedAt) break paging;
+      let updatedAt: number | undefined = newest;
+      const newestRows = newestRowsStmt.all(namespaceKey, row.session_name, newest) as Array<{ summary?: unknown }>;
+      if (newestRows.every((r) => isMemoryNoiseSummary(typeof r.summary === 'string' ? r.summary : undefined))) {
+        updatedAt = latestNonNoiseUpdatedAt(namespaceKey, 'recent_summary', [`${SESSION_NAME_EXPR} = ?`], [row.session_name]);
+      }
+      if (updatedAt === undefined) continue;
+      result.push({ sessionName: row.session_name, namespace: parseNamespaceKey(namespaceKey), updatedAt });
+      if (result.length > safeLimit) {
+        result.sort((x, y) => y.updatedAt - x.updatedAt);
+        result = result.slice(0, safeLimit);
+      } else if (result.length === safeLimit) {
+        result.sort((x, y) => y.updatedAt - x.updatedAt);
+      }
+    }
+    if (candidates.length < pageSize) break;
   }
-  return result;
+  return result.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export function getLatestMasterSummaryUpdatedAt(sessionName: string, namespace: ContextNamespace): number | undefined {
-  const database = ensureDb();
-  const namespaceKey = serializeContextNamespace(namespace);
-  const rows = database.prepare(`
-    SELECT updated_at, summary
-      FROM context_processed_local
-     WHERE namespace_key = ?
-       AND class = 'master_summary'
-       AND status NOT IN ('archived', 'archived_dedup')
-       AND json_extract(content_json, '$.sessionName') = ?
-     ORDER BY updated_at DESC
-  `).all(namespaceKey, sessionName) as Array<{ updated_at?: number; summary?: string }>;
-  for (const row of rows) {
-    if (isMemoryNoiseSummary(row.summary)) continue;
-    const updatedAt = Number(row.updated_at);
-    if (Number.isFinite(updatedAt)) return updatedAt;
-  }
-  return undefined;
+  return latestNonNoiseUpdatedAt(
+    serializeContextNamespace(namespace),
+    'master_summary',
+    [`${SESSION_NAME_EXPR} = ?`],
+    [sessionName],
+  );
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */
@@ -3741,6 +5031,8 @@ export interface ProcessedProjectionStats {
 }
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
+  const cached = panelCacheGet<ProcessedContextProjection[]>('records', filters);
+  if (cached) return cached;
   const database = ensureDb();
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
 
@@ -3762,14 +5054,29 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
+  // Noise is materialized at write time; never parse summaries while opening
+  // the panel.  A bounded LIKE predicate keeps management search from turning
+  // into an unbounded JS scan when a text query is supplied.
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
+  if (normalizedQuery) {
+    appendTextSearchSql(conditions, params, normalizedQuery);
+  }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   // Apply pagination after all namespace/query/noise filters. The previous
   // limit-before-filter shape could hide older matching project rows behind
   // newer rows from other projects and made exact projection/source lookups
   // unreliable for privacy-safe read tools.
-  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC`;
-  const rows = database.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+  const candidateLimit = normalizedQuery ? Math.min(1000, Math.max(limit * 4, 100)) : limit;
+  // Never select embedding/blob columns for the management list.  The old
+  // SELECT * pulled every vector through the worker even though the panel
+  // only renders these scalar projection fields, making a 50-row page
+  // needlessly compete with startup work.
+  const sql = `SELECT id, namespace_key, class, origin, source_event_ids_json,
+      summary, content_json, content_hash, created_at, updated_at, hit_count,
+      last_used_at, status
+    FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ?`;
+  const rows = database.prepare(sql).all(...params, candidateLimit) as Array<Record<string, unknown>>;
 
   const filtered = rows
     .map((row) => {
@@ -3790,25 +5097,19 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
         status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
       } satisfies ProcessedContextProjection;
     })
-    .filter((projection) => {
-      // Namespace + class JS filters — applied regardless of SQL predicate coverage.
-      if (!namespaceMatchesFilters(projection.namespace, filters)) return false;
-      // Class was already in SQL (when provided); still safe to double-check.
-      if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
-      if (isMemoryNoiseSummary(projection.summary)) return false;
-      if (normalizedQuery) {
-        const haystack = `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`;
-        if (!memoryTextMatchesQuery(haystack, normalizedQuery)) return false;
-      }
-      return true;
-    });
+    .filter((projection) => !normalizedQuery || memoryTextMatchesQuery(
+      `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`,
+      normalizedQuery,
+    ));
 
-  return filtered.slice(0, limit);
+  const result = filtered.slice(0, limit);
+  panelCacheSet('records', filters, result);
+  return result;
 }
 
 /** Increment hit_count and update last_used_at for a list of recalled projection IDs. */
 export function recordMemoryHits(ids: string[]): void {
-  if (ids.length === 0) return;
+  if (ids.length === 0 || !isMemoryDaemonEnabled()) return;
   const database = ensureDb();
   const now = Date.now();
   const stmt = database.prepare('UPDATE context_processed_local SET hit_count = hit_count + 1, last_used_at = ? WHERE id = ?');
@@ -3818,7 +5119,10 @@ export function recordMemoryHits(ids: string[]): void {
 }
 
 export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
+  const cached = panelCacheGet<ProcessedProjectionStats>('stats', filters);
+  if (cached) return cached;
   const database = ensureDb();
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const conditions: string[] = [];
   const params: (string | number)[] = [];
   if (!filters.includeArchived) {
@@ -3829,52 +5133,51 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const rows = database.prepare(`
-    SELECT namespace_key, class, summary, content_json, status
-    FROM context_processed_local
-    ${where}
-  `).all(...params) as Array<Record<string, unknown>>;
-  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
-  let totalRecords = 0;
-  let matchedRecords = 0;
-  let recentSummaryCount = 0;
-  let durableCandidateCount = 0;
-  const projectIds = new Set<string>();
-  for (const row of rows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const status = typeof row.status === 'string' ? row.status : 'active';
-    if (!filters.includeArchived && status !== 'active') continue;
-    const projectionClass = String(row.class) as ProcessedContextClass;
-    if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
-    if (isMemoryNoiseSummary(String(row.summary))) continue;
-    totalRecords += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-    if (projectionClass === 'recent_summary') recentSummaryCount += 1;
-    if (projectionClass === 'durable_memory_candidate') durableCandidateCount += 1;
-    if (!normalizedQuery) {
-      matchedRecords += 1;
-      continue;
-    }
-    const haystack = `${String(row.summary)}\n${JSON.stringify(projectionSemanticContent(parseJson<Record<string, unknown>>(row.content_json, {})))}`.toLowerCase();
-    if (haystack.includes(normalizedQuery)) matchedRecords += 1;
+  const baseConditions = [...conditions];
+  const baseParams = [...params];
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
+  appendProcessedNoiseVisibilitySql(database, baseConditions, baseParams);
+  if (normalizedQuery) {
+    appendTextSearchSql(conditions, params, normalizedQuery);
   }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const aggregate = database.prepare(`
+    SELECT
+      COUNT(*) AS total_records,
+      SUM(CASE WHEN class = 'recent_summary' THEN 1 ELSE 0 END) AS recent_summary_count,
+      SUM(CASE WHEN class = 'durable_memory_candidate' THEN 1 ELSE 0 END) AS durable_candidate_count,
+      COUNT(DISTINCT project_id) AS project_count
+    FROM context_processed_local WHERE ${baseConditions.join(' AND ')}
+  `).get(...baseParams) as Record<string, unknown>;
+  const matchedAggregate = normalizedQuery
+    ? database.prepare('SELECT COUNT(*) AS matched_records FROM context_processed_local ' + where).get(...params) as Record<string, unknown>
+    : aggregate;
+  const matchedRecords = Number(matchedAggregate.matched_records ?? matchedAggregate.total_records ?? 0) || 0;
+  const totalRecords = Number(aggregate.total_records ?? 0) || 0;
+  const recentSummaryCount = Number(aggregate.recent_summary_count ?? 0) || 0;
+  const durableCandidateCount = Number(aggregate.durable_candidate_count ?? 0) || 0;
+  // Project count is the indexed processed projection aggregate. Pending
+  // projects are represented by listMemoryProjectSummaries and must not make
+  // this hot stats path perform a UNION/full-table distinct scan.
+  const projectCount = Number(aggregate.project_count ?? 0) || 0;
   const pending = getPendingContextStats(filters);
-  for (const projectId of pending.projectIds) projectIds.add(projectId);
-  return {
+  const result = {
     totalRecords,
     matchedRecords,
     recentSummaryCount,
     durableCandidateCount,
-    projectCount: projectIds.size,
+    projectCount,
     stagedEventCount: pending.stagedEventCount,
     dirtyTargetCount: pending.dirtyTargetCount,
     pendingJobCount: pending.pendingJobCount,
   };
+  panelCacheSet('stats', filters, result);
+  return result;
 }
 
 export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {}): ContextMemoryProjectView[] {
+  const cached = panelCacheGet<ContextMemoryProjectView[]>('projects', filters);
+  if (cached) return cached;
   const database = ensureDb();
   const conditions: string[] = [];
   const params: (string | number)[] = [];
@@ -3886,53 +5189,52 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = database.prepare(`
-    SELECT namespace_key, project_id, class, summary, updated_at, status
+    SELECT project_id,
+           COUNT(*) AS total_records,
+           SUM(CASE WHEN class = 'recent_summary' THEN 1 ELSE 0 END) AS recent_summary_count,
+           SUM(CASE WHEN class = 'durable_memory_candidate' THEN 1 ELSE 0 END) AS durable_candidate_count,
+           MAX(updated_at) AS updated_at
     FROM context_processed_local
     ${where}
+    AND project_id IS NOT NULL AND project_id <> ''
+    GROUP BY project_id
+    ORDER BY updated_at DESC
+    LIMIT 200
   `).all(...params) as Array<Record<string, unknown>>;
 
   const projects = new Map<string, ContextMemoryProjectView>();
   for (const row of rows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const status = typeof row.status === 'string' ? row.status : 'active';
-    if (!filters.includeArchived && status !== 'active') continue;
-    if (isMemoryNoiseSummary(String(row.summary))) continue;
-    const projectId = namespace.projectId || (typeof row.project_id === 'string' ? row.project_id.trim() : '');
+    const projectId = typeof row.project_id === 'string' ? row.project_id.trim() : '';
     if (!projectId) continue;
-    const projectionClass = String(row.class) as ProcessedContextClass;
-    const updatedAt = Number(row.updated_at) || undefined;
-    const current = projects.get(projectId) ?? {
+    projects.set(projectId, {
       projectId,
       displayName: projectId,
-      totalRecords: 0,
-      recentSummaryCount: 0,
-      durableCandidateCount: 0,
+      totalRecords: Number(row.total_records ?? 0) || 0,
+      recentSummaryCount: Number(row.recent_summary_count ?? 0) || 0,
+      durableCandidateCount: Number(row.durable_candidate_count ?? 0) || 0,
       pendingEventCount: 0,
-      updatedAt,
-    };
-    current.totalRecords += 1;
-    if (projectionClass === 'recent_summary') current.recentSummaryCount += 1;
-    if (projectionClass === 'durable_memory_candidate') current.durableCandidateCount += 1;
-    current.updatedAt = Math.max(current.updatedAt ?? 0, updatedAt ?? 0) || undefined;
-    projects.set(projectId, current);
+      updatedAt: Number(row.updated_at) || undefined,
+    });
   }
 
   const pendingConditions: string[] = [];
   const pendingParams: (string | number)[] = [];
   appendNamespaceFilterSql(pendingConditions, pendingParams, filters);
+  pendingConditions.push("project_id IS NOT NULL AND project_id <> ''");
   const pendingWhere = pendingConditions.length > 0 ? `WHERE ${pendingConditions.join(' AND ')}` : '';
   const pendingRows = database.prepare(`
-    SELECT namespace_key
+    SELECT project_id, COUNT(*) AS pending_event_count
     FROM context_staged_events
     ${pendingWhere}
+    GROUP BY project_id
+    ORDER BY MAX(created_at) DESC
+    LIMIT 200
   `).all(...pendingParams) as Array<Record<string, unknown>>;
   for (const row of pendingRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const projectId = namespace.projectId;
+    const projectId = typeof row.project_id === 'string' ? row.project_id.trim() : '';
     if (!projectId) continue;
     const current = projects.get(projectId) ?? {
       projectId,
@@ -3942,73 +5244,86 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
       durableCandidateCount: 0,
       pendingEventCount: 0,
     };
-    current.pendingEventCount = (current.pendingEventCount ?? 0) + 1;
+    current.pendingEventCount = Number(row.pending_event_count ?? 0) || 0;
     projects.set(projectId, current);
   }
 
-  return Array.from(projects.values())
+  const result = Array.from(projects.values())
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || b.totalRecords - a.totalRecords || a.projectId.localeCompare(b.projectId))
     .slice(0, 200);
+  panelCacheSet('projects', filters, result);
+  return result;
 }
 
 function getPendingContextStats(filters: ProcessedProjectionQuery): {
   stagedEventCount: number;
   dirtyTargetCount: number;
   pendingJobCount: number;
-  projectIds: Set<string>;
+  projectCount: number;
 } {
   const database = ensureDb();
   const dirtyConditions: string[] = [];
   const dirtyParams: (string | number)[] = [];
   appendNamespaceFilterSql(dirtyConditions, dirtyParams, filters);
   const dirtyWhere = dirtyConditions.length > 0 ? `WHERE ${dirtyConditions.join(' AND ')}` : '';
-  const dirtyRows = database.prepare(`
-    SELECT namespace_key, event_count
-    FROM context_dirty_targets
-    ${dirtyWhere}
-  `).all(...dirtyParams) as Array<Record<string, unknown>>;
+  const dirtyStats = database.prepare(`
+    SELECT COALESCE(SUM(event_count), 0) AS staged_event_count,
+           COUNT(*) AS dirty_target_count,
+           COUNT(DISTINCT project_id) AS project_count
+    FROM context_dirty_targets ${dirtyWhere}
+  `).get(...dirtyParams) as Record<string, unknown>;
   const jobConditions: string[] = ["status IN ('pending', 'running')"];
   const jobParams: (string | number)[] = [];
   appendNamespaceFilterSql(jobConditions, jobParams, filters);
-  const pendingJobRows = database.prepare(`
-    SELECT namespace_key
-    FROM context_jobs
-    WHERE ${jobConditions.join(' AND ')}
-  `).all(...jobParams) as Array<Record<string, unknown>>;
-
-  let stagedEventCount = 0;
-  let dirtyTargetCount = 0;
-  let pendingJobCount = 0;
-  const projectIds = new Set<string>();
-
-  for (const row of dirtyRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    stagedEventCount += Number(row.event_count);
-    dirtyTargetCount += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-  }
-
-  for (const row of pendingJobRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    pendingJobCount += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-  }
+  const jobStats = database.prepare(`
+    SELECT COUNT(*) AS pending_job_count, COUNT(DISTINCT project_id) AS project_count
+    FROM context_jobs WHERE ${jobConditions.join(' AND ')}
+  `).get(...jobParams) as Record<string, unknown>;
+  const projectStats = database.prepare(`
+    SELECT COUNT(*) AS project_count FROM (
+      SELECT DISTINCT project_id FROM context_dirty_targets ${dirtyWhere}
+      UNION
+      SELECT DISTINCT project_id FROM context_jobs WHERE ${jobConditions.join(' AND ')}
+    ) WHERE project_id IS NOT NULL AND project_id <> ''
+  `).get(...dirtyParams, ...jobParams) as Record<string, unknown>;
+  const stagedEventCount = Number(dirtyStats.staged_event_count ?? 0) || 0;
+  const dirtyTargetCount = Number(dirtyStats.dirty_target_count ?? 0) || 0;
+  const pendingJobCount = Number(jobStats.pending_job_count ?? 0) || 0;
+  const projectCount = Number(projectStats.project_count ?? 0) || 0;
 
   return {
     stagedEventCount,
     dirtyTargetCount,
     pendingJobCount,
-    projectIds,
+    projectCount,
   };
 }
 
-function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void {
+const STAGED_RECONCILE_BATCH_SIZE = 256;
+const STAGED_RECONCILE_CURSOR_KEY = 'staged_reconcile_rowid';
+
+/** Reconcile at most one projection batch; the cursor keeps startup bounded. */
+function reconcileMaterializedStagedEventsBatchForDb(
+  database: DatabaseSyncInstance,
+  limit = STAGED_RECONCILE_BATCH_SIZE,
+): boolean {
   const stagedRows = database.prepare('SELECT id FROM context_staged_events').all() as Array<Record<string, unknown>>;
-  if (stagedRows.length === 0) return;
+  if (stagedRows.length === 0) return true;
   const stagedIds = new Set(stagedRows.map((row) => String(row.id)));
-  const projectionRows = database.prepare('SELECT source_event_ids_json FROM context_processed_local').all() as Array<Record<string, unknown>>;
+  const cursorRaw = internalGetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY);
+  const cursor = cursorRaw && Number.isSafeInteger(Number(cursorRaw)) ? Number(cursorRaw) : 0;
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const projectionRows = database.prepare(`
+    SELECT rowid, source_event_ids_json
+    FROM context_processed_local
+    WHERE rowid > ?
+    ORDER BY rowid ASC
+    LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; source_event_ids_json: string }>;
+  const nextCursor = projectionRows.length > 0 ? Number(projectionRows[projectionRows.length - 1].rowid) : cursor;
+  if (nextCursor !== cursor) {
+    internalSetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY, String(nextCursor));
+  }
   const matchedIds: string[] = [];
   for (const row of projectionRows) {
     const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);
@@ -4016,10 +5331,20 @@ function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void
       if (stagedIds.has(sourceId)) matchedIds.push(sourceId);
     }
   }
-  if (matchedIds.length === 0) return;
+  if (matchedIds.length === 0) return projectionRows.length < safeLimit;
   const uniqueIds = Array.from(new Set(matchedIds));
   const placeholders = uniqueIds.map(() => '?').join(', ');
   database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...uniqueIds);
+  return projectionRows.length < safeLimit;
+}
+
+function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void {
+  // Retained as a bounded startup pass; idle maintenance advances the cursor.
+  reconcileMaterializedStagedEventsBatchForDb(database);
+}
+
+export function reconcileMaterializedStagedEventsBatch(limit = STAGED_RECONCILE_BATCH_SIZE): boolean {
+  return reconcileMaterializedStagedEventsBatchForDb(ensureDb(), limit);
 }
 
 export function getLocalProcessedFreshness(namespace: ContextNamespace, now = Date.now()): ContextFreshness {
@@ -4139,6 +5464,7 @@ const RECENT_SUMMARY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
  * - Age measured from last_used_at (falls back to updated_at if never used)
  */
 export function pruneLocalMemory(now = Date.now()): { archived: number } {
+  clearPanelReadCache();
   const database = ensureDb();
   const cutoff = now - RECENT_SUMMARY_MAX_AGE_MS;
 
@@ -4159,6 +5485,7 @@ export function pruneLocalMemory(now = Date.now()): { archived: number } {
  * Restore a previously archived projection back to active status.
  */
 export function restoreArchivedMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   const result = database.prepare(`
     UPDATE context_processed_local
@@ -4173,6 +5500,7 @@ export function restoreArchivedMemory(id: string): boolean {
  * Archive an active projection (manual archive by user).
  */
 export function archiveMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   const result = database.prepare(`
     UPDATE context_processed_local
@@ -4189,6 +5517,7 @@ export function archiveMemory(id: string): boolean {
  * Also removes the projection id from pending replication state so deleted items are not re-uploaded.
  */
 export function deleteMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
   try {

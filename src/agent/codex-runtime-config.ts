@@ -2,10 +2,14 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_MODEL_IDS } from '../shared/models/options.js';
+import { CODEX_MODEL_IDS, selectLatestCodexSolModel } from '../shared/models/options.js';
+import { getCodexHome } from '../util/codex-rollout-path.js';
 import { killProcessTree } from '../util/kill-process-tree.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
+import { isMeaningfulCodexCreditsPayload } from '../../shared/codex-credit-history.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../shared/effort-levels.js';
 
 const CACHE_TTL_MS = 30_000;
 const APP_SERVER_TIMEOUT_MS = 5_000;
@@ -15,6 +19,7 @@ export interface CodexModelInfo {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: TransportEffortLevel[];
   isDefault?: boolean;
 }
 
@@ -23,6 +28,10 @@ export interface CodexRuntimeConfig {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: ProviderQuotaMeta;
+  /** Pay-as-you-go usage credit balance (bought once the plan's included quota runs out). Decimal string, e.g. "12.50". */
+  creditsBalance?: string;
+  creditsHasCredits?: boolean;
+  creditsUnlimited?: boolean;
   availableModels?: string[];
   models?: CodexModelInfo[];
   defaultModel?: string;
@@ -33,6 +42,7 @@ export interface CodexRuntimeConfig {
 type CodexRuntimeConfigOptions = boolean | {
   force?: boolean;
   probe?: boolean;
+  useFileCatalogOnCold?: boolean;
 };
 
 interface RateLimitWindow {
@@ -41,10 +51,24 @@ interface RateLimitWindow {
   resetsAt?: number;
 }
 
+/**
+ * The pay-as-you-go usage credit balance sub-object the codex backend nests
+ * under `rateLimits` — DIFFERENT from `rateLimitResetCredits`
+ * (shared/codex-reset-credits.ts), which force-resets the 5h/weekly window
+ * early rather than being a spendable balance. Verified against the live
+ * `account/rateLimits/read` app-server RPC response shape.
+ */
+interface RateLimitCredits {
+  hasCredits?: boolean;
+  unlimited?: boolean;
+  balance?: string;
+}
+
 interface RateLimitSnapshot {
   primary?: RateLimitWindow | null;
   secondary?: RateLimitWindow | null;
   planType?: string | null;
+  credits?: RateLimitCredits | null;
 }
 
 function capitalize(value: string | undefined): string | undefined {
@@ -73,11 +97,20 @@ function decodeJwtPayload(token: string | undefined): Record<string, unknown> | 
   }
 }
 
-async function readCodexPlanTypeFromAuthFile(): Promise<string | undefined> {
+async function readCodexPlanTypeFromAuthFile(codexHome: string = join(homedir(), '.codex')): Promise<string | undefined> {
   try {
-    const raw = await readFile(join(homedir(), '.codex', 'auth.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { access_token?: string; id_token?: string };
-    const candidates = [parsed.access_token, parsed.id_token];
+    const raw = await readFile(join(codexHome, 'auth.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      tokens?: { access_token?: string; id_token?: string };
+      access_token?: string;
+      id_token?: string;
+    };
+    const candidates = [
+      parsed.tokens?.access_token,
+      parsed.tokens?.id_token,
+      parsed.access_token,
+      parsed.id_token,
+    ];
     for (const token of candidates) {
       const payload = decodeJwtPayload(token);
       const auth = payload?.['https://api.openai.com/auth'];
@@ -99,8 +132,60 @@ function buildQuotaDisplay(snapshot: RateLimitSnapshot | null | undefined): Pick
   };
 }
 
-async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | undefined> {
-  return await new Promise<RateLimitSnapshot | undefined>((resolve) => {
+/**
+ * Pull the pay-as-you-go credit balance out of a rate-limit snapshot, if the
+ * codex backend reported one (older/unauthenticated states omit it).
+ */
+function buildCreditsDisplay(
+  snapshot: RateLimitSnapshot | null | undefined,
+): Pick<CodexRuntimeConfig, 'creditsBalance' | 'creditsHasCredits' | 'creditsUnlimited'> {
+  const credits = snapshot?.credits;
+  if (!isMeaningfulCodexCreditsPayload(credits)) return {};
+  return {
+    creditsBalance: credits.balance,
+    creditsHasCredits: credits.hasCredits,
+    creditsUnlimited: credits.unlimited,
+  };
+}
+
+const FIVE_HOUR_WINDOW_MINS = 5 * 60;
+const WEEKLY_WINDOW_MINS = 7 * 24 * 60;
+const WINDOW_DURATION_TOLERANCE_MINS = 15;
+
+/**
+ * Find the window matching `targetDurationMins` (5h or 7d) among `primary`/
+ * `secondary` and return its "percent left". `primary`/`secondary` are NOT a
+ * reliable positional (5h, weekly) pair — verified against the real
+ * `account/rateLimits/read` response, whose top-level `rateLimits.primary`
+ * can itself be the 7d window with `secondary: null` once the 5h window
+ * stops being reported for that limitId. `windowDurationMins` is the only
+ * trustworthy signal for which window is which.
+ */
+function findWindowLeftPercent(snapshot: RateLimitSnapshot | null | undefined, targetDurationMins: number): number | undefined {
+  for (const window of [snapshot?.primary, snapshot?.secondary]) {
+    if (!window || typeof window.windowDurationMins !== 'number' || typeof window.usedPercent !== 'number') continue;
+    if (Math.abs(window.windowDurationMins - targetDurationMins) <= WINDOW_DURATION_TOLERANCE_MINS) {
+      return 100 - window.usedPercent;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Generic codex `app-server` JSON-RPC caller: spawn `codex app-server`, perform
+ * the `initialize` (id=1) → `initialized` handshake, invoke `method` (id=2) with
+ * optional params, and resolve with `pickResult(response)` for the id=2 reply.
+ * Resolves `undefined` on timeout, spawn/stdin error, close-before-reply, or
+ * when `pickResult` returns `undefined`. Codex owns token load/refresh, so we
+ * never touch the OAuth token here. Shared by every app-server read/write so the
+ * handshake + lifecycle guards live in exactly one place.
+ */
+export async function callCodexAppServerMethod<T>(
+  method: string,
+  params: Record<string, unknown> | undefined,
+  pickResult: (msg: Record<string, any>) => T | undefined,
+): Promise<T | undefined> {
+  return await new Promise<T | undefined>((resolve) => {
     const child = spawn('codex', ['app-server'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
@@ -115,7 +200,7 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       void killProcessTree(child);
     };
 
-    const finish = (value: RateLimitSnapshot | undefined) => {
+    const finish = (value: T | undefined) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
@@ -148,11 +233,11 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
           if (msg.id === 1 && msg.result && !initialized) {
             initialized = true;
             safeWriteStdin(JSON.stringify({ method: 'initialized' }) + '\n');
-            safeWriteStdin(JSON.stringify({ method: 'account/rateLimits/read', id: requestId }) + '\n');
+            safeWriteStdin(JSON.stringify({ method, id: requestId, ...(params ? { params } : {}) }) + '\n');
             continue;
           }
-          if (msg.id === requestId && msg.result?.rateLimits) {
-            finish(msg.result.rateLimits as RateLimitSnapshot);
+          if (msg.id === requestId) {
+            finish(pickResult(msg));
             return;
           }
         } catch {
@@ -180,6 +265,14 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       },
     }) + '\n');
   });
+}
+
+async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | undefined> {
+  return callCodexAppServerMethod(
+    'account/rateLimits/read',
+    undefined,
+    (msg) => (msg.result?.rateLimits as RateLimitSnapshot | undefined),
+  );
 }
 
 async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefined> {
@@ -260,13 +353,17 @@ async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefin
                   : '';
               if (!modelId || seen.has(modelId)) continue;
               seen.add(modelId);
+              const supportedEffortLevels = normalizeSupportedEffortLevels(entry.supportedReasoningEfforts);
               discovered.push({
                 id: modelId,
                 ...(typeof entry.displayName === 'string' && entry.displayName.trim()
                   ? { name: entry.displayName.trim() }
                   : {}),
-                ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
-                  ? { supportsReasoningEffort: true }
+                ...(supportedEffortLevels
+                  ? {
+                    supportsReasoningEffort: true,
+                    supportedEffortLevels,
+                  }
                   : {}),
                 ...(entry.isDefault === true ? { isDefault: true } : {}),
               });
@@ -308,7 +405,7 @@ async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefin
   });
 }
 
-let cache: { expiresAt: number; value: CodexRuntimeConfig } | null = null;
+let cache: { expiresAt: number; value: CodexRuntimeConfig; hasLiveCatalog: boolean; codexHome: string } | null = null;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Per-model `base_instructions` lookup
@@ -336,39 +433,93 @@ let cache: { expiresAt: number; value: CodexRuntimeConfig } | null = null;
 // ──────────────────────────────────────────────────────────────────────────
 
 interface ModelsCacheData {
-  /** slug → base_instructions */
+  /** slug → base instructions (legacy `base_instructions` or `model_messages.instructions_template`) */
   map: Map<string, string>;
   /** Slugs in the order codex CLI listed them (newest first by convention). */
   order: string[];
+  /** Visible catalog models from `~/.codex/models_cache.json` for cold-daemon passive reads. */
+  models: CodexModelInfo[];
 }
 
-let modelsFileCache: { expiresAt: number; data: ModelsCacheData } | null = null;
+const modelsFileCache = new Map<string, { expiresAt: number; data: ModelsCacheData }>();
 
-async function loadCodexModelsCache(): Promise<ModelsCacheData> {
+async function loadCodexModelsCache(
+  cachePath: string = join(homedir(), '.codex', 'models_cache.json'),
+): Promise<ModelsCacheData> {
   const now = Date.now();
-  if (modelsFileCache && modelsFileCache.expiresAt > now) {
-    return modelsFileCache.data;
+  const cachedEntry = modelsFileCache.get(cachePath);
+  if (cachedEntry && cachedEntry.expiresAt > now) {
+    return cachedEntry.data;
   }
   const map = new Map<string, string>();
   const order: string[] = [];
+  const models: CodexModelInfo[] = [];
+  const seenModels = new Set<string>();
   try {
-    const raw = await readFile(join(homedir(), '.codex', 'models_cache.json'), 'utf8');
+    const raw = await readFile(cachePath, 'utf8');
     const parsed = JSON.parse(raw) as {
-      models?: Array<{ slug?: unknown; base_instructions?: unknown }>;
+      models?: Array<{
+        slug?: unknown;
+        display_name?: unknown;
+        visibility?: unknown;
+        supported_in_api?: unknown;
+        supported_reasoning_levels?: unknown;
+        base_instructions?: unknown;
+        model_messages?: { instructions_template?: unknown } | null;
+      }>;
     };
-    for (const entry of parsed.models ?? []) {
-      const slug = typeof entry.slug === 'string' ? entry.slug.trim().toLowerCase() : '';
-      const instructions = typeof entry.base_instructions === 'string' ? entry.base_instructions : '';
+    for (const entry of Array.isArray(parsed.models) ? parsed.models : []) {
+      if (!entry || typeof entry !== 'object') continue;
+      const rawSlug = typeof entry.slug === 'string' ? entry.slug.trim() : '';
+      const slug = rawSlug.toLowerCase();
+      const legacyBase = typeof entry.base_instructions === 'string' && entry.base_instructions.trim().length > 0
+        ? entry.base_instructions
+        : '';
+      const modelMessages = entry.model_messages && typeof entry.model_messages === 'object'
+        ? entry.model_messages
+        : undefined;
+      const templateBase = typeof modelMessages?.instructions_template === 'string'
+        && modelMessages.instructions_template.trim().length > 0
+        ? modelMessages.instructions_template
+        : '';
+      const instructions = legacyBase || templateBase;
       if (slug && instructions.length > 0 && !map.has(slug)) {
         map.set(slug, instructions);
         order.push(slug);
+      }
+      if (
+        rawSlug
+        && !seenModels.has(slug)
+        && entry.visibility !== 'hide'
+      ) {
+        seenModels.add(slug);
+        const rawEfforts = Array.isArray(entry.supported_reasoning_levels)
+          ? entry.supported_reasoning_levels.map((item) => (
+            typeof item === 'string'
+              ? item
+              : (item && typeof item === 'object' ? (item as { effort?: unknown }).effort : undefined)
+          ))
+          : undefined;
+        const supportedEffortLevels = normalizeSupportedEffortLevels(rawEfforts);
+        models.push({
+          id: rawSlug,
+          ...(typeof entry.display_name === 'string' && entry.display_name.trim()
+            ? { name: entry.display_name.trim() }
+            : {}),
+          ...(supportedEffortLevels
+            ? {
+              supportsReasoningEffort: true,
+              supportedEffortLevels,
+            }
+            : {}),
+        });
       }
     }
   } catch {
     // Missing file / parse error → empty map; caller falls back.
   }
-  const data: ModelsCacheData = { map, order };
-  modelsFileCache = { expiresAt: now + MODELS_CACHE_FILE_TTL_MS, data };
+  const data: ModelsCacheData = { map, order, models };
+  modelsFileCache.set(cachePath, { expiresAt: now + MODELS_CACHE_FILE_TTL_MS, data });
   return data;
 }
 
@@ -435,22 +586,37 @@ async function readCodexModelsViaSingleton(): Promise<CodexModelInfo[] | undefin
 export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions = false): Promise<CodexRuntimeConfig> {
   const force = typeof options === 'boolean' ? options : options.force === true;
   const probe = typeof options === 'boolean' ? true : options.probe !== false;
+  const useFileCatalogOnCold = typeof options === 'object' && options.useFileCatalogOnCold === true;
+  const codexHome = getCodexHome(process.env);
   const now = Date.now();
-  if (!force && cache && cache.expiresAt > now) return cache.value;
-  if (!probe && cache) return cache.value;
+  if (!force && cache && cache.expiresAt > now && (!useFileCatalogOnCold || (cache.hasLiveCatalog && cache.codexHome === codexHome))) {
+    return cache.value;
+  }
+  if (!probe && cache && (!useFileCatalogOnCold || (cache.hasLiveCatalog && cache.codexHome === codexHome))) {
+    return cache.value;
+  }
 
-  const authPlanType = await readCodexPlanTypeFromAuthFile().catch(() => undefined);
+  const authPlanType = await readCodexPlanTypeFromAuthFile(useFileCatalogOnCold ? codexHome : undefined).catch(() => undefined);
   if (!probe) {
-    const models = fallbackCodexModels();
-    const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;
-    const value: CodexRuntimeConfig = {
+    // Never store this cold-start fallback in `cache`: live readers (the model
+    // picker via provider.listModels) trust `cache` within its TTL, and the
+    // frequent passive session-list/sub-session hydration would otherwise keep
+    // replacing the real app-server catalog with this static/file snapshot.
+    const cachedFileCatalog = useFileCatalogOnCold
+      ? await loadCodexModelsCache(join(codexHome, 'models_cache.json'))
+        .then((data) => data.models)
+        .catch(() => [] as CodexModelInfo[])
+      : [];
+    const models = cachedFileCatalog.length > 0 ? cachedFileCatalog : fallbackCodexModels();
+    const defaultModel = cachedFileCatalog.length > 0
+      ? selectLatestCodexSolModel(models)
+      : (models.find((model) => model.isDefault)?.id ?? models[0]?.id);
+    return {
       ...(authPlanType ? { planLabel: capitalize(authPlanType) } : {}),
       availableModels: models.map((model) => model.id),
       models,
       ...(defaultModel ? { defaultModel } : {}),
     };
-    cache = { expiresAt: now + CACHE_TTL_MS, value };
-    return value;
   }
 
   let discoveredModels: CodexModelInfo[] | undefined;
@@ -465,17 +631,37 @@ export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions =
     ?? await readCodexRateLimitsViaAppServer().catch(() => undefined);
   const planLabel = capitalize((rateLimits?.planType ?? authPlanType ?? undefined) || undefined);
   const quotaDisplay = buildQuotaDisplay(rateLimits);
-  const models = discoveredModels && discoveredModels.length > 0 ? discoveredModels : fallbackCodexModels();
+  const creditsDisplay = buildCreditsDisplay(rateLimits);
+  // This function only runs on a real (non-cached) refresh — the CACHE_TTL_MS
+  // gate above already throttles every caller to at most once per 30s, so no
+  // separate poll loop is needed to keep the local history reasonably dense.
+  // Dispatched through the async context-store worker client (never the
+  // synchronous context-store.js export directly — see
+  // scripts/lint-no-sync-context-store.mjs) and never awaited: best-effort
+  // telemetry that must never block or throw into this hot path.
+  if (isMeaningfulCodexCreditsPayload(rateLimits?.credits)) {
+    void getContextStoreClient().run('recordCodexCreditSnapshot', [{
+      planType: rateLimits?.planType ?? undefined,
+      balance: rateLimits!.credits!.balance,
+      hasCredits: rateLimits!.credits!.hasCredits,
+      unlimited: rateLimits!.credits!.unlimited,
+      fiveHourLeftPercent: findWindowLeftPercent(rateLimits, FIVE_HOUR_WINDOW_MINS),
+      weeklyLeftPercent: findWindowLeftPercent(rateLimits, WEEKLY_WINDOW_MINS),
+    }]).catch(() => {});
+  }
+  const hasLiveCatalog = Boolean(discoveredModels && discoveredModels.length > 0);
+  const models = hasLiveCatalog ? discoveredModels! : fallbackCodexModels();
   const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;
   const value: CodexRuntimeConfig = {
     ...(planLabel ? { planLabel } : {}),
     ...quotaDisplay,
+    ...creditsDisplay,
     availableModels: models.map((model) => model.id),
     models,
     ...(defaultModel ? { defaultModel } : {}),
-    ...(discoveredModels && discoveredModels.length > 0 ? { isAuthenticated: true } : {}),
+    ...(hasLiveCatalog ? { isAuthenticated: true } : {}),
     ...(modelProbeError ? { probeError: modelProbeError } : {}),
   };
-  cache = { expiresAt: now + CACHE_TTL_MS, value };
+  cache = { expiresAt: now + CACHE_TTL_MS, value, hasLiveCatalog, codexHome };
   return value;
 }

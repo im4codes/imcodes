@@ -117,31 +117,6 @@ const OC_TOOL_PATTERNS = [
   /\btool\b/i,
 ];
 
-// ─── Gemini CLI patterns ───────────────────────────────────────────────────────
-
-const GEMINI_IDLE_PATTERNS = [
-  /^\s*>\s*$/m,                        // line that is ONLY ">" — the REPL prompt
-  /^\s*❯\s*$/m,                        // line that is ONLY "❯" — alternate prompt
-  /Type your message or @/m,           // Gemini CLI input prompt (newer versions)
-];
-
-const GEMINI_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-const GEMINI_THINKING_PATTERNS = [
-  /\bThinking\b/i,
-  /\bGenerating\b/i,
-  /esc to cancel/i,            // "(esc to cancel, 2m 44s)" — clear working indicator
-];
-
-const GEMINI_TOOL_PATTERNS = [
-  /\bRunning\b/i,
-  /\bExecuting\b/i,
-  /tool_use/i,
-  // Gemini CLI displays tool calls as ">tool_name args ✓/✗" or "··· N more"
-  /^\s*>\s*\w+.*[✓✗]/m,
-  /···\s*\d+\s*more/,
-];
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function hasSpinner(lines: string[], spinners: string[]): boolean {
@@ -156,22 +131,6 @@ function hasSpinner(lines: string[], spinners: string[]): boolean {
     }
     return lastFew.includes(s);
   });
-}
-
-/** Check if any of the last few non-empty lines starts with a braille spinner character (col 0).
- *  This is the definitive working signal for Gemini CLI — the spinner always appears at the leftmost position. */
-function hasLeadingBrailleSpinner(lines: string[]): boolean {
-  const tail = lines.slice(-8);
-  for (let i = tail.length - 1; i >= 0; i--) {
-    const line = tail[i];
-    if (!line || !line.trim()) continue;
-    // Braille pattern dots: U+2800..U+28FF
-    const firstChar = line.charAt(0);
-    if (firstChar >= '\u2800' && firstChar <= '\u28FF') return true;
-    // Only check last few non-empty lines
-    break;
-  }
-  return false;
 }
 
 function matchesAny(text: string, patterns: RegExp[]): boolean {
@@ -233,22 +192,6 @@ export function detectStatus(
         return 'streaming';
       }
       break;
-
-    case 'gemini': {
-      // Braille spinner at column 0 is the definitive working signal for Gemini CLI.
-      // Check the last few non-empty lines for a leading braille character.
-      const geminiLeadingSpinner = hasLeadingBrailleSpinner(lines);
-      const geminiHasSpinner = geminiLeadingSpinner || hasSpinner(lines, GEMINI_SPINNER_CHARS);
-      // Scan ALL lines for idle prompt — Gemini's ">" prompt can appear anywhere
-      // on screen (not just the last line) after long output.
-      if (matchesAny(text, GEMINI_IDLE_PATTERNS) && !geminiHasSpinner)
-        return 'idle';
-      if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
-      if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
-      if (geminiLeadingSpinner) return 'streaming'; // high-confidence: spinner at col 0
-      if (geminiHasSpinner) return 'streaming';
-      break;
-    }
 
     case 'shell':
       // Shell idle: last non-empty line ends with a common prompt char

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { cosineSimilarity, EMBEDDING_DIM, generateEmbedding, isEmbeddingAvailable } from '../../src/context/embedding.js';
 
 const RUN_REAL = process.env.RUN_REAL_EMBEDDING_TESTS === '1';
@@ -20,6 +20,18 @@ async function expectRelatedBeatsUnrelated(queryText: string, relatedText: strin
 }
 
 describeReal('real multilingual embedding integration', () => {
+  beforeAll(async () => {
+    // Cold HuggingFace Hub downloads can fail transiently before caching completes;
+    // ensureEngineLoaded() clears loadingPromise on transient errors so retrying recovers.
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (await isEmbeddingAvailable()) return;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+      }
+    }
+  }, 180000);
+
   it('loads the real transformers.js model and emits 384-dim vectors', async () => {
     const available = await isEmbeddingAvailable();
     expect(available).toBe(true);

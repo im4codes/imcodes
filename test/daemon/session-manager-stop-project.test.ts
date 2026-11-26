@@ -8,7 +8,6 @@ const {
   upsertSessionMock,
   stopWatchingMock,
   stopCodexWatchingMock,
-  stopGeminiWatchingMock,
   stopOpenCodeWatchingMock,
   repoInvalidateMock,
   timelineEmitMock,
@@ -21,7 +20,6 @@ const {
   upsertSessionMock: vi.fn(),
   stopWatchingMock: vi.fn(),
   stopCodexWatchingMock: vi.fn(),
-  stopGeminiWatchingMock: vi.fn(),
   stopOpenCodeWatchingMock: vi.fn(),
   repoInvalidateMock: vi.fn(),
   timelineEmitMock: vi.fn(),
@@ -54,6 +52,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatching: vi.fn().mockResolvedValue(undefined),
   startWatchingFile: vi.fn().mockResolvedValue(undefined),
   stopWatching: stopWatchingMock,
@@ -70,13 +69,6 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   findRolloutPathByUuid: vi.fn().mockResolvedValue(null),
   extractNewRolloutUuid: vi.fn(),
   ensureSessionFile: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({
-  startWatching: vi.fn().mockResolvedValue(undefined),
-  startWatchingLatest: vi.fn().mockResolvedValue(undefined),
-  stopWatching: stopGeminiWatchingMock,
-  isWatching: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({

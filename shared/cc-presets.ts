@@ -1,3 +1,5 @@
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from './agent-types.js';
+
 export const CC_PRESET_MSG = {
   LIST: 'cc.presets.list',
   LIST_RESPONSE: 'cc.presets.list_response',
@@ -6,6 +8,26 @@ export const CC_PRESET_MSG = {
   DISCOVER_MODELS: 'cc.presets.discover_models',
   DISCOVER_MODELS_RESPONSE: 'cc.presets.discover_models_response',
 } as const;
+
+/**
+ * Agent types that can act as a "custom provider SDK" compatibility layer —
+ * they can be pointed at an arbitrary LLM API endpoint through a CC preset.
+ *
+ * The daemon dispatches preset resolution per provider, but membership is one
+ * concept and must be stated once: a type present here without daemon support
+ * (or the reverse) shows the user an option that silently starts as something
+ * else.
+ */
+export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
+  'claude-code',
+  'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+  'qwen',
+  'deepseek-harness',
+  'pi',
+  'codex-sdk',
+  'codex',
+]);
 
 export interface CcPresetSaveResponse {
   type: typeof CC_PRESET_MSG.SAVE_RESPONSE;
@@ -18,7 +40,7 @@ export type CcPresetTransportMode =
   | 'qwen-compatible-api'
   | 'claude-cli-preset';
 
-export type CcPresetAuthType = 'anthropic';
+export type CcPresetAuthType = 'anthropic' | 'openai';
 
 export interface CcPresetModelInfo {
   id: string;
@@ -38,6 +60,27 @@ export interface CcPreset {
   modelDiscoveryError?: string;
 }
 
+export const DEFAULT_CC_PRESET_CONTEXT_WINDOW = 1_000_000;
+const LEGACY_MINIMAX_M3_CONTEXT_WINDOW = 200_000;
+
+/**
+ * MiniMax-M3 presets created before the 1M default shipped were persisted with
+ * the old generic 200K value. Upgrade only that exact legacy/model pairing so
+ * other providers and deliberate custom limits remain untouched.
+ */
+export function normalizeCcPresetContextWindow(
+  contextWindow: number | undefined,
+  model: string | undefined,
+): number | undefined {
+  if (
+    contextWindow === LEGACY_MINIMAX_M3_CONTEXT_WINDOW
+    && /^minimax-m3(?:$|[-_.])/i.test(model?.trim() ?? '')
+  ) {
+    return DEFAULT_CC_PRESET_CONTEXT_WINDOW;
+  }
+  return contextWindow;
+}
+
 export function normalizeCcPresetName(name: string): string {
   return name.trim().toLowerCase();
 }
@@ -54,11 +97,14 @@ function addUniqueModel(target: string[], value: string | undefined): void {
  * Prefer the launch env model so stale discovery data cannot override what the
  * preset actually pins for provider startup.
  */
-export function getCcPresetEffectiveModel(preset: Pick<CcPreset, 'defaultModel' | 'env'>): string | undefined {
-  const model = preset.env['ANTHROPIC_MODEL']?.trim()
-    || preset.defaultModel?.trim()
-    || preset.env['OPENAI_MODEL']?.trim()
-    || '';
+export function getCcPresetEffectiveModel(
+  preset: Pick<CcPreset, 'defaultModel' | 'env'> & Partial<Pick<CcPreset, 'authType'>>,
+): string | undefined {
+  const isOpenAi = preset.authType === 'openai'
+    || Boolean(preset.env['OPENAI_BASE_URL'] && !preset.env['ANTHROPIC_BASE_URL']);
+  const model = isOpenAi
+    ? (preset.env['OPENAI_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['ANTHROPIC_MODEL']?.trim() || '')
+    : (preset.env['ANTHROPIC_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['OPENAI_MODEL']?.trim() || '');
   return model || undefined;
 }
 
@@ -71,4 +117,23 @@ export function getCcPresetAvailableModelIds(
   addUniqueModel(models, preset.env['OPENAI_MODEL']);
   for (const model of preset.availableModels ?? []) addUniqueModel(models, model.id);
   return models;
+}
+
+export function normalizeCodexBaseUrl(rawUrl: string): string {
+  let url = rawUrl.trim().replace(/\/+$/, '');
+  if (url.endsWith('/anthropic')) {
+    url = `${url.slice(0, -'/anthropic'.length)}/v1`;
+  } else if (!url.endsWith('/v1') && !url.includes('/v1/')) {
+    url = `${url}/v1`;
+  }
+  return url;
+}
+
+export function normalizeCodexProviderId(presetName: string): string {
+  const clean = presetName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  const reserved = new Set(['responses', 'openai', 'amazon-bedrock', 'amazon-bedrock-runtime', 'ollama']);
+  if (!clean || reserved.has(clean)) {
+    return `custom_${clean || 'provider'}`;
+  }
+  return clean;
 }

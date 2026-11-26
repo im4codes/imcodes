@@ -16,9 +16,9 @@ vi.mock('react-i18next', () => ({
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
-        'session.state_running_detail': 'Agent working: {{detail}}',
         'session.state_error': 'Session error',
         'session.state_error_detail': 'Error: {{error}}',
+        'session.state_stop_requested': 'Stop requested',
       };
       if (translations[key]) {
         return translations[key].replace(/\{\{(\w+)\}\}/g, (_, name) => String(opts?.[name] ?? ''));
@@ -57,8 +57,16 @@ vi.mock('../src/hooks/usePref.js', () => ({
   }),
 }));
 
+vi.mock('../src/api/usage-summary.js', () => ({
+  fetchUsageSummary: vi.fn(() => new Promise(() => undefined)),
+}));
+
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { getActiveStatusText, getActiveThinkingTs, getTailSessionStateInfo, hasActiveToolCall } from '../src/thinking-utils.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../src/timeline-running.js';
+import { getLatestTransportActivityDetail } from '../src/transport-activity-status.js';
+import { resolveTimelineBackedSessionState } from '../src/session-live-status.js';
 
 function expectRobotAvatar(root: ParentNode | null | undefined) {
   const avatar = root?.querySelector('.session-live-status-robot-avatar') as HTMLImageElement | null;
@@ -74,46 +82,26 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('renders the execution-clone launcher before summary sync and calls its handler', () => {
+  it('hides the execution-clone launcher and omits moved usage-stats and removed footer history-refresh buttons', () => {
     const onRunExecutionClones = vi.fn();
-    const onSyncMemorySummaries = vi.fn();
     const { container } = render(
       <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        usage={{ inputTokens: 1000, cacheTokens: 2000, contextWindow: 1_000_000 }}
         sessionName="deck_test_brain"
         onRunExecutionClones={onRunExecutionClones}
         runExecutionClonesTitle="Run clones"
         runExecutionClonesCount={3}
-        onSyncMemorySummaries={onSyncMemorySummaries}
       />,
     );
 
-    const cloneButton = screen.getByLabelText('Run clones');
-    const syncButton = screen.getByLabelText('chat.memory_summary_sync');
-    const buttons = Array.from(container.querySelectorAll('button'));
-    expect(buttons.indexOf(cloneButton as HTMLButtonElement)).toBeLessThan(buttons.indexOf(syncButton as HTMLButtonElement));
-    expect(cloneButton.textContent).toContain('🤖');
-    expect(cloneButton.textContent).toContain('×3');
-
-    fireEvent.click(cloneButton);
-    expect(onRunExecutionClones).toHaveBeenCalledTimes(1);
-    expect(onSyncMemorySummaries).not.toHaveBeenCalled();
-  });
-
-  it('disables the execution-clone launcher when requested', () => {
-    const onRunExecutionClones = vi.fn();
-    render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
-        onRunExecutionClones={onRunExecutionClones}
-        runExecutionClonesTitle="No task"
-        runExecutionClonesDisabled
-      />,
-    );
-
-    const cloneButton = screen.getByLabelText('No task') as HTMLButtonElement;
-    expect(cloneButton.disabled).toBe(true);
+    expect(screen.queryByLabelText('Run clones')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-execution-clones')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-session-usage')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-history-refresh')).toBeNull();
+    expect(screen.queryByLabelText('sessionUsage.open')).toBeNull();
+    expect(screen.queryByLabelText('chat.sync_history')).toBeNull();
+    expect(document.body.querySelector('.session-usage-backdrop')).toBeNull();
+    expect(onRunExecutionClones).not.toHaveBeenCalled();
   });
 
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
@@ -143,18 +131,21 @@ describe('UsageFooter', () => {
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
   });
 
-  it('shows transport activity detail when running is blocked by a specific reason', () => {
+  it('hides internal transport activity reasons from the user-facing working status', () => {
     const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
         sessionState="running"
-        transportActivityDetail="provider_compaction"
+        transportActivityDetail="runtime_dispatch, act, provider_compaction"
       />,
     );
 
     const liveStatus = container.querySelector('.session-live-status-inline.running');
-    expect(liveStatus?.textContent).toContain('Agent working: provider_compaction');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(liveStatus?.textContent).not.toContain('runtime_dispatch');
+    expect(liveStatus?.textContent).not.toContain('act');
+    expect(liveStatus?.textContent).not.toContain('provider_compaction');
   });
 
   it('shows the concrete session error reason from the session summary', () => {
@@ -203,8 +194,39 @@ describe('UsageFooter', () => {
       expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
     });
     const burn = container.querySelector('.session-ctx-burn') as HTMLElement | null;
+    const edge = container.querySelector('.session-ctx-burn-edge') as HTMLElement | null;
     expect(burn).toBeTruthy();
     expect(burn?.style.width).toBe('0.8%');
+    expect(edge).toBeTruthy();
+    expect(edge?.style.left).toBe('0.8%');
+  });
+
+  it('moves the MiniMax ctx endpoint and cache segment from live stream usage', async () => {
+    const usage = (inputTokens: number, cacheTokens: number) => ({
+      inputTokens,
+      cacheTokens,
+      contextWindow: 1_000_000,
+      contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+      model: 'MiniMax-M3',
+    });
+    const { container, rerender } = render(
+      <UsageFooter usage={usage(437_967, 0)} sessionName="deck_sub_minimax" />,
+    );
+
+    const input = () => container.querySelector('.session-ctx-input') as HTMLElement | null;
+    const cache = () => container.querySelector('.session-ctx-cache') as HTMLElement | null;
+    expect(input()?.style.width).toBe('43.7967%');
+    expect(cache()?.style.width).toBe('0%');
+
+    // Real MiniMax stream fixture: 5,063 uncached + 452,608 cache-read tokens.
+    rerender(<UsageFooter usage={usage(5_063, 452_608)} sessionName="deck_sub_minimax" />);
+
+    await waitFor(() => {
+      expect(cache()?.style.width).toBe('45.2608%');
+      expect(input()?.style.width).toBe('0.5063%');
+      expect(input()?.style.left).toBe('45.2608%');
+      expect((container.querySelector('.session-ctx-burn-edge') as HTMLElement | null)?.style.left).toBe('45.7671%');
+    });
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {
@@ -267,8 +289,12 @@ describe('UsageFooter', () => {
     expect(toolPref.save).toHaveBeenCalledWith(false);
   });
 
-  it('renders memory summary sync button before the tools toggle and calls the sync handler', () => {
-    const onSync = vi.fn();
+  it('does not render the retired manual memory-summary sync button', () => {
+    const legacySyncProps = {
+      onSyncMemorySummaries: vi.fn(),
+      syncMemorySummariesBusy: false,
+      syncMemorySummariesDisabled: false,
+    };
     const { container } = render(
       <UsageFooter
         usage={{
@@ -278,23 +304,16 @@ describe('UsageFooter', () => {
           model: 'coder-model',
         }}
         sessionName="deck_test_brain"
-        onSyncMemorySummaries={onSync}
+        {...legacySyncProps}
       />,
     );
 
-    const syncButton = container.querySelector('.shortcut-btn-memory-sync') as HTMLButtonElement | null;
-    const toolsButton = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
-    expect(syncButton).toBeTruthy();
-    expect(syncButton?.getAttribute('aria-label')).toBe('chat.memory_summary_sync');
-    expect(Array.from(syncButton!.parentElement!.children).indexOf(syncButton!)).toBeLessThan(
-      Array.from(toolsButton!.parentElement!.parentElement!.children).indexOf(toolsButton!.parentElement!),
-    );
-
-    fireEvent.click(syncButton!);
-    expect(onSync).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.shortcut-btn-memory-sync')).toBeNull();
+    expect(screen.queryByLabelText('chat.memory_summary_sync')).toBeNull();
+    expect(legacySyncProps.onSyncMemorySummaries).not.toHaveBeenCalled();
   });
 
-  it('prioritizes active thinking over stale idle state and renders running states inline', () => {
+  it('keeps the robot idle when only stale thinking remains, and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -309,12 +328,11 @@ describe('UsageFooter', () => {
       />,
     );
 
-    const staleIdleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    const staleIdleStatus = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
     expectRobotAvatar(staleIdleStatus);
-    expect(staleIdleStatus?.textContent).toContain('💭');
-    expect(staleIdleStatus?.getAttribute('aria-label')).toContain('thinking');
-    expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+    expect(staleIdleStatus?.textContent).toContain('💤');
+    expect(staleIdleStatus?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(container.querySelector('.session-live-status-inline.thinking')).toBeNull();
 
     rerender(
       <UsageFooter
@@ -357,7 +375,7 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
   });
 
-  it('keeps live transport turns running even when the session snapshot is stale idle', () => {
+  it('keeps the robot idle when only stale transport-turn evidence remains', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -372,14 +390,34 @@ describe('UsageFooter', () => {
       />,
     );
 
-    const runningStatus = container.querySelector('.session-live-status-inline.running') as HTMLSpanElement | null;
-    expectRobotAvatar(runningStatus);
-    expect(runningStatus?.textContent).toContain('⚙️');
-    expect(runningStatus?.textContent).toContain('Agent working...');
+    const idleStatus = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expectRobotAvatar(idleStatus);
+    expect(idleStatus?.textContent).toContain('💤');
+    expect(idleStatus?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
+  });
+
+  it('switches the robot to running immediately while an optimistic send is unresolved', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        pendingUserSend={true}
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.running')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
     expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
   });
 
-  it('does not show Agent working when timeline tail has settled but the session snapshot is stale running', () => {
+  it('keeps the robot running from authoritative session state even when timeline tail has settled', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -394,8 +432,9 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.textContent ?? '').not.toContain('Agent working');
-    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
+    expect(container.textContent ?? '').toContain('Agent working');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
   });
 
   it('shows tool-call icon when explicit running status text is present', () => {
@@ -420,6 +459,31 @@ describe('UsageFooter', () => {
     expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.getAttribute('aria-label')).toBe('Reading file...');
   });
 
+  it('shows stop requested and cancelled feedback from the shared live status', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 1_000_000, model: 'coder-model' }}
+        sessionName="deck_test_brain"
+        sessionState="stopping"
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.stopping')).toBeTruthy();
+    expect(container.textContent).toContain('Stop requested');
+
+    rerender(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 1_000_000, model: 'coder-model' }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        sessionError="Turn cancelled by user stop"
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.cancelled')).toBeTruthy();
+    expect(container.textContent).toContain('Error: Turn cancelled by user stop');
+  });
+
   it('shows a waiting indicator when idle has an active supervision status', () => {
     const { container } = render(
       <UsageFooter
@@ -435,6 +499,7 @@ describe('UsageFooter', () => {
       />,
     );
 
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
     expect(container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
     expect(container.querySelector('.session-live-status-inline.waiting .session-live-status-emoji.wait')).toBeTruthy();
     expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
@@ -461,7 +526,7 @@ describe('UsageFooter', () => {
   });
 
   it('renders explicit quota label inline in the ctx footer', () => {
-    render(
+    const { container } = render(
       <UsageFooter
         usage={{
           inputTokens: 2000,
@@ -480,6 +545,9 @@ describe('UsageFooter', () => {
     expect(screen.getByText('gpt-5')).toBeDefined();
     expect(screen.getByText(/5h 43% 2h03m 4\/6 14:40/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d04h 4\/8 15:48/)).toBeDefined();
+    const quotaLines = container.querySelectorAll('.session-usage-codex-line-compact');
+    expect(quotaLines).toHaveLength(1);
+    expect(quotaLines[0]?.textContent).toBe('5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48');
   });
 
   it('does not render stale codexStatus data when no explicit quota label is present', () => {
@@ -510,7 +578,7 @@ describe('UsageFooter', () => {
   });
 
   it('recomputes codex quota countdown from quotaMeta', () => {
-    render(
+    const { container } = render(
       <UsageFooter
         usage={{
           inputTokens: 2000,
@@ -541,6 +609,52 @@ describe('UsageFooter', () => {
     expect(screen.queryByText('stale quota text')).toBeNull();
     expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
+    expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
+  });
+
+  it('renders a codex 7d-only quota beside the reset-credit badge', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 190_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          model: 'gpt-5.6-terra',
+        }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaLabel="7d 55% 5d05h 9/26 18:39"
+        quotaMeta={{
+          primary: {
+            usedPercent: 55,
+            windowDurationMins: 7 * 24 * 60,
+            resetsAt: 1_790_419_157,
+          },
+        }}
+        now={1_789_979_157_000}
+        wsClient={{} as never}
+      />,
+    );
+
+    expect(container.querySelector('.codex-credits-trigger')).toBeTruthy();
+    expect(screen.getByText(/7d 55%/)).toBeDefined();
+    expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
+  });
+
+  it('does not hide a 7d-only quota merely because its reset timestamp has elapsed', () => {
+    render(
+      <UsageFooter
+        usage={{ inputTokens: 190_000, cacheTokens: 0, contextWindow: 258_400 }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaMeta={{
+          secondary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_700_000_000 },
+        }}
+        now={1_800_000_000_000}
+      />,
+    );
+
+    expect(screen.getByText(/7d 55% 0m/)).toBeDefined();
   });
 
   it('uses provider-sourced context window before model-family inference', () => {
@@ -558,6 +672,23 @@ describe('UsageFooter', () => {
     );
 
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
+  });
+
+  it('uses a preset-sourced 1M window before model-family inference', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+          model: 'claude-haiku-4-5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 1M (10%)');
   });
 
   it('honors Codex provider effective GPT-5.5 context window', () => {
@@ -614,6 +745,50 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 0 / 922k (0.0%)');
   });
 
+  it('displays the last two segments for multi-segment Gemini models and keeps full ID in tooltip', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 10_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'gemini-4-hydrogen-high',
+        }}
+        sessionName="deck_test_agy"
+        agentType="agy-sdk"
+        modelOverride="gemini-4-hydrogen-high"
+      />,
+    );
+
+    const modelEl = container.querySelector('.session-usage-model');
+    expect(modelEl?.textContent).toBe('hydrogen-high');
+    expect(modelEl?.getAttribute('title')).toBe('gemini-4-hydrogen-high');
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('gemini-4-hydrogen-high');
+  });
+
+  it('keeps newly switched multi-segment model ahead of older versioned usage.model', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'gemini-2.5-pro',
+        }}
+        sessionName="deck_test_agy_switch"
+        agentType="agy-sdk"
+        modelOverride="gemini-4-hydrogen-high"
+      />,
+    );
+
+    const modelEl = container.querySelector('.session-usage-model');
+    expect(modelEl?.textContent).toBe('hydrogen-high');
+    expect(modelEl?.getAttribute('title')).toBe('gemini-4-hydrogen-high · gemini-2.5-pro');
+    const footerTitle = container.querySelector('.session-usage-footer')?.getAttribute('title');
+    expect(footerTitle).toContain('gemini-4-hydrogen-high');
+    expect(footerTitle).toContain('Context: 100k / 1M (10%)');
+  });
+
   // ── Shell / script sessions are not "agents" ────────────────────────────────
   //
   // Regression: shell + script terminals fired session.state(running) on any
@@ -659,5 +834,98 @@ describe('UsageFooter', () => {
       />,
     );
     expect(container.textContent ?? '').not.toContain('Agent idle');
+  });
+
+  it('renders Running background task in real UsageFooter for post-complete background_monitor sequence, and yields to foreground activity, explicit clear, and idle', () => {
+    const renderFromTimeline = (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>, opts?: { sessionState?: string; passTransportDetail?: boolean }) => {
+      const statusText = getActiveStatusText(events);
+      const activeThinkingTs = getActiveThinkingTs(events as any);
+      const activeToolCall = hasActiveToolCall(events);
+      const activeTimelineTurn = hasActiveTimelineTurn(events as any);
+      const pendingUserSend = hasPendingUserSend(events as any);
+      const transportActivityDetail = opts?.passTransportDetail === false ? undefined : getLatestTransportActivityDetail(events as any);
+      const tailInfo = getTailSessionStateInfo(events);
+      const liveState = resolveTimelineBackedSessionState({
+        timelineState: tailInfo.state,
+        sessionState: opts?.sessionState ?? 'running',
+        activeThinking: !!activeThinkingTs,
+        activeToolCall,
+        activeTransportTurn: activeTimelineTurn,
+        timelineStateTs: tailInfo.ts,
+        timelineLastEventTs: events.at(-1)?.ts ?? null,
+      });
+      return render(
+        <UsageFooter
+          usage={{ inputTokens: 100, cacheTokens: 0, contextWindow: 1_000_000 }}
+          sessionName="deck_test_bg_footer"
+          agentType="agy-sdk"
+          sessionState={liveState}
+          statusText={statusText}
+          activeThinkingTs={activeThinkingTs}
+          activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
+          transportActivityDetail={transportActivityDetail}
+          now={10_000}
+        />,
+      );
+    };
+
+    // 1) Real ORD 5513..5517 tail: assistant.text -> agent.status('Running background task') -> usage.update -> session.state(running, background_monitor)
+    const bgEvents = [
+      { type: 'assistant.text', ts: 1000, payload: { text: 'final reply' } },
+      { type: 'agent.status', ts: 1001, payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', ts: 1002, payload: { inputTokens: 100 } },
+      { type: 'session.state', ts: 1003, payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ];
+    const fullView = renderFromTimeline(bgEvents, { passTransportDetail: true });
+    expect(fullView.container.querySelector('.session-live-status-text')?.textContent).toBe('Running background task');
+    expect(fullView.container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
+    fullView.unmount();
+
+    // Pinned-panel path (omits transportActivityDetail) also displays Running background task.
+    const pinnedView = renderFromTimeline(bgEvents, { passTransportDetail: false });
+    expect(pinnedView.container.querySelector('.session-live-status-text')?.textContent).toBe('Running background task');
+    pinnedView.unmount();
+
+    // 2) Negative control: new foreground user prompt + thinking overrides back to thinking/working, never stale background text.
+    const nextTurnView = renderFromTimeline([
+      ...bgEvents,
+      { type: 'user.message', ts: 2000, payload: { text: 'next prompt' } },
+      { type: 'assistant.thinking', ts: 2001, payload: { text: 'reasoning' } },
+      { type: 'session.state', ts: 2002, payload: { state: 'running', blockingWorkCount: 1, activeWorkCount: 2, busyReasons: ['runtime_dispatch', 'background_monitor'] } },
+    ]);
+    expect(nextTurnView.container.querySelector('.session-live-status-text')?.textContent).toContain('thinking');
+    expect(nextTurnView.container.querySelector('.session-live-status-text')?.textContent).not.toBe('Running background task');
+    nextTurnView.unmount();
+
+    // 3) Negative control: tool.result + runtime_dispatch running does not show stale tool label or background label.
+    const toolDoneView = renderFromTimeline([
+      { type: 'tool.call', ts: 3000, payload: { tool: 'Read' } },
+      { type: 'agent.status', ts: 3001, payload: { label: 'Reading file...' } },
+      { type: 'tool.result', ts: 3002, payload: { ok: true } },
+      { type: 'session.state', ts: 3003, payload: { state: 'running', blockingWorkCount: 1, busyReasons: ['runtime_dispatch'] } },
+    ]);
+    expect(toolDoneView.container.querySelector('.session-live-status-text')?.textContent).toBe('Agent working...');
+    toolDoneView.unmount();
+
+    // 4) Negative control: explicit agent.status({ label: null }) clear preserves working/non-background state rather than leaking label.
+    const explicitClearView = renderFromTimeline([
+      { type: 'agent.status', ts: 4000, payload: { label: null } },
+      { type: 'usage.update', ts: 4001, payload: { inputTokens: 100 } },
+      { type: 'session.state', ts: 4002, payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, busyReasons: ['background_monitor'] } },
+    ]);
+    expect(explicitClearView.container.querySelector('.session-live-status-text')?.textContent).toBe('Agent working...');
+    explicitClearView.unmount();
+
+    // 5) Negative control: session.state(idle) clears background status immediately.
+    const idleView = renderFromTimeline([
+      ...bgEvents,
+      { type: 'session.state', ts: 5000, payload: { state: 'idle' } },
+    ], { sessionState: 'idle' });
+    const idleInline = idleView.container.querySelector('.session-live-status-inline.idle');
+    expect(idleInline).toBeTruthy();
+    expect(idleInline?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(idleView.container.querySelector('.session-live-status-text')).toBeNull();
   });
 });

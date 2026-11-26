@@ -1,0 +1,368 @@
+name: build-pc-app
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: PC App V1 release version (optional; defaults to channel auto-version)
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+      - dev
+    paths:
+      - 'apps/pc-app/src/**'
+      - 'apps/pc-app/native/**'
+      - 'apps/pc-app/build/**'
+      - 'apps/pc-app/scripts/**'
+      - 'apps/pc-app/package.json'
+      - 'apps/pc-app/package-lock.json'
+      - 'apps/pc-app/electron-builder.config.mjs'
+      - 'shared/locale-default-servers.ts'
+      - 'scripts/build-pc-app.mjs'
+      - 'scripts/build-macos-bundled-tmux.mjs'
+      - '.github/workflows/build-pc-app.yml'
+    tags:
+      - 'pc-app-v*'
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+
+jobs:
+  check-shell:
+    name: Check PC App Shell Hash
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+      shell_sha256: ${{ steps.check.outputs.shell_sha256 }}
+      channel: ${{ steps.check.outputs.channel }}
+      r2_subpath: ${{ steps.check.outputs.r2_subpath }}
+      update_url: ${{ steps.check.outputs.update_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Compute shell hash and resolve build decision
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF:-}" = "refs/heads/dev" ]; then
+            CHANNEL="dev"
+            R2_SUBPATH="dev/pc-app"
+            UPDATE_URL="https://dl.im.codes/dev/pc-app"
+          else
+            CHANNEL="master"
+            R2_SUBPATH="pc-app"
+            UPDATE_URL="https://dl.im.codes/pc-app"
+          fi
+
+          COMPARE_JSON="$(node scripts/pc-app-shell-hash.mjs --compare-url "${UPDATE_URL}/shell-meta.json")"
+          echo "Shell hash comparison (${CHANNEL}): $COMPARE_JSON"
+          SHELL_SHA256="$(printf '%s' "$COMPARE_JSON" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).localHash))')"
+          CHANGED="$(printf '%s' "$COMPARE_JSON" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(String(Boolean(JSON.parse(d).changed))))')"
+
+          MAJOR_MINOR="$(node -e 'const pkg=require("./apps/pc-app/package.json"); const [maj, min] = String(pkg.version).split("."); process.stdout.write(`${maj}.${min}`)')"
+          DEFAULT_VERSION="${MAJOR_MINOR}.${GITHUB_RUN_NUMBER}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_BUILD="true"
+            RAW_INPUT_VERSION="${{ inputs.build_version }}"
+            VERSION="${RAW_INPUT_VERSION:-$DEFAULT_VERSION}"
+          elif [[ "${GITHUB_REF:-}" == refs/tags/pc-app-v* ]]; then
+            SHOULD_BUILD="true"
+            VERSION="${GITHUB_REF_NAME#pc-app-v}"
+          else
+            SHOULD_BUILD="$CHANGED"
+            VERSION="$DEFAULT_VERSION"
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "invalid PC App build version: $VERSION" >&2
+            exit 1
+          fi
+
+          {
+            echo "should_build=$SHOULD_BUILD"
+            echo "version=$VERSION"
+            echo "shell_sha256=$SHELL_SHA256"
+            echo "channel=$CHANNEL"
+            echo "r2_subpath=$R2_SUBPATH"
+            echo "update_url=$UPDATE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    name: PC App macOS (.dmg + .zip)
+    needs: check-shell
+    if: needs.check-shell.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record macOS Xcode toolchain
+        run: xcodebuild -version
+      - name: Ensure Metal toolchain for mlx-swift shaders
+        run: xcodebuild -downloadComponent MetalToolchain || true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Install root and pc-app dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+          npm --prefix apps/pc-app ci
+      - name: Verify node-exe has no native deps
+        run: npm run check:node-exe-deps
+      - name: Import macOS release-signing identity
+        env:
+          IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
+          IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(node scripts/macos-release-signing.mjs import)"
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+      - name: Write macOS notary API key
+        env:
+          IMCODES_MACOS_NOTARY_KEY_BASE64: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMCODES_MACOS_NOTARY_KEY_BASE64:-}" ]; then
+            echo 'macOS notary API key is required.' >&2
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/imcodes-macos-notary.p8"
+          printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Build and verify universal bundled tmux
+        run: node scripts/build-macos-bundled-tmux.mjs --out-dir dist-node-exe/bundled-tmux-macos
+      - name: Build, sign, notarize (.app), verify, and package macOS .dmg & .zip
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.check-shell.outputs.version }}
+          IMCODES_PC_APP_UPDATE_URL: ${{ needs.check-shell.outputs.update_url }}
+          IMCODES_LOCALE_DEFAULT_SERVERS: ${{ vars.IMCODES_LOCALE_DEFAULT_SERVERS || secrets.IMCODES_LOCALE_DEFAULT_SERVERS }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/build-pc-app.mjs \
+            --platform darwin \
+            --arch universal \
+            --version "$IMCODES_BUILD_VERSION" \
+            --tmux-dir dist-node-exe/bundled-tmux-macos \
+            --require-sign \
+            --require-notarize \
+            --require-mlx
+      - name: Upload macOS PC App artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-pc-app-macos
+          path: |
+            apps/pc-app/release/*.dmg
+            apps/pc-app/release/*.zip
+            apps/pc-app/release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove macOS release-signing material
+        if: always()
+        run: node scripts/macos-release-signing.mjs cleanup
+
+  build-windows:
+    name: PC App Windows (.exe)
+    needs: check-shell
+    if: needs.check-shell.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Install root and pc-app dependencies
+        run: |
+          npm ci
+          npm --prefix apps/pc-app ci
+      - name: Verify node-exe has no native deps
+        run: npm run check:node-exe-deps
+      - name: Cache sherpa-onnx Windows x64 C API SDK
+        uses: actions/cache@v4
+        id: sherpa-cache
+        with:
+          path: ${{ runner.temp }}/sherpa-onnx
+          key: sherpa-onnx-v2.0.3-win-x64-shared-MT-Release-no-tts-e1536db1fcd1
+      - name: Download and verify sherpa-onnx Windows x64 C API SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHERPA_TAG="v2.0.3"
+          SHERPA_ARCHIVE="sherpa-onnx-${SHERPA_TAG}-win-x64-shared-MT-Release-no-tts.tar.bz2"
+          SHERPA_SUBDIR="sherpa-onnx-${SHERPA_TAG}-win-x64-shared-MT-Release-no-tts"
+          SHERPA_SHA256="e1536db1fcd1dde829f3cf26dfdbf60909aee6984983f6cd16b03b1352ac43fc"
+          SHERPA_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_TAG}/${SHERPA_ARCHIVE}"
+          SHERPA_ROOT="$(cygpath -u "${RUNNER_TEMP}")/sherpa-onnx"
+          SHERPA_DIR="${SHERPA_ROOT}/${SHERPA_SUBDIR}"
+          if [ ! -f "${SHERPA_DIR}/include/sherpa-onnx/c-api/c-api.h" ] || [ ! -f "${SHERPA_DIR}/lib/sherpa-onnx-c-api.dll" ]; then
+            rm -rf "${SHERPA_ROOT}"
+            mkdir -p "${SHERPA_ROOT}"
+            ARCHIVE_PATH="${SHERPA_ROOT}/${SHERPA_ARCHIVE}"
+            curl -fsSL -o "${ARCHIVE_PATH}" "${SHERPA_URL}"
+            echo "${SHERPA_SHA256}  ${ARCHIVE_PATH}" | sha256sum -c -
+            tar -xjf "${ARCHIVE_PATH}" -C "${SHERPA_ROOT}"
+            rm -f "${ARCHIVE_PATH}"
+          fi
+          test -f "${SHERPA_DIR}/include/sherpa-onnx/c-api/c-api.h"
+          test -f "${SHERPA_DIR}/lib/sherpa-onnx-c-api.dll"
+          test -f "${SHERPA_DIR}/lib/onnxruntime.dll"
+          echo "IMCODES_SHERPA_ONNX_WIN_DIR=$(cygpath -w "${SHERPA_DIR}")" >> "${GITHUB_ENV}"
+      - name: Import Windows release-signing certificate
+        shell: powershell
+        env:
+          IMCODES_WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_BASE64 }}
+          IMCODES_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD)) {
+            throw 'Windows release-signing secrets are required.'
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate -or -not $certificate.HasPrivateKey) { throw 'Imported signing certificate has no private key.' }
+          Remove-Item -LiteralPath $pfxPath -Force
+          $publicCertificatePath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer'
+          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Force | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          "IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+          "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build, sign, and verify Windows PC App .exe
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.check-shell.outputs.version }}
+          IMCODES_PC_APP_UPDATE_URL: ${{ needs.check-shell.outputs.update_url }}
+          IMCODES_LOCALE_DEFAULT_SERVERS: ${{ vars.IMCODES_LOCALE_DEFAULT_SERVERS || secrets.IMCODES_LOCALE_DEFAULT_SERVERS }}
+        run: node scripts/build-pc-app.mjs --platform win32 --arch x64 --version "$env:IMCODES_BUILD_VERSION" --require-sign --require-win-asr
+      - name: Upload Windows PC App artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-pc-app-windows
+          path: |
+            apps/pc-app/release/*.exe
+            apps/pc-app/release/*.blockmap
+            apps/pc-app/release/latest.yml
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove Windows release-signing material
+        if: always()
+        shell: powershell
+        run: |
+          $certificatePaths = @()
+          if ($env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT) {
+            $certificatePaths = @(
+              "Cert:\CurrentUser\My\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPeople\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPublisher\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
+            )
+            $certificatePaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          }
+          $materialPaths = @(
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'),
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer')
+          )
+          $materialPaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
+          if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
+
+  publish-r2:
+    name: Publish PC App Auto-Update Feed to R2
+    needs: [check-shell, build-macos, build-windows]
+    if: needs.check-shell.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: imcodes-pc-app-macos
+          path: dist-pc-app-r2
+      - uses: actions/download-artifact@v4
+        with:
+          name: imcodes-pc-app-windows
+          path: dist-pc-app-r2
+      - name: Generate shell-meta.json and sync latest PC App release to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_SECRET_ACCESS_KEY }}
+          R2_PREFIX: ${{ vars.CONTROLLED_NODE_ARTIFACT_R2_PREFIX }}
+          R2_SUBPATH: ${{ needs.check-shell.outputs.r2_subpath }}
+          PC_APP_VERSION: ${{ needs.check-shell.outputs.version }}
+          PC_APP_SHELL_SHA256: ${{ needs.check-shell.outputs.shell_sha256 }}
+          PC_APP_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -f dist-pc-app-r2/latest-mac.yml
+          test -f dist-pc-app-r2/latest.yml
+          node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync("dist-pc-app-r2/shell-meta.json", JSON.stringify({
+              version: process.env.PC_APP_VERSION,
+              shellSha256: process.env.PC_APP_SHELL_SHA256,
+              commit: process.env.PC_APP_COMMIT,
+              updatedAt: new Date().toISOString(),
+            }, null, 2) + "\n");
+          '
+          if [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET:-}" ] || [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ]; then
+            echo "Optional R2 secrets not configured; skipping PC App R2 publish."
+            exit 0
+          fi
+          prefix="${R2_PREFIX#/}"
+          prefix="${prefix%/}"
+          subpath="${R2_SUBPATH:-pc-app}"
+          subpath="${subpath#/}"
+          subpath="${subpath%/}"
+          if [ "$subpath" != "pc-app" ] && [ "$subpath" != "dev/pc-app" ]; then
+            echo "invalid R2_SUBPATH: $subpath" >&2
+            exit 1
+          fi
+          dest="s3://${R2_BUCKET}${prefix:+/${prefix}}/${subpath}"
+          export AWS_REQUEST_CHECKSUM_CALCULATION="when_required"
+          export AWS_RESPONSE_CHECKSUM_VALIDATION="when_required"
+          aws_config_file="$(mktemp)"
+          trap 'rm -f "$aws_config_file"' EXIT
+          export AWS_CONFIG_FILE="$aws_config_file"
+          aws configure set default.s3.multipart_threshold 100MB
+          aws configure set default.s3.multipart_chunksize 64MB
+          aws configure set default.s3.max_concurrent_requests 4
+          synced=0
+          for attempt in 1 2 3; do
+            if AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+              AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+              AWS_DEFAULT_REGION="auto" \
+              aws s3 sync dist-pc-app-r2 "$dest" \
+                --delete \
+                --cache-control "no-cache, max-age=0, must-revalidate" \
+                --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+                --no-progress; then
+              synced=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * ${R2_SYNC_RETRY_DELAY_SECONDS:-5}))
+            fi
+          done
+          if [ "$synced" -ne 1 ]; then
+            echo "PC App R2 sync failed after 3 attempts" >&2
+            exit 1
+          fi

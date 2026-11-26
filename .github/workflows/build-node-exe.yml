@@ -1,0 +1,682 @@
+# Build the self-contained controlled-node executable on a per-OS matrix and
+# publish the binaries as artifacts (controlled-node-remote-exec 7.3).
+#
+# Each OS gets its own matrix job (win/macos/linux). The macOS job combines
+# official arm64 and x64 Node slices into one Universal 2 executable. The
+# produced binaries are uploaded as workflow artifacts (the "hosting" for a
+# deploy step that populates the server's IMCODES_NODE_EXE_DIR).
+name: build-node-exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Runtime version advertised by the node and matched by the server
+        required: true
+        type: string
+  push:
+    tags:
+      - 'node-exe-v*'
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+  IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1-7 min; the Windows leg may wait up to 250 min for the SDK producer (--wait-seconds 15000), then builds for up to 30).
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: imcodes-node-linux
+          - os: macos-26
+            artifact: imcodes-node-macos
+          - os: windows-2022
+            artifact: imcodes-node.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Install dependencies
+        run: npm ci
+      # Fail the build if the thin entry pulls in a native/unbundlable dep — a
+      # SEA binary must be self-contained (guards the same invariant the local
+      # `check:node-exe-deps` script enforces).
+      - name: Verify node-exe has no native deps
+        run: npm run check:node-exe-deps
+      - name: Resolve controlled-node runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.build_version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-exe-v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "invalid controlled-node build version: $VERSION" >&2
+            exit 1
+          fi
+          echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Import Windows release-signing certificate
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          IMCODES_WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_BASE64 }}
+          IMCODES_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD)) {
+            throw 'Windows release-signing secrets are required.'
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate -or -not $certificate.HasPrivateKey) { throw 'Imported signing certificate has no private key.' }
+          Remove-Item -LiteralPath $pfxPath -Force
+          $publicCertificatePath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer'
+          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Force | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          "IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+          "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import macOS release-signing identity
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
+          IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(node scripts/macos-release-signing.mjs import)"
+          # The fingerprint, not the common name: a name can match several
+          # certificates, and the build plan pins the exact one it signed with.
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+      - name: Write macOS notary API key
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_BASE64: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMCODES_MACOS_NOTARY_KEY_BASE64:-}" ]; then
+            echo 'macOS notary API key is required.' >&2
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/imcodes-macos-notary.p8"
+          printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Build, sign and describe the aiDesk panel window host
+        uses: ./.github/actions/build-aidesk-ui
+        with:
+          version: ${{ env.IMCODES_BUILD_VERSION }}
+          windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}
+          windows-signing-cert-sha256: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 }}
+      - name: Build controlled-node executable
+        run: npm run build:node-exe
+      - name: Notarize macOS controlled-node executable
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+      - name: Prove the signed macOS executable still runs
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
+          ./dist-node-exe/imcodes-node-macos --version
+      - name: Build and notarize the aiDesk application bundle
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # One signed bundle holding every helper that needs a permission, so
+          # macOS attributes Screen Recording and Accessibility to the app the
+          # person chose rather than to whatever launched a helper. Unlike the
+          # bare executable this one CAN carry its notarization ticket, so it
+          # verifies with no network.
+          # Built during `build:node-exe`, before the manifest recorded the
+          # helper archive's hash -- swapping the archive afterwards makes
+          # every consumer reject the set as tampered with.
+          APP="dist-node-exe/aiDesk.to by IM.codes.app"
+          node scripts/macos-release-signing.mjs notarize "$APP"
+          # notarize already staples and validates with bounded CloudKit retries.
+      - name: Build, sign and notarize the aiDesk disk image
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Built from the app as it now stands, which already carries its own
+          # stapled ticket -- so the app keeps verifying offline after being
+          # dragged out of the image. A disk image rather than a package: both
+          # can be stapled, but one is a drag and the other is a wizard.
+          DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
+          node scripts/macos-release-signing.mjs notarize "$DMG"
+          # notarize already staples and validates with bounded CloudKit retries.
+      # The macOS remote-desktop components, built from the published
+      # immutable SDK. Both architectures are produced here because each ships
+      # thin -- the build plan sets universalBinary = false and the runtime
+      # verifier rejects a fat Mach-O -- and both SDKs carry an arm64
+      # toolchain, so this must run on an Apple silicon runner.
+      - name: Build, sign and notarize the macOS remote-desktop components
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
+          # are already in the job environment, written by the import and
+          # notary-key steps above; these are the two the driver additionally
+          # needs, under the same names macos-release-signing.mjs uses.
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            lock="native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json"
+            tag="$(node -p "require('./$lock').releaseTag")"
+            asset="$(node -p "require('./$lock').assetName")"
+            repository="$(node -p "require('./$lock').repository")"
+            download="$RUNNER_TEMP/libwebrtc-sdk-download-$arch"
+            sdk="$RUNNER_TEMP/libwebrtc-sdk-$arch"
+            mkdir -p "$download"
+            gh release download "$tag" --repo "$repository" --pattern "$asset" \
+              --dir "$download" --clobber
+            node scripts/install-libwebrtc-sdk.mjs --target "macos-$arch" \
+              "$download/$asset" "$sdk"
+            node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+              --target "macos-$arch" "$lock" "$sdk"
+            # The driver, not the build script: it also signs each component
+            # with its own entitlements, notarizes each one, runs the guards the
+            # daemon applies on a user's Mac, and writes the manifest.
+            node scripts/build-macos-remote-desktop-release.mjs \
+              --arch "$arch" \
+              --sdk-root "$sdk" \
+              --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
+              --worker-version "$IMCODES_BUILD_VERSION" \
+              --jobs 3
+            # Reclaimed immediately: two extracted SDKs are ~1.7GB, and the
+            # runner still has the signing and packaging steps to do.
+            rm -rf "$download" "$sdk"
+          done
+      # The Linux remote-desktop worker, from the same published, locked SDK
+      # build-libwebrtc-sdk.sh produces once. See ci.yml's own copy of this
+      # block for the full rationale; kept in sync with it deliberately.
+      - name: Install X11 development libraries, Xvfb, and pulseaudio
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ./scripts/ci-apt-hardening.sh
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio
+      - name: Build and test the Linux remote-desktop worker from the SDK
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/linux-remote-desktop/libwebrtc-sdk.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-archives-linux"
+          sdk="$RUNNER_TEMP/libwebrtc-sdk-linux"
+          mkdir -p "$download"
+          gh release download "$tag" --repo "$repository" --pattern "$asset" \
+            --dir "$download" --clobber
+          node scripts/install-libwebrtc-sdk.mjs --target linux-x64 \
+            "$download/$asset" "$sdk"
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+            --target linux-x64 "$lock" "$sdk"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          export DISPLAY=:99
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          # A bare CI runner has no /proc/asound/cards entry at all (no sound
+          # card, real or virtual), which makes WebRTC's
+          # AudioDeviceModule::Init() hard-abort at session start ("Fatal
+          # error ... Check failed: 0 == adm->Init()") even though the
+          # qualification test never asked for audio -- there was simply
+          # nothing to open. Same fix as install-linux-desktop-environment.sh
+          # uses for a real headless server: pulseaudio gives it a real, if
+          # silent, device.
+          pulseaudio --start --exit-idle-time=-1 || true
+          bash native/linux-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$sdk" \
+            --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
+            --worker-version "$IMCODES_BUILD_VERSION" \
+            --run-native-tests
+          kill "$(cat "$RUNNER_TEMP/xvfb.pid")" 2>/dev/null || true
+          rm -rf "$download" "$sdk"
+      - name: Verify the Linux remote-desktop worker artifact
+        if: runner.os == 'Linux'
+        # The full set check (worker + manifest, exact entries, executable bit, strict manifest, size, sha256, release version): the
+        # server serves the worker only with a matching manifest and a node's self-upgrade preflight fails without both.
+        run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}" linux x64
+      - name: Resolve fixed libwebrtc SDK release
+        if: runner.os == 'Windows'
+        id: libwebrtc_sdk
+        run: node scripts/resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000
+      - name: Restore fixed libwebrtc foundation SDK
+        if: runner.os == 'Windows'
+        id: libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-libwebrtc-sdk
+          key: imcodes-libwebrtc-foundation-${{ runner.os }}-${{ steps.libwebrtc_sdk.outputs.sha256 }}-v1
+      - name: Download fixed libwebrtc foundation SDK
+        if: runner.os == 'Windows' && steps.libwebrtc_sdk_cache.outputs.cache-hit != 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-download'
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download '${{ steps.libwebrtc_sdk.outputs.release_tag }}' `
+            --repo '${{ steps.libwebrtc_sdk.outputs.repository }}' `
+            --pattern '${{ steps.libwebrtc_sdk.outputs.asset_name }}' `
+            --dir $download `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed libwebrtc SDK download failed.' }
+          node scripts/install-libwebrtc-sdk.mjs `
+            (Join-Path $download '${{ steps.libwebrtc_sdk.outputs.asset_name }}') `
+            (Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk')
+      - name: Verify cached fixed libwebrtc foundation SDK
+        if: runner.os == 'Windows'
+        run: >-
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock
+          native/windows-remote-desktop/libwebrtc-sdk.lock.json
+          "${{ runner.temp }}\imcodes-libwebrtc-sdk"
+      - name: Build and test current remote-desktop sources from SDK
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        shell: powershell
+        run: |
+          $buildArguments = @{
+            SdkRoot = "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk"
+            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
+            WorkerVersion = $env:IMCODES_BUILD_VERSION
+            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
+            ExpectedSignerSha256 = $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
+            RequireAuthenticodeSignature = $true
+            RunNativeTests = $true
+          }
+          & .\native\windows-remote-desktop\build-worker-from-sdk.ps1 @buildArguments
+      - name: Verify the produced macOS remote-desktop component sets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per architecture and as a SET: the per-component guards already ran
+          # inside the driver, but this is what checks the manifest describes
+          # exactly the files present, at the version this build claims.
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
+      - name: Verify production remote-desktop worker artifact
+        if: runner.os == 'Windows'
+        run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"
+      - name: Verify every Windows release binary uses one publisher
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $virtualDisplayVerify = Join-Path $env:RUNNER_TEMP 'imcodes-virtual-display-signature-verification'
+          Remove-Item -LiteralPath $virtualDisplayVerify -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath 'dist-node-exe\remote-desktop-worker\win32-x64\imcodes-virtual-display.zip' -DestinationPath $virtualDisplayVerify -Force
+          $artifacts = @(
+            'dist-node-exe\imcodes-node.exe',
+            'dist-node-exe\computer-use-helper\win32-x64\open-computer-use.exe',
+            'dist-node-exe\remote-desktop-worker\win32-x64\imcodes-remote-desktop-worker.exe',
+            (Join-Path $virtualDisplayVerify 'imcodes-virtual-display.dll'),
+            (Join-Path $virtualDisplayVerify 'imcodes-virtual-display.cat')
+          )
+          try {
+            foreach ($artifact in $artifacts) {
+              & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath $artifact -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+            }
+            node scripts/node-exe-artifacts.mjs verify-set dist-node-exe imcodes-node.exe
+          } finally {
+            Remove-Item -LiteralPath $virtualDisplayVerify -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Qualify signed Windows self-upgrade and rollback
+        if: runner.os == 'Windows'
+        run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Build, verify and smoke-test POSIX daemon-runtime bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGETS=(darwin-arm64 darwin-x64)
+          else
+            TARGETS=(linux-x64)
+          fi
+          for TARGET in "${TARGETS[@]}"; do
+            node scripts/build-daemon-runtime.mjs \
+              --target "$TARGET" \
+              --out-dir dist-node-exe/daemon-runtime \
+              --build-version "$IMCODES_BUILD_VERSION"
+            node scripts/daemon-runtime-artifacts.mjs verify \
+              "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.manifest.json" \
+              --expected-version "$IMCODES_BUILD_VERSION"
+            (
+              SMOKE_ROOT=""
+              HOME_ROOT=""
+              trap 'chmod -R u+w "$SMOKE_ROOT" 2>/dev/null || true; rm -rf "$SMOKE_ROOT" "$HOME_ROOT"' EXIT
+              SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
+              HOME_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
+              tar -xzf "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" -C "$SMOKE_ROOT"
+              chmod -R a-w "$SMOKE_ROOT"
+              env -i HOME="$HOME_ROOT" IMCODES_HOME="$HOME_ROOT/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+                "$SMOKE_ROOT/bin/node" "$SMOKE_ROOT/package/dist/src/index.js" --version
+            )
+          done
+      - name: Build, verify and smoke-test Windows daemon-runtime bundle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          try {
+            node scripts/build-daemon-runtime.mjs `
+              --target win32-x64 `
+              --out-dir dist-node-exe/daemon-runtime `
+              --stage-dir $stageRoot `
+              --keep-staging `
+              --build-version $env:IMCODES_BUILD_VERSION
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
+            node scripts/daemon-runtime-artifacts.mjs verify `
+              dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
+              --expected-version $env:IMCODES_BUILD_VERSION `
+              --archive-only
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
+            $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
+            $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
+            Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+            try {
+              powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File .\scripts\windows-zip-archive.ps1 `
+                -Mode Expand `
+                -SourcePath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' `
+                -DestinationPath $smokeRoot
+              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke extraction failed.' }
+              & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+              $prevHome = $env:IMCODES_HOME
+              $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
+              try {
+                & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
+                if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
+              } finally {
+                $env:IMCODES_HOME = $prevHome
+              }
+            } finally {
+              Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          } catch {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+          }
+      - name: Build and smoke-test Linux unified installers (.deb + .sh)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-linux-installer.mjs \
+            --arch x64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-linux-x64.tar.gz \
+            --node-exe dist-node-exe/imcodes-node-linux \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/linux-x64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/linux-x64 \
+            --out-dir dist-node-exe/installers
+          DEB="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
+          SH="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
+          dpkg-deb --info "$DEB"
+          DEB_CONTENTS_TMP="$(mktemp "${RUNNER_TEMP}/imcodes-deb-contents.XXXXXX")"
+          dpkg-deb --contents "$DEB" > "$DEB_CONTENTS_TMP"
+          head -n 40 "$DEB_CONTENTS_TMP"
+          rm -f "$DEB_CONTENTS_TMP"
+          ISO_ROOT="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-iso.XXXXXX")"
+          ISO_HOME="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-home.XXXXXX")"
+          trap 'rm -rf "$ISO_ROOT" "$ISO_HOME"' EXIT
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --check
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --no-service-control
+          env -i HOME="$ISO_HOME" IMCODES_HOME="$ISO_HOME/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$ISO_ROOT/bin/imcodes" --version
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --rollback "$ISO_ROOT/rollback-snapshot"
+      - name: Build, sign/notarize (when installer cert available), and verify macOS .pkg installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          IMCODES_MACOS_INSTALLER_P12_BASE64: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_BASE64 }}
+          IMCODES_MACOS_INSTALLER_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          HAS_INSTALLER_CERT=0
+          if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ] || security find-identity -v "$RUNNER_TEMP/imcodes-macos-release-signing.keychain-db" 2>/dev/null | grep -q "Developer ID Installer:"; then
+            if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ]; then
+              node scripts/macos-release-signing.mjs import-installer >/dev/null
+            fi
+            HAS_INSTALLER_CERT=1
+          fi
+          for MAC_ARCH in arm64 x64; do
+            TARGET="darwin-${MAC_ARCH}"
+            node scripts/build-macos-installer.mjs \
+              --arch "$MAC_ARCH" \
+              --version "$IMCODES_BUILD_VERSION" \
+              --runtime-archive "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" \
+              --app-bundle "dist-node-exe/aiDesk.to by IM.codes.app" \
+              --node-exe dist-node-exe/imcodes-node-macos \
+              --remote-desktop-dir "dist-node-exe/remote-desktop-worker/${TARGET}" \
+              --computer-use-dir dist-node-exe/computer-use-helper/darwin-universal \
+              --out-dir dist-node-exe/installers
+            PKG="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-${TARGET}.pkg"
+            EXPAND_DIR="$(mktemp -d "${RUNNER_TEMP}/imcodes-pkg-expand.XXXXXX")"
+            pkgutil --expand-full "$PKG" "$EXPAND_DIR/pkg"
+            APP_INSIDE="$(find "$EXPAND_DIR/pkg" -maxdepth 4 -name "aiDesk.to by IM.codes.app" -type d | head -n 1)"
+            codesign --verify --strict --verbose=2 "$APP_INSIDE"
+            rm -rf "$EXPAND_DIR"
+            if [ "$HAS_INSTALLER_CERT" -eq 1 ]; then
+              node scripts/macos-release-signing.mjs sign-pkg "$PKG"
+              node scripts/macos-release-signing.mjs notarize "$PKG"
+              node scripts/build-macos-installer.mjs \
+                --refresh-manifest "$PKG" \
+                --arch "$MAC_ARCH" \
+                --version "$IMCODES_BUILD_VERSION" \
+                --signed \
+                --notarized \
+                --has-app-bundle \
+                --has-node-binary
+            fi
+          done
+      - name: Build, sign, and smoke-test Windows Inno Setup (.iss/.exe) installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          try {
+            $isccPath = $null
+            foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+            }
+            if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+              choco install innosetup --no-progress -y | Out-Null
+              foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+              }
+            }
+            $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
+            $buildArgs = @(
+              'scripts\build-windows-installer.mjs',
+              '--version', $env:IMCODES_BUILD_VERSION,
+              '--runtime-dir', $stageRoot,
+              '--node-exe', 'dist-node-exe\imcodes-node.exe',
+              '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
+              '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
+              '--local-ui-dir', $localUiDir,
+              '--out-dir', 'dist-node-exe\installers'
+            )
+            if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
+            node @buildArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
+            $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
+            $isoHome = Join-Path $isoRoot 'home'
+            New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+            try {
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+            } finally {
+              Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          } finally {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Build and verify unified desktop release manifest (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGETS=(darwin-arm64 darwin-x64)
+          else
+            TARGETS=(linux-x64)
+          fi
+          for TARGET in "${TARGETS[@]}"; do
+            node scripts/desktop-release-manifest.mjs build \
+              --target "$TARGET" \
+              --dist-dir dist-node-exe \
+              --release-version "$IMCODES_BUILD_VERSION" \
+              --git-sha "$GITHUB_SHA"
+            node scripts/desktop-release-manifest.mjs verify \
+              "dist-node-exe/desktop-release-${TARGET}.manifest.json" \
+              --dist-dir dist-node-exe \
+              --expected-version "$IMCODES_BUILD_VERSION" \
+              --expected-git-sha "$GITHUB_SHA" \
+              --target "$TARGET"
+          done
+      - name: Build and verify unified desktop release manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/desktop-release-manifest.mjs build `
+            --target win32-x64 `
+            --dist-dir dist-node-exe `
+            --release-version $env:IMCODES_BUILD_VERSION `
+            --git-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest build failed.' }
+          node scripts/desktop-release-manifest.mjs verify `
+            dist-node-exe\desktop-release-win32-x64.manifest.json `
+            --dist-dir dist-node-exe `
+            --expected-version $env:IMCODES_BUILD_VERSION `
+            --expected-git-sha $env:GITHUB_SHA `
+            --target win32-x64
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest verification failed.' }
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist-node-exe/${{ matrix.artifact }}
+            dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/desktop-release*.manifest.json
+            dist-node-exe/computer-use-helper/**
+            dist-node-exe/*.dmg
+            dist-node-exe/remote-desktop-worker/**
+            dist-node-exe/aidesk-local-ui/**
+            dist-node-exe/daemon-runtime/**
+            dist-node-exe/installers/**
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove macOS release-signing material
+        if: always() && runner.os == 'macOS'
+        run: node scripts/macos-release-signing.mjs cleanup
+      - name: Remove Windows release-signing material
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $certificatePaths = @()
+          if ($env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT) {
+            $certificatePaths = @(
+              "Cert:\CurrentUser\My\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPeople\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPublisher\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
+            )
+            $certificatePaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          }
+          $materialPaths = @(
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'),
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer')
+          )
+          $materialPaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
+          if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
+
+
+  build-linux-compat:
+    name: build (Linux x64 glibc 2.17, headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Install dependencies
+        run: npm ci
+      - name: Resolve controlled-node runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.build_version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-exe-v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then exit 1; fi
+          echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Build headless compatibility artifact
+        id: compat
+        uses: ./.github/actions/build-controlled-node-compat
+        with:
+          version: ${{ env.IMCODES_BUILD_VERSION }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.compat.outputs.artifact }}
+          path: |
+            dist-node-exe/${{ steps.compat.outputs.artifact }}
+            dist-node-exe/${{ steps.compat.outputs.artifact }}.manifest.json
+          if-no-files-found: error
+          retention-days: 30

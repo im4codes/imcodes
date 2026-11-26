@@ -12,6 +12,47 @@ function makeDb() {
 }
 
 describe('db queries contracts', () => {
+  it('keeps newer synced preferences when requests complete out of timestamp order', async () => {
+    let stored: string | null = null;
+    const db = makeDb();
+    db.queryOne.mockImplementation(async (sql: string) => sql.startsWith('SELECT value') && stored !== null ? { value: stored } : null);
+    db.execute.mockImplementation(async (_sql: string, params: unknown[]) => { stored = params[2] as string; return { changes: 1 }; });
+    const encode = (v: string[], t: number) => JSON.stringify(JSON.stringify({ v, t }));
+    await queries.setUserPref(db, 'user-1', 'server_pinned', encode(['keep'], 20));
+    await queries.setUserPref(db, 'user-1', 'server_pinned', encode([], 10));
+    expect(stored).toBe(encode(['keep'], 20));
+  });
+
+  it('keeps controlled nodes out of full server listings while preserving legacy rows', async () => {
+    const db = makeDb();
+    db.query
+      .mockResolvedValueOnce([
+        { id: 'full-owned', node_role: 'full' },
+        { id: 'controlled-owned', node_role: 'controlled' },
+        { id: 'legacy-owned', node_role: null },
+      ])
+      .mockResolvedValueOnce([
+        { id: 'controlled-team', node_role: 'controlled' },
+        { id: 'legacy-team' },
+      ]);
+
+    await expect(queries.getFullServersByUserId(db, 'user-1')).resolves.toEqual([
+      { id: 'full-owned', node_role: 'full' },
+      { id: 'legacy-owned', node_role: null },
+      { id: 'legacy-team' },
+    ]);
+  });
+
+  it('does not touch any server data when the owner lock does not match', async () => {
+    const db = makeDb();
+    expect(await queries.deleteServer(db, 'srv-other', 'wrong-owner')).toBe(false);
+    expect(db.transaction).toHaveBeenCalledOnce();
+    expect(db.queryOne).toHaveBeenCalledWith(
+      'SELECT id FROM servers WHERE id = $1 AND user_id = $2 FOR UPDATE', ['srv-other', 'wrong-owner'],
+    );
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
   it('bounds and classifies session text tail cache items', () => {
     const many = Array.from({ length: queries.SESSION_TEXT_TAIL_CACHE_LIMIT + 5 }, (_, index) => ({
       eventId: `evt-${index.toString().padStart(3, '0')}`,
@@ -91,6 +132,52 @@ describe('db queries contracts', () => {
       primaryContextModel: 'gpt-5.4',
       primaryContextPreset: 'balanced',
     });
+    db.queryOne.mockResolvedValueOnce({
+      shared_context_runtime_config: {
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'MiniMax-M2.7',
+        primaryContextPreset: 'Current Preset',
+        memoryRecallMinScore: 0.62,
+      },
+    });
+    const patched = await queries.patchServerSharedContextMemorySettings(
+      db,
+      'srv-1',
+      'user-1',
+      {
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+      },
+      { memoryRecallMinScore: 0.62 },
+    );
+    expect(db.queryOne).toHaveBeenLastCalledWith(
+      expect.stringContaining('|| $2::jsonb'),
+      [
+        expect.any(String),
+        JSON.stringify({ memoryRecallMinScore: 0.62 }),
+        'srv-1',
+        'user-1',
+      ],
+    );
+    expect(patched).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M2.7',
+      primaryContextPreset: 'Current Preset',
+      memoryRecallMinScore: 0.62,
+    });
+    db.queryOne.mockResolvedValueOnce(null);
+    await expect(
+      queries.patchServerSharedContextMemorySettings(
+        db,
+        'srv-missing',
+        'user-1',
+        { primaryContextBackend: 'codex-sdk', primaryContextModel: 'gpt-6-luna' },
+        { memoryRecallMinScore: 0.5 },
+      ),
+    ).resolves.toBeNull();
     await queries.updateServerHeartbeat(db, 'srv-1', '2026.5.11');
     await queries.updateServerHeartbeat(db, 'srv-1');
     await queries.updateServerStatus(db, 'srv-1', 'offline');
@@ -100,7 +187,14 @@ describe('db queries contracts', () => {
     await queries.updateProviderRemoteSessions(db, 'srv-1', 'codex-sdk', [{ id: 'remote-1' }]);
     expect(await queries.updateServerName(db, 'srv-1', 'user-1', 'Renamed')).toBe(true);
     expect(await queries.updateServerToken(db, 'srv-1', 'user-1', 'hash-2', 'Renamed', 'key-2')).toBe(true);
+    db.queryOne.mockResolvedValueOnce({ id: 'srv-1' });
     expect(await queries.deleteServer(db, 'srv-1', 'user-1')).toBe(true);
+    expect(db.execute).toHaveBeenCalledWith('DELETE FROM cron_jobs WHERE server_id = $1', ['srv-1']);
+    expect(db.execute).toHaveBeenCalledWith(
+      expect.stringContaining('revoked_at = COALESCE(revoked_at, $2)'),
+      ['srv-1', expect.any(Number)],
+    );
+    expect(db.execute).toHaveBeenCalledWith('UPDATE servers SET host_server_id = NULL WHERE host_server_id = $1', ['srv-1']);
 
     db.query.mockResolvedValueOnce([{ id: 'srv-1' }]).mockResolvedValueOnce([{ id: 'srv-1' }, { id: 'srv-2' }]);
     expect(await queries.getServersByUserId(db, 'user-1')).toEqual([{ id: 'srv-1' }, { id: 'srv-2' }]);
@@ -309,9 +403,23 @@ describe('db queries contracts', () => {
       }),
     });
     expect(await queries.getServerSharedContextRuntimeConfig(db, 'srv-1')).toMatchObject({
+      modelSelectionMode: 'manual',
       primaryContextModel: 'gpt-5.4',
       backupContextModel: 'gpt-5.4-mini',
       enablePersonalMemorySync: true,
+    });
+
+    db.queryOne.mockResolvedValueOnce({
+      shared_context_runtime_config: JSON.stringify({
+        modelSelectionMode: 'auto',
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+      }),
+    });
+    expect(await queries.getServerSharedContextRuntimeConfig(db, 'srv-1')).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-6-luna',
     });
 
     db.queryOne.mockResolvedValueOnce({ shared_context_runtime_config: { primaryContextModel: '  ' } });
@@ -338,7 +446,8 @@ describe('db queries contracts', () => {
       { eventId: 'evt-2', ts: 2, type: 'assistant.text', text: 'answer' },
     ]);
 
-    db.queryOne.mockResolvedValueOnce({ events: '[]' });
+    db.execute.mockClear();
+    db.queryOne.mockClear();
     await queries.upsertSessionTextTailCacheEvent(db, 'srv-1', {
       sessionId: 'deck_alpha_brain',
       eventId: 'evt-3',
@@ -354,6 +463,22 @@ describe('db queries contracts', () => {
       payload: { text: 'partial', streaming: true },
     });
 
-    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.queryOne).not.toHaveBeenCalled();
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    const [upsertSql, upsertParams] = db.execute.mock.calls[0]!;
+    expect(upsertSql).toContain('INSERT INTO session_text_tail_cache');
+    expect(upsertSql).toContain('ON CONFLICT (server_id, session_name)');
+    expect(upsertParams?.[0]).toBe('srv-1');
+    expect(upsertParams?.[1]).toBe('deck_alpha_brain');
+    expect(JSON.parse(upsertParams?.[2] as string)).toEqual({
+      eventId: 'evt-3',
+      ts: 3,
+      type: 'assistant.text',
+      text: 'final answer',
+    });
+    expect(upsertParams?.[3]).toBe(3);
+    expect(upsertParams?.[4]).toBe(queries.SESSION_TEXT_TAIL_CACHE_LIMIT);
+    expect(upsertParams?.[5]).toBe(queries.SESSION_TEXT_TAIL_TEXT_MAX_CHARS);
   });
 });

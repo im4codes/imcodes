@@ -417,26 +417,3 @@ export function normalizeQwenFileChange(params: {
     raw: params.raw ?? params.input,
   });
 }
-
-export function normalizeGeminiFileChange(params: {
-  toolName?: string;
-  toolCallId?: string;
-  args?: unknown;
-  result?: unknown;
-  status?: string;
-}): FileChangeBatch | null {
-  const normalizedTool = String(params.toolName ?? '').toLowerCase();
-  if (normalizedTool === 'run_shell_command') return null;
-  const patch = normalizeGenericToolPatch(params.args, { result: params.result }, params.toolCallId, params.toolName);
-  if (!patch) return null;
-  if (!normalizedTool.includes('edit') && !normalizedTool.includes('write') && !normalizedTool.includes('file')) {
-    return null;
-  }
-  if (normalizedTool.includes('delete')) patch.operation = 'delete';
-  else if (normalizedTool.includes('rename')) patch.operation = 'rename';
-  else if (normalizedTool.includes('write') && patch.operation === 'unknown') patch.operation = 'update';
-  return toBatch('gemini', [patch], {
-    sourceToolCallId: params.toolCallId,
-    raw: { args: params.args, result: params.result, status: params.status },
-  });
-}

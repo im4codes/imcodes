@@ -42,3 +42,38 @@ export async function mapWithConcurrency<T>(
   };
   await Promise.all(Array.from({ length: cap }, () => worker()));
 }
+
+/**
+ * A concurrency bound that is SHARED by every caller, unlike `mapWithConcurrency` (which bounds one call's own work list): `run(fn)`
+ * starts `fn` at once while fewer than `limit` runs are in flight, and otherwise waits its turn (first come, first served). A run that
+ * throws gives its slot back and rejects only its own caller. Use it where independent triggers (timers, sweeps, requests) can each start
+ * the same kind of work and the total, not each trigger's share, must stay bounded.
+ */
+export interface ConcurrencyGate {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  /** Runs in flight right now (diagnostics/tests). */
+  readonly active: number;
+}
+
+export function createConcurrencyGate(limit: number): ConcurrencyGate {
+  const cap = Math.max(1, Math.trunc(limit) || 1);
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  const release = (): void => {
+    const next = waiting.shift();
+    if (next) next(); // hand the slot over directly: `active` stays counted for the next run
+    else active -= 1;
+  };
+  return {
+    get active() { return active; },
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      if (active < cap) active += 1;
+      else await new Promise<void>((resolve) => { waiting.push(resolve); });
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+  };
+}

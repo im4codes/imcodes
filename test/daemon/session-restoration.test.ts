@@ -13,8 +13,6 @@ const mocks = vi.hoisted(() => ({
   codexStartWatching: vi.fn().mockResolvedValue(undefined),
   codexStartWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
   codexIsWatching: vi.fn().mockReturnValue(false),
-  geminiStartWatching: vi.fn().mockResolvedValue(undefined),
-  geminiIsWatching: vi.fn().mockReturnValue(false),
   restartSession: vi.fn().mockResolvedValue(true),
   newSession: vi.fn().mockResolvedValue(undefined),
   respawnPane: vi.fn().mockResolvedValue(undefined),
@@ -30,6 +28,16 @@ vi.mock('../../src/store/session-store.js', () => ({
     const all = mocks.storeListSessions() || [];
     return all.find(s => s.name === name);
   }),
+  updateSessionState: vi.fn(),
+  removeSession: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: () => ({}),
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -47,9 +55,11 @@ vi.mock('../../src/agent/tmux.js', () => ({
   newSession: mocks.newSession,
   capturePane: vi.fn().mockResolvedValue([]),
   sendKey: vi.fn(),
+  BACKEND: 'tmux',
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatching: mocks.jsonlStartWatching,
   startWatchingFile: mocks.jsonlStartWatchingFile,
   isWatching: mocks.jsonlIsWatching,
@@ -70,13 +80,7 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   extractNewRolloutUuid: vi.fn(),
 }));
 
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({
-  startWatching: mocks.geminiStartWatching,
-  isWatching: mocks.geminiIsWatching,
-  preClaimFile: vi.fn(),
-}));
-
-// We can't easily mock restartSession because it's in the same file as restoreFromStore
+// We can't easily mock internal restartSession because it's in the same file as restoreFromStore
 // and called internally. We provide valid data instead.
 
 vi.mock('child_process', () => ({
@@ -123,22 +127,29 @@ describe('Session Restoration (all agents)', () => {
     setSessionEventCallback(() => {});
   });
 
-  it('restores Gemini watcher for live sessions', async () => {
+  it('gracefully handles legacy gemini and gemini-sdk sessions on restore without crashing', async () => {
     mocks.storeListSessions.mockReturnValue([
       {
-        name: 'deck_proj_brain',
+        name: 'deck_legacy_gem_live',
         agentType: 'gemini',
         projectDir: '/proj',
         geminiSessionId: 'gem-123',
         state: 'running',
         restartTimestamps: [],
       },
+      {
+        name: 'deck_legacy_gem_sdk',
+        agentType: 'gemini-sdk',
+        runtimeType: 'transport',
+        providerId: 'gemini-sdk',
+        projectDir: '/proj',
+        state: 'idle',
+        restartTimestamps: [],
+      },
     ]);
-    mocks.tmuxListSessions.mockResolvedValue(['deck_proj_brain']);
+    mocks.tmuxListSessions.mockResolvedValue(['deck_legacy_gem_live']);
 
-    await restoreFromStore();
-
-    expect(mocks.geminiStartWatching).toHaveBeenCalledWith('deck_proj_brain', 'gem-123');
+    await expect(restoreFromStore()).resolves.toBeUndefined();
   });
 
   it('restores Codex watcher for live sessions', async () => {
@@ -160,7 +171,7 @@ describe('Session Restoration (all agents)', () => {
     expect(mocks.codexStartWatching).toHaveBeenCalledWith('deck_proj_w1', '/proj');
   });
 
-  it('restarts missing sessions of any type', async () => {
+  it('restarts supported missing sessions while degrading legacy missing gemini records cleanly', async () => {
     mocks.storeListSessions.mockReturnValue([
       {
         name: 'deck_missing_gemini',
@@ -179,11 +190,11 @@ describe('Session Restoration (all agents)', () => {
     ]);
     mocks.tmuxListSessions.mockResolvedValue([]);
 
-    await restoreFromStore();
+    await expect(restoreFromStore()).resolves.toBeUndefined();
 
-    // Note: since we can't mock internal restartSession easily, 
-    // it will call the real one which calls newSession.
-    expect(mocks.newSession).toHaveBeenCalled();
+    // Note: since we can't mock internal restartSession easily,
+    // it will call the real one which calls newSession for supported agents.
+    expect(mocks.newSession).toHaveBeenCalledTimes(1);
   });
 
   it('skips restoration for stopped sessions', async () => {

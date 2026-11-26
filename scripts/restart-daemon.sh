@@ -19,8 +19,9 @@ npm link --force
 
 PROJECT_ROOT="$PROJECT_ROOT" node --input-type=module <<'NODE'
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const projectRoot = process.env.PROJECT_ROOT;
 const localManifestPath = join(projectRoot, 'dist/.build-manifest.json');
@@ -29,27 +30,9 @@ if (!existsSync(localManifestPath)) {
 }
 const imcodesBin = execFileSync('bash', ['-lc', 'command -v imcodes'], { encoding: 'utf8' }).trim();
 if (!imcodesBin) throw new Error('imcodes is not on PATH after npm link');
-
-let dir = dirname(realpathSync(imcodesBin));
-let linkedRoot = '';
-for (let i = 0; i < 8; i += 1) {
-  const packageJsonPath = join(dir, 'package.json');
-  if (existsSync(packageJsonPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-      if (pkg.name === 'imcodes') {
-        linkedRoot = dir;
-        break;
-      }
-    } catch {
-      // Keep walking upward.
-    }
-  }
-  const next = dirname(dir);
-  if (next === dir) break;
-  dir = next;
-}
-if (!linkedRoot) throw new Error(`could not locate linked imcodes package root from ${imcodesBin}`);
+const resolverUrl = pathToFileURL(join(projectRoot, 'scripts/resolve-linked-imcodes-root.mjs')).href;
+const { resolveLinkedImcodesPackageRoot } = await import(resolverUrl);
+const linkedRoot = resolveLinkedImcodesPackageRoot(imcodesBin);
 
 const linkedManifestPath = join(linkedRoot, 'dist/.build-manifest.json');
 if (!existsSync(linkedManifestPath)) {
@@ -76,14 +59,28 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   USER_SERVICE="$HOME/.config/systemd/user/imcodes.service"
   if [[ -f "$USER_SERVICE" ]]; then
     LOCAL_EXEC="ExecStart=$PROJECT_ROOT/bin/imcodes-launch.sh start --foreground"
-    if ! grep -Fxq "$LOCAL_EXEC" "$USER_SERVICE"; then
+    if ! grep -Fxq "$LOCAL_EXEC" "$USER_SERVICE" \
+      || ! grep -Fxq "KillMode=control-group" "$USER_SERVICE" \
+      || ! grep -Fxq "TimeoutStopSec=45s" "$USER_SERVICE" \
+      || ! grep -Fxq "SendSIGKILL=yes" "$USER_SERVICE"; then
       backup="$USER_SERVICE.bak.$(date +%Y%m%d%H%M%S)"
       cp -p -- "$USER_SERVICE" "$backup"
       tmp="$(mktemp)"
       awk -v exec_line="$LOCAL_EXEC" '
-        /^ExecStart=/ { print exec_line; replaced=1; next }
+        function emit_missing() {
+          if (!replaced) { print exec_line; replaced=1 }
+          if (!kill_mode) { print "KillMode=control-group"; kill_mode=1 }
+          if (!timeout_stop) { print "TimeoutStopSec=45s"; timeout_stop=1 }
+          if (!send_sigkill) { print "SendSIGKILL=yes"; send_sigkill=1 }
+        }
+        /^\[Service\]$/ { in_service=1; print; next }
+        /^\[/ { if (in_service) emit_missing(); in_service=0; print; next }
+        in_service && /^ExecStart=/ { print exec_line; replaced=1; next }
+        in_service && /^KillMode=/ { print "KillMode=control-group"; kill_mode=1; next }
+        in_service && /^TimeoutStopSec=/ { print "TimeoutStopSec=45s"; timeout_stop=1; next }
+        in_service && /^SendSIGKILL=/ { print "SendSIGKILL=yes"; send_sigkill=1; next }
         { print }
-        END { if (!replaced) print exec_line }
+        END { if (in_service) emit_missing() }
       ' "$USER_SERVICE" >"$tmp"
       mv "$tmp" "$USER_SERVICE"
       if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze --user verify "$USER_SERVICE" >/dev/null 2>&1; then
@@ -91,24 +88,45 @@ if [[ "$(uname -s)" == "Linux" ]]; then
         echo "Patched systemd unit failed verification; restored $backup" >&2
         exit 1
       fi
-      echo "Patched systemd ExecStart to current checkout: $PROJECT_ROOT"
+      echo "Patched systemd ExecStart and bounded cgroup shutdown authority: $PROJECT_ROOT"
     fi
   fi
 fi
 
 # Spawn the restart fully detached:
-#   - setsid (or `nohup` fallback) puts it in a new session so SIGHUP from the
-#     parent shell exiting won't kill it.
+#   - Linux user systemd owns the restart outside the calling process tree and
+#     imcodes.service cgroup. setsid/nohup alone cannot escape cgroup teardown.
+#   - setsid (or `nohup` fallback) protects against SIGHUP only, best effort when
+#     the user manager is unavailable.
 #   - stdout/stderr go to a log so we can inspect failures.
 #   - `&` + `disown` releases it from the current shell's job table.
 LOG="${TMPDIR:-/tmp}/imcodes-restart-daemon.log"
 echo "Detaching restart; logs: $LOG"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
+  LINUX_RESTART='
+    exec >>"$1" 2>&1
+    echo "=== Linux daemon restart started at $(date -Is)"
+    status=0
+    systemctl --user daemon-reload && systemctl --user restart imcodes || status=$?
+    echo "=== Linux daemon restart finished at $(date -Is) (status=$status)"
+    exit "$status"
+  '
+  RESTART_UNIT="imcodes-restart-$(date +%s)-$$"
+  # Keep dispatch synchronous until the manager accepts the transient service;
+  # do not --wait for restart, which may stop the very daemon running this tool.
+  if command -v systemd-run >/dev/null 2>&1 && \
+    systemd-run --user --unit="$RESTART_UNIT" --collect --quiet \
+      --property=Type=exec --setenv="PATH=$PATH" \
+      "$BASH" -c "$LINUX_RESTART" imcodes-restart "$LOG" >>"$LOG" 2>&1; then
+    echo "Restart dispatched via user systemd unit $RESTART_UNIT. Logs: $LOG"
+    exit 0
+  fi
+  echo "User systemd dispatch unavailable; using best-effort setsid/nohup fallback (cannot escape service cgroup teardown)." | tee -a "$LOG" >&2
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c 'systemctl --user daemon-reload && systemctl --user restart imcodes' </dev/null >>"$LOG" 2>&1 &
+    setsid bash -c "$LINUX_RESTART" imcodes-restart "$LOG" </dev/null >>"$LOG" 2>&1 &
   else
-    nohup bash -c 'systemctl --user daemon-reload && systemctl --user restart imcodes' </dev/null >>"$LOG" 2>&1 &
+    nohup bash -c "$LINUX_RESTART" imcodes-restart "$LOG" </dev/null >>"$LOG" 2>&1 &
   fi
 elif [[ "$(uname -s)" == "Darwin" ]]; then
   # Do not call the nested CLI service-restart path from here. When this
@@ -121,6 +139,7 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
     plist="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
     label="gui/$(id -u)/imcodes.daemon"
     pid_file="$HOME/.imcodes/daemon.pid"
+    identity_file="$HOME/.imcodes/daemon.lock.json"
     old_pid=""
     if [[ -f "$pid_file" ]]; then
       old_pid="$(tr -dc "0-9" <"$pid_file" 2>/dev/null || true)"
@@ -130,6 +149,17 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
     fi
     if ! [[ "$old_pid" =~ ^[0-9]+$ ]]; then
       old_pid=""
+    fi
+
+    # A numeric PID is not authority: the kernel may already have reused it.
+    # Require the exact lock-owner process-start token before sending signals.
+    if [[ -n "$old_pid" ]]; then
+      recorded_start="$(node -e "try { const m = JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")); if (m.pid === Number(process.argv[2]) && typeof m.startToken === \"string\") process.stdout.write(m.startToken); } catch {}" "$identity_file" "$old_pid")"
+      current_start="$(ps -o lstart= -p "$old_pid" 2>/dev/null | awk "{\$1=\$1; if (length) print \"ps:\" \$0}")"
+      if [[ -z "$recorded_start" || "$recorded_start" != "$current_start" ]]; then
+        echo "refusing PID-only restart cleanup for $old_pid: exact PID+start identity unavailable or stale"
+        old_pid=""
+      fi
     fi
 
     launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || launchctl unload "$plist" 2>/dev/null || true

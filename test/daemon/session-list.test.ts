@@ -179,7 +179,7 @@ describe('buildSessionList', () => {
     expect(store.getSession('deck_codex_stable_brain')?.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48');
   });
 
-  it('derives transport session state from the live runtime instead of stale persisted store state', async () => {
+  it('derives a permission-waiting transport as running but queue entries from SQLite authority', async () => {
     const store = await import('../../src/store/session-store.js');
     store.upsertSession({
       name: 'deck_qwen_busy_brain',
@@ -196,7 +196,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => 'streaming',
+      getStatus: () => 'permission',
       pendingMessages: ['queued second'],
       pendingEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
     });
@@ -207,10 +207,13 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_qwen_busy_brain',
         state: 'running',
-        transportPendingMessages: ['queued second'],
-        transportPendingMessageEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
+        pendingMessageEntries: [],
+        pendingMessageVersion: 0,
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_qwen_busy_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('nudges an idle transport runtime to drain pending messages before returning the list', async () => {
@@ -254,15 +257,18 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_qwen_idle_pending_brain',
         state: 'running',
-        transportPendingMessages: [],
-        transportPendingMessageEntries: [],
+        pendingMessageEntries: [],
+        pendingMessageVersion: 0,
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_qwen_idle_pending_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('surfaces resend queue entries when a transport runtime is missing', async () => {
     const store = await import('../../src/store/session-store.js');
-    const { enqueueResend } = await import('../../src/daemon/transport-resend-queue.js');
+    const { enqueueResend, recipientFromSessionRecord } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
       name: 'deck_codex_missing_runtime_brain',
       projectName: 'demo',
@@ -278,6 +284,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     enqueueResend('deck_codex_missing_runtime_brain', {
+      recipient: recipientFromSessionRecord(store.getSession('deck_codex_missing_runtime_brain')),
       commandId: 'cmd-offline',
       text: 'queued while offline',
       queuedAt: Date.now(),
@@ -291,15 +298,29 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_codex_missing_runtime_brain',
         state: 'queued',
-        transportPendingMessages: ['queued while offline'],
-        transportPendingMessageEntries: [{ clientMessageId: 'cmd-offline', text: 'queued while offline' }],
+        pendingMessageEntries: [
+          expect.objectContaining({
+            clientMessageId: expect.any(String),
+            commandId: 'cmd-offline',
+            text: 'queued while offline',
+          }),
+        ],
+        pendingMessageVersion: expect.any(Number),
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_codex_missing_runtime_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
+    expect(item.queueSnapshot).toEqual(expect.objectContaining({
+      type: 'transport.queue.snapshot',
+      source: 'session_list',
+      pendingMessageVersion: expect.any(Number),
+    }));
   });
 
   it('does not surface expired resend queue entries as pending work', async () => {
     const store = await import('../../src/store/session-store.js');
-    const { enqueueResend, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
+    const { enqueueResend, recipientFromSessionRecord, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
       name: 'deck_codex_expired_resend_brain',
       projectName: 'demo',
@@ -315,6 +336,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     enqueueResend('deck_codex_expired_resend_brain', {
+      recipient: recipientFromSessionRecord(store.getSession('deck_codex_expired_resend_brain')),
       commandId: 'cmd-expired',
       text: 'expired queued while offline',
       queuedAt: Date.now() - RESEND_EXPIRY_MS - 1,
@@ -328,10 +350,20 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_codex_expired_resend_brain',
         state: 'running',
-        transportPendingMessages: [],
-        transportPendingMessageEntries: [],
+        pendingMessageEntries: [],
+        failedMessageEntries: [
+          expect.objectContaining({
+            commandId: 'cmd-expired',
+            text: 'expired queued while offline',
+            failureReason: 'expired',
+          }),
+        ],
+        pendingMessageVersion: expect.any(Number),
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_codex_expired_resend_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('preset-backed qwen sessions surface preset model + BYO tier, dropping OAuth labels', async () => {
@@ -472,5 +504,41 @@ describe('buildSessionList', () => {
         }),
       }),
     });
+  });
+
+  it('replays the daemon-owned heartbeat deadline in a fresh session_list snapshot', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_heartbeat_brain',
+      projectName: 'heartbeat',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    const projection = await import('../../src/daemon/supervision-heartbeat-projection.js');
+    projection.setSupervisionHeartbeatProjection('deck_heartbeat_brain', {
+      state: 'armed',
+      kind: 'waiting',
+      nextHeartbeatAt: 20_000,
+      updatedAt: 10_000,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    expect(await buildSessionList()).toEqual([
+      expect.objectContaining({
+        name: 'deck_heartbeat_brain',
+        supervisionHeartbeat: {
+          state: 'armed',
+          kind: 'waiting',
+          nextHeartbeatAt: 20_000,
+          updatedAt: expect.any(Number),
+        },
+      }),
+    ]);
   });
 });

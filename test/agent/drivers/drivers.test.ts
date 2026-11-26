@@ -3,6 +3,7 @@ import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
 import { ShellDriver } from '../../../src/agent/drivers/shell.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 
 // ── Claude Code ───────────────────────────────────────────────────────────────
 
@@ -27,6 +28,13 @@ describe('ClaudeCodeDriver', () => {
     const cmd = driver.buildLaunchCommand('deck_proj_brain', { cwd: '/home/user/proj' });
     expect(cmd).toContain('cd');
     expect(cmd).toContain('/home/user/proj');
+  });
+
+  it('puts permanent cron authorization in the process system prompt on launch and resume', () => {
+    expect(driver.buildLaunchCommand('deck_proj_brain', { fresh: true }))
+      .toContain(`--append-system-prompt ${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
+    expect(driver.buildResumeCommand('deck_proj_brain', { ccSessionId: 'cc-1' }))
+      .toContain(`--append-system-prompt ${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
   });
 
   it('buildResumeCommand includes -c flag', () => {
@@ -81,14 +89,105 @@ describe('ClaudeCodeDriver', () => {
 
     const done = driver.postLaunch!(capturePane, sendKey);
     await vi.advanceTimersByTimeAsync(1_500);
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(700);
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
     await done;
 
     expect(sendKey).toHaveBeenCalledTimes(1);
     expect(sendKey).toHaveBeenCalledWith('Enter');
+  });
+
+  it('postLaunch selects Yes in the arrow trust-folder menu', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Security guide',
+        'No, exit',
+        'Yes, I trust this folder',
+        'Enter to confirm',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey).toHaveBeenCalledTimes(2);
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Down', 'Enter']);
+  });
+
+  it('postLaunch keeps the numbered trust-folder compatibility path', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Do you trust the files in this folder?',
+        '1. Yes, I trust this folder',
+        '2. No, exit',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['1', 'Enter']);
+  });
+
+  it('postLaunch keeps the explicit legacy default-confirmation path', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Do you trust the files in this folder?',
+        '[Y/n]',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Enter']);
+  });
+
+  it('postLaunch does not authorize unrelated security text or an incomplete menu', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce(['Security guide', 'Do you trust the files in this folder?', 'No, exit'])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_500);
+    await done;
+
+    expect(sendKey).not.toHaveBeenCalled();
+  });
+
+  it('postLaunch matches arrow trust text across lines and whitespace', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'NO,   EXIT',
+        'Yes, I trust',
+        'this',
+        'folder',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Down', 'Enter']);
   });
 });
 
@@ -109,6 +208,12 @@ describe('CodexDriver', () => {
   it('buildResumeCommand returns resume command', () => {
     const cmd = driver.buildResumeCommand('deck_proj_w1');
     expect(cmd).toBeTruthy();
+  });
+
+  it('puts permanent cron authorization in process developer instructions on launch and resume', () => {
+    const expected = JSON.stringify(`developer_instructions=${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
+    expect(driver.buildLaunchCommand('deck_proj_w1', { fresh: true })).toContain(`-c ${expected}`);
+    expect(driver.buildResumeCommand('deck_proj_w1', { codexSessionId: 'codex-1' })).toContain(`-c ${expected}`);
   });
 
   it('captureLastResponse uses capture-pane (no /copy)', async () => {

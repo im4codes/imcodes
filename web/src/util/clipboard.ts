@@ -13,31 +13,199 @@
  * resolves so they can flip their UI into a "Copied!" state without having
  * to know which path succeeded.
  */
-export function copyToClipboard(text: string, onSuccess: () => void): void {
-  if (!text) return;
+/** The only MIME type any of this needs, and the one every browser allows. */
+const CLIPBOARD_TEXT_TYPE = 'text/plain';
+
+/**
+ * Copy text that does not exist yet.
+ *
+ * Every "copy" button whose text comes from the network has the same problem
+ * on iOS: Safari only lets a page write to the clipboard while the user's tap
+ * is still counted as a *transient activation*, and awaiting a request spends
+ * it. By the time the mint returns there is no activation left, so
+ * `writeText` is refused -- and so is the `execCommand` fallback, which needs
+ * the same activation. The page then reports "check your clipboard
+ * permissions" at someone whose permissions were never the problem. Chrome and
+ * most Android browsers allow the late write as long as the document is
+ * focused, which is why the button works on one phone and not on another.
+ *
+ * The supported way round it is to hand the clipboard the PROMISE, inside the
+ * gesture, and let the browser hold the slot open until it settles. That is
+ * what `ClipboardItem` accepts a promise for.
+ *
+ * Must be called synchronously from the event handler. An `await` before it
+ * puts us back where we started.
+ */
+export function copyToClipboardWhenReady(
+  pending: Promise<string>,
+  onSuccess: () => void,
+  onFailure: () => void = () => {},
+): void {
+  // Late path: resolve first, then copy. Correct everywhere except where the
+  // activation has already expired, so it is the fallback rather than the
+  // default.
+  const copyOnceResolved = (): void => {
+    pending.then(
+      (text) => copyToClipboard(text, onSuccess, onFailure),
+      // A rejected promise is the caller's to report -- it means the text
+      // could not be fetched, which is not a clipboard problem and must not be
+      // described as one.
+      () => onFailure(),
+    );
+  };
+
+  const clipboard = navigator.clipboard;
+  const Item = (globalThis as { ClipboardItem?: typeof ClipboardItem }).ClipboardItem;
+  if (!clipboard?.write || typeof Item !== 'function') {
+    copyOnceResolved();
+    return;
+  }
+
+  const blobPromise = pending.then((text) => {
+    if (!text) return Promise.reject(new Error('empty_clipboard_text'));
+    return new Blob([text], { type: CLIPBOARD_TEXT_TYPE });
+  });
+  // Keep an explicit rejection handler on blobPromise so a throwing
+  // ClipboardItem constructor or an early write() rejection never leaves an
+  // unhandled rejection when pending is empty or rejects.
+  blobPromise.catch(() => {});
+
+  let item: ClipboardItem;
+  try {
+    item = new Item({
+      [CLIPBOARD_TEXT_TYPE]: blobPromise,
+    });
+  } catch {
+    // A browser with `ClipboardItem` that refuses a promise value.
+    copyOnceResolved();
+    return;
+  }
+
+  clipboard.write([item]).then(onSuccess, copyOnceResolved);
+}
+
+export function copyToClipboard(
+  text: string,
+  onSuccess: () => void,
+  onFailure: () => void = () => {},
+): void {
+  if (!text) {
+    onFailure();
+    return;
+  }
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
-      execCommandCopy(text, onSuccess);
+      execCommandCopy(text, onSuccess, onFailure);
     });
     return;
   }
-  execCommandCopy(text, onSuccess);
+  execCommandCopy(text, onSuccess, onFailure);
 }
 
-function execCommandCopy(text: string, onSuccess: () => void): void {
+function execCommandCopy(text: string, onSuccess: () => void, onFailure: () => void): void {
+  const selection = window.getSelection();
+  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  let ta: HTMLTextAreaElement | null = null;
+  let copyEventHandled = false;
+  const onCopy = (event: ClipboardEvent) => {
+    if (!event.clipboardData) return;
+    event.preventDefault();
+    event.clipboardData.setData('text/plain', text);
+    copyEventHandled = true;
+  };
+
   try {
-    const ta = document.createElement('textarea');
+    ta = document.createElement('textarea');
     ta.value = text;
+    ta.readOnly = true;
+    ta.tabIndex = -1;
+    ta.setAttribute('aria-hidden', 'true');
     ta.style.position = 'fixed';
+    ta.style.left = '0';
+    ta.style.top = '0';
+    ta.style.width = '1px';
+    ta.style.height = '1px';
     ta.style.opacity = '0';
+    ta.style.pointerEvents = 'none';
+    ta.style.fontSize = '16px';
     document.body.appendChild(ta);
+    selection?.removeAllRanges();
+    ta.focus({ preventScroll: true });
     ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    onSuccess();
+    ta.setSelectionRange(0, ta.value.length);
+    document.addEventListener('copy', onCopy);
+    const commandCopied = document.execCommand('copy');
+    if (copyEventHandled || commandCopied) onSuccess();
+    else onFailure();
   } catch {
-    // No clipboard available. Callers that surface a "Copied!" state will
-    // simply not flip; the user can long-press inside the source element
-    // and use the native callout instead.
+    onFailure();
+  } finally {
+    document.removeEventListener('copy', onCopy);
+    ta?.remove();
+    // Do not restore an ambient page selection. Safari can leave a stale
+    // full-page selection behind after double-tap zoom; restoring it would
+    // make the next native copy action capture surrounding app chrome again.
+    selection?.removeAllRanges();
+    if (activeElement?.isConnected) activeElement.focus({ preventScroll: true });
+  }
+}
+
+export type ClipboardReadResult =
+  | { ok: true; text: string }
+  | { ok: false; reason: 'empty' | 'unavailable' };
+
+type NativeClipboardPlugin = {
+  readText(): Promise<{ text?: string }>;
+};
+
+let nativeClipboardPlugin: NativeClipboardPlugin | null | undefined;
+
+async function getNativeClipboard(): Promise<NativeClipboardPlugin | null> {
+  const cap = (globalThis as {
+    Capacitor?: {
+      isNativePlatform?: () => boolean;
+      isPluginAvailable?: (name: string) => boolean;
+    };
+  }).Capacitor;
+  if (!cap || typeof cap.isNativePlatform !== 'function' || !cap.isNativePlatform()) {
+    return null;
+  }
+  if (typeof cap.isPluginAvailable === 'function' && !cap.isPluginAvailable('NativeClipboard')) {
+    return null;
+  }
+  if (nativeClipboardPlugin !== undefined) return nativeClipboardPlugin;
+  try {
+    const { registerPlugin } = await import('@capacitor/core');
+    const plugin = registerPlugin<NativeClipboardPlugin>('NativeClipboard');
+    // Wrap Capacitor's Proxy so async return does not probe `.then()` as a native method.
+    nativeClipboardPlugin = { readText: () => plugin.readText() };
+    return nativeClipboardPlugin;
+  } catch {
+    nativeClipboardPlugin = null;
+    return null;
+  }
+}
+
+/** Read trimmed plain text from native Android clipboard bridge or Web Clipboard API. */
+export async function readFromClipboard(): Promise<ClipboardReadResult> {
+  const nativeClipboard = await getNativeClipboard();
+  if (nativeClipboard) {
+    try {
+      const res = await nativeClipboard.readText();
+      const text = typeof res?.text === 'string' ? res.text.trim() : '';
+      return text ? { ok: true, text } : { ok: false, reason: 'empty' };
+    } catch {
+      // Fall through to Web Clipboard API if native bridge fails
+    }
+  }
+  if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+    return { ok: false, reason: 'unavailable' };
+  }
+  try {
+    const raw = await navigator.clipboard.readText();
+    const text = raw.trim();
+    return text ? { ok: true, text } : { ok: false, reason: 'empty' };
+  } catch {
+    return { ok: false, reason: 'unavailable' };
   }
 }

@@ -1,0 +1,455 @@
+import Foundation
+
+// MARK: - Captured Audio Chunk
+
+/// A timestamped chunk produced by a live audio capture source.
+///
+/// `hostTime` is the host-clock time of the first input frame before
+/// resampling. Capture APIs leave it nil only when the underlying audio API
+/// did not provide a valid host timestamp. Consumers can use the shared host
+/// clock to order independently captured streams without mixing their PCM.
+public struct CapturedAudioChunk: Sendable, Equatable {
+    /// Mono Float32 PCM at `sampleRate`.
+    public let samples: [Float]
+    /// Delivered sample rate after capture-side resampling.
+    public let sampleRate: Int
+    /// Mach host-clock time for the first captured input frame, when valid.
+    public let hostTime: UInt64?
+
+    /// Zero-based index of the first sample in the source stream.
+    /// Live sources may leave this at zero when they do not track an offset.
+    public let frameIndex: Int64
+
+    /// True when this is the last chunk from a finite source.
+    public let isFinal: Bool
+
+    public init(
+        samples: [Float],
+        sampleRate: Int,
+        hostTime: UInt64?,
+        frameIndex: Int64 = 0,
+        isFinal: Bool = false
+    ) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+        self.hostTime = hostTime
+        self.frameIndex = frameIndex
+        self.isFinal = isFinal
+    }
+}
+
+// MARK: - Model Memory Management
+
+/// Memory statistics for a loaded model.
+public struct ModelMemoryStats: Sendable {
+    /// Estimated weight memory in bytes
+    public let weightMemory: Int
+    /// Current active GPU memory in bytes (MLX only)
+    public let activeMemory: Int
+
+    public init(weightMemory: Int, activeMemory: Int = 0) {
+        self.weightMemory = weightMemory
+        self.activeMemory = activeMemory
+    }
+}
+
+/// A model that supports explicit memory management.
+///
+/// Call `unload()` to release model weights and free GPU memory.
+/// After unloading, the model cannot be used for inference until re-loaded.
+public protocol ModelMemoryManageable: AnyObject {
+    /// Whether the model is currently loaded and ready for inference.
+    var isLoaded: Bool { get }
+
+    /// Release model weights and free GPU memory.
+    ///
+    /// After calling this, `isLoaded` returns false and inference methods will fail.
+    /// To use the model again, create a new instance via `fromPretrained()`.
+    func unload()
+
+    /// Estimated memory footprint of the loaded model weights in bytes.
+    /// Returns 0 if the model is not loaded.
+    var memoryFootprint: Int { get }
+}
+
+// MARK: - Unified Audio Chunk
+
+/// A chunk of audio produced during streaming synthesis or generation.
+public struct AudioChunk: Sendable {
+    /// PCM audio samples (Float32)
+    public let samples: [Float]
+    /// Sample rate in Hz (e.g. 24000)
+    public let sampleRate: Int
+    /// Index of the first frame in this chunk
+    public let frameIndex: Int
+    /// True if this is the last chunk
+    public let isFinal: Bool
+    /// Wall-clock seconds since generation started (nil if not tracked)
+    public let elapsedTime: Double?
+    /// Text tokens generated alongside audio (populated on final chunk if available)
+    public let textTokens: [Int32]
+
+    public init(
+        samples: [Float],
+        sampleRate: Int,
+        frameIndex: Int,
+        isFinal: Bool,
+        elapsedTime: Double? = nil,
+        textTokens: [Int32] = []
+    ) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+        self.frameIndex = frameIndex
+        self.isFinal = isFinal
+        self.elapsedTime = elapsedTime
+        self.textTokens = textTokens
+    }
+}
+
+// MARK: - Aligned Word
+
+/// A word with its aligned start and end timestamps (in seconds).
+public struct AlignedWord: Sendable {
+    public let text: String
+    public let startTime: Float
+    public let endTime: Float
+
+    public init(text: String, startTime: Float, endTime: Float) {
+        self.text = text
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
+// MARK: - Speech Generation (TTS)
+
+/// A text-to-speech model that generates audio from text.
+public protocol SpeechGenerationModel: AnyObject {
+    /// Output sample rate in Hz
+    var sampleRate: Int { get }
+    /// Synthesize audio from text (returns full waveform)
+    func generate(text: String, language: String?) async throws -> [Float]
+    /// Synthesize audio from text with streaming output.
+    /// Default implementation wraps `generate()` as a single chunk.
+    func generateStream(text: String, language: String?) -> AsyncThrowingStream<AudioChunk, Error>
+}
+
+extension SpeechGenerationModel {
+    /// Default: wraps `generate()` as a single-chunk stream.
+    public func generateStream(text: String, language: String?) -> AsyncThrowingStream<AudioChunk, Error> {
+        let rate = sampleRate
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    let samples = try await self.generate(text: text, language: language)
+                    try Task.checkCancellation()
+                    continuation.yield(AudioChunk(samples: samples, sampleRate: rate, frameIndex: 0, isFinal: true))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+}
+
+// MARK: - Speech Recognition (STT)
+
+/// A word with its confidence score and, when the model tracks emission
+/// frames, the time span it was decoded over.
+public struct WordConfidence: Sendable {
+    public let word: String
+    /// Confidence score (0.0–1.0) derived from mean token log-probability.
+    public let confidence: Float
+    /// Seconds from the start of the audio to the encoder frame that emitted
+    /// the word's first token. Emission-aligned rather than forced-aligned: an
+    /// offline encoder sees the whole window, so the stamp can precede the
+    /// word's onset. Nil when the model does not expose frame alignment.
+    public let startTime: Double?
+    /// Seconds from the start of the audio to the end of the encoder frame
+    /// that emitted the word's last token, one frame after that token's start.
+    /// Gaps between consecutive words reflect decoding pace as well as
+    /// silence. Nil when the model does not expose frame alignment.
+    public let endTime: Double?
+
+    public init(word: String, confidence: Float, startTime: Double? = nil, endTime: Double? = nil) {
+        self.word = word
+        self.confidence = confidence
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
+/// A word with the time span it was emitted over, in seconds of session
+/// audio. Streaming transducer decoders emit a token only once the acoustics
+/// are unambiguous, so a word's span trails its true onset by a small,
+/// roughly constant lag; treat the times as emission-aligned rather than
+/// forced-aligned.
+public struct TimedWord: Sendable, Equatable {
+    public let text: String
+    public let startTime: Double
+    public let endTime: Double
+
+    public init(text: String, startTime: Double, endTime: Double) {
+        self.text = text
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
+/// Result of speech recognition including detected language.
+public struct TranscriptionResult: Sendable {
+    public let text: String
+    /// Detected language (e.g. "english", "russian"). Nil if model doesn't detect.
+    public let language: String?
+    /// Confidence score (0.0–1.0). Higher = more confident transcription.
+    /// Derived from average token log-probability. 0.0 if model doesn't provide.
+    public let confidence: Float
+    /// Per-word confidence scores. Nil if model doesn't provide.
+    public let words: [WordConfidence]?
+
+    public init(text: String, language: String? = nil, confidence: Float = 0.0, words: [WordConfidence]? = nil) {
+        self.text = text
+        self.language = language
+        self.confidence = confidence
+        self.words = words
+    }
+}
+
+/// A speech-to-text model that transcribes audio.
+public protocol SpeechRecognitionModel: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Transcribe audio to text
+    func transcribe(audio: [Float], sampleRate: Int, language: String?) -> String
+    /// Transcribe audio to text with language detection
+    func transcribeWithLanguage(audio: [Float], sampleRate: Int, language: String?) -> TranscriptionResult
+}
+
+/// Default implementation: delegates to transcribe() with no language detection.
+public extension SpeechRecognitionModel {
+    func transcribeWithLanguage(audio: [Float], sampleRate: Int, language: String?) -> TranscriptionResult {
+        TranscriptionResult(text: transcribe(audio: audio, sampleRate: sampleRate, language: language))
+    }
+}
+
+// MARK: - Streaming Speech Recognition
+
+/// One incremental result emitted by a streaming speech-recognition session.
+public struct StreamingRecognitionUpdate: Sendable, Equatable {
+    /// Current transcript for this segment.
+    public let text: String
+    /// True once the transcript is committed and will no longer change.
+    public let isFinal: Bool
+    /// True when the recognizer or an external turn detector closed the turn.
+    public let endOfUtterance: Bool
+    /// Monotonically increasing segment index within the session.
+    public let segmentIndex: Int
+    /// Confidence in `[0, 1]`, when supplied by the recognizer.
+    public let confidence: Float
+    /// Detected or configured language, when supplied by the recognizer.
+    public let language: String?
+    /// Optional segment boundaries in seconds of session audio.
+    public let startTime: Double?
+    public let endTime: Double?
+    /// Optional cumulative or segment-local word timings.
+    public let words: [TimedWord]
+
+    public init(
+        text: String,
+        isFinal: Bool,
+        endOfUtterance: Bool = false,
+        segmentIndex: Int,
+        confidence: Float = 0,
+        language: String? = nil,
+        startTime: Double? = nil,
+        endTime: Double? = nil,
+        words: [TimedWord] = []
+    ) {
+        self.text = text
+        self.isFinal = isFinal
+        self.endOfUtterance = endOfUtterance
+        self.segmentIndex = segmentIndex
+        self.confidence = confidence
+        self.language = language
+        self.startTime = startTime
+        self.endTime = endTime
+        self.words = words
+    }
+}
+
+/// Errors shared by streaming recognizer adapters.
+public enum StreamingRecognitionError: Error, LocalizedError, Equatable {
+    case sampleRateMismatch(expected: Int, actual: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .sampleRateMismatch(let expected, let actual):
+            return "Streaming recognizer expects \(expected) Hz audio, received \(actual) Hz"
+        }
+    }
+}
+
+/// A stateful recognition session that consumes audio without reprocessing
+/// earlier chunks. Calls must be serialized by the consumer.
+public protocol StreamingRecognitionSession: AnyObject {
+    /// Sample rate expected by ``push(_:)``.
+    var inputSampleRate: Int { get }
+    /// Consume the next timestamped chunk and return any new partial/final text.
+    func push(_ chunk: CapturedAudioChunk) throws -> [StreamingRecognitionUpdate]
+    /// Drain buffered audio at the end of input.
+    func finish() throws -> [StreamingRecognitionUpdate]
+}
+
+public extension StreamingRecognitionSession {
+    /// Convenience for sources that do not carry capture timestamps.
+    func push(
+        samples: [Float],
+        sampleRate: Int,
+        frameIndex: Int64 = 0,
+        isFinal: Bool = false
+    ) throws -> [StreamingRecognitionUpdate] {
+        try push(CapturedAudioChunk(
+            samples: samples,
+            sampleRate: sampleRate,
+            hostTime: nil,
+            frameIndex: frameIndex,
+            isFinal: isFinal))
+    }
+}
+
+/// A loaded model capable of creating independent incremental sessions.
+public protocol StreamingRecognitionModel: AnyObject {
+    func makeStreamingSession(language: String?) throws -> any StreamingRecognitionSession
+}
+
+// MARK: - Forced Alignment
+
+/// A model that aligns text to audio at the word level.
+public protocol ForcedAlignmentModel: AnyObject {
+    /// Align text to audio, returning word-level timestamps
+    func align(audio: [Float], text: String, sampleRate: Int, language: String?) -> [AlignedWord]
+}
+
+// MARK: - Speech-to-Speech
+
+/// A speech-to-speech model that generates a spoken response to spoken input.
+public protocol SpeechToSpeechModel: AnyObject {
+    /// Output sample rate in Hz
+    var sampleRate: Int { get }
+    /// Generate response audio from input audio (blocking)
+    func respond(userAudio: [Float]) -> [Float]
+    /// Generate response audio from input audio with streaming output
+    func respondStream(userAudio: [Float]) -> AsyncThrowingStream<AudioChunk, Error>
+}
+
+// MARK: - Voice Activity Detection
+
+/// A time segment where speech was detected.
+public struct SpeechSegment: Sendable {
+    /// Start time in seconds
+    public let startTime: Float
+    /// End time in seconds
+    public let endTime: Float
+
+    public init(startTime: Float, endTime: Float) {
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+
+    /// Duration in seconds
+    public var duration: Float { endTime - startTime }
+}
+
+/// A model that detects speech activity regions in audio.
+public protocol VoiceActivityDetectionModel: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Detect speech segments in audio
+    func detectSpeech(audio: [Float], sampleRate: Int) -> [SpeechSegment]
+}
+
+/// A streaming VAD that processes fixed-size audio chunks and returns speech probability.
+///
+/// Maps directly to speech-core's `sc_vad_vtable_t` for pipeline integration.
+public protocol StreamingVADProvider: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Number of samples per chunk
+    var chunkSize: Int { get }
+    /// Process a single audio chunk, returns speech probability in [0, 1]
+    func processChunk(_ samples: [Float]) -> Float
+    /// Reset internal state (LSTM hidden state, context buffer, etc.)
+    func resetState()
+}
+
+/// Decides whether the user has finished their turn once the VAD reports a pause.
+///
+/// A VAD only hears silence; a turn-completion model listens to the prosody of
+/// the whole utterance, so a mid-sentence pause keeps the agent waiting while a
+/// finished sentence gets an immediate reply. Maps to speech-core's
+/// `sc_turn_completion_vtable_t`.
+public protocol TurnCompletionProvider: AnyObject {
+    /// Probability in `[0, 1]` that the turn is complete, given the audio of the
+    /// turn so far. Implementations look at the most recent seconds (Smart Turn: 8 s).
+    func turnCompleteProbability(audio: [Float], sampleRate: Int) throws -> Float
+}
+
+// MARK: - Speaker Diarization
+
+/// A speech segment with an assigned speaker identity.
+public struct DiarizedSegment: Sendable {
+    /// Start time in seconds
+    public let startTime: Float
+    /// End time in seconds
+    public let endTime: Float
+    /// Speaker identifier (0-based)
+    public let speakerId: Int
+
+    public init(startTime: Float, endTime: Float, speakerId: Int) {
+        self.startTime = startTime
+        self.endTime = endTime
+        self.speakerId = speakerId
+    }
+
+    /// Duration in seconds
+    public var duration: Float { endTime - startTime }
+}
+
+/// A model that produces speaker embeddings from audio.
+public protocol SpeakerEmbeddingModel: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Embedding vector dimension
+    var embeddingDimension: Int { get }
+    /// Extract a speaker embedding from audio
+    func embed(audio: [Float], sampleRate: Int) -> [Float]
+}
+
+// MARK: - Speech Enhancement
+
+/// A model that enhances speech by removing noise.
+public protocol SpeechEnhancementModel: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Enhance audio by removing noise
+    func enhance(audio: [Float], sampleRate: Int) throws -> [Float]
+}
+
+/// A model that assigns speaker identities to speech segments.
+public protocol SpeakerDiarizationModel: AnyObject {
+    /// Expected input sample rate in Hz
+    var inputSampleRate: Int { get }
+    /// Diarize audio into speaker-labeled segments
+    func diarize(audio: [Float], sampleRate: Int) -> [DiarizedSegment]
+}
+
+/// A diarization model that also supports extracting a specific speaker's segments
+/// using a reference embedding. Not all engines support this (e.g. Sortformer is
+/// end-to-end and does not produce speaker embeddings).
+public protocol SpeakerExtractionCapable: SpeakerDiarizationModel {
+    /// Extract segments belonging to a target speaker identified by a reference embedding.
+    func extractSpeaker(audio: [Float], sampleRate: Int, targetEmbedding: [Float]) -> [SpeechSegment]
+}

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ContextTargetRef, LocalContextEvent } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../daemon/timeline-event.js';
-import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { isUserDeletedTimelineEvent, preferTimelineEvent } from '../shared/timeline/merge.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { ContextStoreError, getContextStoreClient } from '../store/context-store-worker-client.js';
 import { CONTEXT_STORE_RPC_ERROR, CONTEXT_STORE_RPC_SELF_HEAL, CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
@@ -13,6 +13,10 @@ import { scheduleMarkdownMemoryIngest } from './md-ingest-worker.js';
 import { subscribeRuntimeMemoryCacheInvalidation } from './runtime-memory-cache-bus.js';
 import { serializeContextTarget } from './context-keys.js';
 import { incrementCounter } from '../util/metrics.js';
+import { createConcurrencyGate } from '../util/concurrency.js';
+import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 const INGEST_RETRY_BUFFER_MAX_EVENTS = 256;
@@ -72,6 +76,7 @@ export function isLiveContextMaterializationAdmissionOpen(): boolean {
 
 export interface LiveContextIngestionOptions extends MaterializationCoordinatorOptions {
   sessionLookup: (sessionName: string) => SessionRecord | undefined;
+  sessionLister?: () => SessionRecord[];
   resolveBootstrap: (record: SessionRecord) => Promise<TransportContextBootstrap>;
   shouldIngestTimelineEvent?: (event: TimelineEvent, session: SessionRecord) => boolean;
   onError?: (error: unknown, event: TimelineEvent) => void;
@@ -136,6 +141,25 @@ export class LiveContextIngestion {
     this.coordinator = new MaterializationCoordinator({
       ...options,
       ...(memoryConfigResolver ? { memoryConfigResolver } : {}),
+      resolveUsageContext: options.resolveUsageContext ?? ((target) => {
+        const sessionRecord = target.sessionName ? options.sessionLookup(target.sessionName) : undefined;
+        const targetProjectDir = sessionRecord?.projectDir;
+        const activeSessions = (options.sessionLister?.() ?? [])
+          .filter((record) =>
+            record.state !== 'stopped'
+            && !isKnownTestSessionLike(record)
+            && !record.executionCloneMetadata)
+          .sort((a, b) => {
+            const aSameProject = targetProjectDir && a.projectDir === targetProjectDir ? 1 : 0;
+            const bSameProject = targetProjectDir && b.projectDir === targetProjectDir ? 1 : 0;
+            if (aSameProject !== bSameProject) return bSameProject - aSameProject;
+            return (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0);
+          });
+        return {
+          sessionAgentType: sessionRecord?.agentType,
+          activeSessionAgentTypes: activeSessions.map((record) => record.agentType),
+        };
+      }),
     });
     this.sessionLookup = options.sessionLookup;
     this.resolveBootstrap = options.resolveBootstrap;
@@ -193,21 +217,26 @@ export class LiveContextIngestion {
   }
 
   async flushDueTargets(now = Date.now()): Promise<void> {
-    if (!isLiveContextMaterializationAdmissionOpen()) return;
+    if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
     for (const job of await this.coordinator.scheduleDueTargets(now)) {
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
     await this.coordinator.materializeDueMasterSummaries(now);
   }
 
+  /**
+   * Retry drains of different sessions that run in the background (this sweep and every session's own backoff timer) share ONE bound: when
+   * many sessions are failing for the same reason (a saturated or restarting store) their timers fall due together, and without a shared
+   * bound each would drain at once, which is exactly the load that keeps the store overloaded.
+   */
+  private readonly retryDrainGate = createConcurrencyGate(INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT);
+
   async flushAllRetryBuffers(options: { forceDue?: boolean } = {}): Promise<void> {
+    if (!isMemoryDaemonEnabled()) return;
     const sessionIds = [...this.retryBuffer.keys()];
-    for (let index = 0; index < sessionIds.length; index += INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT) {
-      const batch = sessionIds.slice(index, index + INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT);
-      await Promise.all(batch.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
-        await this.flushRetryBuffer(sessionId, { forceDue: options.forceDue });
-      })));
-    }
+    await Promise.all(sessionIds.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
+      await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId, { forceDue: options.forceDue }));
+    })));
   }
 
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
@@ -497,7 +526,7 @@ export class LiveContextIngestion {
     const timer = setTimeout(() => {
       this.retryDrainTimers.delete(sessionId);
       void this.enqueueSessionWork(sessionId, async () => {
-        await this.flushRetryBuffer(sessionId);
+        await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId));
       });
     }, Math.max(0, delayMs));
     timer.unref?.();
@@ -648,17 +677,31 @@ function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstr
 }
 
 function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventType' | 'content' | 'metadata'> | null {
+  // A message the user deleted must never become memory, live or via backfill.
+  if (isUserDeletedTimelineEvent(event)) return null;
   switch (event.type) {
-    case 'user.message':
+    case 'user.message': {
       if (event.payload.memoryExcluded === true) return null;
+      const text = stringifyContent(event.payload.text);
+      if (text && isSessionModelSwitchCommandText(text)) return null;
       return {
         eventType: 'user.turn',
-        content: stringifyContent(event.payload.text),
+        content: text,
         metadata: { timelineType: event.type },
       };
+    }
     case 'assistant.text': {
       const text = stringifyContent(event.payload.text);
-      if (event.payload.streaming === true || event.payload.memoryExcluded === true) return null;
+      // Provider failures are emitted as assistant.text for the current-turn
+      // diagnostic, but are not model output.  The explicit marker is present
+      // on new events; providerErrorCode/recoverable also protects persisted
+      // rows written by older daemons that predate memoryExcluded.
+      if (
+        event.payload.streaming === true
+        || event.payload.memoryExcluded === true
+        || (typeof event.payload.providerErrorCode === 'string' && event.payload.providerErrorCode.length > 0)
+        || typeof event.payload.providerErrorRecoverable === 'boolean'
+      ) return null;
       if (isMemoryNoiseTurn(text)) return null;
       return {
         eventType: 'assistant.turn',

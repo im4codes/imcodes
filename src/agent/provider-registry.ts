@@ -4,6 +4,11 @@
 import type { TransportProvider, ProviderConfig } from './transport-provider.js';
 import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transport-relay.js';
 import logger from '../util/logger.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -34,9 +39,11 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
     await disconnectProvider(id);
   }
 
-  const provider = await createProvider(id);
+  const provider = await createProvider(id, config);
   await provider.connect(config);
   providers.set(id, provider);
+  // A reconnected provider may now be able to do what it could not before.
+  clearTransportRestoreBackoffForProvider(id);
   wireProviderToRelay(provider);
 
   // Materialize OC sessions before broadcasting status (sessions appear before catalog)
@@ -78,7 +85,7 @@ export async function disconnectAll(): Promise<void> {
   }
 }
 
-async function createProvider(id: string): Promise<TransportProvider> {
+async function createProvider(id: string, config: ProviderConfig): Promise<TransportProvider> {
   switch (id) {
     case 'openclaw': {
       const { OpenClawProvider } = await import('./providers/openclaw.js');
@@ -88,21 +95,37 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { QwenProvider } = await import('./providers/qwen.js');
       return new QwenProvider();
     }
-    case 'gemini-sdk': {
-      const { GeminiSdkProvider } = await import('./providers/gemini-sdk.js');
-      return new GeminiSdkProvider();
-    }
     case 'kimi-sdk': {
       const { KimiSdkProvider } = await import('./providers/kimi-sdk.js');
       return new KimiSdkProvider();
+    }
+    case HERMES_AGENT_PROVIDER_ID: {
+      const { HermesAcpProvider } = await import('./providers/hermes-acp.js');
+      return new HermesAcpProvider();
+    }
+    case 'grok-sdk': {
+      const { GrokSdkProvider } = await import('./providers/grok-sdk.js');
+      return new GrokSdkProvider();
+    }
+    case AGY_SDK_PROVIDER_ID: {
+      const { createAgyProvider } = await import('./providers/agy-acp.js');
+      return createAgyProvider(config);
     }
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');
       return new ClaudeCodeSdkProvider();
     }
+    case CLAUDE_CODE_CLI_SDK_AGENT_TYPE: {
+      const { ClaudeCodeCliSdkProvider } = await import('./providers/claude-code-cli-sdk.js');
+      return new ClaudeCodeCliSdkProvider();
+    }
     case 'codex-sdk': {
       const { CodexSdkProvider } = await import('./providers/codex-sdk.js');
       return new CodexSdkProvider();
+    }
+    case 'qoder-sdk': {
+      const { QoderSdkProvider } = await import('./providers/qoder-sdk.js');
+      return new QoderSdkProvider();
     }
     case 'cursor-headless': {
       const { CursorHeadlessProvider } = await import('./providers/cursor-headless.js');
@@ -111,6 +134,30 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'copilot-sdk': {
       const { CopilotSdkProvider } = await import('./providers/copilot-sdk.js');
       return new CopilotSdkProvider();
+    }
+    case 'opencode-sdk': {
+      const { OpenCodeSdkProvider } = await import('./providers/opencode-sdk.js');
+      return new OpenCodeSdkProvider();
+    }
+    case 'deepseek-harness': {
+      const { DeepseekHarnessProvider } = await import('./providers/deepseek-harness.js');
+      return new DeepseekHarnessProvider();
+    }
+    case 'pi': {
+      const { PiProvider } = await import('./providers/pi.js');
+      return new PiProvider();
+    }
+    case 'muse-code-sdk': {
+      const { MuseCodeSdkProvider } = await import('./providers/muse-code-sdk.js');
+      return new MuseCodeSdkProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.CHINA: {
+      const { CodeBuddyChinaProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyChinaProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.INTERNATIONAL: {
+      const { CodeBuddyInternationalProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyInternationalProvider();
     }
     default:
       throw new Error(`Unknown provider: ${id}`);

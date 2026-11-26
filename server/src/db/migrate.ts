@@ -26,6 +26,11 @@ function sortMigrations(files: string[]): string[] {
   });
 }
 
+/** Only canonical migration names may execute; ignore archive metadata/dotfiles. */
+export function isMigrationFile(file: string): boolean {
+  return /^\d{3}_[A-Za-z0-9][A-Za-z0-9_.-]*\.sql$/.test(file);
+}
+
 export async function runMigrations(db: Database): Promise<void> {
   // Ensure migrations tracking table exists
   await db.exec(`
@@ -41,7 +46,7 @@ export async function runMigrations(db: Database): Promise<void> {
 
   // Discover migration files sorted by numeric prefix
   const files = sortMigrations(
-    (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')),
+    (await readdir(MIGRATIONS_DIR)).filter(isMigrationFile),
   );
 
   for (const file of files) {

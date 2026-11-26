@@ -1,0 +1,112 @@
+import { isNativeMacDesktop, NATIVE_HOST_EVENT, type NativeHostInfo } from './native-platform.js';
+
+/** Phone/tablet detection used by the app shell. */
+export function isMobileUserAgent(userAgent: string = typeof navigator === 'undefined' ? '' : navigator.userAgent): boolean {
+  return /iPhone|iPad|iPod|Android/i.test(userAgent);
+}
+
+export type MobileLayoutOptions = {
+  userAgent?: string;
+  width?: number;
+  pointerCoarse?: boolean;
+  maxTouchPoints?: number;
+  native?: boolean;
+  nativePlatform?: string;
+  platform?: string;
+  hoverFinePointer?: boolean;
+  nativeHost?: NativeHostInfo | null;
+};
+
+/**
+ * Device decision for the app shell. This deliberately does not inspect
+ * viewport width: a desktop window may be resized narrow without becoming a
+ * phone layout, while desktop-site mobile browsers still expose touch.
+ */
+export function isMobileDevice(options: MobileLayoutOptions = {}): boolean {
+  const userAgent = options.userAgent ?? (typeof navigator === 'undefined' ? '' : navigator.userAgent);
+  const maxTouchPoints = options.maxTouchPoints ?? (typeof navigator === 'undefined' ? 0 : navigator.maxTouchPoints || 0);
+  const runtime = globalThis as typeof globalThis & {
+    Capacitor?: { isNativePlatform?: () => boolean; getPlatform?: () => string };
+    __IMCODES_NATIVE_HOST__?: NativeHostInfo;
+  };
+  const capacitor = runtime.Capacitor;
+  const native = options.native ?? Boolean(capacitor?.isNativePlatform?.());
+  const nativePlatform = options.nativePlatform ?? capacitor?.getPlatform?.();
+  const platform = options.platform ?? (typeof navigator === 'undefined' ? undefined : navigator.platform);
+
+  const macDesktop = isNativeMacDesktop({
+    capacitor: {
+      isNativePlatform: () => native,
+      getPlatform: () => nativePlatform ?? '',
+    },
+    navigator: {
+      userAgent,
+      platform,
+      maxTouchPoints,
+      userAgentData: typeof navigator === 'undefined' ? undefined : (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData,
+    },
+    matchMedia: typeof options.hoverFinePointer === 'boolean'
+      ? (query: string) => ({ matches: query === '(hover: hover) and (pointer: fine)' ? options.hoverFinePointer! : false })
+      : (typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : undefined),
+    innerWidth: options.width ?? (typeof window === 'undefined' ? undefined : window.innerWidth),
+    nativeHost: options.nativeHost !== undefined ? options.nativeHost : runtime.__IMCODES_NATIVE_HOST__,
+  });
+  if (macDesktop) return false;
+
+  if (native || isMobileUserAgent(userAgent)) return true;
+  // iPadOS desktop-class Safari identifies as Macintosh but still exposes a
+  // multi-touch surface. Treat it as mobile regardless of its CSS width.
+  if (maxTouchPoints > 1 && /Macintosh|Mac OS X/i.test(userAgent)) return true;
+  const coarse = options.pointerCoarse ?? (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    ? window.matchMedia('(pointer: coarse)').matches
+    : false);
+  return coarse && maxTouchPoints > 0;
+}
+
+export const FOLDABLE_EXPANDED_MIN_WIDTH = 720;
+
+/** Responsive panel decision; unlike the app shell, panels compact in narrow desktop windows. */
+export function isMobileLayout(options: MobileLayoutOptions = {}): boolean {
+  const width = options.width ?? (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) ? window.innerWidth : undefined);
+  return isMobileDevice(options) || (width !== undefined && width <= 720);
+}
+
+/**
+ * Expanded foldable / tablet mobile viewport (`>= 720px` on a touch mobile device),
+ * e.g. unfolded iPhone Duo, Galaxy Z Fold inner screen, or iPad.
+ */
+export function isExpandedMobileViewport(options: MobileLayoutOptions = {}): boolean {
+  if (!isMobileDevice(options)) return false;
+  const width = options.width ?? (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) ? window.innerWidth : undefined);
+  return width !== undefined && width >= FOLDABLE_EXPANDED_MIN_WIDTH;
+}
+
+/**
+ * Subscribe to runtime signals that can change device/layout classification
+ * (native host bridge injection, pointer capability changes, and optionally viewport width).
+ */
+export function subscribeDeviceLayoutChange(
+  listener: () => void,
+  options: { includeResize?: boolean } = {},
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const includeResize = options.includeResize ?? true;
+  const queries = [
+    '(hover: hover) and (pointer: fine)',
+    '(pointer: coarse)',
+    ...(includeResize ? ['(max-width: 720px)'] : []),
+  ];
+  const mediaLists = typeof window.matchMedia === 'function'
+    ? queries.map((q) => window.matchMedia(q)).filter((m): m is MediaQueryList => Boolean(m))
+    : [];
+
+  window.addEventListener(NATIVE_HOST_EVENT, listener);
+  if (includeResize) window.addEventListener('resize', listener);
+  for (const mq of mediaLists) mq.addEventListener?.('change', listener);
+
+  return () => {
+    window.removeEventListener(NATIVE_HOST_EVENT, listener);
+    if (includeResize) window.removeEventListener('resize', listener);
+    for (const mq of mediaLists) mq.removeEventListener?.('change', listener);
+  };
+}

@@ -36,3 +36,10 @@ export const PREF_KEY_P2P_DROPDOWN_TAB = 'p2p_dropdown_tab';
  * GET, one cache entry, and one cross-tab listener.
  */
 export const PREF_KEY_SHOW_TOOL_CALLS = 'show_tool_calls';
+
+/**
+ * Presentation mode for the pinned-message preview dialog. This is a user
+ * preference (not session/device geometry), so it follows the authenticated
+ * account across browsers through `usePref`.
+ */
+export const PREF_KEY_MESSAGE_PIN_PREVIEW_MODE = 'message_pin_preview_mode';

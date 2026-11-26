@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  type TransportProvider,
+  type ProviderError,
+} from '../agent/transport-provider.js';
 import { ensureProviderConnected } from '../agent/provider-registry.js';
 import type { SharedContextRuntimeBackend } from '../../shared/context-types.js';
 import {
   parseTaskRunTerminalStateFromText,
   SUPERVISION_DEFAULT_TIMEOUT_MS,
-  SUPERVISION_MODE,
+  SUPERVISION_MIN_TIMEOUT_MS,
+  isAutomaticSupervisionEnabled,
   SUPERVISION_UNAVAILABLE_REASONS,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
@@ -16,8 +21,21 @@ import {
 } from './supervision-prompts.js';
 import { resolveProcessingProviderSessionConfig } from '../context/processing-provider-config.js';
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
+import logger from '../util/logger.js';
+import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV } from '../../shared/memory-mcp-env.js';
 
-export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
+/**
+ * `waiting` exists because the other three cannot express "correctly parked".
+ *
+ * A session that dispatched a peer audit and is forbidden from touching the
+ * repository until it returns is not `complete` (work remains), not
+ * `ask_human` (nobody needs to intervene), and emphatically not `continue` —
+ * yet `continue` was the only survivor, so automation re-prompted a session
+ * whose sole correct action was to wait, and it answered "still blocked" on
+ * every loop.
+ */
+export type SupervisionDecisionKind = 'complete' | 'continue' | 'waiting' | 'ask_human';
 
 /**
  * Structured supervisor verdict. The schema is intentionally action-oriented:
@@ -32,6 +50,9 @@ export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
  *  - `decision`: complete / continue / ask_human — the verdict.
  *  - `reason`: human-readable explanation (shown in UI / logs).
  *  - `confidence`: supervisor's self-reported confidence, 0..1.
+ *  - `requiresAudit`: whether a completed task warrants a separate peer
+ *    audit. Read-only checks and factual lookups do not; implementation,
+ *    mutations, fixes, and complex debugging do.
  *  - `gap`: what is specifically missing to close out the task. Required
  *    (strongly preferred) when `decision === 'continue'`.
  *  - `nextAction`: imperative, specific instruction for the target agent's
@@ -43,14 +64,32 @@ export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
  *    verbatim to callers that want richer metadata without another schema
  *    bump.
  */
+/**
+ * How much audit a change is worth.
+ *
+ * `requiresAudit` alone is a yes/no, so a two-line stylesheet tweak and a
+ * cross-layer state-machine change were billed the same full audit. That is the
+ * main reason supervised sessions feel audited constantly. `narrow` keeps the
+ * independent check but scopes it to the diff and its direct blast radius.
+ */
+export type SupervisionAuditDepth = 'standard' | 'narrow';
+
 export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
   reason: string;
   confidence: number;
+  requiresAudit?: boolean;
+  auditDepth?: SupervisionAuditDepth;
   gap?: string;
   nextAction?: string;
   extra?: Record<string, unknown>;
   unavailableReason?: SupervisionUnavailableReason;
+  providerFailure?: SupervisionProviderFailure;
+}
+
+export interface SupervisionProviderFailure {
+  code?: string;
+  attempts: number;
 }
 
 /** Minimum length for `nextAction` to be treated as "concrete enough" to
@@ -60,19 +99,157 @@ const MIN_ACTIONABLE_NEXT_ACTION_LENGTH = 12;
 
 export interface SupervisionBrokerRequest {
   snapshot: SessionSupervisionSnapshot | null | undefined;
+  /**
+   * Stable identity of the supervised session instance. The broker keeps one
+   * private provider conversation per identity so consecutive decisions have
+   * context without ever sharing a UUID across different sessions.
+   */
+  targetSessionId?: string;
+  /** Canonical owner session name used for MCP authorization and routing. */
+  targetSessionName?: string;
   taskRequest: string;
   assistantResponse?: string;
+  /**
+   * Bounded chronological evidence from the current session. The decision
+   * prompt renders this as inert context so the arbiter can correlate recent
+   * refinements and structured audit results instead of judging from only the
+   * original request and final assistant paragraph.
+   */
+  recentEvidence?: readonly SupervisionRecentEvidence[];
   cwd?: string;
   description?: string;
 }
 
+export type SupervisionRecentEvidence =
+  | {
+      kind: 'user' | 'assistant';
+      text: string;
+    }
+  | {
+      kind: 'peer_audit_result';
+      outcome: string;
+      auditorSessionName?: string;
+      findings?: string;
+      reason?: string;
+    };
+
 export interface SupervisionBrokerDeps {
   resolveProvider?: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   now?: () => number;
+  waitForRetry?: (delayMs: number) => Promise<void>;
+  random?: () => number;
 }
 
-const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
+const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'waiting', 'ask_human']);
+const AUDIT_DEPTHS = new Set<SupervisionAuditDepth>(['standard', 'narrow']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
+const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
+const PROVIDER_RETRY_BASE_MS = 250;
+const PROVIDER_RETRY_CAP_MS = 2_000;
+const SUPERVISOR_SESSION_IDLE_TTL_MS = 48 * 60 * 60 * 1_000;
+const NON_RETRYABLE_PROVIDER_ERROR_CODES = new Set<string>([
+  PROVIDER_ERROR_CODES.AUTH_FAILED,
+  PROVIDER_ERROR_CODES.CONFIG_ERROR,
+  PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND,
+  PROVIDER_ERROR_CODES.PARSE_ERROR,
+  PROVIDER_ERROR_CODES.CANCELLED,
+]);
+
+type SupervisionExecutionError = Error & {
+  supervisionUnavailableReason?: SupervisionUnavailableReason;
+  supervisionProviderCode?: string;
+  supervisionProviderRetryable?: boolean;
+  supervisionProviderAttempts?: number;
+  supervisionProviderRetryAfterMs?: number;
+};
+
+interface RetainedSupervisorRuntime {
+  provider: TransportProvider;
+  providerSessionId: string;
+  configKey: string;
+}
+
+interface RetainedSupervisorTarget {
+  sessionKey: string;
+  lastUsedAt: number;
+  runtimes: Map<string, RetainedSupervisorRuntime>;
+}
+
+function errorRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/** Placeholder JS produces for `String(plainObject)` — never useful to a human. */
+const USELESS_STRINGIFIED_OBJECT = '[object Object]';
+
+/**
+ * Recover a diagnosable message from whatever the provider surfaced.
+ *
+ * `ProviderError` (transport-provider.ts) is a PLAIN OBJECT
+ * `{ code, message, recoverable, details }` — NOT an `Error`. `String()` on it
+ * yields the literal `[object Object]`, which is what previously reached both
+ * the user-facing warning and the daemon log, destroying every root cause: the
+ * operator saw "after 3 attempts: [object Object]" and had nothing left to
+ * diagnose with. Read the object's own `message` before falling back.
+ *
+ * The last resort deliberately reports the error CODE rather than the useless
+ * placeholder, so a message-less provider failure is still actionable. `details`
+ * is only used when it is already human text — adapters are supposed to keep it
+ * privacy-whitelisted, but stringifying an arbitrary payload here could leak a
+ * raw provider response into logs.
+ */
+function extractProviderErrorMessage(error: unknown, record: Record<string, unknown> | null): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  const message = typeof record?.message === 'string' ? record.message.trim() : '';
+  if (message) return message;
+  const code = typeof record?.code === 'string' ? record.code.trim() : '';
+  const details = typeof record?.details === 'string' ? record.details.trim() : '';
+  if (code) return details ? `${code}: ${details}` : `provider error (${code})`;
+  if (details) return details;
+  const raw = String(error).trim();
+  return raw && raw !== USELESS_STRINGIFIED_OBJECT ? raw : 'unknown provider error';
+}
+
+function normalizeProviderExecutionError(error: unknown): SupervisionExecutionError {
+  const record = errorRecord(error);
+  if (record?.supervisionUnavailableReason) return error as SupervisionExecutionError;
+
+  const message = extractProviderErrorMessage(error, record);
+  const code = typeof record?.code === 'string' && record.code.trim()
+    ? record.code.trim()
+    : undefined;
+  // Provider adapters intentionally classify authentication/configuration and
+  // missing-runtime failures with stable non-retryable codes. A generic
+  // PROVIDER_ERROR is different: SDK adapters often cannot distinguish a
+  // transient upstream failure from a terminal one and conservatively mark it
+  // recoverable=false. Supervisor decisions are read-only ephemeral calls, so
+  // retrying that generic shape in a fresh session is safe and avoids turning a
+  // single provider hiccup into a false terminal automation failure.
+  const retryable = !code || !NON_RETRYABLE_PROVIDER_ERROR_CODES.has(code);
+  const details = errorRecord(record?.details);
+  const rawRetryAfter = record?.retryAfterMs ?? details?.retryAfterMs ?? details?.retryAfter;
+  const retryAfterMs = typeof rawRetryAfter === 'number' && Number.isFinite(rawRetryAfter)
+    ? Math.max(0, Math.floor(rawRetryAfter))
+    : typeof rawRetryAfter === 'string' && /^\d+(?:\.\d+)?$/.test(rawRetryAfter.trim())
+      ? Math.max(0, Math.ceil(Number(rawRetryAfter) * 1_000))
+      : undefined;
+
+  return Object.assign(new Error(message), {
+    supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+    ...(code ? { supervisionProviderCode: code } : {}),
+    supervisionProviderRetryable: retryable,
+    ...(retryAfterMs !== undefined ? { supervisionProviderRetryAfterMs: retryAfterMs } : {}),
+  });
+}
+
+function decisionTimeoutError(): SupervisionExecutionError {
+  return Object.assign(new Error('supervision timeout'), {
+    supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+    supervisionProviderRetryable: false,
+  });
+}
 /**
  * Regex guardrails that downgrade a supervisor LLM's `complete` verdict to
  * `continue` when the assistant response obviously proposes follow-up work.
@@ -163,6 +340,8 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
   if (!DECISIONS.has(record.decision as SupervisionDecisionKind)) return null;
   if (typeof record.reason !== 'string' || !record.reason.trim()) return null;
   if (typeof record.confidence !== 'number' || !Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1) return null;
+  if (record.requiresAudit !== undefined && typeof record.requiresAudit !== 'boolean') return null;
+  if (record.auditDepth !== undefined && !AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)) return null;
   // gap / nextAction / extra are all optional at parse time — the guardrail
   // below is where "continue without nextAction" gets downgraded to
   // ask_human. Keeping the parser permissive means a still-correct
@@ -177,6 +356,10 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
     decision: record.decision as SupervisionDecisionKind,
     reason: record.reason.trim(),
     confidence: record.confidence,
+    ...(typeof record.requiresAudit === 'boolean' ? { requiresAudit: record.requiresAudit } : {}),
+    ...(AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)
+      ? { auditDepth: record.auditDepth as SupervisionAuditDepth }
+      : {}),
     ...(gap ? { gap } : {}),
     ...(nextAction ? { nextAction } : {}),
     ...(extra ? { extra } : {}),
@@ -287,16 +470,23 @@ function applyDecisionGuardrails(
 export class SupervisionBroker {
   private readonly resolveProvider: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   private readonly now: () => number;
+  private readonly waitForRetry: (delayMs: number) => Promise<void>;
+  private readonly random: () => number;
   private readonly queueChains = new Map<string, Promise<void>>();
+  private readonly retainedTargets = new Map<string, RetainedSupervisorTarget>();
 
   constructor(deps: SupervisionBrokerDeps = {}) {
     this.resolveProvider = deps.resolveProvider ?? ((backend) => ensureProviderConnected(backend, {}));
     this.now = deps.now ?? (() => Date.now());
+    this.waitForRetry = deps.waitForRetry ?? ((delayMs) => new Promise((resolve) => {
+      setTimeout(resolve, delayMs);
+    }));
+    this.random = deps.random ?? Math.random;
   }
 
   async decide(request: SupervisionBrokerRequest): Promise<SupervisionDecision> {
     const snapshot = request.snapshot;
-    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) {
+    if (!isAutomaticSupervisionEnabled(snapshot)) {
       return askHuman('supervision disabled');
     }
     if (!snapshot.backend || !snapshot.model) {
@@ -304,8 +494,20 @@ export class SupervisionBroker {
     }
 
     const startedAt = this.now();
-    const timeoutMs = snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS;
-    const key = `${snapshot.backend}:${snapshot.model}:${snapshot.preset ?? ''}`;
+    const timeoutMs = Math.max(
+      snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS,
+      SUPERVISION_MIN_TIMEOUT_MS,
+    );
+    const runtimes = [{
+      backend: snapshot.backend,
+      model: snapshot.model,
+      preset: snapshot.preset,
+    }, ...(snapshot.backupBackend && snapshot.backupModel ? [{
+      backend: snapshot.backupBackend,
+      model: snapshot.backupModel,
+      preset: snapshot.backupPreset,
+    }] : [])];
+    const key = JSON.stringify(runtimes.map(({ backend, model, preset }) => ({ backend, model, preset: preset ?? '' })));
     const previous = this.queueChains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -321,14 +523,77 @@ export class SupervisionBroker {
     }
 
     try {
-      const provider = await this.resolveProvider(snapshot.backend);
-      return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      let lastError: unknown;
+      for (const [runtimeIndex, runtime] of runtimes.entries()) {
+        const runtimeSnapshot: SessionSupervisionSnapshot = {
+          ...snapshot,
+          backend: runtime.backend,
+          model: runtime.model,
+          ...(runtime.preset ? { preset: runtime.preset } : { preset: undefined }),
+        };
+        const runtimeBudget = timeoutMs - (this.now() - startedAt);
+        if (runtimeBudget <= MIN_SUPERVISION_EXECUTION_BUDGET_MS) break;
+        try {
+          const provider = await this.resolveProvider(runtime.backend);
+          const decision = await this.evaluateWithProvider(provider, request, runtimeBudget, runtimeSnapshot, request.cwd);
+          const canTryBackup = runtimeIndex + 1 < runtimes.length
+            && decision.unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT;
+          if (!canTryBackup) return decision;
+          lastError = Object.assign(new Error(decision.reason), {
+            supervisionUnavailableReason: decision.unavailableReason,
+          });
+          logger.warn({
+            backend: runtime.backend,
+            model: runtime.model,
+          }, 'Supervisor primary returned invalid output; trying backup runtime');
+        } catch (error) {
+          lastError = error;
+          if (runtimeIndex + 1 >= runtimes.length) break;
+          const unavailableReason = error && typeof error === 'object' && 'supervisionUnavailableReason' in error
+            ? (error as SupervisionExecutionError).supervisionUnavailableReason
+            : SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
+          if (
+            unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR
+            && unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED
+            && unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT
+          ) break;
+          logger.warn({
+            backend: runtime.backend,
+            model: runtime.model,
+            unavailableReason,
+          }, 'Supervisor primary runtime unavailable; trying backup runtime');
+        }
+      }
+
+      const error = lastError ?? Object.assign(new Error('supervision decision timeout'), {
+        supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+      });
+      const normalized = error as SupervisionExecutionError;
+      // Same reason as normalizeProviderExecutionError: a non-Error thrown from
+      // anywhere in this chain must not degrade into `[object Object]` — this
+      // message becomes `decision.reason`, i.e. the detail the operator reads.
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
-        ? (error as { supervisionUnavailableReason?: SupervisionUnavailableReason }).supervisionUnavailableReason
+        ? normalized.supervisionUnavailableReason
         : undefined) ?? SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
-      return askHuman(message, unavailableReason);
+      const providerAttempts = normalized.supervisionProviderAttempts;
+      if (unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR) {
+        logger.warn({
+          backend: snapshot.backend,
+          model: snapshot.model,
+          providerErrorCode: normalized.supervisionProviderCode ?? 'unknown',
+          providerErrorMessage: sanitizeMcpErrorMessage(normalized, 'provider error'),
+          providerAttempts: providerAttempts ?? 1,
+        }, 'Supervisor provider decision failed');
+      }
+      const decision = askHuman(message, unavailableReason);
+      if (unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR) {
+        decision.providerFailure = {
+          ...(normalized.supervisionProviderCode ? { code: normalized.supervisionProviderCode } : {}),
+          attempts: providerAttempts ?? 1,
+        };
+      }
+      return decision;
     } finally {
       release();
       if (this.queueChains.get(key) === current) this.queueChains.delete(key);
@@ -342,13 +607,13 @@ export class SupervisionBroker {
     snapshot: SessionSupervisionSnapshot,
     cwd?: string,
   ): Promise<SupervisionDecision> {
-    const sessionKey = `deck_supervision_${randomUUID()}`;
+    const deadlineAt = this.now() + timeoutMs;
 
     // Delegate backend/model/preset → env/agentId/settings resolution to the
-    // shared processing-provider config. For qwen with a preset this applies
-    // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned ANTHROPIC_MODEL; for
-    // everything else it short-circuits to `{ agentId: model }`. See
-    // openspec change `supervision-qwen-preset-support` design §1.
+    // shared processing-provider config. For qwen or claude-code-sdk with a
+    // preset this applies ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned
+    // ANTHROPIC_MODEL; for everything else it short-circuits to
+    // `{ agentId: model }`. See openspec change `supervision-qwen-preset-support` design §1.
     let resolved: Awaited<ReturnType<typeof resolveProcessingProviderSessionConfig>>;
     try {
       resolved = await resolveProcessingProviderSessionConfig({
@@ -357,52 +622,215 @@ export class SupervisionBroker {
         preset: snapshot.preset,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       throw Object.assign(new Error(message), {
         supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        supervisionProviderCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        supervisionProviderRetryable: false,
+        supervisionProviderAttempts: 1,
       });
     }
     const effectiveAgentId = resolved.agentId ?? snapshot.model;
 
-    const providerSessionId = await provider.createSession({
-      sessionKey,
-      fresh: true,
-      cwd,
-      ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
-      ...(resolved.env ? { env: resolved.env } : {}),
-      ...(resolved.settings ? { settings: resolved.settings } : {}),
-    });
-    // Supervision runs its own per-call onComplete/onError filtered by sid;
-    // mark the sid so transport-relay's global onDelta drops its events
-    // silently instead of per-delta "unresolved route" warnings.
-    markEphemeralProviderSid(providerSessionId);
+    let providerAttempts = 0;
+    while (true) {
+      providerAttempts += 1;
+      try {
+        return await this.evaluateInProviderSession({
+          provider,
+          request,
+          snapshot,
+          cwd,
+          resolved,
+          effectiveAgentId,
+          deadlineAt,
+        });
+      } catch (error) {
+        const normalized = normalizeProviderExecutionError(error);
+        normalized.supervisionProviderAttempts = providerAttempts;
+        const retryIndex = providerAttempts - 1;
+        const exponentialCeiling = Math.min(
+          PROVIDER_RETRY_CAP_MS,
+          PROVIDER_RETRY_BASE_MS * (2 ** retryIndex),
+        );
+        const random = Math.max(0, Math.min(1, this.random()));
+        const jitterDelayMs = Math.floor(exponentialCeiling * random);
+        const delayMs = Math.max(jitterDelayMs, normalized.supervisionProviderRetryAfterMs ?? 0);
+        const remainingBudget = deadlineAt - this.now();
+        const canRetry = normalized.supervisionUnavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR
+          && normalized.supervisionProviderRetryable === true
+          && providerAttempts <= MAX_RECOVERABLE_PROVIDER_RETRIES
+          && remainingBudget > delayMs + MIN_SUPERVISION_EXECUTION_BUDGET_MS;
+        if (!canRetry) throw normalized;
 
+        logger.warn({
+          backend: snapshot.backend,
+          model: snapshot.model,
+          providerId: provider.id,
+          providerErrorCode: normalized.supervisionProviderCode ?? 'unknown',
+          providerErrorMessage: sanitizeMcpErrorMessage(normalized, 'provider error'),
+          providerAttempt: providerAttempts,
+          retryDelayMs: delayMs,
+        }, 'Supervisor provider decision failed; retrying');
+        await this.waitForRetry(delayMs);
+      }
+    }
+  }
+
+  private remainingExecutionBudget(deadlineAt: number): number {
+    const remaining = deadlineAt - this.now();
+    if (remaining <= MIN_SUPERVISION_EXECUTION_BUDGET_MS) throw decisionTimeoutError();
+    return remaining;
+  }
+
+  private async releaseRetainedTarget(target: RetainedSupervisorTarget): Promise<void> {
+    await Promise.all([...target.runtimes.values()].map(async (runtime) => {
+      await runtime.provider.endSession(runtime.providerSessionId).catch(() => {});
+    }));
+    target.runtimes.clear();
+  }
+
+  private async getRetainedTarget(targetSessionId: string): Promise<RetainedSupervisorTarget> {
+    const now = this.now();
+    // Expiration is lazy but global: the next supervision decision releases
+    // every conversation that has been idle for 48 hours. Do not impose a
+    // lower arbitrary count cap — doing so would make an otherwise-active
+    // session unexpectedly lose context merely because many other sessions
+    // were supervised.
+    for (const [retainedSessionId, target] of this.retainedTargets) {
+      if (now - target.lastUsedAt < SUPERVISOR_SESSION_IDLE_TTL_MS) continue;
+      this.retainedTargets.delete(retainedSessionId);
+      await this.releaseRetainedTarget(target);
+    }
+    const existing = this.retainedTargets.get(targetSessionId);
+    if (existing && now - existing.lastUsedAt < SUPERVISOR_SESSION_IDLE_TTL_MS) {
+      existing.lastUsedAt = now;
+      // Keep insertion order aligned with recent use for diagnostics and
+      // predictable cleanup traversal.
+      this.retainedTargets.delete(targetSessionId);
+      this.retainedTargets.set(targetSessionId, existing);
+      return existing;
+    }
+    if (existing) {
+      this.retainedTargets.delete(targetSessionId);
+      await this.releaseRetainedTarget(existing);
+    }
+
+    const created: RetainedSupervisorTarget = {
+      sessionKey: randomUUID(),
+      lastUsedAt: now,
+      runtimes: new Map(),
+    };
+    this.retainedTargets.set(targetSessionId, created);
+    return created;
+  }
+
+  private async evaluateInProviderSession(input: {
+    provider: TransportProvider;
+    request: SupervisionBrokerRequest;
+    snapshot: SessionSupervisionSnapshot;
+    cwd?: string;
+    resolved: Awaited<ReturnType<typeof resolveProcessingProviderSessionConfig>>;
+    effectiveAgentId: string;
+    deadlineAt: number;
+  }): Promise<SupervisionDecision> {
+    const { provider, request, snapshot, cwd, resolved, effectiveAgentId, deadlineAt } = input;
+    const targetSessionId = request.targetSessionId?.trim();
+    const retainedTarget = targetSessionId
+      ? await this.getRetainedTarget(targetSessionId)
+      : undefined;
+    // Claude Code forwards sessionKey to `--session-id`, whose CLI contract
+    // requires an exact UUID. A supervised session instance retains this UUID
+    // for up to 48 idle hours; different instances never share one.
+    const sessionKey = retainedTarget?.sessionKey ?? randomUUID();
+    const configKey = JSON.stringify({
+      providerId: provider.id,
+      backend: snapshot.backend,
+      model: effectiveAgentId,
+      preset: snapshot.preset ?? '',
+      resolved: resolved.cacheKey,
+      cwd: cwd ?? '',
+    });
+    const retainedRuntime = retainedTarget?.runtimes.get(provider.id);
+    let providerSessionId: string | undefined;
+    let shouldEndProviderSession = !retainedTarget;
     try {
+      if (retainedRuntime && retainedRuntime.configKey === configKey) {
+        providerSessionId = retainedRuntime.providerSessionId;
+      } else {
+        if (retainedRuntime) {
+          await retainedRuntime.provider.endSession(retainedRuntime.providerSessionId).catch(() => {});
+          retainedTarget?.runtimes.delete(provider.id);
+        }
+        const ownerSessionName = request.targetSessionName?.trim();
+        const helperSourceSessionName = ownerSessionName
+          ? `deck_sub_supervision_${ownerSessionName.replace(/^deck_/, '').replace(/[^A-Za-z0-9_-]/g, '_').slice(-48)}`
+          : undefined;
+        providerSessionId = await provider.createSession({
+          sessionKey,
+          ...(ownerSessionName ? { sessionName: ownerSessionName } : {}),
+          // Retained supervisor conversations own their provider state across
+          // decisions. Transient callers keep the historical fresh behaviour.
+          fresh: !retainedTarget,
+          cwd,
+          ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+          ...(resolved.env || helperSourceSessionName
+            ? {
+              env: {
+                ...(resolved.env ?? {}),
+                ...(helperSourceSessionName
+                  ? { [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: helperSourceSessionName }
+                  : {}),
+              },
+            }
+            : {}),
+          ...(resolved.settings ? { settings: resolved.settings } : {}),
+        });
+        if (retainedTarget) {
+          retainedTarget.runtimes.set(provider.id, {
+            provider,
+            providerSessionId,
+            configKey,
+          });
+          shouldEndProviderSession = false;
+        }
+      }
+      // Supervision runs its own per-call onComplete/onError filtered by sid;
+      // mark the sid so transport-relay's global onDelta drops its events
+      // silently instead of per-delta "unresolved route" warnings.
+      markEphemeralProviderSid(providerSessionId);
       if (provider.setSessionAgentId && effectiveAgentId) provider.setSessionAgentId(providerSessionId, effectiveAgentId);
+
       let output = await this.runDecisionAttempt(
         provider,
         providerSessionId,
         buildSupervisionDecisionPrompt(request, request.snapshot?.promptVersion),
-        timeoutMs,
+        this.remainingExecutionBudget(deadlineAt),
       );
       let parsed = parseSupervisionDecision(output);
       if (parsed) return applyDecisionGuardrails(parsed, request);
 
-      const maxRetries = Math.max(0, request.snapshot?.maxParseRetries ?? 1);
+      const maxRetries = Math.max(0, snapshot.maxParseRetries ?? 1);
       for (let retry = 0; retry < maxRetries; retry += 1) {
         output = await this.runDecisionAttempt(
           provider,
           providerSessionId,
           buildSupervisionDecisionRepairPrompt(request, output),
-          timeoutMs,
+          this.remainingExecutionBudget(deadlineAt),
         );
         parsed = parseSupervisionDecision(output);
         if (parsed) return applyDecisionGuardrails(parsed, request);
       }
       return askHuman('invalid supervisor decision', SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
+    } catch (error) {
+      throw normalizeProviderExecutionError(error);
     } finally {
-      unmarkEphemeralProviderSid(providerSessionId);
-      await provider.endSession(providerSessionId).catch(() => {});
+      if (providerSessionId) {
+        unmarkEphemeralProviderSid(providerSessionId);
+        if (shouldEndProviderSession) {
+          await provider.endSession(providerSessionId).catch(() => {});
+        }
+      }
     }
   }
 
@@ -412,29 +840,41 @@ export class SupervisionBroker {
     prompt: string,
     timeoutMs: number,
   ): Promise<string> {
+    let settled = false;
+    const cleanups: Array<() => void> = [];
+    let settleResolve!: (value: string) => void;
+    let settleReject!: (error: unknown) => void;
     const waitForCompletion = new Promise<string>((resolve, reject) => {
-      const cleanups: Array<() => void> = [];
       const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
         while (cleanups.length > 0) cleanups.pop()?.();
         fn();
       };
-      cleanups.push(provider.onComplete((sid, message) => {
-        if (sid !== providerSessionId) return;
-        finish(() => resolve(message.content));
-      }));
-      cleanups.push(provider.onError((sid, error: ProviderError) => {
-        if (sid !== providerSessionId) return;
-        finish(() => reject(Object.assign(new Error(error.message), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR })));
-      }));
-      const timeout = setTimeout(() => {
-        void provider.cancel?.(providerSessionId).catch(() => {});
-        finish(() => reject(Object.assign(new Error('supervision timeout'), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT })));
-      }, timeoutMs);
-      cleanups.push(() => clearTimeout(timeout));
+      settleResolve = (value) => finish(() => resolve(value));
+      settleReject = (error) => finish(() => reject(error));
     });
 
+    cleanups.push(provider.onComplete((sid, message) => {
+      if (sid !== providerSessionId) return;
+      settleResolve(message.content);
+    }));
+    cleanups.push(provider.onError((sid, error: ProviderError) => {
+      if (sid !== providerSessionId) return;
+      settleReject(normalizeProviderExecutionError(error));
+    }));
+    const timeout = setTimeout(() => {
+      void provider.cancel?.(providerSessionId).catch(() => {});
+      settleReject(decisionTimeoutError());
+    }, timeoutMs);
+    cleanups.push(() => clearTimeout(timeout));
+
     void waitForCompletion.catch(() => {});
-    await provider.send(providerSessionId, prompt);
+    try {
+      await provider.send(providerSessionId, prompt);
+    } catch (error) {
+      settleReject(normalizeProviderExecutionError(error));
+    }
     return await waitForCompletion;
   }
 }

@@ -1,4 +1,3 @@
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { ContextNamespace, LocalContextEvent, ProcessedContextProjection } from '../../shared/context-types.js';
@@ -13,10 +12,15 @@ import type {
   ProjectionSourceRow,
 } from '../store/context-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
 const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
 const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
-const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
+// Alias of the shared sentinel, not a second definition: this module already
+// imports LEGACY_DAEMON_LOCAL_USER_ID. Two literals of the same value in one
+// codebase are how the register/resolve halves of the handle namespace drifted
+// apart in the first place.
+const DAEMON_LOCAL_MEMORY_USER_ID = LEGACY_DAEMON_LOCAL_USER_ID;
 
 /**
  * Caller identity passed to public read-tool handlers.
@@ -84,7 +88,7 @@ function isInternalCaller(caller: AnyCaller): caller is InternalMemoryToolCaller
 }
 
 export function getBoundMemoryToolUserId(): string | undefined {
-  const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(homedir(), '.imcodes', 'server.json');
+  const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(resolveImcodesHome(), 'server.json');
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { userId?: string };
     return typeof parsed.userId === 'string' && parsed.userId.trim() ? parsed.userId.trim() : DAEMON_LOCAL_MEMORY_USER_ID;

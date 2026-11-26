@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
 import { CloneSessionGroupDialog } from '../../src/components/CloneSessionGroupDialog.js';
 import type { SessionInfo } from '../../src/types.js';
+import { ApiError } from '../../src/api.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1, SESSION_GROUP_CLONE_MSG } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 
@@ -459,5 +460,90 @@ describe('CloneSessionGroupDialog', () => {
     expect(screen.getByText('deck_p2p_design_review_brain')).toBeDefined();
     expect(screen.queryByText('P2P Design Review')).toBeNull();
     expect(screen.queryByText('P2P Design Review copy')).toBeNull();
+  });
+
+  it('displays gitRemoteCapabilityMissing when API rejects with unsupported_command for git-remote-clone:v1', async () => {
+    const ws = makeWs();
+    ws.cloneSessionGroup.mockRejectedValueOnce(new ApiError(409, JSON.stringify({
+      error: 'unsupported_command',
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
+    })));
+
+    renderDialog(ws);
+
+    fireEvent.click(screen.getByLabelText(/working director/i));
+    fireEvent.input(screen.getByPlaceholderText('/work/new-checkout'), {
+      target: { value: '/work/new-checkout' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('https://github.com/org/repo.git'), {
+      target: { value: 'https://github.com/acme/repo.git' },
+    });
+
+    const submit = screen.getByRole('button', { name: 'Copy group' });
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+
+    expect(screen.getByText('The daemon does not support remote clone.')).toBeDefined();
+    expect(screen.queryByText('The daemon has not reported copy support.')).toBeNull();
+    // Submit button should NOT be permanently disabled on failure
+    expect(submit.hasAttribute('disabled')).toBe(false);
+
+    // Editing the input clears the failed error
+    fireEvent.input(screen.getByPlaceholderText('https://github.com/org/repo.git'), {
+      target: { value: '' },
+    });
+    expect(screen.queryByText('The daemon does not support remote clone.')).toBeNull();
+  });
+
+  it('displays daemonOffline when API rejects with daemon_offline', async () => {
+    const ws = makeWs();
+    ws.cloneSessionGroup.mockRejectedValueOnce(new ApiError(503, JSON.stringify({
+      error: 'daemon_offline',
+    })));
+
+    renderDialog(ws);
+
+    const submit = screen.getByRole('button', { name: 'Copy group' });
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+
+    expect(screen.getByText('Daemon offline.')).toBeDefined();
+    expect(submit.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('allows retrying submission after a failure with a fresh idempotency key', async () => {
+    const ws = makeWs();
+    ws.cloneSessionGroup.mockRejectedValueOnce(new ApiError(409, JSON.stringify({
+      error: 'name_taken',
+    })));
+
+    renderDialog(ws);
+    const submit = screen.getByRole('button', { name: 'Copy group' });
+
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+
+    expect(screen.getByText('That target session name is already in use.')).toBeDefined();
+    const firstKey = ws.cloneSessionGroup.mock.calls[0]?.[0]?.idempotencyKey;
+
+    // Change target project name
+    fireEvent.input(screen.getByPlaceholderText('my-project-copy'), {
+      target: { value: 'cd_retry' },
+    });
+
+    expect(screen.queryByText('That target session name is already in use.')).toBeNull();
+
+    ws.cloneSessionGroup.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+
+    expect(ws.cloneSessionGroup).toHaveBeenCalledTimes(2);
+    const secondKey = ws.cloneSessionGroup.mock.calls[1]?.[0]?.idempotencyKey;
+    expect(secondKey).toBeDefined();
+    expect(secondKey).not.toBe(firstKey);
   });
 });

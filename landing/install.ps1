@@ -1,4 +1,4 @@
-# IM.codes daemon — Windows one-click installer
+﻿# IM.codes daemon — Windows one-click installer
 #
 #   Quick install (latest):
 #     irm https://im.codes/install.ps1 | iex
@@ -235,10 +235,49 @@ if ($useMirror) {
   }
 }
 
-# ── Install the daemon (plain dist-tag; explicit --registry, no global config) ─
+# ── Install the daemon (R2 primary, npm fallback) ─────────────────────────────
 Write-Step "Installing imcodes@$Channel ..."
-& $npmExe install -g "imcodes@$Channel" --no-fund --no-audit --registry $npmRegistry
-if ($LASTEXITCODE -ne 0) { throw "npm install failed (exit $LASTEXITCODE)" }
+$installedFromR2 = $false
+$useR2 = ($env:IMCODES_USE_R2 -ne 'false') -and ($env:IMCODES_USE_R2 -ne '0') -and ($env:USE_R2_ARTIFACT -ne 'false')
+$r2Base = if ($env:IMCODES_R2_BASE_URL) { $env:IMCODES_R2_BASE_URL.TrimEnd('/') } else { 'https://dl.im.codes' }
+$r2Channel = switch ($Channel) { 'dev' { 'dev' } 'latest' { 'master' } default { '' } }
+if ($useR2 -and $r2Channel -and ($r2Base -match '^https://')) {
+  $r2Tmp = Join-Path $env:TEMP ('imcodes-r2-' + [guid]::NewGuid().ToString('N'))
+  try {
+    New-Item -ItemType Directory -Force -Path $r2Tmp | Out-Null
+    $manifest = Invoke-RestMethod "$r2Base/$r2Channel/npm/latest.json" -TimeoutSec 15
+    if (
+      $manifest `
+      -and ($manifest.channel -eq $r2Channel) `
+      -and ($manifest.filename -eq 'imcodes-latest.tgz') `
+      -and ([string]$manifest.version).Trim() `
+      -and ($manifest.sha256 -match '^[0-9a-fA-F]{64}$') `
+      -and ([int64]$manifest.sizeBytes -gt 0)
+    ) {
+      $r2Tgz = Join-Path $r2Tmp 'imcodes-latest.tgz'
+      Write-Ok ("downloading imcodes@{0} from R2 ({1})..." -f $manifest.version, $r2Channel)
+      Invoke-WebRequest "$r2Base/$r2Channel/npm/imcodes-latest.tgz" -OutFile $r2Tgz -UseBasicParsing -TimeoutSec 600
+      $actualSize = (Get-Item -LiteralPath $r2Tgz).Length
+      if ($actualSize -ne [int64]$manifest.sizeBytes) {
+        throw "size mismatch (expected $($manifest.sizeBytes), got $actualSize)"
+      }
+      $actualSha = (Get-FileHash -LiteralPath $r2Tgz -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($actualSha -ne $manifest.sha256.ToLowerInvariant()) {
+        throw "sha256 mismatch (expected $($manifest.sha256), got $actualSha)"
+      }
+      & $npmExe install -g $r2Tgz --no-fund --no-audit --registry $npmRegistry
+      if ($LASTEXITCODE -eq 0) { $installedFromR2 = $true }
+    }
+  } catch {
+    Write-Note "R2 install unavailable or failed ($($_.Exception.Message)) — falling back to npm..."
+  } finally {
+    Remove-Item -LiteralPath $r2Tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+if (-not $installedFromR2) {
+  & $npmExe install -g "imcodes@$Channel" --no-fund --no-audit --registry $npmRegistry
+  if ($LASTEXITCODE -ne 0) { throw "npm install failed (exit $LASTEXITCODE)" }
+}
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 $installed = ''

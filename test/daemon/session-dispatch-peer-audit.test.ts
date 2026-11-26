@@ -1,0 +1,378 @@
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SessionRecord } from '../../src/store/session-store.js';
+
+const sendMock = vi.fn();
+const appendExternalMock = vi.fn();
+const removeMock = vi.fn();
+const processSendMock = vi.fn();
+const injectPrivateMock = vi.fn();
+const getSessionMock = vi.fn();
+const getTransportRuntimeMock = vi.fn();
+const ensureTransportRuntimeForPendingResendMock = vi.fn();
+const drainTransportResendQueueForDispatchMock = vi.fn();
+const enqueueResendMock = vi.fn();
+
+vi.mock('../../src/agent/session-manager.js', () => ({
+  getTransportRuntime: (...args: unknown[]) => getTransportRuntimeMock(...args),
+  ensureTransportRuntimeForPendingResend: (...args: unknown[]) => ensureTransportRuntimeForPendingResendMock(...args),
+  drainTransportResendQueueForDispatch: (...args: unknown[]) => drainTransportResendQueueForDispatchMock(...args),
+}));
+
+vi.mock('../../src/daemon/transport-resend-queue.js', () => ({
+  enqueueResend: (...args: unknown[]) => enqueueResendMock(...args),
+  // Durable queue rows are now addressed to a runtime identity, so the dispatch
+  // path derives one from the live SessionRecord before enqueueing.
+  recipientFromSessionRecord: (record: { sessionInstanceId?: string; runtimeEpoch?: string } | undefined) => (
+    record?.sessionInstanceId && record?.runtimeEpoch
+      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
+      : undefined
+  ),
+}));
+
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  sendProcessSessionMessageForAutomation: (...args: unknown[]) => processSendMock(...args),
+  runWithProcessSessionSendLock: async (_name: string, fn: () => Promise<unknown>) => fn(),
+  prepareProcessSessionPrivateWriter: async () => (text: string) => injectPrivateMock(text),
+}));
+
+vi.mock('../../src/store/session-store.js', () => ({
+  getSession: (...args: unknown[]) => getSessionMock(...args),
+}));
+
+vi.mock('../../src/daemon/transport-queue-projection.js', () => ({
+  buildTransportQueueSnapshotPayload: vi.fn(() => ({ queueEpoch: 'queue_epoch_1' })),
+}));
+
+const {
+  cancelQueuedPeerAuditMessage,
+  dispatchPeerAuditMessage,
+  dispatchSessionMessage,
+  dispatchSessionMessageByName,
+} = await import('../../src/daemon/session-dispatch.js');
+
+function target(patch: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name: 'deck_sub_audit123',
+    sessionInstanceId: 'instance_audit123',
+    runtimeEpoch: 'runtime_audit123',
+    projectName: 'p',
+    projectDir: '/repo',
+    role: 'w1',
+    parentSession: 'deck_p_brain',
+    agentType: 'codex-sdk',
+    runtimeType: 'transport',
+    providerId: 'openai',
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: 1,
+    updatedAt: 1,
+    ...patch,
+  };
+}
+
+describe('peer-audit dedicated dispatch', () => {
+  beforeEach(() => {
+    sendMock.mockReset();
+    appendExternalMock.mockReset();
+    removeMock.mockReset();
+    processSendMock.mockReset();
+    injectPrivateMock.mockReset();
+    getSessionMock.mockReset();
+    getTransportRuntimeMock.mockReset();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider_session_1',
+      send: sendMock,
+      appendExternalMessageToActiveTurn: appendExternalMock,
+      removePendingMessage: removeMock,
+    });
+    ensureTransportRuntimeForPendingResendMock.mockReset();
+    ensureTransportRuntimeForPendingResendMock.mockResolvedValue(undefined);
+    drainTransportResendQueueForDispatchMock.mockReset();
+    drainTransportResendQueueForDispatchMock.mockResolvedValue(undefined);
+    enqueueResendMock.mockReset();
+    enqueueResendMock.mockReturnValue({ accepted: true, droppedOldest: false, pendingVersion: 1 });
+  });
+
+  it.each(['sent', 'queued'] as const)('returns the exact transport %s disposition and private queue metadata', async (disposition) => {
+    sendMock.mockReturnValue(disposition);
+    const result = await dispatchPeerAuditMessage({ target: target(), brief: 'bounded brief', attemptId: 'attempt_1' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.receipt.disposition).toBe(disposition);
+    expect(result.receipt.queueEpoch).toBe(disposition === 'queued' ? 'queue_epoch_1' : undefined);
+    expect(sendMock).toHaveBeenCalledWith(
+      'bounded brief',
+      expect.any(String),
+      undefined,
+      undefined,
+      {
+        deliveryMode: 'append',
+        // A queued brief drains as the daemon's message, not the human's input.
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: expect.any(String) },
+      },
+    );
+  });
+
+  it('cancels only the exact queued message id', () => {
+    removeMock.mockReturnValue(true);
+    expect(cancelQueuedPeerAuditMessage('deck_sub_audit123', 'message_exact')).toBe(true);
+    expect(removeMock).toHaveBeenCalledWith('message_exact');
+  });
+
+  it('injects idle process auditors privately and never through the ordinary automation send', async () => {
+    const idle = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(idle);
+
+    await expect(dispatchPeerAuditMessage({ target: idle, brief: 'audit', attemptId: 'attempt_2' }))
+      .resolves.toMatchObject({ ok: true, receipt: { disposition: 'sent_unrevocable' } });
+    expect(injectPrivateMock).toHaveBeenCalledWith('audit');
+    // The capability-bearing brief must not reach the timeline/history/memory path.
+    expect(processSendMock).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a busy process auditor without injecting', async () => {
+    const busy = target({ agentType: 'codex', runtimeType: 'process', state: 'running' });
+    getSessionMock.mockReturnValue(busy);
+
+    await expect(dispatchPeerAuditMessage({ target: busy, brief: 'audit', attemptId: 'attempt_3' }))
+      .resolves.toEqual({ ok: false, error: 'target_runtime_busy_uncancellable' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('sends nothing when the authoritative record diverges from the caller snapshot', async () => {
+    // Caller snapshot is idle and correctly identified; the live record has
+    // since been replaced (delete/recreate) and is busy.
+    const snapshot = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(target({
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'running',
+      sessionInstanceId: 'instance_recreated',
+    }));
+
+    await expect(dispatchPeerAuditMessage({ target: snapshot, brief: 'audit', attemptId: 'attempt_4' }))
+      .resolves.toEqual({ ok: false, error: 'target_ineligible' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+  });
+
+  it('does not claim sent_unrevocable when the effect was cancelled before the write', async () => {
+    const idle = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(idle);
+
+    await expect(dispatchPeerAuditMessage({
+      target: idle,
+      brief: 'audit',
+      attemptId: 'attempt_5',
+      isEffectCurrent: () => false,
+    })).resolves.toEqual({ ok: false, error: 'attempt_not_found' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary manual dispatch on the inferred transport path for legacy records', async () => {
+    sendMock.mockReturnValue('sent');
+    const legacyTransport = target({ runtimeType: undefined, agentType: 'codex-sdk' });
+    await expect(dispatchSessionMessage(legacyTransport, 'ordinary delegation', {
+      messageId: 'send_message_12345678' as never,
+    })).resolves.toBe('sent');
+    expect(sendMock).toHaveBeenCalledWith(
+      'ordinary delegation',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('routes named external sends through transport and process runtimes', async () => {
+    sendMock.mockReturnValue('sent');
+    getSessionMock.mockReturnValueOnce(target());
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'transport external message'))
+      .resolves.toBe('sent');
+    expect(sendMock).toHaveBeenCalledWith(
+      'transport external message',
+      expect.stringMatching(/^send_message_/),
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
+    expect(processSendMock).not.toHaveBeenCalled();
+
+    sendMock.mockClear();
+    getSessionMock.mockReturnValueOnce(target({ agentType: 'codex', runtimeType: 'process' }));
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'process external message'))
+      .resolves.toBeUndefined();
+    expect(processSendMock).toHaveBeenCalledWith('deck_sub_audit123', 'process external message');
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('appends MCP-mode transport messages directly and never touches the resend FIFO', async () => {
+    appendExternalMock.mockResolvedValue('appended');
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('sent');
+
+    expect(appendExternalMock).toHaveBeenCalledWith('peer update', 'send_message_12345678', undefined, undefined, { timelineCommitted: false });
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueResendMock).not.toHaveBeenCalled();
+  });
+
+  it('returns temporary supervision authority to the durable producer without FIFO fallback', async () => {
+    appendExternalMock.mockResolvedValue('retry');
+    const queueSupervisionReference = {
+      kind: 'exact_integration' as const,
+      taskId: 'tsk_retry', assignmentId: 'asg_retry', revision: 'r1',
+    };
+
+    await expect(dispatchSessionMessage(target(), 'retry later', {
+      dispatchId: 'send_dispatch_retry' as never,
+      messageId: 'send_message_retry' as never,
+      deliveryMode: 'append',
+      queueSupervisionReference,
+    })).rejects.toThrow('transport supervision authority temporarily unavailable');
+    expect(appendExternalMock).toHaveBeenCalledWith(
+      'retry later', 'send_message_retry', queueSupervisionReference, undefined, { timelineCommitted: false },
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit queue delivery in ordinary FIFO without active-turn append', async () => {
+    sendMock.mockReturnValue('queued');
+
+    await expect(dispatchSessionMessage(target(), 'wait your turn', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'queue',
+    })).resolves.toBe('queued');
+
+    expect(appendExternalMock).not.toHaveBeenCalled();
+    expect(sendMock).toHaveBeenCalledWith('wait your turn', 'send_message_12345678');
+  });
+
+  it('persists daemon-owned control traffic before draining the live runtime', async () => {
+    await expect(dispatchSessionMessage(target(), 'automatic audit', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      durableQueue: true,
+      deliveryMode: 'append',
+      suppressTimeline: true,
+      queueSupervisionReference: {
+        kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
+      },
+    })).resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'automatic audit',
+      commandId: 'send_message_12345678',
+      clientMessageId: 'send_message_12345678',
+      supervisionReference: {
+        kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
+      },
+      deliveryMode: 'append',
+      timelineCommitted: true,
+    }));
+    expect(drainTransportResendQueueForDispatchMock).toHaveBeenCalledWith('deck_sub_audit123');
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('delivers daemon control turns without projecting a second transport user message', async () => {
+    sendMock.mockReturnValue('sent');
+
+    await expect(dispatchSessionMessage(target(), 'internal continuation', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      suppressTimeline: true,
+    })).resolves.toBe('sent');
+
+    expect(sendMock).toHaveBeenCalledWith(
+      'internal continuation',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
+    );
+  });
+
+  it('delivers daemon control turns to process agents without a second timeline projection', async () => {
+    const processTarget = target({ agentType: 'codex', runtimeType: 'process' });
+
+    await expect(dispatchSessionMessage(processTarget, 'internal continuation', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      suppressTimeline: true,
+    })).resolves.toBeUndefined();
+
+    expect(processSendMock).toHaveBeenCalledWith(
+      'deck_sub_audit123',
+      'internal continuation',
+      { suppressTimeline: true },
+    );
+  });
+
+  it('durably queues MCP delivery when the transport runtime is unavailable', async () => {
+    getTransportRuntimeMock.mockReturnValueOnce(undefined);
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'peer update',
+      clientMessageId: 'send_message_12345678',
+      deliveryMode: 'append',
+    }));
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
+  });
+
+  it('falls back to the durable runtime FIFO when native append is unsupported', async () => {
+    appendExternalMock.mockResolvedValue('unsupported');
+    sendMock.mockReturnValue('queued');
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('queued');
+
+    expect(appendExternalMock).toHaveBeenCalledOnce();
+    expect(sendMock).toHaveBeenCalledWith(
+      'peer update',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
+  });
+
+  it('durably queues a named transport send while its runtime is still restoring', async () => {
+    getSessionMock.mockReturnValueOnce(target());
+    getTransportRuntimeMock.mockReturnValueOnce(undefined);
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'startup-window external message'))
+      .resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'startup-window external message',
+      commandId: expect.stringMatching(/^send_message_/),
+      clientMessageId: expect.stringMatching(/^send_message_/),
+      queuedAt: expect.any(Number),
+    }));
+    const queuedEntry = enqueueResendMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(queuedEntry.commandId).toBe(queuedEntry.clientMessageId);
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+});

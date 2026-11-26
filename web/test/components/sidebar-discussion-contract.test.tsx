@@ -78,13 +78,13 @@ describe('Sidebar contract', () => {
     fireEvent.mouseDown(mouseHandle, { clientX: 100 });
     fireEvent.mouseMove(document, { clientX: 220 });
     fireEvent.mouseUp(document, { clientX: 220 });
-    expect(localStorage.getItem('sidebar_width_srv-1')).toBe('440');
+    expect(localStorage.getItem('sidebar_width')).toBe('440');
 
     const touchHandle = container.querySelector('.sidebar-resize-grip') as HTMLElement;
     fireEvent.touchStart(touchHandle, { touches: [{ clientX: 220 }] });
     fireEvent.touchMove(document, { touches: [{ clientX: 20 }] });
     fireEvent.touchEnd(document, { changedTouches: [{ clientX: 20 }] });
-    expect(localStorage.getItem('sidebar_width_srv-1')).toBe('240');
+    expect(localStorage.getItem('sidebar_width')).toBe('240');
 
     saveSidebarCollapsed(true);
     expect(loadSidebarCollapsed()).toBe(true);
@@ -210,7 +210,8 @@ describe('StartDiscussionDialog contract', () => {
     expect(screen.getAllByText('discussion.arbiter')).toHaveLength(1);
 
     const comboboxes = screen.getAllByRole('combobox');
-    changeSelect(comboboxes[2], 'gemini');
+    expect(comboboxes[2].querySelector('option[value="gemini"]')).toBeNull();
+    changeSelect(comboboxes[2], 'codex');
     expect(screen.getAllByDisplayValue('Sonnet').length).toBeGreaterThan(0);
 
     const overlay = container.querySelector('.dialog-overlay') as HTMLElement;

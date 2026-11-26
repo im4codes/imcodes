@@ -64,12 +64,17 @@ export type PreviewAccessResult =
 export async function resolveLocalPreviewAccess(input: PreviewAccessInput): Promise<PreviewAccessResult> {
   const registry = LocalWebPreviewRegistry.get(input.serverId);
 
-  // 1. Resolve userId — session wins; otherwise verify the preview access token.
+  // 1. Resolve userId — session wins; verify any presented preview access token
+  //    explicitly so an unvalidated query token is never echoed or set-cookied.
   let userId: string | null = input.session?.userId ?? null;
-  if (!userId && input.previewAccessToken) {
+  let validatedPreviewAccessToken: string | null = null;
+  if (input.previewAccessToken) {
     // PURE verify — peekWithAccessToken never mutates lastAccessAt/expiresAt.
     const fromToken = registry.peekWithAccessToken(input.previewId, input.previewAccessToken);
-    if (fromToken) userId = fromToken.userId;
+    if (fromToken) {
+      validatedPreviewAccessToken = input.previewAccessToken;
+      if (!userId) userId = fromToken.userId;
+    }
   }
 
   // 2. No identity → unauthorized.
@@ -87,7 +92,7 @@ export async function resolveLocalPreviewAccess(input: PreviewAccessInput): Prom
   const role = await resolveServerRole(input.db, input.serverId, userId);
   if (role === 'none') return { ok: false, status: 403, error: PREVIEW_ERROR.FORBIDDEN };
 
-  return { ok: true, userId, role, preview, previewAccessToken: input.previewAccessToken };
+  return { ok: true, userId, role, preview, previewAccessToken: validatedPreviewAccessToken };
 }
 
 /**

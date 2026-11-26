@@ -1,0 +1,107 @@
+name: build-libwebrtc-sdk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - shared/remote-desktop-native-pins.json
+      - native/windows-remote-desktop/sdk.BUILD.gn
+      - native/windows-remote-desktop/libwebrtc-sdk.gni
+      - native/windows-remote-desktop/sdk_anchor.cc
+      - native/windows-remote-desktop/load-native-pins.ps1
+      - native/windows-remote-desktop/initialize-hermetic-windows-git.ps1
+      - native/windows-remote-desktop/invoke-native-logged.ps1
+      - native/windows-remote-desktop/build-libwebrtc-sdk.ps1
+      - native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py
+      - scripts/libwebrtc-sdk-artifacts.mjs
+      - scripts/promote-libwebrtc-sdk.mjs
+      - scripts/publish-libwebrtc-sdk.mjs
+      - scripts/windows-libwebrtc-sdk-archive.ps1
+      - .github/workflows/build-libwebrtc-sdk.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-libwebrtc-sdk-windows-x64
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+
+jobs:
+  build:
+    name: Build immutable Windows libwebrtc foundation SDK
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: npm
+      - name: Install dependencies
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
+      - name: Resolve SDK foundation cache identity
+        id: sdk_foundation
+        shell: bash
+        run: echo "source_sha256=$(node scripts/libwebrtc-sdk-artifacts.mjs fingerprint)" >> "$GITHUB_OUTPUT"
+      - name: Restore exported libwebrtc foundation SDK
+        id: sdk_foundation_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-libwebrtc-sdk
+          key: imcodes-libwebrtc-foundation-windows-2022-${{ steps.sdk_foundation.outputs.source_sha256 }}-v1
+      - name: Restore pinned depot_tools and CIPD bootstrap
+        if: steps.sdk_foundation_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-webrtc/depot_tools
+          key: imcodes-depot-tools-windows-2022-${{ hashFiles('shared/remote-desktop-native-pins.json') }}-v2
+      - name: Build the dependency-only SDK
+        if: steps.sdk_foundation_cache.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          & .\native\windows-remote-desktop\build-libwebrtc-sdk.ps1 `
+            -CheckoutRoot "$env:RUNNER_TEMP\imcodes-webrtc" `
+            -ArtifactRoot "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk" `
+            -Jobs 4
+      - name: Verify restored libwebrtc foundation SDK
+        if: steps.sdk_foundation_cache.outputs.cache-hit == 'true'
+        run: node scripts/libwebrtc-sdk-artifacts.mjs verify "${{ runner.temp }}\imcodes-libwebrtc-sdk"
+      - name: Package and verify the immutable SDK
+        id: sdk
+        shell: powershell
+        run: |
+          node scripts/publish-libwebrtc-sdk.mjs `
+            "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk" `
+            sdk-release `
+            $env:GITHUB_SHA
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-lock `
+            sdk-release/libwebrtc-sdk.lock.json `
+            sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip `
+            "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk"
+          $lock = Get-Content -LiteralPath sdk-release\libwebrtc-sdk.lock.json -Raw | ConvertFrom-Json
+          "release_tag=$($lock.releaseTag)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Upload SDK candidate and generated lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-sdk-candidate-${{ steps.sdk.outputs.release_tag }}
+          path: |
+            sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
+            sdk-release/libwebrtc-sdk.lock.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish immutable SDK release and advance repository lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/promote-libwebrtc-sdk.mjs
+          sdk-release/libwebrtc-sdk.lock.json
+          sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
+          ${{ github.sha }}
+          dev

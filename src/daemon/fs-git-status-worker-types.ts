@@ -25,6 +25,7 @@ export interface FsGitStatusBuildJobInput {
   repoSignature: string;
   requestedPath: string;
   includeStats: boolean;
+  summaryOnly?: boolean;
 }
 
 export interface FsGitStatusWorkerRequest extends FsGitStatusBuildJobInput, FsGitStatusWorkerIdentity {}
@@ -35,7 +36,10 @@ export interface FsGitStatusWorkerSuccess extends FsGitStatusWorkerIdentity {
   repoSignature: string;
   requestedPath: string;
   includeStats: boolean;
+  summaryOnly?: boolean;
   files: FsGitStatusWorkerFile[];
+  totalCount?: number;
+  truncated?: boolean;
 }
 
 export interface FsGitStatusWorkerError extends FsGitStatusWorkerIdentity {

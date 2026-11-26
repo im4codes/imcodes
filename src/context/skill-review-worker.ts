@@ -39,6 +39,7 @@ import {
   getPersistedMemoryFeatureFlagValues,
   getRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 type StoredSkillReviewJob = MaterializationSkillReviewJob & {
   state: SkillReviewJobState;
@@ -239,6 +240,7 @@ export class LocalSkillReviewWorker implements MaterializationSkillReviewSchedul
       ? target.source.path
       : getUserSkillPath({
         homeDir,
+        stateDir: imcodesStateDirForHome(homeDir),
         category: 'learned',
         skillName,
       });

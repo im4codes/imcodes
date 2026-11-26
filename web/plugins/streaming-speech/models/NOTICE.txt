@@ -1,0 +1,14 @@
+IM.codes offline speech third-party notices
+
+Qwen3-ASR 0.6B INT4 ONNX export
+https://huggingface.co/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx
+Revision 9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e.
+Apache License 2.0 (inherited from Qwen3-ASR).
+
+ONNX Runtime Android (com.microsoft.onnxruntime:onnxruntime-android)
+https://github.com/microsoft/onnxruntime
+MIT License; see LICENSE.onnxruntime.txt.
+
+The bundled ONNX model and tokenizer bytes are unchanged from the above pinned export.
+This application supplies its own Whisper mel extractor, BPE tokenizer, decoder loop,
+microphone capture, and Capacitor adapters.

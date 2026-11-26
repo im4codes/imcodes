@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { Hono } from 'hono';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createServer, createSubSession, createUser, updateSessionLabel, upsertDbSession } from '../src/db/queries.js';
+import { createServer, createSubSession, createUser, updateSession, updateSessionLabel, updateSubSession, upsertDbSession } from '../src/db/queries.js';
 import {
   createOrUpdateShare,
   deriveShareTransitionKey,
@@ -12,9 +12,11 @@ import {
   writeShareAuditEvent,
 } from '../src/db/tab-sharing.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
-import { resolveHttpShareAccess } from '../src/routes/share-http-auth.js';
-import { resolveServerRole } from '../src/security/authorization.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from '../src/routes/share-http-auth.js';
+import { resolveServerMembershipRole, resolveServerRole } from '../src/security/authorization.js';
 import { signJwt, verifyJwt } from '../src/security/crypto.js';
+import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { WsBridge } from '../src/ws/bridge.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
 
@@ -276,9 +278,115 @@ describe('tab sharing persistence helpers', () => {
     const afterAllExpired = await resolveEffectiveShareCoverage(db, { userId: recipientId, target: mainTarget, now: 10_000 });
     expect(afterAllExpired).toBeNull();
   });
+
+  it('lets a main share cover ordinary child HTTP history without covering execution clones', async () => {
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 1_000,
+    });
+
+    const childAccess = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'subsession', serverId, subSessionId },
+      now: 2_000,
+    });
+    expect(childAccess.actor).toMatchObject({
+      kind: 'share',
+      coverage: {
+        target: { kind: 'main', serverId, sessionName },
+        effectiveRole: 'viewer',
+      },
+    });
+
+    const cloneId = id('clone');
+    await createSubSession(
+      db,
+      cloneId,
+      serverId,
+      'codex',
+      null,
+      '/tmp/proj',
+      'Execution clone',
+      null,
+      null,
+      sessionName,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      { kind: EXECUTION_CLONE_KIND, parentRunId: id('run') },
+    );
+    const cloneAccess = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'subsession', serverId, subSessionId: cloneId },
+      now: 2_000,
+    });
+    expect(cloneAccess.actor).toEqual({ kind: 'none' });
+  });
 });
 
 describe('tab sharing APIs', () => {
+  it('gives only a server-share participant owner-equivalent operations while re-share stays member-only', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, outsiderId, serverId, sessionName } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('server-participant'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+
+    expect(await resolveServerMembershipRole(db, serverId, recipientId)).toBe('none');
+    expect(await resolveServerRole(db, serverId, recipientId)).toBe('owner');
+    const operationalShareAccess = await resolveHttpShareAccess(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'main', serverId, sessionName },
+    });
+    expect(operationalShareAccess.membership).toBe('none');
+    expect(operationalShareAccess.shareProvenance).toBe('server');
+    expect(operationalShareAccess.actor).toMatchObject({
+      kind: 'share',
+      effectiveActorRole: 'participant',
+      coverage: { target: { kind: 'main', serverId, sessionName } },
+    });
+
+    const reshared = await app.request(`/api/server/${serverId}/shares`, {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({
+        target: { kind: 'main', serverId, sessionName },
+        targetUserId: outsiderId,
+        role: 'participant',
+      }),
+    });
+    expect(reshared.status).toBe(403);
+
+    await createOrUpdateShare(db, {
+      id: id('session-participant'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: outsiderId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+    expect(await resolveServerRole(db, serverId, outsiderId)).toBe('none');
+  });
+
   it('enforces manager-only creation, self-share rejection, and sub-session normalization', async () => {
     const app = makeApp();
     const { ownerId, recipientId, outsiderId, serverId, subSessionId } = await seedShareTarget();
@@ -394,11 +502,13 @@ describe('tab sharing APIs', () => {
     };
     expect(openBody.coverage).toMatchObject({ effectiveRole: 'viewer', historyCutoffAt: 0 });
     expect(openBody.sessions).toEqual([expect.objectContaining({ sessionName })]);
+    expect(openBody.sessions[0]).not.toHaveProperty('activeDispatchId');
     expect(openBody.subSessions).toEqual([expect.objectContaining({
       subSessionId,
       sessionName: `deck_sub_${subSessionId}`,
       parentSessionName: sessionName,
     })]);
+    expect(openBody.subSessions[0]).not.toHaveProperty('activeDispatchId');
 
     const openServer = await app.request('/api/shares/open', {
       method: 'POST',
@@ -416,6 +526,58 @@ describe('tab sharing APIs', () => {
       sessionName: `deck_sub_${subSessionId}`,
       parentSessionName: sessionName,
     })]));
+  });
+
+  it('includes authoritative serverStatus and lastHeartbeatAt presence in share discovery for server, main, and subsession targets', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share-server'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-main'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-subsession'),
+      target: { kind: 'subsession', serverId, subSessionId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+
+    // Initial state: server has status 'offline' and null heartbeat
+    let discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    let body = await discover.json() as { shares: Array<{ id: string; target: { kind: string }; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares).toHaveLength(3);
+    for (const share of body.shares) {
+      expect(share.serverStatus).toBe('offline');
+      expect(share.lastHeartbeatAt).toBeNull();
+    }
+
+    // Server daemon reports active heartbeat
+    const heartbeatTimestamp = Date.now();
+    await db.execute('UPDATE servers SET status = $1, last_heartbeat_at = $2 WHERE id = $3', ['online', heartbeatTimestamp, serverId]);
+
+    discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    body = await discover.json() as { shares: Array<{ id: string; target: { kind: string }; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares).toHaveLength(3);
+    for (const share of body.shares) {
+      expect(share.serverStatus).toBe('online');
+      expect(share.lastHeartbeatAt).toBe(heartbeatTimestamp);
+    }
   });
 
   it('opens a shared sub-session with its parent main session for tree rendering', async () => {
@@ -672,6 +834,29 @@ describe('tab sharing APIs', () => {
   it('keeps manager and recipient share metadata minimized and shape-separated', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await updateSession(db, serverId, sessionName, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak' },
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    await updateSubSession(db, subSessionId, serverId, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak-sub' },
+        supervision: { mode: 'supervised' },
+      },
+    });
     await db.execute(
       'UPDATE users SET username = $1, display_name = $2, password_hash = $3 WHERE id = $4',
       [`recipient_${recipientId}`, 'Shared Recipient', 'secret-hash', recipientId],
@@ -749,6 +934,8 @@ describe('tab sharing APIs', () => {
       body: JSON.stringify({ target: { kind: 'subsession', serverId, subSessionId } }),
     });
     expect(open.status).toBe(403);
+    const activeDispatchSpy = vi.spyOn(WsBridge.get(serverId), 'getActiveDispatchIdForSession')
+      .mockImplementation((name) => name === sessionName ? 'dispatch-main-1' : 'dispatch-sub-1');
     const openMain = await app.request('/api/shares/open', {
       method: 'POST',
       headers: authHeaders(recipientId),
@@ -756,6 +943,7 @@ describe('tab sharing APIs', () => {
     });
     expect(openMain.status).toBe(200);
     const openBody = await openMain.json() as Record<string, unknown>;
+    activeDispatchSpy.mockRestore();
     expect(openBody).toMatchObject({
       server: {
         id: serverId,
@@ -768,6 +956,8 @@ describe('tab sharing APIs', () => {
           title: 'Main Label',
           state: 'idle',
           agentType: 'codex',
+          activeDispatchId: 'dispatch-main-1',
+          supervisionMode: 'supervised_audit',
         },
       ],
       subSessions: [
@@ -777,9 +967,13 @@ describe('tab sharing APIs', () => {
           title: 'Sub Label',
           type: 'codex',
           parentSessionName: sessionName,
+          activeDispatchId: 'dispatch-sub-1',
+          supervisionMode: 'supervised',
         },
       ],
     });
+    expect((openBody.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
+    expect((openBody.subSessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
     expect(openBody).not.toHaveProperty('shares');
     expect(openBody).not.toHaveProperty('targetUser');
     expect(openBody).not.toHaveProperty('createdBy');
@@ -796,5 +990,116 @@ describe('tab sharing APIs', () => {
       'transportConfig',
       'providerSessionId',
     ]);
+  });
+
+  it('POST /shares/open for a main share returns direct and nested non-clone descendants while excluding execution clones and other main sessions', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+
+    // Another main session with its own sub-session that must NOT appear in main share open response.
+    const otherMain = `deck_other_${id('main')}`;
+    await upsertDbSession(db, id('other-sess'), serverId, otherMain, 'OtherProj', 'brain', 'codex', '/tmp/other', 'idle', 'Other Label');
+    const otherSubId = id('other-sub');
+    await createSubSession(db, otherSubId, serverId, 'shell', null, '/tmp/other', 'Other Sub', null, null, otherMain);
+
+    // Nested descendant: subSessionId (child of main) -> nestedChildId -> deepChildId
+    const nestedChildId = id('nested-child');
+    await createSubSession(
+      db,
+      nestedChildId,
+      serverId,
+      'codex-sdk',
+      null,
+      '/tmp/proj',
+      'Nested Child',
+      null,
+      null,
+      `deck_sub_${subSessionId}`,
+    );
+    const deepChildId = id('deep-child');
+    await createSubSession(
+      db,
+      deepChildId,
+      serverId,
+      'shell',
+      null,
+      '/tmp/proj',
+      'Deep Child',
+      null,
+      null,
+      `deck_sub_${nestedChildId}`,
+    );
+
+    // Execution clone under shared main session + execution clone under nested child must both be excluded.
+    const mainCloneId = id('main-clone');
+    await createSubSession(
+      db,
+      mainCloneId,
+      serverId,
+      'codex',
+      null,
+      '/tmp/proj',
+      'Main Clone',
+      null,
+      null,
+      sessionName,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      { kind: EXECUTION_CLONE_KIND, parentRunId: id('run-1') },
+    );
+    const nestedCloneId = id('nested-clone');
+    await createSubSession(
+      db,
+      nestedCloneId,
+      serverId,
+      'codex',
+      null,
+      '/tmp/proj',
+      'Nested Clone',
+      null,
+      null,
+      `deck_sub_${subSessionId}`,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      { kind: EXECUTION_CLONE_KIND, parentRunId: id('run-2') },
+    );
+
+    await createOrUpdateShare(db, {
+      id: id('share-main-nested'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 12_000,
+    });
+
+    const res = await app.request('/api/shares/open', {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({ target: { kind: 'main', serverId, sessionName } }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      subSessions: Array<{ subSessionId: string; parentSessionName: string | null }>;
+    };
+    const returnedIds = body.subSessions.map((s) => s.subSessionId);
+    expect(returnedIds).toEqual(expect.arrayContaining([subSessionId, nestedChildId, deepChildId]));
+    expect(returnedIds).not.toContain(otherSubId);
+    expect(returnedIds).not.toContain(mainCloneId);
+    expect(returnedIds).not.toContain(nestedCloneId);
   });
 });

@@ -1,15 +1,20 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
 import { sharedContextRoutes } from '../src/routes/shared-context.js';
+import { computeProjectionContentHash } from '../../shared/memory-content-hash.js';
+import { sanitizePostgresJson } from '../../shared/postgres-json-safe.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 
 const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+const storeProjectionEmbeddingMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/util/embedding.js', () => ({
   generateEmbedding: generateEmbeddingMock,
+  storeProjectionEmbedding: storeProjectionEmbeddingMock,
   embeddingToSql: (embedding: Float32Array) => `[${Array.from(embedding).join(',')}]`,
 }));
 
@@ -24,6 +29,8 @@ vi.mock('../src/security/authorization.js', () => ({
 beforeEach(() => {
   generateEmbeddingMock.mockReset();
   generateEmbeddingMock.mockResolvedValue(null);
+  storeProjectionEmbeddingMock.mockReset();
+  storeProjectionEmbeddingMock.mockResolvedValue(undefined);
   process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
 });
 
@@ -66,22 +73,14 @@ function makeMockDb() {
 
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id, team_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1' } as T;
+      // The daemon-token guard reads role and revocation together with the row,
+      // and matches on id first. A stub that omits node_role/revoked_at would
+      // make a controlled or revoked credential look like a full daemon.
+      if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+        if (params[0] === 'srv-1' && params[1] === validTokenHash) {
+          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
         }
         return null;
       }
@@ -271,6 +270,13 @@ function makeMockDb() {
       executeSql.push(sql);
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('insert into shared_context_projections')) {
+        // Postgres itself is what rejects a literal NUL byte in a text
+        // parameter (error 22021); a JS mock can't reproduce that, so this
+        // simulates it explicitly to prove the route sanitizes before this
+        // call instead of relying on the real database to catch it.
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         projectionRows.push({
           id: params[0],
           server_id: params[1],
@@ -280,11 +286,18 @@ function makeMockDb() {
           user_id: params[5],
           project_id: params[6],
           projection_class: params[7],
+          source_event_ids_json: params[8],
+          summary: params[9],
+          content_json: params[10],
+          content_hash: params[11],
           origin: params[12],
         });
         return { changes: 1 };
       }
       if (normalized.includes('insert into shared_context_records')) {
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         recordRows.push({
           id: params[0],
           projection_id: params[1],
@@ -295,6 +308,8 @@ function makeMockDb() {
           user_id: params[6],
           project_id: params[7],
           record_class: params[8],
+          summary: params[9],
+          content_json: params[10],
           origin: params[11],
         });
         return { changes: 1 };
@@ -399,6 +414,175 @@ describe('shared-context processed remote route', () => {
     expect(aliasRows).toHaveLength(0);
   });
 
+  it('strips a NUL byte from the summary instead of letting it break the whole replication batch', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        projections: [
+          {
+            id: 'proj-nul',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
+            sourceEventIds: ['evt-1'],
+            summary: 'decision with an embedded\u0000NUL byte',
+            content: { kind: 'decision' },
+            createdAt: 100,
+            updatedAt: 110,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+    expect(projectionRows[0].summary).toBe('decision with an embedded�NUL byte');
+    expect(recordRows).toHaveLength(1);
+    expect(recordRows[0].summary).toBe('decision with an embedded�NUL byte');
+  });
+
+  it('sanitizes nested NULs before JSONB writes and hashes the persisted content', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    const content = {
+      nested: { text: 'a\u0000b', 'key\u0000': ['emoji 😀', 'literal\\u0000'] },
+      list: [{ value: '\u0000' }],
+    };
+    const sourceEventIds = ['evt-1', 'evt\u0000-2'];
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-nested-nul',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'durable_memory_candidate', origin: 'chat_compacted', sourceEventIds,
+          summary: 'nested NUL', content, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const safeContent = sanitizePostgresJson(content).value;
+    const safeSourceEventIds = sanitizePostgresJson(sourceEventIds).value;
+    const persistedProjection = projectionRows[0];
+    const persistedRecord = recordRows[0];
+    expect(response.status).toBe(200);
+    expect(persistedProjection).toMatchObject({
+      source_event_ids_json: JSON.stringify(safeSourceEventIds),
+      content_json: JSON.stringify(safeContent),
+      content_hash: computeProjectionContentHash({ summary: 'nested NUL', content: safeContent }),
+    });
+    expect(JSON.parse(persistedProjection.content_json as string)).toEqual(safeContent);
+    expect(JSON.parse(persistedRecord.content_json as string)).toEqual(safeContent);
+    expect((persistedProjection.content_json as string).includes('\u0000')).toBe(false);
+
+    // Replaying the same payload remains successful and produces the same hash.
+    const replay = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-nested-nul',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'durable_memory_candidate', origin: 'chat_compacted', sourceEventIds, summary: 'nested NUL', content,
+          createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+    expect(replay.status).toBe(200);
+    expect(projectionRows.at(-1)?.content_hash).toBe(persistedProjection.content_hash);
+  });
+
+  it('turns a rejected projection write into a 503 and keeps the next request healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const originalExecute = db.execute.bind(db);
+    let rejectNextProjectionWrite = true;
+    (db as unknown as {
+      execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }>;
+    }).execute = async (sql, params = []) => {
+      if (rejectNextProjectionWrite && sql.toLowerCase().includes('insert into shared_context_projections')) {
+        rejectNextProjectionWrite = false;
+        throw new Error('22P05: unsupported Unicode escape sequence');
+      }
+      return originalExecute(sql, params);
+    };
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-db-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const failed = await request();
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ error: 'processed_replication_failed', projectionId: 'proj-db-rejection' });
+    expect(projectionRows).toHaveLength(0);
+
+    const recovered = await request();
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+  });
+
+  it('contains a rejected embedding promise so a later request remains healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    storeProjectionEmbeddingMock.mockRejectedValueOnce(new Error('embedding unavailable'));
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-embedding-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const first = await request();
+    expect(first.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await request();
+    expect(second.status).toBe(200);
+    expect(projectionRows).toHaveLength(2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeProjectionEmbeddingMock).toHaveBeenCalledTimes(2);
+  });
 
   it('skips noisy API error projections during remote replication', async () => {
     const { db, projectionRows, recordRows } = makeMockDb();
@@ -723,10 +907,11 @@ describe('shared-context processed remote route', () => {
     const personalDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-          if (params[0] === sha256Hex('daemon-token') && params[1] === 'srv-1') {
-            return { id: 'srv-1', team_id: null, user_id: 'user-1' } as T;
+        if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+          if (params[0] === 'srv-1' && params[1] === sha256Hex('daemon-token')) {
+            return { id: 'srv-1', team_id: null, user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
           }
         }
         return db.queryOne<T>(sql, params);
@@ -1056,6 +1241,7 @@ describe('shared-context processed remote route', () => {
     const staleDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
         if (normalized.includes('select id, updated_at from shared_context_projections where enterprise_id = $1 and project_id = $2 order by updated_at desc limit 1')) {
           if (params[0] === 'ent-1' && params[1] === 'github.com/acme/repo') {

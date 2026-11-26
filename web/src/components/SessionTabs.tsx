@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
@@ -6,6 +7,10 @@ import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { recordPerfRender } from '../perf-render-debug.js';
+import { appendMissingOrderIds, reorderOrderIdsPreservingHidden, sameOrderIds } from '../server-order.js';
+import { readLegacyTabOrder, sortSessionsByTabOrder } from '../keyboard-shortcuts.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -18,8 +23,10 @@ interface Props {
   p2pSessionLabels?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
   onSelect: (name: string) => void;
-  onNewSession: () => void;
+  onNewSession?: () => void;
   onStopProject: (project: string) => void;
+  /** Whole-project stop is owner/server-share authority, never tab-share authority. */
+  canStopProject?: boolean;
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
   onOpenSessionSettings?: (session: SessionInfo) => void;
@@ -35,12 +42,16 @@ interface Props {
   pinned: Set<string>;
   /** Setter for the pinned array (server-synced via useSyncedPreference) */
   setPinnedArr: (value: string[] | ((prev: string[]) => string[])) => void;
+  /** Optional lifted tab order array (synced via useSyncedPreference in app.tsx). */
+  tabOrder?: string[];
+  /** Optional setter for lifted tab order. */
+  setTabOrder?: (value: string[] | ((prev: string[]) => string[])) => void;
+  /** Whether lifted tabOrder has finished hydrating from the server. */
+  tabOrderHydrated?: boolean;
 }
 
 interface CtxMenu { x: number; y: number; session: SessionInfo }
 
-/** Legacy localStorage key — read once on first load for migration. */
-const LEGACY_LS_ORDER = 'rcc_tab_order';
 const TAB_LONG_PRESS_MS = 520;
 const TAB_LONG_PRESS_MOVE_CANCEL_PX = 10;
 const TAB_MOUSE_CLICK_MOVE_CANCEL_PX = 6;
@@ -67,11 +78,14 @@ interface MousePressState {
   startY: number;
 }
 
-function readLegacyOrder(): string[] {
-  try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
-}
+type ControlledTabsProps = Omit<Props, 'tabOrder' | 'setTabOrder' | 'tabOrderHydrated'> & {
+  tabOrder: string[];
+  setTabOrder: (value: string[] | ((prev: string[]) => string[])) => void;
+  tabOrderHydrated: boolean;
+};
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
+  recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -87,49 +101,31 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const suppressNextClickRef = useRef(false);
   const suppressNextClickResetRef = useRef<number | null>(null);
 
-  // Persisted order via server-synced preferences. (Pinned state is lifted to
-  // app.tsx so handleStopProject can guard against stopping pinned sessions.)
-  // Default to legacy localStorage value so existing users don't lose their arrangement.
-  const [tabOrder, setTabOrder] = useSyncedPreference<string[]>(
-    'tab_order',
-    readLegacyOrder(),
-    500,
-  );
-
   // Drag state
   const dragIdx = useRef<number | null>(null);
+  const dragName = useRef<string | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
-  // Merge sessions with persisted order: keep known positions, prune destroyed,
-  // append unknown sessions to the end.
-  const orderedSessions = useMemo(() => {
-    const nameSet = new Set(sessions.map((s) => s.name));
-    // Remove stale entries from order (destroyed sessions).
-    const validOrder = tabOrder.filter((n) => nameSet.has(n));
-    // Find new sessions not yet in order — append to end.
-    const newNames = sessions.filter((s) => !validOrder.includes(s.name)).map((s) => s.name);
-    const fullOrder = [...validOrder, ...newNames];
+  // Merge visible sessions with persisted order without mutating entries belonging
+  // to other servers or currently offline views.
+  const orderedSessions = useMemo(
+    () => sortSessionsByTabOrder(sessions, tabOrder, pinned),
+    [sessions, tabOrder, pinned],
+  );
 
-    const byName = new Map(sessions.map((s) => [s.name, s]));
-    const ordered = fullOrder.map((n) => byName.get(n)).filter(Boolean) as SessionInfo[];
-
-    // Pinned first, then unpinned — stable within each group.
-    const pinnedArr = ordered.filter((s) => pinned.has(s.name));
-    const unpinnedArr = ordered.filter((s) => !pinned.has(s.name));
-    return [...pinnedArr, ...unpinnedArr];
-  }, [sessions, tabOrder, pinned]);
-
-  // Sync back: when orderedSessions changes (e.g. new session arrives), update
-  // the persisted order so the next render is stable.
+  // Append newly discovered session names only once both sessions and the
+  // synced tab_order preference are hydrated. Never strip entries from other
+  // servers/views and never rewrite order simply because pinned tabs group first.
   useEffect(() => {
-    const newOrder = orderedSessions.map((s) => s.name);
-    if (JSON.stringify(newOrder) !== JSON.stringify(tabOrder)) {
-      setTabOrder(newOrder);
-    }
-  // We intentionally omit tabOrder from deps to avoid a render loop — the
-  // comparison inside guards against infinite updates.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orderedSessions]);
+    if (!sessionsLoaded || !tabOrderHydrated || sessions.length === 0) return;
+    const visibleNames = sessions.map((s) => s.name);
+    const nextOrder = appendMissingOrderIds(visibleNames, tabOrder);
+    if (sameOrderIds(nextOrder, tabOrder)) return;
+    setTabOrder((prev) => {
+      const merged = appendMissingOrderIds(visibleNames, prev);
+      return sameOrderIds(merged, prev) ? prev : merged;
+    });
+  }, [sessions, sessionsLoaded, tabOrder, tabOrderHydrated, setTabOrder]);
 
   useEffect(() => {
     if (!ctx) return;
@@ -195,7 +191,11 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
       }
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeSession, orderedSessions]);
+  // Session activity updates replace the session objects frequently, but do
+  // not affect which tab should be scrolled into view. Re-running this DOM
+  // measurement for every status frame creates a cross-window layout pass;
+  // only the active tab or tab-count change can require it.
+  }, [activeSession, orderedSessions.length]);
 
   // Mouse-wheel → horizontal scroll for the tab bar. On Windows/Linux a plain
   // mouse wheel only emits vertical `deltaY`, and the browser will NOT translate
@@ -388,31 +388,34 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     setCtx(null);
   }, [setPinnedArr]);
 
-  // Drag handlers — reorder only within the same group (pinned or unpinned).
+  // Drag handlers — reorder only within the same group (pinned or unpinned),
+  // surgically moving the dragged name inside persisted tab_order so other
+  // servers' IDs and unrelated/pinned entries keep their exact slots.
   const onDragStart = useCallback((e: DragEvent, idx: number) => {
     mousePressRef.current = null;
     dragIdx.current = idx;
+    dragName.current = orderedSessions[idx]?.name ?? null;
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', String(idx));
     }
     (e.currentTarget as HTMLElement).classList.add('tab-dragging');
-  }, []);
+  }, [orderedSessions]);
 
   const onDragEnd = useCallback((e: DragEvent) => {
     dragIdx.current = null;
+    dragName.current = null;
     setDragOverIdx(null);
     (e.currentTarget as HTMLElement).classList.remove('tab-dragging');
   }, []);
 
   const onDragOver = useCallback((e: DragEvent, idx: number) => {
     e.preventDefault();
-    const fromIdx = dragIdx.current;
-    if (fromIdx === null) return;
+    const fromName = dragName.current ?? (dragIdx.current !== null ? orderedSessions[dragIdx.current]?.name ?? null : null);
+    const toName = orderedSessions[idx]?.name ?? null;
+    if (!fromName || !toName) return;
     // Only allow drag within the same group.
-    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
-    const toPinned = pinned.has(orderedSessions[idx]?.name ?? '');
-    if (fromPinned !== toPinned) {
+    if (pinned.has(fromName) !== pinned.has(toName)) {
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
       return;
     }
@@ -422,20 +425,28 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const onDrop = useCallback((e: DragEvent, dropIdx: number) => {
     e.preventDefault();
-    const fromIdx = dragIdx.current;
-    if (fromIdx === null || fromIdx === dropIdx) { setDragOverIdx(null); return; }
-
-    // Enforce same-group constraint.
-    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
-    const toPinned = pinned.has(orderedSessions[dropIdx]?.name ?? '');
-    if (fromPinned !== toPinned) { setDragOverIdx(null); return; }
-
-    const names = orderedSessions.map((s) => s.name);
-    const [moved] = names.splice(fromIdx, 1);
-    names.splice(dropIdx, 0, moved);
-    setTabOrder(names);
+    const fallbackIdx = dragIdx.current;
+    const capturedName = dragName.current;
     setDragOverIdx(null);
     dragIdx.current = null;
+    dragName.current = null;
+
+    const fromName = capturedName ?? (fallbackIdx !== null ? orderedSessions[fallbackIdx]?.name ?? null : null);
+    const toName = orderedSessions[dropIdx]?.name ?? null;
+    if (!fromName || !toName || fromName === toName) return;
+
+    const currentFromIdx = orderedSessions.findIndex((s) => s.name === fromName);
+    if (currentFromIdx === -1 || currentFromIdx === dropIdx) return;
+
+    // Enforce same-group constraint without mutating tab_order.
+    if (pinned.has(fromName) !== pinned.has(toName)) return;
+
+    const visibleNames = orderedSessions.map((s) => s.name);
+    const insertAfter = currentFromIdx < dropIdx;
+    setTabOrder((prev) => {
+      const next = reorderOrderIdsPreservingHidden(prev, visibleNames, fromName, toName, insertAfter);
+      return sameOrderIds(next, prev) ? prev : next;
+    });
   }, [orderedSessions, pinned, setTabOrder]);
 
   const menuX = ctx ? Math.min(ctx.x, window.innerWidth - 160) : 0;
@@ -451,9 +462,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         const isActive = s.name === activeSession;
         const isBrain = s.role === 'brain';
         const isPinned = pinned.has(s.name);
-        const hasAlert = idleAlerts?.has(s.name) ?? false;
-        const stateClass = s.state === 'running' || s.state === 'queued' ? 'busy' : s.state === 'idle' ? 'idle' : '';
-        const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
+        // A completion pulse is meaningful only while the session is still
+        // idle. This also prevents a stale alert class from switching animation
+        // names (active → inactive) and replaying red when the user changes tabs.
+        const hasAlert = s.state === 'idle' && (idleAlerts?.has(s.name) ?? false);
+        const stateClass = isWorkingSessionState(s.state) ? 'busy' : s.state === 'idle' ? 'idle' : '';
+        const classes = ['tab', isBrain ? 'brain' : '', s.incognito ? 'incognito' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;
 
         // WS latency shown inline on the active tab
@@ -516,6 +530,16 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
+                {s.state === 'error' && (
+                  <span
+                    class="tab-session-error"
+                    role="img"
+                    aria-label={s.error ?? t('session.state_error')}
+                    title={s.error ?? t('session.state_error')}
+                  >
+                    ⚠️
+                  </span>
+                )}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}
@@ -530,7 +554,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      {onNewSession && (
+        <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      )}
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the
@@ -577,21 +603,25 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
             </button>
           )}
-          <div class="menu-divider" />
-          <button
-            class="menu-item session-action-menu-item menu-item-danger"
-            disabled={projectHasPinned}
-            title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
-            onClick={() => {
-              if (projectHasPinned) return;
-              setStopConfirmProject(ctx.session.project);
-              setStopConfirmLevel(0);
-              setCtx(null);
-            }}
-          >
-            <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
-            <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
-          </button>
+          {canStopProject && (
+            <>
+              <div class="menu-divider" />
+              <button
+                class="menu-item session-action-menu-item menu-item-danger"
+                disabled={projectHasPinned}
+                title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
+                onClick={() => {
+                  if (projectHasPinned) return;
+                  setStopConfirmProject(ctx.session.project);
+                  setStopConfirmLevel(0);
+                  setCtx(null);
+                }}
+              >
+                <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
+                <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
+              </button>
+            </>
+          )}
         </div>
         );
       })()}
@@ -632,3 +662,67 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     </div>
   );
 }
+
+function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (left.name !== right.name
+      || left.project !== right.project
+      || left.role !== right.role
+      || left.state !== right.state
+      || left.label !== right.label
+      || left.agentType !== right.agentType
+      || left.runtimeType !== right.runtimeType
+      || !!left.incognito !== !!right.incognito) return false;
+  }
+  return true;
+}
+
+function SessionTabsWithOwnPref(props: Props) {
+  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
+    'tab_order',
+    readLegacyTabOrder(),
+    0,
+  );
+  return (
+    <SessionTabsControlled
+      {...props}
+      tabOrder={tabOrder}
+      setTabOrder={setTabOrder}
+      tabOrderHydrated={tabOrderHydrated}
+    />
+  );
+}
+
+function SessionTabsImpl(props: Props) {
+  if (props.tabOrder !== undefined && props.setTabOrder !== undefined) {
+    return (
+      <SessionTabsControlled
+        {...props}
+        tabOrder={props.tabOrder}
+        setTabOrder={props.setTabOrder}
+        tabOrderHydrated={props.tabOrderHydrated ?? true}
+      />
+    );
+  }
+  return <SessionTabsWithOwnPref {...props} />;
+}
+
+export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
+  sameTabSessions(prev.sessions, next.sessions)
+  && prev.activeSession === next.activeSession
+  && prev.connected === next.connected
+  && prev.latencyMs === next.latencyMs
+  && prev.idleAlerts === next.idleAlerts
+  && prev.p2pSessionLabels === next.p2pSessionLabels
+  && prev.canStopProject === next.canStopProject
+  && prev.renameRequest === next.renameRequest
+  && prev.sessionsLoaded === next.sessionsLoaded
+  && prev.pinned === next.pinned
+  && prev.setPinnedArr === next.setPinnedArr
+  && prev.tabOrder === next.tabOrder
+  && prev.tabOrderHydrated === next.tabOrderHydrated
+));

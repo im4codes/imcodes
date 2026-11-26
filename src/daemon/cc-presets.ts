@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * CC Environment Presets — named sets of env vars for launching Claude Code
  * with alternative API providers (MiniMax, DeepSeek, OpenRouter, etc.).
@@ -9,17 +10,22 @@
 
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import {
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
+  normalizeCcPresetContextWindow,
   normalizeCcPresetName,
+  normalizeCodexBaseUrl,
+  normalizeCodexProviderId,
   type CcPreset,
+  type CcPresetAuthType,
   type CcPresetModelInfo,
 } from '../../shared/cc-presets.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
-const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
+function presetsPath(): string { return join(resolveImcodesHome(), 'cc-presets.json'); }
 
 let cachedPresets: CcPreset[] | null = null;
 
@@ -66,15 +72,25 @@ function normalizePreset(raw: unknown): CcPreset | null {
   const defaultModel = typeof record.defaultModel === 'string'
     ? record.defaultModel.trim()
     : '';
+  const configuredContextWindow = typeof record.contextWindow === 'number'
+    && Number.isFinite(record.contextWindow)
+    && record.contextWindow > 0
+    ? record.contextWindow
+    : undefined;
+  const effectiveModel = envRecord['ANTHROPIC_MODEL']?.trim()
+    || defaultModel
+    || envRecord['OPENAI_MODEL']?.trim()
+    || undefined;
+  const contextWindow = normalizeCcPresetContextWindow(configuredContextWindow, effectiveModel);
   return {
     name,
     env: envRecord,
-    ...(typeof record.contextWindow === 'number' ? { contextWindow: record.contextWindow } : {}),
+    ...(contextWindow ? { contextWindow } : {}),
     ...(typeof record.initMessage === 'string' ? { initMessage: record.initMessage } : {}),
     ...(record.transportMode === 'qwen-compatible-api' || record.transportMode === 'claude-cli-preset'
       ? { transportMode: record.transportMode }
       : {}),
-    ...(record.authType === 'anthropic' ? { authType: record.authType } : {}),
+    ...(record.authType === 'anthropic' || record.authType === 'openai' ? { authType: record.authType } : {}),
     ...(availableModels?.length ? { availableModels } : {}),
     ...(defaultModel ? { defaultModel } : {}),
     ...(typeof record.lastDiscoveredAt === 'number' ? { lastDiscoveredAt: record.lastDiscoveredAt } : {}),
@@ -99,12 +115,12 @@ function normalizePresets(raw: unknown): CcPreset[] {
 export async function loadPresets(): Promise<CcPreset[]> {
   if (cachedPresets) return cachedPresets;
   try {
-    const raw = await fs.readFile(PRESETS_PATH, 'utf8');
+    const raw = await fs.readFile(presetsPath(), 'utf8');
     cachedPresets = normalizePresets(JSON.parse(raw));
     return cachedPresets;
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      logger.warn({ err, path: PRESETS_PATH }, 'Failed to load CC presets');
+      logger.warn({ err, path: presetsPath() }, 'Failed to load CC presets');
     }
     cachedPresets = [];
     return cachedPresets;
@@ -113,10 +129,10 @@ export async function loadPresets(): Promise<CcPreset[]> {
 
 export async function savePresets(presets: CcPreset[]): Promise<void> {
   const normalized = normalizePresets(presets);
-  await fs.mkdir(dirname(PRESETS_PATH), { recursive: true });
-  const tempPath = `${PRESETS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await fs.mkdir(dirname(presetsPath()), { recursive: true });
+  const tempPath = `${presetsPath()}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(normalized, null, 2), 'utf8');
-  await fs.rename(tempPath, PRESETS_PATH);
+  await fs.rename(tempPath, presetsPath());
   cachedPresets = normalized;
 }
 
@@ -135,10 +151,64 @@ export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableMode
 }
 
 /**
+ * Select a model inside one preset atomically.
+ *
+ * A model id from the previously selected third-party API must never leak into
+ * the newly selected preset. When discovery produced a catalogue, only ids in
+ * that catalogue are valid; without a catalogue, a deliberate free-text model
+ * remains supported and the UI owns resetting it when the preset changes.
+ */
+export function selectPresetModel(
+  preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>,
+  requestedModel?: string,
+): string | undefined {
+  // Only a discovered catalogue is authoritative for membership. The helper
+  // also includes the preset's current default/env model, which made its list
+  // non-empty even when discovery had never run and accidentally rejected
+  // every deliberate model override as "not available".
+  const discoveredModels = (preset.availableModels ?? []).map((entry) => entry.id);
+  const fallback = getPresetEffectiveModel(preset) ?? discoveredModels[0];
+  const requested = requestedModel?.trim();
+  if (!requested) return fallback;
+  if (discoveredModels.length === 0 || discoveredModels.includes(requested)) return requested;
+  return fallback;
+}
+
+/** `${preset}:${model}` pairs already warned about, so launches stay quiet after the first. */
+const warnedUndiscoveredPresetModels = new Set<string>();
+
+/**
+ * Warn when a preset pins a model the provider never advertised.
+ *
+ * Anthropic-compatible third-party endpoints accept an unknown model id without
+ * an error and silently serve their own default — MiniMax answers a request for
+ * `MiniMax-M.27` (a typo for `MiniMax-M2.7`) exactly like a valid one. The
+ * session then runs fine on a model the preset does not name, which is
+ * invisible without this check. Only advisory: an empty discovery list, or a
+ * model the user legitimately knows about, must never block a launch.
+ */
+function warnIfPresetModelUndiscovered(preset: CcPreset, configuredModel: string | undefined): void {
+  if (!configuredModel) return;
+  const discovered = (preset.availableModels ?? []).map((entry) => entry.id);
+  if (discovered.length === 0 || discovered.includes(configuredModel)) return;
+  const key = `${preset.name}:${configuredModel}`;
+  if (warnedUndiscoveredPresetModels.has(key)) return;
+  warnedUndiscoveredPresetModels.add(key);
+  logger.warn(
+    { preset: preset.name, configuredModel, discoveredModels: discovered },
+    'cc-preset: configured model is not in this provider\'s discovered model list — the endpoint may silently serve a different model',
+  );
+}
+
+/**
  * Resolve a preset name to env vars ready for session launch.
  * Auto-fills MODEL_ALIASES from ANTHROPIC_MODEL if set.
  */
-export async function resolvePresetEnv(presetName: string, ccSessionId?: string): Promise<Record<string, string>> {
+export async function resolvePresetEnv(
+  presetName: string,
+  ccSessionId?: string,
+  modelOverride?: string,
+): Promise<Record<string, string>> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = { ...preset.env };
@@ -147,12 +217,29 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
     env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
   }
-  const effectiveModel = getPresetEffectiveModel(preset);
-  if (effectiveModel) env['ANTHROPIC_MODEL'] = effectiveModel;
+  // Cross-align OpenAI and Anthropic credentials for multi-agent interoperability
+  if (env['ANTHROPIC_API_KEY'] && !env['OPENAI_API_KEY']) {
+    env['OPENAI_API_KEY'] = env['ANTHROPIC_API_KEY'];
+  } else if (env['OPENAI_API_KEY'] && !env['ANTHROPIC_API_KEY']) {
+    env['ANTHROPIC_API_KEY'] = env['OPENAI_API_KEY'];
+  }
+  if (env['ANTHROPIC_BASE_URL'] && !env['OPENAI_BASE_URL']) {
+    env['OPENAI_BASE_URL'] = env['ANTHROPIC_BASE_URL'];
+  } else if (env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL']) {
+    env['ANTHROPIC_BASE_URL'] = env['OPENAI_BASE_URL'];
+  }
+  const effectiveModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
+  if (effectiveModel) {
+    env['ANTHROPIC_MODEL'] = effectiveModel;
+    env['OPENAI_MODEL'] = effectiveModel;
+  }
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
-      if (!env[alias]) env[alias] = env['ANTHROPIC_MODEL'];
+      // A per-session model selection must override aliases persisted by an
+      // older one-model-per-preset config. Otherwise the SDK may still route
+      // "sonnet"/"opus"/"haiku" through the preset's previous default.
+      if (modelOverride?.trim() || !env[alias]) env[alias] = env['ANTHROPIC_MODEL'];
     }
   }
   // Set context window hint as env var so daemon can report it in usage events
@@ -165,15 +252,19 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   return env;
 }
 
-export async function getPresetTransportOverrides(presetName: string): Promise<{
+export async function getPresetTransportOverrides(
+  presetName: string,
+  modelOverride?: string,
+): Promise<{
   model?: string;
   systemPrompt?: string;
   contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
-  const env = await resolvePresetEnv(presetName);
-  const configuredModel = getPresetEffectiveModel(preset);
+  const configuredModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
+  warnIfPresetModelUndiscovered(preset, configuredModel);
+  const env = await resolvePresetEnv(presetName, undefined, configuredModel);
   const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const runtimeFacts = [
     `Authoritative runtime fact: this session is using the Claude Code preset "${preset.name}".`,
@@ -181,7 +272,7 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
     configuredModel ? `Authoritative runtime model: ${configuredModel}.` : undefined,
     configuredModel ? `If the user asks which model you are using, answer exactly with "${configuredModel}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
     configuredBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${configuredBaseUrl}".` : undefined,
-    'These runtime facts override any generic Claude Code tool schema, enum, or default.',
+    'These runtime facts only override generic model/provider identity. They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults. Follow every provided tool input schema exactly and never omit required fields.',
     'Do not answer with Sonnet, Opus, Haiku, or any inferred Claude default unless that exact value matches the authoritative runtime model above.',
   ].filter(Boolean).join(' ');
   return {
@@ -191,7 +282,7 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
   };
 }
 
-export async function getQwenPresetTransportConfig(presetName: string): Promise<{
+export async function getQwenPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   settings?: Record<string, unknown>;
   model?: string;
@@ -202,9 +293,9 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
 
-  const resolvedEnv = await resolvePresetEnv(presetName);
   const availableModels = getPresetAvailableModelIds(preset);
-  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
   const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
@@ -281,15 +372,204 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   };
 }
 
+export interface CodexModelProviderConfig {
+  providerId: string;
+  baseUrl: string;
+  apiKey?: string;
+  wireApi?: 'responses';
+  httpHeaders?: Record<string, string>;
+}
+
+export async function getCodexPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+  codexModelProvider?: CodexModelProviderConfig;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const rawBaseUrl = resolvedEnv['OPENAI_BASE_URL']?.trim()
+    || resolvedEnv['ANTHROPIC_BASE_URL']?.trim()
+    || undefined;
+  const apiKey = resolvedEnv['OPENAI_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  const normalizedBaseUrl = rawBaseUrl ? normalizeCodexBaseUrl(rawBaseUrl) : undefined;
+  const providerId = normalizeCodexProviderId(preset.name);
+
+  const env: Record<string, string> = {};
+  if (normalizedBaseUrl) {
+    env['OPENAI_BASE_URL'] = normalizedBaseUrl;
+    env['CODEX_BASE_URL'] = normalizedBaseUrl;
+  }
+  if (resolvedEnv['ANTHROPIC_BASE_URL']) {
+    env['ANTHROPIC_BASE_URL'] = resolvedEnv['ANTHROPIC_BASE_URL'];
+  } else if (rawBaseUrl) {
+    env['ANTHROPIC_BASE_URL'] = rawBaseUrl;
+  }
+  if (apiKey) {
+    env['OPENAI_API_KEY'] = apiKey;
+    env['ANTHROPIC_API_KEY'] = apiKey;
+    env['CODEX_API_KEY'] = apiKey;
+  }
+  if (model) {
+    env['OPENAI_MODEL'] = model;
+    env['ANTHROPIC_MODEL'] = model;
+    env['CODEX_MODEL'] = model;
+  }
+  if (resolvedEnv['IMCODES_CONTEXT_WINDOW']) {
+    env['IMCODES_CONTEXT_WINDOW'] = resolvedEnv['IMCODES_CONTEXT_WINDOW'];
+  }
+  env['IMCODES_CC_PRESET'] = preset.name;
+
+  const codexModelProvider: CodexModelProviderConfig | undefined = normalizedBaseUrl ? {
+    providerId,
+    baseUrl: normalizedBaseUrl,
+    ...(apiKey ? { apiKey } : {}),
+    wireApi: 'responses',
+  } : undefined;
+
+  const runtimeFacts = (model || normalizedBaseUrl || rawBaseUrl) ? [
+    `Authoritative runtime fact: this Codex session is routed through the "${preset.name}" API provider preset.`,
+    normalizedBaseUrl ? `Authoritative provider endpoint: ${normalizedBaseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
+    normalizedBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${normalizedBaseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider identity.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env,
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+    ...(codexModelProvider ? { codexModelProvider } : {}),
+  };
+}
+
+export async function getDshPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  llm?: DshLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  // dsh registers third-party presets through its generic pi-ai adapter. The
+  // API key stays in memory and is passed to the child through a private env
+  // reference; it is never serialized into the generated overlay.
+  const env: Record<string, string> = {};
+  if (model) env['ANTHROPIC_MODEL'] = model;
+
+  const llm = (model || baseUrl)
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        model: model ?? availableModels[0],
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+      }
+    : undefined;
+
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env,
+    ...(llm ? { llm } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getPiPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  piLlm?: PiLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+  const piLlm = model
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        model,
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+      }
+    : undefined;
+  const runtimeFacts = model ? [
+    `Authoritative runtime fact: this Pi session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env: model ? { ANTHROPIC_MODEL: model } : {},
+    ...(piLlm ? { piLlm } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
 function getDiscoveryCandidates(baseUrl: string): string[] {
   const trimmed = baseUrl.trim().replace(/\/+$/, '');
   if (!trimmed) return [];
   const candidates = new Set<string>();
   if (trimmed.endsWith('/models')) {
     candidates.add(trimmed);
-  } else {
+  } else if (/\/v\d+(?:$|\/)/.test(trimmed)) {
     candidates.add(`${trimmed}/models`);
-    if (!/\/v\d+(?:$|\/)/.test(trimmed)) candidates.add(`${trimmed}/v1/models`);
+  } else {
+    // Anthropic-compatible providers standardize on /v1/models. Try that
+    // first so MiniMax and the official Claude API do not pay a guaranteed
+    // 404 round-trip through the unversioned path.
+    candidates.add(`${trimmed}/v1/models`);
+    candidates.add(`${trimmed}/models`);
   }
   return [...candidates];
 }
@@ -319,32 +599,107 @@ function parseDiscoveredModels(payload: unknown): CcPresetModelInfo[] {
   return models;
 }
 
+class CompatibleModelsEndpointUnavailableError extends Error {}
+
 export async function discoverPresetModels(preset: CcPreset): Promise<{
   availableModels: CcPresetModelInfo[];
   defaultModel?: string;
   endpoint: string;
 }> {
   const env = { ...preset.env };
-  const baseUrl = env['ANTHROPIC_BASE_URL']?.trim() || '';
-  const apiKey = env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '';
-  if (!baseUrl) throw new Error('Preset is missing ANTHROPIC_BASE_URL');
-  if (!apiKey) throw new Error('Preset is missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN');
+  const authType: CcPresetAuthType = preset.authType ?? (
+    env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic'
+  );
+  const baseUrl = authType === 'openai'
+    ? (env['OPENAI_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim() || '')
+    : (env['ANTHROPIC_BASE_URL']?.trim() || env['OPENAI_BASE_URL']?.trim() || '');
+  const apiKey = authType === 'openai'
+    ? (env['OPENAI_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '')
+    : (env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || env['OPENAI_API_KEY']?.trim() || '');
+
+  if (!baseUrl) {
+    throw new Error(authType === 'openai' ? 'Preset is missing OPENAI_BASE_URL' : 'Preset is missing ANTHROPIC_BASE_URL');
+  }
+  if (!apiKey) {
+    throw new Error(authType === 'openai' ? 'Preset is missing OPENAI_API_KEY' : 'Preset is missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN');
+  }
 
   let lastError: Error | null = null;
   for (const endpoint of getDiscoveryCandidates(baseUrl)) {
     try {
-      const response = await fetch(endpoint, {
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          accept: 'application/json',
-        },
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+      const availableModels: CcPresetModelInfo[] = [];
+      const seen = new Set<string>();
+
+      if (authType === 'openai') {
+        const url = new URL(endpoint);
+        const bearerToken = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
+        const response = await fetch(url, {
+          headers: {
+            Authorization: bearerToken,
+            accept: 'application/json',
+          },
+        });
+        if (!response.ok) {
+          const message = `HTTP ${response.status} ${response.statusText}`.trim();
+          if (response.status === 404 || response.status === 405) {
+            throw new CompatibleModelsEndpointUnavailableError(message);
+          }
+          throw new Error(message);
+        }
+        const payload = await response.json() as unknown;
+        for (const model of parseDiscoveredModels(payload)) {
+          if (seen.has(model.id)) continue;
+          seen.add(model.id);
+          availableModels.push(model);
+        }
+      } else {
+        let afterId: string | undefined;
+        // Anthropic's list endpoint is cursor-paginated. The page cap prevents a
+        // broken compatible gateway from returning an endless has_more loop.
+        for (let page = 0; page < 100; page += 1) {
+          const url = new URL(endpoint);
+          url.searchParams.set('limit', '1000');
+          if (afterId) url.searchParams.set('after_id', afterId);
+          const response = await fetch(url, {
+            headers: {
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+              accept: 'application/json',
+            },
+          });
+          if (!response.ok) {
+            const message = `HTTP ${response.status} ${response.statusText}`.trim();
+            if (response.status === 404 || response.status === 405) {
+              throw new CompatibleModelsEndpointUnavailableError(message);
+            }
+            // Authentication, rate-limit, and provider failures prove that this
+            // endpoint exists. Do not replace a useful 401/429/5xx diagnosis
+            // with the fallback endpoint's likely 404.
+            throw new Error(message);
+          }
+          const payload = await response.json() as unknown;
+          for (const model of parseDiscoveredModels(payload)) {
+            if (seen.has(model.id)) continue;
+            seen.add(model.id);
+            availableModels.push(model);
+          }
+          const payloadRecord = payload && typeof payload === 'object'
+            ? payload as Record<string, unknown>
+            : {};
+          if (payloadRecord.has_more !== true) break;
+          const nextAfterId = typeof payloadRecord.last_id === 'string'
+            ? payloadRecord.last_id.trim()
+            : '';
+          if (!nextAfterId || nextAfterId === afterId) {
+            throw new Error('Compatible models API returned an invalid pagination cursor');
+          }
+          afterId = nextAfterId;
+          if (page === 99) {
+            throw new Error('Compatible models API exceeded the pagination limit');
+          }
+        }
       }
-      const payload = await response.json() as unknown;
-      const availableModels = parseDiscoveredModels(payload);
+
       if (availableModels.length === 0) {
         throw new Error('No models returned by compatible API');
       }
@@ -353,9 +708,92 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
       return { availableModels, defaultModel, endpoint };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      if (!(error instanceof CompatibleModelsEndpointUnavailableError)) throw lastError;
     }
   }
   throw lastError ?? new Error('Failed to discover models');
+}
+
+export interface CcPresetModelCatalog {
+  preset: CcPreset;
+  models: CcPresetModelInfo[];
+  defaultModel?: string;
+  endpoint?: string;
+}
+
+function getStoredPresetModelCatalog(preset: CcPreset): CcPresetModelCatalog {
+  const discovered = preset.availableModels ?? [];
+  const models = discovered.length > 0
+    ? discovered
+    : getPresetAvailableModelIds(preset).map((id) => ({ id }));
+  const effectiveModel = getPresetEffectiveModel(preset);
+  const defaultModel = effectiveModel && models.some((model) => model.id === effectiveModel)
+    ? effectiveModel
+    : models[0]?.id;
+  return {
+    preset,
+    models,
+    ...(defaultModel ? { defaultModel } : {}),
+  };
+}
+
+/**
+ * Refresh one preset's model catalog and persist it without changing the
+ * preset's default model. A preset represents provider credentials/endpoint;
+ * the selected model remains per-session state.
+ */
+export async function refreshPresetModels(presetName: string): Promise<CcPresetModelCatalog> {
+  const preset = await getPreset(presetName);
+  if (!preset) throw new Error(`Preset "${presetName}" not found`);
+  const normalizedName = normalizeCcPresetName(preset.name);
+  try {
+    const discovered = await discoverPresetModels(preset);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find(
+      (item) => normalizeCcPresetName(item.name) === normalizedName,
+    ) ?? preset;
+    const effectiveAuthType: CcPresetAuthType = latestPreset.authType
+      ?? (latestPreset.env['OPENAI_BASE_URL'] && !latestPreset.env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic');
+    const updatedPreset: CcPreset = {
+      ...latestPreset,
+      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
+      authType: effectiveAuthType,
+      availableModels: discovered.availableModels,
+      lastDiscoveredAt: Date.now(),
+      modelDiscoveryError: undefined,
+    };
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+    )));
+    const catalog = getStoredPresetModelCatalog(updatedPreset);
+    return { ...catalog, endpoint: discovered.endpoint };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find(
+      (item) => normalizeCcPresetName(item.name) === normalizedName,
+    ) ?? preset;
+    const updatedPreset: CcPreset = {
+      ...latestPreset,
+      modelDiscoveryError: message,
+    };
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+    )));
+    throw error;
+  }
+}
+
+export async function getPresetModelCatalog(
+  presetName: string,
+  force = false,
+): Promise<CcPresetModelCatalog> {
+  const preset = await getPreset(presetName);
+  if (!preset) throw new Error(`Preset "${presetName}" not found`);
+  if (force || !preset.availableModels?.length) {
+    return await refreshPresetModels(preset.name);
+  }
+  return getStoredPresetModelCatalog(preset);
 }
 
 /** Default init message for non-Anthropic providers (no native web search). */

@@ -2,18 +2,29 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**エージェントのための IM。共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、人間同士の協調、そして AI プロバイダー横断の監査。**
+**エージェントのための IM。AI リモートデスクトップ、共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、クロスモデル監査。**
 
 <!-- TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认 -->
 > 三人寄れば文殊の知恵。<br>
 > されど三人の孔明、談笑のうちに天下を定む。<br>
 > — IM.codes
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
+IM.codes は AI agent を coding session だけでなく、実際に作業するコンピューターにも接続します。対応マシンを制限付きの **制御対象ノード（Controlled Nodes）** として登録すると、認可された agent が scoped command、ファイル転送、型付き Computer Use を使って 1 台でも複数台でも直接操作できます。人が画面を確認・引き継ぐ必要があるときは、対応する Windows ノードをブラウザやスマートフォンからリモートデスクトップで操作できます。
+
+マシン制御に加え、IM.codes は provider をまたぐ共有メモリレイヤーと管理対象 MCP tool surface を coding agent に提供します。完了した作業を再利用可能なコンテキストとして Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで活用できます。ターミナル、ファイルと Git、localhost プレビュー、通知、マルチエージェント連携、OpenSpec Auto Deliver、Auto supervision、Team 監査により、人と agent の作業を見える状態でつなぎます。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
 複数のエージェントが CLI と SDK の両方で接続できます。
+
+## 制御対象ノード：AI リモートデスクトップ
+
+各マシンを完全な IM.codes source server にせず、対応コンピューターを AI が操作できる制御対象ノードとして登録できます。
+
+- **1 つの AI で複数の PC。** 複数マシンを登録し、1 つの agent または agent チームがそれらを直接操作して作業を実行できます。
+- **実際のコンピューター操作。** scoped command、個別ファイル転送、型付き Computer Use によるデスクトップアプリ操作に対応します。
+- **必要なときは人がリモート操作。** 対応する Windows ノードをブラウザやスマートフォンから開き、画面の確認や操作の引き継ぎができます。
+- **権限を限定し、いつでも取り消し可能。** ノードごとに独立した認証情報を使い、通常の server/session 一覧から分離し、所有者が実行権限を無効化・取り消しできます。
 
 ## スクリーンショット
 
@@ -122,6 +133,26 @@ IM.codes は、自分で書いた supervisor の指示で、対応する agent s
 - **実際の IM.codes workflow を前提。** Auto supervision は OpenSpec 作業、Team レビュー/議論、`imcodes send` によるエージェント間連携を「人間待ち」の理由ではなく、エージェントが続けるべき正当な次の一手として扱います。
 
 ## 主な機能
+
+### プライベートエイリアス
+
+ユーザー所有の再利用可能なテキスト断片を保存し、composer で `;` を入力して検索するか、`;;(name)` マーカーを直接挿入できます。メッセージにはマーカーが表示されたまま、IM.codes が値を帯域外で解決して agent に渡します。Agent は managed MCP tools からエイリアスの作成・検索・編集・解決もできます。一覧取得はメタデータのみを返すため、1 回の呼び出しですべての値がモデルコンテキストへ流出しません。
+
+### 制御対象ノード
+
+1 台または複数のコンピューターを登録し、`^` で対象を選ぶ（または `^^(name)` を直接挿入する）と、認可された agent が選択したマシンで作業できます。scoped command、個別ファイル転送、型付き Computer Use を同じ会話から利用でき、コンピューター群の操作と連携に適しています。実行権限は所有者が管理・取り消しでき、ノードごとに独立した認証情報を使い、通常の server/session 一覧から分離されます。ダウンロードリンクは期限切れになりますが、インストーラーは保存して再利用できます。
+
+### リモートデスクトップ操作
+
+対応する Windows ノードは、認可された Owner と Participant にブラウザ内リモートデスクトップを提供します。操作/閲覧モード、ディスプレイと画質の切り替え、複数の認可ユーザーによる共同閲覧・操作に対応します。モバイルではタッチナビゲーションと仮想マウスで、スマートフォンやタブレットからデスクトップを操作できます。
+
+リモートデスクトップは利用可能な接続を自動選択し、権限はいつでも取り消せます。**現在は Windows に対応しています。macOS と Linux のノードでは他の機能を利用でき、リモートデスクトップ対応は今後予定されています。**
+
+### Computer Use とブラウザ自動化
+
+対応 SDK agent は型付き Computer Use tool でデスクトップアプリを操作できます。クロスプラットフォームのデスクトップアプリ操作には、Leo（[iFurySt](https://github.com/iFurySt)）による MIT ライセンスの [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) を統合しています。この統合機能について同プロジェクトに明確なクレジットを表します。
+
+ブラウザ自動化は別個に IM.codes が実装した Chrome DevTools Protocol（CDP）ベースの機能です。ページの起動、検査、移動、クリック、入力、スクリプト評価に対応し、既定では構造化テキストを返し、要求時のみスクリーンショットを添付します。管理対象ブラウザはローカルループバック限定の CDP endpoint も公開するため、ローカルの Python / Node script が同じ実行中の browser instance を再利用できます。
 
 ### リモートターミナル
 SSH、VPN、ポート開放なしで、任意のブラウザから agent session の端末に完全アクセスできます。
@@ -242,7 +273,8 @@ Daemon は開発マシン上で動作し、tmux による process-backed session
 ## インストール
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash
+# fallback: npm install -g imcodes
 ```
 
 ## クイックスタート
@@ -288,7 +320,7 @@ imcodes connect openclaw --url wss://gateway.example.com
 ### ワンコマンドセットアップ
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
@@ -305,8 +337,9 @@ docker compose up -d
 
 ## Windows（実験的）
 
-```cmd
-npm install -g imcodes
+```powershell
+irm https://im.codes/install.ps1 | iex
+# fallback: npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
@@ -344,10 +377,15 @@ setx PATH "<npm-prefix-path>;%PATH%"
 
 ## 免責事項
 
-IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw などとは提携・承認・支援関係にありません。
+IM.codes は独立したソース公開（source-available）プロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw などとは提携・承認・支援関係にありません。
 
 ## ライセンス
 
-[MIT](../LICENSE)
+[Business Source License 1.1 (BSL 1.1)](../LICENSE) — [商用ライセンス案内](../COMMERCIAL-LICENSE.md) | [サードパーティ表記](../THIRD_PARTY_NOTICES.md)
+
+- **非本番利用および個人本番利用:** 著作権・ライセンス表示と商標規定を遵守する限り、非本番環境での評価・テスト・複製・改変・再配布は組織規模を問わず無料です。自然人が個人端末・個人サーバーで個人開発・学習・研究・個人セルフホストのために利用する場合は雇用主の規模に関わらず永続的に無料です（組織による集中配備・共有および第三者向けホスティング/SaaS/ホワイトラベル商用提供を除く）。
+- **小規模チームの本番利用:** 法人・関連会社および全インスタンスを**合算**し、アクティブユーザー **<= 5 名** **かつ** 組織総人員 **<= 50 名**の両方を満たす場合に限り、内部本番利用が追加利用許諾の無料対象となります。
+- **追加利用許諾の対象外（商用ライセンス必須）:** 移行日前において上記上限を超える内部本番利用（例: `6/50` や `5/51`）、または人数を問わず（1 名でも）ホスティング・マネージド・マルチテナント SaaS やホワイトラベル商用提供の本番利用は追加利用許諾の対象外となり、`support@im.codes` での商用ライセンス取得が必要です。
+- **移行日:** 各バージョンの公開から 4 年後（本リリースは `2030-11-26`）に [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) へ移行します。
 
 © 2026 [IM.codes](https://im.codes)

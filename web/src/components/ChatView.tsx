@@ -1,11 +1,70 @@
+import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
+import {
+  initialSdkAgentsAutoOpen,
+  resolveEffectiveSdkAgentsAutoOpen,
+  resolveSdkAgentsTimerAction,
+  SDK_AGENTS_AUTO_CLOSE_GRACE_MS,
+  SDK_AGENTS_AUTO_OPEN_DELAY_MS,
+  type SdkAgentsAutoOpenState,
+} from '../timeline/sdk-agents-panel-stability.js';
+import { isHoverPreviewSuppressed, onHoverPreviewSuppressed } from '../hover-preview-gate.js';
+import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
+import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
+import {
+  isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
+  isGuaranteedVisibleTimelineEvent,
+} from '../../../src/shared/timeline/types.js';
+import {
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+  type SupervisionExecutionState,
+} from '@shared/supervision-config.js';
+import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_RUN_TIMELINE,
+  readCronRunTimelineProjection,
+  type CronRunTimelineProjection,
+} from '@shared/cron-types.js';
+import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
+import { recordPerfRender } from '../perf-render-debug.js';
+import { localizeChatDownloadError } from '../chat-download-error.js';
+import { copyToClipboard } from '../util/clipboard.js';
+import { WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
-import { h } from 'preact';
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import {
+  beginDownloadTransfer,
+  failDownloadTransfer,
+  isDownloadTransferPaused,
+  setDownloadTransferRetry,
+} from '../download-transfer-store.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
+import {
+  isMobileNavigationGestureActive,
+  MOBILE_NAV_GESTURE_ACTIVE_EVENT,
+  wasMobileNavigationGestureRecentlyActive,
+} from '../mobile-navigation-gestures.js';
+import { h, type ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
-import { memo } from 'preact/compat';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
+import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
   TimelineEvent,
@@ -16,48 +75,146 @@ import type {
 } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import {
-  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
-  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
-} from '@shared/session-control-commands.js';
+import { isInsufficientCapacityError } from '../upload-error.js';
+import { attachmentDisplayName, attachmentDownloadId, isAbsoluteAttachmentPath } from '../attachment-refs.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
+import { getDomRectToLayoutScale, UI_SCALE_EVENT } from '../ui-scale.js';
+import { getChatTopActionsReserve } from '../chat-top-actions-reserve.js';
+import { formatToolDuration } from '../util/tool-duration.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
+import { canonicalizeChatFilePath } from '@shared/chat-local-path.js';
+import { REMOTE_DESKTOP_CITATION_PREFIX } from '@shared/remote-desktop-reference.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
-import { computeFollowThresholds } from './chat-follow-thresholds.js';
-import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
+import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
+import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
+import { AskQuestionOption, buildAskQuestionAnswer, localizeAskQuestionItem, type AskQuestionItem } from './AskQuestionDialog.js';
+import {
+  extractAskQuestionsFromToolCallPayload,
+  isAskQuestionToolName,
+  normalizeAskQuestionsPayload,
+  resolveAskQuestionEventToolUseId,
+} from '@shared/ask-question-normalize.js';
+import { findTrailingAskQuestion, resolveAskQuestionAnswerMap } from '../find-pending-question.js';
+import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
+import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
+import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
+import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
+import {
+  getTtsAutoReadEnabled,
+  getTtsState,
+  isTtsSupported,
+  isTtsVoiceCaptureActive,
+  prepareTextForTts,
+  setTtsAutoReadEnabled,
+  speakText,
+  stopSpeaking,
+  subscribeTtsPreferences,
+  subscribeTtsState,
+  type TtsPlaybackState,
+} from '../tts.js';
+import { formatTaskPairTtsAnnouncement } from '../task-pair-tts.js';
+import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
+import { claimRunKey } from './chat-run-keys.js';
+import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
+import {
+  CHAT_MOUNT_SETTLE_MS,
+  CHAT_MOUNT_SETTLE_TICK_MS,
+  CHAT_USER_SCROLL_UP_HOLD_MS,
+  computeFollowThresholds,
+} from './chat-follow-thresholds.js';
+import {
+  ChatLocalImagePreview,
+  type ChatLocalImagePreviewLoader,
+  type ChatLocalImagePreviewResult,
+} from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
-import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
+import {
+  isImagePreviewPath,
+  isLikelyDomainPath,
+  isLocalChatPath,
+  renderChatPathActions,
+  splitTextWithCloudDocsAndUrls,
+  type ChatPathDownloadHandler,
+} from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { scaledCssFontPx, CHAT_FONT_SIZE_VAR } from '../global-font.js';
+const CHAT_FONT_FAMILY_VAR = '--imcodes-chat-font-family';
+import { shouldUseIosMacTextScale } from '../native-platform.js';
+import { subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
-import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { PREF_KEY_MESSAGE_PIN_PREVIEW_MODE, PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
-import { splitTextByHttpUrls } from '../link-detection.js';
 import {
   CHAT_INITIAL_RENDER_ITEM_LIMIT,
   CHAT_RENDER_ITEM_INCREMENT,
   PREVIEW_EVENT_TAIL_LIMIT,
   PREVIEW_RENDER_ITEM_LIMIT,
   shouldSkipRichTextEnhancement,
+  toolFoldDisplayText,
 } from '../chat-render-limits.js';
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { deriveSessionLiveStatus } from '../session-live-status.js';
+import { getSessionStatePayloadDetail, isVisibleSessionStatePayload } from '@shared/session-activity-types.js';
+import {
+  PEER_AUDIT_VERDICTS,
+  isPeerAuditRound,
+  isPeerAuditRuntimeDisposition,
+  isPeerAuditVerdict,
+} from '@shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  readAgentDelegationSupervisionTaskProjection,
+} from '@shared/agent-delegation.js';
+import { parseTimelineDisplayText } from '../timeline-display-text.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
+import { TaskPairEventChip } from './TaskPairEventChip.js';
+import { parseTaskPairNotification, taskPairNotificationKey } from '@shared/task-pair-notification.js';
+import {
+  MESSAGE_PIN_LIMITS,
+  isMessagePinEventType,
+  type MessagePin,
+  type MessagePinEventType,
+} from '@shared/message-pins.js';
+import { useMessagePins } from '../hooks/useMessagePins.js';
+import { MessagePinsBar, type MessagePinPreviewMode } from './MessagePinsBar.js';
+import { SessionUsagePanel } from './SessionUsagePanel.js';
+import {
+  clearPendingMessagePin,
+  getPendingMessagePin,
+  requestMessagePinNavigation,
+  subscribeMessagePinNavigation,
+} from '../message-pin-navigation.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import {
+  deriveLiveAssignmentStatuses,
+  liveAssignmentStatusesKey,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -75,16 +232,26 @@ interface Props {
   loadingOlder?: boolean;
   /** False when no more history is available */
   hasOlderHistory?: boolean;
+  /** The hole between a stale local cache and the newest block, while it is still being filled newest→oldest. */
+  historyGap?: { lowerTs: number; upperTs: number | null } | null;
   /** Called when user wants to load older messages */
   onLoadOlder?: () => void;
   sessionState?: string;
   sessionId?: string | null;
+  /** Session labels used by task-pair status rows when the event omits one. */
+  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
+  /** False for retained/collapsed windows: keep data cached but pause all chat timers. */
+  visible?: boolean;
   /** When provided, clicking file paths opens the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** When provided, clicking Cloud Doc links/chips opens that document in Cloud Docs. */
+  onCloudDocClick?: (docId: string) => void;
+  /** When provided, clicking Remote Desktop citation chips opens that Remote Desktop window. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** When provided, the right-side file panel is available. */
   ws?: WsClient | null;
   /** Called when user inserts a path via the FileBrowser opened from a chat message */
@@ -98,22 +265,67 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Opens loopback HTTP links in the shared local-web-preview window. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Shared viewers may browse/preview/download but cannot mutate files. */
+  readOnlyFiles?: boolean;
+  /** Constrain file operations to this session's canonical project root. */
+  scopeFilesToSession?: boolean;
+  /** Allow opening DocShare controls from the embedded file panel (false for shared-in callers). */
+  canManageFileShares?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
+  /** Load the bounded timeline window around an old PostgreSQL-backed pin. */
+  onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
+  /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
+  messagePinsEnabled?: boolean;
+  /** Sub-session windows scope the task-pair panel to their own assignments. */
+  scopeTaskPairs?: boolean;
+  /** Isolated split-executor visit; independent of the canonical session filter. */
+  taskPairPanelVisitKey?: string;
+  /** Compact floating panels hide the split file-panel toggle so narrow views stay unobstructed. */
+  hideFilePanel?: boolean;
+  /** Compact floating mini chats hide the docked task-pair status bar. */
+  hideTaskPairPanel?: boolean;
+  /** Submit an inline timeline answer for a trailing pending ask.question event. */
+  onAskAnswer?: (toolUseId: string, answer: string) => boolean | void;
 }
 
-/** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
+function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
+  return raw === 'rendered' || raw === 'text' ? raw : null;
+}
+
+const { projectAssistantEventForDisplay } = createTimelineDisplayProjectionCache(
+  projectAssistantTextForDisplay, isGuaranteedVisibleTimelineEvent,
+);
+
+/** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run' | 'history-gap';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
+  /** Source event ids represented by an assistant block (for old-pin locate). */
+  eventIds?: string[];
   assistantAutomation?: boolean;
+  assistantStreaming?: boolean;
+  /** Active final execution marker from a completed source event. */
+  executionState?: SupervisionExecutionState;
+  /** Metadata record of the block's completed assistant message, when it
+   *  carries the structured delegation-claim projection. Passed through by
+   *  reference so the memoized AssistantBlock keeps a stable prop identity. */
+  delegationMetadata?: Record<string, unknown>;
+  /** Daemon-authored task creation/lifecycle notice projected as the same card. */
+  taskPairNotification?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
   linkedEvents?: TimelineEvent[];
+  /** Original presentation items represented by a repeated supervision-status row. */
+  statusItems?: ViewItem[];
+  heartbeatCount?: number;
+  waitingCount?: number;
   ts?: number;
   lastTs?: number;
 }
@@ -125,7 +337,17 @@ type ChatHtmlFullscreenPreviewState =
 interface AssistantBlockProps {
   text: string;
   automation?: boolean;
+  streaming?: boolean;
+  executionState?: SupervisionExecutionState;
   ts: number;
+  /** Completed assistant message metadata carrying the delegation-claim
+   *  projection, when the runtime attached one. */
+  delegationMetadata?: Record<string, unknown>;
+  taskPairNotification?: Record<string, unknown>;
+  /** Session directory used to fill model names omitted by older task payloads. */
+  sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
+  /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -133,34 +355,57 @@ interface AssistantBlockProps {
    *  break a `===` comparison between consecutive taps. */
   eventId?: string;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  ttsSpeaking?: boolean;
+  onToggleSpeak?: (messageId: string, rawText: string) => void;
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const AGENT_MESSAGE_COLLAPSE_LINE_LIMIT = 7;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
-const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+/**
+ * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
+ * expires server-side (4h). An LRU with no TTL therefore served dead URLs
+ * indefinitely. This bound is deliberately well under the handle lifetime so a
+ * cached entry can never outlive the handle it points at.
+ */
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000;
+interface ChatLocalImagePreviewCacheEntry {
+  promise: Promise<ChatLocalImagePreviewResult>;
+  createdAt: number;
+}
+const chatLocalImagePreviewCache = new Map<string, ChatLocalImagePreviewCacheEntry>();
+
+function invalidateChatLocalImagePreview(cacheKey: string): void {
+  chatLocalImagePreviewCache.delete(cacheKey);
+}
 
 function getCachedChatLocalImagePreview(
   cacheKey: string,
   load: () => Promise<ChatLocalImagePreviewResult>,
+  now: number = Date.now(),
 ): Promise<ChatLocalImagePreviewResult> {
   const existing = chatLocalImagePreviewCache.get(cacheKey);
-  if (existing) {
+  if (existing && now - existing.createdAt <= CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS) {
     chatLocalImagePreviewCache.delete(cacheKey);
     chatLocalImagePreviewCache.set(cacheKey, existing);
-    return existing;
+    return existing.promise;
   }
+  if (existing) chatLocalImagePreviewCache.delete(cacheKey);
 
   const pending = load().catch((err) => {
-    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+    if (chatLocalImagePreviewCache.get(cacheKey)?.promise === pending) {
       chatLocalImagePreviewCache.delete(cacheKey);
     }
     throw err;
   });
-  chatLocalImagePreviewCache.set(cacheKey, pending);
+  chatLocalImagePreviewCache.set(cacheKey, { promise: pending, createdAt: now });
   while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
     const oldestKey = chatLocalImagePreviewCache.keys().next().value;
     if (typeof oldestKey !== 'string') break;
@@ -173,6 +418,13 @@ export function __clearChatLocalImagePreviewCacheForTests() {
   chatLocalImagePreviewCache.clear();
 }
 
+/** Test seam for the streamed-URL cache boundary (tsk_5rf R2). */
+export const __chatLocalImagePreviewCacheInternals = {
+  get: getCachedChatLocalImagePreview,
+  invalidate: invalidateChatLocalImagePreview,
+  ttlMs: CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS,
+};
+
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
  *  copying a multi-paragraph assistant message keeps its paragraph and list
@@ -184,14 +436,15 @@ function extractChatEventText(target: HTMLElement): string {
 }
 
 function isAbsolutePreviewPath(path: string): boolean {
-  return path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
+  return path.startsWith('/') || path === '~' || path.startsWith('~/') || path.startsWith('~\\') || /^[A-Za-z]:[/\\]/.test(path);
 }
 
-function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
+export function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
   const cleaned = path.replace(/^`+|`+$/g, '');
-  if (isAbsolutePreviewPath(cleaned)) return cleaned;
+  if (isAbsolutePreviewPath(cleaned)) return canonicalizeChatFilePath(cleaned) ?? cleaned;
   const root = (workdir && workdir.trim()) || '~';
-  return `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
+  const joined = `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
+  return canonicalizeChatFilePath(joined) ?? joined;
 }
 
 function formatMemoryContextScore(score: number | undefined): string | null {
@@ -199,13 +452,129 @@ function formatMemoryContextScore(score: number | undefined): string | null {
   return score >= 1 ? score.toFixed(2) : score.toFixed(3);
 }
 
-function formatMemoryContextTimestamp(ts: number | undefined): string | null {
-  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
-  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+type I18nLocaleSource = {
+  resolvedLanguage?: string;
+  language?: string;
+};
+
+function resolveI18nLocale(i18n: I18nLocaleSource | undefined): string | undefined {
+  return i18n?.resolvedLanguage || i18n?.language || undefined;
 }
 
-function formatChatDateTime(ts: number): string {
-  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+function formatMemoryContextTimestamp(ts: number | undefined, locale?: string): string | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+// `toLocaleTimeString` / `toLocaleString` construct a fresh Intl.DateTimeFormat
+// on every single call. Every rendered bubble stamps a timestamp, so first paint
+// of a long history pays that construction once per message: measured at ~15% of
+// a 4.9s mount task with 250 rendered items on a 20x-CPU-throttled browser.
+// The formatter depends only on (locale, shape), so build each one once.
+//
+// Output is identical to the toLocale* calls this replaces: those differ from
+// Intl.DateTimeFormat only in the defaults they inject when NO relevant field is
+// requested, and both shapes below request their fields explicitly.
+const CHAT_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+};
+const CHAT_DATE_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: 'numeric',
+  ...CHAT_TIME_FORMAT_OPTIONS,
+};
+// Bounded in practice by the supported locale count (7) x 2 shapes.
+const chatDateTimeFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function chatDateTimeFormatter(locale: string | undefined, withDate: boolean): Intl.DateTimeFormat {
+  const key = `${withDate ? 'd' : 't'}:${locale ?? ''}`;
+  const cached = chatDateTimeFormatterCache.get(key);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat(
+    locale,
+    withDate ? CHAT_DATE_TIME_FORMAT_OPTIONS : CHAT_TIME_FORMAT_OPTIONS,
+  );
+  chatDateTimeFormatterCache.set(key, formatter);
+  return formatter;
+}
+
+export function formatChatDateTime(ts: number, now = Date.now(), locale?: string): string {
+  const date = new Date(ts);
+  const today = new Date(now);
+  const isToday = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  return chatDateTimeFormatter(locale, !isToday).format(date);
+}
+
+const PINNED_MEMORY_SUMMARY_PREVIEW_MAX = 240;
+const MEMORY_PROBLEM_HEADING_RE = /^#{1,6}\s*(?:user\s+problem|problem|issue|问题|問題)\s*[:：]?\s*$/i;
+const MEMORY_PROBLEM_INLINE_RE = /^(?:user\s+problem|problem|issue|问题|問題)\s*[:：]\s*(.+)$/i;
+const MARKDOWN_HEADING_RE = /^#{1,6}\s+/;
+
+function compactMemorySummaryPreview(text: string): string | null {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))
+    .filter(Boolean)
+    .join(' · ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > PINNED_MEMORY_SUMMARY_PREVIEW_MAX
+    ? `${cleaned.slice(0, PINNED_MEMORY_SUMMARY_PREVIEW_MAX - 1).trimEnd()}…`
+    : cleaned;
+}
+
+function extractMemoryProblemPreview(summary: string): string | null {
+  const normalized = summary.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return null;
+  const lines = normalized.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const inline = MEMORY_PROBLEM_INLINE_RE.exec(line);
+    if (inline?.[1]?.trim()) return compactMemorySummaryPreview(inline[1]);
+    if (!MEMORY_PROBLEM_HEADING_RE.test(line)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nextLine = lines[j].trim();
+      if (MARKDOWN_HEADING_RE.test(nextLine)) break;
+      body.push(lines[j]);
+    }
+    const preview = compactMemorySummaryPreview(body.join('\n'));
+    if (preview) return preview;
+  }
+  return compactMemorySummaryPreview(
+    lines.filter((line) => !MARKDOWN_HEADING_RE.test(line.trim())).join('\n'),
+  );
+}
+
+function getLatestRecentMemoryProblemPreview(
+  events: TimelineEvent[],
+  sessionId: string | null | undefined,
+  relatedToEventId: string | null | undefined,
+): string | null {
+  if (!sessionId || !relatedToEventId) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'memory.context') continue;
+    const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (payload.relatedToEventId !== relatedToEventId) continue;
+    if (!Array.isArray(payload.items)) continue;
+    for (const item of payload.items) {
+      if (item?.projectionClass !== 'recent_summary') continue;
+      if (item.sourceSessionName !== sessionId) continue;
+      const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
+      if (preview) return preview;
+    }
+  }
+  return null;
 }
 
 type MemoryContextSection =
@@ -332,9 +701,6 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
-const TOOL_SUMMARY_MAX_CHARS = 240;
-const TOOL_SUMMARY_SCAN_CHARS = 4_096;
-const TOOL_SUMMARY_ARRAY_ITEMS = 8;
 
 type GroupedFileChange = {
   filePath: string;
@@ -354,52 +720,15 @@ function getFileChangeBatch(event: TimelineEvent): FileChangeBatch | null {
   return payload;
 }
 
-function truncateToolText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
-}
-
-function normalizeToolSummaryText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
-  let out = '';
-  let pendingSpace = false;
-  let sawText = false;
-  const scanLength = Math.min(text.length, TOOL_SUMMARY_SCAN_CHARS);
-  for (let i = 0; i < scanLength; i += 1) {
-    const ch = text[i]!;
-    if (/\s/.test(ch)) {
-      if (sawText) pendingSpace = true;
-      continue;
-    }
-    if (pendingSpace && out.length > 0) {
-      out += ' ';
-      pendingSpace = false;
-    }
-    out += ch;
-    sawText = true;
-    if (out.length >= max) return truncateToolText(out, max);
-  }
-  return truncateToolText(out.trim(), max);
-}
-
-function formatToolObjectSummary(record: Record<string, unknown>): string {
-  const entries = Object.entries(record);
-  if (entries.length === 0) return '';
-  const parts = entries.slice(0, 4).map(([key, value]) => {
-    const formatted = formatToolPayloadValue(value);
-    return formatted ? `${key}: ${formatted}` : key;
-  });
-  if (entries.length > 4) parts.push('…');
-  return truncateToolText(`{${parts.join(', ')}}`);
-}
-
+/** Full-fidelity value for the tool card's single-line horizontal scroller. */
 function formatToolPayloadValue(value: unknown): string {
   if (value == null) return '';
-  if (typeof value === 'string') return normalizeToolSummaryText(value);
+  if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
-    const parts = value.slice(0, TOOL_SUMMARY_ARRAY_ITEMS).map((item) => formatToolPayloadValue(item)).filter(Boolean);
-    if (value.length > TOOL_SUMMARY_ARRAY_ITEMS) parts.push('…');
+    const parts = value.map((item) => formatToolPayloadValue(item)).filter(Boolean);
     if (parts.length === 0) return '';
-    return truncateToolText(parts.join(', '));
+    return parts.join(', ');
   }
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
@@ -414,9 +743,13 @@ function formatToolPayloadValue(value: unknown): string {
     if (entries.length === 1) {
       return formatToolPayloadValue(entries[0][1]);
     }
-    return formatToolObjectSummary(record);
+    try {
+      return JSON.stringify(record);
+    } catch {
+      return String(value);
+    }
   }
-  return truncateToolText(String(value));
+  return String(value);
 }
 
 function summarizeToolInput(
@@ -437,6 +770,58 @@ function summarizeToolInput(
   return formatToolPayloadValue(rawRecord.input);
 }
 
+function summarizeToolCommand(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): string {
+  if (!value || depth > 5 || typeof value !== 'object') return '';
+  if (seen.has(value)) return '';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const command = summarizeToolCommand(item, depth + 1, seen);
+      if (command) return command;
+    }
+    return '';
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['command', 'cmd'] as const) {
+    const command = formatToolCommandValue(record[key]);
+    if (command) return command;
+  }
+  for (const key of ['input', 'args', 'raw', 'detail', '_callDetail', '_resultDetail'] as const) {
+    const command = summarizeToolCommand(record[key], depth + 1, seen);
+    if (command) return command;
+  }
+  return '';
+}
+
+function formatToolCommandArgument(value: string | number): string {
+  const argument = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(argument)) return argument;
+  return `'${argument.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function formatToolCommandValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (!Array.isArray(value) || value.length === 0) return '';
+  const argumentsList: Array<string | number> = [];
+  for (const argument of value) {
+    if (typeof argument === 'string') {
+      argumentsList.push(argument);
+      continue;
+    }
+    if (typeof argument === 'number' && Number.isFinite(argument)) {
+      argumentsList.push(argument);
+      continue;
+    }
+    return '';
+  }
+  return argumentsList.map(formatToolCommandArgument).join(' ');
+}
+
 function isGenericWebSearchLabel(value: string | undefined): boolean {
   if (!value) return false;
   return /^\((?:other|open_page|find_in_page|search|web_search)\)$/i.test(value.trim());
@@ -447,8 +832,16 @@ function pickMergedToolInput(
   callInput: string,
   resultInput: string,
 ): string {
-  if (toolName === 'WebSearch' && resultInput) {
-    if (!callInput || isGenericWebSearchLabel(callInput)) return resultInput;
+  if (toolName === 'WebSearch') {
+    const callGeneric = !callInput || isGenericWebSearchLabel(callInput);
+    const resultGeneric = !resultInput || isGenericWebSearchLabel(resultInput);
+    // Reasoning-model web search sometimes reports `action: { type: 'other' }`
+    // with an empty query — codex/OpenAI withholds the actual query, so there
+    // is nothing to show. Drop the cryptic "(other)" token and render a bare
+    // "WebSearch" row instead of leaking the raw enum to the user.
+    if (callGeneric && resultGeneric) return '';
+    if (callGeneric) return resultInput;
+    return callInput;
   }
   return callInput || resultInput;
 }
@@ -489,6 +882,42 @@ function formatToolDetailJson(value: unknown): string | null {
   }
 }
 
+/**
+ * Full-fidelity single-line output preview.
+ *
+ * Keep a one-field object readable (and preserve path-link detection), while
+ * serializing every field for compound values. Expanded details use the
+ * pretty-printed formatter above.
+ */
+function formatToolOutputPreview(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 1) {
+      return formatToolPayloadValue(entries[0][1]) || formatToolDetailJson(value);
+    }
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function splitToolFoldPreview(text: string | null | undefined): {
+  firstLine: string;
+  remainingLines: string | null;
+} {
+  if (!text) return { firstLine: text ?? '', remainingLines: null };
+  const newlineIndex = text.indexOf('\n');
+  if (newlineIndex < 0) return { firstLine: text, remainingLines: null };
+  return {
+    firstLine: text.slice(0, newlineIndex),
+    remainingLines: text.slice(newlineIndex + 1),
+  };
+}
+
 function ToolDetailSection({
   label,
   value,
@@ -510,57 +939,38 @@ function MergedToolDetailPanel({
   toolName,
   callDetail,
   resultDetail,
+  callPayloadInput,
+  resultPayloadOutput,
 }: {
   toolName: string;
   callDetail: unknown;
   resultDetail: unknown;
+  callPayloadInput: unknown;
+  resultPayloadOutput: unknown;
 }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  if (!callDetail && !resultDetail) return null;
-  const detailInput = useMemo(() => (
-    open ? pickMergedToolDetailInput(toolName, callDetail, resultDetail) : undefined
-  ), [callDetail, open, resultDetail, toolName]);
-  const detailMeta = useMemo(() => (
-    open ? pickMergedToolDetailMeta(toolName, callDetail, resultDetail) : undefined
-  ), [callDetail, open, resultDetail, toolName]);
-  const rawDetail = open ? (callDetail as any)?.raw ?? (resultDetail as any)?.raw : undefined;
+  const detailInput = pickMergedToolDetailInput(toolName, callDetail, resultDetail) ?? callPayloadInput;
+  const detailOutput = (resultDetail as any)?.output ?? resultPayloadOutput;
+  const detailMeta = pickMergedToolDetailMeta(toolName, callDetail, resultDetail);
+  const rawDetail = (callDetail as any)?.raw ?? (resultDetail as any)?.raw;
   return (
-    <details
-      class="chat-tool-detail"
-      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
-    >
-      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
-      {open && (
-        <>
-          <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
-          <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
-          <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
-          <ToolDetailSection label={t('chat.tool_detail_raw')} value={rawDetail} />
-        </>
-      )}
-    </details>
+    <div class="chat-tool-detail">
+      <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
+      <ToolDetailSection label={t('chat.tool_detail_output')} value={detailOutput} />
+      <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
+      <ToolDetailSection label={t('chat.tool_detail_raw')} value={rawDetail} />
+    </div>
   );
 }
 
-function ToolResultDetailPanel({ detail }: { detail: unknown }) {
+function ToolResultDetailPanel({ detail, payloadOutput }: { detail: unknown; payloadOutput: unknown }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  if (!detail) return null;
   return (
-    <details
-      class="chat-tool-detail"
-      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
-    >
-      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
-      {open && (
-        <>
-          <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
-          <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
-          <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any).raw} />
-        </>
-      )}
-    </details>
+    <div class="chat-tool-detail">
+      <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any)?.output ?? payloadOutput} />
+      <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any)?.meta} />
+      <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any)?.raw} />
+    </div>
   );
 }
 
@@ -572,14 +982,13 @@ function ToolResultDetailPanel({ detail }: { detail: unknown }) {
 /**
  * Event types that the show_tool_calls preference governs.
  *
- * When the preference is off (Simple view), the chat shows only natural-
- * language turn content — `user.message`, `assistant.text`, plus errors and
- * `ask.question` events that require user response. Everything in this set
- * is debug/work-in-progress detail that a non-dev user does not want to
- * see by default:
+ * When the preference is off (Simple view), the chat keeps natural-language
+ * turn content plus a one-line aggregate for tool activity. Detailed entries
+ * in this set are debug/work-in-progress content that a non-dev user does not
+ * want to see by default:
  *
- *   - `tool.call` / `tool.result` — every Bash/Read/etc. invocation the
- *     agent makes (also implicitly hides the `tool-group` collapse UI).
+ *   - `tool.call` / `tool.result` — detailed Bash/Read/etc. rows become one
+ *                                  compact activity rail per user turn.
  *   - `file.change`              — the file-diff cards rendered for
  *                                  apply_patch / file_change events.
  *   - `memory.context`           — "Related history" recall results that
@@ -598,15 +1007,35 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
+/**
+ * Types that reach `ChatEvent` and always come back as `null`:
+ * `assistant.thinking` returns null outright, and the `transport.queue.*`
+ * family has no case at all and falls through to `default`.
+ *
+ * They must not become ViewItems. A ViewItem that draws nothing still counts
+ * towards `viewItems.length`, which gates BOTH the "load earlier messages"
+ * button and the suppression of the empty-state placeholder — so a window made
+ * only of these rendered as a button floating above an empty scroller, with no
+ * spinner and no "no messages" text.
+ *
+ * They are deliberately NOT removed by `isVisibleChatTimelineEvent`: they still
+ * have to flow through `buildViewItems`, where `assistant.thinking` is a
+ * grouping boundary that flushes pending text and tool runs. Filtering them out
+ * earlier would silently merge assistant blocks that are currently separate.
+ * Only the item PUSH is suppressed; every grouping side effect still happens.
+ */
+
+
 function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
   // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
-  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden only when
-  //   the user has explicitly turned the wrench preference off. Undecided
-  //   users default to ON and see the first-run prompt.
+  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden when the user
+  //   explicitly turns the wrench preference off. buildViewItems retains only
+  //   tool.call/result long enough to replace their detail rows with a compact
+  //   activity rail. Undecided users default to ON and see the chooser.
   return (
     !event.hidden &&
     event.type !== 'agent.status' &&
@@ -614,20 +1043,14 @@ function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean
     event.type !== 'mode.state' &&
     event.type !== 'command.ack' &&
     event.type !== 'terminal.snapshot' &&
-    !(event.type === 'session.state'
-      && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')
-      && !getSessionStateDetail(event)) &&
-    (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type))
+    (event.type !== 'session.state' || isVisibleSessionStatePayload(event.payload)) &&
+    (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type) || isAskQuestionToolCallEvent(event))
   );
 }
 
 function getSessionStateDetail(event: TimelineEvent): string {
   if (event.type !== 'session.state') return '';
-  for (const key of ['error', 'message', 'errorReason'] as const) {
-    const value = event.payload[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
+  return getSessionStatePayloadDetail(event.payload);
 }
 
 function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean): string[] {
@@ -646,8 +1069,262 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
   return ids;
 }
 
+/**
+ * Reference cache for merged call+result events.
+ *
+ * `buildViewItems` re-runs on every incoming event, and the merge below built a
+ * fresh object each time (`{ ...ev, payload: { ... } }`). Every already-merged
+ * tool call in the history therefore got a NEW identity on every streamed token,
+ * which defeated the `ChatEvent` memo for the entire visible list. Measured in a
+ * throttled browser: one incoming event re-executed ~120 ChatEvent bodies while
+ * producing only 3 DOM mutations — the output was identical, so the DOM was
+ * spared, but the JS cost was paid in full and saturated a slow CPU.
+ *
+ * Keyed on the two source OBJECTS, not on their eventIds.
+ *
+ * An eventId-keyed cache is wrong here, and wrong in the direction that silently
+ * stops output from updating: a tool result keeps its eventId while its payload
+ * changes — streaming output grows under the same id, and the detail-hydration
+ * path replaces a truncated payload with the full one under the same id. Keyed
+ * by id, the first (shortest) merge wins forever and the real output never
+ * reaches the screen.
+ *
+ * `useTimeline` updates events immutably (`{ ...existing, payload }`), so a new
+ * object IS the signal that content changed. Keying on identity therefore gives
+ * both properties at once: unchanged inputs return the same merged object (the
+ * memo holds), and any payload change misses the cache (no staleness). A WeakMap
+ * pair also needs no size cap or eviction — entries die with their events.
+ */
+const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
+
+// Stable source identities let the incremental view-model preserve unaffected
+// items across an append/update. The expensive group is rebuilt only when one
+// of its source event objects changes; Preact then skips those unchanged rows.
+const incrementalViewItemCache = new Map<string, ViewItem>();
+function sameViewItem(left: ViewItem, right: ViewItem): boolean {
+  const keys = Object.keys(left) as Array<keyof ViewItem>;
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => {
+    const a = left[key];
+    const b = right[key];
+    // Compare source references/small id lists without copying a potentially
+    // megabyte-sized text into a new signature on every unrelated update.
+    return a === b || (Array.isArray(a) && Array.isArray(b)
+      && a.length === b.length && a.every((value, index) => value === b[index]));
+  });
+}
+function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
+  const next = items.map((item) => {
+    const cached = incrementalViewItemCache.get(item.key);
+    if (cached && sameViewItem(cached, item)) return cached;
+    incrementalViewItemCache.set(item.key, item);
+    return item;
+  });
+  while (incrementalViewItemCache.size > 4096) {
+    const first = incrementalViewItemCache.keys().next().value;
+    if (first === undefined) break;
+    incrementalViewItemCache.delete(first);
+  }
+  return next;
+}
+
+export function __resetIncrementalViewModelCacheForTests(): void {
+  incrementalViewItemCache.clear();
+}
+
+function cacheMergedToolEvent(
+  call: TimelineEvent,
+  result: TimelineEvent,
+  build: () => TimelineEvent,
+): TimelineEvent {
+  let byResult = mergedToolEventCache.get(call);
+  if (!byResult) {
+    byResult = new WeakMap<TimelineEvent, TimelineEvent>();
+    mergedToolEventCache.set(call, byResult);
+  }
+  const hit = byResult.get(result);
+  if (hit) return hit;
+  const built = build();
+  byResult.set(result, built);
+  return built;
+}
+
+export function __resetMergedToolEventCacheForTests(): void {
+  // Identity-keyed entries cannot outlive their events, so there is nothing to
+  // clear; kept as a no-op so tests read the same either way.
+}
+
+/**
+ * Test seam for the identity invariant. Render-count proxies turned out to be
+ * unreliable here (the count moves for unrelated reasons and stays flat when the
+ * memo does miss), so the property is asserted directly on the objects.
+ */
+/**
+ * Presentation items for the tail of a conversation, derived from a bounded
+ * window of events.
+ *
+ * `buildViewItems` is O(events) and runs on every update — a streamed chunk, a
+ * new message. In an 8,000-row session that was measured at 3.0ms per update
+ * and rising linearly, which is most of what made a long session feel worse
+ * than a short one. Almost all of it is waste: the renderer only ever shows the
+ * last `wantItems` of what it derives.
+ *
+ * The window is grown until it yields enough items or reaches the beginning, so
+ * the caller always gets at least what it asked for when the history can supply
+ * it. `windowStartIndex` tells the caller whether anything was left out, which
+ * is what "there is more to show locally" is decided from.
+ *
+ * Boundary effects are real and deliberately tolerated: a tool result whose
+ * call fell outside the window cannot merge with it, and an assistant block cut
+ * by the window edge starts short. Both land in the OLDEST items of the window,
+ * and the caller renders the newest `wantItems` — so the margin below is what
+ * keeps them off screen.
+ */
+interface DerivedViewTail {
+  items: ViewItem[];
+  /** Where the window started in `events`; 0 means the whole history. */
+  windowStartIndex: number;
+}
+
+/** Extra items derived beyond what the caller shows, absorbing window-edge artefacts. */
+const VIEW_TAIL_MARGIN_ITEMS = 24;
+/** First guess at events-per-item. Tool groups collapse many events into one. */
+const VIEW_TAIL_EVENTS_PER_ITEM = 4;
+
+/**
+ * Passes before giving up and deriving everything.
+ *
+ * Each pass quadruples the window, so four billion events are covered in
+ * sixteen. Reaching this cap means the arithmetic below is wrong, and the
+ * correct response is a slow full derivation rather than another pass.
+ */
+const VIEW_TAIL_MAX_WIDENING_PASSES = 16;
+
+function buildViewItemsTail(
+  events: TimelineEvent[],
+  showToolCalls: boolean,
+  wantItems: number,
+): DerivedViewTail {
+  // Every exit below is a numeric comparison, and every comparison against NaN
+  // is false — a non-finite want would therefore loop forever, on the main
+  // thread, wedging the tab past the point where even a reload can run. The
+  // callers pass finite numbers today; this does not depend on them continuing
+  // to.
+  const want = Number.isFinite(wantItems) && wantItems > 0
+    ? Math.floor(wantItems)
+    : CHAT_INITIAL_RENDER_ITEM_LIMIT;
+  const target = want + VIEW_TAIL_MARGIN_ITEMS;
+  let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
+  for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
+    const startIndex = Math.max(0, events.length - windowSize);
+    const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
+    // A folded run touching the left edge may have started before this window.
+    // Widen until the first visible item is not foldable (or history begins),
+    // otherwise a 700-row restored run would display only the last 200 count.
+    const foldRunTouchesWindowStart = startIndex > 0
+      && items.length > 0
+      && (items[0].type === 'supervision-status-run' || supervisionStatusCandidate(items[0]) !== null);
+    // Enough, or there is nothing older to widen into.
+    if ((items.length >= target && !foldRunTouchesWindowStart) || startIndex === 0) {
+      return { items, windowStartIndex: startIndex };
+    }
+    // A tool-heavy stretch can collapse hundreds of events into a handful of
+    // items, so widening by a constant factor rather than a constant count.
+    windowSize = Math.min(events.length, windowSize * 4);
+  }
+  return { items: buildViewItems(events, showToolCalls), windowStartIndex: 0 };
+}
+
+/** Test seam for the windowed derivation; production goes through the memo. */
+export function __buildViewItemsTailForTests(
+  events: TimelineEvent[],
+  showToolCalls: boolean,
+  wantItems: number,
+): { items: ViewItem[]; windowStartIndex: number } {
+  return buildViewItemsTail(events, showToolCalls, wantItems);
+}
+
+
+
+export function __buildViewItemsForTests(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
+  return buildViewItems(events, showToolCalls);
+}
+
+function deduplicateTaskPairTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
+  const latest = new Map<string, TimelineEvent>();
+  for (const event of events) {
+    if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+    const key = taskPairNotificationKey(event.payload);
+    if (!key) continue;
+    const previous = latest.get(key);
+    const eventTs = Number.isFinite(event.ts) ? event.ts : Number.NEGATIVE_INFINITY;
+    const previousTs = previous && Number.isFinite(previous.ts) ? previous.ts : Number.NEGATIVE_INFINITY;
+    if (!previous || eventTs >= previousTs) latest.set(key, event);
+  }
+  const emitted = new Set<string>();
+  return events.filter((event) => {
+    if (event.type !== TASK_PAIR_TIMELINE_EVENT) return true;
+    const key = taskPairNotificationKey(event.payload);
+    if (!key) return true;
+    if (latest.get(key) !== event || emitted.has(key)) return false;
+    emitted.add(key);
+    return true;
+  });
+}
+
+function deduplicateTaskPairViewItems(items: ViewItem[]): ViewItem[] {
+  const result: ViewItem[] = [];
+  const byLifecycle = new Map<string, number>();
+  for (const item of items) {
+    if (item.type !== 'assistant-block' || !item.taskPairNotification) {
+      result.push(item);
+      continue;
+    }
+    const key = taskPairNotificationKey(item.taskPairNotification);
+    if (!key) {
+      result.push(item);
+      continue;
+    }
+    const existingIndex = byLifecycle.get(key);
+    if (existingIndex === undefined) {
+      byLifecycle.set(key, result.length);
+      result.push(item);
+      continue;
+    }
+    const existing = result[existingIndex];
+    const currentTs = Number.isFinite(item.lastTs ?? item.ts) ? (item.lastTs ?? item.ts)! : Number.NEGATIVE_INFINITY;
+    const existingTs = Number.isFinite(existing.lastTs ?? existing.ts) ? (existing.lastTs ?? existing.ts)! : Number.NEGATIVE_INFINITY;
+    const mergedEventIds = [...new Set([...(existing.eventIds ?? []), ...(item.eventIds ?? [])])];
+    if (currentTs >= existingTs) {
+      result[existingIndex] = { ...item, key: existing.key, eventIds: mergedEventIds };
+    } else {
+      result[existingIndex] = { ...existing, eventIds: mergedEventIds };
+    }
+  }
+  return result;
+}
+
+const taskNoticeProjectionCache = new WeakMap<object, {
+  text: unknown; value: ReturnType<typeof parseTaskPairNotification>;
+}>();
+function parseTaskPairEventNotification(event: TimelineEvent) {
+  const text = event.payload.text;
+  const cached = taskNoticeProjectionCache.get(event.payload);
+  if (cached && cached.text === text) return cached.value;
+  const value = parseTaskPairNotification(text);
+  taskNoticeProjectionCache.set(event.payload, { text, value });
+  return value;
+}
+
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
-  const visible = events.filter((event) => isVisibleChatTimelineEvent(event, showToolCalls));
+  // Simple view still needs tool call/result events to build its compact live
+  // activity rail. Other developer details remain fully filtered.
+  const visible = events.filter((event) => (
+    isVisibleChatTimelineEvent(event, showToolCalls)
+    || (!showToolCalls
+      && !event.hidden
+      && (event.type === 'tool.call' || event.type === 'tool.result'))
+  ));
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
   // and dedup stable-eventId streaming events (keep last occurrence only)
@@ -659,6 +1336,22 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   const lastByEventId = new Map<string, number>();
   for (let i = 0; i < visible.length; i++) {
     lastByEventId.set(visible[i].eventId, i);
+  }
+
+  // toolCallId -> result indices, in order. Built once over the WHOLE list:
+  // a correlation id makes the ten-event adjacency window meaningless, and a
+  // result can legitimately arrive far later than its call. Each index is
+  // handed out at most once, so a reused/duplicate id cannot let two calls
+  // consume the same result.
+  const resultsByToolCallId = new Map<string, number[]>();
+  for (let i = 0; i < visible.length; i++) {
+    const candidate = visible[i];
+    if (candidate.type !== 'tool.result') continue;
+    const id = typeof candidate.payload.toolCallId === 'string' ? candidate.payload.toolCallId : '';
+    if (!id) continue;
+    const bucket = resultsByToolCallId.get(id);
+    if (bucket) bucket.push(i);
+    else resultsByToolCallId.set(id, [i]);
   }
 
   for (let i = 0; i < visible.length; i++) {
@@ -675,9 +1368,52 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     // command.ack etc. can land between them during a long-running tool.
     if (ev.type === 'tool.call') {
       let resultIdx = -1;
-      for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
-        if (visible[j].type === 'tool.result') { resultIdx = j; break; }
-        if (visible[j].type === 'tool.call') break; // another call started, stop
+      const callId = typeof ev.payload.toolCallId === 'string' ? ev.payload.toolCallId : '';
+      // Prefer the correlation id. Concurrent tools interleave as
+      // callA, callB, resultA, resultB — the adjacency scan below stops at the
+      // next call, so A never merged and B took A's result, giving the wrong
+      // arguments, the wrong duration, and a call stuck "running" forever.
+      if (callId) {
+        const bucket = resultsByToolCallId.get(callId);
+        while (bucket && bucket.length > 0) {
+          const next = bucket.shift()!;
+          // Only results AFTER this call. Anything an earlier adjacency merge
+          // consumed necessarily sits before it, so this also covers the
+          // double-consume case without a separate `consumedIds` check —
+          // verified by mutation: adding one changed no test.
+          if (next <= i) continue;
+          // Skip indices dropped by the streaming-delta dedup above.
+          if (lastByEventId.get(visible[next].eventId) !== next) continue;
+          resultIdx = next;
+          break;
+        }
+      }
+      // Adjacency fallback. Runs when the call has no id (older events, providers
+      // that omit it) AND when the call HAS an id but the correlation lookup came
+      // up empty — a result that carries no id of its own lands in no bucket, so
+      // an id-bearing call could never pair with it and stayed "running" forever
+      // with the peek stuck on "waiting for output".
+      //
+      // When the call is id-bearing the fallback is deliberately narrower: only a
+      // result with NO id may match. A result carrying a DIFFERENT non-empty id
+      // belongs to another call, and accepting it would reintroduce exactly the
+      // concurrent-tool cross-talk the correlation path above exists to prevent.
+      if (resultIdx === -1) {
+        for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
+          if (visible[j].type === 'tool.result') {
+            const resultId = typeof visible[j].payload.toolCallId === 'string'
+              ? visible[j].payload.toolCallId
+              : '';
+            // Fail closed on either side carrying an id: an id-bearing result
+            // has declared which call owns it, and an id-bearing call must only
+            // pair through the correlation map. Adjacency is the fallback for
+            // events that carry no identity at all.
+            if (resultId) break;
+            resultIdx = j;
+            break;
+          }
+          if (visible[j].type === 'tool.call') break; // another call started, stop
+        }
       }
       if (resultIdx !== -1) {
         const next = visible[resultIdx];
@@ -690,8 +1426,14 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         const inputText = pickMergedToolInput(toolName, callInput, resultInput);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
-        const output = !next.payload.error ? formatToolPayloadValue(next.payload.output) : undefined;
-        consolidated.push({
+        const output = !next.payload.error
+          ? formatToolOutputPreview(next.payload.output)
+            ?? formatToolOutputPreview((next.payload.detail as any)?.output)
+            ?? undefined
+          : undefined;
+        // Same two source events must yield the SAME object every render, or the
+        // whole visible list loses its memo on every incoming token.
+        consolidated.push(cacheMergedToolEvent(ev, next, () => ({
           ...ev,
           type: 'tool.call',
           payload: {
@@ -699,11 +1441,22 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             tool: toolName,
             input: `${input} ${status}`.trim(),
             _merged: true,
+            _toolFailed: Boolean(next.payload.error),
+            // The failure text only survived inside the composed `input` string
+            // (as "✗ <error>"), so anything wanting the real reason had to parse
+            // it back out. Keep it verbatim for the hover peek.
+            ...(next.payload.error ? { _toolError: String(next.payload.error) } : {}),
+            // The merged event keeps the CALL's ts (so ordering is unchanged);
+            // the result's ts is the only record of when the tool finished, and
+            // without it a completed tool has no computable duration.
+            ...(typeof next.ts === 'number' ? { _resultTs: next.ts } : {}),
+            _callPayloadInput: ev.payload.input,
+            _resultPayloadOutput: next.payload.output,
             ...(output ? { _output: output } : {}),
             ...(ev.payload.detail ? { _callDetail: ev.payload.detail } : {}),
             ...(next.payload.detail ? { _resultDetail: next.payload.detail } : {}),
           },
-        });
+        })));
         continue;
       }
     }
@@ -725,7 +1478,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       .filter((event) => event.type === 'user.message')
       .map((event) => event.eventId),
   );
-  const renderable = consolidated.filter((event) => {
+  const renderable = deduplicateTaskPairTimelineEvents(consolidated.filter((event) => {
     if (event.type !== 'memory.context') return true;
     const relatedToEventId = typeof event.payload.relatedToEventId === 'string'
       ? event.payload.relatedToEventId
@@ -735,7 +1488,25 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     group.push(event);
     linkedMemoryEvents.set(relatedToEventId, group);
     return false;
-  });
+  }));
+
+  // A daemon notice can be persisted both as a structured task event and as
+  // the assistant text that announced it. The structured event is the
+  // authoritative card; suppress the duplicate text card below.
+  const structuredTaskLifecycleKeys = new Set(
+    renderable
+      .filter((event) => event.type === TASK_PAIR_TIMELINE_EVENT)
+      .map((event) => taskPairNotificationKey(event.payload) ?? '')
+      .filter(Boolean),
+  );
+  // Canonical ask.question events are authoritative over duplicate raw tool.call
+  // ask_question events carrying the same non-empty toolUseId.
+  const canonicalAskQuestionToolUseIds = new Set(
+    renderable
+      .filter((event) => event.type === 'ask.question' && normalizeAskQuestionsPayload(event.payload?.questions).length > 0)
+      .map((event) => resolveAskQuestionEventToolUseId(event))
+      .filter(Boolean),
+  );
 
   // Main pass: merge assistant.text blocks + group consecutive tool.call runs
   const items: ViewItem[] = [];
@@ -743,61 +1514,136 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingFirstTs = 0;
   let pendingLastTs = 0;
   let pendingKey = '';
+  let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingAssistantStreaming = false;
+  let pendingExecutionState: SupervisionExecutionState | undefined;
+  let pendingDelegationMetadata: Record<string, unknown> | undefined;
+  let pendingTaskPairNotification: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
+  // Keys claimed by merged runs in this derivation (see chat-run-keys.ts).
+  const usedRunKeys = new Set<string>();
+
   const flushPending = () => {
-    if (pendingText.length > 0) {
+    if (pendingEventIds.length > 0) {
+      const pendingTextValue = pendingText.join('\n');
+      const notification = pendingTaskPairNotification
+        ? { payload: pendingTaskPairNotification, taskId: pendingTaskPairNotification.taskId as string }
+        : parseTaskPairNotification(pendingTextValue);
+      if (notification && structuredTaskLifecycleKeys.has(taskPairNotificationKey(notification.payload) ?? '')) {
+        pendingText = [];
+        pendingEventIds = [];
+        pendingAssistantAutomation = false;
+        pendingAssistantStreaming = false;
+        pendingExecutionState = undefined;
+        pendingDelegationMetadata = undefined;
+        pendingTaskPairNotification = undefined;
+        return;
+      }
       items.push({
-        key: pendingKey,
+        key: claimRunKey('assistant-block', pendingKey, pendingEventIds, usedRunKeys),
         type: 'assistant-block',
-        text: pendingText.join('\n'),
+        text: pendingTextValue,
+        eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        assistantStreaming: pendingAssistantStreaming,
+        ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
+        ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
+        ...(notification ? { taskPairNotification: notification.payload } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
+      pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingAssistantStreaming = false;
+      pendingExecutionState = undefined;
+      pendingDelegationMetadata = undefined;
+      pendingTaskPairNotification = undefined;
     }
   };
 
   const flushTools = () => {
     if (pendingTools.length === 0) return;
-    if (pendingTools.length === 1) {
+    if (!showToolCalls) {
+      items.push({
+        key: claimRunKey('tool-activity', `ta_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
+        type: 'tool-activity',
+        toolEvents: [...pendingTools],
+      });
+    } else if (pendingTools.length === 1) {
       items.push({ key: pendingTools[0].eventId, type: 'event', event: pendingTools[0] });
     } else {
       // 2+ consecutive tool events → collapsible group
       items.push({
-        key: `tg_${pendingTools[0].eventId}`,
+        key: claimRunKey('tool-group', `tg_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
         type: 'tool-group',
         toolEvents: [...pendingTools],
       });
     }
     pendingTools = [];
     // Flush any session.state events that were deferred to avoid breaking the group
-    for (const ev of deferredEvents) items.push({ key: ev.eventId, type: 'event', event: ev });
+    for (const ev of deferredEvents) {
+      if (isNeverRenderedTimelineEventType(ev.type)) continue;
+      items.push({ key: ev.eventId, type: 'event', event: ev });
+    }
     deferredEvents = [];
   };
 
   for (const event of renderable) {
     if (event.type === 'assistant.text') {
-      flushTools();
+      // Developer view preserves exact chronology. Simple view holds tool
+      // events until the next user turn (or the tail) so one turn produces a
+      // single live activity rail instead of many tiny rows.
+      if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
-      if (!text) continue;
+      const rawNotification = parseTaskPairEventNotification(event);
+      const projection = projectAssistantEventForDisplay(event);
+      const text = projection.text;
+      const executionState = event.payload.streaming === true || event.payload.pending === true
+        ? null
+        : projection.executionState;
+      if (!text && !executionState && !rawNotification) continue;
       const assistantAutomation = event.payload.automation === true;
-      if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
+      // A single assistant turn may be delivered as several timeline events,
+      // so retain the existing merge while one notice's text grows.  A
+      // different task (or a lifecycle transition for the same task) starts a
+      // new card; flush before replacing the singular pending payload so
+      // adjacent notices cannot silently overwrite one another.
+      if (rawNotification && pendingEventIds.length > 0 && pendingTaskPairNotification) {
+        const taskChanged = pendingTaskPairNotification.taskId !== rawNotification.payload.taskId;
+        const lifecycleChanged = pendingTaskPairNotification.verb !== rawNotification.payload.verb
+          || pendingTaskPairNotification.toStatus !== rawNotification.payload.toStatus;
+        if (taskChanged || lifecycleChanged) flushPending();
+      }
+      if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
       }
-      if (pendingText.length === 0) {
+      if (pendingEventIds.length === 0) {
         pendingKey = event.eventId;
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      // The newest event is authoritative: a terminal assistant.text must
+      // clear streaming even when earlier deltas in this merged block were
+      // marked streaming/pending. This lets the markdown renderer finalize
+      // immediately and freeze its parsed AST.
+      pendingAssistantStreaming = event.payload.streaming === true || event.payload.pending === true;
+      // Only the turn's completed message carries the delegation-claim
+      // projection, so the newest event that has one wins for the block.
+      const delegationMetadata = readDelegationClaimMetadata(event.payload);
+      if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
+      if (executionState) pendingExecutionState = executionState;
+      if (rawNotification) pendingTaskPairNotification = rawNotification.payload;
       pendingLastTs = event.ts;
-      pendingText.push(text);
-    } else if (event.type === 'tool.call' || event.type === 'tool.result') {
+      if (text) pendingText.push(text);
+      pendingEventIds.push(event.eventId);
+    } else if (event.type === 'tool.call' && isAskQuestionToolCallEvent(event) && canonicalAskQuestionToolUseIds.has(resolveAskQuestionEventToolUseId(event))) {
+      // Canonical ask.question event already renders the interactive timeline card.
+      continue;
+    } else if ((event.type === 'tool.call' && !isAskQuestionToolCallEvent(event)) || event.type === 'tool.result') {
       flushPending();
       pendingTools.push(event);
     } else if (event.type === 'assistant.thinking' && pendingTools.length > 0) {
@@ -807,9 +1653,49 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // session.state hooks can fire between tool calls (e.g. CC notification hook).
       // Defer: render after the tool group closes.
       deferredEvents.push(event);
-    } else {
+    } else if (event.type === 'user.message'
+      && event.payload.automation === true
+      && event.payload.automationKind === TASK_PAIR_AUTOMATION_KIND) {
+      // Daemon task-pair notices are delivered as automation user.message
+      // rows (the dispatch path intentionally suppresses a provider echo).
+      // Treat only that trusted automation kind as a task notification; user
+      // prose or code examples must remain ordinary message events.
       flushPending();
       flushTools();
+      const notificationText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
+      const notification = parseTaskPairNotification(notificationText);
+      if (notification && notificationText !== undefined && !structuredTaskLifecycleKeys.has(taskPairNotificationKey(notification.payload) ?? '')) {
+        items.push({
+          key: claimRunKey('assistant-block', event.eventId, [event.eventId], usedRunKeys),
+          type: 'assistant-block',
+          text: notificationText,
+          eventIds: [event.eventId],
+          assistantAutomation: true,
+          taskPairNotification: notification.payload,
+          ts: event.ts,
+          lastTs: event.ts,
+        });
+      } else if (!notification) {
+        // Not every trusted task-pair automation row is a lifecycle notice.
+        // Keep ordinary automation prose visible instead of silently dropping
+        // it when it does not match the task-notification grammar.
+        if (!isNeverRenderedTimelineEventType(event.type)) {
+          items.push({
+            key: event.eventId,
+            type: 'event',
+            event,
+            ...(linkedMemoryEvents.has(event.eventId)
+              ? { linkedEvents: linkedMemoryEvents.get(event.eventId) }
+              : {}),
+          });
+        }
+      }
+    } else {
+      flushPending();
+      if (showToolCalls || event.type === 'user.message') flushTools();
+      // Flushing above is the grouping contract and still runs; only the
+      // unrenderable item itself is withheld.
+      if (isNeverRenderedTimelineEventType(event.type)) continue;
       items.push({
         key: event.eventId,
         type: 'event',
@@ -823,7 +1709,102 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return items;
+  return stabilizeViewItems(foldSupervisionStatusRuns(deduplicateTaskPairViewItems(items)));
+}
+
+type SupervisionStatusCandidate = {
+  kind: 'heartbeat' | 'waiting';
+  count: number;
+};
+
+/**
+ * Identify only the two machine-only rows authorized for compact presentation.
+ * Real assistant text, NEEDS_INPUT, audit/implementation heartbeats and every
+ * other visible row deliberately return null and therefore break the run.
+ */
+function supervisionStatusCandidate(item: ViewItem): SupervisionStatusCandidate | null {
+  if (
+    item.type === 'event'
+    && item.event?.type === 'user.message'
+    && (item.linkedEvents?.length ?? 0) === 0
+    && item.event.payload.automation === true
+    && item.event.payload.automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+  ) {
+    return { kind: 'heartbeat', count: 1 };
+  }
+  if (
+    item.type === 'assistant-block'
+    && item.executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    && (item.text ?? '').trim().length === 0
+  ) {
+    return { kind: 'waiting', count: Math.max(1, item.eventIds?.length ?? 0) };
+  }
+  return null;
+}
+
+function foldSupervisionStatusRuns(items: ViewItem[]): ViewItem[] {
+  const folded: ViewItem[] = [];
+  let run: ViewItem[] = [];
+  let heartbeatCount = 0;
+  let waitingCount = 0;
+
+  const flush = () => {
+    const sourceCount = heartbeatCount + waitingCount;
+    if (sourceCount < 2) {
+      folded.push(...run);
+    } else {
+      const first = run[0];
+      const last = run[run.length - 1];
+      folded.push({
+        // The first source event owns the run identity. A live append changes
+        // the summary revision/count but not its key, so Preact preserves the
+        // disclosure node, focus and expanded state without a flicker.
+        key: `supervision-status-run:${first.key}`,
+        type: 'supervision-status-run',
+        statusItems: run,
+        heartbeatCount,
+        waitingCount,
+        ts: first.ts ?? first.event?.ts ?? 0,
+        lastTs: last.lastTs ?? last.ts ?? last.event?.ts ?? 0,
+      });
+    }
+    run = [];
+    heartbeatCount = 0;
+    waitingCount = 0;
+  };
+
+  for (const item of items) {
+    const candidate = supervisionStatusCandidate(item);
+    if (!candidate) {
+      flush();
+      folded.push(item);
+      continue;
+    }
+    run.push(item);
+    if (candidate.kind === 'heartbeat') heartbeatCount += candidate.count;
+    else waitingCount += candidate.count;
+  }
+  flush();
+  return folded;
+}
+
+/** Return the source text represented by a pinnable timeline event.
+ *
+ * Assistant rows can merge several consecutive `assistant.text` events into
+ * one visible bubble. In that case the first event id is attached to the DOM,
+ * so reading only that event's payload would truncate the pinned message. The
+ * merged ViewItem is still source data (including Markdown), unlike text read
+ * back from the rendered DOM, which also contains interactive link controls. */
+function messagePinSourceText(event: TimelineEvent, viewItems: ViewItem[]): string | null {
+  if (event.type === 'assistant.text') {
+    const block = viewItems.find((item) => (
+      item.type === 'assistant-block'
+      && (item.key === event.eventId || item.eventIds?.includes(event.eventId))
+    ));
+    if (typeof block?.text === 'string' && block.text.trim()) return block.text;
+  }
+  const text = event.payload.text;
+  return typeof text === 'string' && text.trim() ? text : null;
 }
 
 function textRevision(text: string | undefined): string {
@@ -841,6 +1822,7 @@ function eventRevision(event: TimelineEvent): string {
     event.seq,
     event.payload.streaming === true ? 'streaming' : '',
     event.payload.pending === true ? 'pending' : '',
+    event.payload.queued === true ? 'queued' : '',
     event.payload.failed === true ? 'failed' : '',
     state,
     text,
@@ -848,6 +1830,11 @@ function eventRevision(event: TimelineEvent): string {
 }
 
 function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'history-gap') return `${item.key}:history-gap`;
+  if (item.type === 'supervision-status-run') {
+    return `${item.key}:supervision-status-run:${item.heartbeatCount ?? 0}:${item.waitingCount ?? 0}:`
+      + (item.statusItems ?? []).map(viewItemRevision).join('|');
+  }
   if (item.type === 'assistant-block') {
     return [
       item.key,
@@ -855,11 +1842,15 @@ function viewItemRevision(item: ViewItem): string {
       item.ts ?? 0,
       item.lastTs ?? 0,
       item.assistantAutomation === true ? 'automation' : '',
+      item.executionState ?? '',
       textRevision(item.text),
     ].join(':');
   }
   if (item.type === 'tool-group') {
     return `${item.key}:tool-group:${(item.toolEvents ?? []).map(eventRevision).join('|')}`;
+  }
+  if (item.type === 'tool-activity') {
+    return `${item.key}:tool-activity:${(item.toolEvents ?? []).map(eventRevision).join('|')}`;
   }
   const linked = item.linkedEvents?.map(eventRevision).join('|') ?? '';
   return `${item.key}:event:${item.event ? eventRevision(item.event) : ''}:${linked}`;
@@ -974,6 +1965,25 @@ function findEventElement(root: ParentNode, eventId: string): HTMLElement | null
   return null;
 }
 
+/** Center a message inside the chat's own scroll viewport. `scrollIntoView`
+ * also scrolls every eligible ancestor, which can move a floating chat window
+ * and push its titlebar (including the pin control) out of view. */
+function scrollEventWithinChat(container: HTMLElement, target: HTMLElement, behavior: ScrollBehavior): void {
+  const rectScale = getDomRectToLayoutScale(container);
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const targetTop = container.scrollTop + (targetRect.top - containerRect.top) / rectScale;
+  const targetHeight = targetRect.height / rectScale;
+  const centerOffset = Math.max(0, (container.clientHeight - targetHeight) / 2);
+  const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  const top = Math.min(maxTop, Math.max(0, targetTop - centerOffset));
+  if (typeof container.scrollTo === 'function') {
+    container.scrollTo({ top, behavior });
+  } else {
+    container.scrollTop = top;
+  }
+}
+
 /** Walk up the DOM from `start` and return the nearest ancestor that actually
  *  scrolls (overflow-y is `auto` or `scroll` AND the element has extra scroll
  *  height beyond its clientHeight). Used by the pinned-last-sent banner to
@@ -1009,10 +2019,35 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
       return t('chat.sdk_agents_provider_codex');
     case SDK_SUBAGENT_PROVIDERS.QWEN:
       return t('chat.sdk_agents_provider_qwen');
-    case SDK_SUBAGENT_PROVIDERS.GEMINI_SDK:
-      return t('chat.sdk_agents_provider_gemini');
+    case SDK_SUBAGENT_PROVIDERS.GROK_SDK:
+      return t('chat.sdk_agents_provider_grok');
+    case SDK_SUBAGENT_PROVIDERS.AGY_SDK:
+      return t('chat.sdk_agents_provider_agy');
+    case SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK:
+      return t('chat.sdk_agents_provider_muse');
     default:
       return t('chat.sdk_agents_provider_unknown');
+  }
+}
+
+function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): string {
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH) return t('chat.sdk_agents_task_bash');
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT || row.taskType === SDK_SUBAGENT_TASK_TYPES.AGENT) {
+    return t('chat.sdk_agents_task_agent');
+  }
+  switch (row.providerKind) {
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL:
+      return t('chat.sdk_agents_task_bash');
+    case SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT:
+      return t('chat.sdk_agents_task_agent');
+    default:
+      return t('chat.sdk_agents_task_background');
   }
 }
 
@@ -1221,6 +2256,7 @@ function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) 
     <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
       <div class="chat-sdk-agent-row-top">
         <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, row)}</span>
+        <span class="chat-sdk-agent-task-kind">{sdkAgentsTaskKindLabel(t, row)}</span>
         <span class="chat-sdk-agent-status">{statusLabel}</span>
       </div>
       <div class="chat-sdk-agent-summary">{summary}</div>
@@ -1293,8 +2329,887 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
-  const { t } = useTranslation();
+export function __computeVirtualChatRangeForTests(
+  heights: readonly number[],
+  scrollTop: number,
+  viewportHeight: number,
+  overscan = 6,
+): { start: number; end: number; totalHeight: number; topSpacer: number; bottomSpacer: number } {
+  const offsets = new Array<number>(heights.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < heights.length; i += 1) offsets[i + 1] = offsets[i] + Math.max(1, heights[i] || 0);
+  // A foreground restore can briefly retain the old scrollTop while the
+  // cache-backed list is replaced with a shorter tail. Clamp before choosing
+  // a range; otherwise start can equal length and the virtualizer renders only
+  // spacers, producing the empty black chat region reported on iOS.
+  const maxScrollTop = Math.max(0, offsets[heights.length] - Math.max(1, viewportHeight));
+  const top = Math.min(maxScrollTop, Math.max(0, scrollTop));
+  const bottom = top + Math.max(1, viewportHeight);
+  let start = 0;
+  while (start < heights.length && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < heights.length && offsets[end] < bottom) end += 1;
+  const rangeStart = Math.max(0, start - overscan);
+  const rangeEnd = Math.min(heights.length, end + overscan);
+  return {
+    start: rangeStart,
+    end: rangeEnd,
+    totalHeight: offsets[heights.length],
+    topSpacer: offsets[rangeStart],
+    bottomSpacer: Math.max(0, offsets[heights.length] - offsets[rangeEnd]),
+  };
+}
+
+/** Return the measured/estimated scroll offset needed to reveal an item. */
+export function __computeVirtualChatRevealScrollTopForTests(
+  heights: readonly number[],
+  index: number,
+): number {
+  const end = Math.max(0, Math.min(heights.length, Math.floor(index)));
+  let offset = 0;
+  for (let i = 0; i < end; i += 1) offset += Math.max(1, heights[i] ?? 72);
+  return offset;
+}
+
+/** Tail size required to include an event-backed presentation item. */
+export function __computeRevealRenderItemLimitForTests(
+  items: ReadonlyArray<{ key: string; event?: { eventId: string }; eventIds?: readonly string[] }>,
+  eventId: string,
+  currentLimit: number,
+): number {
+  const index = items.findIndex((item) => (
+    item.key === eventId
+    || item.event?.eventId === eventId
+    || item.eventIds?.includes(eventId)
+  ));
+  return index < 0 ? currentLimit : Math.max(currentLimit, items.length - index);
+}
+
+interface VirtualizedViewItemsProps {
+  items: ViewItem[];
+  contentRevision?: string;
+  scrollRef: { current: HTMLDivElement | null };
+  enabled: boolean;
+  /** A pinned/search target that must be mounted before its caller locates it. */
+  revealKey?: string;
+  /**
+   * Called after every commit / row measurement. The virtualizer only reports
+   * that layout may have changed; ChatView remains the single owner of scroll
+   * policy (re-pin a follower, re-align a reader's anchor row).
+   */
+  onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean) => void;
+  /**
+   * Filled by the virtualizer: absorbs a layout shift ABOVE the reader into its top
+   * offset (no scrollTop write) and returns the part it could not absorb (all of it
+   * when the list is not virtualized). See `topOffsetStyle`.
+   */
+  absorbTopShiftRef?: { current: ((delta: number) => number) | null };
+  /** After the idle reconcile moved content (ChatView re-records its reader anchor). */
+  onTopOffsetReconciled?: () => void;
+  /** Identity of the conversation shown; a change drops the recorded offset/anchor. */
+  resetKey?: string;
+  /** True while the viewport follows the tail: pin writes own scrollTop then, so the idle reconcile stands down. */
+  isFollowing?: () => boolean;
+  /** False while active touch or explicit user scroll intent forbids passive auto-pinning. */
+  canPassivePin?: () => boolean;
+  /** Notify parent before writing scrollTop so handleScroll treats it as programmatic. */
+  onProgrammaticScroll?: () => void;
+  /** Called after virtual rows commit so observers can re-bind replaced DOM nodes. */
+  onRowsRendered?: () => void;
+  renderItem: (item: ViewItem) => h.JSX.Element;
+}
+
+/** How long the scroller must be still (no scroll events, no finger) before the
+ * virtual list may move its content with a single compensated scrollTop write. */
+const VIRTUAL_IDLE_RECONCILE_MS = 160;
+/** Unmeasured rows are estimated below the measured mean on purpose: a low
+ * estimate only hides content above the scroll origin (invisible, reconciled when
+ * idle), a high one would show a blank gap. */
+const VIRTUAL_ESTIMATE_FLOOR = 72;
+const VIRTUAL_ESTIMATE_MEAN_FACTOR = 0.75;
+const VIRTUAL_ESTIMATE_CEIL = 1200;
+const VIRTUAL_ESTIMATE_MIN_SAMPLES = 6;
+
+/**
+ * Viewport virtualization for the chat list. Heights are measured after mount
+ * and retained by stable item key; unknown rows use a conservative estimate.
+ * The top/bottom spacers preserve the scroll range, while the parent ChatView
+ * remains the owner of follow/anchor policy and therefore streaming and history
+ * prepend semantics stay unchanged.
+ */
+function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, revealKey, onMeasuredLayout, absorbTopShiftRef, onTopOffsetReconciled, resetKey, isFollowing, canPassivePin, onProgrammaticScroll, onRowsRendered, renderItem }: VirtualizedViewItemsProps) {
+  const heightsRef = useRef(new Map<string, number>());
+  const [layoutVersion, setLayoutVersion] = useState(0);
+  const [scrollRenderVersion, setScrollRenderVersion] = useState(0);
+  const scrollTopRef = useRef(0);
+  const viewportRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const wasAtBottomRef = useRef(true);
+  const wasVirtualizedRef = useRef(false);
+  const itemKeysRef = useRef<ItemKeySnapshot | null>(null);
+  const resumeSnapshotRef = useRef<{ scrollTop: number; atBottom: boolean } | null>(null);
+  const [resumeGeneration, setResumeGeneration] = useState(0);
+  // Height of a row nobody has measured yet. Starts at the floor and follows the
+  // measured mean (re-derived each time the sample count doubles, so it does not
+  // churn the offsets on every commit).
+  const estimateRef = useRef(VIRTUAL_ESTIMATE_FLOOR);
+  const measuredSumRef = useRef(0);
+  const nextEstimateAtRef = useRef(VIRTUAL_ESTIMATE_MIN_SAMPLES);
+  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimateRef.current;
+  // Layout shifts above the reader are absorbed here instead of by scrollTop: the
+  // rendered top offset is `range.topSpacer + biasRef.current`.
+  const biasRef = useRef(0);
+  const topSpacerElRef = useRef<HTMLDivElement | null>(null);
+  const topSpacerBaseRef = useRef(0);
+  const atTopRef = useRef(false);
+  // Which mounted row sits at the viewport top, and where. The mounted range is
+  // derived from THIS (DOM truth) rather than from scrollTop, so absorbing a layout
+  // shift into `biasRef` can never move the range and flip a boundary row in and
+  // out of the DOM (which would shift the layout again and loop).
+  const viewportAnchorRef = useRef<{ key: string; top: number } | null>(null);
+  const resetKeyRef = useRef(resetKey);
+  const touchingRef = useRef(false);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onTopOffsetReconciledRef = useRef(onTopOffsetReconciled);
+  onTopOffsetReconciledRef.current = onTopOffsetReconciled;
+  const isFollowingRef = useRef(isFollowing);
+  isFollowingRef.current = isFollowing;
+  const canPassivePinRef = useRef(canPassivePin);
+  canPassivePinRef.current = canPassivePin;
+  const onProgrammaticScrollRef = useRef(onProgrammaticScroll);
+  onProgrammaticScrollRef.current = onProgrammaticScroll;
+  const onRowsRenderedRef = useRef(onRowsRendered);
+  onRowsRenderedRef.current = onRowsRendered;
+
+  const resetVirtualizerStateForScope = (resetScrollTop: boolean) => {
+    resetKeyRef.current = resetKey;
+    heightsRef.current.clear();
+    measuredSumRef.current = 0;
+    estimateRef.current = VIRTUAL_ESTIMATE_FLOOR;
+    nextEstimateAtRef.current = VIRTUAL_ESTIMATE_MIN_SAMPLES;
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+    itemKeysRef.current = null;
+    resumeSnapshotRef.current = null;
+    wasAtBottomRef.current = true;
+    wasVirtualizedRef.current = false;
+    lastCommitSignatureRef.current = '';
+    lastExternalSignatureRef.current = '';
+    if (resetScrollTop) scrollTopRef.current = 0;
+  };
+
+  const computeIsFollowingOrNearBottom = (root: HTMLElement) => (
+    isFollowingRef.current
+      ? Boolean(isFollowingRef.current())
+      : root.scrollHeight - root.scrollTop - root.clientHeight < 24
+  );
+  const readEffectiveFollowing = () => (
+    isFollowingRef.current ? Boolean(isFollowingRef.current()) : wasAtBottomRef.current
+  );
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    if (readEffectiveFollowing() && (canPassivePinRef.current?.() ?? true) && root.scrollTop === 0 && root.scrollHeight > root.clientHeight) {
+      onProgrammaticScrollRef.current?.();
+      root.scrollTop = root.scrollHeight;
+      wasAtBottomRef.current = true;
+    }
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    setLayoutVersion((v) => v + 1);
+    const onScroll = () => {
+      if (Math.abs(root.scrollTop - scrollTopRef.current) > 1) {
+        absorbPassCountRef.current = 0;
+      }
+      scrollTopRef.current = root.scrollTop;
+      viewportRef.current = root.clientHeight;
+      const following = Boolean(isFollowingRef.current?.());
+      wasAtBottomRef.current = computeIsFollowingOrNearBottom(root);
+      if (following) {
+        viewportAnchorRef.current = null;
+      } else {
+        captureViewportAnchor();
+      }
+      scheduleIdleReconcile();
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setScrollRenderVersion((v) => v + 1);
+      });
+    };
+    const onTouchStart = () => { touchingRef.current = true; };
+    const onTouchEnd = () => { touchingRef.current = false; scheduleIdleReconcile(); };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    root.addEventListener('touchstart', onTouchStart, { passive: true });
+    root.addEventListener('touchend', onTouchEnd, { passive: true });
+    root.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      root.removeEventListener('touchstart', onTouchStart);
+      root.removeEventListener('touchend', onTouchEnd);
+      root.removeEventListener('touchcancel', onTouchEnd);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+      touchingRef.current = false;
+    };
+  }, [enabled, scrollRef]);
+
+  const captureViewportAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rectScale = getDomRectToLayoutScale(root);
+    const rootTop = root.getBoundingClientRect().top;
+    viewportAnchorRef.current = null;
+    for (const node of root.querySelectorAll<HTMLElement>('[data-virtual-key]')) {
+      const rect = node.getBoundingClientRect();
+      if ((rect.bottom - rootTop) / rectScale <= 1) continue;
+      const key = node.dataset.virtualKey;
+      if (key) viewportAnchorRef.current = { key, top: (rect.top - rootTop) / rectScale };
+      break;
+    }
+  };
+
+  const patchTopSpacer = (x: number) => {
+    const el = topSpacerElRef.current;
+    if (!el) return;
+    const style = topOffsetStyle(x);
+    el.style.height = `${style.height}px`;
+    el.style.marginTop = `${style.marginTop}px`;
+  };
+  // A shift the top offset absorbed can leave content above the scroll origin (or a
+  // gap above the first row). Once the viewport is idle - no finger, no scroll event
+  // for a moment, so there is no momentum to cancel - move it back with ONE write
+  // that is exactly compensated in the same task, so nothing moves on screen.
+  const reconcileIdle = () => {
+    idleTimerRef.current = null;
+    const root = scrollRef.current;
+    if (!root) return;
+    if (touchingRef.current) { scheduleIdleReconcile(); return; }
+    // A follower's scrollTop belongs to the pin (rows keep growing at the tail); the
+    // offset is reconciled when the reader next scrolls and comes to rest.
+    if (isFollowingRef.current?.()) return;
+    const x = topSpacerBaseRef.current + biasRef.current;
+    const result = reconcileTopOffset(x, atTopRef.current, root.scrollTop);
+    if (!result) return;
+    biasRef.current += result.x - x;
+    patchTopSpacer(result.x);
+    if (result.scrollTopDelta !== 0) {
+      onProgrammaticScrollRef.current?.();
+      root.scrollTop += result.scrollTopDelta;
+    }
+    scrollTopRef.current = root.scrollTop;
+    captureViewportAnchor();
+    setLayoutVersion((v) => v + 1);
+    onTopOffsetReconciledRef.current?.();
+  };
+  const scheduleIdleReconcile = () => {
+    if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = setTimeout(reconcileIdle, VIRTUAL_IDLE_RECONCILE_MS);
+  };
+
+  useEffect(() => {
+    if (!absorbTopShiftRef || !enabled) return undefined;
+    absorbTopShiftRef.current = (delta: number) => {
+      if (!topSpacerElRef.current) return delta;
+      if (absorbPassCountRef.current >= MAX_VIRTUAL_ABSORB_PASSES) return 0;
+      absorbPassCountRef.current += 1;
+      biasRef.current -= delta;
+      patchTopSpacer(topSpacerBaseRef.current + biasRef.current);
+      scheduleIdleReconcile();
+      if (inSyncLayoutEffectRef.current) {
+        didAbsorbThisPassRef.current = true;
+      } else {
+        setLayoutVersion((v) => v + 1);
+      }
+      return 0;
+    };
+    return () => { absorbTopShiftRef.current = null; };
+  }, [enabled, absorbTopShiftRef]);
+
+  // iOS may reset the nested scrollTop while the WebView is backgrounded,
+  // without a useful scroll event when it becomes visible again. Capture the
+  // logical position before hiding and reconcile it on pageshow/visibility
+  // resume, rather than letting the old virtual range point at empty space.
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let lastResumeAt = 0;
+    const capture = () => {
+      if (document.visibilityState !== 'hidden') return;
+      resumeSnapshotRef.current = {
+        scrollTop: scrollTopRef.current,
+        atBottom: wasAtBottomRef.current,
+      };
+    };
+    const resume = (ev?: Event) => {
+      if (document.visibilityState === 'hidden') return;
+      // Ignore non-persisted initial pageshow when we never captured a hidden snapshot.
+      if (ev && ev.type === 'pageshow' && 'persisted' in ev && !(ev as PageTransitionEvent).persisted && !resumeSnapshotRef.current) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResumeAt < WEB_UNLOCK_COALESCE_MS) return;
+      lastResumeAt = now;
+      if (!resumeSnapshotRef.current) {
+        const root = scrollRef.current;
+        if (root) resumeSnapshotRef.current = {
+          scrollTop: scrollTopRef.current,
+          atBottom: wasAtBottomRef.current,
+        };
+      }
+      setResumeGeneration((generation) => generation + 1);
+    };
+    document.addEventListener('visibilitychange', capture);
+    document.addEventListener('visibilitychange', resume);
+    window.addEventListener('pageshow', resume);
+    return () => {
+      document.removeEventListener('visibilitychange', capture);
+      document.removeEventListener('visibilitychange', resume);
+      window.removeEventListener('pageshow', resume);
+    };
+  }, [enabled, scrollRef]);
+
+  // Resume/cache replay can replace the children without dispatching a scroll
+  // event. Reconcile the real viewport before the next paint: keep a viewer
+  // who was following at the bottom, and clamp an old offset if the restored
+  // content became shorter. This prevents a stale high scrollTop from making
+  // the computed virtual range empty while preserving readers' numeric anchor.
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const scopeChanged = resetKeyRef.current !== resetKey;
+    if (scopeChanged) {
+      resetVirtualizerStateForScope(false);
+    }
+    if (!scopeChanged && itemKeysUnchanged(itemKeysRef.current, resumeGeneration, items)) return;
+    itemKeysRef.current = snapshotItemKeys(resumeGeneration, items);
+    const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    const resumeSnapshot = resumeSnapshotRef.current;
+    const allowPassivePin = canPassivePinRef.current?.() ?? true;
+    if (scopeChanged) {
+      onProgrammaticScrollRef.current?.();
+      root.scrollTop = root.scrollHeight;
+      wasAtBottomRef.current = true;
+    } else if (resumeSnapshot?.atBottom || (!resumeSnapshot && readEffectiveFollowing())) {
+      if (allowPassivePin && (resumeSnapshot?.atBottom || root.scrollTop <= maxScrollTop + 1)) {
+        onProgrammaticScrollRef.current?.();
+        root.scrollTop = root.scrollHeight;
+        wasAtBottomRef.current = true;
+      } else {
+        wasAtBottomRef.current = computeIsFollowingOrNearBottom(root);
+      }
+    } else {
+      const preferredTop = resumeSnapshot?.scrollTop ?? root.scrollTop;
+      if (preferredTop > maxScrollTop && !touchingRef.current && allowPassivePin) {
+        onProgrammaticScrollRef.current?.();
+        root.scrollTop = maxScrollTop;
+      } else if (resumeSnapshot && Math.abs(root.scrollTop - preferredTop) > 1 && allowPassivePin) {
+        onProgrammaticScrollRef.current?.();
+        root.scrollTop = preferredTop;
+      }
+    }
+    resumeSnapshotRef.current = null;
+    viewportAnchorRef.current = null;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    wasAtBottomRef.current = computeIsFollowingOrNearBottom(root);
+    setLayoutVersion((version) => version + 1);
+  }, [enabled, items, scrollRef, resumeGeneration, resetKey]);
+
+  // Pin/search navigation can target an item outside the mounted overscan
+  // range. Move the real scroll viewport to its measured offset first; the
+  // next render then mounts the target and the existing locator can highlight
+  // it without rendering the entire history.
+  useEffect(() => {
+    if (!enabled || !revealKey) return undefined;
+    const root = scrollRef.current;
+    const index = items.findIndex((item) => (
+      item.key === revealKey || item.event?.eventId === revealKey || item.eventIds?.includes(revealKey)
+    ));
+    if (!root || index < 0) return undefined;
+    const heights = items.map(getHeight);
+    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index) + biasRef.current;
+    if (Math.abs(root.scrollTop - targetTop) > 1) root.scrollTop = targetTop;
+    scrollTopRef.current = targetTop;
+    viewportAnchorRef.current = null;
+    setLayoutVersion((v) => v + 1);
+    return undefined;
+  }, [enabled, revealKey, items, scrollRef]);
+
+  // One measurement rule for both the synchronous post-commit pass and the
+  // ResizeObserver, so they can never disagree (a disagreement would make every
+  // render flip a row between two heights). Reports whether any row changed;
+  // ChatView (the single scroll owner) decides what to do about the viewport.
+  const commitMeasuredRows = (nodes: Iterable<HTMLElement>): boolean => {
+    let changed = false;
+    const root = scrollRef.current;
+    const nodeList = Array.isArray(nodes) ? nodes : Array.from(nodes);
+    const rectScale = getDomRectToLayoutScale(root, nodeList);
+    for (const node of nodeList) {
+      const key = node.dataset.virtualKey;
+      if (!key) continue;
+      // A ResizeObserver also reports rows that were just unmounted (their box
+      // collapses to 0x0). Measuring a detached node would overwrite the row's
+      // real height with the 1px floor, so its spacer share would vanish and the
+      // list below would jump by the whole row every time it left the window.
+      if (!node.isConnected) continue;
+      const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height / rectScale));
+      const known = heightsRef.current.get(key);
+      if (known === height) continue;
+      // First sight of a row is recorded (it feeds the estimate) even when it happens
+      // to match the estimate; only a real difference is a layout change.
+      if ((known ?? estimateRef.current) !== height) changed = true;
+      heightsRef.current.set(key, height);
+      measuredSumRef.current += height - (known ?? 0);
+    }
+    if (heightsRef.current.size >= nextEstimateAtRef.current) {
+      nextEstimateAtRef.current = heightsRef.current.size * 2;
+      const mean = measuredSumRef.current / heightsRef.current.size;
+      const next = Math.min(VIRTUAL_ESTIMATE_CEIL, Math.max(VIRTUAL_ESTIMATE_FLOOR, Math.round(mean * VIRTUAL_ESTIMATE_MEAN_FACTOR)));
+      if (next !== estimateRef.current) { estimateRef.current = next; changed = true; }
+    }
+    return changed;
+  };
+
+  // Post-commit, PRE-PAINT pass. A commit can change the scroll range without
+  // any ResizeObserver delivery yet (new/streaming rows, a range swap that
+  // trades estimated spacer heights for measured rows). Measuring the mounted
+  // rows here - and re-pinning a pinned viewport in the same task, after the
+  // layout that the commit produced - means the browser never paints the
+  // stale range. The previous flow measured in a ResizeObserver AFTER the
+  // paint, re-rendered in a later task and never re-pinned after that render:
+  // that frame showed a 15-42px gap/reverse jump.
+  const lastCommitSignatureRef = useRef('');
+  const lastExternalSignatureRef = useRef('');
+  const lastCommitClientHeightRef = useRef(0);
+  const syncLayoutPassCountRef = useRef(0);
+  const rafRetryCountRef = useRef(0);
+  const resizeObserverPassCountRef = useRef(0);
+  const absorbPassCountRef = useRef(0);
+  const inSyncLayoutEffectRef = useRef(false);
+  const didAbsorbThisPassRef = useRef(false);
+  const pendingLayoutRafRef = useRef<number | null>(null);
+  const MAX_VIRTUAL_SYNC_LAYOUT_PASSES = 3;
+  const MAX_VIRTUAL_LAYOUT_RAF_RETRIES = 2;
+  const MAX_VIRTUAL_RESIZE_OBSERVER_PASSES = 6;
+  const MAX_VIRTUAL_ABSORB_PASSES = 6;
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
+  const latestLayoutHandlersRef = useRef({
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  });
+  latestLayoutHandlersRef.current = {
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  };
+
+  const [scaleGeneration, setScaleGeneration] = useState(0);
+  const pendingScaleAnchorRef = useRef<{ key: string; top: number } | null>(null);
+  const pendingScaleFollowPinRef = useRef(false);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const onScaleChange = () => {
+      if (idleTimerRef.current !== null) {
+        clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+      if (rafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+      const following = readEffectiveFollowing();
+      onProgrammaticScrollRef.current?.();
+      if (following) {
+        viewportAnchorRef.current = null;
+        pendingScaleAnchorRef.current = null;
+        pendingScaleFollowPinRef.current = true;
+        wasAtBottomRef.current = true;
+      } else {
+        if (!viewportAnchorRef.current) captureViewportAnchor();
+        const savedAnchor = viewportAnchorRef.current;
+        pendingScaleAnchorRef.current = savedAnchor;
+        pendingScaleFollowPinRef.current = false;
+        wasAtBottomRef.current = false;
+      }
+      heightsRef.current.clear();
+      measuredSumRef.current = 0;
+      estimateRef.current = VIRTUAL_ESTIMATE_FLOOR;
+      nextEstimateAtRef.current = VIRTUAL_ESTIMATE_MIN_SAMPLES;
+      biasRef.current = 0;
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      resizeObserverPassCountRef.current = 0;
+      absorbPassCountRef.current = 0;
+      setScaleGeneration((g) => g + 1);
+    };
+    window.addEventListener(UI_SCALE_EVENT, onScaleChange);
+    return () => {
+      window.removeEventListener(UI_SCALE_EVENT, onScaleChange);
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+    };
+  }, [enabled]);
+
+  useLayoutEffect(() => {
+    if (!enabled) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      resizeObserverPassCountRef.current = 0;
+      absorbPassCountRef.current = 0;
+      lastExternalSignatureRef.current = '';
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+      return;
+    }
+    const root = scrollRef.current;
+    if (!root) return;
+    const clientHeight = root.clientHeight;
+    const clientWidth = root.clientWidth;
+    const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${clientWidth}:${scaleGeneration}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}:${contentRevision ?? ''}`;
+    if (externalSignature !== lastExternalSignatureRef.current) {
+      lastExternalSignatureRef.current = externalSignature;
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      resizeObserverPassCountRef.current = 0;
+      absorbPassCountRef.current = 0;
+    }
+    const isDocumentHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    // Hidden/collapsed panes report 0px row rects, which commitMeasuredRows would
+    // clamp to 1px and poison already-measured heights when returning from background.
+    // Still allow the very first unmeasured commit when visible so an initial layout
+    // establishes its baseline signature before any non-rendered update arrives.
+    if (isDocumentHidden || (clientHeight <= 0 && (lastCommitClientHeightRef.current > 0 || heightsRef.current.size > 0))) {
+      if (clientHeight <= 0) {
+        lastCommitClientHeightRef.current = clientHeight;
+      }
+      return;
+    }
+    const wasAtBottom = wasAtBottomRef.current;
+    const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    // Only a commit that can have changed the scroll range acts: a row height
+    // changed, the row set changed (first/last key, length), the viewport itself
+    // resized (a banner/composer mounting beside the list in the same commit), or
+    // this render was our own layout re-render. A render that changed nothing
+    // visible (a non-rendered status/usage update) must leave the viewport alone.
+    // (A 0 -> N height is a pane becoming measurable, not a resize.)
+    const viewportResized = lastCommitClientHeightRef.current > 0 && clientHeight !== lastCommitClientHeightRef.current;
+    lastCommitClientHeightRef.current = clientHeight;
+    const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
+    const layoutMayHaveChanged = changed || viewportResized || Boolean(pendingScaleAnchorRef.current) || signature !== lastCommitSignatureRef.current;
+    lastCommitSignatureRef.current = signature;
+    if (!layoutMayHaveChanged) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      if (!isFollowingRef.current?.()) {
+        onTopOffsetReconciledRef.current?.();
+      }
+      scrollTopRef.current = root.scrollTop;
+      return;
+    }
+    inSyncLayoutEffectRef.current = true;
+    didAbsorbThisPassRef.current = false;
+    try {
+      onMeasuredLayout?.(root, wasAtBottom);
+    } finally {
+      inSyncLayoutEffectRef.current = false;
+    }
+    scrollTopRef.current = root.scrollTop;
+    const pendingScaleAnchor = pendingScaleAnchorRef.current;
+    if (pendingScaleAnchor && (!changed || syncLayoutPassCountRef.current >= MAX_VIRTUAL_SYNC_LAYOUT_PASSES)) {
+      pendingScaleAnchorRef.current = null;
+      const targetNode = Array.from(root.querySelectorAll<HTMLElement>('[data-virtual-key]'))
+        .find((n) => n.dataset.virtualKey === pendingScaleAnchor.key);
+      if (targetNode) {
+        const rectScale = getDomRectToLayoutScale(root);
+        const rootTop = root.getBoundingClientRect().top;
+        const actualTop = (targetNode.getBoundingClientRect().top - rootTop) / rectScale;
+        const adjust = actualTop - pendingScaleAnchor.top;
+        if (Math.abs(adjust) > 0.5) {
+          onProgrammaticScrollRef.current?.();
+          root.scrollTop = Math.max(0, root.scrollTop + adjust);
+        }
+      }
+      scrollTopRef.current = root.scrollTop;
+      captureViewportAnchor();
+      onTopOffsetReconciledRef.current?.();
+      scheduleIdleReconcile();
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      return;
+    }
+    if (isFollowingRef.current?.()) {
+      viewportAnchorRef.current = null;
+      if (pendingScaleFollowPinRef.current && !changed) {
+        pendingScaleFollowPinRef.current = false;
+      }
+    } else if (!pendingScaleAnchor) {
+      captureViewportAnchor();
+    }
+    if (!changed && !didAbsorbThisPassRef.current) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      return;
+    }
+    // Bound both synchronous pre-paint re-renders (including reader-anchor shift
+    // absorption) and cross-frame rAF retries so oscillating row heights or
+    // un-converging anchors cannot lock the main thread in a tight loop or 60Hz spin.
+    syncLayoutPassCountRef.current += 1;
+    if (syncLayoutPassCountRef.current <= MAX_VIRTUAL_SYNC_LAYOUT_PASSES) {
+      setLayoutVersion((v) => v + 1);
+      return;
+    }
+    if (changed && rafRetryCountRef.current < MAX_VIRTUAL_LAYOUT_RAF_RETRIES && pendingLayoutRafRef.current === null) {
+      if (typeof requestAnimationFrame === 'function') {
+        rafRetryCountRef.current += 1;
+        pendingLayoutRafRef.current = requestAnimationFrame(() => {
+          pendingLayoutRafRef.current = null;
+          syncLayoutPassCountRef.current = 0;
+          setLayoutVersion((v) => v + 1);
+        });
+      }
+    }
+  });
+
+  useEffect(() => {
+    if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    const observed = observedNodesRef.current;
+    observed.clear();
+    const observer = new ResizeObserver((entries) => {
+      if (root.clientHeight <= 0) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      // Bound ResizeObserver-driven re-layout per external signature/items epoch so
+      // oscillating row heights (CSS zoom, subpixel rounding, scrollbar toggles)
+      // after background resume settle instead of spinning layoutVersion forever.
+      if (resizeObserverPassCountRef.current >= MAX_VIRTUAL_RESIZE_OBSERVER_PASSES) return;
+      const { commitMeasuredRows: commitRows, captureViewportAnchor: captureAnchor, onMeasuredLayout: handleMeasured } =
+        latestLayoutHandlersRef.current;
+      const wasAtBottom = wasAtBottomRef.current;
+      const changed = commitRows(entries.map((entry) => entry.target as HTMLElement));
+      // Do not infer pin state from the post-growth geometry: with
+      // `overflow-anchor: none`, a row growing at the bottom makes the current
+      // distance non-zero even though the user was pinned immediately before
+      // the measurement. That used to classify a pinned stream as a reader
+      // anchor, then fight ChatView's follow pass on the next frame.
+      if (!changed) return;
+      resizeObserverPassCountRef.current += 1;
+      handleMeasured?.(root, wasAtBottom);
+      scrollTopRef.current = root.scrollTop;
+      if (isFollowingRef.current?.()) {
+        viewportAnchorRef.current = null;
+      } else if (!pendingScaleAnchorRef.current) {
+        captureAnchor();
+      }
+      setLayoutVersion((v) => v + 1);
+    });
+    resizeObserverRef.current = observer;
+    return () => {
+      observer.disconnect();
+      if (resizeObserverRef.current === observer) resizeObserverRef.current = null;
+      observed.clear();
+    };
+  }, [enabled, scrollRef]);
+
+  useEffect(() => {
+    const observer = resizeObserverRef.current;
+    const root = scrollRef.current;
+    if (!enabled || !observer || !root) return;
+    const observed = observedNodesRef.current;
+    const current = new Set(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    for (const node of observed) {
+      if (!node.isConnected || !current.has(node)) {
+        observer.unobserve(node);
+        observed.delete(node);
+      }
+    }
+    for (const node of current) {
+      if (!observed.has(node)) {
+        observer.observe(node);
+        observed.add(node);
+      }
+    }
+  }, [enabled, items, layoutVersion, scrollRenderVersion, scrollRef]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    onRowsRenderedRef.current?.();
+  }, [enabled, items, layoutVersion, scrollRenderVersion]);
+
+  // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
+  // real viewport exists, preserving deterministic rendering and accessibility.
+  if (resetKeyRef.current !== resetKey) {
+    // A different conversation: nothing recorded about the previous one applies.
+    resetVirtualizerStateForScope(true);
+  }
+  if (!enabled || items.length <= 24 || viewportRef.current <= 0) {
+    // Not virtualized (short list, hidden pane): there is no spacer to carry an offset.
+    wasVirtualizedRef.current = false;
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+    return <>{items.map(renderItem)}</>;
+  }
+  // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
+  const heights = items.map(getHeight);
+  const followingNow = Boolean(isFollowingRef.current?.());
+  if (!wasVirtualizedRef.current) {
+    wasVirtualizedRef.current = true;
+    if (scrollTopRef.current === 0 && readEffectiveFollowing()) {
+      const totalHeight = heights.reduce((sum, height) => sum + height, 0);
+      scrollTopRef.current = Math.max(0, totalHeight - viewportRef.current);
+      viewportAnchorRef.current = null;
+    }
+  }
+  // Viewport top in offset space: from the anchor row when it is still in the list
+  // (immune to bias / estimate / prepend changes), else from scrollTop (a jump past
+  // every mounted row).
+  let viewportTop = scrollTopRef.current - biasRef.current;
+  const viewportAnchor = viewportAnchorRef.current;
+  if (viewportAnchor) {
+    const anchorIndex = items.findIndex((item) => item.key === viewportAnchor.key);
+    if (anchorIndex >= 0) {
+      let offset = 0;
+      for (let i = 0; i < anchorIndex; i += 1) offset += Math.max(1, heights[i] || 0);
+      viewportTop = offset - viewportAnchor.top;
+    }
+  } else if (followingNow && scrollTopRef.current === 0) {
+    // Follow-mode browser reset to scrollTop=0: project to the bottom slice instead
+    // of mounting row 0 until the pin effect writes the real scrollTop.
+    const totalHeight = heights.reduce((sum, height) => sum + height, 0);
+    const bottomTop = Math.max(0, totalHeight - viewportRef.current);
+    scrollTopRef.current = bottomTop;
+    viewportTop = bottomTop - biasRef.current;
+  }
+  const range = __computeVirtualChatRangeForTests(heights, viewportTop, viewportRef.current);
+  topSpacerBaseRef.current = range.topSpacer;
+  atTopRef.current = range.start === 0;
+  const topStyle = topOffsetStyle(range.topSpacer + biasRef.current);
+  return <>
+    <div aria-hidden="true" data-virtual-spacer="true" ref={topSpacerElRef} style={{ height: `${topStyle.height}px`, marginTop: `${topStyle.marginTop}px`, flexShrink: 0 }} />
+    {items.slice(range.start, range.end).map((item) => (
+      <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
+        {renderItem(item)}
+      </div>
+    ))}
+    <div aria-hidden="true" data-virtual-spacer="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
+  </>;
+}
+
+const EMPTY_ID_SET: ReadonlySet<string> = new Set();
+
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, onRemoteDesktopClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false, hideTaskPairPanel = false, onAskAnswer }: Props) {
+  recordPerfRender('ChatView');
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
+  // Optimistic delete: ids the user just deleted are hidden at once, before the daemon
+  // answers. A failed delete removes them again (message restored + visible error).
+  const [locallyDeletedIds, setLocallyDeletedIds] = useState<ReadonlySet<string>>(EMPTY_ID_SET);
+  const [deleteErrorKey, setDeleteErrorKey] = useState<string | null>(null);
+  const events = useMemo(
+    () => (locallyDeletedIds.size === 0 ? eventsProp : eventsProp.filter((event) => !locallyDeletedIds.has(event.eventId))),
+    [eventsProp, locallyDeletedIds],
+  );
+  const trailingAskQuestion = useMemo(() => findTrailingAskQuestion(events), [events]);
+  const activeAskQuestionEvent = useMemo(() => {
+    if (!trailingAskQuestion || !onAskAnswer || preview) return null;
+    let fallbackToolCallEvent: TimelineEvent | null = null;
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i];
+      if (ev.hidden) continue;
+      if (resolveAskQuestionEventToolUseId(ev) !== trailingAskQuestion.toolUseId) continue;
+      if (ev.type === 'ask.question' && normalizeAskQuestionsPayload(ev.payload?.questions).length > 0) {
+        return ev;
+      }
+      if (fallbackToolCallEvent === null && isAskQuestionToolCallEvent(ev)) {
+        fallbackToolCallEvent = ev;
+      }
+    }
+    return fallbackToolCallEvent;
+  }, [events, trailingAskQuestion, onAskAnswer, preview]);
+  const activeAskQuestionEventId = activeAskQuestionEvent?.eventId ?? null;
+  const [submittedAskEventId, setSubmittedAskEventId] = useState<string | null>(null);
+  const [submittedAskAnswers, setSubmittedAskAnswers] = useState<Record<string, string>>({});
+  useEffect(() => {
+    setSubmittedAskEventId(null);
+    setSubmittedAskAnswers((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+  }, [sessionId, serverId]);
+  useEffect(() => {
+    if (activeAskQuestionEventId && submittedAskEventId && activeAskQuestionEventId !== submittedAskEventId) {
+      setSubmittedAskEventId(null);
+    }
+  }, [activeAskQuestionEventId, submittedAskEventId]);
+  const isDockedPendingAsk = Boolean(
+    activeAskQuestionEvent
+    && activeAskQuestionEventId
+    && submittedAskEventId !== activeAskQuestionEventId,
+  );
+  const recordSubmittedAskAnswer = useCallback((eventId: string | undefined, toolUseId: string, answer: string) => {
+    setSubmittedAskAnswers((prev) => {
+      const next = { ...prev };
+      if (eventId) next[eventId] = answer;
+      if (toolUseId) next[toolUseId] = answer;
+      return next;
+    });
+  }, []);
+  const handleDockedAskAnswer = useCallback((toolUseId: string, answer: string) => {
+    if (!onAskAnswer) return false;
+    const result = onAskAnswer(toolUseId, answer);
+    if (result !== false && activeAskQuestionEventId) {
+      recordSubmittedAskAnswer(activeAskQuestionEventId, toolUseId, answer);
+      setSubmittedAskEventId(activeAskQuestionEventId);
+    }
+    return result;
+  }, [onAskAnswer, activeAskQuestionEventId, recordSubmittedAskAnswer]);
+  const handleTimelineAskAnswer = useMemo(() => (
+    onAskAnswer
+      ? (toolUseId: string, answer: string) => {
+          const result = onAskAnswer(toolUseId, answer);
+          if (result !== false) {
+            recordSubmittedAskAnswer(undefined, toolUseId, answer);
+          }
+          return result;
+        }
+      : undefined
+  ), [onAskAnswer, recordSubmittedAskAnswer]);
+  const askAnswerMap = useMemo(
+    () => resolveAskQuestionAnswerMap(events, submittedAskAnswers),
+    [events, submittedAskAnswers],
+  );
+  const dockedAskQuestionsOverride = useMemo(
+    () => (activeAskQuestionEvent?.type === 'tool.call' && trailingAskQuestion?.questions
+      ? normalizeAskQuestionsPayload(trailingAskQuestion.questions)
+      : undefined),
+    [activeAskQuestionEvent?.type, trailingAskQuestion?.questions],
+  );
+  useEffect(() => {
+    if (!deleteErrorKey) return undefined;
+    const timer = setTimeout(() => setDeleteErrorKey(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [deleteErrorKey]);
+  // Sent on every chatFileReference:true request (path click, preview, download).
+  // The daemon needs the viewed session's identity to find its own in-project
+  // root and its own assistant-published grants (session-file-read-grants.ts);
+  // without it every chat file link is refused as forbidden_path, even ones the
+  // session itself just published. This is unrelated to scopeFilesToSession,
+  // which restricts *unscoped* file-browser access for shared/guest viewers --
+  // that stays wired separately into the embedded FileBrowser panel below.
+  const fileScopeSessionName = sessionId ?? undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1311,14 +3226,27 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [copiedExternalUrl, setCopiedExternalUrl] = useState<string | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<ChatHtmlFullscreenPreviewState | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  // The virtualizer uses this key to mount and scroll an offscreen navigation
+  // target before the locator/highlighter inspects the DOM.
+  const [virtualRevealKey, setVirtualRevealKey] = useState<string | undefined>();
+  const pendingPinnedLocateIdRef = useRef<string | null>(null);
+  const timelineEventsRef = useRef(events);
+  timelineEventsRef.current = events;
+  const [pinnedLocateError, setPinnedLocateError] = useState(false);
   const [revealingOlder, setRevealingOlder] = useState(false);
   const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Scroll anchor preservation: pre-prepend scrollHeight, restored after the
+  // taller list commits. Declared with the reveal state it serves (both the
+  // local render-limit reveal and the HTTP load-older prepend set it).
+  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
   // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
@@ -1328,13 +3256,56 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
   const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
+  useEffect(() => {
+    setSessionUsageOpen(false);
+  }, [sessionId, preview]);
+  const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
+  const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
+
+  const [ttsState, setTtsState] = useState<TtsPlaybackState>(() => getTtsState());
+  const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
+  const [ttsSettingsOpen, setTtsSettingsOpen] = useState(false);
+  const ttsControlRef = useRef<HTMLDivElement>(null);
+  const handleCloseTtsSettings = useCallback(() => {
+    setTtsSettingsOpen(false);
+  }, []);
+  const ttsSupported = isTtsSupported();
+  const ttsOwnedSessionRef = useRef(false);
+  useEffect(() => {
+    setTtsSettingsOpen(false);
+  }, [sessionId, preview]);
+  useEffect(() => subscribeTtsState(setTtsState), []);
+  useEffect(() => subscribeTtsPreferences(() => setTtsAutoRead(getTtsAutoReadEnabled())), []);
+  useEffect(() => {
+    return () => {
+      if (ttsOwnedSessionRef.current) {
+        ttsOwnedSessionRef.current = false;
+        void stopSpeaking();
+      }
+    };
+  }, [sessionId]);
+  const handleToggleSpeak = useCallback((messageId: string, rawText: string) => {
+    const current = getTtsState();
+    if (current.status === 'speaking' && current.activeMessageId === messageId) {
+      ttsOwnedSessionRef.current = false;
+      void stopSpeaking();
+      return;
+    }
+    ttsOwnedSessionRef.current = true;
+    void speakText(rawText, { messageId, lang: locale });
+  }, [locale]);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
   // Y of the active touch's start, for detecting an explicit finger-down
   // (content scrolls up) gesture that should pause follow-mode immediately.
+  const touchingChatRef = useRef(false);
   const touchStartYRef = useRef(0);
+  const touchMinYRef = useRef(0);
+  const touchScrollUpActiveRef = useRef(false);
+  const touchNavSuppressedRef = useRef(false);
   // Epoch ms of the last "LAST SENT" pin-banner show/hide. The banner is a
   // flow sibling of `.chat-view`, so toggling it resizes the scroll area by
   // ~60px and fires the ResizeObserver — which must NOT re-pin to bottom (the
@@ -1343,7 +3314,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // oscillation can't snap the user back to the bottom (works for any input
   // method, including scrollbar drag that emits no wheel/touch).
   const bannerToggleAtRef = useRef(0);
-  const suppressLoadOlderUntilRef = useRef(0);
+  const suppressLoadOlderUntilRef = useRef(Date.now() + 1200);
   // ── Programmatic-scroll guard ────────────────────────────────────────────
   // `scrollToBottom` writes `el.scrollTop` directly, which fires a synthetic
   // `scroll` event. Without disambiguation, `handleScroll` sees that synthetic
@@ -1373,21 +3344,37 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // as the bubble comes back into view.
   const [pinnedAboveViewport, setPinnedAboveViewport] = useState(false);
   const [pinnedExpanded, setPinnedExpanded] = useState(false);
+  // Mobile task status is portaled into this titlebar so its collapsed strip
+  // shares the pinned-message row instead of overlaying the conversation.
+  const chatTitlebarRef = useRef<HTMLDivElement>(null);
+  const chatTopActionsRef = useRef<HTMLDivElement>(null);
   const lastSentUserMessage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.type !== 'user.message') continue;
       const p = e.payload as Record<string, unknown>;
       if (p.pending === true || p.failed === true) continue;
+      // The banner pins what the human sent, not an agent delivery or injection.
+      if (classifyUserMessageOrigin(p) !== CHAT_MESSAGE_ORIGINS.USER) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
       return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
     }
     return null;
   }, [events, t]);
-  // Reset the expand state whenever the pinned target changes so a new
+  const recentMemoryProblemPreview = useMemo(
+    () => getLatestRecentMemoryProblemPreview(events, sessionId, lastSentUserMessage?.eventId),
+    [events, sessionId, lastSentUserMessage?.eventId],
+  );
+  const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedCompactPreviewText = useMemo(() => {
+    const compact = pinnedPreviewText.replace(/\s+/g, ' ').trim();
+    return compact.length > 180 ? `${compact.slice(0, 177)}…` : compact;
+  }, [pinnedPreviewText]);
+  const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
+  // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
-  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId, recentMemoryProblemPreview]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -1415,6 +3402,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
   // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
   const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
+  // Explicit manual inspection of recent terminal/diagnostic rows when runningCount === 0.
+  // Keyed to sessionId so switching tabs/servers resets inspection synchronously on render 1 (no 1-frame flash).
+  const [inspectRecentAgentsState, setInspectRecentAgentsState] = useState<{ sessionId: string | null | undefined; open: boolean }>(() => ({
+    sessionId,
+    open: false,
+  }));
+  const inspectRecentAgentsOpen = inspectRecentAgentsState.sessionId === sessionId && inspectRecentAgentsState.open;
+  const setInspectRecentAgentsOpen = useCallback((next: boolean | ((prev: boolean) => boolean)) => {
+    setInspectRecentAgentsState((current) => {
+      const prevOpen = current.sessionId === sessionId && current.open;
+      const resolved = typeof next === 'function' ? next(prevOpen) : next;
+      return current.sessionId === sessionId && current.open === resolved
+        ? current
+        : { sessionId, open: resolved };
+    });
+  }, [sessionId]);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
@@ -1437,6 +3440,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     prevSessionIdRef.current = sessionId;
     setShowFilePanel(readPanelOpen(sessionId));
     setFilePanelWidth(readPanelWidth(sessionId));
+    setInspectRecentAgentsOpen(false);
   }, [sessionId]);
 
   const toggleFilePanel = useCallback(() => {
@@ -1451,10 +3455,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // Persist + broadcast; every window's listener (incl. this one) updates state.
     writeSdkAgentsOpen(next);
   }, []);
-
-  const toggleAgentsPanel = useCallback(() => {
-    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
-  }, [desiredAgentsOpen, setDesiredAgentsPanelOpen]);
 
   const onDragStart = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -1486,14 +3486,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const viewMode = previewViewMode ?? (preferDiff ? 'diff' : 'source');
     onPreviewFile({
       path: resolvedPath,
-      sessionName: sessionId ?? undefined,
+      sessionName: fileScopeSessionName,
       preferDiff: viewMode === 'diff' && preferDiff,
       previewViewMode: viewMode,
       preview: { status: 'loading', path: resolvedPath },
       rootPath: workdir ?? undefined,
       sourcePreviewLive: false,
     });
-  }, [onPreviewFile, workdir]);
+  }, [fileScopeSessionName, onPreviewFile, workdir]);
 
   const handlePathClick = useCallback((path: string) => {
     openFilePreview(path, false);
@@ -1512,26 +3512,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [t]);
 
   const handleHtmlPreview = useCallback((path: string) => {
-    const resolvedPath = resolvePreviewPath(path, workdir);
     if (!ws || typeof ws.fsReadFile !== 'function') {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: t('file_browser.preview_error'),
       });
       return;
     }
     try {
-      const requestId = ws.fsReadFile(resolvedPath);
-      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+      const requestId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
+      setHtmlFullscreenPreview({ status: 'loading', path, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1549,25 +3548,26 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: msg.resolvedPath ?? current.path, content: msg.content ?? '' };
         return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
   }, [t, ws]);
 
   const handleUrlClick = useCallback((url: string) => {
+    setCopiedExternalUrl(null);
     setPendingUrl(url);
   }, []);
 
-  const mapDownloadError = useCallback((err: unknown): string => {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) return t('upload.daemon_offline');
-    if (msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404')) return t('upload.download_expired');
-    if (msg.includes('504') || msg.includes('timeout')) return t('upload.download_timeout');
-    return t('upload.download_failed');
-  }, [t]);
+  const mapDownloadError = useCallback((err: unknown, pathRequest = false): string => (
+    localizeChatDownloadError(err, t, { pathRequest })
+  ), [t]);
 
-  const requestPathDownloadId = useCallback((path: string): Promise<string> => (
+  const requestPathDownloadId = useCallback((path: string): Promise<{
+    downloadId: string;
+    resolvedPath: string;
+    matchCount: number;
+  }> => (
     new Promise((resolve, reject) => {
       if (!ws) {
         reject(new Error(t('upload.daemon_offline')));
@@ -1580,7 +3580,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         unsub?.();
       };
       try {
-        const reqId = ws.fsReadFile(path);
+        const reqId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -1589,100 +3589,204 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
           cleanup();
           if (typeof msg.downloadId === 'string' && msg.downloadId.trim()) {
-            resolve(msg.downloadId);
+            resolve({
+              downloadId: msg.downloadId,
+              resolvedPath: typeof msg.resolvedPath === 'string' ? msg.resolvedPath : path,
+              matchCount: typeof msg.resolutionMatchCount === 'number' ? msg.resolutionMatchCount : 1,
+            });
             return;
           }
           if (msg.status === 'error') {
-            reject(new Error(mapDownloadError(new Error(String(msg.error ?? 'download_failed')))));
+            const cause = Object.assign(new Error(String(msg.error ?? 'download_failed')), {
+              attemptedLocations: msg.attemptedLocations,
+            });
+            reject(new Error(mapDownloadError(cause, true)));
             return;
           }
           reject(new Error(t('upload.download_failed')));
         });
       } catch (err) {
         cleanup();
-        reject(new Error(mapDownloadError(err)));
+        reject(new Error(mapDownloadError(err, true)));
       }
     })
-  ), [mapDownloadError, t, ws]);
+  ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
-  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
-    new Promise((resolve, reject) => {
-      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
-        reject(new Error(t('file_browser.preview_error')));
-        return;
-      }
-
-      let unsub: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const resolvedPath = resolvePreviewPath(path, workdir);
-      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-      const cacheKey = `${cacheScope}\0${resolvedPath}`;
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        unsub?.();
-      };
-
-      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
-        try {
-          const reqId = ws.fsReadFile(resolvedPath);
-          timer = setTimeout(() => {
-            cleanup();
-            rejectCached(new Error(t('upload.download_timeout')));
-          }, 30_000);
-          unsub = ws.onMessage((msg) => {
-            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-            cleanup();
-            if (msg.status === 'error') {
-              rejectCached(new Error(t('file_browser.preview_error')));
-              return;
-            }
-            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-              resolveCached({
-                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-              });
-              return;
-            }
-            rejectCached(new Error(t('file_browser.preview_error')));
-          });
-        } catch (err) {
-          cleanup();
-          rejectCached(err instanceof Error ? err : new Error(String(err)));
-        }
-      })).then(resolve, reject);
-    })
-  ), [serverId, sessionId, t, workdir, ws]);
+  // tsk_5rf: this used to carry its own copy of the fs.read_response loader and
+  // accepted ONLY base64. After 6a169ad3c the daemon answers image previews with
+  // metadata plus a download handle, so that copy rejected every streamed image
+  // and the chat thumbnail vanished while FileBrowser (the other copy) kept
+  // working. There is now one shared loader, so a contract change cannot fix one
+  // surface and silently break the other.
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => {
+    if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+      return Promise.reject(new Error(t('file_browser.preview_error')));
+    }
+    const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+    const cacheKey = `${cacheScope}\0${path}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, path, {
+      sessionName: fileScopeSessionName,
+      serverId: serverId ?? undefined,
+      chatFileReference: true,
+      timeoutMs: 30_000,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('upload.download_timeout'),
+    }).then((result) => ({
+      ...result,
+      // Evict on a real <img> failure so the retry calls fsReadFile again for a
+      // fresh handle instead of replaying a dead URL.
+      onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
+    })));
+  }, [fileScopeSessionName, serverId, sessionId, t, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
-    if (!serverId) throw new Error(t('upload.daemon_offline'));
-    const resolvedPath = resolvePreviewPath(path, workdir);
-    let downloadId = await requestPathDownloadId(resolvedPath);
-    const { downloadAttachment } = await import('../api.js');
+    if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
+    const fileName = path.replace(/:\d+(?::\d+)?$/, '').split(/[/\\]/).pop() || undefined;
+    // The save dialog must open first, inside the click that asked for it; any
+    // await in front of it lets the browser refuse the picker. Choosing where
+    // the file goes is also what lets the finished row offer "Show in folder"
+    // — the same path the file browser downloads through.
+    let destination: DirectPreviewDownloadDestination | null;
     try {
-      await downloadAttachment(serverId, downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(resolvedPath);
-      try {
-        await downloadAttachment(serverId, downloadId);
-      } catch (retryErr) {
-        throw new Error(mapDownloadError(retryErr));
-      }
+      destination = await selectPreviewDownloadDestination(fileName);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      throw new Error(t('upload.download_failed'));
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, t, workdir]);
+    const { downloadAttachment } = await import('../api.js');
+    const transfer = beginDownloadTransfer(fileName ?? path);
+    const attempt = async (downloadId: string, signal: AbortSignal) => {
+      const wiring = createDownloadTransferWiring(transfer.id);
+      await downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: downloadId,
+        suggestedName: fileName,
+        sessionName: fileScopeSessionName,
+        destination,
+        httpFallback: () => (sessionId
+          ? downloadAttachment(serverId, downloadId, sessionId, signal)
+          : downloadAttachment(serverId, downloadId, undefined, signal)),
+        signal,
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
+      });
+      wiring.complete(destination);
+    };
+    // requestPathDownloadId already rejects with a user-facing message; mapping
+    // it again would turn e.g. a timeout into a generic failure.
+    const alreadyMapped = new WeakSet<object>();
+    const requestDownloadId = async () => {
+      try {
+        return await requestPathDownloadId(path);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        alreadyMapped.add(error);
+        throw error;
+      }
+    };
+    const isStaleHandle = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+    };
+    // A retry requests a fresh path handle, but keeps the same destination and
+    // the direct/HTTP resume prefix owned by the transfer operation.
+    setDownloadTransferRetry(transfer.id, async (signal) => {
+      const next = await requestDownloadId();
+      await attempt(next.downloadId, signal);
+    });
+    try {
+      try {
+        const first = await requestDownloadId();
+        await attempt(first.downloadId, transfer.signal);
+        if (first.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: first.resolvedPath,
+            count: first.matchCount,
+          });
+        }
+        if (first.resolvedPath !== path) {
+          return t('upload.download_resolved_to', { path: first.resolvedPath });
+        }
+      } catch (err) {
+        // A preview handle can expire between the request and the transfer:
+        // fetch a fresh one once, keeping the same chosen destination.
+        if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
+        const retry = await requestDownloadId();
+        await attempt(retry.downloadId, transfer.signal);
+        if (retry.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: retry.resolvedPath,
+            count: retry.matchCount,
+          });
+        }
+        if (retry.resolvedPath !== path) return t('upload.download_resolved_to', { path: retry.resolvedPath });
+      }
+    } catch (err) {
+      if (isDownloadTransferPaused(transfer.id)) return;
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
+      if (err instanceof Error && alreadyMapped.has(err)) throw err;
+      throw new Error(mapDownloadError(err));
+    }
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
+  const cloudDocClickHandler = onCloudDocClick;
+  const remoteDesktopClickHandler = !preview ? onRemoteDesktopClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
   const imagePreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleImagePreview : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
+  // The presentation choice is account-scoped and shared by every mounted
+  // chat window. Geometry remains device-local in ZoomedTextDialog.
+  const messagePinPreviewModePref = usePref<MessagePinPreviewMode>(
+    messagePinsEnabled ? PREF_KEY_MESSAGE_PIN_PREVIEW_MODE : null,
+    { parse: parseMessagePinPreviewMode },
+  );
+  const messagePinPreviewMode: MessagePinPreviewMode = messagePinPreviewModePref.value === 'text'
+    ? 'text'
+    : 'rendered';
+  const handleMessagePinPreviewModeChange = useCallback((mode: MessagePinPreviewMode) => {
+    if (mode === messagePinPreviewMode) return;
+    void messagePinPreviewModePref.save(mode).catch((error) => {
+      console.warn('[message-pins] failed to save preview mode:', error);
+    });
+  }, [messagePinPreviewMode, messagePinPreviewModePref]);
+  const renderPinnedMessagePreview = useCallback((text: string, closePreview: () => void) => (
+    <ChatMarkdown
+      text={parseTimelineDisplayText(text)}
+      onPathClick={pathClickHandler}
+      onCloudDocClick={cloudDocClickHandler ? (docId) => {
+        closePreview();
+        cloudDocClickHandler(docId);
+      } : undefined}
+      onRemoteDesktopClick={remoteDesktopClickHandler ? (targetId) => {
+        closePreview();
+        remoteDesktopClickHandler(targetId);
+      } : undefined}
+      onUrlClick={urlClickHandler ? (url) => {
+        closePreview();
+        urlClickHandler(url);
+      } : undefined}
+      onDownload={downloadHandler}
+      onHtmlPreview={htmlPreviewHandler}
+      onImagePreview={imagePreviewHandler}
+      onOpenLocalWebPreview={onOpenLocalWebPreview ? (target) => {
+        closePreview();
+        onOpenLocalWebPreview(target);
+      } : undefined}
+    />
+  ), [cloudDocClickHandler, downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, remoteDesktopClickHandler, urlClickHandler]);
+
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
-  //   value === false → simple chat, hide them
+  //   value === false → simple chat, summarize tools and hide other details
   //   value === null  → undecided (first run); show by default and surface a
   //                     one-time chooser banner above the timeline if the
   //                     user has actually generated developer-detail events.
@@ -1704,25 +3808,228 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const handleChooserPickSimple = useCallback(() => {
     void showToolCallsPref.save(false);
   }, [showToolCallsPref]);
-  const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
-  useEffect(() => {
-    if (!hasSdkAgentEvents) return;
-    setSdkAgentsNow(Date.now());
-  }, [hasSdkAgentEvents, events]);
+  // Keyed by content so assistant blocks re-render only when a status changes.
+  const liveAssignmentStatusesSignature = useMemo(
+    () => liveAssignmentStatusesKey(deriveLiveAssignmentStatuses(events)),
+    [events],
+  );
+  const liveAssignmentStatuses = useMemo(
+    () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
+    [liveAssignmentStatusesSignature],
+  );
+  const [sdkAgentsTickActive, setSdkAgentsTickActive] = useState(false);
+  const sdkAgentsTickerNow = useNowTicker(visible && sdkAgentsTickActive);
+  const sdkAgentsEventNowRef = useRef(sdkAgentsTickerNow);
+  const prevSdkEventsRef = useRef<readonly TimelineEvent[] | null>(null);
+  if (hasSdkAgentEvents && prevSdkEventsRef.current !== events) {
+    prevSdkEventsRef.current = events;
+    sdkAgentsEventNowRef.current = Date.now();
+  } else if (!hasSdkAgentEvents) {
+    prevSdkEventsRef.current = events;
+  }
+  const sdkAgentsNow = visible && sdkAgentsTickActive ? sdkAgentsTickerNow : sdkAgentsEventNowRef.current;
   const sdkAgentsStatus = useMemo(
     () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
     [events, sdkAgentsNow],
   );
+  const runningAgentsCount = sdkAgentsStatus.runningCount;
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
+  // Preview cards reuse the existing Agents panel when background work exists.
+  // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
+  // never make this control or panel appear.
+  const canShowAgentsControl = !preview || hasAgentsStatusRows;
+  const [autoAgentsOpenState, setAutoAgentsOpenState] = useState<SdkAgentsAutoOpenState>(() => ({
+    sessionId,
+    open: initialSdkAgentsAutoOpen({
+      sessionId,
+      canShowAgentsControl,
+      hasAgentsStatusRows,
+      desiredAgentsOpen,
+      runningAgentsCount,
+    }),
+  }));
+  const autoAgentsTimerRef = useRef<{
+    id: ReturnType<typeof setTimeout>;
+    kind: 'open' | 'close';
+    sessionId: string | null | undefined;
+  } | null>(null);
+  const clearAutoAgentsTimer = useCallback(() => {
+    const active = autoAgentsTimerRef.current;
+    if (!active) return;
+    clearTimeout(active.id);
+    autoAgentsTimerRef.current = null;
+  }, []);
+  const setAutoAgentsOpen = useCallback((nextOpen: boolean, targetSessionId: string | null | undefined = sessionId) => {
+    setAutoAgentsOpenState((current) => (
+      current.sessionId === targetSessionId && current.open === nextOpen
+        ? current
+        : { sessionId: targetSessionId, open: nextOpen }
+    ));
+  }, [sessionId]);
+  const effectiveAutoAgentsOpen = resolveEffectiveSdkAgentsAutoOpen(autoAgentsOpenState, {
+    sessionId,
+    canShowAgentsControl,
+    hasAgentsStatusRows,
+    desiredAgentsOpen,
+    runningAgentsCount,
+  });
+
+  useEffect(() => () => clearAutoAgentsTimer(), [clearAutoAgentsTimer]);
+
   useEffect(() => {
-    if (preview || !hasAgentsStatusRows) return undefined;
-    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [hasAgentsStatusRows, preview]);
-  const canShowAgentsControl = !preview;
-  const hasRunningSdkAgents = sdkAgentsStatus.runningCount > 0;
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasRunningSdkAgents;
+    const sessionChanged = autoAgentsOpenState.sessionId !== sessionId;
+    if (sessionChanged) {
+      clearAutoAgentsTimer();
+      const nextOpen = initialSdkAgentsAutoOpen({
+        sessionId,
+        canShowAgentsControl,
+        hasAgentsStatusRows,
+        desiredAgentsOpen,
+        runningAgentsCount,
+      });
+      setAutoAgentsOpenState({ sessionId, open: nextOpen });
+      if ((runningAgentsCount > 0 || !hasAgentsStatusRows) && inspectRecentAgentsOpen) {
+        setInspectRecentAgentsOpen(false);
+      }
+      return;
+    }
+
+    // If the user already had recent inspection open when a live agent starts
+    // under desiredAgentsOpen, promote to auto-open seamlessly (zero gap flash).
+    if (runningAgentsCount > 0 && inspectRecentAgentsOpen) {
+      setInspectRecentAgentsOpen(false);
+      if (canShowAgentsControl && hasAgentsStatusRows && desiredAgentsOpen) {
+        clearAutoAgentsTimer();
+        setAutoAgentsOpen(true);
+        return;
+      }
+    } else if (!hasAgentsStatusRows && inspectRecentAgentsOpen) {
+      setInspectRecentAgentsOpen(false);
+    }
+
+    const action = resolveSdkAgentsTimerAction(effectiveAutoAgentsOpen, {
+      canShowAgentsControl,
+      hasAgentsStatusRows,
+      desiredAgentsOpen,
+      runningAgentsCount,
+    });
+    if (action === 'cancel') {
+      clearAutoAgentsTimer();
+      if ((!canShowAgentsControl || !hasAgentsStatusRows || !desiredAgentsOpen) && autoAgentsOpenState.open) {
+        setAutoAgentsOpen(false);
+      }
+      return;
+    }
+    if (action === 'schedule-open') {
+      if (autoAgentsTimerRef.current?.kind === 'open' && autoAgentsTimerRef.current.sessionId === sessionId) {
+        return;
+      }
+      clearAutoAgentsTimer();
+      const scheduledSessionId = sessionId;
+      const id = setTimeout(() => {
+        autoAgentsTimerRef.current = null;
+        setAutoAgentsOpen(true, scheduledSessionId);
+      }, SDK_AGENTS_AUTO_OPEN_DELAY_MS);
+      autoAgentsTimerRef.current = { id, kind: 'open', sessionId: scheduledSessionId };
+      return;
+    }
+    if (action === 'schedule-close') {
+      if (autoAgentsTimerRef.current?.kind === 'close' && autoAgentsTimerRef.current.sessionId === sessionId) {
+        return;
+      }
+      clearAutoAgentsTimer();
+      const scheduledSessionId = sessionId;
+      const id = setTimeout(() => {
+        autoAgentsTimerRef.current = null;
+        setAutoAgentsOpen(false, scheduledSessionId);
+      }, SDK_AGENTS_AUTO_CLOSE_GRACE_MS);
+      autoAgentsTimerRef.current = { id, kind: 'close', sessionId: scheduledSessionId };
+    }
+  }, [
+    autoAgentsOpenState.open,
+    autoAgentsOpenState.sessionId,
+    canShowAgentsControl,
+    clearAutoAgentsTimer,
+    desiredAgentsOpen,
+    effectiveAutoAgentsOpen,
+    hasAgentsStatusRows,
+    inspectRecentAgentsOpen,
+    runningAgentsCount,
+    sessionId,
+    setAutoAgentsOpen,
+    setInspectRecentAgentsOpen,
+  ]);
+
+  const toggleAgentsPanel = useCallback(() => {
+    clearAutoAgentsTimer();
+    if (runningAgentsCount === 0 && hasAgentsStatusRows) {
+      if (effectiveAutoAgentsOpen) {
+        setAutoAgentsOpen(false);
+        setInspectRecentAgentsOpen(false);
+        return;
+      }
+      setInspectRecentAgentsOpen((open) => !open);
+      return;
+    }
+    setInspectRecentAgentsOpen(false);
+    const nextDesired = !desiredAgentsOpen;
+    setDesiredAgentsPanelOpen(nextDesired);
+    if (nextDesired && runningAgentsCount > 0 && canShowAgentsControl && hasAgentsStatusRows) {
+      setAutoAgentsOpen(true);
+    } else if (!nextDesired) {
+      setAutoAgentsOpen(false);
+    }
+  }, [
+    canShowAgentsControl,
+    clearAutoAgentsTimer,
+    desiredAgentsOpen,
+    effectiveAutoAgentsOpen,
+    hasAgentsStatusRows,
+    runningAgentsCount,
+    setAutoAgentsOpen,
+    setDesiredAgentsPanelOpen,
+    setInspectRecentAgentsOpen,
+  ]);
+
+  // Asymmetric hysteresis prevents 0->1->0 transient flash and 1->0->1
+  // close/reopen jitter between sequential tasks, while keeping manual toggles
+  // and tab/server switches immediate.
+  const showAgentsPane = canShowAgentsControl
+    && hasAgentsStatusRows
+    && ((desiredAgentsOpen && effectiveAutoAgentsOpen) || inspectRecentAgentsOpen);
+  useEffect(() => {
+    const next = runningAgentsCount > 0 && showAgentsPane;
+    setSdkAgentsTickActive((prev) => (prev === next ? prev : next));
+  }, [runningAgentsCount, showAgentsPane]);
+  const canShowFilePanel = !preview && !hideFilePanel && !!ws;
+  useLayoutEffect(() => {
+    const titlebar = chatTitlebarRef.current;
+    if (!titlebar) return undefined;
+    const actions = chatTopActionsRef.current;
+    if (!actions) {
+      titlebar.style.removeProperty('--chat-top-actions-reserve');
+      return undefined;
+    }
+    const update = () => {
+      const reserve = getChatTopActionsReserve(actions);
+      if (reserve == null) {
+        titlebar.style.removeProperty('--chat-top-actions-reserve');
+      } else {
+        titlebar.style.setProperty('--chat-top-actions-reserve', `${reserve}px`);
+      }
+    };
+    update();
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update);
+    observer?.observe(actions);
+    window.addEventListener('resize', update);
+    window.addEventListener(UI_SCALE_EVENT, update);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', update);
+      window.removeEventListener(UI_SCALE_EVENT, update);
+    };
+  }, [canShowAgentsControl, canShowFilePanel, onForceSync]);
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -1730,27 +4037,340 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // session pane / sub-session window) keeps the full list so "load older"
   // and infinite scroll-back continue to work — only the rendered slice is
   // capped further down (`renderedViewItems`).
-  const sourceEvents = useMemo(
+  const rawSourceEvents = useMemo(
     () => (preview && events.length > PREVIEW_EVENT_TAIL_LIMIT
       ? events.slice(-PREVIEW_EVENT_TAIL_LIMIT)
       : events),
     [preview, events],
   );
-  const viewItems = useMemo(() => buildViewItems(sourceEvents, showToolCalls), [sourceEvents, showToolCalls]);
-  const finalVisibleEventIds = useMemo(
-    () => getFinalVisibleEventIds(sourceEvents, showToolCalls),
-    [sourceEvents, showToolCalls],
+  const sourceEvents = useMemo(
+    () => rawSourceEvents.map((event) => localizeDaemonUserNoticeEvent(event, t)),
+    [rawSourceEvents, t, i18n?.resolvedLanguage],
   );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
-  const hiddenRenderedItemCount = Math.max(0, viewItems.length - effectiveRenderLimit);
+  // Derived from a window of recent events, not the whole session: the renderer
+  // only ever shows `effectiveRenderLimit` items, and deriving thousands to
+  // discard all but a hundred was the largest per-update cost in a long
+  // conversation. See `buildViewItemsTail`.
+  const derivedTail = useMemo(
+    () => buildViewItemsTail(sourceEvents, showToolCalls, effectiveRenderLimit),
+    [sourceEvents, showToolCalls, effectiveRenderLimit],
+  );
+  const viewItems = derivedTail.items;
+  const assistantBlockTextById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const item of viewItems) {
+      if (item.type === 'assistant-block' && !item.taskPairNotification && item.text) {
+        const blockId = item.eventIds?.[0] ?? item.key;
+        map.set(blockId, parseTimelineDisplayText(item.text));
+      }
+    }
+    return map;
+  }, [viewItems]);
+  const autoReadStateRef = useRef<{ sessionKey: string; seeded: boolean; maxTs: number }>({
+    sessionKey: sessionId ?? '',
+    seeded: false,
+    maxTs: 0,
+  });
+  const seenAutoReadKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const currentSessionKey = sessionId ?? '';
+    if (autoReadStateRef.current.sessionKey !== currentSessionKey) {
+      autoReadStateRef.current = { sessionKey: currentSessionKey, seeded: false, maxTs: 0 };
+      seenAutoReadKeysRef.current.clear();
+    }
+    if (!ttsAutoRead || !ttsSupported || preview) {
+      autoReadStateRef.current.seeded = false;
+      seenAutoReadKeysRef.current.clear();
+      return;
+    }
+    const recordSeenItem = (item: ViewItem) => {
+      if (item.type !== 'assistant-block' || item.assistantStreaming) return;
+      if (item.taskPairNotification) {
+        const announcement = formatTaskPairTtsAnnouncement(t, item.taskPairNotification);
+        if (announcement) {
+          seenAutoReadKeysRef.current.add(`tp:${announcement.dedupKey}`);
+        }
+        const ts = item.lastTs ?? item.ts ?? 0;
+        if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+        return;
+      }
+      if (item.eventIds && item.eventIds.length > 0) {
+        for (const eid of item.eventIds) seenAutoReadKeysRef.current.add(eid);
+      } else {
+        seenAutoReadKeysRef.current.add(item.key);
+      }
+      const ts = item.lastTs ?? item.ts ?? 0;
+      if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+    };
+    const recordSeenTaskPairEvent = (ev: TimelineEvent) => {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT) return;
+      const announcement = formatTaskPairTtsAnnouncement(t, ev.payload);
+      if (announcement) {
+        seenAutoReadKeysRef.current.add(`tp:${announcement.dedupKey}`);
+      }
+      const ts = ev.ts ?? 0;
+      if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+    };
+    if (loading || loadingOlder || refreshing || !!historyGap) {
+      for (const item of viewItems) recordSeenItem(item);
+      for (const ev of sourceEvents) recordSeenTaskPairEvent(ev);
+      return;
+    }
+    if (!autoReadStateRef.current.seeded) {
+      for (const item of viewItems) recordSeenItem(item);
+      for (const ev of sourceEvents) recordSeenTaskPairEvent(ev);
+      autoReadStateRef.current.seeded = true;
+      return;
+    }
+
+    const sourceEventById = new Map<string, TimelineEvent>();
+    for (const ev of sourceEvents) sourceEventById.set(ev.eventId, ev);
+
+    const previousMaxTs = autoReadStateRef.current.maxTs;
+    let nextMaxTs = previousMaxTs;
+    const queuedAnnouncements: Array<{ id: string; text: string; ts: number; order: number }> = [];
+    let order = 0;
+
+    for (const item of viewItems) {
+      if (item.type !== 'assistant-block' || item.assistantStreaming) continue;
+      if (item.taskPairNotification) {
+        const announcement = formatTaskPairTtsAnnouncement(t, item.taskPairNotification);
+        if (!announcement) continue;
+        const tpKey = `tp:${announcement.dedupKey}`;
+        const alreadySeen = seenAutoReadKeysRef.current.has(tpKey);
+        seenAutoReadKeysRef.current.add(tpKey);
+        const ts = item.lastTs ?? item.ts ?? 0;
+        if (alreadySeen || ts < previousMaxTs) continue;
+        if (ts > nextMaxTs) nextMaxTs = ts;
+        if (visible && prepareTextForTts(announcement.text, locale).length > 0) {
+          queuedAnnouncements.push({ id: item.key, text: announcement.text, ts, order: order++ });
+        }
+        continue;
+      }
+      if (item.assistantAutomation === true || !item.text) continue;
+      const ids = item.eventIds && item.eventIds.length > 0 ? item.eventIds : [item.key];
+      const tailSeen = seenAutoReadKeysRef.current.has(ids[ids.length - 1]);
+      const unseenIds = ids.filter((eid) => !seenAutoReadKeysRef.current.has(eid));
+      const hadSeenPrefix = unseenIds.length < ids.length;
+      for (const eid of ids) seenAutoReadKeysRef.current.add(eid);
+      if (tailSeen || unseenIds.length === 0) continue;
+      const ts = item.lastTs ?? item.ts ?? 0;
+      if (ts < previousMaxTs) continue;
+      if (ts > nextMaxTs) nextMaxTs = ts;
+      const rawText = hadSeenPrefix
+        ? unseenIds
+          .map((eid) => sourceEventById.get(eid))
+          .filter((ev): ev is TimelineEvent => !!ev)
+          .map((ev) => projectAssistantEventForDisplay(ev).text)
+          .filter(Boolean)
+          .join('\n\n')
+        : item.text;
+      const displayText = parseTimelineDisplayText(rawText);
+      const blockId = ids[0];
+      if (visible && prepareTextForTts(displayText, locale).length > 0) {
+        queuedAnnouncements.push({ id: blockId, text: displayText, ts, order: order++ });
+      }
+    }
+
+    for (const ev of sourceEvents) {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+      const announcement = formatTaskPairTtsAnnouncement(t, ev.payload);
+      if (!announcement) continue;
+      const tpKey = `tp:${announcement.dedupKey}`;
+      const alreadySeen = seenAutoReadKeysRef.current.has(tpKey);
+      seenAutoReadKeysRef.current.add(tpKey);
+      const ts = ev.ts ?? 0;
+      if (alreadySeen || ts < previousMaxTs) continue;
+      if (ts > nextMaxTs) nextMaxTs = ts;
+      if (visible && prepareTextForTts(announcement.text, locale).length > 0) {
+        queuedAnnouncements.push({ id: ev.eventId, text: announcement.text, ts, order: order++ });
+      }
+    }
+
+    autoReadStateRef.current.maxTs = nextMaxTs;
+
+    if (queuedAnnouncements.length > 0 && visible && !isTtsVoiceCaptureActive()) {
+      queuedAnnouncements.sort((a, b) => (a.ts - b.ts) || (a.order - b.order));
+      ttsOwnedSessionRef.current = true;
+      for (const entry of queuedAnnouncements) {
+        void speakText(entry.text, { messageId: entry.id, lang: locale, queue: true });
+      }
+    }
+  }, [viewItems, sourceEvents, sessionId, ttsAutoRead, ttsSupported, preview, loading, loadingOlder, refreshing, historyGap, visible, locale, t]);
+  /** Loaded history the derivation window left out entirely. */
+  const hasOlderOutsideWindow = derivedTail.windowStartIndex > 0;
+  /**
+   * Finalized visible events, scanned over the same window.
+   *
+   * This feeds the unread badge, and the badge only ever asks about the recent
+   * end: a message finalized thousands of turns ago cannot become news.
+   * Scanning everything meant filtering every event, building a map of every
+   * event ID and walking it again on every streamed chunk.
+   *
+   * Widening the window later would make old messages look newly finalized, so
+   * the effect below absorbs them as already-counted instead.
+   */
+  const finalVisibleEventIds = useMemo(
+    () => getFinalVisibleEventIds(
+      derivedTail.windowStartIndex === 0
+        ? sourceEvents
+        : sourceEvents.slice(derivedTail.windowStartIndex),
+      showToolCalls,
+    ),
+    [sourceEvents, showToolCalls, derivedTail.windowStartIndex],
+  );
+  const previousWindowStartRef = useRef(derivedTail.windowStartIndex);
+  useEffect(() => {
+    const previous = previousWindowStartRef.current;
+    previousWindowStartRef.current = derivedTail.windowStartIndex;
+    if (derivedTail.windowStartIndex >= previous) return;
+    // The window grew backwards — revealing older history, not receiving it.
+    // Counting those as arrivals would make the unread badge jump every time
+    // the reader scrolled up.
+    const counted = countedFinalEventIdsRef.current;
+    for (const eventId of finalVisibleEventIds) counted.add(eventId);
+  }, [derivedTail.windowStartIndex, finalVisibleEventIds]);
+  // Items the reader could see but is not being shown: the ones the window
+  // holds beyond the cap, plus — if the window itself stopped short — whatever
+  // is older than it. The exact count of the latter is unknown by design; the
+  // reveal path only needs to know whether there is more.
+  const hiddenInsideWindow = Math.max(0, viewItems.length - effectiveRenderLimit);
+  const hiddenRenderedItemCount = hasOlderOutsideWindow
+    ? Math.max(1, hiddenInsideWindow)
+    : hiddenInsideWindow;
   const renderedViewItems = useMemo(
     () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
     [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
   );
-  const renderedRevision = useMemo(
-    () => getRenderedViewRevision(renderedViewItems),
-    [renderedViewItems],
+  const visibleScrollViewItems = useMemo(
+    () => (isDockedPendingAsk && activeAskQuestionEventId
+      ? renderedViewItems.filter((item) => !(item.type === 'event' && item.event?.eventId === activeAskQuestionEventId))
+      : renderedViewItems),
+    [renderedViewItems, isDockedPendingAsk, activeAskQuestionEventId],
   );
+  // The "earlier messages are still loading" row lives IN the list (between the older cached block and the
+  // stitched newest block), so its arrival and removal take the same layout/anchor path as any other row.
+  const historyGapPlacement = useMemo(
+    () => (preview ? { kind: 'none' as const } : placeHistoryGapMarker(visibleScrollViewItems, historyGap)),
+    [preview, visibleScrollViewItems, historyGap],
+  );
+  const displayViewItems = useMemo(
+    () => insertHistoryGapMarker(visibleScrollViewItems, historyGapPlacement, { key: HISTORY_GAP_MARKER_KEY, type: 'history-gap' }) as ViewItem[],
+    [visibleScrollViewItems, historyGapPlacement],
+  );
+  const renderedRevision = useMemo(
+    () => getRenderedViewRevision(displayViewItems),
+    [displayViewItems],
+  );
+  const viewItemsRef = useRef(viewItems);
+  viewItemsRef.current = viewItems;
+  const hasOlderOutsideWindowRef = useRef(hasOlderOutsideWindow);
+  hasOlderOutsideWindowRef.current = hasOlderOutsideWindow;
+  const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
+    if (pin.sessionName !== sessionId) return pin.text;
+    const sourceEvent = events.find((event) => event.eventId === pin.eventId);
+    return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
+  }, [events, sessionId, viewItems]);
+
+  /**
+   * Reveal an event through the virtualizer and retry DOM lookup until the
+   * measured target is mounted. All message-navigation entry points use this
+   * helper so an offscreen target cannot leave a pending jump stuck.
+   */
+  const revealEvent = useCallback((
+    eventId: string,
+    onFound: (root: HTMLElement, target: HTMLElement) => void,
+    onTimeout?: () => void,
+    eventTs?: number,
+  ): (() => void) => {
+    setVirtualRevealKey(eventId);
+    let cancelled = false;
+    let attempts = 0;
+    let loadingContext = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = async () => {
+      if (cancelled) return;
+      const currentItems = viewItemsRef.current;
+      const presentationItem = currentItems.find((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ));
+      const presentationKey = presentationItem?.key ?? eventId;
+      setVirtualRevealKey(presentationKey);
+      const root = scrollRef.current;
+      const target = root ? findEventElement(root, presentationKey) : null;
+      if (root && target) {
+        setVirtualRevealKey(undefined);
+        onFound(root, target);
+        return;
+      }
+      const sourceHasEvent = timelineEventsRef.current.some((event) => event.eventId === eventId);
+      if (!sourceHasEvent && eventTs !== undefined && onLoadMessageContext && !loadingContext) {
+        loadingContext = true;
+        await onLoadMessageContext(eventId, eventTs);
+        loadingContext = false;
+      }
+      const requiredLimit = __computeRevealRenderItemLimitForTests(currentItems, eventId, effectiveRenderLimit);
+      if (requiredLimit > effectiveRenderLimit) setRenderItemLimit(requiredLimit);
+      else if (hasOlderOutsideWindowRef.current && !currentItems.some((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ))) setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
+      if (attempts++ >= 30) {
+        setVirtualRevealKey(undefined);
+        onTimeout?.();
+        return;
+      }
+      timer = setTimeout(attempt, 16);
+    };
+    timer = setTimeout(() => { void attempt(); }, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [effectiveRenderLimit, onLoadMessageContext]);
+
+  const locatePinnedMessage = useCallback((pin: MessagePin) => {
+    if (!sessionId || pin.sessionName !== sessionId) {
+      requestMessagePinNavigation(pin, sessionId);
+      return;
+    }
+    if (pendingPinnedLocateIdRef.current === pin.id) return;
+    pendingPinnedLocateIdRef.current = pin.id;
+    pendingVisibleScrollToBottomRef.current = false;
+    setPinnedLocateError(false);
+    setPendingPinnedLocate(pin);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!pinsEnabled || !sessionId) return undefined;
+    const handleNavigation = (pin: MessagePin) => {
+      if (pin.sessionName === sessionId) void locatePinnedMessage(pin);
+    };
+    const pending = getPendingMessagePin(sessionId);
+    if (pending) void locatePinnedMessage(pending);
+    return subscribeMessagePinNavigation(handleNavigation);
+  }, [locatePinnedMessage, pinsEnabled, sessionId]);
+
+  useEffect(() => {
+    if (!pendingPinnedLocate) return undefined;
+    return revealEvent(pendingPinnedLocate.eventId, (root, target) => {
+      const reducedMotion = typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+      target.classList.add('chat-pin-located');
+      window.setTimeout(() => target.classList.remove('chat-pin-located'), 1_800);
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+    }, () => {
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
+    }, pendingPinnedLocate.eventTs);
+  }, [pendingPinnedLocate, revealEvent, renderedRevision]);
+
+  const scrollScopeKey = sessionId ? `${serverId ?? ''}:${sessionId}` : (serverId ?? '');
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -1759,10 +4379,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     }
     setRevealingOlder(false);
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
-  }, [sessionId]);
+    pendingPinnedLocateIdRef.current = null;
+    setPendingPinnedLocate(null);
+    setPinnedLocateError(false);
+  }, [scrollScopeKey]);
 
   useEffect(() => () => {
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+    if (pendingScrollFrameRef.current !== null) cancelAnimationFrame(pendingScrollFrameRef.current);
   }, []);
 
   const markProgrammaticScroll = () => {
@@ -1774,6 +4398,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   };
 
   const revealHiddenOlderItems = () => {
+    // Raising the render limit mounts CHAT_RENDER_ITEM_INCREMENT more items
+    // ABOVE the viewport. Without an anchor the browser keeps `scrollTop`, so
+    // the same offset now points that much higher in the list and the reading
+    // position lurches toward older history — the "scrolled to the end and it
+    // jumps up a section" report. Worse, it lands the view back inside the
+    // `scrollTop < 100` trigger zone, so the next cooldown tick reveals again
+    // and jumps again. Capture the pre-reveal height here (not at the call
+    // sites) so every caller — the scroll auto-trigger and the manual
+    // "load older" button — is anchored identically; the restore effect below
+    // re-adds the delta.
+    const scrollEl = scrollRef.current;
+    if (scrollEl) scrollAnchorRef.current = { scrollHeight: scrollEl.scrollHeight };
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
     setRevealingOlder(true);
     setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
@@ -1787,27 +4423,264 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // public contract used by `onScrollBottomFn` parents (SessionPane,
   // SubSessionWindow), which intentionally call this after the user sends a
   // message and expect "force jump + re-engage".
+  // Six independent effects call this (session change, mount, first-content,
+  // new events, the resize observer, the height observer) and they all target
+  // the same place: the bottom. Each call used to read `scrollHeight`, which
+  // forces a synchronous layout of the entire message list.
+  //
+  // Measured on a 20x-CPU-throttled browser, 300 history events, no streaming:
+  //
+  //   1 window     5 calls   1.3s   inside a 4.9s  mount task
+  //   4 windows   20 calls   3.8s   inside a 12.2s mount task
+  //
+  // It scales with window count because the windows mount in the same task, so
+  // opening several sub-sessions on a slow machine produces one multi-second
+  // block during which the tab cannot even process a reload. The redundant
+  // flushes buy nothing — coalesce the DOM measure+write to one per frame. The
+  // follow/suppress policy stays synchronous so ordering against callers that
+  // set state right after is unchanged.
+  const pendingScrollFrameRef = useRef<number | null>(null);
+  const pendingEngageFollowRef = useRef(false);
+  const pendingVisibleScrollToBottomRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const hasInitialPinCompletedRef = useRef(false);
+  const loadingRef = useRef(loading);
+  loadingRef.current = loading;
+  const lastVisibleTsRef = useRef(0);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  // Single-flight frame for every "follow the bottom" request in this view.
+  // These fire from timeline updates, scroll handling and ResizeObserver — all
+  // of which keep running while the display is asleep and frames are not
+  // produced. A raw rAF per request therefore builds an unbounded backlog that
+  // the browser executes in one post-unlock frame. See useCoalescedFrame.
+  const scheduleFollowFrame = useCoalescedFrame();
+
+  const lastScrollHeightRef = useRef(0);
+  const lastClientHeightRef = useRef(0);
+  const userScrollUpUntilRef = useRef(0);
+  const userPointerOrKeyScrollUntilRef = useRef(0);
+  const pointerScrollActiveRef = useRef(false);
+  const isTouchInteracting = () => touchingChatRef.current || touchScrollUpActiveRef.current;
+  const hasActiveUserScrollIntent = () => (
+    Date.now() < userScrollUpUntilRef.current
+    || Date.now() < userPointerOrKeyScrollUntilRef.current
+    || pointerScrollActiveRef.current
+  );
+
+  const pinScrollToBottomNow = (el: HTMLDivElement, clampToBottom = false) => {
+    markProgrammaticScroll();
+    el.scrollTop = clampToBottom && el.clientHeight > 0
+      ? Math.max(0, el.scrollHeight - el.clientHeight)
+      : el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+    lastScrollHeightRef.current = el.scrollHeight;
+    lastClientHeightRef.current = el.clientHeight;
+    if (!loadingRef.current && lastVisibleTsRef.current > 0 && el.clientHeight > 0 && el.scrollHeight > el.clientHeight) {
+      hasInitialPinCompletedRef.current = true;
+    }
+  };
+
   const scrollToBottom = (engageFollow: boolean = true) => {
-    const el = scrollRef.current;
-    if (!el) return;
     if (engageFollow) {
+      userScrollUpUntilRef.current = 0;
+      userPointerOrKeyScrollUntilRef.current = 0;
+      pointerScrollActiveRef.current = false;
+      touchingChatRef.current = false;
+      touchScrollUpActiveRef.current = false;
       autoScrollRef.current = true;
+      pendingEngageFollowRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      setShowScrollBtn(false);
+      suppressLoadOlder();
     }
-    suppressLoadOlder();
-    markProgrammaticScroll();
-    el.scrollTop = el.scrollHeight;
-    lastScrollTopRef.current = el.scrollTop;
+    if (!visibleRef.current) {
+      if (engageFollow) {
+        pendingVisibleScrollToBottomRef.current = true;
+      }
+      return undefined;
+    }
+    const el = scrollRef.current;
+    if (!el) {
+      if (engageFollow) {
+        pendingVisibleScrollToBottomRef.current = true;
+      }
+      return undefined;
+    }
+    if (!engageFollow) {
+      suppressLoadOlder();
+    }
+    if (pendingScrollFrameRef.current !== null) return;
+    pendingScrollFrameRef.current = requestAnimationFrame(() => {
+      pendingScrollFrameRef.current = null;
+      const shouldEngage = pendingEngageFollowRef.current;
+      pendingEngageFollowRef.current = false;
+      if (!visibleRef.current) {
+        if (shouldEngage) {
+          pendingVisibleScrollToBottomRef.current = true;
+        }
+        return;
+      }
+      const node = scrollRef.current;
+      if (!node) {
+        if (shouldEngage) {
+          pendingVisibleScrollToBottomRef.current = true;
+        }
+        return;
+      }
+      // A wheel/touch scroll-away can land between scheduling and this frame.
+      // Follow intent is re-checked HERE (not only when scheduled) so a reader
+      // is never snapped back down by a pin that was queued before they moved.
+      const maxTop = Math.max(0, node.scrollHeight - node.clientHeight);
+      if (!shouldEngage && !preview) {
+        if (!autoScrollRef.current || isTouchInteracting() || hasActiveUserScrollIntent()) return;
+        if (isVirtualizedChatRef.current && node.scrollTop >= maxTop - 1) return;
+      }
+      if (isVirtualizedChatRef.current && node.clientHeight > 0 && Math.abs(node.scrollTop - maxTop) <= 1) return;
+      // Armed here rather than at call time: it is a 200ms one-shot guard
+      // against the synthetic scroll event fired by the write below.
+      pinScrollToBottomNow(node);
+    });
   };
+  const scrollToBottomRef = useRef(scrollToBottom);
+  scrollToBottomRef.current = scrollToBottom;
+
+  // The reading anchor: the first row that reaches into the viewport and where its
+  // top edge sits in SCROLL-CONTENT coordinates (which do not change while the
+  // reader scrolls, only when layout above the row changes). Recorded on every user
+  // scroll event while the reader is NOT following. Whatever later changes layout
+  // above it (virtual rows measured, a page of older history prepended, a banner
+  // mounting, an image loading) is undone by moving that row back: the DOM position
+  // is the truth, so there is no estimate to get wrong and no way to apply a
+  // correction twice.
+  //
+  // HOW it is undone matters on a phone. A scrollTop write while a finger or its
+  // momentum owns the scroller stops the momentum and jumps the content (iOS has no
+  // scroll anchoring to lean on), so a virtualized list absorbs the shift in its top
+  // offset instead (`absorbTopShiftRef`): nothing on screen moves and no write is
+  // made. Only a list that is not virtualized falls back to scrollTop.
+  const readerAnchorRef = useRef<ReaderAnchor | null>(null);
+  const absorbTopShiftRef = useRef<((delta: number) => number) | null>(null);
+  const isVirtualizedChatRef = useRef(false);
+  isVirtualizedChatRef.current = !preview && displayViewItems.length > 24;
+  useEffect(() => {
+    const onScaleChange = () => {
+      if (isVirtualizedChatRef.current) {
+        readerAnchorRef.current = null;
+      }
+    };
+    window.addEventListener(UI_SCALE_EVENT, onScaleChange);
+    return () => window.removeEventListener(UI_SCALE_EVENT, onScaleChange);
+  }, []);
+  const captureReaderAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rectScale = getDomRectToLayoutScale(root);
+    const rootTop = root.getBoundingClientRect().top;
+    // Stop at the first row that reaches into the viewport: rows above it are not
+    // measured, so a long normal-flow list costs O(rows above the viewport) reads
+    // of already-clean layout, not a scan of the whole history.
+    const rows: Array<{ id: string; top: number; bottom: number }> = [];
+    for (const node of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      const id = node.getAttribute('data-event-id');
+      if (!id) continue;
+      const rect = node.getBoundingClientRect();
+      const top = (rect.top - rootTop) / rectScale;
+      const bottom = (rect.bottom - rootTop) / rectScale;
+      rows.push({ id, top, bottom });
+      if (bottom > 1) break;
+    }
+    readerAnchorRef.current = pickReaderAnchor(rows, 0, root.scrollTop);
+  };
+  const restoreReaderAnchor = () => {
+    const root = scrollRef.current;
+    const anchor = readerAnchorRef.current;
+    if (!root || !anchor) return;
+    // Attribute lookup by iteration: ids are opaque strings, and this avoids
+    // building a selector from them (no escaping rules to get wrong).
+    let node: HTMLElement | null = null;
+    for (const candidate of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      if (candidate.getAttribute('data-event-id') === anchor.id) { node = candidate; break; }
+    }
+    // The anchor row left the DOM (virtualized out): pick the row now in view.
+    if (!node) { captureReaderAnchor(); return; }
+    const rectScale = getDomRectToLayoutScale(root);
+    const contentTop = ((node.getBoundingClientRect().top - root.getBoundingClientRect().top) / rectScale) + root.scrollTop;
+    const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
+    if (delta === 0) return;
+    const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
+    if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
+    if (isTouchInteracting()) return;
+    markProgrammaticScroll();
+    const prevScrollTop = root.scrollTop;
+    root.scrollTop += remainder;
+    const appliedDelta = root.scrollTop - prevScrollTop;
+    // Content moved by `appliedDelta`, the viewport followed it: re-record the row.
+    // Sync to actual contentTop when scrollTop clamped so a clamped container cannot oscillate.
+    readerAnchorRef.current = {
+      ...anchor,
+      contentTop: Math.abs(appliedDelta - remainder) > 0.5 ? contentTop : anchor.contentTop + appliedDelta,
+    };
+  };
+
+  // Virtualized row measurements are the only layout correction that may
+  // adjust the viewport outside the normal content-follow effects. Keep that
+  // correction here so one owner decides whether the user is pinned or
+  // reading an older anchor. In particular, use the pre-measurement pin bit:
+  // after a streaming row grows, the post-growth distance is necessarily
+  // non-zero when `overflow-anchor` is disabled and must not be mistaken for a
+  // user scroll-away.
+  // Single owner of the viewport after a commit / row measurement: a follower is
+  // re-pinned using the PRE-change pin bit (after a row grows the post-growth
+  // distance is non-zero even though the user was pinned - `overflow-anchor: none`
+  // means nothing else compensates); a reader's anchor row is re-aligned.
+  const applyMeasuredLayoutScroll = useCallback((root: HTMLDivElement, wasAtBottom: boolean) => {
+    if (!autoScrollRef.current) {
+      restoreReaderAnchor();
+      return;
+    }
+    if (isTouchInteracting() || hasActiveUserScrollIntent()) {
+      return;
+    }
+    if (!hasInitialPinCompletedRef.current) {
+      const targetTop = Math.max(0, root.scrollHeight - root.clientHeight);
+      if (Math.abs(root.scrollTop - targetTop) > 1) {
+        markProgrammaticScroll();
+        root.scrollTop = targetTop;
+        lastScrollTopRef.current = root.scrollTop;
+        lastScrollHeightRef.current = root.scrollHeight;
+        lastClientHeightRef.current = root.clientHeight;
+      }
+      if (!loadingRef.current && lastVisibleTsRef.current > 0 && root.clientHeight > 0 && root.scrollHeight > root.clientHeight) {
+        hasInitialPinCompletedRef.current = true;
+      }
+      return;
+    }
+    const correction = computeMeasuredScrollCorrection({
+      wasAtBottom,
+      autoFollow: true,
+      currentTop: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+      anchorDelta: 0,
+    });
+    if (correction?.kind === 'pin') {
+      markProgrammaticScroll();
+      root.scrollTop = correction.targetTop;
+      lastScrollTopRef.current = root.scrollTop;
+      lastScrollHeightRef.current = root.scrollHeight;
+      lastClientHeightRef.current = root.clientHeight;
+    }
+  }, []);
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
   // preview-aware, and inlining `if (preview || autoScrollRef.current)`
   // there reads more clearly than threading preview-awareness through a
   // helper that would otherwise have to capture the prop.)
 
-  // On session change, reset scroll position to bottom
+  // On server or session change, reset scroll position to bottom before initial hydration runs.
   useEffect(() => {
     autoScrollRef.current = true;
     hasInitialScrolledRef.current = false;
@@ -1815,10 +4688,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setNewSinceUnfollow(0);
     countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(false);
-    // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
+    suppressLoadOlder();
+    // Force scroll to bottom on server/tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom(true));
-  }, [sessionId]);
+    scheduleFollowFrame(() => {
+      if (hasActiveUserScrollIntent() || isTouchInteracting() || !autoScrollRef.current) return;
+      scrollToBottom(false);
+    });
+  }, [scrollScopeKey, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -1843,11 +4720,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       if (vv.height !== prevHeight) {
         suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          requestAnimationFrame(() => scrollToBottom());
+          scheduleFollowFrame(() => scrollToBottom(false));
         } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
           lastScrollTopRef.current = el.scrollTop;
+          lastScrollHeightRef.current = el.scrollHeight;
+          lastClientHeightRef.current = el.clientHeight;
         }
       }
       prevHeight = vv.height;
@@ -1860,22 +4739,40 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     };
   }, []);
 
-  // Expose scroll-to-bottom fn to parent (stable when parent uses useCallback).
   useEffect(() => {
-    onScrollBottomFn?.(scrollToBottom);
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Expose scroll-to-bottom fn to parent via stable ref delegate so retained/hidden
+  // parents never invoke a stale closure after `visible` transitions false -> true.
+  useEffect(() => {
+    onScrollBottomFn?.(() => {
+      if (!isMountedRef.current) return false;
+      scrollToBottomRef.current(true);
+      return true;
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onScrollBottomFn]);
 
   // Scroll to bottom once on mount (e.g. when switching terminal→chat).
   // Keep separate from fn-registration so parent re-renders don't re-trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { scrollToBottom(); }, []);
+  useEffect(() => {
+    if (visibleRef.current && !pendingPinnedLocateIdRef.current) {
+      scrollToBottom(false);
+    }
+  }, []);
 
   // Track whether the last sent user bubble is above/below/inside the
   // viewport. Only "above" flips the pin on — that's when new assistant
   // output has pushed the user's last prompt off the top and they'd
   // otherwise have to scroll up to re-read it. Below / intersecting cases
   // both leave the pin hidden.
+  const syncPinnedTargetRef = useRef<((forceIfConnected?: boolean) => void) | null>(null);
+
   useEffect(() => {
     // Preview mode (sub-session card) never renders the pinned banner — it
     // sits in `.chat-main`'s normal flow as a sibling of `.chat-view`, so its
@@ -1887,10 +4784,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // around ~50–100 px from bottom. Bail in preview so neither the banner
     // nor the observer can run.
     if (preview) {
+      syncPinnedTargetRef.current = null;
       setPinnedAboveViewport(false);
       return;
     }
     if (!lastSentUserMessage) {
+      syncPinnedTargetRef.current = null;
       setPinnedAboveViewport(false);
       return;
     }
@@ -1900,17 +4799,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // ship IntersectionObserver. Bail before touching it — no pin is better
     // than a blow-up rendering any chat view at all.
     if (typeof IntersectionObserver === 'undefined') {
+      syncPinnedTargetRef.current = null;
       setPinnedAboveViewport(false);
-      return;
-    }
-    const target = findEventElement(scrollEl, lastSentUserMessage.eventId);
-    if (!target) {
-      // Target not mounted yet (virtualization, pagination) — treat as above
-      // viewport ONLY if the user isn't sitting at the bottom of the scroll
-      // (i.e. they're reading older history). Otherwise keep the pin hidden
-      // so a bubble that never actually rendered doesn't cause a ghost pin.
-      const atBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40;
-      setPinnedAboveViewport(!atBottom);
       return;
     }
 
@@ -1921,34 +4811,154 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // that instead. For main pane + sub-session window this naturally
     // resolves back to .chat-view itself.
     const root = findScrollParent(scrollEl);
-    const observer = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.target !== target) continue;
-        if (entry.isIntersecting) {
-          setPinnedAboveViewport(false);
-          continue;
-        }
-        // Above viewport: the bubble's bottom edge is above the root's top.
-        // Below viewport is the opposite — we leave the pin off in that case
-        // because the user just scrolled up and the real bubble is still
-        // within easy scroll reach, not "lost".
-        const rootBounds = entry.rootBounds;
-        const rect = entry.boundingClientRect;
-        if (rootBounds && rect.bottom <= rootBounds.top) {
+    let observedTarget: HTMLElement | null = null;
+    let syncRafId: number | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const evaluatePinnedGeometry = (
+      activeTarget: HTMLElement,
+      rect: { top: number; bottom: number; left?: number; right?: number; width?: number; height?: number },
+      bounds: { top: number; bottom: number; width?: number; height?: number },
+      isIntersectingHint?: boolean,
+    ) => {
+      if (!activeTarget.isConnected) return;
+      const rectScale = getDomRectToLayoutScale(scrollEl);
+      const showThreshold = bounds.top - 4 * rectScale;
+      const hideThreshold = bounds.top + 8 * rectScale;
+      const isAllZeroRect = rect.top === 0 && rect.bottom === 0
+        && (rect.left ?? 0) === 0 && (rect.right ?? 0) === 0
+        && (rect.width ?? 0) === 0 && (rect.height ?? 0) === 0;
+
+      if (isIntersectingHint === false) {
+        if (isAllZeroRect) return;
+        if (rect.bottom <= showThreshold) {
           setPinnedAboveViewport(true);
-        } else {
+          return;
+        }
+      } else if (isIntersectingHint === undefined && !isAllZeroRect && rect.bottom <= showThreshold) {
+        setPinnedAboveViewport(true);
+        return;
+      }
+
+      const maxTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+      if (scrollEl.scrollTop > maxTop + 2) {
+        if (settleTimer !== null) clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          scheduleSync();
+        }, 180);
+        return;
+      }
+
+      if (isIntersectingHint === true) {
+        if (isAllZeroRect || rect.bottom >= hideThreshold) {
           setPinnedAboveViewport(false);
         }
+      } else if (!isAllZeroRect && (rect.bottom >= hideThreshold || rect.top >= bounds.bottom)) {
+        setPinnedAboveViewport(false);
+      }
+    };
+
+    let ensureObservedTarget: () => HTMLElement | null = () => null;
+    const syncPinnedFromGeometry = () => {
+      const activeTarget = ensureObservedTarget();
+      if (!activeTarget || !activeTarget.isConnected) return;
+      if (scrollEl.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      const bounds = root.getBoundingClientRect();
+      const rect = activeTarget.getBoundingClientRect();
+      const hasRootSize = bounds.width > 0 || bounds.height > 0 || bounds.top !== 0 || bounds.bottom !== 0;
+      const hasTargetSize = rect.width > 0 || rect.height > 0 || rect.top !== 0 || rect.bottom !== 0;
+      if (!hasRootSize || !hasTargetSize) return;
+      evaluatePinnedGeometry(activeTarget, rect, bounds);
+    };
+
+    const scheduleSync = () => {
+      if (typeof requestAnimationFrame !== 'function') {
+        syncPinnedFromGeometry();
+        return;
+      }
+      if (syncRafId !== null) return;
+      syncRafId = requestAnimationFrame(() => {
+        syncRafId = null;
+        syncPinnedFromGeometry();
+      });
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      const activeTarget = ensureObservedTarget();
+      if (!activeTarget) return;
+      for (const entry of entries) {
+        if (entry.target !== activeTarget) continue;
+        if (!activeTarget.isConnected || !entry.rootBounds) continue;
+        evaluatePinnedGeometry(activeTarget, entry.boundingClientRect, entry.rootBounds, entry.isIntersecting);
       }
     }, { root, threshold: [0, 1] });
-    observer.observe(target);
-    return () => observer.disconnect();
+
+    ensureObservedTarget = () => {
+      if (observedTarget && observedTarget.isConnected) {
+        return observedTarget;
+      }
+      if (observedTarget) {
+        observer.unobserve(observedTarget);
+        observedTarget = null;
+      }
+      const next = findEventElement(scrollEl, lastSentUserMessage.eventId);
+      if (next && next.isConnected) {
+        observedTarget = next;
+        observer.observe(next);
+        return next;
+      }
+      return null;
+    };
+
+    if (!ensureObservedTarget()) {
+      // Target not mounted yet (virtualization, pagination) — treat as above
+      // viewport ONLY if the user isn't sitting at the bottom of the scroll
+      // (i.e. they're reading older history). Otherwise keep the pin hidden
+      // so a bubble that never actually rendered doesn't cause a ghost pin.
+      const atBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40;
+      setPinnedAboveViewport(!atBottom);
+    }
+
+    syncPinnedTargetRef.current = (forceIfConnected = false) => {
+      if (!forceIfConnected && observedTarget && observedTarget.isConnected) return;
+      syncPinnedFromGeometry();
+    };
+    root.addEventListener('scroll', scheduleSync, { passive: true });
+    root.addEventListener('scrollend', scheduleSync, { passive: true });
+    scrollEl.addEventListener('touchend', scheduleSync, { passive: true });
+    scheduleSync();
+    return () => {
+      syncPinnedTargetRef.current = null;
+      observer.disconnect();
+      root.removeEventListener('scroll', scheduleSync);
+      root.removeEventListener('scrollend', scheduleSync);
+      scrollEl.removeEventListener('touchend', scheduleSync);
+      if (syncRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(syncRafId);
+      }
+      if (settleTimer !== null) clearTimeout(settleTimer);
+    };
   }, [lastSentUserMessage?.eventId, preview]);
 
   // Stamp when the pin banner toggles so the ResizeObserver can tell its own
   // ~60px height shift apart from a genuine viewport resize (sub-session bar,
   // keyboard) and skip re-pinning to bottom for the former. See bannerToggleAtRef.
+  //
+  // Compare against the previous value instead of just running on the dep change:
+  // an effect keyed on `[pinnedAboveViewport]` ALSO runs on mount, which stamped a
+  // 300ms suppression window over the most layout-unstable moment there is — the
+  // first frames after a page refresh, when `--vvh` is applied from an effect, the
+  // composer rehydrates its saved draft, and the sub-session bar runs its 200ms
+  // max-height transition. Every one of those shrinks `.chat-view` while
+  // `scrollTop` stays put (the list sets `overflow-anchor: none`, so the engine
+  // never compensates), and the suppressed ResizeObserver consumed the change
+  // without re-pinning — leaving the view permanently a little above the bottom
+  // after every reload. Mount is not a toggle, so it must not stamp.
+  const prevPinnedAboveViewportRef = useRef(pinnedAboveViewport);
   useEffect(() => {
+    if (prevPinnedAboveViewportRef.current === pinnedAboveViewport) return;
+    prevPinnedAboveViewportRef.current = pinnedAboveViewport;
     bannerToggleAtRef.current = Date.now();
   }, [pinnedAboveViewport]);
 
@@ -1964,30 +4974,117 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     }
     return 0;
   }, [events]);
+  lastVisibleTsRef.current = lastVisibleTs;
+  useEffect(() => {
+    syncPinnedTargetRef.current?.(true);
+  }, [renderedRevision, lastVisibleTs]);
   const prevVisibleTsRef = useRef(lastVisibleTs);
   const hasInitialScrolledRef = useRef(false);
   const layoutHandledVisibleTsRef = useRef(lastVisibleTs);
   const prevRenderedRevisionRef = useRef(renderedRevision);
+  const latestRenderedRevisionRef = useRef(renderedRevision);
+  latestRenderedRevisionRef.current = renderedRevision;
   const prevLoadingRef = useRef(loading);
+  const renderScrollScopeRef = useRef<string>(scrollScopeKey);
+  const renderVisibleRef = useRef(visible);
+  const prevScrollScopeRef = useRef<string>(scrollScopeKey);
+  const prevVisibleRef = useRef(visible);
 
-  // Synchronous scroll-to-bottom BEFORE paint on initial history load.
+  const resetFollowRefsForSwitch = (engageFollow: boolean) => {
+    autoScrollRef.current = true;
+    pendingEngageFollowRef.current = engageFollow;
+    hasInitialScrolledRef.current = false;
+    hasInitialPinCompletedRef.current = false;
+    userScrollUpUntilRef.current = 0;
+    userPointerOrKeyScrollUntilRef.current = 0;
+    pointerScrollActiveRef.current = false;
+    lastScrollHeightRef.current = 0;
+    lastClientHeightRef.current = 0;
+    readerAnchorRef.current = null;
+    newSinceUnfollowRef.current = 0;
+    countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+  };
+
+  const resetFollowUiStateForSwitch = () => {
+    setNewSinceUnfollow(0);
+    setShowScrollBtn(false);
+    suppressLoadOlder();
+  };
+
+  // Synchronously reset follow/reader refs before child VirtualizedViewItems renders or
+  // runs its child useLayoutEffect on scope change or visible: false -> true.
+  if (renderScrollScopeRef.current !== scrollScopeKey) {
+    renderScrollScopeRef.current = scrollScopeKey;
+    pendingVisibleScrollToBottomRef.current = false;
+    prevVisibleTsRef.current = 0;
+    layoutHandledVisibleTsRef.current = 0;
+    lastScrollTopRef.current = 0;
+    resetFollowRefsForSwitch(false);
+  }
+  const renderBecameVisible = !preview && !renderVisibleRef.current && visible && !pendingPinnedLocateIdRef.current;
+  renderVisibleRef.current = visible;
+  if (renderBecameVisible) {
+    resetFollowRefsForSwitch(false);
+  }
+
+  // Clear React state + load-older timer synchronously in layout effect when (serverId, sessionId) changes.
+  useLayoutEffect(() => {
+    if (prevScrollScopeRef.current === scrollScopeKey) return;
+    prevScrollScopeRef.current = scrollScopeKey;
+    pendingVisibleScrollToBottomRef.current = false;
+    prevVisibleTsRef.current = 0;
+    layoutHandledVisibleTsRef.current = 0;
+    lastScrollTopRef.current = 0;
+    resetFollowRefsForSwitch(false);
+    resetFollowUiStateForSwitch();
+  }, [scrollScopeKey]);
+
+  // Synchronous scroll-to-bottom BEFORE paint on initial history load or when a
+  // retained ChatView becomes visible again (visible: false -> true).
   // useLayoutEffect runs after DOM mutation but before the browser paints,
   // so the user never sees content at the top position.
   useLayoutEffect(() => {
-    if (preview) return;
-    if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
-      hasInitialScrolledRef.current = true;
-      // Use the non-engaging variant. autoScrollRef is initialised to true,
-      // so on the genuine first mount this still scrolls. On rerenders that
-      // happen while the user has scrolled away (autoScrollRef=false), the
-      // session-change effect's reset of hasInitialScrolledRef can cause
-      // this branch to re-fire when lastVisibleTs next advances; in that
-      // window we MUST NOT engage follow because the user did not request
-      // it. The session-change effect itself already schedules an explicit
-      // force-jump rAF so the genuine session-switch case still re-engages.
-      if (autoScrollRef.current) scrollToBottom(false);
+    const becameVisible = !prevVisibleRef.current && visible;
+    prevVisibleRef.current = visible;
+    if (!visible) return;
+    const hasPendingVisibleScroll = pendingVisibleScrollToBottomRef.current && !pendingPinnedLocateIdRef.current;
+    if (pendingVisibleScrollToBottomRef.current) {
+      pendingVisibleScrollToBottomRef.current = false;
     }
-  }, [lastVisibleTs]);
+    if (hasPendingVisibleScroll) {
+      resetFollowRefsForSwitch(true);
+      resetFollowUiStateForSwitch();
+      if (scrollRef.current) {
+        pinScrollToBottomNow(scrollRef.current);
+      }
+      scrollToBottom(true);
+    }
+    if (preview) return;
+    if (becameVisible && !pendingPinnedLocateIdRef.current) {
+      resetFollowRefsForSwitch(false);
+      resetFollowUiStateForSwitch();
+    }
+    if (lastVisibleTs === 0) {
+      // Clearing events to empty (e.g. server switch / refresh reset) must arm
+      // initial pin again so delayed repopulation still pins synchronously.
+      hasInitialScrolledRef.current = false;
+      hasInitialPinCompletedRef.current = false;
+      lastScrollHeightRef.current = 0;
+      lastClientHeightRef.current = 0;
+    } else if (!hasInitialScrolledRef.current) {
+      hasInitialScrolledRef.current = true;
+      // Pin synchronously before paint whenever initial content renders (both
+      // pre-seeded and async-hydrated) so the first painted frame never sits
+      // at scrollTop=0, and schedule a non-engaging rAF pass for post-paint settle.
+      if (autoScrollRef.current && !hasActiveUserScrollIntent() && !isTouchInteracting()) {
+        suppressLoadOlder();
+        if (scrollRef.current) {
+          pinScrollToBottomNow(scrollRef.current, true);
+        }
+        scrollToBottom(false);
+      }
+    }
+  }, [lastVisibleTs, scrollScopeKey, visible]);
 
   // Any visible content update should follow IFF the user is currently
   // engaged with auto-follow. Preview mode keeps its existing "always follow"
@@ -2021,6 +5118,30 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       layoutHandledVisibleTsRef.current = lastVisibleTs;
       return;
     }
+    if (contentBecameVisible) {
+      suppressLoadOlder();
+    }
+    const el = scrollRef.current;
+    const hasExplicitUserScrollUp = hasActiveUserScrollIntent();
+    if (
+      !preview
+      && el
+      && el.scrollHeight > el.clientHeight
+      && !hasExplicitUserScrollUp
+      && !isTouchInteracting()
+      && el.scrollTop < Math.max(0, el.scrollHeight - el.clientHeight) - 1
+      && (
+        !hasInitialPinCompletedRef.current
+        || contentBecameVisible
+        || el.scrollTop === 0
+        || el.scrollHeight > lastScrollHeightRef.current
+      )
+    ) {
+      if (!hasInitialPinCompletedRef.current || contentBecameVisible || el.scrollTop === 0) {
+        suppressLoadOlder();
+      }
+      pinScrollToBottomNow(el, true);
+    }
     scrollToBottom(false);
     layoutHandledVisibleTsRef.current = lastVisibleTs;
   }, [preview, renderedRevision, loading, loadingOlder, lastVisibleTs, finalVisibleEventIds]);
@@ -2043,13 +5164,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
       if (preview || autoScrollRef.current) scrollToBottom(false);
     });
-  }, [lastVisibleTs, preview]);
+  }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
   const lastScrollActivityRef = useRef(Date.now());
   // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
@@ -2064,12 +5185,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
   const LOAD_OLDER_COOLDOWN_MS = 1000;
-  // Scroll anchor preservation: save scrollHeight before prepend, restore after
-  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
+
+  // Mirror `loadingOlder` into a ref so the mount-settle interval can read the
+  // CURRENT value. Adding the prop to that effect's deps instead would restart
+  // the settle window every time a load-older starts or finishes, which is both
+  // wasteful and wrong (the window is meant to track the mount, not history
+  // fetches), and reading the captured prop would leave it permanently stale.
+  const loadingOlderRef = useRef(loadingOlder);
+  loadingOlderRef.current = loadingOlder;
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
   const disengageFollow = () => {
+    pendingEngageFollowRef.current = false;
     if (!autoScrollRef.current) return;
     autoScrollRef.current = false;
     newSinceUnfollowRef.current = 0;
@@ -2077,6 +5205,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(true);
     lastScrollActivityRef.current = Date.now();
+    captureReaderAnchor();
   };
 
   // An explicit upward wheel/touch gesture is unambiguous "stop following"
@@ -2088,6 +5217,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // These events are never synthesised by scrollToBottom, so they can't
   // false-trigger. Re-engagement stays distance-based (scroll back to bottom).
   const handleUserScrollUpIntent = () => {
+    // Record the intent even when follow is already off: while the reader is
+    // still dragging/wheeling toward older content, handleScroll must not
+    // re-engage follow just because they are (briefly) still within the
+    // re-engage band of the bottom - the next stream pin would snap them back.
+    userScrollUpUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
     if (preview || !autoScrollRef.current) return;
     const el = scrollRef.current;
     if (!el) return;
@@ -2095,16 +5229,113 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     disengageFollow();
   };
   const handleWheel = (e: WheelEvent) => {
-    if (e.deltaY < 0) handleUserScrollUpIntent();
+    if (e.deltaY < 0) {
+      handleUserScrollUpIntent();
+    } else if (e.deltaY > 0) {
+      userScrollUpUntilRef.current = 0;
+      userPointerOrKeyScrollUntilRef.current = 0;
+    }
   };
   const handleTouchStart = (e: TouchEvent) => {
-    touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchingChatRef.current = true;
+      touchNavSuppressedRef.current = true;
+      touchStartYRef.current = 0;
+      touchMinYRef.current = 0;
+      touchScrollUpActiveRef.current = false;
+      return;
+    }
+    if (e.touches.length === 1) {
+      const y = e.touches[0]?.clientY ?? 0;
+      touchingChatRef.current = true;
+      touchNavSuppressedRef.current = false;
+      touchStartYRef.current = y;
+      touchMinYRef.current = y;
+      touchScrollUpActiveRef.current = false;
+    }
   };
   const handleTouchMove = (e: TouchEvent) => {
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchNavSuppressedRef.current = true;
+      return;
+    }
+    if (touchNavSuppressedRef.current) return;
+    if (highlightElRef.current || ctxMenu) return;
     const y = e.touches[0]?.clientY ?? 0;
+    if (y < touchMinYRef.current) {
+      touchMinYRef.current = y;
+    }
     // Finger moving DOWN (clientY increases) drags content UP toward older
-    // history. 6px deadzone avoids reacting to taps / micro-jitter.
-    if (y - touchStartYRef.current > 6) handleUserScrollUpIntent();
+    // history. Compare against touchMinYRef as well as start so pulling down to
+    // the bottom and reversing back up in the same touch disengages immediately.
+    // Conversely, a non-reversed upward finger drag (clientY decreases) scrolls
+    // content DOWN toward the bottom and clears any stale upward-scroll hold.
+    if (y - touchMinYRef.current > 6) {
+      touchScrollUpActiveRef.current = true;
+      handleUserScrollUpIntent();
+    } else if (!touchScrollUpActiveRef.current && touchStartYRef.current - y > 6) {
+      userScrollUpUntilRef.current = 0;
+      userPointerOrKeyScrollUntilRef.current = 0;
+    }
+  };
+  const handleTouchEndOrCancel = (e: TouchEvent) => {
+    if (e.touches.length === 0) {
+      const wasTouching = touchingChatRef.current;
+      const hadScrollUp = touchScrollUpActiveRef.current;
+      touchingChatRef.current = false;
+      touchScrollUpActiveRef.current = false;
+      touchNavSuppressedRef.current = false;
+      if (
+        wasTouching
+        && !hadScrollUp
+        && !preview
+        && autoScrollRef.current
+        && !hasActiveUserScrollIntent()
+      ) {
+        const el = scrollRef.current;
+        const maxTop = el ? Math.max(0, el.scrollHeight - el.clientHeight) : 0;
+        if (el && maxTop > 0 && el.scrollTop < maxTop - 1) {
+          scrollToBottom(false);
+        }
+      }
+    }
+  };
+
+  const clearPointerScrollbarIntent = useCallback(() => {
+    if (!pointerScrollActiveRef.current) return;
+    pointerScrollActiveRef.current = false;
+    userPointerOrKeyScrollUntilRef.current = Math.max(
+      userPointerOrKeyScrollUntilRef.current,
+      Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS,
+    );
+  }, []);
+
+  useEffect(() => {
+    if (preview || typeof window === 'undefined') return undefined;
+    window.addEventListener('pointerup', clearPointerScrollbarIntent);
+    window.addEventListener('pointercancel', clearPointerScrollbarIntent);
+    window.addEventListener('blur', clearPointerScrollbarIntent);
+    return () => {
+      window.removeEventListener('pointerup', clearPointerScrollbarIntent);
+      window.removeEventListener('pointercancel', clearPointerScrollbarIntent);
+      window.removeEventListener('blur', clearPointerScrollbarIntent);
+      pointerScrollActiveRef.current = false;
+    };
+  }, [clearPointerScrollbarIntent, preview]);
+
+  const markPointerScrollbarIntent = (e: PointerEvent) => {
+    if (preview) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const rectScale = getDomRectToLayoutScale(el);
+    const onScrollbarTrack = e.clientX >= rect.left + el.clientWidth * rectScale;
+    if (onScrollbarTrack || e.target === el) {
+      pointerScrollActiveRef.current = true;
+      userPointerOrKeyScrollUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
+    }
   };
 
   const handleScroll = () => {
@@ -2127,14 +5358,61 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const scrollTop = el.scrollTop;
     const scrollHeight = el.scrollHeight;
     const clientHeight = el.clientHeight;
+    const prevClientHeight = lastClientHeightRef.current > 0 ? lastClientHeightRef.current : clientHeight;
+    const layoutGrew = scrollHeight > lastScrollHeightRef.current;
+    const viewportShrank = lastClientHeightRef.current > 0 && clientHeight < lastClientHeightRef.current;
+    const layoutChanged = layoutGrew || viewportShrank;
     const wasAutoFollowing = autoScrollRef.current;
-    const transientTopJump = wasAutoFollowing
-      && scrollTop < 100
-      && lastScrollTopRef.current > 100
-      && Date.now() < suppressLoadOlderUntilRef.current;
-    if (transientTopJump) {
+    const hasExplicitUserScrollUp = hasActiveUserScrollIntent();
+    const touchBusy = isTouchInteracting();
+    const awaitingInitialPin = !hasInitialPinCompletedRef.current
+      || pendingEngageFollowRef.current
+      || pendingScrollFrameRef.current !== null;
+    const spuriousTopReset = wasAutoFollowing
+      && !hasExplicitUserScrollUp
+      && !touchBusy
+      && !pendingPinnedLocateIdRef.current
+      && scrollHeight > clientHeight
+      && (
+        scrollTop === 0
+        || (scrollTop < 100 && lastScrollTopRef.current > 100)
+      );
+    const transientTopJump = spuriousTopReset
+      || (
+        wasAutoFollowing
+        && scrollTop < 100
+        && !hasExplicitUserScrollUp
+        && !touchBusy
+        && awaitingInitialPin
+      );
+    // Before initial hydration/measurement finishes pinning (or when a short
+    // pre-overflow snippet grows into overflowing history, or when async image/footer/
+    // composer layout shifts change scrollHeight/clientHeight without user scroll-up),
+    // re-pin instead of misclassifying that lag as a manual scroll-away.
+    const wasPinnedBeforeLayoutShift = lastScrollHeightRef.current > 0
+      && (lastScrollHeightRef.current - lastScrollTopRef.current - prevClientHeight) < 24
+      && Math.abs(scrollTop - lastScrollTopRef.current) <= 2
+      && layoutChanged;
+    const hydrationGrowthLag = !preview
+      && wasAutoFollowing
+      && !hasExplicitUserScrollUp
+      && !touchBusy
+      && !pendingPinnedLocateIdRef.current
+      && (scrollHeight - scrollTop - clientHeight) > 1
+      && (
+        (awaitingInitialPin && scrollTop >= lastScrollTopRef.current)
+        || (scrollTop === 0 && lastScrollTopRef.current === 0 && scrollHeight > lastScrollHeightRef.current)
+        || wasPinnedBeforeLayoutShift
+      );
+    if (transientTopJump || hydrationGrowthLag) {
+      lastScrollTopRef.current = scrollTop;
+      lastScrollHeightRef.current = scrollHeight;
+      lastClientHeightRef.current = clientHeight;
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom(true));
+      scheduleFollowFrame(() => {
+        if (!autoScrollRef.current || hasActiveUserScrollIntent() || isTouchInteracting()) return;
+        scrollToBottom(false);
+      });
       return;
     }
     // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
@@ -2144,21 +5422,46 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // secondary disengage path; the primary is the wheel/touch gesture handler.
     const distance = scrollHeight - scrollTop - clientHeight;
     const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
-    if (wasAutoFollowing && distance > disengageThreshold) {
+    const previousDistance = lastScrollHeightRef.current > 0
+      ? lastScrollHeightRef.current - lastScrollTopRef.current - clientHeight
+      : 0;
+    const scrolledDownToBottom = !touchScrollUpActiveRef.current
+      && previousDistance > 2
+      && distance <= 2
+      && scrollTop > lastScrollTopRef.current + 2;
+    if (wasAutoFollowing && (distance > disengageThreshold || ((pointerScrollActiveRef.current || touchScrollUpActiveRef.current) && scrollTop < lastScrollTopRef.current && distance > 1))) {
       disengageFollow();
-    } else if (!wasAutoFollowing && distance < reengageThreshold) {
+    } else if (
+      !wasAutoFollowing
+      && distance < reengageThreshold
+      && !touchScrollUpActiveRef.current
+      && (
+        scrolledDownToBottom
+        || (
+          !hasExplicitUserScrollUp
+          && scrollTop >= lastScrollTopRef.current
+        )
+      )
+    ) {
+      userScrollUpUntilRef.current = 0;
+      userPointerOrKeyScrollUntilRef.current = 0;
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     setShowScrollBtn(!autoScrollRef.current);
-    if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
+    if (!autoScrollRef.current) {
+      lastScrollActivityRef.current = Date.now();
+      captureReaderAnchor();
+    }
     lastScrollTopRef.current = scrollTop;
+    lastScrollHeightRef.current = scrollHeight;
+    lastClientHeightRef.current = clientHeight;
     // Auto-trigger load older when scrolled near top. Skip in preview mode —
     // preview cards have a fixed render tail (PREVIEW_RENDER_ITEM_LIMIT) and
     // should never expand their event budget from a tiny thumbnail scroll.
-    if (!preview && scrollTop < 100 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && !loadingOlder && !loading) {
+    if (!preview && !autoScrollRef.current && scrollTop < 100 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && !loadingOlder && !loading) {
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
@@ -2178,6 +5481,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
   useEffect(() => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
 
@@ -2196,18 +5500,214 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
       // during the frame gap must still win, or we'd snap them back against
       // their intent.
-      requestAnimationFrame(() => {
-        if (autoScrollRef.current) scrollToBottom();
+      scheduleFollowFrame(() => {
+        if (autoScrollRef.current && !isTouchInteracting() && !hasActiveUserScrollIntent()) {
+          scrollToBottom(false);
+        }
       });
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview]);
+  }, [preview, scheduleFollowFrame, visible]);
+
+  // Local DOM growth that no ChatView render owns (a tool card / thinking block
+  // expanding, code block or image settling) changes scrollHeight in a commit
+  // that never reaches the pin effects above. A MutationObserver callback is a
+  // microtask, so it runs right after that commit and BEFORE the next animation
+  // frame: pin here (only while follow is engaged) and the viewport is at the
+  // bottom in the first frame that can observe the new height. Coalesced by the
+  // browser per microtask checkpoint, reads scrollHeight once, no per-frame work.
+  useEffect(() => {
+    if (!visible || preview) return undefined;
+    const el = scrollRef.current;
+    if (!el || typeof MutationObserver === 'undefined') return undefined;
+    let frameId: number | null = null;
+    const isSpacerElement = (node: Node | null): boolean =>
+      Boolean(node && node.nodeType === 1 && (
+        (node as Element).hasAttribute?.('data-virtual-spacer')
+        || (node as Element).classList?.contains('chat-virtual-item')
+      ));
+    const isVirtualSpacerTarget = (node: Node | null): boolean => {
+      if (!node) return false;
+      const element = node.nodeType === 1 ? (node as Element) : node.parentElement;
+      return Boolean(element?.closest?.('[data-virtual-spacer="true"]'));
+    };
+    const isSpacerOnlyRecord = (record: MutationRecord): boolean => {
+      if (isVirtualSpacerTarget(record.target)) return true;
+      if (record.type === 'childList' && (record.addedNodes.length > 0 || record.removedNodes.length > 0)) {
+        for (const node of Array.from(record.addedNodes)) {
+          if (!isSpacerElement(node)) return false;
+        }
+        for (const node of Array.from(record.removedNodes)) {
+          if (!isSpacerElement(node)) return false;
+        }
+        return true;
+      }
+      return false;
+    };
+    const runAdjustment = () => {
+      frameId = null;
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      if (loadingOlderRef.current || scrollAnchorRef.current || pendingPinnedLocateIdRef.current) return;
+      // A reader's anchor row is re-aligned; only a follower is pinned.
+      if (!autoScrollRef.current) { restoreReaderAnchor(); return; }
+      if (isTouchInteracting() || hasActiveUserScrollIntent()) return;
+      const target = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (target - el.scrollTop <= 1) return;
+      markProgrammaticScroll();
+      el.scrollTop = target;
+      lastScrollTopRef.current = el.scrollTop;
+      lastScrollHeightRef.current = el.scrollHeight;
+      lastClientHeightRef.current = el.clientHeight;
+    };
+    const observer = new MutationObserver((records) => {
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      if (records.every(isSpacerOnlyRecord)) return;
+      if (typeof requestAnimationFrame === 'function') {
+        if (frameId !== null) return;
+        frameId = requestAnimationFrame(runAdjustment);
+      } else {
+        runAdjustment();
+      }
+    });
+    observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'open', 'hidden', 'aria-expanded'] });
+    return () => {
+      if (frameId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(frameId);
+        frameId = null;
+      }
+      observer.disconnect();
+    };
+  }, [preview, visible]);
+
+  // Async media (<img> / <video>) load and error events do not bubble and are
+  // invisible to MutationObserver and container ResizeObserver. Listen in capture
+  // phase so late image decode preserves bottom follow or reader anchor cleanly.
+  useEffect(() => {
+    if (!visible || preview) return undefined;
+    const el = scrollRef.current;
+    if (!el) return undefined;
+    const onMediaLayout = (ev: Event) => {
+      const target = ev.target as Element | null;
+      if (!target || (target.tagName !== 'IMG' && target.tagName !== 'VIDEO')) return;
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      if (loadingOlderRef.current || scrollAnchorRef.current || pendingPinnedLocateIdRef.current) return;
+      if (!autoScrollRef.current) {
+        restoreReaderAnchor();
+        return;
+      }
+      if (isTouchInteracting() || hasActiveUserScrollIntent()) return;
+      const targetTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (targetTop - el.scrollTop > 1) {
+        pinScrollToBottomNow(el, true);
+      }
+      scheduleFollowFrame(() => {
+        if (!autoScrollRef.current || isTouchInteracting() || hasActiveUserScrollIntent()) return;
+        scrollToBottom(false);
+      });
+    };
+    el.addEventListener('load', onMediaLayout, true);
+    el.addEventListener('error', onMediaLayout, true);
+    return () => {
+      el.removeEventListener('load', onMediaLayout, true);
+      el.removeEventListener('error', onMediaLayout, true);
+    };
+  }, [preview, scheduleFollowFrame, visible]);
+
+  // Hold the bottom through the post-mount layout settle.
+  //
+  // The ResizeObserver above only reacts to `clientHeight`, so anything that
+  // changes CONTENT height after the initial pin is invisible to it — and the
+  // blocks that mount ABOVE every message are the worst case, because growth
+  // above the viewport with `scrollTop` frozen slides the whole log down and the
+  // user ends up looking at older content: the reported "refresh 后上弹".
+  // Culprits that need no images at all: the "Load older" row appearing when
+  // `hasOlderHistory` flips after the first history response, the
+  // `.chat-load-older-status` row, `AgentTodoList` (first child of the scroller),
+  // and the tool-chooser banner gated on an async `usePref` fetch. None of them
+  // change `renderedRevision`, so the content-update layout effect never re-pins
+  // either, and `overflow-anchor: none` means the engine will not help.
+  //
+  // So for a bounded window after mount/session-change, re-assert the bottom
+  // whenever total height changes. Deliberately narrow: it only acts while follow
+  // is still engaged (a gentle scroll-up disengages it and this goes inert
+  // immediately — the exact complaint behind the earlier Safari jitter fixes), it
+  // never engages follow itself, it stays out of the way of the load-older anchor,
+  // and it only fires on an actual height change so a quiet mount costs nothing.
+  const hasInitialVisibleContent = lastVisibleTs > 0;
+  useEffect(() => {
+    if (!visible) return undefined;
+    const el = scrollRef.current;
+    if (!el) return;
+    let lastScrollHeight = el.scrollHeight;
+    let lastClientHeight = el.clientHeight;
+    let seenRenderedRevision = latestRenderedRevisionRef.current;
+    const deadline = Date.now() + CHAT_MOUNT_SETTLE_MS;
+    const timer = setInterval(() => {
+      if (Date.now() > deadline) { clearInterval(timer); return; }
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      const following = preview || autoScrollRef.current;
+      if (!following) { clearInterval(timer); return; }
+      if (!preview && (isTouchInteracting() || hasActiveUserScrollIntent())) return;
+      if (loadingOlderRef.current || scrollAnchorRef.current || pendingPinnedLocateIdRef.current) return;
+      const nextScrollHeight = el.scrollHeight;
+      const nextClientHeight = el.clientHeight;
+      if (latestRenderedRevisionRef.current !== seenRenderedRevision) {
+        seenRenderedRevision = latestRenderedRevisionRef.current;
+        lastScrollHeight = nextScrollHeight;
+        lastClientHeight = nextClientHeight;
+        return;
+      }
+      const maxTop = Math.max(0, nextScrollHeight - nextClientHeight);
+      const distance = maxTop - el.scrollTop;
+      const layoutChanged = nextScrollHeight !== lastScrollHeight || nextClientHeight !== lastClientHeight;
+      lastScrollHeight = nextScrollHeight;
+      lastClientHeight = nextClientHeight;
+      if (!layoutChanged && distance <= 1) return;
+      scrollToBottom(false);
+    }, CHAT_MOUNT_SETTLE_TICK_MS);
+    return () => clearInterval(timer);
+  }, [scrollScopeKey, preview, visible, hasInitialVisibleContent]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
   const isTouchDevice = useTouchChatGestures();
+  const renderMenuIcon = (kind: 'copy' | 'copied' | 'speak' | 'stop' | 'quote' | 'quoteAll' | 'pin' | 'unpin' | 'delete') => {
+    const props = {
+      class: 'chat-sel-btn-icon',
+      viewBox: '0 0 24 24',
+      width: '13',
+      height: '13',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '1.9',
+      'stroke-linecap': 'round' as const,
+      'stroke-linejoin': 'round' as const,
+      'aria-hidden': 'true' as const,
+    };
+    switch (kind) {
+      case 'copied':
+        return <svg {...props}><polyline points="20 6 9 17 4 12" /></svg>;
+      case 'copy':
+        return <svg {...props}><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>;
+      case 'speak':
+        return <svg {...props}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /></svg>;
+      case 'stop':
+        return <svg {...props}><rect x="6" y="6" width="12" height="12" rx="2" /></svg>;
+      case 'quote':
+        return <svg {...props}><path d="M9 17H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h4v8" /><path d="M21 17h-4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h4v8" /></svg>;
+      case 'quoteAll':
+        return <svg {...props}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>;
+      case 'pin':
+        return <svg {...props}><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16h14v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>;
+      case 'unpin':
+        return <svg {...props}><line x1="2" y1="2" x2="22" y2="22" /><path d="M12 17v5" /><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16h11" /><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89" /></svg>;
+      case 'delete':
+        return <svg {...props}><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></svg>;
+    }
+  };
   const getActionMenuContainerRect = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return null;
@@ -2301,6 +5801,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number) => {
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     target.classList.add('chat-highlight');
+    highlightElRef.current = target;
     setHighlightEl(target);
     const text = extractChatEventText(target);
     if (!text) return;
@@ -2350,6 +5851,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
+    const doc = container.ownerDocument;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
     let startTarget: HTMLElement | null = null;
@@ -2359,17 +5861,48 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
 
+    const clearPendingLongPress = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const dismissTouchHighlightAndMenu = () => {
+      if (highlightElRef.current) {
+        highlightElRef.current.classList.remove('chat-highlight');
+        highlightElRef.current = null;
+      }
+      container.querySelectorAll('.chat-highlight').forEach((el) => el.classList.remove('chat-highlight'));
+      setHighlightEl(null);
+      setCtxMenu(null);
+    };
+
+    const onNavGestureActive = (e: Event) => {
+      const active = Boolean((e as CustomEvent<{ active?: boolean }>).detail?.active);
+      if (!active) return;
+      clearPendingLongPress();
+      container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
+      lastTapEventId = '';
+      lastTapTs = 0;
+      dismissTouchHighlightAndMenu();
+    };
+
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length > 1) {
-        // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
-        if (timer) { clearTimeout(timer); timer = null; }
+      if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+        // multi-touch or active mobile nav gesture → cancel any in-flight tap/long-press tracking
+        clearPendingLongPress();
         return;
       }
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
       startTarget = e.target as HTMLElement;
+      clearPendingLongPress();
+      if (startTarget?.closest?.('.ask-question-timeline-card-interactive')) return;
       timer = setTimeout(() => {
         timer = null;
+        if (isMobileNavigationGestureActive(doc)) return;
+        if (startTarget?.closest?.('.ask-question-timeline-card-interactive')) return;
         const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
@@ -2379,20 +5912,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     };
 
     const onTouchMove = (e: TouchEvent) => {
+      if (isMobileNavigationGestureActive(doc)) {
+        clearPendingLongPress();
+        return;
+      }
       if (!timer) return;
       const t = e.touches[0];
       if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
-        clearTimeout(timer); timer = null;
+        clearPendingLongPress();
       }
     };
 
     const onTouchEnd = () => {
       // Long-press fired or finger moved? clear timer; double-tap pairing
       // is handled in onClick (which won't fire if cancelEvent ran).
-      if (timer) { clearTimeout(timer); timer = null; }
+      clearPendingLongPress();
     };
 
     const onClick = (e: MouseEvent) => {
+      if (isMobileNavigationGestureActive(doc) || wasMobileNavigationGestureRecentlyActive(doc)) {
+        lastTapEventId = ''; lastTapTs = 0;
+        return;
+      }
       const target = e.target as HTMLElement | null;
       const bubble = target?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
       if (!bubble) {
@@ -2413,13 +5954,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       }
     };
 
+    doc.addEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     container.addEventListener('click', onClick);
     return () => {
-      if (timer) clearTimeout(timer);
+      clearPendingLongPress();
+      doc.removeEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
@@ -2429,22 +5972,40 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     };
   }, [isTouchDevice, preview, openCtxMenu]);
 
-  const canShowFilePanel = !preview && !!ws;
   const hasRightPanel = showAgentsPane || (canShowFilePanel && showFilePanel);
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
   // because each machine's display, OS font availability, and viewing
   // distance differ. Surfaced via the title-bar dropdown on every platform
   // — phones included — so users can pick the font that reads best for them.
-  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const [iosMacTextScale, setIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+  useEffect(() => {
+    const sync = () => setIosMacTextScale(shouldUseIosMacTextScale());
+    sync();
+    return subscribeDeviceLayoutChange(sync, { includeResize: false });
+  }, []);
+  const effectiveDefaultChatFont = useMemo(
+    () => (iosMacTextScale ? { ...DEFAULT_CHAT_FONT, size: 16 } : DEFAULT_CHAT_FONT),
+    [iosMacTextScale],
+  );
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', effectiveDefaultChatFont);
+  const scaledChatFontSize = scaledCssFontPx(chatFontPrefs.size);
   const chatFontStyle = !preview
-    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    ? ({
+        fontSize: scaledChatFontSize,
+        fontFamily: chatFontPrefs.family,
+        [CHAT_FONT_SIZE_VAR]: scaledChatFontSize,
+        [CHAT_FONT_FAMILY_VAR]: chatFontPrefs.family,
+      } as h.JSX.CSSProperties)
     : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
     return order
-      .map((key) => ({ key, state: historyStatus.steps[key] }))
+      // `counts` is optional on the wire: a status built by an older caller (or
+      // restored from a previous shape) has no such field, and indexing it
+      // unguarded crashes the whole chat view rather than losing one number.
+      .map((key) => ({ key, state: historyStatus.steps[key], count: historyStatus.counts?.[key] }))
       .filter((step) => step.state !== 'skipped')
       .map((step) => ({
         ...step,
@@ -2459,12 +6020,49 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 : t('session.history_step_older'),
       }));
   }, [historyStatus, t]);
+  // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  // Delete = hide at once (optimistic), then ask the daemon. Every stored event of the
+  // rendered block is named (assistant text segments merge into one bubble), and the
+  // outcome is never silent: an error/timeout restores the message and shows why.
+  const deleteMessage = (eventId: string, pin: MessagePin | undefined): void => {
+    if (!ws || !sessionId) return;
+    const targets = resolveTimelineDeleteTargets(viewItems, eventsProp, eventId);
+    setLocallyDeletedIds((prev) => new Set([...prev, ...targets.eventIds]));
+    requestTimelineMessageDelete(ws, sessionId, targets).then(
+      () => {
+        // A pinned message that is deleted for everyone must not linger as a ghost pin.
+        if (pin) void messagePins.unpinMessage(pin);
+      },
+      (err: unknown) => {
+        console.warn('delete timeline message failed', err);
+        setLocallyDeletedIds((prev) => {
+          const next = new Set(prev);
+          for (const id of targets.eventIds) next.delete(id);
+          return next;
+        });
+        setDeleteErrorKey(timelineDeleteErrorKey(err instanceof TimelineDeleteError ? err.code : TIMELINE_DELETE_ERROR_CODES.FAILED));
+      },
+    );
+  };
+  const contextMenuEvent = ctxMenu?.eventId
+    ? events.find((event) => event.eventId === ctxMenu.eventId)
+    : undefined;
+  const contextMenuPinEvent: (TimelineEvent & { type: MessagePinEventType }) | undefined = contextMenuEvent
+    && isMessagePinEventType(contextMenuEvent.type)
+    ? contextMenuEvent as TimelineEvent & { type: MessagePinEventType }
+    : undefined;
+  const contextMenuPin = contextMenuPinEvent
+    ? messagePins.pins.find((pin) => pin.sessionName === sessionId && pin.eventId === contextMenuPinEvent.eventId)
+    : undefined;
+  const contextMenuPinText = contextMenuPinEvent
+    ? (messagePinSourceText(contextMenuPinEvent, viewItems) ?? '')
+    : '';
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
-        <div class="chat-top-actions">
+        <div ref={chatTopActionsRef} class="chat-top-actions">
           {onForceSync && (
             <button
               class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
@@ -2479,7 +6077,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           {canShowAgentsControl && (
             <button
               type="button"
-              class={`chat-panel-toggle chat-sdk-agents-toggle${desiredAgentsOpen ? ' active' : ''}`}
+              class={`chat-panel-toggle chat-sdk-agents-toggle${(desiredAgentsOpen || showAgentsPane) ? ' active' : ''}`}
               onClick={toggleAgentsPanel}
               title={t('chat.sdk_agents_toggle')}
               aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
@@ -2511,6 +6109,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       <div class="chat-main">
         {!preview && (
           <div
+            ref={chatTitlebarRef}
             class="chat-titlebar"
             style={{
               display: 'flex',
@@ -2535,11 +6134,102 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <SessionRepoBranchSummary
               sessionId={sessionId}
               projectDir={workdir}
+              serverId={serverId}
               onOpenRepo={onViewRepo}
               className="session-repo-branch-summary-chat-titlebar"
             />
+            {pinsEnabled && sessionId && (
+              <MessagePinsBar
+                pins={messagePins.pins}
+                currentSessionName={sessionId}
+                loading={messagePins.loading}
+                mutating={messagePins.mutating}
+                error={messagePins.error}
+                locateError={pinnedLocateError}
+                onLocate={(pin) => { void locatePinnedMessage(pin); }}
+                onQuote={onQuote}
+                previewMode={messagePinPreviewMode}
+                onPreviewModeChange={handleMessagePinPreviewModeChange}
+                renderPreview={renderPinnedMessagePreview}
+                resolvePinText={resolvePinnedMessageText}
+                onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
+                onDismissError={() => {
+                  messagePins.clearError();
+                  setPinnedLocateError(false);
+                }}
+              />
+            )}
+            {sessionId && (
+              <button
+                type="button"
+                class="chat-session-usage-btn"
+                title={t('sessionUsage.open')}
+                aria-label={t('sessionUsage.open')}
+                onClick={() => setSessionUsageOpen(true)}
+              >
+                📊
+              </button>
+            )}
+            {sessionId && !preview && ttsSupported && (
+              <div ref={ttsControlRef} class="chat-tts-control-wrap">
+                <div class="chat-tts-control-group" data-testid="chat-tts-control-group">
+                  <button
+                    type="button"
+                    class={`chat-tts-autoread-btn${ttsAutoRead ? ' is-active' : ''}${ttsAutoRead && ttsState.status === 'speaking' ? ' is-speaking' : ''}`}
+                    title={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
+                    aria-label={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
+                    aria-pressed={ttsAutoRead}
+                    onClick={() => {
+                      const next = !ttsAutoRead;
+                      setTtsAutoReadEnabled(next);
+                      setTtsAutoRead(next);
+                      if (!next) {
+                        void stopSpeaking();
+                      }
+                    }}
+                  >
+                    {ttsAutoRead ? (
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                        <line x1="22" y1="9" x2="16" y2="15" />
+                        <line x1="16" y1="9" x2="22" y2="15" />
+                      </svg>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    class={`chat-tts-settings-btn${ttsSettingsOpen ? ' is-open' : ''}`}
+                    data-testid="chat-tts-settings-btn"
+                    title={t('chat.tts_settings')}
+                    aria-label={t('chat.tts_settings')}
+                    aria-expanded={ttsSettingsOpen}
+                    aria-haspopup="dialog"
+                    onClick={() => setTtsSettingsOpen((prev) => !prev)}
+                  >
+                    <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="3" />
+                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                  </button>
+                </div>
+                {ttsSettingsOpen && (
+                  <TtsQuickSettingsPopover
+                    anchorRef={ttsControlRef}
+                    locale={locale}
+                    onClose={handleCloseTtsSettings}
+                  />
+                )}
+              </div>
+            )}
           </div>
         )}
+        {!!sessionId && !hideTaskPairPanel && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} canCloseTasks={canManageFileShares} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -2552,11 +6242,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 <span class="chat-history-overlay-label">{t('session.history_loading_label')}</span>
                 <span class="chat-history-overlay-steps">
                   {historySteps.map((step) => (
-                    <span key={step.key} class={`chat-history-step ${step.state}`}>
+                    <span
+                      key={step.key}
+                      class={`chat-history-step ${step.state}`}
+                      title={step.state === 'empty' ? t('session.history_step_empty_hint') : undefined}
+                    >
                       <span class="chat-history-step-icon" aria-hidden="true">
-                        {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
+                        {step.state === 'done' ? '✓' : step.state === 'empty' ? '∅' : step.state === 'running' ? '…' : '○'}
                       </span>
                       {step.label}
+                      {step.count !== undefined && (
+                        <span class="chat-history-step-count">{step.count}</span>
+                      )}
                     </span>
                   ))}
                 </span>
@@ -2569,42 +6266,48 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
             tabIndex={0}
-            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            aria-label={pinnedPreviewUsesMemory
+              ? t('chat.pinned_recent_summary_aria', 'Show recent summary and jump to your last sent message')
+              : t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
             onClick={() => {
               // Tap once → toggle 2-line clamp; tap again (while expanded)
               // behaves like a jump-to-message. Holds the expand state so a
               // long message can be read without hunting for it.
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
-              const root = scrollRef.current;
-              if (!root) return;
-              const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) {
-                // Respect the OS reduced-motion preference — smooth scrolling
-                // is a vestibular-trigger axis for some users.
+              // The last-sent bubble may be outside the virtualizer's mounted
+              // range. Reveal it first, then perform the same centered jump.
+              revealEvent(lastSentUserMessage.eventId, (root, target) => {
                 const reducedMotion = typeof window !== 'undefined'
                   && window.matchMedia
                   && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-                target.scrollIntoView({
-                  behavior: reducedMotion ? 'auto' : 'smooth',
-                  block: 'center',
-                });
-              }
+                scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+              });
             }}
           >
             <span class="chat-pinned-last-sent-meta">
-              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              <span class="chat-pinned-last-sent-label">
+                {pinnedPreviewUsesMemory
+                  ? t('chat.pinned_recent_summary_label', 'Recent summary')
+                  : t('chat.pinned_last_sent_label', 'Last sent')}
+              </span>
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
-              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts)}</span>
+              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedExpanded ? pinnedPreviewText : pinnedCompactPreviewText}</span>
           </div>
         )}
+        <div class="chat-scroll-region">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
+          onPointerDown={preview ? undefined : markPointerScrollbarIntent}
+          onPointerUp={preview ? undefined : clearPointerScrollbarIntent}
+          onPointerCancel={preview ? undefined : clearPointerScrollbarIntent}
           onTouchStart={preview ? undefined : handleTouchStart}
           onTouchMove={preview ? undefined : handleTouchMove}
+          onTouchEnd={preview ? undefined : handleTouchEndOrCancel}
+          onTouchCancel={preview ? undefined : handleTouchEndOrCancel}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
@@ -2613,6 +6316,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             if (e.key === 'End') {
               e.preventDefault();
               scrollToBottom(true);
+            } else if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home' || (e.key === ' ' && e.shiftKey)) {
+              userPointerOrKeyScrollUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
+            } else if (e.key === 'PageDown' || e.key === 'ArrowDown' || (e.key === ' ' && !e.shiftKey)) {
+              userScrollUpUntilRef.current = 0;
+              userPointerOrKeyScrollUntilRef.current = 0;
             }
           }}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
@@ -2624,7 +6332,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           } : undefined}
         >
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
-          {loading ? (
+          {/* The spinner is for an EMPTY pane only. It used to be an exclusive
+           *  branch on `loading` alone, which — together with the `!loading`
+           *  guard on the message list below — blanked a pane whose cached
+           *  events were already in state, purely because a background
+           *  refresh was in flight. Cached history must stay on screen while
+           *  the network catches up. */}
+          {loading && viewItems.length === 0 ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
             // Suppress the "no events" placeholder while history bootstrap
@@ -2681,6 +6395,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
             </div>
           )}
+          {/* The hole lies above everything rendered: the same marker as the inline one, as a plain row at the top
+              (outside the virtualized list, so it is always in the DOM while the hole is open). */}
+          {historyGapPlacement.kind === 'above' && (
+            <div className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+              <span className="chat-refreshing-spinner" aria-hidden="true" />
+              <span>{t('chat.history_gap_loading')}</span>
+            </div>
+          )}
           {!loading && !preview && viewItems.length > 0 && (loadingOlder || revealingOlder) && (
             <div class="chat-load-older-status" role="status" aria-live="polite">
               <span class="chat-refreshing-spinner" aria-hidden="true" />
@@ -2706,50 +6428,103 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               </button>
             </div>
           )}
-          {!loading && renderedViewItems.map((item) => {
+          {/* No `loading` guard: whatever is already restored renders now. */}
+          <VirtualizedViewItems
+            items={displayViewItems}
+            contentRevision={renderedRevision}
+            scrollRef={scrollRef}
+            enabled={!preview}
+            revealKey={virtualRevealKey}
+            onMeasuredLayout={applyMeasuredLayoutScroll}
+            absorbTopShiftRef={absorbTopShiftRef}
+            resetKey={scrollScopeKey || undefined}
+            isFollowing={() => autoScrollRef.current}
+            canPassivePin={() => !isTouchInteracting() && !hasActiveUserScrollIntent()}
+            onProgrammaticScroll={markProgrammaticScroll}
+            onRowsRendered={() => { syncPinnedTargetRef.current?.(); }}
+            onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
+            renderItem={(item) => {
+            if (item.type === 'history-gap') {
+              return (
+                <div key={item.key} className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+                  <span className="chat-refreshing-spinner" aria-hidden="true" />
+                  <span>{t('chat.history_gap_loading')}</span>
+                </div>
+              );
+            }
+            if (item.type === 'supervision-status-run') {
+              return <SupervisionStatusRun key={item.key} item={item} />;
+            }
             if (item.type === 'assistant-block') {
+              const blockId = item.eventIds?.[0] ?? item.key;
               return (
                 <AssistantBlock
                   key={item.key}
-                  eventId={item.key}
+                  // The row key is stable across the run losing its oldest event; the DOM
+                  // marker stays a real, current event id (the run's first).
+                  eventId={blockId}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  streaming={item.assistantStreaming === true}
+                  executionState={item.executionState}
+                  delegationMetadata={item.delegationMetadata}
+                  taskPairNotification={item.taskPairNotification}
+                  sessions={sessions}
+                  liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
+                  onCloudDocClick={cloudDocClickHandler}
+                  onRemoteDesktopClick={remoteDesktopClickHandler}
                   onUrlClick={urlClickHandler}
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
                   onImagePreview={imagePreviewHandler}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  ttsSpeaking={ttsState.status === 'speaking' && ttsState.activeMessageId === blockId}
+                  onToggleSpeak={!preview && ttsSupported ? handleToggleSpeak : undefined}
                 />
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+            }
+            if (item.type === 'tool-activity') {
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} chatFontSize={!preview ? scaledChatFontSize : undefined} chatFontFamily={!preview ? chatFontPrefs.family : undefined} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} isPendingAskQuestion={isDockedPendingAsk && activeAskQuestionEventId === item.event!.eventId} answeredText={askAnswerMap.get(item.event!.eventId)} onAskAnswer={handleTimelineAskAnswer} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onRemoteDesktopClick={remoteDesktopClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} isPendingAskQuestion={isDockedPendingAsk && activeAskQuestionEventId === item.event!.eventId} answeredText={askAnswerMap.get(item.event!.eventId)} onAskAnswer={handleTimelineAskAnswer} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
+                    visible={visible}
+                    sessionName={sessionId ?? undefined}
+                    sessions={sessions}
                     onPathClick={pathClickHandler}
+                    onCloudDocClick={cloudDocClickHandler}
+                    onRemoteDesktopClick={remoteDesktopClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
                     onHtmlPreview={htmlPreviewHandler}
                     onImagePreview={imagePreviewHandler}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
+                    isPendingAskQuestion={isDockedPendingAsk && activeAskQuestionEventId === linkedEvent.eventId}
+                    answeredText={askAnswerMap.get(linkedEvent.eventId)}
+                    onAskAnswer={handleTimelineAskAnswer}
                   />
                 ))}
               </div>
             );
-          })}
+            }}
+          />
           {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
@@ -2767,6 +6542,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           >
             ↓{newSinceUnfollow > 0 ? ` ${newSinceUnfollow}` : ''}
           </button>
+        )}
+        </div>
+        {isDockedPendingAsk && activeAskQuestionEvent && (
+          <div class="chat-pending-ask-dock" data-testid="chat-pending-ask-dock">
+            <AskQuestionTimelineCard
+              event={activeAskQuestionEvent}
+              showTime
+              isPending
+              onAskAnswer={handleDockedAskAnswer}
+              {...(activeAskQuestionEvent.type === 'tool.call'
+                ? {
+                    questionsOverride: dockedAskQuestionsOverride,
+                    toolUseIdOverride: trailingAskQuestion?.toolUseId,
+                  }
+                : {})}
+            />
+          </div>
         )}
         {selMenu && !preview && (
           <div
@@ -2787,8 +6579,33 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 });
               }}
             >
+              {renderMenuIcon(copied ? 'copied' : 'copy')}
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {(() => {
+              const menu = ctxMenu;
+              if (!menu) return null;
+              const ctxSpeakText = menu.eventId
+                ? (assistantBlockTextById.get(menu.eventId) ?? menu.text)
+                : menu.text;
+              const ctxMessageId = menu.eventId ?? ctxSpeakText;
+              const canSpeakCtx = ttsSupported && prepareTextForTts(ctxSpeakText).length > 0;
+              const isCtxSpeaking = ttsState.status === 'speaking' && ttsState.activeMessageId === ctxMessageId;
+              if (!canSpeakCtx) return null;
+              return (
+                <button
+                  class="chat-sel-btn"
+                  onClick={() => {
+                    handleToggleSpeak(ctxMessageId, ctxSpeakText);
+                    setCtxMenu(null);
+                    if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                  }}
+                >
+                  {renderMenuIcon(isCtxSpeaking ? 'stop' : 'speak')}
+                  {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
+                </button>
+              );
+            })()}
             {onQuote && (
               <button
                 class="chat-sel-btn"
@@ -2798,6 +6615,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   window.getSelection()?.removeAllRanges();
                 }}
               >
+                {renderMenuIcon('quote')}
                 {t('common.quote', 'Quote')}
               </button>
             )}
@@ -2821,8 +6639,33 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 });
               }}
             >
+              {renderMenuIcon(copied ? 'copied' : 'copy')}
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {(() => {
+              const menu = ctxMenu;
+              if (!menu) return null;
+              const ctxSpeakText = menu.eventId
+                ? (assistantBlockTextById.get(menu.eventId) ?? menu.text)
+                : menu.text;
+              const ctxMessageId = menu.eventId ?? ctxSpeakText;
+              const canSpeakCtx = ttsSupported && prepareTextForTts(ctxSpeakText).length > 0;
+              const isCtxSpeaking = ttsState.status === 'speaking' && ttsState.activeMessageId === ctxMessageId;
+              if (!canSpeakCtx) return null;
+              return (
+                <button
+                  class="chat-sel-btn"
+                  onClick={() => {
+                    handleToggleSpeak(ctxMessageId, ctxSpeakText);
+                    setCtxMenu(null);
+                    if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                  }}
+                >
+                  {renderMenuIcon(isCtxSpeaking ? 'stop' : 'speak')}
+                  {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
+                </button>
+              );
+            })()}
             {onQuote && (
               <>
               <button
@@ -2833,6 +6676,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon('quote')}
                 {t('common.quote', 'Quote')}
               </button>
               <button
@@ -2843,46 +6687,79 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon('quoteAll')}
                 {t('common.quote_block', 'Quote All')}
               </button>
               </>
             )}
-            {ctxMenu.eventId && ws && sessionId && (
+            {contextMenuPinEvent && contextMenuPinText && (
               <button
                 class="chat-sel-btn"
-                style={{ color: '#e5484d' }}
+                disabled={messagePins.mutating}
                 onClick={() => {
-                  const eid = ctxMenu.eventId;
-                  if (!eid || !sessionId || !ws) return;
-                  // Destructive + global → keep an explicit confirmation (no click-to-delete).
-                  if (!window.confirm(t('chat.delete_message_confirm'))) return;
-                  try {
-                    ws.deleteTimelineMessage(sessionId, eid);
-                  } catch (err) {
-                    console.warn('delete timeline message failed', err);
+                  if (contextMenuPin) {
+                    void messagePins.unpinMessage(contextMenuPin);
+                  } else {
+                    void messagePins.pinMessage({
+                      eventId: contextMenuPinEvent.eventId,
+                      eventTs: contextMenuPinEvent.ts,
+                      eventType: contextMenuPinEvent.type,
+                      text: contextMenuPinText.slice(0, MESSAGE_PIN_LIMITS.TEXT_CHARS),
+                    });
                   }
                   setCtxMenu(null);
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
               >
+                {renderMenuIcon(contextMenuPin ? 'unpin' : 'pin')}
+                {contextMenuPin ? t('messagePins.unpin') : t('messagePins.pin')}
+              </button>
+            )}
+            {ctxMenu.eventId && ws && sessionId && (
+              <button
+                class="chat-sel-btn chat-sel-btn-danger"
+                onClick={() => {
+                  const eid = ctxMenu.eventId;
+                  if (!eid || !sessionId || !ws) return;
+                  // Destructive + global → keep an explicit confirmation (no click-to-delete).
+                  if (!window.confirm(t('chat.delete_message_confirm'))) return;
+                  deleteMessage(eid, contextMenuPin);
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {renderMenuIcon('delete')}
                 {t('chat.delete_message')}
               </button>
             )}
           </div>
         )}
       </div>
+      {deleteErrorKey && (
+        <div class="chat-toast chat-toast-error" role="alert" data-chat-delete-error>
+          <span>{t(deleteErrorKey)}</span>
+          <button type="button" class="chat-toast-close" aria-label={t('common.close')} onClick={() => setDeleteErrorKey(null)}>✕</button>
+        </div>
+      )}
       {showAgentsPane && (
         <SdkAgentsPanel
           rows={sdkAgentsStatus.rows}
           diagnostics={sdkAgentsStatus.diagnostics}
           runningCount={sdkAgentsStatus.runningCount}
           now={sdkAgentsNow}
-          onClose={() => setDesiredAgentsPanelOpen(false)}
+          onClose={() => {
+            clearAutoAgentsTimer();
+            setAutoAgentsOpen(false);
+            setInspectRecentAgentsOpen(false);
+            if (runningAgentsCount > 0) {
+              setDesiredAgentsPanelOpen(false);
+            }
+          }}
         />
       )}
       {canShowFilePanel && showFilePanel && ws && (
         <>
-          <div class="chat-panel-drag" onMouseDown={onDragStart} />
+          <div class="chat-panel-drag resize-hover-surface" {...resizeHandleHoverEvents} onMouseDown={onDragStart} />
           <div class="chat-file-panel" style={{ width: `${filePanelWidth}px`, flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', background: '#1e293b', borderBottom: '1px solid #334155' }}>
               <span style={{ flex: 1, fontSize: 11, color: '#64748b' }}>{t('picker.files')}</span>
@@ -2892,6 +6769,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               ws={ws}
               serverId={serverId}
               sessionName={sessionId ?? undefined}
+              scopeToSessionRoot={scopeFilesToSession}
+              readOnly={readOnlyFiles}
+              canShare={canManageFileShares}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -2917,6 +6797,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
+      {!preview && sessionId && sessionUsageOpen && (
+        <SessionUsagePanel targetSessionName={sessionId} onClose={() => setSessionUsageOpen(false)} />
+      )}
       <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
       {/* External link confirm dialog */}
       {pendingUrl && (
@@ -2932,7 +6815,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               <span class="external-link-icon" aria-hidden="true">↗</span>
               <div class="external-link-title" id="external-link-dialog-title">{t('chat.external_link_title')}</div>
             </div>
-            <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+            <div class="external-link-url-row">
+              <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+              <button
+                type="button"
+                class={`external-link-copy${copiedExternalUrl === pendingUrl ? ' copied' : ''}`}
+                title={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                aria-label={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                onClick={() => {
+                  const url = pendingUrl;
+                  copyToClipboard(url, () => setCopiedExternalUrl(url));
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  {copiedExternalUrl === pendingUrl
+                    ? <path d="m5 12 4 4L19 6" />
+                    : <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
+                </svg>
+              </button>
+            </div>
             <div class="external-link-warning">{t('chat.external_link_warning')}</div>
             <div class="external-link-actions">
               <button class="external-link-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
@@ -2948,32 +6849,537 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 }
 
-/** Unified tool block fold — collapses any tool content exceeding ~3 lines (54px). */
-function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [overflows, setOverflows] = useState(false);
+/**
+ * Memoized so an open window costs nothing when its own session is quiet.
+ *
+ * Every mounted ChatView used to re-render on every timeline event, whatever
+ * session that event belonged to, because the owner of the events state
+ * re-renders and ChatView had no memo boundary. Measured over real components:
+ * a window on an idle session re-rendered once per event delivered to a
+ * DIFFERENT session, so per-event work scaled with the number of open windows.
+ * The inner `ChatEvent` / `AssistantBlock` memos kept the DOM stable, which is
+ * why this stayed invisible on fast machines — but the reconciliation still ran
+ * N times, and on a low-spec machine with many sub-session windows and a live
+ * token stream the queue stopped draining and the whole tab wedged.
+ *
+ * Default shallow prop comparison is what we want: `events` gets a new array
+ * identity precisely when that session's timeline changed. It follows that the
+ * CALLBACK props must be referentially stable at every call site — an inline
+ * closure would defeat this entirely and silently restore the old cost.
+ */
+export const ChatView = memo(ChatViewImpl);
+
+/** Tool shell: bounded collapsed preview, full-fidelity scrollable expansion. */
+function ToolBlockFold({
+  children,
+}: {
+  children: (
+    expanded: boolean,
+    toggleExpanded: () => void,
+    action: string,
+  ) => preact.ComponentChildren;
+}) {
   const [expanded, setExpanded] = useState(false);
   const { t } = useTranslation();
-
-  useEffect(() => {
-    if (!ref.current) return;
-    setOverflows(ref.current.scrollHeight > 60);
-  }, [children]);
+  const action = expanded ? t('chat.tool_fold_collapse') : t('chat.tool_detail_toggle');
+  const toggleExpanded = () => setExpanded((value) => !value);
 
   return (
-    <div class={`chat-tool-block-fold${!expanded && overflows ? ' collapsed' : ''}`}>
-      <div ref={ref} class="chat-tool-block-fold-content" style={!expanded && overflows ? { maxHeight: 54, overflow: 'hidden' } : undefined}>
-        {children}
+    <div class={`chat-tool-block-fold${expanded ? ' is-expanded' : ' is-collapsed'}`}>
+      <div class="chat-tool-block-fold-content">
+        {children(expanded, toggleExpanded, action)}
+        {expanded && (
+          <div class="chat-tool-fold-footer">
+            <button
+              type="button"
+              class="chat-tool-fold-collapse"
+              aria-expanded={expanded}
+              aria-label={action}
+              title={action}
+              onClick={toggleExpanded}
+            >
+              <span aria-hidden="true">▴</span>
+              <span>{action}</span>
+            </button>
+          </div>
+        )}
       </div>
-      {overflows && !expanded && (
-        <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
-          {'··· more'}
-        </button>
+    </div>
+  );
+}
+
+function toggleToolFoldFromHeader(
+  event: MouseEvent,
+  toggleExpanded: () => void,
+) {
+  const target = event.target;
+  if (
+    target instanceof Element
+    && target.closest('button, a, input, select, textarea, .chat-path-link, [role="button"], [role="link"]')
+  ) {
+    return;
+  }
+  toggleExpanded();
+}
+
+/**
+ * Name + input for a `tool.call`, exactly as the full tool row derives them.
+ *
+ * Shared so the Simple-view chip really is a miniature of the detailed row: it
+ * needs `pickMergedToolInput` (which prefers the result's complete args when a
+ * streamed call arrived without input) rather than the raw payload, or a tool
+ * like TodoWrite renders as a wall of JSON.
+ */
+function deriveToolCallDisplay(event: TimelineEvent): { toolName: string; toolInput: string } {
+  const toolName = String(event.payload.tool ?? 'tool');
+  const callDetail = event.payload._callDetail ?? event.payload.detail;
+  const resultDetail = event.payload._resultDetail;
+  const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
+    ? event.payload._callPayloadInput
+    : event.payload.input;
+  // Fall back to result detail for input — transport SDK tool.call may arrive without input.
+  const callInput = summarizeToolInput(callPayloadInput, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  return { toolName, toolInput: pickMergedToolInput(toolName, callInput, resultInput) };
+}
+
+function getToolActivityCounts(events: TimelineEvent[]) {
+  let terminal = 0;
+  let failed = 0;
+  for (const event of events) {
+    const isCompleted = event.type === 'tool.result' || event.payload._merged === true;
+    if (!isCompleted) continue;
+    terminal++;
+    if (event.payload.error || event.payload._toolFailed === true) failed++;
+  }
+  return {
+    total: events.length,
+    completed: Math.max(0, terminal - failed),
+    failed,
+    running: Math.max(0, events.length - terminal),
+  };
+}
+
+/**
+ * What the newest tool in the group is doing, for the Simple-view chip.
+ *
+ * The counters alone answer "how many", not "what is it stuck on" — which is
+ * the question during a long wait. A running tool reports live elapsed time; a
+ * finished one reports how long it took.
+ */
+function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
+  startedAt: number | null;
+  running: boolean;
+  failed: boolean;
+  durationMs: number | null;
+  toolName: string;
+  toolInput: string;
+  /** Untruncated output of the finished call — null while it is still running. */
+  toolOutput: string | null;
+  /** Failure text when the call ended in an error. */
+  toolError: string | null;
+} | null {
+  // Walk back to the newest `tool.call`. The last event in a group is often a
+  // standalone `tool.result` (its call fell outside the merge window), and a
+  // result carries no tool name and no start time — reading it directly is why
+  // the chip showed a bare input dump with no name and no duration.
+  let index = events.length - 1;
+  while (index >= 0 && events[index].type !== 'tool.call') index -= 1;
+  if (index < 0) return null;
+  const call = events[index];
+
+  const { toolName, toolInput } = deriveToolCallDisplay(call);
+
+  const startedAt = typeof call.ts === 'number' && Number.isFinite(call.ts) ? call.ts : null;
+  // Merging is what pairs a call with its result, so a merged event is finished
+  // and carries the result's timestamp; anything unmerged is still in flight.
+  // (An explicit "look for a trailing result" branch was tried here and removed:
+  // the merge window scans forward by array position, so a result adjacent to
+  // its call always merges, and no test could reach the branch.)
+  const finishedAt = typeof call.payload._resultTs === 'number' ? call.payload._resultTs : null;
+  const running = call.payload._merged !== true;
+
+  let durationMs: number | null = null;
+  if (startedAt !== null) {
+    // Clock skew or a rehydrated event can put the start in the future; clamp
+    // rather than render a negative age.
+    if (running) durationMs = Math.max(0, nowMs - startedAt);
+    else if (finishedAt !== null) durationMs = Math.max(0, finishedAt - startedAt);
+  }
+
+  // The hover peek shows the real result, so read the untruncated output the
+  // merge step stashed rather than the one-line chip preview. `_output` is the
+  // already-formatted string; fall back to the raw payload for events that were
+  // merged before it existed (or whose output only became non-empty later).
+  const failed = call.payload._toolFailed === true || Boolean(call.payload.error);
+  const toolError = failed
+    ? String(call.payload._toolError ?? call.payload.error ?? '') || null
+    : null;
+  const toolOutput = running
+    ? null
+    : (typeof call.payload._output === 'string' && call.payload._output)
+      || formatToolOutputPreview(call.payload._resultPayloadOutput)
+      || null;
+
+  return { startedAt, running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
+}
+
+let toolPeekIdCounter = 0;
+
+/**
+ * Hover peek for the Simple-view tool chip: the last full command and the
+ * output it produced. Portalled to `document.body` because the chat scroller
+ * clips overflow, so it is positioned from the chip's viewport rect. That rect
+ * goes stale the moment anything scrolls, so the owner re-measures it on scroll
+ * and resize — with a pointer the chip slides out from under the cursor and
+ * `mouseleave` closes the panel anyway, but a keyboard-focused peek has no such
+ * escape hatch and would otherwise sit stranded mid-screen.
+ */
+function ToolActivityPeek({
+  anchor,
+  peekId,
+  toolName,
+  command,
+  output,
+  error,
+  running,
+  failed,
+  duration,
+  startTime,
+  chatContainerRect,
+  chatFontSize,
+  chatFontFamily,
+}: {
+  anchor: DOMRect;
+  peekId: string;
+  toolName: string;
+  command: string;
+  output: string | null;
+  error: string | null;
+  running: boolean;
+  failed: boolean;
+  duration: string | null;
+  startTime?: string | null;
+  chatContainerRect?: DOMRect | null;
+  chatFontSize?: string;
+  chatFontFamily?: string;
+}) {
+  const { t } = useTranslation();
+  if (typeof document === 'undefined') return null;
+
+  const margin = 8;
+  const BASE_WIDTH = 560;
+
+  const viewportWidth = (typeof window !== 'undefined' && window.innerWidth > 0)
+    ? window.innerWidth
+    : 1024;
+  const hasContainer = Boolean(chatContainerRect && chatContainerRect.width > 0);
+  const containerLeft = hasContainer ? chatContainerRect!.left : 0;
+  const containerRight = hasContainer ? chatContainerRect!.right : viewportWidth;
+  const containerWidth = hasContainer ? chatContainerRect!.width : viewportWidth;
+
+  const minLeft = Math.max(margin, containerLeft + margin);
+  const maxRight = Math.min(viewportWidth - margin, containerRight - margin);
+  const maxAvailableWidth = Math.max(0, maxRight - minLeft);
+
+  const targetWidth = Math.round(containerWidth * 0.6);
+  // When chat container is narrow or 60% of chat width is less than base 560px,
+  // adapt to full available width (leaving safe margins); otherwise use >=60% of chat width.
+  const computedWidth = targetWidth < BASE_WIDTH
+    ? maxAvailableWidth
+    : Math.min(targetWidth, maxAvailableWidth);
+
+  const minWidth = Math.min(280, maxAvailableWidth);
+  const width = Math.min(maxAvailableWidth, Math.max(minWidth, computedWidth));
+
+  const maxLeft = maxRight - width;
+  const left = Math.min(
+    Math.max(minLeft, anchor.left),
+    Math.max(minLeft, maxLeft),
+  );
+
+  // Prefer above the chip (the chip sits under the reply text, so upward keeps
+  // the message readable); flip below only when there is not enough room.
+  const spaceAbove = anchor.top;
+  const viewportHeight = (typeof window !== 'undefined' && window.innerHeight > 0)
+    ? window.innerHeight
+    : 768;
+  const spaceBelow = viewportHeight - anchor.bottom;
+  const placeBelow = spaceAbove < 280 && spaceBelow > spaceAbove;
+  const availableSpace = (placeBelow ? spaceBelow : anchor.top) - margin * 2;
+  if (availableSpace <= 0) return null;
+  const maxHeight = availableSpace;
+  const position = placeBelow
+    ? { top: `${anchor.bottom + margin}px` }
+    : { bottom: `${viewportHeight - anchor.top + margin}px` };
+
+  const status = running
+    ? t('chat.tool_peek_running')
+    : failed
+      ? t('chat.tool_peek_failed')
+      : t('chat.tool_peek_done');
+
+  return createPortal((
+    <div
+      id={peekId}
+      class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position, [CHAT_FONT_SIZE_VAR]: chatFontSize, [CHAT_FONT_FAMILY_VAR]: chatFontFamily }}
+      role="tooltip"
+    >
+      <div class="chat-tool-peek-frame" aria-hidden="true" />
+      <div class="chat-tool-peek-head">
+        <span class="chat-tool-peek-dot" aria-hidden="true" />
+        <span class="chat-tool-peek-tool">{toolName}</span>
+        <span class="chat-tool-peek-status">{status}</span>
+        {startTime && <span class="chat-tool-peek-start-time">{startTime}</span>}
+        {duration && <span class="chat-tool-peek-duration">{duration}</span>}
+      </div>
+      <div class="chat-tool-peek-body">
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_command')}</span>
+          <pre class="chat-tool-peek-pre">{command || t('chat.tool_peek_empty')}</pre>
+        </div>
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_output')}</span>
+          {running ? (
+            <div class="chat-tool-peek-pending">
+              <span class="chat-tool-peek-pending-bar" aria-hidden="true" />
+              {t('chat.tool_peek_waiting')}
+            </div>
+          ) : (
+            <pre class={`chat-tool-peek-pre${failed ? ' is-failed' : ''}`}>
+              {error || output || t('chat.tool_peek_empty')}
+            </pre>
+          )}
+        </div>
+      </div>
+    </div>
+  ), document.body);
+}
+
+/** One-line live tool telemetry for Simple view; expands details on demand. */
+function ToolActivitySummary({
+  events,
+  visible = true,
+  onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
+  onUrlClick,
+  onDownload,
+  onHtmlPreview,
+  onImagePreview,
+  onOpenLocalWebPreview,
+  serverId,
+  chatFontSize,
+  chatFontFamily,
+}: {
+  events: TimelineEvent[];
+  visible?: boolean;
+  onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  serverId?: string;
+  chatFontSize?: string;
+  chatFontFamily?: string;
+}) {
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
+  const [expanded, setExpanded] = useState(false);
+  // Anchor rect, not a boolean: the peek is portalled out of the scroller, so it
+  // needs the chip's viewport position. Re-measured on every open so scrolling
+  // between hovers cannot leave it stranded.
+  const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
+  const [chatContainerRect, setChatContainerRect] = useState<DOMRect | null>(null);
+  // The element the peek is anchored to, kept so scroll/resize can re-measure it
+  // rather than leaving the panel at a rect that is now wrong.
+  const peekTriggerRef = useRef<HTMLElement | null>(null);
+  // Stable per-instance id for `aria-describedby`. A plain counter rather than
+  // `useId` so this does not depend on the Preact hooks version.
+  const peekIdRef = useRef<string | null>(null);
+  if (peekIdRef.current === null) peekIdRef.current = `chat-tool-peek-${++toolPeekIdCounter}`;
+  const peekId = peekIdRef.current;
+  const counts = getToolActivityCounts(events);
+  // Tick only while something is actually running: a settled group must not keep
+  // a timer alive, and the shared ticker stops once its last listener leaves.
+  const nowMs = useNowTicker(visible && counts.running > 0);
+  const last = getLastToolActivity(events, nowMs);
+  // A completed group stops its elapsed ticker. Calendar labels must still
+  // use the current day whenever rendering again (e.g. opening a peek tomorrow).
+  const lastStartTime = last?.startedAt != null ? formatChatDateTime(last.startedAt, Date.now(), locale) : null;
+  const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
+  // Same one-line preview the full row shows, so this reads as a miniature of it
+  // rather than a different rendering of the same data.
+  const lastInput = last ? splitToolFoldPreview(toolFoldDisplayText(last.toolInput, false)).firstLine : null;
+  const summary = t('chat.tool_activity_summary', counts);
+  const action = expanded
+    ? t('chat.tool_activity_collapse')
+    : t('chat.tool_activity_expand');
+  const openPeek = (element: HTMLElement | null) => {
+    if (!last || !element) return;
+    peekTriggerRef.current = element;
+    setPeekAnchor(element.getBoundingClientRect());
+    const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+    setChatContainerRect(container ? container.getBoundingClientRect() : null);
+  };
+  const closePeek = () => {
+    peekTriggerRef.current = null;
+    setPeekAnchor(null);
+    setChatContainerRect(null);
+  };
+  // Pointer only. Touch clients report no hover, and opening the peek on a tap
+  // would fight the expand toggle. Keyboard focus deliberately does NOT go
+  // through this gate: a no-hover device can still have a keyboard, and gating
+  // focus on hover capability made the panel unreachable for those users.
+  const openPeekFromPointer = (element: HTMLElement | null) => {
+    if (isHoverPreviewSuppressed()) return;
+    if (typeof window !== 'undefined' && window.matchMedia
+      && !window.matchMedia('(hover: hover)').matches) return;
+    openPeek(element);
+  };
+
+  useEffect(() => onHoverPreviewSuppressed(closePeek), []);
+
+  // The anchor is a viewport rect and the panel is `position: fixed`, so any
+  // scroll invalidates it. Re-measure instead of drifting; drop the peek if the
+  // chip has left the viewport entirely.
+  useEffect(() => {
+    if (!peekAnchor) return;
+    const sync = () => {
+      const element = peekTriggerRef.current;
+      if (!element) return;
+      const rect = element.getBoundingClientRect();
+      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight
+        || rect.right < 0 || rect.left > window.innerWidth;
+      if (offscreen) { closePeek(); return; }
+      setPeekAnchor(rect);
+      const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+      setChatContainerRect(container ? container.getBoundingClientRect() : null);
+    };
+    // Capture phase so nested scrollers (the chat list itself) are observed too;
+    // `scroll` does not bubble.
+    window.addEventListener('scroll', sync, true);
+    window.addEventListener('resize', sync);
+    return () => {
+      window.removeEventListener('scroll', sync, true);
+      window.removeEventListener('resize', sync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!peekAnchor]);
+
+  if (counts.total === 0) return null;
+
+  return (
+    <div class={`chat-tool-activity-wrap${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
+        aria-expanded={expanded}
+        aria-label={`${summary}. ${action}`}
+        {...(peekAnchor && last ? { 'aria-describedby': peekId } : {})}
+        onMouseEnter={(e) => openPeekFromPointer(e.currentTarget as HTMLElement)}
+        onMouseMove={(e) => { if (!peekAnchor) openPeekFromPointer(e.currentTarget as HTMLElement); }}
+        onMouseLeave={closePeek}
+        onFocus={(e) => openPeek(e.currentTarget as HTMLElement)}
+        onBlur={closePeek}
+        onClick={() => { closePeek(); setExpanded((value) => !value); }}
+      >
+        <span class="chat-tool-activity-core" aria-hidden="true" />
+        <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
+        <span class="chat-tool-activity-total" aria-hidden="true">{counts.total}</span>
+        <span class="chat-tool-activity-stats" aria-hidden="true">
+          <span class="chat-tool-activity-stat is-complete">✓{counts.completed}</span>
+          {counts.running > 0 && <span class="chat-tool-activity-stat is-running">●{counts.running}</span>}
+          {counts.failed > 0 && <span class="chat-tool-activity-stat is-failed">×{counts.failed}</span>}
+        </span>
+        {/* A miniature tool call: which tool, and what it was called with. Shown
+            on every client — "what is it doing" is the question during a wait
+            regardless of screen size; the chip goes full width and this ellipses
+            rather than being dropped. */}
+        {last && (
+          // No `title` on this span: the hover peek supersedes it, and a native
+          // tooltip would render on top of the panel.
+          <span class="chat-tool-activity-last" aria-hidden="true">
+            <span class="chat-tool-activity-last-name">{last.toolName}</span>
+            {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
+          </span>
+        )}
+        {lastStartTime && <span class="chat-tool-activity-start-time" aria-hidden="true">{lastStartTime}</span>}
+        {lastDuration && (
+          <span
+            class={`chat-tool-activity-time${last?.running ? ' is-running' : ''}`}
+            aria-hidden="true"
+          >{lastDuration}</span>
+        )}
+        <span class="chat-tool-activity-rail" aria-hidden="true">
+          {counts.completed > 0 && (
+            <span class="chat-tool-activity-segment is-complete" style={{ flexGrow: counts.completed }} />
+          )}
+          {counts.running > 0 && (
+            <span class="chat-tool-activity-segment is-running" style={{ flexGrow: counts.running }} />
+          )}
+          {counts.failed > 0 && (
+            <span class="chat-tool-activity-segment is-failed" style={{ flexGrow: counts.failed }} />
+          )}
+        </span>
+        <span class="chat-tool-activity-chevron" aria-hidden="true">⌄</span>
+      </button>
+      {peekAnchor && last && (
+        <ToolActivityPeek
+          anchor={peekAnchor}
+          peekId={peekId}
+          toolName={last.toolName}
+          command={last.toolInput}
+          output={last.toolOutput}
+          error={last.toolError}
+          running={last.running}
+          failed={last.failed}
+          startTime={lastStartTime}
+          duration={lastDuration}
+          chatContainerRect={chatContainerRect}
+          chatFontSize={chatFontSize}
+          chatFontFamily={chatFontFamily}
+        />
       )}
-      {overflows && expanded && (
-        <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
-          {t('chat.tool_fold_collapse')}
-        </button>
+      <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
+      {expanded && (
+        <>
+          <div class="chat-tool-activity-details">
+            {events.map((event) => (
+              <ChatEvent
+                key={event.eventId}
+                event={event}
+                onPathClick={onPathClick}
+                onCloudDocClick={onCloudDocClick}
+                onRemoteDesktopClick={onRemoteDesktopClick}
+                onUrlClick={onUrlClick}
+                onDownload={onDownload}
+                onHtmlPreview={onHtmlPreview}
+                onImagePreview={onImagePreview}
+                onOpenLocalWebPreview={onOpenLocalWebPreview}
+                serverId={serverId}
+                showTime
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            class="chat-tool-activity chat-tool-activity-collapse-footer"
+            aria-expanded={expanded}
+            aria-label={action}
+            title={action}
+            onClick={() => { closePeek(); setExpanded(false); }}
+          >
+            <span class="chat-tool-activity-core" aria-hidden="true" />
+            <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
+            <span class="chat-tool-activity-collapse-label">{action}</span>
+            <span class="chat-tool-activity-collapse-chevron" aria-hidden="true">⌃</span>
+          </button>
+        </>
       )}
     </div>
   );
@@ -2982,19 +7388,27 @@ function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
 /** Collapsible group of consecutive tool events. Shows first and last, folds middle. */
 function ToolCallGroup({
   events,
+  visible = true,
   onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
 }: {
   events: TimelineEvent[];
+  visible?: boolean;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -3009,18 +7423,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
+      <ChatEvent event={first} visible={visible} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} visible={visible} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} visible={visible} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -3031,26 +7445,92 @@ function ToolCallGroup({
   );
 }
 
-// ToolInputFold removed — replaced by unified ToolBlockFold (CSS max-height based)
+// Folded tool rows mount only a bounded preview. The complete stored payload
+// is rendered on expansion (and in an explicitly opened hover peek).
 
 const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
+  streaming,
+  executionState,
   ts,
   eventId,
+  delegationMetadata,
+  taskPairNotification,
+  sessions,
+  liveAssignmentStatuses,
   onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
+  ttsSpeaking,
+  onToggleSpeak,
 }: AssistantBlockProps) {
+  const { t } = useTranslation();
+  const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    ? { className: 'waiting', glyph: SUPERVISION_HEARTBEAT_GLYPH.WAITING, label: t('chat.execution_status.waiting') }
+    : executionState === SUPERVISION_EXECUTION_STATES.NEEDS_INPUT
+      ? { className: 'needs-input', glyph: SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT, label: t('chat.execution_status.needs_input') }
+      : null;
+  const statusOnly = text.length === 0 && status !== null;
+  if (taskPairNotification) {
+    return <TaskPairEventChip eventId={eventId ?? 'task-pair-notice'} payload={taskPairNotification} timestamp={ts} sessions={sessions} />;
+  }
+  const displayText = parseTimelineDisplayText(text);
+  const canSpeak = !statusOnly && !streaming && !!onToggleSpeak && !!eventId && prepareTextForTts(displayText).length > 0;
   return (
     <div
-      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
-      <ChatTime ts={ts} />
+      {text && <ChatMarkdown text={displayText} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {status && (
+        <span
+          class={`chat-execution-status-chip ${status.className}`}
+          role="status"
+          aria-label={status.label}
+          title={status.label}
+        >
+          <span class="chat-execution-status-glyph" aria-hidden="true">{status.glyph}</span>
+          {status.label}
+        </span>
+      )}
+      {!statusOnly && (
+        <div class="chat-assistant-footer">
+          <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
+          <div class="chat-assistant-footer-meta">
+            <ChatTime ts={ts} />
+            {canSpeak && (
+              <button
+                type="button"
+                class={`chat-tts-btn${ttsSpeaking ? ' is-speaking' : ''}`}
+                aria-label={t(ttsSpeaking ? 'chat.tts_stop' : 'chat.tts_speak')}
+                title={t(ttsSpeaking ? 'chat.tts_stop' : 'chat.tts_speak')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleSpeak!(eventId!, displayText);
+                }}
+              >
+                {ttsSpeaking ? (
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <rect x="4" y="4" width="8" height="8" rx="1.5" />
+                  </svg>
+                ) : (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 });
@@ -3060,20 +7540,25 @@ function AttachmentDownloadButton({
   serverId,
   onPathClick,
   onHtmlPreview,
+  sessionName,
 }: {
-  att: { id: string; originalName?: string; size?: number; daemonPath?: string };
+  att: { id?: string; originalName?: string; size?: number; daemonPath?: string };
   serverId: string;
   onPathClick?: (p: string) => void;
   onHtmlPreview?: (p: string) => void;
+  sessionName?: string;
 }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
-  const label = att.originalName || att.id;
+  const pickingDownloadRef = useRef(false);
+  const downloadId = attachmentDownloadId(att.id, att.daemonPath);
+  const label = attachmentDisplayName(att.id, att.originalName, att.daemonPath);
   const sizeLabel = att.size ? ` (${(att.size / 1024).toFixed(0)}KB)` : '';
 
   const handleError = (err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
+    if (isInsufficientCapacityError(msg)) setError(t('upload.insufficient_capacity'));
+    else if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
     else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
     else if (msg.includes('404')) setError(t('upload.download_expired'));
     else setError(t('upload.upload_failed'));
@@ -3086,13 +7571,22 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl"
         onClick={() => {
           setError(null);
-          // If file has a daemon path, open in file browser floating panel
-          if (att.daemonPath && onPathClick) {
+          // Relative source references are still opened in the file browser.
+          // Uploaded attachments use their opaque download handle; never send
+          // a host absolute path to the browser or to the download route.
+          if (!downloadId && att.daemonPath && !isAbsoluteAttachmentPath(att.daemonPath) && onPathClick) {
             onPathClick(att.daemonPath);
             return;
           }
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
+            return;
+          }
           import('../api.js').then(({ previewAttachment }) => {
-            previewAttachment(serverId, att.id).catch(handleError);
+            const request = sessionName
+              ? previewAttachment(serverId, downloadId, sessionName)
+              : previewAttachment(serverId, downloadId);
+            request.catch(handleError);
           });
         }}
         title={error || label}
@@ -3103,16 +7597,33 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl-btn"
         onClick={() => {
           setError(null);
-          import('../api.js').then(({ downloadAttachment }) => {
-            downloadAttachment(serverId, att.id).catch(handleError);
-          });
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
+            return;
+          }
+          if (pickingDownloadRef.current) return;
+          pickingDownloadRef.current = true;
+          // Open save dialog synchronously inside the click gesture before any dynamic import.
+          void selectPreviewDownloadDestination(label)
+            .finally(() => {
+              pickingDownloadRef.current = false;
+            })
+            .then((destination) =>
+              import('../api.js').then(({ downloadAttachmentToCenter }) =>
+                downloadAttachmentToCenter(serverId, downloadId, label, sessionName, destination),
+              ),
+            )
+            .catch((err) => {
+              if (isFileUploadCanceled(err)) return;
+              handleError(err);
+            });
         }}
         title={t('upload.download_file')}
         aria-label={t('upload.download_file')}
       >
         ⬇
       </button>
-      {att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
+      {!downloadId && att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
         <button
           type="button"
           class="chat-attachment-dl-btn chat-html-preview-btn"
@@ -3130,75 +7641,391 @@ function AttachmentDownloadButton({
   );
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string | null {
+  if (payload.automation !== true || typeof payload.automationKind !== 'string') return null;
+  const kind = payload.automationKind;
+  const known = (SUPERVISION_USER_PROMPT_LABEL_KEYS as Readonly<Record<string, string>>)[kind];
+  if (known) return known;
+  return kind.startsWith(SUPERVISION_AUTOMATION_KIND_PREFIX)
+    ? 'chat.supervision_prompt.generic'
+    : null;
+}
+
+function SupervisionAutomationPrompt({
+  text,
+  label,
+  automationKind,
+  showDetailsLabel,
+  hideDetailsLabel,
+}: {
+  text: string;
+  label: string;
+  automationKind: string;
+  showDetailsLabel: string;
+  hideDetailsLabel: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
+  const heartbeat = automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === TASK_PAIR_HEARTBEAT_AUTOMATION_KIND;
+  return (
+    <div class={`chat-supervision-prompt${heartbeat ? ' is-heartbeat' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-prompt-toggle"
+        aria-expanded={expanded}
+        aria-label={`${label}: ${actionLabel}`}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeat && <span class="chat-supervision-heartbeat-glyph" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>}
+        {label}
+      </button>
+      {expanded && (
+        <pre class="chat-supervision-prompt-details">{text}</pre>
+      )}
+    </div>
+  );
+}
+
+function CronRunCard({ run, locale }: { run: CronRunTimelineProjection; locale?: string }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = `cron-run-${run.scheduleId}-${run.executionId ?? 'dispatch'}`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+  const formatTime = (value: number | undefined) => value === undefined
+    ? t('cron.run_card.not_available')
+    : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  const completionLabel = run.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? t('cron.completion_until_complete')
+    : t('cron.completion_recurring');
+  return (
+    <section class="chat-cron-run" aria-label={t('cron.run_card.aria_label', { name: run.name })}>
+      <div class="chat-cron-run-header">
+        <strong class="chat-cron-run-title">{run.name}</strong>
+        <div class="chat-cron-run-chips">
+          {run.cronExpr && <span class="chat-cron-run-chip" title={t('cron.run_card.schedule')}>{run.cronExpr}</span>}
+          <span class="chat-cron-run-chip">{completionLabel}</span>
+          <span class="chat-cron-run-chip is-status">{t('cron.run_card.status_dispatched')}</span>
+        </div>
+      </div>
+      <div class="chat-cron-run-next">
+        <span>{t('cron.run_card.next_run')}</span>
+        <time>{formatTime(run.nextRunAt)}</time>
+        {run.timezone && <span class="chat-cron-run-timezone">{run.timezone}</span>}
+      </div>
+      <button
+        type="button"
+        class="chat-cron-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? t('cron.run_card.hide_details') : t('cron.run_card.show_details')}
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-cron-run-details">
+          <div class="chat-cron-run-detail-row">
+            <span>{t('cron.run_card.previous_run')}</span>
+            <time>{formatTime(run.previousRunAt)}</time>
+          </div>
+          <div class="chat-cron-run-contract">
+            {t('cron.run_card.contract_summary', {
+              id: run.contractId,
+              version: run.contractVersion,
+              count: Object.keys(run.constraints).length,
+            })}
+          </div>
+          <div class="chat-cron-run-task-label">{t('cron.run_card.task_body')}</div>
+          <pre class="chat-cron-run-task">{run.taskBody}</pre>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PeerAuditRoundChip({
+  round,
+  outcomeLabel,
+}: {
+  round: unknown;
+  outcomeLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (!isPeerAuditRound(round)) return null;
+  const roundAria = t('peerAuditResult.roundAria', { round, outcome: outcomeLabel });
+  return (
+    <span
+      class="peer-audit-round-chip"
+      aria-label={roundAria}
+      title={roundAria}
+    >
+      {t('peerAuditResult.roundChip', { round })}
+    </span>
+  );
+}
+
+function ToolCallRow({
+  event,
+  visible,
+  toolName,
+  toolInput,
+  locale,
+  onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
+  onUrlClick,
+  onDownload,
+  onHtmlPreview,
+  onImagePreview,
+  onOpenLocalWebPreview,
+}: {
+  event: TimelineEvent;
+  visible: boolean;
+  toolName: string;
+  toolInput: string;
+  locale?: string;
+  onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+}) {
+  const { t } = useTranslation();
+  const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
+    ? event.payload._callPayloadInput
+    : event.payload.input;
+  const callDetail = event.payload._callDetail ?? event.payload.detail;
+  const resultDetail = event.payload._resultDetail;
+  const resultPayloadOutput = event.payload._resultPayloadOutput;
+  const isMerged = event.payload._merged === true;
+  const running = !isMerged;
+  const toolFailed = event.payload._toolFailed === true || Boolean(event.payload.error);
+  const startTs = typeof event.ts === 'number' && Number.isFinite(event.ts) ? event.ts : null;
+  const endTs = typeof event.payload._resultTs === 'number' && Number.isFinite(event.payload._resultTs)
+    ? event.payload._resultTs
+    : null;
+  // Tick only while an unmerged call is running and visible: settled historical calls register zero intervals.
+  const nowMs = useNowTicker(visible && running && startTs !== null);
+  const durationMs = startTs !== null
+    ? (running ? Math.max(0, nowMs - startTs) : (endTs !== null ? Math.max(0, endTs - startTs) : null))
+    : null;
+  const durationText = durationMs !== null ? formatToolDuration(durationMs) : null;
+  const startTimeText = startTs !== null
+    ? formatChatDateTime(startTs, running ? nowMs : Date.now(), locale)
+    : null;
+  const toolError = toolFailed
+    ? (String(event.payload._toolError ?? event.payload.error ?? '') || undefined)
+    : undefined;
+  const toolOutput = !toolFailed
+    ? (event.payload._output
+        ? String(event.payload._output)
+        : (isMerged
+            ? formatToolOutputPreview(resultPayloadOutput)
+              ?? formatToolOutputPreview((resultDetail as any)?.output)
+              ?? undefined
+            : undefined))
+    : undefined;
+  const previewText = toolError ? `error: ${toolError}` : toolOutput;
+
+  return (
+    <ToolBlockFold>
+      {(expanded, toggleExpanded, action) => {
+        const { firstLine: toolInputFirstLine, remainingLines: toolInputRemainingLines } = splitToolFoldPreview(toolFoldDisplayText(toolInput, expanded));
+        return (
+          <>
+            <div
+              class="chat-event chat-tool chat-tool-command-row chat-tool-fold-header"
+              onClick={(clickEvent) => toggleToolFoldFromHeader(clickEvent, toggleExpanded)}
+            >
+              <button
+                type="button"
+                class="chat-tool-block-toggle"
+                aria-expanded={expanded}
+                aria-label={action}
+                title={action}
+                onClick={toggleExpanded}
+              >
+                <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+              </button>
+              <span class="chat-tool-name">{toolName}</span>
+              {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>}
+              <span class="chat-tool-meta">
+                {running ? (
+                  <span
+                    class="chat-tool-state is-running"
+                    role="status"
+                    aria-label={t('chat.tool_peek_running')}
+                    title={t('chat.tool_peek_running')}
+                  >
+                    <span class="chat-tool-state-dot" aria-hidden="true" />
+                    <span>{t('chat.tool_peek_running')}</span>
+                  </span>
+                ) : (
+                  <span
+                    class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`}
+                    aria-label={toolFailed ? t('chat.tool_peek_failed') : t('chat.tool_peek_done')}
+                    title={toolFailed ? t('chat.tool_peek_failed') : t('chat.tool_peek_done')}
+                  >
+                    {toolFailed ? '×' : '✓'}
+                  </span>
+                )}
+                {durationText !== null && <span class="chat-tool-duration">{durationText}</span>}
+                {startTimeText !== null && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{startTimeText}</span>}
+              </span>
+            </div>
+            {toolInputRemainingLines !== null && (
+              <div class="chat-event chat-tool chat-tool-fold-continuation">
+                <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
+              </div>
+            )}
+            {previewText && (
+              <div class="chat-event chat-tool chat-tool-result-preview">
+                <span class={toolError ? 'chat-tool-error' : 'chat-tool-output'}>
+                  {splitPathsAndUrls(toolFoldDisplayText(previewText, expanded), onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}
+                </span>
+              </div>
+            )}
+            {expanded && (
+              <MergedToolDetailPanel
+                toolName={toolName}
+                callDetail={callDetail}
+                resultDetail={resultDetail}
+                callPayloadInput={callPayloadInput}
+                resultPayloadOutput={resultPayloadOutput}
+              />
+            )}
+          </>
+        );
+      }}
+    </ToolBlockFold>
+  );
+}
+
 const ChatEvent = memo(function ChatEvent({
   event,
+  visible = true,
+  sessionName,
+  sessions,
   onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onFileChangeOpen,
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
   onResendFailed,
   showTime,
+  isPendingAskQuestion,
+  answeredText,
+  onAskAnswer,
 }: {
   event: TimelineEvent;
+  visible?: boolean;
+  sessionName?: string;
+  sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
+  isPendingAskQuestion?: boolean;
+  answeredText?: string;
+  onAskAnswer?: (toolUseId: string, answer: string) => boolean | void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   switch (event.type) {
     case 'user.message': {
-      let userText = String(event.payload.text ?? '');
-      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
+      const rawUserText = String(event.payload.text ?? '');
+      // Only the human's own input sits on the right; agent deliveries and
+      // daemon injections are incoming messages and sit on the left.
+      const origin = classifyUserMessageOrigin(event.payload);
+      const originClass = ` chat-user-origin-${origin}`;
+      const cronRun = event.source === 'daemon' && event.confidence === 'high'
+        ? readCronRunTimelineProjection(event.payload[CRON_RUN_TIMELINE.PAYLOAD_KEY])
+        : undefined;
+      if (cronRun) {
+        return (
+          <div class={`chat-event chat-user chat-user-cron-run${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <CronRunCard run={cronRun} locale={locale} />
+            <ChatTime ts={event.ts} />
+          </div>
+        );
+      }
+      const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
+      if (supervisionPromptLabelKey) {
+        return (
+          <div class={`chat-event chat-user chat-user-supervision-prompt${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <SupervisionAutomationPrompt
+              text={rawUserText}
+              label={t(supervisionPromptLabelKey)}
+              automationKind={String(event.payload.automationKind)}
+              showDetailsLabel={t('chat.supervision_prompt.show_details')}
+              hideDetailsLabel={t('chat.supervision_prompt.hide_details')}
+            />
+          </div>
+        );
+      }
+      let userText = parseTimelineDisplayText(rawUserText);
+      const attachments = event.payload.attachments as Array<{ id?: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
         for (const att of attachments) {
-          if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
+          if (att.daemonPath) {
+            const path = escapeRegExp(att.daemonPath);
+            // Attachment references are model-facing metadata.  Do not paint
+            // the daemon's absolute host path into the browser history.
+            userText = userText
+              .replace(new RegExp(`#\\d+:\\(${path}\\)`, 'g'), '')
+              .replace(new RegExp(`@${path}`, 'g'), '')
+              .trim();
+          }
         }
       }
       const isPending = !!event.payload.pending;
       const isFailed = !!event.payload.failed;
-      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
+      const isQueued = event.payload.queued === true && !isFailed && !isPending;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
+      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
-      return (
-        // data-event-id lets the pinned-last-message banner target this bubble
-        // with an IntersectionObserver so the banner only shows when the real
-        // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
-          {sharedActorLabel && (
-            <div class="chat-shared-actor-label" title={sharedActorLabel}>
-              {sharedActorLabel}
-            </div>
-          )}
-          {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
-          ))}
-          {userText && (
-            <UserMessageText
-              text={userText}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-            />
-          )}
+      const isAgent = origin === CHAT_MESSAGE_ORIGINS.AGENT;
+      const hasTime = showTime !== false && typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
+      const hasStatusOrTime = isPending || isQueued || isFailed || (!isPending && !isFailed && hasTime);
+      const timeAndStatus = hasStatusOrTime ? (
+        <>
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
               aria-label={t('chat.sendingLabel', 'Sending')}
               title={t('chat.sendingLabel', 'Sending')}
             />
+          )}
+          {isQueued && (
+            <span
+              class="chat-user-status chat-user-status-queued"
+              aria-label={t('chat.messageQueuedLabel', 'Queued')}
+              title={t('chat.messageQueuedLabel', 'Queued')}
+            >{t('chat.messageQueuedLabel', 'Queued')}</span>
           )}
           {isFailed && (
             <div class="chat-user-status chat-user-status-failed">
@@ -3211,68 +8038,317 @@ const ChatEvent = memo(function ChatEvent({
                 <button
                   type="button"
                   class="chat-user-retry-btn"
-                  onClick={() => onResendFailed(commandId, String(event.payload.text ?? ''))}
+                  onClick={() => onResendFailed(commandId, rawUserText)}
                 >
                   {t('chat.retrySend', 'Retry')}
                 </button>
               )}
             </div>
           )}
-          {!isPending && !isFailed && <ChatTime ts={event.ts} />}
+          {!isPending && !isFailed && hasTime && <ChatTime ts={event.ts} />}
+        </>
+      ) : null;
+      return (
+        // data-event-id lets the pinned-last-message banner target this bubble
+        // with an IntersectionObserver so the banner only shows when the real
+        // bubble has scrolled off the top of the viewport.
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+          {sharedActorLabel && (
+            <div class="chat-shared-actor-label" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
+          {attachments && serverId && attachments.length > 0 && (
+            <div class="chat-user-attachments">
+              {attachments.map((att) => (
+                <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+              ))}
+            </div>
+          )}
+          {userText && (
+            <UserMessageText
+              text={userText}
+              visible={visible}
+              onPathClick={onPathClick}
+              onCloudDocClick={onCloudDocClick}
+              onRemoteDesktopClick={onRemoteDesktopClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
+              isAgent={isAgent}
+              compactPathBadge={origin === CHAT_MESSAGE_ORIGINS.USER}
+              footerRight={timeAndStatus}
+            />
+          )}
+          {!userText && timeAndStatus}
         </div>
       );
     }
 
-    case 'tool.call': {
-      const toolName = String(event.payload.tool ?? 'tool');
-      const callDetail = event.payload._callDetail ?? event.payload.detail;
-      const resultDetail = event.payload._resultDetail;
-      const shouldShowTime = showTime || event.payload._merged === true;
-      // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const callInput = summarizeToolInput(event.payload.input, callDetail);
-      const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
-      const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
-      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
+    case 'peer_audit.result': {
+      const outcome = String(event.payload.outcome ?? 'target_unavailable');
+      const outcomeKey = outcome === 'pass'
+        ? 'result_pass'
+        : outcome === 'rework'
+          ? 'result_rework'
+          : outcome === 'timeout'
+            ? 'result_timeout'
+            : outcome === 'cancelled'
+              ? 'result_cancelled'
+              : 'result_unavailable';
+      const outcomeLabel = t(`peerAuditQuick.${outcomeKey}`);
+      const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
+      const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
+      const findingsPreview = typeof event.payload.findingsPreview === 'string'
+        ? event.payload.findingsPreview
+        : '';
+      const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
+        ? event.payload.disposition
+        : null;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <ToolBlockFold>
-          <div class="chat-event chat-tool">
-            <span class="chat-tool-icon">{'>'}</span>
-            <span class="chat-tool-name">{toolName}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
-            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+        <section
+          class="chat-event chat-system peer-audit-result-card"
+          data-event-id={event.eventId}
+          {...(supervisionTask ? {
+            'data-task-id': supervisionTask.taskId,
+            'data-assignment-id': supervisionTask.assignmentId,
+          } : {})}
+        >
+          {supervisionTask?.title ? (
+            <div class="delegation-reply-card-heading peer-audit-result-heading">
+              <span class="delegation-reply-card-kicker">{t('peerAuditResult.title')}</span>
+              <ExpandableTaskObjective
+                text={supervisionTask.objective ?? supervisionTask.title}
+                textClassName="peer-audit-result-objective"
+              />
+            </div>
+          ) : (
+            <strong>{t('peerAuditResult.title')}</strong>
+          )}
+          <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
+          <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
+          <div class="peer-audit-result-verdict-row">
+            <span class={`peer-audit-result-outcome peer-audit-result-outcome--${outcome}`}>{outcomeLabel}</span>
+            <PeerAuditRoundChip round={event.payload.round} outcomeLabel={outcomeLabel} />
           </div>
-          {toolOutput && (
-            <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+          {disposition && (
+            <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
+          )}
+          {findingsPreview && (
+            <details>
+              <summary>{t('peerAuditResult.findingsPreview')}</summary>
+              <ChatMarkdown text={findingsPreview} onCloudDocClick={onCloudDocClick} onRemoteDesktopClick={onRemoteDesktopClick} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
+            </details>
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
+
+    case 'peer_audit.status':
+      return null;
+
+    case TASK_PAIR_TIMELINE_EVENT:
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} timestamp={event.ts} sessions={sessions} />;
+
+    case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
+      const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
+      const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : undefined;
+      const verdictClass = verdict ? ` delegation-reply-card--${verdict.toLowerCase()}` : '';
+      const verdictLabel = verdict
+        ? t(verdict === PEER_AUDIT_VERDICTS[0]
+          ? 'peerAuditQuick.result_pass'
+          : 'peerAuditQuick.result_rework')
+        : undefined;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
+      return (
+        <section
+          class={`chat-event chat-system delegation-reply-card${verdictClass}`}
+          data-event-id={event.eventId}
+          {...(verdict ? { 'data-verdict': verdict } : {})}
+        >
+          <div class="delegation-reply-card-head">
+            <div class="delegation-reply-card-heading">
+              {supervisionTask?.title ? (
+                <>
+                  <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
+                  <ExpandableTaskObjective
+                    text={supervisionTask.objective ?? supervisionTask.title}
+                    textClassName="delegation-reply-card-objective"
+                  />
+                </>
+              ) : (
+                <strong>{t('delegation.reply_title')}</strong>
+              )}
+            </div>
+            <div class="delegation-reply-card-meta">
+              {verdict && (
+                <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              {verdict && (
+                <PeerAuditRoundChip round={event.payload.round} outcomeLabel={verdictLabel ?? verdict} />
+              )}
+              <span>{t('delegation.reply_from', { source })}</span>
+            </div>
+          </div>
+          {supervisionTask && (
+            <div
+              class={`delegation-reply-task${supervisionTask.title ? '' : ' is-fallback'}`}
+              data-testid="delegation-reply-task"
+              data-task-id={supervisionTask.taskId}
+              data-assignment-id={supervisionTask.assignmentId}
+              {...(supervisionTask.attemptId ? { 'data-attempt-id': supervisionTask.attemptId } : {})}
+              {...(supervisionTask.revision ? { 'data-revision': supervisionTask.revision } : {})}
+            >
+              <span class="delegation-reply-task-ids">
+                <span aria-label={`${t('delegation.claim.task_id')}: ${supervisionTask.taskId}`}>{supervisionTask.taskId}</span>
+                <span aria-hidden="true">·</span>
+                <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
+              </span>
             </div>
           )}
-          <MergedToolDetailPanel toolName={toolName} callDetail={callDetail} resultDetail={resultDetail} />
-        </ToolBlockFold>
+          {result && (
+            verdict ? (
+              <details class="delegation-reply-card-findings">
+                <summary>{t('peerAuditResult.findingsPreview')}</summary>
+                <div class="delegation-reply-card-body">
+                  <ChatMarkdown
+                    text={result}
+                    onPathClick={onPathClick}
+                    onCloudDocClick={onCloudDocClick}
+                    onRemoteDesktopClick={onRemoteDesktopClick}
+                    onUrlClick={onUrlClick}
+                    onDownload={onDownload}
+                    onHtmlPreview={onHtmlPreview}
+                    onImagePreview={onImagePreview}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  />
+                </div>
+              </details>
+            ) : (
+              <div class="delegation-reply-card-body">
+                <ChatMarkdown
+                  text={result}
+                  onPathClick={onPathClick}
+                  onCloudDocClick={onCloudDocClick}
+                  onRemoteDesktopClick={onRemoteDesktopClick}
+                  onUrlClick={onUrlClick}
+                  onDownload={onDownload}
+                  onHtmlPreview={onHtmlPreview}
+                  onImagePreview={onImagePreview}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
+                />
+              </div>
+            )
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
+
+    case 'tool.call': {
+      const { toolName, toolInput } = deriveToolCallDisplay(event);
+      if (isAskQuestionToolName(toolName)) {
+        const extractedQuestions = extractAskQuestionsFromToolCallPayload(event.payload, toolInput);
+        if (extractedQuestions.length > 0) {
+          return (
+            <AskQuestionTimelineCard
+              event={event}
+              showTime={showTime}
+              isPending={Boolean(isPendingAskQuestion)}
+              answeredText={answeredText}
+              onAskAnswer={onAskAnswer}
+              questionsOverride={extractedQuestions}
+              toolUseIdOverride={resolveAskQuestionEventToolUseId(event)}
+            />
+          );
+        }
+      }
+      return (
+        <ToolCallRow
+          event={event}
+          visible={visible}
+          toolName={toolName}
+          toolInput={toolInput}
+          locale={locale}
+          onPathClick={onPathClick}
+          onCloudDocClick={onCloudDocClick}
+          onRemoteDesktopClick={onRemoteDesktopClick}
+          onUrlClick={onUrlClick}
+          onDownload={onDownload}
+          onHtmlPreview={onHtmlPreview}
+          onImagePreview={onImagePreview}
+          onOpenLocalWebPreview={onOpenLocalWebPreview}
+        />
       );
     }
 
     case 'tool.result': {
       // Standalone tool.result (not merged) — still rendered for cases without a preceding call
       const error = event.payload.error;
-      const output = formatToolPayloadValue(event.payload.output);
+      const output = formatToolOutputPreview(event.payload.output) ?? '';
       const detail = event.payload.detail;
+      const command = summarizeToolCommand(event.payload);
+      const completedText = command
+        ? t('chat.tool_result_done_with_command', { command })
+        : t('chat.tool_result_done');
+      const resultText = error ? `error: ${String(error)}` : output || completedText;
+      const resultClass = error ? 'chat-tool-error' : 'chat-tool-output';
+      const resultTs = typeof event.ts === 'number' && Number.isFinite(event.ts) ? event.ts : null;
+      const resultTimeText = resultTs !== null ? formatChatDateTime(resultTs, Date.now(), locale) : null;
       return (
         <ToolBlockFold>
-          <div class="chat-event chat-tool">
-            <span class="chat-tool-icon">{'<'}</span>
-            {error ? (
-            <span class="chat-tool-error">{`error: ${String(error)}`}</span>
-          ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
-            ) : (
-              <span class="chat-tool-output">done</span>
-            )}
-            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
-          </div>
-          <ToolResultDetailPanel detail={detail} />
+          {(expanded, toggleExpanded, action) => {
+            const { firstLine: resultFirstLine, remainingLines: resultRemainingLines } = splitToolFoldPreview(toolFoldDisplayText(resultText, expanded));
+            return (
+              <>
+                <div
+                  class="chat-event chat-tool chat-tool-result-row chat-tool-fold-header"
+                  onClick={(event) => toggleToolFoldFromHeader(event, toggleExpanded)}
+                >
+                  <button
+                    type="button"
+                    class="chat-tool-block-toggle"
+                    aria-expanded={expanded}
+                    aria-label={action}
+                    title={action}
+                    onClick={toggleExpanded}
+                  >
+                    <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                  </button>
+                  <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
+                  <span class="chat-tool-meta">
+                    <span
+                      class={`chat-tool-state${error ? ' is-failed' : ' is-complete'}`}
+                      aria-label={error ? t('chat.tool_peek_failed') : t('chat.tool_peek_done')}
+                      title={error ? t('chat.tool_peek_failed') : t('chat.tool_peek_done')}
+                    >
+                      {error ? '×' : '✓'}
+                    </span>
+                    {resultTimeText !== null && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{resultTimeText}</span>}
+                  </span>
+                </div>
+                {resultRemainingLines !== null && (
+                  <div class="chat-event chat-tool chat-tool-fold-continuation">
+                    <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}</span>
+                  </div>
+                )}
+                {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
+              </>
+            );
+          }}
         </ToolBlockFold>
       );
     }
+
 
     case 'mode.state':
       return (
@@ -3283,8 +8359,12 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'session.state': {
       const state = String(event.payload.state ?? '');
-      const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
-      const isUserCompactFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
+      const errorDetail = getSessionStateDetail(event);
+      const liveStatus = deriveSessionLiveStatus({
+        sessionState: state,
+        sessionStateReason: typeof event.payload.reason === 'string' ? event.payload.reason : null,
+        sessionStateError: errorDetail,
+      });
       const stateLabel: Record<string, string> = {
         idle: t('session.state_idle'),
         running: t('session.state_running'),
@@ -3294,15 +8374,14 @@ const ChatEvent = memo(function ChatEvent({
         stopping: t('session.state_stopping'),
         stopped: t('session.state_stopped'),
       };
-      const label = isUserCancelFeedback
+      const label = liveStatus.controlFeedback === 'stop_requested'
         ? t('session.state_stop_requested')
-        : isUserCompactFeedback
+        : liveStatus.controlFeedback === 'compact_requested'
           ? t('session.state_compacting')
           : (stateLabel[state] ?? state);
-      const errorDetail = getSessionStateDetail(event);
-      const displayLabel = errorDetail
+      const displayLabel = (liveStatus.mode === 'error' || liveStatus.mode === 'cancelled') && liveStatus.errorDetail
         ? t('session.state_error_detail', {
-            error: errorDetail,
+            error: liveStatus.errorDetail,
             defaultValue: 'Error: {{error}}',
           })
         : label;
@@ -3311,7 +8390,7 @@ const ChatEvent = memo(function ChatEvent({
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
           <span>{displayLabel}</span>
           {inline
-            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>
             : <ChatTime ts={event.ts} />}
         </div>
       );
@@ -3333,10 +8412,258 @@ const ChatEvent = memo(function ChatEvent({
     case 'file.change':
       return <FileChangeCard event={event} onOpenFile={onFileChangeOpen} />;
 
+    case 'ask.question':
+      return (
+        <AskQuestionTimelineCard
+          event={event}
+          showTime={showTime}
+          isPending={Boolean(isPendingAskQuestion)}
+          answeredText={answeredText}
+          onAskAnswer={onAskAnswer}
+        />
+      );
+
     default:
       return null;
   }
 });
+
+function isAskQuestionToolCallEvent(event: TimelineEvent): boolean {
+  return event.type === 'tool.call'
+    && isAskQuestionToolName(event.payload?.tool)
+    && extractAskQuestionsFromToolCallPayload(event.payload).length > 0;
+}
+
+const AskQuestionTimelineCard = memo(function AskQuestionTimelineCard({
+  event,
+  showTime,
+  isPending = false,
+  answeredText,
+  onAskAnswer,
+  questionsOverride,
+  toolUseIdOverride,
+}: {
+  event: TimelineEvent;
+  showTime?: boolean;
+  isPending?: boolean;
+  answeredText?: string;
+  onAskAnswer?: (toolUseId: string, answer: string) => boolean | void;
+  questionsOverride?: AskQuestionItem[];
+  toolUseIdOverride?: string;
+}) {
+  const { t } = useTranslation();
+  const rawQuestions = useMemo(
+    () => questionsOverride ?? normalizeAskQuestionsPayload(event.payload?.questions),
+    [questionsOverride, event.payload?.questions],
+  );
+  const displayQuestions = useMemo(
+    () => rawQuestions.map((q) => localizeAskQuestionItem(q, t)),
+    [rawQuestions, t],
+  );
+  const [selections, setSelections] = useState<Array<Set<number>>>(() =>
+    displayQuestions.map(() => new Set<number>()),
+  );
+  const [texts, setTexts] = useState<string[]>(() => displayQuestions.map(() => ''));
+  const [submitted, setSubmitted] = useState(false);
+  const [submittedAnswer, setSubmittedAnswer] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelections(displayQuestions.map(() => new Set<number>()));
+    setTexts(displayQuestions.map(() => ''));
+    setSubmitted(false);
+    setSubmittedAnswer(null);
+  }, [event.eventId, displayQuestions.length]);
+
+  const hasTime = showTime !== false && typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
+  const isInteractive = isPending && Boolean(onAskAnswer) && displayQuestions.length > 0 && !submitted;
+  const toolUseId = toolUseIdOverride ?? (typeof event.payload?.toolUseId === 'string' ? event.payload.toolUseId : String(event.payload?.toolUseId ?? ''));
+  const effectiveAnsweredText = answeredText?.trim() || submittedAnswer?.trim() || '';
+
+  function submitInlineAnswer() {
+    if (!onAskAnswer || !isInteractive) return;
+    const answer = buildAskQuestionAnswer(displayQuestions, selections, texts);
+    const result = onAskAnswer(toolUseId, answer);
+    if (result !== false) {
+      setSubmittedAnswer(answer);
+      setSubmitted(true);
+    }
+  }
+
+  return (
+    <div
+      class={`chat-event ask-question-timeline-card${isInteractive ? ' ask-question-timeline-card-interactive' : ' ask-question-timeline-card-compact ask-question-timeline-card-answered'}`}
+      data-event-id={event.eventId}
+      data-ask-state={isInteractive ? 'pending' : 'answered'}
+    >
+      {displayQuestions.length === 0 ? (
+        <div class="ask-question-timeline-empty">
+          {t('askQuestion.timelineFallback', { defaultValue: 'Question asked' })}
+        </div>
+      ) : isInteractive ? (
+        <div class="ask-question-timeline-list">
+          {displayQuestions.map((q, qi) => (
+            <div class="ask-question-timeline-item" key={qi}>
+              {q.header && <div class="ask-header ask-question-timeline-header">{q.header}</div>}
+              <div class="ask-question ask-question-timeline-question">{q.question}</div>
+              {q.options && q.options.length > 0 && (
+                <div class="ask-options ask-question-timeline-options">
+                  {q.options.map((opt, oi) => (
+                    <AskQuestionOption
+                      key={oi}
+                      label={opt.label}
+                      description={opt.description}
+                      multiSelect={q.multiSelect}
+                      name={`ask-inline-${event.eventId}-${qi}`}
+                      selected={Boolean(selections[qi]?.has(oi))}
+                      optionClassName="ask-question-timeline-option"
+                      onChange={() => {
+                        setSelections((prev) => {
+                          const next = displayQuestions.map((_, idx) => new Set(prev[idx] ?? []));
+                          if (q.multiSelect) {
+                            if (next[qi].has(oi)) next[qi].delete(oi);
+                            else next[qi].add(oi);
+                          } else {
+                            next[qi] = new Set([oi]);
+                          }
+                          return next;
+                        });
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+              <input
+                class="ask-custom-input ask-question-timeline-input"
+                type="text"
+                placeholder={q.options && q.options.length > 0
+                  ? t('askQuestion.customPlaceholder', { defaultValue: 'Custom / extra (optional)' })
+                  : t('askQuestion.answerPlaceholder', { defaultValue: 'Your answer' })}
+                value={texts[qi] ?? ''}
+                onInput={(e) => {
+                  const value = (e.target as HTMLInputElement).value;
+                  setTexts((prev) => displayQuestions.map((_, idx) => (idx === qi ? value : (prev[idx] ?? ''))));
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+                    e.preventDefault();
+                    submitInlineAnswer();
+                  }
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div class="ask-question-compact-body">
+          <div class="ask-question-compact-top">
+            <span class={`ask-question-compact-badge${effectiveAnsweredText ? '' : ' is-unanswered'}`}>
+              {effectiveAnsweredText
+                ? t('askQuestion.answered', { defaultValue: 'Answered' })
+                : t('askQuestion.timelineFallback', { defaultValue: 'Question asked' })}
+            </span>
+            {displayQuestions.length === 1 && displayQuestions[0]?.header && (
+              <span class="ask-header ask-question-compact-header">{displayQuestions[0].header}</span>
+            )}
+          </div>
+          <div class="ask-question-compact-list">
+            {displayQuestions.map((q, qi) => (
+              <div class="ask-question-compact-item" key={qi}>
+                {displayQuestions.length > 1 && q.header && (
+                  <span class="ask-header ask-question-compact-header">{q.header}</span>
+                )}
+                <div class="ask-question-compact-question">{q.question}</div>
+              </div>
+            ))}
+          </div>
+          {effectiveAnsweredText && (
+            <div class="ask-question-compact-answer">{effectiveAnsweredText}</div>
+          )}
+        </div>
+      )}
+      {isInteractive && (
+        <div class="ask-actions ask-question-timeline-actions">
+          <button type="button" class="ask-btn-submit" onClick={submitInlineAnswer}>
+            {t('askQuestion.answer', { defaultValue: 'Answer' })}
+          </button>
+        </div>
+      )}
+      {hasTime && <ChatTime ts={event.ts} />}
+    </div>
+  );
+});
+
+function SupervisionStatusRun({ item }: { item: ViewItem }) {
+  const { t, i18n } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const heartbeatCount = item.heartbeatCount ?? 0;
+  const waitingCount = item.waitingCount ?? 0;
+  const heartbeatLabel = heartbeatCount > 0
+    ? t('chat.supervision_status_run.heartbeats', { count: heartbeatCount })
+    : '';
+  const waitingLabel = waitingCount > 0
+    ? t('chat.supervision_status_run.waiting', { count: waitingCount })
+    : '';
+  const statusLabel = [heartbeatLabel, waitingLabel].filter(Boolean).join(' · ');
+  const locale = resolveI18nLocale(i18n);
+  const now = Date.now();
+  const firstTime = formatChatDateTime(item.ts ?? 0, now, locale);
+  const lastTime = formatChatDateTime(item.lastTs ?? item.ts ?? 0, now, locale);
+  const timeRange = firstTime === lastTime ? firstTime : `${firstTime}–${lastTime}`;
+  const actionLabel = expanded
+    ? t('chat.supervision_status_run.collapse')
+    : t('chat.supervision_status_run.expand');
+  const detailsId = `${item.key}:details`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+
+  return (
+    <div class={`chat-supervision-status-run${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-status-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        aria-label={t('chat.supervision_status_run.aria', { status: statusLabel, timeRange, action: actionLabel })}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeatCount > 0 && (
+          <span class="chat-supervision-status-run-part is-heartbeat">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>
+            {heartbeatLabel}
+          </span>
+        )}
+        {heartbeatCount > 0 && waitingCount > 0 && <span aria-hidden="true">·</span>}
+        {waitingCount > 0 && (
+          <span class="chat-supervision-status-run-part is-waiting">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.WAITING}</span>
+            {waitingLabel}
+          </span>
+        )}
+        <span aria-hidden="true">·</span>
+        <span class="chat-supervision-status-run-time">{timeRange}</span>
+        <span class="chat-supervision-status-run-chevron" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-supervision-status-run-details">
+          {(item.statusItems ?? []).map((source) => {
+            if (source.type === 'assistant-block') {
+              return (
+                <AssistantBlock
+                  key={source.key}
+                  eventId={source.key}
+                  text={source.text ?? ''}
+                  automation={source.assistantAutomation === true}
+                  executionState={source.executionState}
+                  ts={source.lastTs ?? source.ts ?? 0}
+                />
+              );
+            }
+            return <ChatEvent key={source.key} event={source.event!} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function groupFileChangePatches(batch: FileChangeBatch): GroupedFileChange[] {
   const groups = new Map<string, GroupedFileChange>();
@@ -3559,7 +8886,8 @@ function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
 }
 
 const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [expanded, setExpanded] = useState(false);
   const payload = event.payload as unknown as MemoryContextTimelinePayload;
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
@@ -3571,6 +8899,8 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const statusSummary = getMemoryContextStatusSummary(t, payload, contextItemCount);
   const statusDetail = getMemoryContextStatusDetail(t, payload);
   const isStatusOnly = contextItemCount === 0 && !!payload.status;
+  const hasSupplementalSummaries = reason === 'message'
+    && items.some((item) => item.projectionClass === 'recent_summary');
   // The startup-memory dump and the per-message recall both render as
   // memory-context cards, but they're conceptually different things:
   //   - startup: a one-shot "pre-loaded project history" preamble
@@ -3580,7 +8910,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   // fresh recall (see the daemon-restart dedup fix that pairs with this).
   const titleKey = reason === 'startup'
     ? 'chat.memory_context_startup_title'
-    : 'chat.memory_context_title';
+    : hasSupplementalSummaries
+      ? 'chat.memory_context_supplemental_title'
+      : 'chat.memory_context_title';
 
   if (isStatusOnly) {
     // Skipped/empty recall cards were showing title + summary + query + detail
@@ -3643,11 +8975,14 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
                   </div>
                 )) : section.items.map((item) => {
                   const score = formatMemoryContextScore(item.relevanceScore);
-                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
+                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt, locale);
                   return (
                     <div key={item.id} class="chat-memory-context-item">
                       <div class="chat-memory-context-item-summary">{item.summary}</div>
                       <div class="chat-memory-context-item-meta">
+                        {item.ref && (
+                          <code class="chat-memory-context-chip chat-memory-context-ref">{item.ref}</code>
+                        )}
                         <span class="chat-memory-context-chip">{item.projectId}</span>
                         {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
                         {typeof item.hitCount === 'number' && item.hitCount > 0 ? (
@@ -3700,32 +9035,131 @@ function countHardLines(text: string): number {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
 }
 
+/**
+ * Measure visual line overflow from the browser's rendered box. `scrollHeight`
+ * includes soft-wrapped content even while the element is capped, so this
+ * catches long paragraphs without guessing from character count.
+ */
+export function renderedUserMessageExceedsLineLimit(
+  element: HTMLElement,
+  lineLimit = USER_MESSAGE_COLLAPSE_LINE_LIMIT,
+): boolean | null {
+  const style = window.getComputedStyle(element);
+  const fontSize = Number.parseFloat(style.fontSize);
+  const rawLineHeight = Number.parseFloat(style.lineHeight);
+  const lineHeight = style.lineHeight.endsWith('px')
+    ? rawLineHeight
+    : Number.isFinite(rawLineHeight) && Number.isFinite(fontSize)
+      ? rawLineHeight * fontSize
+      : Number.NaN;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0 || element.scrollHeight <= 0) return null;
+  return element.scrollHeight > (lineHeight * lineLimit) + 0.5;
+}
+
 function UserMessageText({
   text,
+  visible = true,
   onPathClick,
+  onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
+  isAgent,
+  compactPathBadge = false,
+  footerRight,
 }: {
   text: string;
+  visible?: boolean;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  isAgent?: boolean;
+  compactPathBadge?: boolean;
+  footerRight?: ComponentChildren;
 }) {
   const { t } = useTranslation();
-  const lineCount = countHardLines(text);
-  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
+  const richContent = splitPathsAndUrlsCore(prose, {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel: t('upload.download_file'),
+    htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
+    onOpenLocalWebPreview,
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    compactPathBadge,
+    hoistImagePreviews: compactPathBadge,
+    taggedAttachmentPathsOnly: compactPathBadge,
+  });
+  const hasImages = !isAgent && richContent.imagePreviews.length > 0;
+  const hasMultiImages = !isAgent && richContent.imagePreviews.length > 1;
+  const hasSplitLayout = hasImages && richContent.hasNonBadgeProse;
+  const lineLimit = isAgent
+    ? AGENT_MESSAGE_COLLAPSE_LINE_LIMIT
+    : USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const hardLineOverflow = countHardLines(prose) > lineLimit;
+  const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
+    hardLineOverflow ? true : null,
+  );
   const [expanded, setExpanded] = useState(false);
+  const shouldFold = renderedOverflow === true;
+  const measuring = renderedOverflow === null;
   const folded = shouldFold && !expanded;
 
-  return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
-      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}
-      </div>
+  useLayoutEffect(() => {
+    if (hardLineOverflow) {
+      setRenderedOverflow((current) => current === true ? current : true);
+      return undefined;
+    }
+    if (!visible) return undefined;
+    const content = contentRef.current;
+    if (!content) return undefined;
+    let active = true;
+    const measure = () => {
+      if (!active) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (content.clientWidth <= 0 && content.scrollHeight <= 0) return;
+      const measured = renderedUserMessageExceedsLineLimit(content, lineLimit);
+      const next = hardLineOverflow || measured;
+      if (next === null) return;
+      setRenderedOverflow((current) => current === next ? current : next);
+    };
+
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    if (content.firstElementChild) observer?.observe(content.firstElementChild);
+    if (content.parentElement) observer?.observe(content.parentElement);
+    window.addEventListener('resize', measure);
+
+    const fonts = document.fonts;
+    fonts?.addEventListener?.('loadingdone', measure);
+    void fonts?.ready.then(() => {
+      if (active) measure();
+    });
+
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      fonts?.removeEventListener?.('loadingdone', measure);
+    };
+  }, [hardLineOverflow, prose, lineLimit, visible]);
+
+  const foldFooter = (isAgent || shouldFold) && (shouldFold || footerRight) ? (
+    <div class="chat-user-footer">
       {shouldFold && (
         <button
           type="button"
@@ -3736,14 +9170,47 @@ function UserMessageText({
           {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
         </button>
       )}
+      {footerRight && <span class="chat-user-footer-right">{footerRight}</span>}
     </div>
+  ) : null;
+
+  return (
+    <>
+      <div class={`chat-user-message-fold${hasImages ? ' has-images' : ''}${hasMultiImages ? ' has-multi-images' : ''}${hasSplitLayout ? ' has-split-layout' : ''}${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+        {leadingSender && <DelegationSenderCardView card={leadingSender} />}
+        <div
+          ref={contentRef}
+          class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+        >
+          {hasImages ? (
+            <div class="chat-user-split-layout">
+              <div class="chat-user-media-pane">
+                {richContent.imagePreviews}
+              </div>
+              {richContent.hasBodyNodes && (
+                <div class="chat-user-text-pane">
+                  {richContent.nodes}
+                </div>
+              )}
+            </div>
+          ) : (
+            richContent.nodes
+          )}
+        </div>
+        {foldFooter}
+        {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
+      </div>
+      {/* Keep the non-foldable, non-Agent timestamp/status DOM and height unchanged. */}
+      {!isAgent && !shouldFold && footerRight}
+    </>
   );
 }
 
 const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
+  const { i18n } = useTranslation();
   return (
     <div class="chat-bubble-time">
-      {new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      {formatChatDateTime(ts, Date.now(), resolveI18nLocale(i18n))}
     </div>
   );
 });
@@ -3752,9 +9219,201 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 
 // ── URL detection (must run BEFORE path detection) ────────────────────────
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
-const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
+const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}.\-~])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
-/** Split a plain-text segment into URL tokens, path tokens, and plain text. */
+interface SplitPathsAndUrlsOptions {
+  onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  downloadLabel?: string;
+  htmlPreviewLabel?: string;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
+  compactPathBadge?: boolean;
+  hoistImagePreviews?: boolean;
+  /** When true, only `#N:(path)` attachment tags are formatted; bare `/` prose is left as plain text. */
+  taggedAttachmentPathsOnly?: boolean;
+}
+
+interface SplitPathsAndUrlsResult {
+  nodes: h.JSX.Element[];
+  imagePreviews: h.JSX.Element[];
+  hasNonBadgeProse: boolean;
+  hasBodyNodes: boolean;
+}
+
+function isCompactBadgePath(path: string, isTaggedAttachment: boolean): boolean {
+  return isTaggedAttachment || path.startsWith('/') || path.startsWith('\\\\') || /^[A-Za-z]:\\/.test(path);
+}
+
+function splitPathsAndUrlsCore(
+  text: string,
+  options: SplitPathsAndUrlsOptions,
+): SplitPathsAndUrlsResult {
+  const {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel = '',
+    htmlPreviewLabel = '',
+    onOpenLocalWebPreview,
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    compactPathBadge = false,
+    hoistImagePreviews = false,
+    taggedAttachmentPathsOnly = false,
+  } = options;
+  const hasCloudDocText = text.includes('[CloudDoc:') || text.includes('cdoc_');
+  const hasRemoteDesktopText = text.includes(REMOTE_DESKTOP_CITATION_PREFIX);
+  if (
+    !onPathClick
+    && !onUrlClick
+    && !onDownload
+    && !onHtmlPreview
+    && !onImagePreview
+    && !onOpenLocalWebPreview
+    && !onCloudDocClick
+    && !onRemoteDesktopClick
+    && !hasCloudDocText
+    && !hasRemoteDesktopText
+    && !compactPathBadge
+  ) {
+    const hasProse = text.trim().length > 0;
+    return {
+      nodes: [<span>{text}</span>],
+      imagePreviews: [],
+      hasNonBadgeProse: hasProse,
+      hasBodyNodes: hasProse,
+    };
+  }
+  if (shouldSkipRichTextEnhancement(text)) {
+    const hasProse = text.trim().length > 0;
+    return {
+      nodes: [<span>{text}</span>],
+      imagePreviews: [],
+      hasNonBadgeProse: hasProse,
+      hasBodyNodes: hasProse,
+    };
+  }
+
+  const imagePreviews: h.JSX.Element[] = [];
+  let hasNonBadgeProse = false;
+  let hasBodyNodes = false;
+  let plainNodeCount = 0;
+
+  const nodes = splitTextWithCloudDocsAndUrls(text, {
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    onUrlClick,
+    onOpenLocalWebPreview,
+    omitEmptyFallback: hoistImagePreviews && compactPathBadge,
+    renderPlainText: (chunkText, baseOffset) => {
+      if (
+        (!onPathClick && !onImagePreview && !compactPathBadge)
+        || (!chunkText.includes('/') && !chunkText.includes('\\'))
+        || (taggedAttachmentPathsOnly && !/#\d+:\(/.test(chunkText))
+      ) {
+        if (chunkText.trim().length > 0) {
+          hasNonBadgeProse = true;
+          hasBodyNodes = true;
+        }
+        plainNodeCount += 1;
+        return [<span key={`t${baseOffset}`}>{chunkText}</span>];
+      }
+      const parts: h.JSX.Element[] = [];
+      let pathLast = 0;
+      PATH_REGEX.lastIndex = 0;
+      let pm: RegExpExecArray | null;
+      while ((pm = PATH_REGEX.exec(chunkText)) !== null) {
+        const path = pm[1];
+        if (path.length < 3) continue;
+        if (isLikelyDomainPath(path)) continue;
+        const leadingSlice = chunkText.slice(pathLast, pm.index);
+        const tagMatch = compactPathBadge ? /#(\d+):\($/.exec(leadingSlice) : null;
+        const hasClosingParen = !!tagMatch && chunkText[pm.index + pm[0].length] === ')';
+        const isTaggedAttachment = !!(tagMatch && hasClosingParen);
+        if (taggedAttachmentPathsOnly && !isTaggedAttachment) continue;
+        const useCompactBadge = compactPathBadge && isCompactBadgePath(path, isTaggedAttachment);
+        const prefixText = isTaggedAttachment
+          ? leadingSlice.slice(0, leadingSlice.length - tagMatch![0].length)
+          : leadingSlice;
+        const badgePrefix = isTaggedAttachment ? `#${tagMatch![1]}` : undefined;
+        const isImage = !!onImagePreview && isLocalChatPath(path) && isImagePreviewPath(path);
+        const shouldHoist = hoistImagePreviews && isImage;
+        if (prefixText.trim().length > 0) {
+          hasNonBadgeProse = true;
+          hasBodyNodes = true;
+          parts.push(<span key={`t${baseOffset + pathLast}`}>{prefixText}</span>);
+        } else if (prefixText && (!shouldHoist || parts.length > 0)) {
+          parts.push(<span key={`t${baseOffset + pathLast}`}>{prefixText}</span>);
+        }
+        const badgeNode = renderChatPathActions({
+          key: `p${baseOffset + pm.index}`,
+          path,
+          compactPathBadge: useCompactBadge,
+          badgePrefix,
+          hideInlineImagePreview: shouldHoist,
+          labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
+          handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
+        });
+        if (shouldHoist && onImagePreview) {
+          imagePreviews.push(
+            <ChatLocalImagePreview
+              key={`img${baseOffset + pm.index}`}
+              path={path}
+              loadImagePreview={onImagePreview}
+              caption={useCompactBadge ? badgeNode : undefined}
+              onDownload={onDownload
+                ? async (downloadPath) => { await onDownload(downloadPath); }
+                : undefined}
+            />,
+          );
+          if (!useCompactBadge) {
+            hasBodyNodes = true;
+            parts.push(badgeNode);
+          }
+        } else {
+          hasBodyNodes = true;
+          parts.push(badgeNode);
+        }
+        pathLast = pm.index + pm[0].length + (isTaggedAttachment ? 1 : 0);
+      }
+      if (pathLast < chunkText.length) {
+        const trailing = chunkText.slice(pathLast);
+        if (trailing.trim().length > 0) {
+          hasNonBadgeProse = true;
+          hasBodyNodes = true;
+          parts.push(<span key={`t${baseOffset + pathLast}`}>{trailing}</span>);
+        } else if (trailing && parts.length > 0) {
+          parts.push(<span key={`t${baseOffset + pathLast}`}>{trailing}</span>);
+        }
+      }
+      const resolved = parts.length
+        ? parts
+        : (pathLast === 0 ? [<span key={`t${baseOffset}`}>{chunkText}</span>] : []);
+      if (pathLast === 0 && chunkText.trim().length > 0) {
+        hasNonBadgeProse = true;
+        hasBodyNodes = true;
+      }
+      plainNodeCount += resolved.length;
+      return resolved;
+    },
+  });
+
+  if (nodes.length > plainNodeCount) {
+    hasNonBadgeProse = true;
+    hasBodyNodes = true;
+  }
+
+  return { nodes, imagePreviews, hasNonBadgeProse, hasBodyNodes };
+}
+
+/** Split a plain-text segment into CloudDoc, RemoteDesktop, URL, path, and plain-text tokens. */
 function splitPathsAndUrls(
   text: string,
   onPathClick?: (p: string) => void,
@@ -3764,57 +9423,29 @@ function splitPathsAndUrls(
   onImagePreview?: ChatLocalImagePreviewLoader,
   downloadLabel = '',
   htmlPreviewLabel = '',
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler,
+  onCloudDocClick?: (docId: string) => void,
+  onRemoteDesktopClick?: (targetId: string) => void,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview) return [<span>{text}</span>];
-  if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
-
-  // Step 1: Split by URLs first (URLs take priority over path detection)
-  const parts: preact.JSX.Element[] = [];
-  const chunks = splitTextByHttpUrls(text);
-
-  // Step 2: For text chunks, apply path detection. URL chunks render as links.
-  for (const chunk of chunks) {
-    if (chunk.type === 'url') {
-      parts.push(
-        <a
-          key={`u${chunk.start}`}
-          class="chat-external-link"
-          href={chunk.value}
-          title={chunk.value}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!onUrlClick) return;
-            e.preventDefault();
-            onUrlClick(chunk.value);
-          }}
-        >
-          {chunk.value}
-        </a>,
-      );
-    } else if (onPathClick || onImagePreview) {
-      // Apply path detection only on non-URL text
-      let pathLast = 0;
-      PATH_REGEX.lastIndex = 0;
-      let pm: RegExpExecArray | null;
-      while ((pm = PATH_REGEX.exec(chunk.value)) !== null) {
-        const path = pm[1];
-        if (path.length < 3) continue;
-        if (isLikelyDomainPath(path)) continue;
-        if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
-        parts.push(renderChatPathActions({
-          key: `p${chunk.start + pm.index}`,
-          path,
-          labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
-          handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
-        }));
-        pathLast = pm.index + pm[0].length;
-      }
-      if (pathLast < chunk.value.length) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast)}</span>);
-    } else {
-      parts.push(<span key={`t${chunk.start}`}>{chunk.value}</span>);
-    }
-  }
-
-  return parts.length ? parts : [<span>{text}</span>];
+  return splitPathsAndUrlsCore(text, {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel,
+    htmlPreviewLabel,
+    onOpenLocalWebPreview,
+    onCloudDocClick,
+    onRemoteDesktopClick,
+  }).nodes;
 }
+
+/**
+ * Test seam: the renderer itself, so a contract test can measure what a type
+ * ACTUALLY draws instead of trusting the classification it is meant to check.
+ * Same convention as `__buildViewItemsForTests` above.
+ */
+export const __ChatEventForTests = ChatEvent;
+export const __ToolActivityPeekForTests = ToolActivityPeek;
+export const __VirtualizedViewItemsForTests = VirtualizedViewItems;

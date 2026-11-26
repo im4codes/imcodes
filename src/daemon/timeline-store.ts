@@ -1,3 +1,8 @@
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { getSession } from '../store/session-store.js';
+import type { TimelineTextTailOptions } from './timeline-projection-types.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Timeline event store.
  *
@@ -12,7 +17,8 @@
  * `emit()` synchronous guarantees (handled by timeline-emitter):
  *   - Ring buffer push completes; `replay()` immediately sees it.
  *   - Handler broadcast completes; WS / projection sync listeners see it.
- *   - `recordTurnUsage` (better-sqlite3) writes synchronously.
+ *   - usage telemetry is submitted to the context-store worker asynchronously;
+ *     emit never waits for SQLite.
  *
  * `emit()` does NOT guarantee:
  *   - JSONL file content visible to `read()` / `getLatest()` — those paths
@@ -29,19 +35,95 @@
  *     prefer ring buffer / preferred APIs.
  */
 
-import { mkdirSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync } from 'fs';
-import { mkdir, appendFile, writeFile, readFile, rename, unlink } from 'fs/promises';
+import { mkdirSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync, createReadStream } from 'fs';
+import { mkdir, appendFile, writeFile, rename, unlink } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
+import { createInterface } from 'readline';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
-import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
+import { timelineProjection, TimelineProjectionBusyError, type TimelineProjectionQueryOpts } from './timeline-projection.js';
 import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
 
-export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
+export function timelineDir(): string { return join(resolveImcodesHome(), 'timeline'); }
+/** @deprecated Use timelineDir() so HOME changes are observed lazily. */
+export const TIMELINE_DIR = timelineDir();
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
+
+// A busy provider can emit thousands of status/tool lifecycle records during a
+// single user turn. Those records are useful while they are recent, but must
+// never evict the actual conversation merely because the JSONL file reached
+// its bounded retention size. When compaction is necessary, these event types
+// are retained before filling the remaining budget with the newest auxiliary
+// events. The output is sorted back into append order before the atomic rename.
+const CONVERSATION_RETENTION_TYPES = new Set([
+  'user.message',
+  'assistant.text',
+  'ask.question',
+  'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  'memory.compression',
+]);
+
+interface RetainedTimelineLine {
+  ordinal: number;
+  line: string;
+}
+
+function pushBoundedLine(target: RetainedTimelineLine[], value: RetainedTimelineLine, limit: number): void {
+  target.push(value);
+  // Compact in batches rather than shift() on every line, which would turn a
+  // large malformed/noisy timeline into quadratic startup work.
+  if (target.length > limit * 2) target.splice(0, target.length - limit);
+}
+
+async function selectRetainedTimelineLines(
+  filePath: string,
+  keepLast: number,
+): Promise<{ total: number; kept: string[] } | null> {
+  const conversation: RetainedTimelineLine[] = [];
+  const auxiliary: RetainedTimelineLine[] = [];
+  let total = 0;
+  const lines = createInterface({
+    input: createReadStream(filePath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
+
+  try {
+    for await (const line of lines) {
+      if (!line) continue;
+      total += 1;
+      let type = '';
+      try {
+        const parsed = JSON.parse(line) as { type?: unknown };
+        if (typeof parsed.type === 'string') type = parsed.type;
+      } catch {
+        // Keep malformed lines in the auxiliary tail. Existing readers already
+        // ignore malformed JSON, and compaction must not make it more durable
+        // than a real conversation event.
+      }
+      const retained = { ordinal: total, line };
+      pushBoundedLine(
+        CONVERSATION_RETENTION_TYPES.has(type) ? conversation : auxiliary,
+        retained,
+        keepLast,
+      );
+    }
+  } finally {
+    lines.close();
+  }
+
+  if (total <= keepLast) return null;
+  const protectedTail = conversation.slice(-keepLast);
+  const auxiliaryBudget = keepLast - protectedTail.length;
+  const selected = auxiliaryBudget > 0
+    ? [...protectedTail, ...auxiliary.slice(-auxiliaryBudget)]
+    : protectedTail;
+  selected.sort((left, right) => left.ordinal - right.ordinal);
+  return { total, kept: selected.map((entry) => entry.line) };
+}
 
 export class TimelinePreferredReadError extends Error {
   constructor(
@@ -103,7 +185,7 @@ export function readTailLines(filePath: string, maxLines: number): string[] {
 }
 
 class TimelineStore {
-  private initialized = false;
+  private initializedDir: string | null = null;
   /**
    * Per-session async append chains. Each session has at most one
    * outstanding write Promise; appends are serialized per-session to
@@ -112,25 +194,27 @@ class TimelineStore {
   private sessionChains = new Map<string, Promise<void>>();
 
   private ensureDirSync(): void {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      mkdirSync(TIMELINE_DIR, { recursive: true });
+      mkdirSync(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   private async ensureDirAsync(): Promise<void> {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      await mkdir(TIMELINE_DIR, { recursive: true });
+      await mkdir(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   filePath(sessionName: string): string {
     // Sanitize session name for filesystem
     const safe = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    return join(TIMELINE_DIR, `${safe}.jsonl`);
+    return join(timelineDir(), `${safe}.jsonl`);
   }
 
   /**
@@ -144,6 +228,7 @@ class TimelineStore {
    * as ack-outbox `appendRecord`).
    */
   append(event: TimelineEvent): Promise<void> {
+    if (isIncognitoSession(event.payload) || isIncognitoSessionName(event.sessionId) || inIncognitoContext()) return Promise.resolve();
     const sessionId = event.sessionId;
     const prev = this.sessionChains.get(sessionId) ?? Promise.resolve();
     const next = prev.then(
@@ -169,6 +254,7 @@ class TimelineStore {
         logger.debug({ err, sessionId: event.sessionId, eventId: event.eventId }, 'TimelineProjection: append mirror failed');
       });
     } catch (err) {
+      this.initializedDir = null;
       logger.debug({ err, sessionId: event.sessionId }, 'TimelineStore: append failed');
     }
   }
@@ -203,6 +289,19 @@ class TimelineStore {
   }
 
   /**
+   * Unconditionally wait until all currently pending and newly queued
+   * per-session append/truncate chains settle. Unlike {@link flushAll} (used
+   * by SIGTERM shutdown to bound latency), this never returns early on a
+   * timeout while writers remain active, making it safe as a filesystem
+   * teardown barrier in tests.
+   */
+  async drainAll(): Promise<void> {
+    while (this.sessionChains.size > 0) {
+      await Promise.allSettled([...this.sessionChains.values()]);
+    }
+  }
+
+  /**
    * Wait for a single session's append chain to settle. Used by tests
    * that need synchronous visibility after a few `emit()` calls.
    */
@@ -224,7 +323,12 @@ class TimelineStore {
    * Uses reverse-read from file tail for efficiency — only reads as many lines
    * as needed instead of loading the entire file.
    */
+  private isPrivateSession(sessionName: string): boolean {
+    return inIncognitoContext() || isIncognitoSessionName(sessionName) || isIncognitoSession(getSession(sessionName));
+  }
+
   read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; beforeTs?: number; limit?: number }): TimelineEvent[] {
+    if (this.isPrivateSession(sessionName)) return [];
     const filePath = this.filePath(sessionName);
     // Read more lines than limit to account for filtered-out events.
     // For most queries (no epoch/afterTs filter), 2x is plenty.
@@ -252,14 +356,25 @@ class TimelineStore {
 
   async readPreferred(
     sessionName: string,
-    opts?: { afterTs?: number; beforeTs?: number; limit?: number },
+    opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryHistory({
-      sessionId: sessionName,
-      afterTs: opts?.afterTs,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    if (this.isPrivateSession(sessionName)) return [];
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryHistory({
+        sessionId: sessionName,
+        afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -269,19 +384,41 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryByTypes({
-      sessionId: sessionName,
-      types,
-      afterTs: opts?.afterTs,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    if (this.isPrivateSession(sessionName)) return [];
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryByTypes({
+        sessionId: sessionName,
+        types,
+        afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      // Busy is not absence. Reporting it as absence is what invites the caller
+      // to do this work on the main thread.
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
 
-  async readCompletedTextTail(sessionName: string, limit = 50): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit);
+  async readCompletedTextTail(sessionName: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[]> {
+    if (this.isPrivateSession(sessionName)) return [];
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -290,6 +427,7 @@ class TimelineStore {
    * Get the latest epoch and seq for a session (from the last line).
    */
   getLatest(sessionName: string): { epoch: number; seq: number } | null {
+    if (this.isPrivateSession(sessionName)) return null;
     const filePath = this.filePath(sessionName);
     const lines = readTailLines(filePath, 5); // read last few lines in case some are corrupt
     for (const line of lines) {
@@ -302,6 +440,7 @@ class TimelineStore {
   }
 
   async getLatestPreferred(sessionName: string): Promise<{ epoch: number; seq: number } | null> {
+    if (this.isPrivateSession(sessionName)) return null;
     return await timelineProjection.getLatest(sessionName);
   }
 
@@ -314,32 +453,49 @@ class TimelineStore {
    * reset so subsequent appends open a fresh fd against the new inode.
    */
   async truncate(sessionName: string, keepLast = MAX_EVENTS_PER_FILE): Promise<void> {
-    const filePath = this.filePath(sessionName);
-    // 1) Wait for any pending appends so they reach the live file *before*
-    //    we read its tail and rewrite it. Without this we could lose
-    //    fresh events to the rename.
-    const chain = this.sessionChains.get(sessionName);
-    if (chain) {
-      await chain.catch(() => undefined);
+    if (this.isPrivateSession(sessionName)) return;
+    // Put compaction on the same per-session chain as appends. Merely awaiting
+    // the current chain leaves a race where a new append can start while the
+    // tmp file is being written and then be erased by rename. Reserving the
+    // chain first makes appends arriving during compaction wait for the new
+    // authoritative file.
+    const previous = this.sessionChains.get(sessionName) ?? Promise.resolve();
+    const operation = previous.then(
+      () => this.truncateOne(sessionName, keepLast),
+      () => this.truncateOne(sessionName, keepLast),
+    );
+    this.sessionChains.set(sessionName, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.sessionChains.get(sessionName) === operation) {
+        this.sessionChains.delete(sessionName);
+      }
     }
+  }
 
-    const newestFirst = readTailLines(filePath, keepLast + 1);
-    if (newestFirst.length <= keepLast) return;
-
-    const kept = newestFirst.slice(0, keepLast).reverse();
+  private async truncateOne(sessionName: string, keepLast: number): Promise<void> {
+    const filePath = this.filePath(sessionName);
+    let selection: Awaited<ReturnType<typeof selectRetainedTimelineLines>>;
+    try {
+      selection = await selectRetainedTimelineLines(filePath, keepLast);
+    } catch (err) {
+      // Preserve the former best-effort contract: a concurrently deleted or
+      // unreadable history file must not reject daemon startup.
+      logger.debug({ err, sessionName }, 'TimelineStore: truncate read failed');
+      return;
+    }
+    if (!selection) return;
+    const kept = selection.kept;
     const tmpPath = `${filePath}.tmp`;
     try {
       await writeFile(tmpPath, kept.join('\n') + '\n', 'utf-8');
       await rename(tmpPath, filePath);
-      void timelineProjection.pruneSessionToAuthoritative(sessionName, keepLast).catch((err) => {
-        logger.debug({ err, sessionName }, 'TimelineProjection: prune after truncate failed');
-      });
-      logger.info({ sessionName, after: kept.length }, 'TimelineStore: truncated');
-      // 2) Reset chain head — subsequent appends start a fresh fd against
-      //    the new file. POSIX `appendFile` re-opens by path each call, so
-      //    the rename is transparent, but clearing the cached promise
-      //    avoids holding a settled chain forever.
-      this.sessionChains.delete(sessionName);
+      // Compaction is priority-aware rather than a contiguous tail now, so a
+      // positional SQLite prune would retain rows that no longer exist in the
+      // authoritative JSONL. Rebuild the projection from the rewritten file.
+      await timelineProjection.rebuildSession(sessionName);
+      logger.info({ sessionName, before: selection.total, after: kept.length }, 'TimelineStore: truncated');
     } catch (err) {
       logger.debug({ err, sessionName }, 'TimelineStore: truncate write failed');
       // Best-effort tmp cleanup; ignore errors (file may not exist).
@@ -357,7 +513,7 @@ class TimelineStore {
     this.ensureDirSync();
     let files: string[];
     try {
-      files = readdirSync(TIMELINE_DIR);
+      files = readdirSync(timelineDir());
     } catch (err) {
       logger.debug({ err }, 'TimelineStore: truncateAll readdir failed');
       return;
@@ -386,14 +542,14 @@ class TimelineStore {
     const now = Date.now();
     let files: string[];
     try {
-      files = readdirSync(TIMELINE_DIR);
+      files = readdirSync(timelineDir());
     } catch (err) {
       logger.debug({ err }, 'TimelineStore: cleanup readdir failed');
       return;
     }
     for (const file of files) {
       if (!file.endsWith('.jsonl')) continue;
-      const fullPath = join(TIMELINE_DIR, file);
+      const fullPath = join(timelineDir(), file);
       try {
         const stat = statSync(fullPath);
         if (now - stat.mtimeMs > MAX_AGE_MS) {

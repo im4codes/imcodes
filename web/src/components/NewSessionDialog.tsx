@@ -1,59 +1,90 @@
+import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
+import { scopeIncognitoTimelineCacheKey, setIncognitoTimelineKeyActive } from '../incognito-session-registry.js';
 import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
 import { parseString, usePref } from "../hooks/usePref.js";
 import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
-import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
+import { sanitizeProjectName, buildDefaultProjectDir, DEFAULT_PROJECTS_DIR_PREFIX } from "@shared/sanitize-project-name.js";
+import { AGENT_AVAILABILITY_MSG, type AgentAvailabilityMap } from "@shared/agent-availability.js";
 import {
   getSessionAgentGroups,
+  isSessionAgentTypeSelectable,
   getSessionAgentLabel,
   SESSION_AGENT_GROUP_LABEL_KEYS,
 } from "./session-agent-options.js";
+import { SdkModeRecommendation } from "./SdkModeRecommendation.js";
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
+  MUSE_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
+  PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   formatEffortLevel,
+  clampTransportEffort,
   type TransportEffortLevel,
 } from "@shared/effort-levels.js";
 import {
   useTransportModels,
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
+import { ModelCombobox } from "./ModelCombobox.js";
+import { usePresetModelSelection } from "../hooks/usePresetModelSelection.js";
 import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
 import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
   createDefaultCcPresetDraft,
+  DEFAULT_CC_PRESET_BASE_URL,
+  DEFAULT_CC_PRESET_MODEL,
+  DEFAULT_OPENAI_PRESET_BASE_URL,
+  DEFAULT_OPENAI_PRESET_MODEL,
   type CcPresetDraft,
   type CcPresetEntry,
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import {
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
 } from "@shared/cc-presets.js";
-import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
-import { loadCodexModelPreference } from "../codex-model-preference.js";
+import { AGY_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions, resolveCodexAutoDefaultModel } from "../../../src/shared/models/options.js";
+import { loadAgyModelPreference, saveAgyModelPreference } from "../agy-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from "@shared/codebuddy.js";
+import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
+import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
+import { saveSessionIdentityProfile } from '../api.js';
+import { SessionIdentityTabs } from './SessionIdentityTabs.js';
+import { requestSessionIdentityRefresh } from '../session-identity-refresh.js';
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
-const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
+const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", "muse-fast", "wander"] as const;
+const AGY_SDK_MODEL_FALLBACK = [...AGY_MODEL_IDS] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
-  width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
-  maxWidth: 380,
+  width: "calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
+  maxWidth: 660,
   minWidth: 0,
   boxSizing: "border-box",
   // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
@@ -63,25 +94,15 @@ const responsiveDialogStyle = {
 
 interface Props {
   ws: WsClient | null;
+  serverId: string;
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
   isProviderConnected: (id: string) => boolean;
   onToast?: (message: string) => void;
 }
 
-type AgentType =
-  | "claude-code"
-  | "claude-code-sdk"
-  | "codex"
-  | "codex-sdk"
-  | "copilot-sdk"
-  | "cursor-headless"
-  | "opencode"
-  | "gemini"
-  | "gemini-sdk"
-  | "kimi-sdk"
-  | "openclaw"
-  | "qwen";
+type AgentType = SessionAgentType;
+
 type OpenClawMode = "new" | "bind";
 
 interface RemoteSession {
@@ -104,6 +125,7 @@ function canUseGitRemoteClone(ws: WsClient | null): boolean {
 
 export function NewSessionDialog({
   ws,
+  serverId,
   onClose,
   onSessionStarted,
   isProviderConnected: _isProviderConnected,
@@ -111,20 +133,57 @@ export function NewSessionDialog({
 }: Props) {
   const { t } = useTranslation();
   const [project, setProject] = useState("");
-  const [dir, setDir] = useState("~/");
+  const [dir, setDir] = useState(DEFAULT_PROJECTS_DIR_PREFIX);
+  const [dirManuallyEdited, setDirManuallyEdited] = useState(false);
   const [gitRemoteUrl, setGitRemoteUrl] = useState("");
-  const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
-  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>("claude-code-sdk");
+  const [agentType, setAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
+  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [incognito, setIncognito] = useState(false);
+  const canIncognito = !!ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(SESSION_INCOGNITO_CAPABILITY) && !ws?.isDaemonCapabilityStale?.();
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [pendingSessionIdentity, setPendingSessionIdentity] = useState('');
+  const [pendingSessionIdentitySourceFile, setPendingSessionIdentitySourceFile] = useState('');
   const [thinking, setThinking] = useState<TransportEffortLevel>("high");
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>("");
+  const [agentAvailability, setAgentAvailability] = useState<AgentAvailabilityMap | null>(null);
+  const [detectingAgents, setDetectingAgents] = useState(false);
+  const lastAvailabilityCheckedAtRef = useRef<number>(0);
   const pendingStartRef = useRef<PendingStart | null>(null);
   const agentGroups = getSessionAgentGroups("new-session");
+  const isAgentInstalled = (id: AgentType, map: AgentAvailabilityMap | null = agentAvailability): boolean =>
+    !map || map[id]?.installed !== false;
+  const isAgentExplicitlyInstalled = (id: AgentType, map: AgentAvailabilityMap | null = agentAvailability): boolean =>
+    map?.[id]?.installed === true;
+  const isAgentValidForFilters = (
+    id: AgentType,
+    map: AgentAvailabilityMap | null = agentAvailability,
+  ): boolean => (
+    isSessionAgentTypeSelectable(id)
+    && isAgentInstalled(id, map)
+    && (!incognito || supportsSessionIncognito(id))
+    && (!customProviderSdk || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(id))
+  );
+  const findFirstAvailableAgent = (
+    opts: { customOnly?: boolean; incognitoOnly?: boolean; map?: AgentAvailabilityMap | null } = {},
+  ): AgentType | null => {
+    const map = opts.map === undefined ? agentAvailability : opts.map;
+    for (const group of agentGroups) {
+      for (const choice of group.items) {
+        if (choice.hidden) continue;
+        if (!isSessionAgentTypeSelectable(choice.id)) continue;
+        if (opts.customOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)) continue;
+        if (opts.incognitoOnly && !supportsSessionIncognito(choice.id)) continue;
+        if (map ? !isAgentExplicitlyInstalled(choice.id, map) : !isAgentInstalled(choice.id, map)) continue;
+        return choice.id;
+      }
+    }
+    return null;
+  };
 
   // CC env presets
   const [ccPresets, setCcPresets] = useState<CcPresetEntry[]>([]);
@@ -134,6 +193,7 @@ export function NewSessionDialog({
   // New preset form
   const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState("");
+  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState("");
   const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
@@ -157,6 +217,7 @@ export function NewSessionDialog({
   };
   const applyPresetDraft = (draft: CcPresetDraft) => {
     setNewPresetName(draft.name);
+    setNewPresetAuthType(draft.authType);
     setNewPresetBaseUrl(draft.baseUrl);
     setNewPresetToken(draft.token);
     setNewPresetModel(draft.model);
@@ -167,6 +228,7 @@ export function NewSessionDialog({
   };
   const buildCurrentPresetDraft = (): CcPresetDraft => ({
     name: newPresetName,
+    authType: newPresetAuthType,
     baseUrl: newPresetBaseUrl,
     token: newPresetToken,
     model: newPresetModel,
@@ -185,7 +247,17 @@ export function NewSessionDialog({
     } catch {}
     return preset;
   };
+  const resolveCustomProviderAgent = (map: AgentAvailabilityMap | null = agentAvailability): AgentType | null => {
+    const defaultCompatible = isSessionAgentTypeSelectable("claude-code-sdk")
+      && (!incognito || supportsSessionIncognito("claude-code-sdk"));
+    if (defaultCompatible && (map ? isAgentExplicitlyInstalled("claude-code-sdk", map) : isAgentInstalled("claude-code-sdk", map))) {
+      return "claude-code-sdk";
+    }
+    return findFirstAvailableAgent({ customOnly: true, incognitoOnly: incognito, map });
+  };
   const selectAgentType = (nextAgentType: AgentType) => {
+    if (!isAgentValidForFilters(nextAgentType)) return;
+    if (nextAgentType !== agentType) setRequestedModel("");
     setAgentType(nextAgentType);
     if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
     setError("");
@@ -195,17 +267,28 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
-      if (agentType !== "qwen") setLastUnlockedAgentType(agentType);
-      setAgentType("qwen");
+      if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) || !isAgentInstalled(agentType) || (incognito && !supportsSessionIncognito(agentType))) {
+        const nextCustom = resolveCustomProviderAgent();
+        if (nextCustom) {
+          setLastUnlockedAgentType(agentType);
+          setRequestedModel("");
+          setAgentType(nextCustom);
+        }
+      }
       return;
     }
-    setAgentType(lastUnlockedAgentType);
+    const target = isAgentInstalled(lastUnlockedAgentType) && (!incognito || supportsSessionIncognito(lastUnlockedAgentType))
+      ? lastUnlockedAgentType
+      : (findFirstAvailableAgent({ incognitoOnly: incognito }) ?? lastUnlockedAgentType);
+    if (target !== agentType) setRequestedModel("");
+    setAgentType(target);
   };
   const selectedCcPreset = useMemo(
     () => ccPresets.find((preset) => preset.name === ccPreset),
     [ccPreset, ccPresets],
   );
-  const qwenPresetModels = useMemo(
+  const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
@@ -261,6 +344,17 @@ export function NewSessionDialog({
           setShellBin(list[0] ?? "");
         }
       }
+      if (msg.type === AGENT_AVAILABILITY_MSG.RESULT) {
+        if (typeof msg.checkedAt === "number" && msg.checkedAt < lastAvailabilityCheckedAtRef.current) {
+          return;
+        }
+        if (typeof msg.checkedAt === "number") {
+          lastAvailabilityCheckedAtRef.current = msg.checkedAt;
+        }
+        const nextMap = msg.agents ?? {};
+        setAgentAvailability(nextMap);
+        setDetectingAgents(false);
+      }
       // Listen for CC presets response
       if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
         setCcPresets((msg as any).presets ?? []);
@@ -292,6 +386,14 @@ export function NewSessionDialog({
       }
     });
     ws.subSessionDetectShells?.();
+    if (typeof ws.detectAgents === "function") {
+      setDetectingAgents(true);
+      try {
+        ws.detectAgents(false);
+      } catch {
+        setDetectingAgents(false);
+      }
+    }
     try {
       ws.send({ type: CC_PRESET_MSG.LIST });
     } catch {
@@ -300,6 +402,29 @@ export function NewSessionDialog({
     return unsub;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
+
+  // Recover the refresh button cleanly when an older daemon never replies to session.detect_agents.
+  useEffect(() => {
+    if (!detectingAgents) return;
+    const timer = setTimeout(() => setDetectingAgents(false), 10_000);
+    return () => clearTimeout(timer);
+  }, [detectingAgents]);
+
+  // Auto-fall back to the first explicitly installed agent matching current filters when the selected agent is unavailable or incompatible.
+  useEffect(() => {
+    if (!agentAvailability || isAgentValidForFilters(agentType, agentAvailability)) return;
+    const fallback = findFirstAvailableAgent({
+      customOnly: customProviderSdk,
+      incognitoOnly: incognito,
+      map: agentAvailability,
+    });
+    if (fallback && fallback !== agentType) {
+      setRequestedModel("");
+      setAgentType(fallback);
+      if (!customProviderSdk) setLastUnlockedAgentType(fallback);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentAvailability, agentType, customProviderSdk, incognito]);
 
   // Fetch remote sessions when bind mode is selected
   useEffect(() => {
@@ -326,8 +451,26 @@ export function NewSessionDialog({
       pendingStartRef.current = null;
       setError("");
       setStarting(false);
-      onSessionStarted(sessionName);
-      onClose();
+      void (async () => {
+        if (!incognito && pendingSessionIdentity.trim()) {
+          try {
+            await saveSessionIdentityProfile({
+              scope: SESSION_IDENTITY_SCOPES.SESSION,
+              scopeKey: `${serverId}:${sessionName}`,
+              content: normalizeSessionIdentityContent(pendingSessionIdentity),
+              ...(pendingSessionIdentitySourceFile ? { sourceFile: pendingSessionIdentitySourceFile } : {}),
+            });
+            await requestSessionIdentityRefresh(ws, sessionName);
+          } catch {
+            onToast?.(t('session.identityCreateApplyFailed'));
+          }
+        }
+        if (incognito) {
+          setIncognitoTimelineKeyActive(scopeIncognitoTimelineCacheKey(serverId, sessionName), true);
+        }
+        onSessionStarted(sessionName);
+        onClose();
+      })();
     };
     const matchesPendingSession = (name: string, pending: PendingStart) =>
       name === pending.sessionName;
@@ -372,7 +515,7 @@ export function NewSessionDialog({
     });
 
     return unsub;
-  }, [ws, onClose, onSessionStarted]);
+  }, [onClose, onSessionStarted, onToast, incognito, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
 
   useEffect(() => {
     if (!ws || !starting) return;
@@ -390,9 +533,31 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (agentType !== "qwen") setAgentType("qwen");
+    // Snap only when the current type cannot act as a custom-provider layer.
+    // Forcing `claude-code-sdk` unconditionally here re-locked the dropdown:
+    // picking another supported type set the state and then this effect, which
+    // re-runs on every `agentType` change, immediately reverted it — so the
+    // session still started as `claude-code-sdk` while the UI had briefly shown
+    // otherwise. Mirrors the same guard in StartSubSessionDialog.
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
+      const nextCustom = resolveCustomProviderAgent();
+      if (nextCustom) {
+        setRequestedModel("");
+        setAgentType(nextCustom);
+      }
+    }
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
+
+  const handleRefreshAgents = () => {
+    if (!ws || !ws.connected || starting || detectingAgents) return;
+    setDetectingAgents(true);
+    try {
+      ws.detectAgents?.(true);
+    } catch {
+      setDetectingAgents(false);
+    }
+  };
 
   const handleStart = () => {
     if (!project.trim()) {
@@ -411,6 +576,18 @@ export function NewSessionDialog({
       setError(t("new_session.daemon_offline"));
       return;
     }
+    if (!isAgentInstalled(agentType)) {
+      setError(t("new_session.agent_not_installed"));
+      return;
+    }
+    if (incognito && (!canIncognito || !supportsSessionIncognito(agentType))) {
+      setError(t('session.incognito_unsupported'));
+      return;
+    }
+    if (!isAgentValidForFilters(agentType)) {
+      setError(t("new_session.agent_not_installed"));
+      return;
+    }
     if (customProviderSdk && !ccPreset) {
       setError(t("new_session.custom_provider_preset_required"));
       setShowPresetEditor(true);
@@ -423,6 +600,9 @@ export function NewSessionDialog({
     }
 
     const slug = sanitizeProjectName(project.trim());
+    const identityPrompt = pendingSessionIdentity.trim()
+      ? normalizeSessionIdentityContent(pendingSessionIdentity)
+      : undefined;
     pendingStartRef.current = {
       project: slug,
       sessionName: `deck_${slug}_brain`,
@@ -442,40 +622,58 @@ export function NewSessionDialog({
               ocDescription: ocDescription.trim(),
             };
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
         ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
         thinking,
+        ...(identityPrompt ? { identityPrompt } : {}),
       });
     } else {
       const extra: Record<string, unknown> = {};
-      if (ccPreset && (agentType === "claude-code" || agentType === "qwen"))
+      if (ccPreset && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType))
         extra.ccPreset = ccPreset;
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
         (agentType === "claude-code-sdk"
+          || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
           || agentType === "codex-sdk"
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
-          || agentType === "gemini-sdk"
+          || agentType === "opencode-sdk"
+          || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
+          || agentType === "muse-code-sdk"
+          || agentType === HERMES_AGENT_PROVIDER_ID
+          || agentType === AGY_SDK_PROVIDER_ID
+          || agentType === "deepseek-harness"
+          || agentType === "pi"
+          || isCodeBuddyProviderId(agentType)
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
         extra.requestedModel = requestedModel.trim();
+        if (agentType === AGY_SDK_PROVIDER_ID) {
+          saveAgyModelPreference(requestedModel.trim());
+        }
       }
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
         ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
+        ...(identityPrompt ? { identityPrompt } : {}),
         ...(agentType === "claude-code-sdk" ||
+        agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
         agentType === "codex-sdk" ||
         agentType === "copilot-sdk" ||
+        agentType === "muse-code-sdk" ||
+        agentType === "pi" ||
         agentType === "qwen"
           ? { thinking }
           : {}),
@@ -486,23 +684,52 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "muse-code-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
+  const dynamicModelsAgentType = supportsDynamicTransportModels(agentType) ? agentType : null;
+  const creationTargetScope = serverId?.trim()
+    || (ws as { getServerId?: () => string } | null)?.getServerId?.()?.trim()
+    || ws?.getDaemonCapabilitySnapshot?.()?.daemonId?.trim()
+    || undefined;
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) ? ccPreset : undefined,
+    undefined,
+    creationTargetScope,
+  );
+  const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
   const thinkingLevels: readonly TransportEffortLevel[] =
-    agentType === "claude-code-sdk"
+    (agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE)
       ? CLAUDE_SDK_EFFORT_LEVELS
       : agentType === "codex-sdk"
-        ? CODEX_SDK_EFFORT_LEVELS
+        ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
         : agentType === "copilot-sdk"
           ? COPILOT_SDK_EFFORT_LEVELS
-          : agentType === "qwen"
-            ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
-            : agentType === "openclaw"
-              ? OPENCLAW_THINKING_LEVELS
-              : [];
-  const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+          : agentType === "muse-code-sdk"
+            ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
+            : agentType === "qwen"
+              ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
+              : agentType === "pi"
+                ? PI_EFFORT_LEVELS
+              : agentType === "openclaw"
+                ? OPENCLAW_THINKING_LEVELS
+                : [];
+  useEffect(() => {
+    if ((agentType !== 'codex-sdk' && agentType !== 'muse-code-sdk') || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
+    if (!clamped || clamped === thinking) return;
+    setThinking(clamped);
+    onToast?.(t('session.thinking_clamped', { from: formatEffortLevel(thinking), to: formatEffortLevel(clamped) }));
+  }, [agentType, onToast, selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, t, thinking]);
+  const supportsCcPreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType);
+  // The third-party SDK switch is a launch mode, not an attribute of the
+  // currently highlighted card. Keep its controls mounted while the mode
+  // transition selects a compatible transport so users can always enter or
+  // leave the mode from any model/provider selection.
+  const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
     ? t("new_session.custom_provider_preset")
     : agentType === "qwen"
@@ -510,43 +737,119 @@ export function NewSessionDialog({
       : t("new_session.api_provider");
   const supportsModelSelection =
     agentType === "claude-code-sdk"
+    || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
     || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
-    || agentType === "gemini-sdk"
+    || agentType === "opencode-sdk"
+    || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
+    || agentType === "muse-code-sdk"
+    || agentType === HERMES_AGENT_PROVIDER_ID
+    || agentType === AGY_SDK_PROVIDER_ID
+    || agentType === "deepseek-harness"
+    || agentType === "pi"
+    || isCodeBuddyProviderId(agentType)
     || (agentType === "qwen" && !!selectedCcPreset);
-  const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
-    ? agentType
-    : null;
-  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
-    if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
+    if (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) && selectedCcPreset) {
+      return mergeModelSuggestions(
+        selectedPresetModels,
+        transportModels.models.map((model) => model.id),
+      );
+    }
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
-      return agentType === "gemini-sdk"
-        ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
-        : dynamicModelIds;
+      if (agentType === "codex-sdk") return dynamicModelIds;
+      if (agentType === "muse-code-sdk") return mergeModelSuggestions(MUSE_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === AGY_SDK_PROVIDER_ID) return dynamicModelIds;
+      if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, dynamicModelIds);
+      return dynamicModelIds;
     }
-    if (agentType === "qwen") return qwenPresetModels;
+    if (agentType === "qwen") return selectedPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
-    if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
+    if (agentType === "muse-code-sdk") return [...MUSE_SDK_MODEL_FALLBACK];
+    if (agentType === AGY_SDK_PROVIDER_ID) return [...AGY_SDK_MODEL_FALLBACK];
+    if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return [...CODEBUDDY_CHINA_MODEL_FALLBACK];
+    if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK];
     return [] as string[];
-  }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
+  }, [transportModels.models, agentType, selectedPresetModels, selectedCcPreset]);
+
+  usePresetModelSelection({
+    agentType,
+    preset: selectedCcPreset,
+    suggestions: modelSuggestions,
+    setRequestedModel,
+  });
+
+  const codexModelManuallySelectedRef = useRef(false);
+  const lastCodexTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
+  useEffect(() => {
+    const nextTarget = serverId?.trim() || ws || null;
+    if (lastCodexTargetRef.current && nextTarget && lastCodexTargetRef.current !== nextTarget) {
+      codexModelManuallySelectedRef.current = false;
+      if (agentType === "codex-sdk" && !selectedCcPreset) setRequestedModel("");
+    }
+    lastCodexTargetRef.current = nextTarget;
+  }, [agentType, selectedCcPreset, serverId, ws]);
 
   useEffect(() => {
-    if (agentType !== "codex-sdk") return;
+    if (agentType !== "codex-sdk" || selectedCcPreset) {
+      codexModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (codexModelManuallySelectedRef.current && trimmed) return trimmed;
+      return resolveCodexAutoDefaultModel(modelSuggestions, transportModels.defaultModel) ?? "";
+    });
+  }, [agentType, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(agentType)) return;
+    setRequestedModel((current) => {
+      const preferred = agentType === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (agentType !== "muse-code-sdk") return;
     setRequestedModel((current) => {
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const stored = loadCodexModelPreference();
-      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
-      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
-        return transportModels.defaultModel;
+      const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_FALLBACK[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
+
+  const agyModelManuallySelectedRef = useRef(false);
+  useEffect(() => {
+    if (agentType !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
       }
-      return trimmed;
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
@@ -554,35 +857,13 @@ export function NewSessionDialog({
     setThinking("high");
   }, [agentType, qwenCompatibleApiPresetSelected]);
 
-  useEffect(() => {
-    if (agentType !== "qwen") return;
-    const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? "") : "";
-    setRequestedModel((current) => {
-      if (modelSuggestions.length === 0) {
-        return current || fallbackModel;
-      }
-      if (
-        fallbackModel
-        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
-        && current !== fallbackModel
-        && modelSuggestions.includes(fallbackModel)
-      ) {
-        return fallbackModel;
-      }
-      if (!current || !modelSuggestions.includes(current)) {
-        return modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0];
-      }
-      return current;
-    });
-  }, [agentType, modelSuggestions, selectedCcPreset]);
-
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !starting) handleStart();
   };
 
   return (
     <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
-      <div class="dialog" style={responsiveDialogStyle}>
+      <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <h2>{t("new_session.title")}</h2>
           <button
@@ -603,7 +884,11 @@ export function NewSessionDialog({
             value={project}
             disabled={starting}
             onInput={(e) => {
-              setProject((e.target as HTMLInputElement).value);
+              const nextProject = (e.target as HTMLInputElement).value;
+              setProject(nextProject);
+              if (!dirManuallyEdited) {
+                setDir(buildDefaultProjectDir(nextProject));
+              }
               setError("");
             }}
             autoFocus
@@ -621,10 +906,13 @@ export function NewSessionDialog({
           <div class="input-with-browse">
             <input
               type="text"
-              placeholder="~/projects/my-project"
+              placeholder="~/.imcodes/projects/my-project"
               value={dir}
               disabled={starting}
-              onInput={(e) => setDir((e.target as HTMLInputElement).value)}
+              onInput={(e) => {
+                setDirManuallyEdited(true);
+                setDir((e.target as HTMLInputElement).value);
+              }}
               autoComplete="off"
               autoCorrect="off"
               autoCapitalize="off"
@@ -653,10 +941,12 @@ export function NewSessionDialog({
             layout="modal"
             initialPath={dir || "~"}
             onConfirm={(paths) => {
+              setDirManuallyEdited(true);
               setDir(paths[0] ?? "");
               setShowDirBrowser(false);
             }}
             onDirectoryCreated={(path) => {
+              setDirManuallyEdited(true);
               setDir(path);
               setShowDirBrowser(false);
               setError("");
@@ -664,6 +954,18 @@ export function NewSessionDialog({
             onClose={() => setShowDirBrowser(false)}
           />
         )}
+
+        <SessionIdentityTabs
+          serverId={serverId}
+          projectKey={project.trim() ? sanitizeProjectName(project.trim()) : undefined}
+          ws={ws}
+          pendingSessionIdentity={pendingSessionIdentity}
+          onPendingSessionIdentityChange={(content, sourceFile) => {
+            setPendingSessionIdentity(content);
+            setPendingSessionIdentitySourceFile(sourceFile);
+          }}
+          disabled={starting}
+        />
 
         <div class="form-group">
           <label>{t("new_session.git_remote_url")}</label>
@@ -685,34 +987,64 @@ export function NewSessionDialog({
           </div>
         </div>
 
-        <div class="form-group">
-          <label>{t("new_session.agent_type")}</label>
-          <select
-            value={agentType}
-            disabled={starting || customProviderSdk}
-            onInput={(e) =>
-              selectAgentType((e.target as HTMLSelectElement).value as AgentType)
-            }
-            style={{
-              width: "100%",
-              background: "#0f172a",
-              border: "1px solid #334155",
-              color: "#e2e8f0",
-              padding: "8px 12px",
-              borderRadius: 4,
-              fontFamily: "inherit",
-            }}
-          >
-            {agentGroups.map((group) => (
-              <optgroup key={group.id} label={t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}>
-                {group.items.map((choice) => (
-                  <option key={choice.id} value={choice.id}>
-                    {getSessionAgentLabel(t, choice)}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+        <div class="form-group session-agent-selector">
+          <div class="session-agent-header">
+            <label>{t("new_session.agent_type")}</label>
+            {ws && (
+              <button
+                type="button"
+                class={`session-agent-refresh-btn${detectingAgents ? " is-refreshing" : ""}`}
+                onClick={handleRefreshAgents}
+                disabled={starting || detectingAgents || !ws.connected}
+                title={t("new_session.refresh_agents_hint")}
+                aria-label={t("new_session.refresh_agents")}
+              >
+                <span class="session-agent-refresh-icon" aria-hidden="true">↻</span>
+                <span>{t("new_session.refresh_agents")}</span>
+              </button>
+            )}
+          </div>
+          <div class="session-agent-groups">
+            {agentGroups.map((group) => {
+              const visibleItems = customProviderSdk
+                ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                : group.items;
+              if (visibleItems.length === 0) return null;
+              return (
+                <div key={group.id} class="session-agent-group">
+                  <div class="session-agent-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                  <div class="session-agent-grid">
+                  {visibleItems.map((choice) => {
+                    const unavailable = !isAgentInstalled(choice.id);
+                    return (
+                    <button
+                      type="button"
+                      key={choice.id}
+                      data-agent-type={choice.id}
+                      class={`session-agent-card${agentType === choice.id ? " active" : ""}${unavailable ? " is-unavailable" : ""}`}
+                      // Hidden choices (e.g. qwen) stay real DOM nodes -- just
+                      // invisible and out of the tab/accessibility order --
+                      // rather than being omitted from visibleItems, so the
+                      // choice is unreachable for a real user while the
+                      // underlying data/behavior (and any test that still
+                      // queries it directly) stays fully intact.
+                      style={choice.hidden ? { display: 'none' } : undefined}
+                      disabled={starting || !isAgentValidForFilters(choice.id)}
+                      aria-pressed={agentType === choice.id}
+                      title={unavailable ? t("new_session.agent_not_installed_hint") : undefined}
+                      onClick={() => selectAgentType(choice.id as AgentType)}
+                    >
+                      <span class="session-agent-card-icon" aria-hidden="true">{choice.icon}</span>
+                      <span>{getSessionAgentLabel(t, choice)}</span>
+                    </button>
+                    );
+                  })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <SdkModeRecommendation agentType={agentType} />
           {/*
            * R-3-cycle-N — drop the nested flex layout for the help text.
            * The previous `<label display:flex>` + inner `<span flex:1
@@ -725,59 +1057,59 @@ export function NewSessionDialog({
            * via `.dialog`'s width:100%; max-width:calc(100vw - ...)`).
            */}
           <div style={{ marginTop: 10 }}>
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                cursor: starting ? "not-allowed" : "pointer",
-              }}
-            >
-              {/*
-               * width:auto is REQUIRED to override the global
-               * `.form-group input { width: 100% }` rule. Without it the
-               * checkbox stretches to the full label width (≈340 px),
-               * pushing the span past the dialog's right edge. The span
-               * then inherits `overflow-wrap: anywhere` from the dialog
-               * root and wraps the "Custom provider SDK" label as a
-               * one-character-per-line vertical strip on the screen edge.
-               * Setting margin:0 is paired defense in case form-group ever
-               * grows side margins on inputs.
-               */}
-              <input
-                type="checkbox"
-                checked={customProviderSdk}
-                disabled={starting}
-                onChange={(e) =>
-                  toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
-                }
-                style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
-              />
-              <span
+              <label
                 style={{
-                  color: "#e2e8f0",
-                  fontSize: 13,
-                  // Match the help text: break at word boundaries, not
-                  // characters, in case the label ever grows to overflow.
-                  overflowWrap: "break-word",
-                  minWidth: 0,
-                  flex: "1 1 auto",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  cursor: starting ? "not-allowed" : "pointer",
                 }}
               >
-                {t("new_session.custom_provider_sdk")}
-              </span>
-            </label>
-            <div
-              style={{
-                marginLeft: 24,
-                marginTop: 4,
-                color: "#94a3b8",
-                fontSize: 12,
-                lineHeight: 1.35,
-              }}
-            >
-              {t("new_session.custom_provider_sdk_help")}
-            </div>
+                {/*
+                 * width:auto is REQUIRED to override the global
+                 * `.form-group input { width: 100% }` rule. Without it the
+                 * checkbox stretches to the full label width (≈340 px),
+                 * pushing the span past the dialog's right edge. The span
+                 * then inherits `overflow-wrap: anywhere` from the dialog
+                 * root and wraps the "Custom provider SDK" label as a
+                 * one-character-per-line vertical strip on the screen edge.
+                 * Setting margin:0 is paired defense in case form-group ever
+                 * grows side margins on inputs.
+                 */}
+                <input
+                  type="checkbox"
+                  checked={customProviderSdk}
+                  disabled={starting}
+                  onChange={(e) =>
+                    toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
+                  }
+                  style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
+                />
+                <span
+                  style={{
+                    color: "#e2e8f0",
+                    fontSize: 13,
+                    // Match the help text: break at word boundaries, not
+                    // characters, in case the label ever grows to overflow.
+                    overflowWrap: "break-word",
+                    minWidth: 0,
+                    flex: "1 1 auto",
+                  }}
+                >
+                  {t("new_session.custom_provider_sdk")}
+                </span>
+              </label>
+              <div
+                style={{
+                  marginLeft: 24,
+                  marginTop: 4,
+                  color: "#94a3b8",
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                }}
+              >
+                {t("new_session.custom_provider_sdk_help")}
+              </div>
           </div>
           {agentFlavor && (
             <div
@@ -793,7 +1125,7 @@ export function NewSessionDialog({
                 : t("new_session.agent_flavor_sdk")}
             </div>
           )}
-          <QwenCodingPlanHint selected={agentType === "qwen"} />
+          <QwenCodingPlanHint selected={customProviderSdk || agentType === "qwen"} />
         </div>
 
         {thinkingLevels.length > 0 && (
@@ -819,7 +1151,7 @@ export function NewSessionDialog({
             >
               {thinkingLevels.map((level) => (
                 <option key={level} value={level}>
-                  {formatEffortLevel(level)}
+                  {formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}
                 </option>
               ))}
             </select>
@@ -833,9 +1165,14 @@ export function NewSessionDialog({
               <select
                 value={requestedModel}
                 disabled={starting}
-                onInput={(e) =>
-                  setRequestedModel((e.target as HTMLSelectElement).value)
-                }
+                onInput={(e) => {
+                  const val = (e.target as HTMLSelectElement).value;
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  if (agentType === "codex-sdk" && !selectedCcPreset) {
+                    codexModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
+                  setRequestedModel(val);
+                }}
                 style={{
                   width: "100%",
                   background: "#0f172a",
@@ -850,6 +1187,9 @@ export function NewSessionDialog({
                 {!requestedModel && (
                   <option value="">{t("new_session.default_model")}</option>
                 )}
+                {requestedModel.trim() && !modelSuggestions.includes(requestedModel.trim()) && (
+                  <option value={requestedModel.trim()}>{requestedModel.trim()}</option>
+                )}
                 {modelSuggestions.map((model) => (
                   <option key={model} value={model}>
                     {model}
@@ -857,35 +1197,43 @@ export function NewSessionDialog({
                 ))}
               </select>
             ) : (
-              <input
-                type="text"
-                list={`new-session-model-options-${agentType}`}
+              <ModelCombobox
+                options={modelSuggestions}
+                id={`new-session-model-${agentType}`}
                 placeholder={t("session.supervision.selectModel")}
                 value={requestedModel}
                 disabled={starting}
-                onInput={(e) =>
-                  setRequestedModel((e.target as HTMLInputElement).value)
-                }
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellcheck={false}
-                data-lpignore="true"
-                data-1p-ignore
+                onChange={(val) => {
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  if (agentType === "codex-sdk" && !selectedCcPreset) {
+                    codexModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
+                  setRequestedModel(val);
+                }}
+                className="input"
+                style={{ width: "100%" }}
               />
             )}
-            {modelSuggestions.length > 0 && (
-              <datalist id={`new-session-model-options-${agentType}`}>
-                {modelSuggestions.map((model) => (
-                  <option key={model} value={model} />
-                ))}
-              </datalist>
+            {agentType === "grok-sdk" && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.grok_prerequisite_error", { error: transportModels.error })}
+              </div>
+            )}
+            {agentType === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.hermes_prerequisite_error", { error: transportModels.error })}
+              </div>
+            )}
+            {agentType === AGY_SDK_PROVIDER_ID && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.agy_prerequisite_error", { error: transportModels.error })}
+              </div>
             )}
           </div>
         )}
 
         {/* CC env preset selector + editor */}
-        {supportsCcPreset && (
+        {showCcPresetControls && (
           <>
             <div class="form-group">
               <label
@@ -974,6 +1322,49 @@ export function NewSessionDialog({
                 >
                   Stored locally on daemon (~/.imcodes/cc-presets.json)
                 </div>
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}>
+                    API Protocol
+                  </div>
+                  <div style={{ display: "flex", gap: 12 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
+                      <input
+                        type="radio"
+                        name="new-session-preset-auth-type"
+                        value="anthropic"
+                        checked={newPresetAuthType === "anthropic"}
+                        onChange={() => {
+                          setNewPresetAuthType("anthropic");
+                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
+                            setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
+                          }
+                          if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
+                            setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
+                          }
+                        }}
+                      />
+                      Anthropic Compatible
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
+                      <input
+                        type="radio"
+                        name="new-session-preset-auth-type"
+                        value="openai"
+                        checked={newPresetAuthType === "openai"}
+                        onChange={() => {
+                          setNewPresetAuthType("openai");
+                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
+                            setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
+                          }
+                          if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
+                            setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
+                          }
+                        }}
+                      />
+                      OpenAI Compatible
+                    </label>
+                  </div>
+                </div>
                 {[
                   {
                     label: "Preset Name",
@@ -984,14 +1375,14 @@ export function NewSessionDialog({
                   },
                   {
                     label: "API Base URL",
-                    envKey: "ANTHROPIC_BASE_URL",
-                    ph: "https://api.minimax.io/anthropic",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_BASE_URL" : "ANTHROPIC_BASE_URL",
+                    ph: newPresetAuthType === "openai" ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
                     val: newPresetBaseUrl,
                     set: setNewPresetBaseUrl,
                   },
                   {
                     label: "API Key",
-                    envKey: "ANTHROPIC_AUTH_TOKEN",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY",
                     ph: "your-api-key",
                     val: newPresetToken,
                     set: setNewPresetToken,
@@ -999,8 +1390,8 @@ export function NewSessionDialog({
                   },
                   {
                     label: "Model",
-                    envKey: "ANTHROPIC_MODEL",
-                    ph: "e.g. MiniMax-M2.7",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_MODEL" : "ANTHROPIC_MODEL",
+                    ph: newPresetAuthType === "openai" ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
                     val: newPresetModel,
                     set: setNewPresetModel,
                   },
@@ -1667,6 +2058,16 @@ export function NewSessionDialog({
 
         </div>
 
+        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
+          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
+            <input type="checkbox" checked={incognito} disabled={!canIncognito}
+              onChange={event => setIncognito(event.currentTarget.checked)} />
+            <span>🕶️ {t('session.incognito')}</span>
+          </label>
+          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
+          {(!canIncognito || (incognito && !supportsSessionIncognito(agentType))) && <p role="status">{t('session.incognito_unsupported')}</p>}
+        </div>
+
         <div
           class="dialog-footer"
           style={{
@@ -1686,9 +2087,9 @@ export function NewSessionDialog({
             {t("common.cancel")}
           </button>
           <button
-            class="btn btn-primary"
+            class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`}
             onClick={handleStart}
-            disabled={starting}
+            disabled={starting || !isAgentValidForFilters(agentType) || (incognito && !canIncognito)}
           >
             {starting ? t("new_session.starting") : t("new_session.start")}
           </button>

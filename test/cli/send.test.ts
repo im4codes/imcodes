@@ -5,6 +5,31 @@
  * - Backward compatibility with existing positional args
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { appendAgentSendDocs } from '../../src/daemon/imcodes-workflow-docs.js';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const DOCS_MODULE = join(REPO_ROOT, 'src/daemon/imcodes-workflow-docs.ts');
+
+/** Transitive repo-local runtime imports of a TypeScript module (type-only imports excluded). */
+function localImportGraph(entry: string): Set<string> {
+  const seen = new Set<string>();
+  const visit = (file: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const source = readFileSync(file, 'utf8');
+    const specifiers = source.matchAll(/^\s*(import|export)\s+(?!type\b)(?:[^'"]*?\sfrom\s+)?['"](\.{1,2}\/[^'"]+)['"]/gm);
+    for (const match of specifiers) {
+      const target = resolve(dirname(file), match[2]!).replace(/\.js$/, '.ts');
+      const resolved = existsSync(target) ? target : join(target.replace(/\.ts$/, ''), 'index.ts');
+      if (existsSync(resolved)) visit(resolved);
+    }
+  };
+  visit(entry);
+  return seen;
+}
 
 // ── detectSenderSession tests ─────────────────────────────────────────────────
 
@@ -66,29 +91,51 @@ describe('detectSenderSession', () => {
   });
 
   it('falls through TMUX_PANE on tmux query failure when CLAUDECODE is set', async () => {
-    // In CI/Claude Code, tmux is unavailable — should throw gracefully
+    // Previously this assumed tmux is absent ("In CI/Claude Code, tmux is
+    // unavailable"). That is not true on a developer machine with tmux running:
+    // the query for pane %99 can actually resolve to a real session, and the
+    // test then failed with "promise resolved ... instead of rejecting".
+    // Force the failure instead of hoping the environment supplies it.
+    vi.resetModules();
+    vi.doMock('child_process', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('child_process')>();
+      return {
+        ...actual,
+        execFile: (_file: string, _args: readonly string[], cb: (e: Error | null, so: string, se: string) => void) => {
+          cb(new Error('tmux unavailable'), '', '');
+          return undefined as never;
+        },
+      };
+    });
+    const mod = await import('../../src/util/detect-session.js');
     process.env.TMUX_PANE = '%99';
-    // The execFile call to tmux will fail, so detectSenderSession should throw
-    await expect(detectSenderSession()).rejects.toThrow('Cannot detect session identity');
+    try {
+      await expect(mod.detectSenderSession()).rejects.toThrow('Cannot detect session identity');
+    } finally {
+      vi.doUnmock('child_process');
+      vi.resetModules();
+    }
   });
 });
 
 // ── Memory inject: appendAgentSendDocs tests ────────────────────────────────
 
 describe('appendAgentSendDocs', () => {
-  let appendAgentSendDocs: typeof import('../../src/daemon/memory-inject.js').appendAgentSendDocs;
-
-  beforeEach(async () => {
-    vi.resetModules();
-    vi.mock('../../src/util/logger.js', () => ({
-      default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn() },
-    }));
-    const mod = await import('../../src/daemon/memory-inject.js');
-    appendAgentSendDocs = mod.appendAgentSendDocs;
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
+  // A static import of the pure, dependency-light docs module. This block used
+  // to vi.resetModules() and dynamically re-import memory-inject (≈100 daemon
+  // modules) before every test only to reach this string helper; on a loaded
+  // Windows runner that cold import exceeded the 10 s hook timeout.
+  it('lives in a dependency-light module so callers never load the memory-inject graph', () => {
+    const graph = localImportGraph(DOCS_MODULE);
+    expect([...graph].map((file) => relative(REPO_ROOT, file).split(sep).join('/')).sort()).toEqual([
+      'shared/imcodes-send.ts',
+      'shared/memory-mcp-feature-flags.ts',
+      'src/daemon/imcodes-workflow-docs.ts',
+    ]);
+    // Guard against the helper drifting back: memory-inject only re-exports it.
+    const memoryInject = readFileSync(join(REPO_ROOT, 'src/daemon/memory-inject.ts'), 'utf8');
+    expect(memoryInject).not.toMatch(/function\s+appendAgentSendDocs\b/);
+    expect(memoryInject).toContain("export { appendAgentSendDocs } from './imcodes-workflow-docs.js';");
   });
 
   it('appends send docs to existing memory', () => {

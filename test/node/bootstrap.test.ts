@@ -1,0 +1,1190 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN } from '../../shared/controlled-node-abi.js';
+import { describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
+import { mkdtemp, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  bootstrapControlledNode,
+  bootstrapControlledNodeWithDisposition,
+  isCurrentExecutableStable,
+  journalPathFor,
+  type ControlledNodeBootstrapDeps,
+} from '../../src/node/bootstrap.js';
+import { INSTALL_JOURNAL_VERSION, writeInstallPhase as realWriteInstallPhase } from '../../src/node/install-journal.js';
+import type { InstallJournal, InstallPhase, ServiceReceipt } from '../../src/node/install-journal.js';
+import type {
+  ControlledNodeCredential,
+  PendingInstallIdentity,
+  StagedExecutableReceipt,
+  VerifiedEnrollmentSource,
+} from '../../src/node/enrollment.js';
+import type { EnrollmentBlob, EnrollmentTrailerRange } from '../../shared/remote-exec.js';
+
+const CRED: ControlledNodeCredential = {
+  serverId: 'srv-1',
+  token: 'tok-local',
+  serverUrl: 'https://relay',
+  nodeRole: 'controlled',
+};
+const BLOB: EnrollmentBlob = { serverUrl: 'https://relay', enrollToken: 'e1' };
+const TRAILER: EnrollmentTrailerRange = { blob: BLOB, trailerStart: 4096, trailerLength: 128 };
+const IDENTITY: PendingInstallIdentity = {
+  installId: 'inst-1',
+  nodeToken: 'tok-local',
+  nodeTokenHash: 'a'.repeat(64),
+  sourceExePath: '/tmp/download/imcodes-node',
+};
+const STAGED_RECEIPT: StagedExecutableReceipt = {
+  path: '/tmp/staged/imcodes-node',
+  size: TRAILER.trailerStart,
+  sha256: 'b'.repeat(64),
+  sourceIdentity: { size: 4224, mtimeMs: 1, ctimeMs: 1 },
+  stagedIdentity: { size: 4096, mtimeMs: 2, ctimeMs: 2 },
+};
+const SERVICE_RECEIPT: ServiceReceipt = {
+  name: 'imcodes-node',
+  platform: 'linux',
+  definitionPath: '/etc/systemd/system/imcodes-node.service',
+  definitionSha256: 'c'.repeat(64),
+  action: '/tmp/staged/imcodes-node',
+};
+const MAC_SERVICE_RECEIPT: ServiceReceipt = {
+  name: 'cc.imcodes.node',
+  platform: 'darwin',
+  definitionPath: '/Library/LaunchDaemons/cc.imcodes.node.plist',
+  definitionSha256: 'd'.repeat(64),
+  watchdogDefinitionPath: '/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist',
+  watchdogDefinitionSha256: 'e'.repeat(64),
+  action: '/tmp/staged/imcodes-node',
+};
+
+function makeSource(over: Partial<VerifiedEnrollmentSource> = {}): VerifiedEnrollmentSource {
+  return {
+    sourcePath: '/tmp/download/imcodes-node',
+    identity: STAGED_RECEIPT.sourceIdentity,
+    statSize: vi.fn(async () => 4224),
+    readExactly: vi.fn(async () => Buffer.alloc(0)),
+    readEnrollmentBlobWithRange: vi.fn(async () => TRAILER),
+    stageTrailerFreeExecutable: vi.fn(async () => STAGED_RECEIPT),
+    cleanupEnrollmentSource: vi.fn(async () => 'cleaned' as const),
+    close: vi.fn(async () => {}),
+    ...over,
+  };
+}
+
+function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNodeBootstrapDeps & { phases: InstallPhase[]; journal: InstallJournal } {
+  const phases: InstallPhase[] = [];
+  let journal: InstallJournal = { version: INSTALL_JOURNAL_VERSION, phase: 'uninstalled', updatedAt: 0 };
+  // Every deps set gets its own on-disk journal so the real writer's transition
+  // and immutability rules apply exactly as they do in production.
+  const journalFilePath = join(
+    mkdtempSync(join(tmpdir(), 'deck-bootstrap-')),
+    'install.json',
+  );
+  const source = makeSource();
+  const deps = {
+    loadCredential: vi.fn(async () => null),
+    openVerifiedEnrollmentSource: vi.fn(async () => source),
+    loadInstallIdentity: vi.fn(async () => null),
+    persistInstallIdentity: vi.fn(async () => {}),
+    generateInstallIdentity: vi.fn(() => ({ ...IDENTITY })),
+    redeemEnrollmentV2: vi.fn(async () => CRED),
+    persistCredential: vi.fn(async () => {}),
+    installDefinition: vi.fn(async () => SERVICE_RECEIPT),
+    inspectDefinition: vi.fn(async (receipt: ServiceReceipt) => receipt),
+    inspectServiceState: vi.fn(async () => ({
+      installed: true,
+      action: SERVICE_RECEIPT.action ?? null,
+      effectiveAction: SERVICE_RECEIPT.action ?? null,
+      loadedActionMatches: true,
+      loaded: true,
+      bootEnabled: true,
+      principal: 'root',
+      restartPolicy: 'on-failure',
+      observedDefinitionSha256: SERVICE_RECEIPT.definitionSha256 ?? null,
+      definitionMatches: true,
+      runState: 'running' as const,
+      errors: [],
+      raw: 'running',
+    })),
+    startService: vi.fn(async () => {}),
+    verifyStagedExecutable: vi.fn(async () => {}),
+    isStableRuntime: vi.fn(async () => false),
+    assertElevated: vi.fn(async () => {}),
+    ensureReleasePublisherTrust: vi.fn(async () => {}),
+    // Content identity of the launched installer. Real installs read it from
+    // the verified inspection; the fixture pins it so path drift can be tested
+    // without a real executable on disk.
+    inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
+    prepareCredentialDir: vi.fn(async () => {}),
+    loadInstallJournal: vi.fn(async () => journal),
+    // The REAL writer, not a merge-only stand-in.
+    //
+    // The previous fake reproduced the merge and skipped `assertImmutableMetadata`
+    // entirely, so every bootstrap test ran with the tamper guards switched off
+    // and would have passed even if those guards did not exist. It writes to a
+    // per-test temp journal so the transition rules are exercised for real.
+    writeInstallPhase: vi.fn(async (_p: string, phase: InstallPhase, extra: Partial<InstallJournal> & { previous?: InstallJournal | null; now: number }) => {
+      phases.push(phase);
+      journal = await realWriteInstallPhase(journalFilePath, phase, { ...extra, previous: extra.previous ?? journal });
+      return journal;
+    }),
+    journalPath: journalFilePath,
+    credentialPath: '/tmp/credential.json',
+    stagedExecutablePath: '/tmp/staged/imcodes-node',
+    sourceExecutablePath: '/tmp/download/imcodes-node',
+    now: 123,
+    warn: vi.fn(),
+    ...over,
+  } as ControlledNodeBootstrapDeps & { phases: InstallPhase[]; journal: InstallJournal };
+  // Seed the real journal file from whatever the fixture reports as loaded, so
+  // the on-disk state the real writer validates against matches the scenario
+  // under test. Without this the writer compares a synthetic in-memory journal
+  // against an empty file and reports a stale transition.
+  const loadFixture = deps.loadInstallJournal;
+  deps.loadInstallJournal = vi.fn(async (...args: Parameters<typeof loadFixture>) => {
+    const loaded = await loadFixture(...args);
+    journal = loaded;
+    if (loaded && loaded.phase !== 'uninstalled') {
+      await writeFile(journalFilePath, JSON.stringify(loaded));
+    }
+    return loaded;
+  }) as typeof loadFixture;
+  deps.phases = phases;
+  deps.journal = journal;
+  return deps;
+}
+
+describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () => {
+  it('reconciles an interrupted Windows upgrade before deciding whether the runtime is stable', async () => {
+    const oldJournal: InstallJournal = {
+      version: 1,
+      phase: 'service_start_requested',
+      updatedAt: 5,
+      installId: 'inst-1',
+      nodeTokenHash: 'a'.repeat(64),
+      sourceExePath: '/tmp/download/imcodes-node',
+      stagedExePath: STAGED_RECEIPT.path,
+      stagedReceipt: STAGED_RECEIPT,
+      serverId: 'srv-1',
+      serviceName: 'imcodes-node',
+      serviceReceipt: SERVICE_RECEIPT,
+      serviceStartRequestedAt: 5,
+    };
+    const repairedJournal = { ...oldJournal, updatedAt: 6, stagedReceipt: { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) } };
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => oldJournal),
+      recoverInterruptedUpgrade: vi.fn(async () => ({
+        journal: repairedJournal,
+        handoff: false,
+        outcome: 'target_receipt_completed',
+      })),
+      isStableRuntime: vi.fn(async (journal) => journal === repairedJournal),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('run_runtime');
+    expect(deps.recoverInterruptedUpgrade).toHaveBeenCalledWith(oldJournal);
+    expect(deps.isStableRuntime).toHaveBeenCalledWith(repairedJournal);
+    expect(deps.persistCredential).not.toHaveBeenCalled();
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+  });
+
+  it('hands off to the durable upgrade task when startup recovery needs external replacement', async () => {
+    const journal: InstallJournal = {
+      version: 1, phase: 'service_healthy', updatedAt: 5, installId: 'inst-1',
+      nodeTokenHash: 'a'.repeat(64), sourceExePath: '/tmp/download/imcodes-node',
+      stagedExePath: STAGED_RECEIPT.path, stagedReceipt: STAGED_RECEIPT,
+      serverId: 'srv-1', serviceName: 'imcodes-node', serviceReceipt: SERVICE_RECEIPT,
+      serviceStartRequestedAt: 4, healthyAt: 5,
+    };
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => journal),
+      recoverInterruptedUpgrade: vi.fn(async () => ({ journal, handoff: true, outcome: 'rollback_resumed' })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('handoff_complete');
+    expect(deps.isStableRuntime).not.toHaveBeenCalled();
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('runs runtime only from stable executable after service start was requested', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_start_requested' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: STAGED_RECEIPT.path,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+        serviceStartRequestedAt: 5,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'run_runtime' });
+    expect(deps.assertElevated).not.toHaveBeenCalled();
+    expect(deps.openVerifiedEnrollmentSource).not.toHaveBeenCalled();
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+    expect(deps.installDefinition).not.toHaveBeenCalled();
+    expect(deps.inspectServiceState).toHaveBeenCalledWith(SERVICE_RECEIPT);
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('keeps an already-installed stable runtime online when publisher-trust maintenance transiently fails', async () => {
+    const trustFailure = new Error('PowerShell trust-store timeout');
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      ensureReleasePublisherTrust: vi.fn(async () => { throw trustFailure; }),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_start_requested' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).resolves.toMatchObject({
+      credential: CRED,
+      disposition: 'run_runtime',
+    });
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining('trust-store timeout'));
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('keeps the machine reachable when publisher trust cannot be installed', async () => {
+    // The trust anchor gates native sidecars, not enrolment. Failing closed
+    // here would leave a machine that nobody can open a session to — including
+    // to inspect the policy or antivirus that blocked the import, which on a
+    // remote machine is the only way to fix it at all.
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      ensureReleasePublisherTrust: vi.fn(async () => { throw new Error('publisher trust invalid'); }),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_registered' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.credential).toEqual(CRED);
+    // The reason is carried, not swallowed: the installer prints it and the
+    // operator learns why remote desktop will not start.
+    expect(result.publisherTrustError).toMatch(/publisher trust invalid/);
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringMatching(/publisher trust invalid/));
+  });
+
+  it('reports no publisher-trust error when the certificate installs', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_registered' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.publisherTrustError).toBeUndefined();
+  });
+
+  it('stable macOS owner repairs durable drift, re-inspects, and never restarts itself', async () => {
+    const inspectServiceState = vi.fn()
+      .mockResolvedValueOnce({ installed: true, action: '/wrong', effectiveAction: '/wrong', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: 'x'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'drift' })
+      .mockResolvedValueOnce({ installed: true, action: MAC_SERVICE_RECEIPT.action, effectiveAction: MAC_SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: MAC_SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'repaired' });
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
+      inspectServiceState,
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_start_requested' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: STAGED_RECEIPT.path,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: MAC_SERVICE_RECEIPT.name,
+        serviceReceipt: MAC_SERVICE_RECEIPT,
+        serviceStartRequestedAt: 5,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('run_runtime');
+    expect(deps.installDefinition).toHaveBeenCalledWith(STAGED_RECEIPT.path);
+    expect(inspectServiceState).toHaveBeenCalledTimes(2);
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('stable macOS owner refuses healthy when the disk definition is rewritten but the manager keeps the old action', async () => {
+    // Post-rewrite the on-disk definition matches the receipt, but the service
+    // MANAGER never reloaded, so its effective loaded action still lags. That
+    // divergence (definitionMatches=true, loadedActionMatches=false) MUST keep
+    // reconciliation unhealthy — the stable owner may repair the file but is
+    // forbidden from restarting itself, so it refuses to claim persistence.
+    const inspectServiceState = vi.fn()
+      .mockResolvedValueOnce({ installed: true, action: '/old', effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: 'x'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'pre-repair' })
+      .mockResolvedValueOnce({ installed: true, action: MAC_SERVICE_RECEIPT.action, effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: MAC_SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'disk-rewritten-manager-stale' });
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
+      inspectServiceState,
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_start_requested' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: STAGED_RECEIPT.path,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: MAC_SERVICE_RECEIPT.name,
+        serviceReceipt: MAC_SERVICE_RECEIPT,
+        serviceStartRequestedAt: 5,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('run_runtime');
+    expect(deps.installDefinition).toHaveBeenCalledWith(STAGED_RECEIPT.path);
+    expect(inspectServiceState).toHaveBeenCalledTimes(2);
+    // SIDE-EFFECT-FREE reconciliation: rewrote the file, never restarted itself.
+    expect(deps.startService).not.toHaveBeenCalled();
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining('remains unverified'));
+  });
+
+  it('stable Linux owner durably repairs WatchdogSec then exits for systemd to relaunch it', async () => {
+    const inspectServiceState = vi.fn()
+      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: 'legacy', definitionMatches: false, runState: 'running', errors: [], raw: 'watchdog disabled' })
+      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'definition loaded' });
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      inspectServiceState,
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_start_requested' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: STAGED_RECEIPT.path,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: SERVICE_RECEIPT.name,
+        serviceReceipt: SERVICE_RECEIPT,
+        serviceStartRequestedAt: 5,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps))
+      .rejects.toThrow('restarting under systemd supervision');
+    expect(deps.installDefinition).toHaveBeenCalledWith(STAGED_RECEIPT.path);
+    expect(deps.writeInstallPhase).toHaveBeenCalledWith(
+      deps.journalPath,
+      'service_start_requested',
+      expect.objectContaining({ serviceReceipt: SERVICE_RECEIPT }),
+    );
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('stable owner at service_registered only persists start intent and does not restart itself', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_registered' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'run_runtime' });
+    expect(deps.verifyStagedExecutable).toHaveBeenCalledWith(STAGED_RECEIPT);
+    expect(deps.inspectDefinition).toHaveBeenCalledWith(SERVICE_RECEIPT);
+    expect(deps.phases).toEqual(['service_start_requested']);
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('source process resumes service registration, writes start intent, starts service, then hands off', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'enrolled' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+    expect(deps.installDefinition).toHaveBeenCalledWith('/tmp/staged/imcodes-node');
+    expect(deps.inspectDefinition).toHaveBeenCalledWith(SERVICE_RECEIPT);
+    expect(deps.startService).toHaveBeenCalledWith(SERVICE_RECEIPT);
+    expect(deps.verifyStagedExecutable).toHaveBeenCalledWith(STAGED_RECEIPT);
+    expect(deps.phases).toEqual(['service_registered', 'service_start_requested']);
+  });
+
+  it('re-installs an enrolled machine whose stable image drifted, instead of refusing forever', async () => {
+    // The exact field state: the node is enrolled, its journal says healthy, and
+    // its stable image no longer matches the receipt because it was replaced
+    // since the install. Re-running the downloaded installer is the one repair
+    // a person has, and it reported `stable executable hash mismatch` and quit.
+    //
+    // Distinct from the drift case below: this process is NOT the stable
+    // runtime and a credential already exists, so the enrolled early-return
+    // path is taken and executable staging is never reached at all.
+    const restaged: StagedExecutableReceipt = { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) };
+    const source = makeSource({ stageTrailerFreeExecutable: vi.fn(async () => restaged) });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      sourceExecutablePath: '/tmp/download/imcodes-node (1)',
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => false),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        sourceExePath: '/tmp/download/imcodes-node',
+        healthyAt: 2,
+        phase: 'service_healthy' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        serverId: CRED.serverId,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+      verifyStagedExecutable: vi.fn()
+        .mockRejectedValueOnce(new Error('stable executable hash mismatch'))
+        .mockResolvedValue(undefined),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    // The installer's own bytes must land; that is what running it means.
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith(
+      '/tmp/staged/imcodes-node',
+      TRAILER.trailerStart,
+      undefined,
+    );
+    // The journal now describes what is actually on disk, not what used to be.
+    expect(result.journal.stagedReceipt).toEqual(restaged);
+    expect(result.journal.sourceExePath).toBe('/tmp/download/imcodes-node');
+    expect(result.credential).toEqual(CRED);
+  });
+
+  it('refuses a different package delivered at the SAME source path', async () => {
+    // The worst shape of the attack: do not move the file at all, just replace
+    // its bytes at the path the journal already trusts. Checking only when the
+    // path changed meant nobody ever looked.
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'f'.repeat(64), size: 9999 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        // Same path the installer is running from — only the bytes differ.
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps))
+      .rejects.toThrow(/source executable does not match the journal source artifact/);
+  });
+
+  it('converges a torn journal/identity pair on the next boot without regressing the path', async () => {
+    // Crash injection at the persistence boundary: the journal was written and
+    // fsynced with the new download path, then the process died before the
+    // durable identity cache was updated. The journal is the authority, so the
+    // next boot must pull the identity forward — never push the journal back.
+    const persisted: PendingInstallIdentity[] = [];
+    const torn = { ...IDENTITY, sourceExePath: 'C:\\Users\\k\\Downloads\\imcodes-node.exe' };
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => torn),
+      persistInstallIdentity: vi.fn(async (identity: PendingInstallIdentity) => { persisted.push({ ...identity }); }),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        // Already advanced by the crashed run.
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    expect(result.journal.sourceExePath, 'the journal must never regress').toBe('/tmp/download/imcodes-node');
+    expect(persisted.at(-1)?.sourceExePath, 'the identity cache must converge onto the journal')
+      .toBe('/tmp/download/imcodes-node');
+  });
+
+  it('is idempotent: a converged pair rewrites nothing', async () => {
+    const persisted: PendingInstallIdentity[] = [];
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => ({ ...IDENTITY, sourceExePath: '/tmp/download/imcodes-node' })),
+      persistInstallIdentity: vi.fn(async (identity: PendingInstallIdentity) => { persisted.push({ ...identity }); }),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    await bootstrapControlledNodeWithDisposition(deps);
+    expect(persisted, 'an already-converged pair must not be rewritten').toHaveLength(0);
+  });
+
+  it('re-stages when the staged copy drifted from its receipt instead of refusing the install', async () => {
+    // Field failure (Windows, 2026-09): a node whose stable image had been
+    // replaced since its install could never be re-installed. Every run failed
+    // with `stable executable size mismatch` because the resume path verified a
+    // stale receipt and refused, so the operator had no way back.
+    const source = makeSource();
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => null),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        sourceExePath: '/tmp/download/imcodes-node',
+        serverId: 'srv-1',
+        serviceName: 'imcodes-node',
+        healthyAt: 2,
+        phase: 'service_healthy' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+      })),
+      // The stale receipt fails; the receipt written by the re-stage verifies.
+      verifyStagedExecutable: vi.fn()
+        .mockRejectedValueOnce(new Error('stable executable size mismatch'))
+        .mockResolvedValue(undefined),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart, undefined);
+    // The repair records the refreshed receipt WITHOUT rewinding the label: a
+    // healthy machine stays healthy. Stamping `files_staged` here would be a
+    // backward transition the journal refuses, which is what used to leave
+    // drifted machines with no way back.
+    expect(deps.phases).not.toContain('files_staged');
+    expect(deps.phases.every((phase) => phase === 'service_healthy')).toBe(true);
+    expect(result.journal.stagedReceipt).toEqual(STAGED_RECEIPT);
+  });
+
+  it('first run stages a trailer-free service copy while preserving the reusable source installer', async () => {
+    const order: string[] = [];
+    const source = makeSource({
+      readEnrollmentBlobWithRange: vi.fn(async () => { order.push('trailer'); return TRAILER; }),
+      stageTrailerFreeExecutable: vi.fn(async () => { order.push('stage'); return STAGED_RECEIPT; }),
+      cleanupEnrollmentSource: vi.fn(async () => { order.push('cleanup'); return 'cleaned' as const; }),
+    });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      assertElevated: vi.fn(async () => { order.push('elevate'); }),
+      ensureReleasePublisherTrust: vi.fn(async () => { order.push('trust'); }),
+      prepareCredentialDir: vi.fn(async () => { order.push('prepare'); }),
+      persistInstallIdentity: vi.fn(async () => { order.push('identity'); }),
+      redeemEnrollmentV2: vi.fn(async () => { order.push('redeem'); return CRED; }),
+      persistCredential: vi.fn(async () => { order.push('persist'); }),
+      installDefinition: vi.fn(async () => { order.push('install'); return SERVICE_RECEIPT; }),
+      inspectDefinition: vi.fn(async (receipt) => { order.push('inspect'); return receipt; }),
+      startService: vi.fn(async () => { order.push('start'); }),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
+    expect(order).toEqual(['elevate', 'trust', 'trailer', 'prepare', 'identity', 'stage', 'redeem', 'persist', 'install', 'inspect', 'start']);
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart, undefined);
+    expect(source.cleanupEnrollmentSource).not.toHaveBeenCalled();
+    expect(source.close).toHaveBeenCalledOnce();
+    expect(deps.phases).toEqual(['elevated', 'credential_prepared', 'files_staged', 'enrolled', 'service_registered', 'service_start_requested']);
+    expect(result.journal.stagedReceipt).toEqual(STAGED_RECEIPT);
+    expect(result.journal.cleanupStatus).toBe('skipped');
+    expect(result.journal.serviceReceipt).toEqual(SERVICE_RECEIPT);
+    expect(result.journal.serviceStartRequestedAt).toBe(123);
+  });
+
+  it('persists install identity BEFORE redeeming (D-A ordering)', async () => {
+    const order: string[] = [];
+    const deps = makeDeps({
+      persistInstallIdentity: vi.fn(async () => { order.push('identity'); }),
+      redeemEnrollmentV2: vi.fn(async () => { order.push('redeem'); return CRED; }),
+    });
+    await bootstrapControlledNode(deps);
+    expect(order.indexOf('identity')).toBeLessThan(order.indexOf('redeem'));
+  });
+
+  it('fails before any protected write or redeem when first launch is not elevated', async () => {
+    const deps = makeDeps({
+      assertElevated: vi.fn(async () => { throw new Error('requires Administrator/root'); }),
+    });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/Administrator\/root/);
+    expect(deps.phases).toEqual([]);
+    expect(deps.prepareCredentialDir).not.toHaveBeenCalled();
+    expect(deps.persistInstallIdentity).not.toHaveBeenCalled();
+    expect(deps.openVerifiedEnrollmentSource).not.toHaveBeenCalled();
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+  });
+
+  it('errors (without redeeming) when there is no enrollment blob on fresh install', async () => {
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+    });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/not enrolled/);
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+  });
+
+  it('a persist failure after redeem leaves enrolled journal and retries on next boot', async () => {
+    const persist = vi.fn()
+      .mockRejectedValueOnce(new Error('EACCES'))
+      .mockResolvedValueOnce(undefined);
+    const deps = makeDeps({ persistCredential: persist });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/could not persist/i);
+    expect(deps.redeemEnrollmentV2).toHaveBeenCalledOnce();
+    expect(deps.phases).toEqual(['elevated', 'credential_prepared', 'files_staged', 'enrolled']);
+
+    const retry = makeDeps({
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'enrolled' as InstallPhase,
+        updatedAt: 5,
+        installId: 'inst-1',
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        serverId: 'srv-1',
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+      })),
+      persistCredential: persist,
+    });
+    const cred = await bootstrapControlledNode(retry);
+    expect(cred).toBe(CRED);
+    expect(retry.redeemEnrollmentV2).toHaveBeenCalledWith(BLOB, IDENTITY);
+    expect(persist).toHaveBeenCalledTimes(2);
+  });
+
+  it('journal=enrolled with persisted identity replays redeem to recover credential metadata', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'enrolled' as InstallPhase,
+        updatedAt: 5,
+        installId: 'inst-1',
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        serverId: 'srv-1',
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        cleanupStatus: 'cleaned' as const,
+      })),
+    });
+    const cred = await bootstrapControlledNode(deps);
+    expect(cred).toBe(CRED);
+    expect(deps.redeemEnrollmentV2).toHaveBeenCalledWith(BLOB, IDENTITY);
+    expect(deps.phases).toEqual(['enrolled', 'service_registered', 'service_start_requested']);
+  });
+
+  it('reconciles the legitimate credential-fsync crash window one phase at a time', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'files_staged' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+      })),
+    });
+    await expect(bootstrapControlledNode(deps)).resolves.toBe(CRED);
+    expect(deps.phases).toEqual(['enrolled', 'service_registered', 'service_start_requested']);
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+    expect(deps.installDefinition).toHaveBeenCalledWith('/tmp/staged/imcodes-node');
+  });
+
+  it('rejects a credential that appears before files_staged instead of inventing journal progress', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({ phase: 'elevated' as InstallPhase, updatedAt: 5 })),
+    });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/before files_staged/);
+    expect(deps.installDefinition).not.toHaveBeenCalled();
+    expect(deps.phases).toEqual([]);
+  });
+
+  it('installer failure does not write service_registered or start intent', async () => {
+    const deps = makeDeps({
+      installDefinition: vi.fn(async () => { throw new Error('schtasks failed'); }),
+    });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/schtasks failed/);
+    expect(deps.phases).not.toContain('service_registered');
+    expect(deps.phases).not.toContain('service_start_requested');
+  });
+
+  it('repairs a files_staged journal with no staged receipt instead of refusing', async () => {
+    // This used to fail closed. It is the installer that reaches here, and the
+    // authority for installing is the package's OWN signature -- already
+    // verified before it ran, and re-verified when its trailer is read. A
+    // receipt describing the previous copy is evidence of what was installed
+    // last time, never a reason to refuse the bytes in hand, so a journal
+    // missing one is repaired by staging rather than declared unrecoverable.
+    const restaged: StagedExecutableReceipt = { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) };
+    const source = makeSource({ stageTrailerFreeExecutable: vi.fn(async () => restaged) });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'files_staged' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledOnce();
+    expect(result.journal.stagedReceipt).toEqual(restaged);
+    expect(deps.installDefinition).toHaveBeenCalled();
+  });
+
+  it('repairs a service_registered definition by reinstalling from the staged receipt before start', async () => {
+    const staleReceipt: ServiceReceipt = { ...SERVICE_RECEIPT, definitionSha256: 'd'.repeat(64) };
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_registered' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: staleReceipt,
+      })),
+      inspectDefinition: vi.fn()
+        .mockRejectedValueOnce(new Error('definition hash mismatch'))
+        .mockResolvedValueOnce(SERVICE_RECEIPT),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('handoff_complete');
+    expect(deps.installDefinition).toHaveBeenCalledWith('/tmp/staged/imcodes-node');
+    expect(deps.inspectDefinition).toHaveBeenNthCalledWith(1, staleReceipt);
+    expect(deps.inspectDefinition).toHaveBeenNthCalledWith(2, SERVICE_RECEIPT);
+    expect(deps.phases).toEqual(['service_registered', 'service_start_requested']);
+  });
+
+  it('reinstalling a service_healthy node repairs drifted Windows scheduled task definition before startService', async () => {
+    const winExe = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
+    const winReceipt: ServiceReceipt = {
+      name: 'imcodes-node',
+      platform: 'win32',
+      action: winExe,
+    };
+    const repairedReceipt: ServiceReceipt = {
+      name: 'imcodes-node',
+      platform: 'win32',
+      action: winExe,
+      definitionSha256: 'repaired-sha',
+    };
+    const winStagedReceipt: StagedExecutableReceipt = {
+      ...STAGED_RECEIPT,
+      path: winExe,
+    };
+    const order: string[] = [];
+    const source = makeSource({
+      stageTrailerFreeExecutable: vi.fn(async () => winStagedReceipt),
+    });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => CRED),
+      stagedExecutablePath: winExe,
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_healthy' as InstallPhase,
+        healthyAt: 2,
+        updatedAt: 5,
+        stagedExePath: winExe,
+        stagedReceipt: winStagedReceipt,
+        serviceName: 'imcodes-node',
+        serviceReceipt: winReceipt,
+      })),
+      installDefinition: vi.fn(async (exePath) => {
+        order.push(`install:${exePath}`);
+        return repairedReceipt;
+      }),
+      inspectDefinition: vi.fn()
+        .mockRejectedValueOnce(new Error('controlled node Windows task definition drifted'))
+        .mockImplementationOnce(async (receipt) => {
+          order.push('inspect-repaired');
+          return receipt;
+        }),
+      startService: vi.fn(async (receipt) => {
+        order.push(`start:${receipt.definitionSha256 ?? 'none'}`);
+      }),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('handoff_complete');
+    expect(order).toEqual([`install:${winExe}`, 'inspect-repaired', 'start:repaired-sha']);
+    expect(result.journal.serviceReceipt).toEqual(repairedReceipt);
+  });
+
+  it('reinstalling a service_healthy node treats mismatched serviceReceipt.action vs stagedPath as drifted without accepting stale receipt', async () => {
+    const oldWinExe = 'C:\\Temp\\imcodes-demo-rd-win\\imcodes-node\\imcodes-node.exe';
+    const newWinExe = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
+    const staleActionReceipt: ServiceReceipt = {
+      name: 'imcodes-node',
+      platform: 'win32',
+      action: oldWinExe,
+    };
+    const repairedReceipt: ServiceReceipt = {
+      name: 'imcodes-node',
+      platform: 'win32',
+      action: newWinExe,
+    };
+    const newStagedReceipt: StagedExecutableReceipt = {
+      ...STAGED_RECEIPT,
+      path: newWinExe,
+    };
+    const source = makeSource({
+      stageTrailerFreeExecutable: vi.fn(async () => newStagedReceipt),
+    });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => CRED),
+      stagedExecutablePath: newWinExe,
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
+        phase: 'service_healthy' as InstallPhase,
+        healthyAt: 2,
+        updatedAt: 5,
+        stagedExePath: newWinExe,
+        stagedReceipt: newStagedReceipt,
+        serviceName: 'imcodes-node',
+        serviceReceipt: staleActionReceipt,
+      })),
+      installDefinition: vi.fn(async () => repairedReceipt),
+      inspectDefinition: vi.fn(async (receipt) => receipt),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('handoff_complete');
+    expect(deps.installDefinition).toHaveBeenCalledWith(newWinExe);
+    expect(deps.inspectDefinition).toHaveBeenCalledTimes(1);
+    expect(deps.inspectDefinition).toHaveBeenCalledWith(repairedReceipt);
+    expect(deps.startService).toHaveBeenCalledWith(repairedReceipt);
+    expect(result.journal.serviceReceipt).toEqual(repairedReceipt);
+  });
+
+  it('service start failure leaves durable start intent for crash recovery replay', async () => {
+    const deps = makeDeps({
+      startService: vi.fn(async () => { throw new Error('start failed'); }),
+    });
+    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/start failed/);
+    expect(deps.phases).toContain('service_registered');
+    expect(deps.phases).toContain('service_start_requested');
+  });
+
+  it('reuses persisted install identity on retry instead of regenerating', async () => {
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+    });
+    await bootstrapControlledNode(deps);
+    expect(deps.generateInstallIdentity).not.toHaveBeenCalled();
+    expect(deps.persistInstallIdentity).not.toHaveBeenCalled();
+    expect(deps.redeemEnrollmentV2).toHaveBeenCalledWith(BLOB, IDENTITY);
+  });
+});
+
+describe('journalPathFor', () => {
+  it('places the journal beside the credential in the protected dir', () => {
+    expect(journalPathFor('/var/lib/imcodes-node/credential.json')).toBe('/var/lib/imcodes-node/install-journal.json');
+  });
+});
+
+describe('isCurrentExecutableStable', () => {
+  it('requires the receipt hash and does not trust source==staged string equality', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stable-runtime-'));
+    try {
+      const exePath = join(dir, 'imcodes-node');
+      const bytes = Buffer.from('stable-executable');
+      await writeFile(exePath, bytes);
+      const st = await stat(exePath);
+      const receipt: StagedExecutableReceipt = {
+        path: exePath,
+        size: st.size,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        sourceIdentity: { size: st.size + 1, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: {
+          size: st.size,
+          mtimeMs: st.mtimeMs,
+          ctimeMs: st.ctimeMs,
+          dev: st.dev,
+          ino: st.ino,
+        },
+      };
+      await expect(isCurrentExecutableStable({ stagedReceipt: receipt }, exePath)).resolves.toBe(true);
+
+      // Causal rollback-recovery test: copying the exact receipt-pinned bytes to a new inode
+      // (as Windows Copy-Item rollback does when restoring imcodes-node.exe.upgrade-old) must still
+      // verify stable runtime identity via size + sha256 + realpath instead of crash-looping.
+      const replacedExe = join(dir, 'imcodes-node.replaced');
+      await writeFile(replacedExe, bytes);
+      await rm(exePath);
+      await rename(replacedExe, exePath);
+      await expect(isCurrentExecutableStable({ stagedReceipt: receipt }, exePath)).resolves.toBe(true);
+
+      await writeFile(exePath, Buffer.from('changed'));
+      await expect(isCurrentExecutableStable({ stagedReceipt: receipt }, exePath)).resolves.toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('bootstrap ABI authority before protected side effects', () => {
+  it.each([undefined, CONTROLLED_NODE_ABI_MODERN])('refuses stale credential profile %j on compat before elevation or repair', async (profile) => {
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      loadCredential: vi.fn(async () => ({ ...CRED, abiProfile: profile })) });
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow('persisted ABI profile');
+    expect(deps.prepareCredentialDir).not.toHaveBeenCalled();
+    expect(deps.assertElevated).not.toHaveBeenCalled();
+    expect(deps.installDefinition).not.toHaveBeenCalled();
+    expect(deps.phases).toEqual([]);
+  });
+
+  it('refuses a missing prepared journal profile before interrupted-upgrade recovery', async () => {
+    const recovery = vi.fn();
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      loadCredential: vi.fn(async () => ({ ...CRED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 })),
+      loadInstallJournal: vi.fn(async () => ({ version: INSTALL_JOURNAL_VERSION, phase: 'credential_prepared', updatedAt: 5 })),
+      recoverInterruptedUpgrade: recovery,
+    });
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow('persisted ABI profile');
+    expect(recovery).not.toHaveBeenCalled();
+    expect(deps.phases).toEqual([]);
+  });
+
+  it('pins profile in every subsequent durable phase, not only the credential', async () => {
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      redeemEnrollmentV2: vi.fn(async () => ({ ...CRED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 })) });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.credential?.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(result.journal.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(result.journal.phase).toBe('service_start_requested');
+    expect(deps.writeInstallPhase).toHaveBeenCalledWith(expect.any(String), 'credential_prepared', expect.objectContaining({abiProfile: CONTROLLED_NODE_ABI_GLIBC217}));
+  });
+});
+
+describe('pending_setup disposition when unbound without credential or trailer', () => {
+  it('returns pending_setup from bootstrapControlledNodeWithDisposition while legacy bootstrapControlledNode throws', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'uninstalled',
+        updatedAt: 0,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('pending_setup');
+    expect(result.credential).toBeNull();
+    expect(deps.phases).toEqual(['elevated']);
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+
+    const depsLegacy = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+    });
+    await expect(bootstrapControlledNode(depsLegacy)).rejects.toThrow('controlled node is not enrolled');
+  });
+
+  it('still fails closed when journal is already enrolled or later and credential.json is missing', async () => {
+    const nodeToken = 'secret-token-123';
+    const nodeTokenHash = createHash('sha256').update(nodeToken).digest('hex');
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+      loadInstallIdentity: vi.fn(async () => ({
+        installId: 'inst-1',
+        nodeToken,
+        nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+      })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'enrolled',
+        updatedAt: 100,
+        installId: 'inst-1',
+        nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: 'srv-1',
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(
+      'controlled node is enrolled but enrollment blob is unavailable; manual recovery required',
+    );
+  });
+
+  it('repairs drifted credential dir ACL on elevated reinstall/repair and retries credential load', async () => {
+    let repaired = false;
+    const order: string[] = [];
+    const deps = makeDeps({
+      isStableRuntime: vi.fn(async () => false),
+      assertElevated: vi.fn(async () => { order.push('elevate'); }),
+      prepareCredentialDir: vi.fn(async () => {
+        order.push('prepare');
+        repaired = true;
+      }),
+      loadCredential: vi.fn(async () => {
+        order.push('load');
+        if (!repaired) {
+          throw new Error('windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff');
+        }
+        return CRED;
+      }),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'service_healthy',
+        updatedAt: 100,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: CRED.serverId,
+        serviceName: SERVICE_RECEIPT.name,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
+    expect(order.slice(0, 4)).toEqual(['load', 'elevate', 'prepare', 'load']);
+  });
+
+  it('still fails closed on credential ACL drift when running as the stable service runtime', async () => {
+    const deps = makeDeps({
+      isStableRuntime: vi.fn(async () => true),
+      prepareCredentialDir: vi.fn(async () => {}),
+      loadCredential: vi.fn(async () => {
+        throw new Error('windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff');
+      }),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'service_healthy',
+        updatedAt: 100,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: CRED.serverId,
+        serviceName: SERVICE_RECEIPT.name,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/windows_credential_acl_insecure/);
+    expect(deps.prepareCredentialDir).not.toHaveBeenCalled();
+  });
+});

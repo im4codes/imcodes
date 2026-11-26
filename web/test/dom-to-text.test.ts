@@ -127,6 +127,20 @@ describe('domNodeToPlainText', () => {
     expect(domNodeToPlainText(el)).toBe('./shots/result.png');
   });
 
+  it('omits loopback-link action buttons while preserving the URL', () => {
+    const el = makeEl(
+      '<div class="chat-event chat-assistant">' +
+        '<p>Local: <span class="chat-loopback-link">http://127.0.0.1:8787/' +
+          '<span class="chat-loopback-actions">' +
+            '<button>Open through IM.codes proxy</button>' +
+            '<button>Open directly on LAN</button>' +
+          '</span>' +
+        '</span></p>' +
+      '</div>',
+    );
+    expect(domNodeToPlainText(el)).toBe('Local: http://127.0.0.1:8787/');
+  });
+
   it('round-trips a marked-style multi-paragraph assistant message', () => {
     // Shape mirrors what ChatMarkdown renders for:
     //   First paragraph.

@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import { realpath as fsRealpath } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import * as path from 'node:path';
@@ -108,7 +109,22 @@ export function getDeniedSensitivePathPrefixes(options: FilePreviewPathPolicyOpt
 }
 
 export function isFilePreviewPathAllowed(realPath: string, options: FilePreviewPathPolicyOptions = {}): boolean {
-  return isPathAllowedForHome(realPath, getHomeDir(options), getPlatform(options));
+  const platform = getPlatform(options);
+  const homeDir = getHomeDir(options);
+  if (!isPathAllowedForHome(realPath, homeDir, platform)) return false;
+  if (platform === process.platform) {
+    try {
+      const canonicalHome = realpathSync(homeDir);
+      if (canonicalHome !== homeDir && !isPathAllowedForHome(realPath, canonicalHome, platform)) return false;
+    } catch { /* non-existent synthetic home in unit tests */ }
+    for (const deniedDir of FILE_PREVIEW_DENIED_HOME_DIRS) {
+      try {
+        const canonicalDenied = realpathSync(path.join(homeDir, deniedDir));
+        if (isSameOrInside(canonicalDenied, realPath, platform)) return false;
+      } catch { /* denied dir does not exist */ }
+    }
+  }
+  return true;
 }
 
 export function validateCanonicalRealPath(realPath: string, options: FilePreviewPathPolicyOptions = {}): ValidatedRealPath | null {

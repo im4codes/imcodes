@@ -3,16 +3,33 @@
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
 import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
-import { bestModelLabel } from '../model-label.js';
+import { formatModelPresentation } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
+import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
-import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { formatProviderQuotaTitle, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
+import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '@shared/capacity-retry.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
+import { CodexResetCredits } from './CodexResetCredits.js';
+import { CodexCreditBalance } from './CodexCreditBalance.js';
+import type { WsClient } from '../ws-client.js';
+import type { ExecutionCloneLaunchState } from '../hooks/useExecutionCloneLaunch.js';
+import {
+  ACK_FAILURE_ACK_TIMEOUT,
+  ACK_FAILURE_DAEMON_OFFLINE,
+} from '@shared/ack-protocol.js';
+import {
+  isCompactProviderQuotaAgent,
+  ProviderQuotaLine,
+  useProviderQuotaLabel,
+} from './ProviderQuotaLine.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 interface Props {
   usage: UsageData;
@@ -24,6 +41,9 @@ interface Props {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: ProviderQuotaMeta | null;
+  /** Codex pay-as-you-go usage credit balance — see shared/codex-credit-history.ts. */
+  codexCreditsBalance?: string | null;
+  codexCreditsUnlimited?: boolean | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -34,31 +54,41 @@ interface Props {
   activeToolCall?: boolean;
   /** Whether the current timeline tail still has an active transport turn. */
   activeTimelineTurn?: boolean;
+  /** Whether this browser is still tracking an unresolved optimistic send. */
+  pendingUserSend?: boolean;
   /** Safe transport activity/error detail extracted from session.state payloads. */
   transportActivityDetail?: string | null;
   /** Session-list error reason when no timeline error detail is present. */
   sessionError?: string | null;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
-  /** Sends recent memory summaries into the current agent as sync-only context. */
-  onSyncMemorySummaries?: () => void;
-  syncMemorySummariesBusy?: boolean;
-  syncMemorySummariesDisabled?: boolean;
   /** Dispatches the current composer task to dedicated execution clones. */
   onRunExecutionClones?: () => void;
   runExecutionClonesBusy?: boolean;
   runExecutionClonesDisabled?: boolean;
   runExecutionClonesTitle?: string;
   runExecutionClonesCount?: number;
+  runExecutionClonesFeedback?: ExecutionCloneLaunchState;
+  /** WS client — enables the Codex reset-credits affordance (codex sessions). */
+  wsClient?: WsClient | null;
+  connected?: boolean;
+  isMobile?: boolean;
 }
+
+// Keep execution-clone plumbing intact while removing only this compact
+// footer entry point. The feature still has its existing handlers/state and
+// can be restored deliberately without competing with history refresh here.
+const SHOW_EXECUTION_CLONE_LAUNCHER = false;
 
 const fmt = (n: number) =>
   n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M`
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount }: Props) {
+function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, wsClient, connected, isMobile }: Props) {
+  recordPerfRender('UsageFooter');
   const { t } = useTranslation();
+
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
   // share one GET / one listener / one cache entry per tab.
@@ -88,39 +118,23 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // for a shell prompt and confusing for users running `top`, tailing logs,
   // etc. Skip the live-work UI entirely for these session types.
   const isAgentless = agentType === 'shell' || agentType === 'script';
-  const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
-  const hasLiveTransportTurn = !isAgentless && !!activeTimelineTurn;
-  const hasRunningSessionSnapshot = !isAgentless
-    && (sessionState === 'queued' || (sessionState === 'running' && activeTimelineTurn !== false));
+  const liveStatus = deriveSessionLiveStatus({
+    sessionState,
+    activeThinking: !!activeThinkingTs,
+    activeToolCall: !!activeToolCall,
+    activeTransportTurn: !!activeTimelineTurn,
+    pendingUserSend: !!pendingUserSend,
+    statusText,
+    transportActivityDetail,
+    sessionError,
+    isAgentless,
+  });
   const showLiveStatus = !isAgentless;
-  const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
-  // Live-tick the quota label (so "resets in Xm" stays current) for ANY provider
-  // that reports structured quota windows — Codex and claude-code-sdk both feed
-  // `quotaMeta`; the gate is its presence, not the agent family.
-  useEffect(() => {
-    if (!quotaMeta) return;
-    let intervalId: number | undefined;
-    const tick = () => setQuotaNow(Date.now());
-    tick();
-    const delay = Math.max(250, 60_000 - (Date.now() % 60_000));
-    const timeoutId = window.setTimeout(() => {
-      tick();
-      intervalId = window.setInterval(tick, 60_000);
-    }, delay);
-    return () => {
-      window.clearTimeout(timeoutId);
-      if (intervalId !== undefined) window.clearInterval(intervalId);
-    };
-  }, [quotaMeta]);
-
-  const displayQuotaLabel = useMemo(() => {
-    if (!quotaMeta) return quotaLabel;
-    return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
-  }, [now, quotaLabel, quotaMeta, quotaNow]);
+  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta, now, isMobile });
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
@@ -136,12 +150,16 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       usage.contextWindow,
       displayModel,
       1_000_000,
-      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+      { preferExplicit: isAuthoritativeUsageContextWindowSource(usage.contextWindowSource) },
     );
     const total = usage.inputTokens + usage.cacheTokens;
-    const totalPct = Math.min(100, total / ctx * 100);
-    const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
-    const newPct = totalPct - cachePct;
+    // Keep style percentages stable across rerenders. Raw floating-point
+    // subtraction can produce values such as 0.506299999999996%, which makes
+    // tiny live ctx changes harder to inspect and needlessly dirties the DOM.
+    const roundPct = (value: number) => Math.round(value * 10_000) / 10_000;
+    const totalPct = roundPct(Math.min(100, total / ctx * 100));
+    const cachePct = roundPct(Math.min(totalPct, usage.cacheTokens / ctx * 100));
+    const newPct = roundPct(Math.max(0, totalPct - cachePct));
     const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
       displayModel ?? '',
@@ -156,8 +174,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
 
   // Prefer a version-bearing label: modelOverride is often a bare alias
   // (`opus[1M]` → `opus`) while usage.model carries the resolved id
-  // (`claude-opus-4-8` → `opus-4.8`).
-  const modelLabel = bestModelLabel(modelOverride, usage.model);
+  // (`claude-opus-4-8` → `opus-4.8`). Keep raw full IDs in `title`.
+  const { label: modelLabel, title: modelTitle } = formatModelPresentation(modelOverride, usage.model);
   // Keep the ctx meter visible even before the first non-zero usage event when
   // the session/model is known. A zero-token session still has useful context
   // capacity information (e.g. "0 / 922k" for GPT-5.5); hiding it made Codex
@@ -177,7 +195,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (!previousSignature || previousSignature === signature) return;
 
     setCtxBurning(true);
-    const timeoutId = window.setTimeout(() => setCtxBurning(false), 780);
+    const timeoutId = window.setTimeout(() => setCtxBurning(false), 1_200);
     return () => window.clearTimeout(timeoutId);
   }, [cachePct, ctx, hasContextInfo, newPct, total]);
 
@@ -185,45 +203,46 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
-  const errorDetail = sessionState === 'error'
-    ? ((transportActivityDetail && !/^error$/i.test(transportActivityDetail) ? transportActivityDetail : null) ?? sessionError ?? null)
-    : null;
-  const liveStatusMode = isAgentless
-    ? null
-    : sessionState === 'error'
-      ? 'error'
-      : hasActiveLiveWork
-      ? (activeToolCall ? 'tool' : 'thinking')
-      : hasLiveTransportTurn || hasRunningSessionSnapshot
-        ? 'running'
-        : statusText
-          ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
-          : 'idle';
+  const liveStatusMode = liveStatus.visualMode;
   const liveStatusText = useMemo(() => {
-    if (isAgentless) return null;
-    if (sessionState === 'error') {
-      return errorDetail
+    if (isAgentless || !liveStatusMode) return null;
+    if (liveStatusMode === 'error') {
+      return liveStatus.errorDetail
         ? t('session.state_error_detail', {
-          error: errorDetail,
+          error: liveStatus.errorDetail,
           defaultValue: 'Error: {{error}}',
         })
         : t('session.state_error', { defaultValue: 'Session error' });
     }
-    if (hasActiveLiveWork || hasLiveTransportTurn || hasRunningSessionSnapshot) {
-      if (activeToolCall) return statusText || 'Tool running...';
-      if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
-      if (transportActivityDetail) {
-        return t('session.state_running_detail', {
-          detail: transportActivityDetail,
-          defaultValue: 'Agent working: {{detail}}',
-        });
+    if (liveStatusMode === 'stopping') return t('session.state_stop_requested');
+    if (liveStatusMode === 'cancelled') {
+      return liveStatus.errorDetail
+        ? t('session.state_error_detail', {
+          error: liveStatus.errorDetail,
+          defaultValue: 'Error: {{error}}',
+        })
+        : t('session.state_stop_requested');
+    }
+    if (liveStatusMode === 'result') return statusText || t('session.state_idle');
+    if (liveStatusMode === 'waiting') {
+      if (liveStatus.activityDetail?.startsWith(CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX)) {
+        return t('session.capacity_retrying');
       }
+      return statusText || t('session.state_idle');
+    }
+    if (liveStatus.sweep) {
+      if (activeToolCall) return statusText || t('session.state_running');
+      if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
+      // Transport activity details are daemon-internal liveness signals such as
+      // `runtime_dispatch`, `act`, or `provider_compaction`. They are useful for
+      // deciding whether the session is busy, but not meaningful user-facing
+      // status copy. Keep the generic working state while retaining concrete
+      // error details in the error branch above.
       return t('session.state_running');
     }
-    if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, errorDetail, hasActiveLiveWork, hasLiveTransportTurn, hasRunningSessionSnapshot, isAgentless, now, sessionState, statusText, t, transportActivityDetail]);
-  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result' || liveStatusMode === 'error';
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
   // rate_limit_event). Show an authorize affordance for claude-code-sdk until
@@ -231,40 +250,97 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyQuotaPref = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
   const showWeeklyAuthPrompt = agentType === 'claude-code-sdk' && weeklyQuotaPref.value !== true;
   // Providers that report structured quota windows (Codex + claude-code-sdk)
-  // render the SAME prominent multi-line quota block as Codex — not the inline
-  // bottom token span — so the limit display is consistent across providers.
-  const providerQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
-    ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
-    : [];
+  // render one compact quota row. Keep the provider's existing separator and
+  // full reset details intact; normal whitespace around ` · ` provides a safe
+  // wrap point on a narrow viewport without turning 5h/7d into two DOM rows.
+  const providerQuotaText = isCompactProviderQuotaAgent(agentType)
+    ? (displayQuotaLabel ?? '').trim()
+    : '';
+  const isGroupedQuota = Boolean(quotaMeta?.groups && quotaMeta.groups.length > 0);
+  const providerQuotaTitle = isGroupedQuota
+    ? formatProviderQuotaTitle(quotaMeta, now)
+    : undefined;
+  // Reset credits are a codex-account feature (accrued via ChatGPT auth).
+  const isCodexSession = agentType === 'codex' || agentType === 'codex-sdk';
+  const executionCloneFeedbackText = useMemo(() => {
+    const feedback = runExecutionClonesFeedback;
+    if (!feedback || feedback.phase === 'idle') return null;
+    if (feedback.phase === 'pending') {
+      return t('chat.execution_clone_launch_pending', { count: feedback.requestedCount });
+    }
+    if (feedback.phase === 'success') {
+      return t('chat.execution_clone_launch_success', { count: feedback.requestedCount });
+    }
+    if (feedback.error === ACK_FAILURE_DAEMON_OFFLINE) {
+      return t('chat.execution_clone_launch_offline');
+    }
+    if (feedback.error === ACK_FAILURE_ACK_TIMEOUT) {
+      return t('chat.execution_clone_launch_timeout');
+    }
+    return t('chat.execution_clone_launch_failed', {
+      error: feedback.error || t('chat.execution_clone_launch_unknown_error'),
+    });
+  }, [runExecutionClonesFeedback, t]);
+  const executionCloneFeedbackPhase = runExecutionClonesFeedback?.phase ?? 'idle';
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {hasContextInfo && (
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-          {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
+          {ctxBurning && (
+            <>
+              <span
+                key={`burn:${total}:${ctx}`}
+                class="session-ctx-burn"
+                style={{ width: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+              <span
+                key={`edge:${total}:${ctx}`}
+                class="session-ctx-burn-edge"
+                style={{ left: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+            </>
+          )}
         </div>
       )}
-      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
-        <div class="session-usage-codex-quota">
-          {providerQuotaLines.map((line) => (
-            <div class="session-usage-codex-line">{line}</div>
-          ))}
-          {showWeeklyAuthPrompt && (
-            <button
-              type="button"
-              class="session-usage-codex-line session-usage-weekly-authorize"
-              title={t('session.weekly_quota_authorize_hint')}
-              onClick={() => {
-                // Explicit consent before reading the local Claude token — not
-                // a one-click toggle.
-                if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
-                  void weeklyQuotaPref.save(true);
-                }
-              }}
-            >
-              {t('session.weekly_quota_authorize')}
-            </button>
+      {(providerQuotaText || showWeeklyAuthPrompt || isCodexSession) && (
+        <div class="session-usage-codex-row">
+          {isCodexSession && wsClient && (
+            <CodexResetCredits wsClient={wsClient} connected={connected !== false} />
+          )}
+          {isCodexSession && wsClient && codexCreditsBalance != null && (
+            <CodexCreditBalance
+              wsClient={wsClient}
+              connected={connected !== false}
+              balance={codexCreditsBalance}
+              unlimited={codexCreditsUnlimited}
+            />
+          )}
+          {(providerQuotaText || showWeeklyAuthPrompt) && (
+            <div class="session-usage-codex-quota">
+              {providerQuotaText && (
+                <ProviderQuotaLine text={providerQuotaText} className={isGroupedQuota ? 'session-usage-codex-line-grouped' : ''} title={providerQuotaTitle} />
+              )}
+              {showWeeklyAuthPrompt && (
+                <button
+                  type="button"
+                  class="session-usage-codex-line session-usage-weekly-authorize"
+                  title={t('session.weekly_quota_authorize_hint')}
+                  onClick={() => {
+                    // Explicit consent before reading the local Claude token — not
+                    // a one-click toggle.
+                    if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
+                      void weeklyQuotaPref.save(true);
+                    }
+                  }}
+                >
+                  {t('session.weekly_quota_authorize')}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -282,6 +358,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
             {liveStatusMode === 'waiting' && <span class="session-live-status-emoji wait">⏳</span>}
+            {liveStatusMode === 'stopping' && <span class="session-live-status-emoji wait">■</span>}
+            {liveStatusMode === 'cancelled' && <span class="session-live-status-emoji error">⚠️</span>}
             {liveStatusMode === 'result' && <span class="session-live-status-emoji result">✅</span>}
             {liveStatusMode === 'error' && <span class="session-live-status-emoji error">⚠️</span>}
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
@@ -289,32 +367,31 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {onRunExecutionClones && (
-            <button
-              type="button"
-              class={`shortcut-btn shortcut-btn-icon shortcut-btn-execution-clones${runExecutionClonesBusy ? ' is-busy' : ''}`}
-              title={runExecutionClonesTitle ?? t('chat.execution_clone_run')}
-              aria-label={runExecutionClonesTitle ?? t('chat.execution_clone_run')}
-              disabled={runExecutionClonesDisabled}
-              onClick={onRunExecutionClones}
-            >
-              <span aria-hidden="true">🤖</span>
-              {runExecutionClonesCount && runExecutionClonesCount > 1 ? (
-                <span class="shortcut-btn-mini-count" aria-hidden="true">×{runExecutionClonesCount}</span>
-              ) : null}
-            </button>
-          )}
-          {onSyncMemorySummaries && (
-            <button
-              type="button"
-              class={`shortcut-btn shortcut-btn-icon shortcut-btn-memory-sync${syncMemorySummariesBusy ? ' is-busy' : ''}`}
-              title={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
-              aria-label={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
-              disabled={syncMemorySummariesDisabled}
-              onClick={onSyncMemorySummaries}
-            >
-              ↻
-            </button>
+          {SHOW_EXECUTION_CLONE_LAUNCHER && onRunExecutionClones && (
+            <span class="shortcut-btn-execution-clones-wrapper">
+              <button
+                type="button"
+                class={`shortcut-btn shortcut-btn-icon shortcut-btn-execution-clones${runExecutionClonesBusy ? ' is-busy' : ''}`}
+                title={executionCloneFeedbackText ?? runExecutionClonesTitle ?? t('chat.execution_clone_run')}
+                aria-label={executionCloneFeedbackText ?? runExecutionClonesTitle ?? t('chat.execution_clone_run')}
+                disabled={runExecutionClonesDisabled}
+                onClick={onRunExecutionClones}
+              >
+                <span aria-hidden="true">🤖</span>
+                {runExecutionClonesCount && runExecutionClonesCount > 1 ? (
+                  <span class="shortcut-btn-mini-count" aria-hidden="true">×{runExecutionClonesCount}</span>
+                ) : null}
+              </button>
+              {executionCloneFeedbackText && executionCloneFeedbackPhase !== 'idle' && (
+                <span
+                  class={`shortcut-btn-execution-clones-feedback ${executionCloneFeedbackPhase}`}
+                  role={executionCloneFeedbackPhase === 'error' ? 'alert' : 'status'}
+                  aria-live={executionCloneFeedbackPhase === 'error' ? 'assertive' : 'polite'}
+                >
+                  {executionCloneFeedbackText}
+                </span>
+              )}
+            </span>
           )}
           <span class="shortcut-btn-tools-wrapper">
             {/* Undecided-state bubble. Points the user at the wrench so the
@@ -353,9 +430,9 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
               🛠
             </button>
           </span>
-          {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
+          {modelLabel && <span class="session-usage-model" title={modelTitle}>{modelLabel}</span>}
           {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {inlineQuotaText && providerQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
+          {inlineQuotaText && !providerQuotaText && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
@@ -366,3 +443,43 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     </div>
   );
 }
+
+function sameUsage(a: UsageData, b: UsageData): boolean {
+  return a === b
+    || (a.inputTokens === b.inputTokens
+      && a.cacheTokens === b.cacheTokens
+      && a.contextWindow === b.contextWindow
+      && a.contextWindowSource === b.contextWindowSource
+      && a.model === b.model
+      && a.codexStatus?.capturedAt === b.codexStatus?.capturedAt);
+}
+
+export const UsageFooter = memo(UsageFooterImpl, (prev, next) => (
+  sameUsage(prev.usage, next.usage)
+  && prev.sessionName === next.sessionName
+  && prev.sessionState === next.sessionState
+  && prev.agentType === next.agentType
+  && prev.modelOverride === next.modelOverride
+  && prev.planLabel === next.planLabel
+  && prev.quotaLabel === next.quotaLabel
+  && prev.quotaUsageLabel === next.quotaUsageLabel
+  && prev.quotaMeta === next.quotaMeta
+  && prev.codexCreditsBalance === next.codexCreditsBalance
+  && prev.codexCreditsUnlimited === next.codexCreditsUnlimited
+  && prev.showCost === next.showCost
+  && prev.activeThinkingTs === next.activeThinkingTs
+  && prev.statusText === next.statusText
+  && prev.activeToolCall === next.activeToolCall
+  && prev.activeTimelineTurn === next.activeTimelineTurn
+  && prev.pendingUserSend === next.pendingUserSend
+  && prev.transportActivityDetail === next.transportActivityDetail
+  && prev.sessionError === next.sessionError
+  && prev.now === next.now
+  && prev.runExecutionClonesBusy === next.runExecutionClonesBusy
+  && prev.runExecutionClonesDisabled === next.runExecutionClonesDisabled
+  && prev.runExecutionClonesTitle === next.runExecutionClonesTitle
+  && prev.runExecutionClonesCount === next.runExecutionClonesCount
+  && prev.runExecutionClonesFeedback === next.runExecutionClonesFeedback
+  && prev.wsClient === next.wsClient
+  && prev.connected === next.connected
+));

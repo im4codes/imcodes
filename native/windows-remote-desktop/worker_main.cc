@@ -1,0 +1,1966 @@
+#include <windows.h>
+#include <shellapi.h>
+#include <wtsapi32.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <mfapi.h>
+#include <objbase.h>
+
+#include "api/audio/audio_device.h"
+#include "api/audio_codecs/builtin_audio_decoder_factory.h"
+#include "api/audio_codecs/builtin_audio_encoder_factory.h"
+#include "api/create_modular_peer_connection_factory.h"
+#include "api/enable_media.h"
+#include "api/environment/environment_factory.h"
+#include "api/make_ref_counted.h"
+#include "api/peer_connection_interface.h"
+#include "api/video_codecs/builtin_video_decoder_factory.h"
+#include "rtc_base/ssl_adapter.h"
+#include "rtc_base/thread.h"
+#include "rtc_base/win32_socket_init.h"
+#include "third_party/imcodes_remote_desktop/display_capture.h"
+#include "third_party/imcodes_remote_desktop/consent_ipc.h"
+#include "third_party/imcodes_remote_desktop/privacy_ipc.h"
+#include "third_party/imcodes_remote_desktop/common/local_management_types.h"
+#include "third_party/imcodes_remote_desktop/common/loopback_audio_device_module.h"
+#include "third_party/imcodes_remote_desktop/input_injector.h"
+#include "third_party/imcodes_remote_desktop/json_protocol.h"
+#include "third_party/imcodes_remote_desktop/local_indicator.h"
+#include "third_party/imcodes_remote_desktop/mf_h264_encoder.h"
+#include "third_party/imcodes_remote_desktop/peer_session.h"
+#include "third_party/imcodes_remote_desktop/pipe_ipc.h"
+#include "third_party/imcodes_remote_desktop/unlock_secret.h"
+#include "third_party/imcodes_remote_desktop/wasapi_loopback_capture.h"
+#include "third_party/imcodes_remote_desktop/worker_policy.h"
+#include "third_party/imcodes_remote_desktop/virtual_display_controller.h"
+#include "third_party/imcodes_remote_desktop/windows_platform_adapters.h"
+
+namespace imcodes::rd {
+namespace {
+
+constexpr wchar_t kPipePrefix[] = L"\\\\.\\pipe\\imcodes-remote-desktop-";
+
+HANDLE ConfigureResourceJob() {
+  HANDLE job = CreateJobObjectW(nullptr, nullptr);
+  if (!job) return nullptr;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  limits.BasicLimitInformation.LimitFlags =
+      JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+  limits.ProcessMemoryLimit = kMaxWorkerMemoryBytes;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                               &limits, sizeof(limits)) ||
+      !AssignProcessToJobObject(job, GetCurrentProcess())) {
+    CloseHandle(job);
+    return nullptr;
+  }
+  // Intentionally retained for the lifetime of this process. Windows closes
+  // the final handle after process teardown while enforcing the hard cap.
+  return job;
+}
+
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string WideToUtf8(const std::wstring& value) {
+  if (value.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                       value.data(), value.size(), nullptr, 0,
+                                       nullptr, nullptr);
+  if (size <= 0) return {};
+  std::string output(static_cast<size_t>(size), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                          value.size(), output.data(), size, nullptr,
+                          nullptr) != size) {
+    return {};
+  }
+  return output;
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+  if (value.empty()) return {};
+  const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                       value.data(), value.size(), nullptr, 0);
+  if (size <= 0) return {};
+  std::wstring output(static_cast<size_t>(size), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                          value.size(), output.data(), size) != size) {
+    return {};
+  }
+  return output;
+}
+
+bool IsSafePipePath(const std::wstring& path) {
+  return path.size() > std::size(kPipePrefix) - 1 && path.size() <= 240 &&
+         path.starts_with(kPipePrefix) &&
+         std::all_of(path.begin() + (std::size(kPipePrefix) - 1), path.end(),
+                     [](wchar_t value) {
+                       return (value >= L'a' && value <= L'z') ||
+                              (value >= L'A' && value <= L'Z') ||
+                              (value >= L'0' && value <= L'9') ||
+                              value == L'-';
+                     });
+}
+
+bool ConstantTimeEqual(const std::string& left, const std::string& right) {
+  size_t difference = left.size() ^ right.size();
+  const size_t count = std::max(left.size(), right.size());
+  for (size_t index = 0; index < count; ++index) {
+    const uint8_t a = index < left.size()
+                          ? static_cast<uint8_t>(left[index]) : 0;
+    const uint8_t b = index < right.size()
+                          ? static_cast<uint8_t>(right[index]) : 0;
+    difference |= static_cast<size_t>(a ^ b);
+  }
+  return difference == 0;
+}
+
+/**
+ * Whether this session is locked, asked of Windows rather than guessed from the
+ * desktop name: a locked machine rests on the lock curtain, which lives on the
+ * user's own desktop and is indistinguishable from a signed-in screen by name
+ * alone.
+ */
+std::optional<bool> CurrentSessionLockedState() {
+  WTSINFOEXW* info = nullptr;
+  DWORD bytes = 0;
+  if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
+                                   WTS_CURRENT_SESSION, WTSSessionInfoEx,
+                                   reinterpret_cast<LPWSTR*>(&info), &bytes) ||
+      !info) {
+    return std::nullopt;
+  }
+  std::optional<bool> locked;
+  if (info->Level == 1) {
+    // WTS_SESSIONSTATE_LOCK is 0, so this is a comparison and never a mask
+    // test: `flags & WTS_SESSIONSTATE_LOCK` is always zero and reports every
+    // locked machine as unlocked. Measured on the node: 0x0 while at the lock
+    // screen, 0x1 the instant it unlocks.
+    locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+  }
+  WTSFreeMemory(info);
+  return locked;
+}
+
+bool CurrentSessionIsLocked() {
+  // Unknown is protected. Treating a failed WTS query as unlocked could show
+  // a consent prompt on a surface the local operator cannot actually see.
+  return CurrentSessionLockedState().value_or(true);
+}
+
+std::wstring CurrentInputDesktopName() {
+  HDESK desktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+  if (!desktop) return {};
+  wchar_t name[64]{};
+  DWORD needed = 0;
+  const bool read = GetUserObjectInformationW(
+      desktop, UOI_NAME, name, sizeof(name), &needed) != FALSE;
+  CloseDesktop(desktop);
+  return read ? std::wstring(name) : std::wstring();
+}
+
+
+bool IsLocalSystemProcess() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+  DWORD needed = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+  std::vector<uint8_t> storage(needed);
+  const bool read = needed > 0 &&
+      GetTokenInformation(token, TokenUser, storage.data(), needed, &needed);
+  CloseHandle(token);
+  if (!read) return false;
+  const auto* user = reinterpret_cast<const TOKEN_USER*>(storage.data());
+  return IsWellKnownSid(user->User.Sid, WinLocalSystemSid) != FALSE;
+}
+
+// Owner id for input the node types on its own behalf. It is separate from any
+// session so a viewer disconnecting cannot release, replay, or inherit it.
+constexpr char kAutoUnlockOwner[] = "imcodes-auto-unlock";
+// The desktop Windows puts the credential box on. The lock curtain is not here
+// — it lives on the user's own desktop until a keystroke arrives.
+constexpr wchar_t kSignInDesktop[] = L"Winlogon";
+
+// Crash reporting. A structured exception inside libwebrtc or a platform
+// subsystem would otherwise close the pipe and look exactly like an ordinary
+// disconnect, which is how one Core Audio teardown fault stayed invisible for
+// a full release. The filter allocates nothing, holds no lock the faulting
+// thread may already own, writes one bounded frame that carries no session,
+// capability, media or input data, and always terminates within a bounded
+// wait so a wedged pipe can never keep a dead worker alive.
+// True only while the indicator/input thread owns the desktop that currently
+// receives input. Input during the brief follow is dropped rather than sent to
+// the desktop being left behind.
+std::atomic<bool> g_input_desktop_ready{false};
+std::atomic<PipeChannel*> g_crash_pipe{nullptr};
+char g_crash_nonce[64] = {};
+char g_crash_line[512] = {};
+
+DWORD WINAPI WriteCrashLine(LPVOID) {
+  PipeChannel* pipe = g_crash_pipe.load();
+  if (!pipe || !pipe->valid()) return 0;
+  pipe->Write(std::string(g_crash_line, strlen(g_crash_line)));
+  return 0;
+}
+
+void CrashModuleForAddress(const void* address,
+                           char (&name)[64],
+                           unsigned long long* offset) {
+  lstrcpynA(name, "unknown", static_cast<int>(sizeof(name)));
+  *offset = 0;
+  HMODULE module = nullptr;
+  if (!address ||
+      !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCWSTR>(address), &module) ||
+      !module) {
+    return;
+  }
+  *offset = static_cast<unsigned long long>(
+      reinterpret_cast<uintptr_t>(address) -
+      reinterpret_cast<uintptr_t>(module));
+  wchar_t path[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) return;
+  const wchar_t* base = path;
+  for (const wchar_t* cursor = path; *cursor; ++cursor) {
+    if (*cursor == L'\\' || *cursor == L'/') base = cursor + 1;
+  }
+  size_t out = 0;
+  for (; base[out] && out + 1 < sizeof(name); ++out) {
+    const wchar_t value = base[out];
+    const bool safe = (value >= L'a' && value <= L'z') ||
+                      (value >= L'A' && value <= L'Z') ||
+                      (value >= L'0' && value <= L'9') || value == L'.' ||
+                      value == L'_' || value == L'-';
+    name[out] = safe ? static_cast<char>(value) : '_';
+  }
+  name[out] = '\0';
+  if (out == 0) lstrcpynA(name, "unknown", static_cast<int>(sizeof(name)));
+}
+
+LONG WINAPI ReportCrashToDaemon(EXCEPTION_POINTERS* pointers) {
+  if (pointers && pointers->ExceptionRecord &&
+      g_crash_pipe.load() != nullptr) {
+    char module[64] = {};
+    unsigned long long offset = 0;
+    CrashModuleForAddress(pointers->ExceptionRecord->ExceptionAddress, module,
+                          &offset);
+    snprintf(g_crash_line, sizeof(g_crash_line),
+             "\n{\"type\":\"%s\",\"ipcVersion\":%d,\"nonce\":\"%s\","
+             "\"pid\":%lu,\"exceptionCode\":%lu,\"module\":\"%s\","
+             "\"moduleOffset\":%llu}\n",
+             kWorkerCrashType, kIpcVersion, g_crash_nonce,
+             GetCurrentProcessId(),
+             static_cast<unsigned long>(
+                 pointers->ExceptionRecord->ExceptionCode),
+             module, offset);
+    // The pipe handle is synchronous, so a daemon that stopped reading could
+    // block this write forever. Bound it on a helper thread and terminate
+    // either way.
+    const HANDLE writer =
+        CreateThread(nullptr, 0, WriteCrashLine, nullptr, 0, nullptr);
+    if (writer) {
+      WaitForSingleObject(writer, 2000);
+      CloseHandle(writer);
+    }
+  }
+  TerminateProcess(GetCurrentProcess(), 20);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Read one UTF-8 line from stdin as the sign-in secret. Bounded, never echoed,
+// and wiped by the caller. Using stdin keeps it out of argv, which any local
+// process can read through WMI.
+bool ReadSecretFromStdin(std::wstring* secret) {
+  if (!secret) return false;
+  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == INVALID_HANDLE_VALUE || input == nullptr) return false;
+  std::string utf8;
+  char buffer[512];
+  for (;;) {
+    DWORD read = 0;
+    if (!ReadFile(input, buffer, sizeof(buffer), &read, nullptr) || read == 0) {
+      break;
+    }
+    utf8.append(buffer, read);
+    SecureZeroMemory(buffer, sizeof(buffer));
+    if (utf8.size() > 4096) {
+      SecureZeroMemory(utf8.data(), utf8.size());
+      return false;
+    }
+  }
+  while (!utf8.empty() && (utf8.back() == '\n' || utf8.back() == '\r')) {
+    utf8.pop_back();
+  }
+  if (utf8.empty()) return false;
+  const int wide_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                            utf8.data(),
+                                            static_cast<int>(utf8.size()),
+                                            nullptr, 0);
+  if (wide_size <= 0) {
+    SecureZeroMemory(utf8.data(), utf8.size());
+    return false;
+  }
+  secret->resize(static_cast<size_t>(wide_size));
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                      static_cast<int>(utf8.size()), secret->data(),
+                      wide_size);
+  SecureZeroMemory(utf8.data(), utf8.size());
+  return !secret->empty();
+}
+
+class PipeWriter {
+ public:
+  explicit PipeWriter(PipeChannel* pipe) : pipe_(pipe) {}
+
+  bool Emit(const Json::Value& value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string line = WriteJson(value);
+    line.push_back('\n');
+    if (line.size() > kMaxIpcLineBytes) return false;
+    return pipe_->Write(line);
+  }
+
+ private:
+  PipeChannel* const pipe_;
+  std::mutex mutex_;
+};
+
+class ConsentDispatcher {
+ public:
+  explicit ConsentDispatcher(PipeWriter* writer) : writer_(writer) {}
+  ~ConsentDispatcher() { Shutdown(); }
+
+  bool Handle(const Json::Value& root) {
+    const std::optional<ConsentFrame> frame = ParseConsentFrame(root);
+    if (!frame) return false;
+    if (frame->kind == ConsentFrameKind::kSurfaceQuery) {
+      const std::wstring desktop = CurrentInputDesktopName();
+      const bool interactive = !desktop.empty();
+      const bool protected_desktop = CurrentSessionIsLocked() ||
+          (interactive && _wcsicmp(desktop.c_str(), L"Default") != 0);
+      writer_->Emit(ConsentSurfaceStateEnvelope(
+          interactive && !protected_desktop, interactive, protected_desktop));
+      return true;
+    }
+    if (frame->kind == ConsentFrameKind::kDismiss) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_ && active_approval_id_ == frame->approval_id) prompt_.Cancel();
+      return true;
+    }
+
+    std::thread completed;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_) {
+        writer_->Emit(ConsentAnswerEnvelope(
+            frame->approval_id, consent_ipc::kOutcomeUnavailable));
+        return true;
+      }
+      if (prompt_thread_.joinable()) completed = std::move(prompt_thread_);
+      active_ = true;
+      active_approval_id_ = frame->approval_id;
+      const ConsentAsk ask = frame->ask;
+      const uint64_t cancellation_generation =
+          prompt_.cancellation_generation();
+      prompt_thread_ = std::thread([this, ask, cancellation_generation] {
+        ConsentPrompt::Outcome outcome = ConsentPrompt::Outcome::kUnavailable;
+        const std::wstring desktop = CurrentInputDesktopName();
+        const std::wstring requester = Utf8ToWide(ask.requester_label);
+        if (!requester.empty() && !desktop.empty() && !CurrentSessionIsLocked() &&
+            _wcsicmp(desktop.c_str(), L"Default") == 0) {
+          outcome = prompt_.Ask(requester, ask.control_mode, ask.deadline_ms,
+                                cancellation_generation);
+        }
+        writer_->Emit(ConsentAnswerEnvelope(
+            ask.approval_id, ConsentOutcomeLiteral(outcome)));
+        std::lock_guard<std::mutex> done_lock(mutex_);
+        active_ = false;
+        active_approval_id_.clear();
+      });
+    }
+    if (completed.joinable()) completed.join();
+    return true;
+  }
+
+  void Shutdown() {
+    std::thread prompt_thread;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_) prompt_.Cancel();
+      if (prompt_thread_.joinable()) prompt_thread = std::move(prompt_thread_);
+    }
+    if (prompt_thread.joinable()) prompt_thread.join();
+  }
+
+ private:
+  PipeWriter* const writer_;
+  ConsentPrompt prompt_;
+  std::mutex mutex_;
+  std::thread prompt_thread_;
+  bool active_ = false;
+  std::string active_approval_id_;
+};
+
+/**
+ * Prompt-only lifecycle used before PREPARE.
+ *
+ * This path deliberately returns before Winsock, COM, Media Foundation,
+ * libwebrtc, capture, the input injector, and session Signal parsing are
+ * initialized. The authenticated pipe can therefore ask/dismiss consent and
+ * nothing on it can create capture, input, offer, ICE, or session authority.
+ */
+int RunConsentOnlyWorker(PipeChannel* pipe_channel, PipeWriter* writer) {
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  ConsentDispatcher consent(writer);
+  bool protocol_ok = true;
+  std::string pending;
+  std::vector<char> buffer(8192);
+  while (protocol_ok) {
+    const size_t read = pipe_channel->Read(buffer.data(), buffer.size());
+    if (read == 0) break;
+    pending.append(buffer.data(), read);
+    if (pending.size() > kMaxIpcLineBytes) {
+      protocol_ok = false;
+      break;
+    }
+    for (;;) {
+      const size_t newline = pending.find('\n');
+      if (newline == std::string::npos) break;
+      std::string line = pending.substr(0, newline);
+      pending.erase(0, newline + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      Json::Value root;
+      // Malformed or session/privacy frames are ignored. They never fall
+      // through to another dispatcher in this lifecycle.
+      if (!ParseJson(line, &root) || !consent.Handle(root)) continue;
+    }
+  }
+  consent.Shutdown();
+  return protocol_ok ? 0 : 11;
+}
+
+class WorkerRuntime {
+ public:
+  using SessionFactory = std::function<
+      webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>(
+          std::string_view)>;
+  WorkerRuntime(webrtc::Thread* signaling_thread,
+                SessionFactory session_factory,
+                PipeWriter* writer,
+                LocalIndicator* indicator,
+                LoopbackAudioRouter* audio_router)
+      : signaling_thread_(signaling_thread),
+        session_factory_(std::move(session_factory)),
+        writer_(writer),
+        indicator_(indicator),
+        audio_router_(audio_router),
+        presentation_adapter_(
+            [this, indicator](WindowsEnvironmentSink sink) {
+              return indicator &&
+                     indicator->Start(
+                         [this] { RequestLocalStopAll(); }, std::move(sink));
+            },
+            [indicator](std::uint32_t viewers, std::uint32_t controllers) {
+              if (!indicator ||
+                  viewers > static_cast<std::uint32_t>(INT_MAX) ||
+                  controllers > static_cast<std::uint32_t>(INT_MAX)) {
+                return false;
+              }
+              indicator->Update(static_cast<int>(viewers),
+                                static_cast<int>(controllers));
+              return !indicator->BoundDesktop().empty();
+            },
+            [indicator] {
+              if (indicator) indicator->Update(0, 0);
+            },
+            [indicator] {
+              if (indicator) indicator->Stop();
+            },
+            [this](std::uint32_t event_mask) {
+              RequestEnvironmentChange(event_mask);
+            }),
+        input_(
+            [this, indicator](UINT count, LPINPUT inputs, int size) {
+              if (privacy_active_.load() || !g_input_desktop_ready.load()) {
+                return static_cast<UINT>(0);
+              }
+              return indicator ? indicator->DispatchInput(count, inputs, size)
+                               : 0;
+            },
+            [this, indicator] {
+              return !privacy_active_.load() && g_input_desktop_ready.load() && indicator &&
+                     indicator->InputAvailable();
+            },
+            [this, indicator](int x, int y) {
+              return !privacy_active_.load() && g_input_desktop_ready.load() && indicator &&
+                     indicator->MovePointer(x, y);
+            }),
+        dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
+
+  ~WorkerRuntime() { CloseDwmBaselineHandle(); }
+
+  bool StartPlatformAdapters() {
+    return presentation_adapter_.Start(
+        [this](common::GraphicalSessionEvent event) {
+          RequestGraphicalSessionChange(event);
+        });
+  }
+
+  void StopPlatformAdapters() noexcept { presentation_adapter_.Stop(); }
+
+  bool Handle(const Json::Value& root) {
+    const int64_t now_ms = NowMs();
+    const std::optional<Signal> signal = ParseServiceSignal(root, now_ms);
+    if (!signal) return false;
+    DWORD sampled_dwm_pid = 0;
+    if (signal->kind == Signal::Kind::kPrepare) {
+      sampled_dwm_pid = CurrentDwmProcessIdForCurrentSession();
+    }
+    return signaling_thread_->BlockingCall(
+        [this, signal = *signal, now_ms, sampled_dwm_pid] {
+          return HandleOnSignaling(signal, now_ms, sampled_dwm_pid);
+        });
+  }
+
+  void Maintenance() {
+    bool compositor_restarted = false;
+    const CohortSnapshot cohort = ReadCohortSnapshot();
+    const uint64_t current_cohort = cohort.epoch;
+
+    if (!cohort.has_active_sessions) {
+      compositor_scan_ticks_ = 0;
+      dwm_respawn_pending_ = false;
+      CloseDwmBaselineHandle();
+      dwm_process_id_ = 0;
+    } else {
+      bool cohort_transition = false;
+      if (handled_cohort_epoch_ != current_cohort) {
+        handled_cohort_epoch_ = current_cohort;
+        CloseDwmBaselineHandle();
+        dwm_process_id_ = cohort.baseline_pid;
+        compositor_scan_ticks_ = 0;
+        dwm_respawn_pending_ = false;
+        EnsureDwmBaselineHandle();
+        cohort_transition = true;
+      }
+
+      bool tracked_process_alive = false;
+      bool tracked_process_exited = false;
+      if (dwm_process_handle_) {
+        const DWORD wait_result = WaitForSingleObject(dwm_process_handle_, 0);
+        if (wait_result == WAIT_TIMEOUT) {
+          tracked_process_alive = true;
+        } else if (wait_result == WAIT_OBJECT_0) {
+          tracked_process_exited = true;
+          dwm_respawn_pending_ = true;
+          CloseDwmBaselineHandle();
+        }
+      }
+
+      const bool must_check_now = tracked_process_exited ||
+                                  dwm_respawn_pending_ ||
+                                  (cohort_transition && !dwm_process_handle_);
+
+      if (ShouldPollCompositorPidWithBudget(cohort.has_active_sessions,
+                                            tracked_process_alive,
+                                            must_check_now,
+                                            compositor_scan_ticks_ + 1)) {
+        compositor_scan_ticks_ = 0;
+        const DWORD current_dwm_pid = CurrentDwmProcessIdForCurrentSession();
+        if (current_dwm_pid != 0) {
+          compositor_restarted = AdvanceCompositorProcessGeneration(
+              current_dwm_pid, &dwm_process_id_);
+          dwm_respawn_pending_ = false;
+          CloseDwmBaselineHandle();
+          EnsureDwmBaselineHandle();
+        } else {
+          compositor_restarted = false;
+        }
+      } else if (!tracked_process_alive) {
+        ++compositor_scan_ticks_;
+      } else {
+        compositor_scan_ticks_ = 0;
+      }
+    }
+
+    // A DWM crash can poison a DXGI or WebRTC call deeply enough that even
+    // signaling-thread cleanup never returns. Once the compositor pid changes,
+    // give the reset a bounded window and let the node relaunch this verified
+    // worker if recovery cannot complete.
+    HANDLE recovery_complete = nullptr;
+    std::thread recovery_watchdog;
+    auto recovery_accepted = std::make_shared<std::atomic<bool>>(false);
+    if (compositor_restarted) {
+      recovery_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!recovery_complete) {
+        const CohortSnapshot active = ReadCohortSnapshot();
+        if (active.has_active_sessions && active.epoch == current_cohort) {
+          TerminateProcess(GetCurrentProcess(), 16);
+        }
+        return;
+      }
+      recovery_watchdog = std::thread(
+          [this, recovery_complete, current_cohort, recovery_accepted] {
+            if (WaitForSingleObject(recovery_complete,
+                                    kWorkerShutdownGraceMs) == WAIT_TIMEOUT) {
+              const CohortSnapshot active = ReadCohortSnapshot();
+              if (ShouldWatchdogTerminateOnTimeout(
+                      recovery_accepted->load(std::memory_order_acquire),
+                      active.has_active_sessions, active.epoch, current_cohort)) {
+                TerminateProcess(GetCurrentProcess(), 16);
+              }
+            }
+          });
+    }
+    signaling_thread_->BlockingCall(
+        [this, compositor_restarted, current_cohort, recovery_accepted] {
+          if (local_stop_requested_.exchange(false))
+            StopAllOnSignaling("stopped_by_local_user", true);
+          uint32_t environment_mask = environment_events_.exchange(0);
+          if (ShouldApplyCompositorRestartToCohort(
+                  compositor_restarted, cohort_state_.has_active_sessions,
+                  cohort_state_.epoch, current_cohort)) {
+            recovery_accepted->store(true, std::memory_order_release);
+            environment_mask |= kEnvironmentCompositionChanged;
+          }
+          const WorkerEnvironmentAction environment_action =
+              SelectWorkerEnvironmentAction(environment_mask);
+      const bool topology_refresh_requested =
+          environment_action == WorkerEnvironmentAction::kRefreshTopology;
+      if (environment_action == WorkerEnvironmentAction::kFollowDesktop) {
+        // Deliberately not followed here. A lock notification arrives while
+        // Windows is still moving input around — measured on real hardware it
+        // reports the sign-in desktop, then the curtain on the user's own
+        // desktop again, inside a single poll period. The tick below runs in
+        // this same call: it reconciles capture immediately and moves the
+        // indicator once the desktop has actually settled.
+        session_transition_pending_ = true;
+        g_input_desktop_ready.store(false);
+        ReleaseAllInputOnSignaling();
+        desktop_follow_candidate_.clear();
+      } else if (environment_action == WorkerEnvironmentAction::kStopProtected) {
+        StopAllOnSignaling("protected_desktop", true);
+        ResetCaptureSourcesOnSignaling();
+      } else if (environment_action ==
+                 WorkerEnvironmentAction::kStopAndReinitialize) {
+        StopAllOnSignaling("media_unavailable", true);
+        ResetCaptureSourcesOnSignaling();
+      } else if (environment_action ==
+                 WorkerEnvironmentAction::kRefreshTopology) {
+        topology_scan_ticks_ = 0;
+      }
+      if (AdvanceTopologyRefreshDebounce(topology_refresh_requested,
+                                         &topology_refresh_debounce_ticks_)) {
+        RefreshTopologyOnSignaling();
+      }
+      if (!sessions_.empty()) {
+        // Windows moves input between the user's desktop and the sign-in/lock
+        // desktop; the lock screen even lives on both at once (the curtain on
+        // Default, the credential box on Winlogon). Follow it in place so the
+        // peer, encoder and grant all survive a sign-in and the viewer just
+        // sees the picture change.
+        const std::wstring input_desktop = CurrentInputDesktopName();
+        const DesktopFollowAction follow = SelectDesktopFollowAction(
+            input_desktop, indicator_->BoundDesktop(),
+            session_transition_pending_,
+            &desktop_follow_failures_);
+        // Evaluated every tick, including the ticks that stay put, so the
+        // candidate never carries a desktop from before an unreadable sample.
+        const bool settled =
+            DesktopFollowSettled(input_desktop, &desktop_follow_candidate_);
+        // Capture is reconciled first and on every tick: it must sit on the
+        // desktop Windows is displaying even when the indicator is already
+        // there, because a rebind Windows refused mid-switch would otherwise
+        // never be retried.
+        ReconcileCaptureDesktopOnSignaling(input_desktop);
+        UpdateSignInStateOnSignaling(input_desktop);
+        MaybeAutoUnlockOnSignaling(input_desktop);
+        if (follow == DesktopFollowAction::kFollow && settled) {
+          FollowDesktopsOnSignaling();
+        } else if (follow == DesktopFollowAction::kUnavailable) {
+          // The input desktop stayed unreadable for long enough that this
+          // worker cannot know where it is. Hand the session back rather than
+          // streaming a desktop nobody asked for.
+          StopAllOnSignaling("protected_desktop", true);
+        }
+        if (session_transition_pending_ && settled &&
+            !input_desktop.empty()) {
+          session_transition_pending_ = false;
+        }
+        g_input_desktop_ready.store(!privacy_active_.load() &&
+                                    !session_transition_pending_ &&
+                                    !input_desktop.empty() &&
+                                    input_desktop == indicator_->BoundDesktop());
+        const bool expected_desktop =
+            !session_transition_pending_ &&
+            follow != DesktopFollowAction::kUnavailable;
+        if (expected_desktop) {
+          if (topology_refresh_debounce_ticks_ == 0 &&
+              ++topology_scan_ticks_ >= 8) {
+            topology_scan_ticks_ = 0;
+            std::vector<DisplayInfo> displays = EnumerateDisplays();
+            if (displays.empty()) {
+              if (AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)) {
+                StopAllOnSignaling("media_unavailable", true);
+                ResetCaptureSourcesOnSignaling();
+              }
+            } else {
+              empty_topology_ticks_ = 0;
+              for (auto& [id, session] : sessions_) {
+                if (!session->closed() && !session->RefreshDisplays(displays))
+                  session->Close("media_unavailable");
+              }
+            }
+          }
+        }
+      }
+      const int64_t now_ms = NowMs();
+      for (auto& [id, session] : sessions_) {
+        if (!session->closed()) {
+          // Input readiness changes on its own schedule — a layout
+          // acknowledged, a desktop followed — and the viewer used to learn
+          // about it only on the next lease renewal, which is why a fresh
+          // connection ignored clicks for seconds.
+          session->PublishInputReadinessIfChanged();
+          session->CheckMediaProgress();
+        }
+        if (!session->closed() && session->protected_content_masked()) {
+          session->Close("protected_desktop");
+        } else if (!session->closed()) {
+          session->Tick(now_ms);
+        }
+      }
+      RemoveClosedOnSignaling();
+      input_.RetryPendingReleases();
+    });
+    if (recovery_complete) {
+      SetEvent(recovery_complete);
+      recovery_watchdog.join();
+      CloseHandle(recovery_complete);
+    }
+  }
+
+  void RequestLocalStopAll() { local_stop_requested_ = true; }
+
+  void RequestGraphicalSessionChange(
+      common::GraphicalSessionEvent event) {
+    const std::uint32_t event_mask = WindowsEnvironmentMask(event);
+    if (event_mask != 0) RequestEnvironmentChange(event_mask);
+  }
+
+  /**
+   * Engage the management-privacy shield on every capture source.
+   *
+   * Ordering is the whole point and is enforced here rather than left to the
+   * caller: held input is released FIRST (a viewer whose key is still down
+   * would keep typing into a secret surface it can no longer see), then the
+   * shield goes up, and only then do we report. `routes` is captured AFTER the
+   * switch, so a session that appeared mid-switch is either shielded and
+   * listed, or not present at all -- never streaming and unlisted.
+   */
+  struct PrivacyShieldResult {
+    bool epoch_accepted = false;
+    bool input_released = false;
+    bool route_generations_complete = true;
+    int64_t worker_generation = 0;
+    std::vector<PrivacyRouteGeneration> routes;
+  };
+
+  PrivacyShieldResult EngagePrivacyShield(const std::string& epoch_id,
+                                           int64_t revision) {
+    PrivacyShieldResult result{};
+    signaling_thread_->BlockingCall([this, &result, &epoch_id, revision] {
+      if (privacy_active_.load() &&
+          (privacy_epoch_ != epoch_id || revision < privacy_revision_)) {
+        return;
+      }
+      privacy_active_.store(true);
+      privacy_epoch_ = epoch_id;
+      privacy_revision_ = revision;
+      g_input_desktop_ready.store(false);
+      result.epoch_accepted = true;
+      // Clear common-ledger ownership before the established OS-wide
+      // key/button-up fallback. The privacy gate is already closed, so no new
+      // input can race between those two operations.
+      result.input_released = ReleaseAllInputOnSignaling();
+      for (int attempt = 0; attempt < 4 && !input_.RetryPendingReleases();
+           ++attempt) {
+        Sleep(10);
+      }
+      for (auto& [id, source] : sources_) source.source->EngagePrivacyShield();
+      int64_t generation = 0;
+      for (auto& [id, source] : sources_) {
+        generation = std::max<int64_t>(
+            generation, static_cast<int64_t>(source.source->shield_generation()));
+      }
+      result.worker_generation = generation;
+      for (auto& [id, session] : sessions_) {
+        if (!session->authority().route_generation) {
+          // Legacy v2 remains usable for authenticated access, but an absent
+          // route epoch can never be acknowledged as part of a privacy
+          // snapshot. daemon_generation is not a substitute.
+          result.route_generations_complete = false;
+          continue;
+        }
+        PrivacyRouteGeneration route{};
+        route.route_id = session->authority().session_id;
+        route.route_generation = *session->authority().route_generation;
+        result.routes.push_back(route);
+      }
+    });
+    return result;
+  }
+
+  /** Current highest broadcast generation across all sources. */
+  int64_t PrivacyShieldGeneration() {
+    int64_t generation = 0;
+    signaling_thread_->BlockingCall([this, &generation] {
+      for (auto& [id, source] : sources_) {
+        generation = std::max<int64_t>(
+            generation, static_cast<int64_t>(source.source->shield_generation()));
+      }
+    });
+    return generation;
+  }
+
+  bool ReleasePrivacyShield(const std::string& epoch_id, int64_t revision) {
+    bool released = false;
+    signaling_thread_->BlockingCall([this, &released, &epoch_id, revision] {
+      if (!privacy_active_.load() || privacy_epoch_ != epoch_id ||
+          revision != privacy_revision_) {
+        return;
+      }
+      for (auto& [id, source] : sources_) source.source->ReleasePrivacyShield();
+      // Input remains disabled until CompletePrivacyRelease runs after a
+      // strictly newer real frame is proven.
+      released = true;
+    });
+    return released;
+  }
+
+  bool CompletePrivacyRelease(const std::string& epoch_id, int64_t revision) {
+    bool completed = false;
+    signaling_thread_->BlockingCall([this, &completed, &epoch_id, revision] {
+      if (!privacy_active_.load() || privacy_epoch_ != epoch_id ||
+          revision != privacy_revision_) {
+        return;
+      }
+      privacy_epoch_.clear();
+      privacy_revision_ = 0;
+      privacy_active_.store(false);
+      g_input_desktop_ready.store(!session_transition_pending_ &&
+                                  !indicator_->BoundDesktop().empty() &&
+                                  indicator_->BoundDesktop() ==
+                                      CurrentInputDesktopName());
+      completed = true;
+    });
+    return completed;
+  }
+  void RequestEnvironmentChange(uint32_t event_mask) {
+    environment_events_.fetch_or(event_mask);
+  }
+
+  void Shutdown() {
+    CloseDwmBaselineHandle();
+    signaling_thread_->BlockingCall([this] {
+      StopAllOnSignaling("worker_failed", false);
+      for (int attempt = 0; attempt < 4 && !input_.RetryPendingReleases();
+           ++attempt) {
+        Sleep(10);
+      }
+      for (auto& [id, source] : sources_) source.source->Stop();
+      sources_.clear();
+    });
+  }
+
+ private:
+  struct SourceEntry {
+    webrtc::scoped_refptr<DxgiDesktopSource> source;
+    size_t references = 0;
+  };
+
+  bool Matches(const Authority& expected, const Authority& received) const {
+    return expected.request_id == received.request_id &&
+           expected.session_id == received.session_id &&
+           ConstantTimeEqual(expected.capability, received.capability);
+  }
+
+  bool HandleOnSignaling(const Signal& signal, int64_t now_ms,
+                         DWORD sampled_dwm_pid) {
+    if (signal.kind == Signal::Kind::kPrepare) {
+      RemoveClosedOnSignaling();
+      if (sessions_.contains(signal.authority.session_id)) return false;
+      if (sessions_.size() >= kMaxSessions) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "session_limit"));
+        return true;
+      }
+      const bool was_empty = sessions_.empty();
+      // Viewers begin without input authority (epoch zero).  A control route
+      // may be a fresh route (epoch one) or a bounded worker replacement that
+      // preserves a newer input epoch, so only non-zero is required there.
+      const bool valid_initial_mode =
+          (signal.authority.mode == kViewMode &&
+           signal.authority.input_epoch == 0) ||
+          (signal.authority.mode == kControlMode &&
+           signal.authority.input_epoch > 0);
+      if (!valid_initial_mode ||
+          signal.authority.expires_at_ms <
+              signal.authority.lease_expires_at_ms) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "protocol_error"));
+        return true;
+      }
+      if (signal.authority.reconnect_attempt > 0) {
+        // A bounded browser reconnect follows a receive-progress failure. Keep
+        // healthy existing peers intact, but prevent the replacement encoder
+        // from selecting the same process-local hardware path again.
+        DisqualifyHardwareEncoderForProcess();
+      }
+      // The desktop can already have moved since this worker launched — a
+      // session locked, or the sign-in screen came up. Move to the one that
+      // receives input now instead of refusing the session; only a desktop
+      // this worker cannot read at all is reported back.
+      const std::wstring prepare_desktop = CurrentInputDesktopName();
+      if (prepare_desktop.empty()) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "protected_desktop"));
+        return true;
+      }
+      FollowDesktopsOnSignaling();
+      // A session begins on a clean keyboard. A modifier Windows still holds
+      // that this worker never pressed was left behind by something it no
+      // longer tracks -- a worker killed mid-press, a route lost between a
+      // modifier's down and its up -- and until something releases it, it
+      // silently rewrites every click and keystroke that follows. Sessions
+      // already running keep everything they are holding; only the keys
+      // nobody owns are released. See common/latched_modifiers.h.
+      input_.ReleaseLatchedModifiers();
+      std::vector<DisplayInfo> displays = EnumerateDisplays();
+      if (displays.empty()) {
+        writer_->Emit(TerminalEnvelope(signal.authority,
+                                       kHeadlessDisplayReason));
+        return true;
+      }
+      const ActiveSessionCounts active = CountActiveSessionsOnSignaling();
+      const std::uint32_t pending_viewers = active.viewers + 1;
+      const std::uint32_t pending_controllers =
+          active.controllers + (signal.authority.mode == kControlMode ? 1 : 0);
+      // Show the native disclosure synchronously before AcquireSource starts
+      // DXGI.  A failed initialization immediately restores the actual count.
+      if (!presentation_adapter_.Show(pending_viewers, pending_controllers)) {
+        writer_->Emit(TerminalEnvelope(signal.authority,
+                                       "protected_desktop"));
+        return true;
+      }
+      auto session_factory = session_factory_;
+      if (!session_factory) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "media_unavailable"));
+        return true;
+      }
+      auto factory = session_factory(signal.authority.session_id);
+      if (!factory) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "media_unavailable"));
+        return true;
+      }
+      auto session = PeerSession::Create(
+          signal.authority, std::move(factory), std::move(displays),
+          [this](const common::DisplayTopology& display) {
+            return AcquireSource(display);
+          },
+          [this](const DisplayInfo& display) { ReleaseSource(display); },
+          &input_,
+          [this] {
+            return !privacy_active_.load() &&
+                           ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
+                       ? indicator_->ClipboardSequence()
+                       : static_cast<DWORD>(0);
+          },
+          [this](DWORD previous_sequence) {
+            return !privacy_active_.load() &&
+                           ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
+                       ? indicator_->ReadClipboardText(previous_sequence)
+                       : std::optional<std::u16string>();
+          },
+          [this] { return RequestUnlockOnSignaling(); },
+          signaling_thread_,
+          [this](const Json::Value& value) { writer_->Emit(value); },
+          [this, session_id = signal.authority.session_id](bool enabled) {
+            if (audio_router_) {
+              audio_router_->SetSessionAudioEnabled(session_id, enabled);
+            }
+          });
+      if (!session->Initialize()) {
+        session->Close("media_unavailable", false);
+        if (audio_router_) {
+          audio_router_->UnregisterSession(signal.authority.session_id);
+        }
+        UpdateIndicatorOnSignaling();
+        writer_->Emit(TerminalEnvelope(signal.authority,
+                                       "media_unavailable"));
+        return true;
+      }
+      sessions_.emplace(signal.authority.session_id, std::move(session));
+      if (was_empty) {
+        std::lock_guard<std::mutex> lock(cohort_mutex_);
+        cohort_state_.has_active_sessions = true;
+        cohort_state_.epoch++;
+        cohort_state_.baseline_pid = sampled_dwm_pid;
+      }
+      UpdateIndicatorOnSignaling();
+      return true;
+    }
+
+    const auto found = sessions_.find(signal.authority.session_id);
+    if (found == sessions_.end() || found->second->closed() ||
+        !Matches(found->second->authority(), signal.authority)) {
+      return false;
+    }
+    std::shared_ptr<PeerSession> session = found->second;
+    bool accepted = false;
+    switch (signal.kind) {
+      case Signal::Kind::kOffer:
+        accepted = session->ApplyOffer(signal.sdp);
+        break;
+      case Signal::Kind::kIce:
+        accepted = session->AddIce(signal.mid, signal.candidate);
+        break;
+      case Signal::Kind::kLease:
+        accepted = session->Renew(signal.authority);
+        break;
+      case Signal::Kind::kMode:
+        accepted = session->SetMode(signal.authority, signal.reason);
+        if (accepted) UpdateIndicatorOnSignaling();
+        break;
+      case Signal::Kind::kStop:
+        session->Close("stopped_by_controller");
+        accepted = true;
+        RemoveClosedOnSignaling();
+        break;
+      case Signal::Kind::kPrepare:
+        break;
+    }
+    if (!accepted && !session->closed() &&
+        (signal.kind == Signal::Kind::kOffer ||
+         signal.kind == Signal::Kind::kLease ||
+         signal.kind == Signal::Kind::kMode)) {
+      session->Close("protocol_error");
+      RemoveClosedOnSignaling();
+    }
+    return accepted;
+  }
+
+  webrtc::scoped_refptr<DxgiDesktopSource> AcquireSource(
+      const common::DisplayTopology& requested) {
+    const std::vector<DisplayInfo> current = EnumerateDisplays();
+    const auto resolved = std::find_if(
+        current.begin(), current.end(), [&](const DisplayInfo& display) {
+          const common::PixelSize pixels = WindowsEncodedPixels(display);
+          return display.available && display.id == requested.display_id &&
+                 pixels.width == requested.encoded_pixels.width &&
+                 pixels.height == requested.encoded_pixels.height;
+        });
+    if (resolved == current.end()) return nullptr;
+    const DisplayInfo& display = *resolved;
+    const std::string key = DisplaySourceKey(display);
+    auto found = sources_.find(key);
+    if (found != sources_.end()) {
+      ++found->second.references;
+      return found->second.source;
+    }
+    if (sources_.size() >= kMaxCaptureSources ||
+        sources_.size() >= kMaxGpuCaptureSurfaces) {
+      return nullptr;
+    }
+    // Both desktops need the same rescue: DXGI enumerates the output and
+    // opens a duplication, then never presents a first frame on an idle,
+    // monitor-less machine. Without the fallback that surfaces as
+    // media_unavailable and no session can ever start on such a node.
+    auto source =
+        DxgiDesktopSource::Create(display, CaptureFallback::kDesktopGdi);
+    if (!source) return nullptr;
+    // The tick reconciler corrects this the moment Windows disagrees; an
+    // empty name simply means "whatever receives input right now".
+    source->RequestDesktopRebind(CurrentInputDesktopName());
+    // A source created after BEGIN is opaque before its capture thread can
+    // publish even one frame. This also covers display hotplug while an epoch
+    // remains active.
+    if (privacy_active_.load()) source->EngagePrivacyShield();
+    source->Start();
+    sources_.emplace(key, SourceEntry{source, 1});
+    return source;
+  }
+
+  void ReleaseSource(const DisplayInfo& display) {
+    const auto found = sources_.find(DisplaySourceKey(display));
+    if (found == sources_.end()) return;
+    if (found->second.references > 0) --found->second.references;
+    if (found->second.references == 0) {
+      found->second.source->Stop();
+      sources_.erase(found);
+    }
+  }
+
+  void RemoveClosedOnSignaling() {
+    for (auto current = sessions_.begin(); current != sessions_.end();) {
+      if (current->second->closed()) {
+        if (audio_router_) audio_router_->UnregisterSession(current->first);
+        current = sessions_.erase(current);
+      } else {
+        ++current;
+      }
+    }
+    UpdateIndicatorOnSignaling();
+  }
+
+  void StopAllOnSignaling(const char* reason, bool emit_terminal) {
+    for (auto& [id, session] : sessions_) {
+      session->Close(reason, emit_terminal);
+      if (audio_router_) audio_router_->UnregisterSession(id);
+    }
+    sessions_.clear();
+    UpdateIndicatorOnSignaling();
+  }
+
+  // Move this worker to the desktop that now receives input. The peer, the
+  // encoder and every authority stay exactly as they are: only the capture
+  // thread and the indicator/input thread change desktops. Held keys and
+  // buttons are released first, because an input ledger must never survive the
+  // boundary it was pressed on.
+  // Input follows the desktop that receives it; capture follows the one that
+  // can be read. They are the same desktop most of the time, but a locked
+  // session keeps the curtain (and input) on Default while refusing screen
+  // reads there, so capture has to sit on Winlogon until it unlocks.
+  void FollowDesktopsOnSignaling() {
+    const std::wstring input_desktop = CurrentInputDesktopName();
+    if (input_desktop != indicator_->BoundDesktop()) {
+      g_input_desktop_ready.store(false);
+      ReleaseAllInputOnSignaling();
+      presentation_adapter_.Stop();
+      if (!StartPlatformAdapters()) {
+        // Without the disclosure indicator there is no visible sign that the
+        // desktop is being streamed, so stop rather than capture silently.
+        StopAllOnSignaling("protected_desktop", true);
+        return;
+      }
+      UpdateIndicatorOnSignaling();
+      g_input_desktop_ready.store(indicator_->BoundDesktop() == input_desktop);
+    }
+    ReconcileCaptureDesktopOnSignaling(input_desktop);
+  }
+
+  bool ReleaseAllInputOnSignaling() {
+    for (const auto& session_entry : sessions_) {
+      session_entry.second->ReleaseInputForPlatformTransition();
+    }
+    // A lock/privacy transition may already gate the adapter. Preserve the
+    // existing allowlisted OS release as physical truth; the calls above clear
+    // InputLedger ownership and each PeerSession's pressed-code mirror.
+    return ReleaseAllSupportedInput();
+  }
+
+  // Capture goes where input goes: Windows refuses a screen read from any
+  // desktop other than the one it is displaying, so there is exactly one valid
+  // target at a time. Locking moves that target twice — briefly to the sign-in
+  // desktop, back to the curtain on the user's own desktop, then to the
+  // credential box when a key arrives — so the target is re-checked against
+  // what each source reports it is actually reading, never against what was
+  // last asked for.
+  void ReconcileCaptureDesktopOnSignaling(const std::wstring& input_desktop) {
+    if (input_desktop.empty()) return;
+    for (auto& [id, source] : sources_) {
+      if (ShouldRebindCapture(input_desktop, source.source->BoundDesktop())) {
+        source.source->RequestDesktopRebind(input_desktop);
+      }
+    }
+  }
+
+  /**
+   * Track the lock state and tell every session what it is looking at, so a
+   * viewer sees "sign-in screen" and gets the unlock control instead of
+   * wondering why the desktop it expected is a password box.
+   */
+  void UpdateSignInStateOnSignaling(const std::wstring& input_desktop) {
+    const bool locked = CurrentSessionIsLocked();
+    if (IsTypedUnlockSuccess(session_locked_, locked, secret_typed_this_lock_,
+                            secret_typed_at_ms_,
+                            static_cast<int64_t>(GetTickCount64()))) {
+      // The stored secret this worker just typed opened the lock. Credit the
+      // sessions that were controlling; each Server route notifies once.
+      for (const auto& [id, session] : sessions_) {
+        if (!session->closed() && session->controlling()) {
+          session->MarkAutoUnlockSucceeded();
+        }
+      }
+    }
+    if (!locked && session_locked_) {
+      // Unlocked: both budgets belong to the lock that just ended.
+      auto_unlock_attempts_ = 0;
+      auto_unlock_raise_attempts_ = 0;
+      secret_typed_this_lock_ = false;
+    }
+    session_locked_ = locked;
+    const bool sign_in_screen = locked || input_desktop == kSignInDesktop;
+    const bool unlock_available = sign_in_screen && UnlockSecret::Configured();
+    for (const auto& [id, session] : sessions_) {
+      session->SetSignInState(sign_in_screen, unlock_available);
+    }
+  }
+
+  bool ControllerPresentOnSignaling() const {
+    return std::any_of(sessions_.begin(), sessions_.end(),
+                       [](const auto& entry) {
+                         return !entry.second->closed() &&
+                                entry.second->controlling();
+                       });
+  }
+
+  // Answer the sign-in screen on behalf of a watching controller. Evaluated on
+  // every tick, not only when the desktop changes: a session that connects to
+  // an already-locked machine never sees a transition, and the machine rests on
+  // the lock curtain — a screen with no password box — so the credential UI has
+  // to be woken before there is anywhere to type.
+  void MaybeAutoUnlockOnSignaling(const std::wstring& input_desktop) {
+    const AutoUnlockStep step = SelectAutoUnlockStep(
+        UnlockSecret::Configured(), ControllerPresentOnSignaling(),
+        g_input_desktop_ready.load(), session_locked_,
+        input_desktop == kSignInDesktop, auto_unlock_raise_attempts_,
+        auto_unlock_attempts_);
+    if (step == AutoUnlockStep::kRaiseCredentialUi) {
+      ++auto_unlock_raise_attempts_;
+      RaiseCredentialUiOnSignaling();
+      return;
+    }
+    if (step != AutoUnlockStep::kTypeSecret) return;
+    ++auto_unlock_attempts_;
+    TypeStoredSecretOnSignaling();
+  }
+
+  /**
+   * Run the controller's explicit unlock request. Unlike the automatic path it
+   * is not once-per-lock: the operator asked for it, and the sign-in UI is
+   * exactly the place where one attempt can silently do nothing. It still needs
+   * a stored secret, control of this session and a locked screen, and it types
+   * only when the credential box is actually up.
+   */
+  bool RequestUnlockOnSignaling() {
+    if (!ShouldAcceptUnlockRequest(UnlockSecret::Configured(),
+                                   ControllerPresentOnSignaling(),
+                                   g_input_desktop_ready.load(),
+                                   session_locked_)) {
+      return false;
+    }
+    if (CurrentInputDesktopName() != kSignInDesktop) {
+      // No password box yet: wake the curtain and let the next tick type.
+      RaiseCredentialUiOnSignaling();
+      return true;
+    }
+    return TypeStoredSecretOnSignaling();
+  }
+
+  void RaiseCredentialUiOnSignaling() {
+    input_.KeyDown(kAutoUnlockOwner, "Space", false);
+    input_.KeyUp(kAutoUnlockOwner, "Space");
+  }
+
+  // The secret is decrypted for the length of this call and wiped immediately;
+  // it is never logged, echoed, or sent anywhere.
+  bool TypeStoredSecretOnSignaling() {
+    std::wstring secret;
+    if (!UnlockSecret::Load(&secret)) return false;
+    std::u16string typed(secret.begin(), secret.end());
+    SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+    secret.clear();
+    const bool typed_ok = input_.Text(typed);
+    SecureZeroMemory(typed.data(), typed.size() * sizeof(char16_t));
+    typed.clear();
+    if (!typed_ok) return false;
+    input_.KeyDown(kAutoUnlockOwner, "Enter", false);
+    input_.KeyUp(kAutoUnlockOwner, "Enter");
+    secret_typed_this_lock_ = true;
+    secret_typed_at_ms_ = static_cast<int64_t>(GetTickCount64());
+    writer_->Emit(AutoUnlockAttemptEnvelope());
+    return true;
+  }
+
+  Json::Value AutoUnlockAttemptEnvelope() const {
+    // Auditable, and deliberately content-free: an operator can see that the
+    // node answered its own lock screen, never what it typed.
+    Json::Value root(Json::objectValue);
+    root["type"] = kAutoUnlockAttemptType;
+    return root;
+  }
+
+  void ResetCaptureSourcesOnSignaling() {
+    for (auto& [id, source] : sources_) source.source->Stop();
+    sources_.clear();
+    protected_desktop_checks_ = 0;
+    topology_scan_ticks_ = 0;
+  }
+
+  void RefreshTopologyOnSignaling() {
+    if (sessions_.empty()) return;
+    std::vector<DisplayInfo> displays = EnumerateDisplays();
+    if (displays.empty()) {
+      // RefreshTopologyOnSignaling() runs on the same signaling thread as the
+      // Maintenance() empty-scan. Reuse the same bounded grace counter so a
+      // single transient DXGI / DWM dip does not terminate every peer.
+      if (AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)) {
+        StopAllOnSignaling("media_unavailable", true);
+        ResetCaptureSourcesOnSignaling();
+      }
+      return;
+    }
+    empty_topology_ticks_ = 0;
+    for (auto& [id, session] : sessions_) {
+      if (!session->closed() && !session->RefreshDisplays(displays))
+        session->Close("media_unavailable");
+    }
+    RemoveClosedOnSignaling();
+  }
+
+  struct ActiveSessionCounts {
+    std::uint32_t viewers = 0;
+    std::uint32_t controllers = 0;
+  };
+
+  ActiveSessionCounts CountActiveSessionsOnSignaling() const {
+    ActiveSessionCounts counts;
+    for (const auto& [id, session] : sessions_) {
+      if (session->closed()) continue;
+      ++counts.viewers;
+      if (session->controlling()) ++counts.controllers;
+    }
+    return counts;
+  }
+
+  void UpdateIndicatorOnSignaling() {
+    const ActiveSessionCounts active = CountActiveSessionsOnSignaling();
+    {
+      std::lock_guard<std::mutex> lock(cohort_mutex_);
+      cohort_state_.has_active_sessions = (active.viewers > 0);
+    }
+    if (active.viewers == 0) {
+      presentation_adapter_.Hide();
+    } else {
+      presentation_adapter_.Show(active.viewers, active.controllers);
+    }
+  }
+
+  void CloseDwmBaselineHandle() noexcept {
+    if (dwm_process_handle_) {
+      CloseHandle(dwm_process_handle_);
+      dwm_process_handle_ = nullptr;
+    }
+  }
+
+  void EnsureDwmBaselineHandle() noexcept {
+    if (dwm_process_handle_ || dwm_process_id_ == 0) return;
+    dwm_process_handle_ = OpenProcess(SYNCHRONIZE, FALSE, dwm_process_id_);
+  }
+
+  webrtc::Thread* const signaling_thread_;
+  const SessionFactory session_factory_;
+  PipeWriter* const writer_;
+  LocalIndicator* const indicator_;
+  LoopbackAudioRouter* const audio_router_;
+  WindowsDisclosureSessionAdapter presentation_adapter_;
+  InputArbiter input_;
+  std::atomic<bool> privacy_active_{false};
+  // Signaling-thread only. The atomic above gates input callbacks running on
+  // other threads; epoch/revision are compared only while serialized there.
+  std::string privacy_epoch_;
+  int64_t privacy_revision_ = 0;
+  std::map<std::string, std::shared_ptr<PeerSession>> sessions_;
+  std::map<std::string, SourceEntry> sources_;
+  std::atomic<bool> local_stop_requested_{false};
+  std::atomic<uint32_t> environment_events_{0};
+  struct CohortSnapshot {
+    bool has_active_sessions = false;
+    uint64_t epoch = 0;
+    DWORD baseline_pid = 0;
+  };
+
+  CohortSnapshot ReadCohortSnapshot() const {
+    std::lock_guard<std::mutex> lock(cohort_mutex_);
+    return cohort_state_;
+  }
+
+  DWORD dwm_process_id_ = 0;
+  HANDLE dwm_process_handle_ = nullptr;
+  mutable std::mutex cohort_mutex_;
+  CohortSnapshot cohort_state_;
+  uint64_t handled_cohort_epoch_ = 0;
+  bool dwm_respawn_pending_ = false;
+  int protected_desktop_checks_ = 0;
+  int desktop_follow_failures_ = 0;
+  std::wstring desktop_follow_candidate_;
+  bool session_transition_pending_ = false;
+  bool session_locked_ = false;
+  int auto_unlock_raise_attempts_ = 0;
+  int auto_unlock_attempts_ = 0;
+  bool secret_typed_this_lock_ = false;
+  int64_t secret_typed_at_ms_ = 0;
+  int compositor_scan_ticks_ = 0;
+  int topology_scan_ticks_ = 0;
+  int topology_refresh_debounce_ticks_ = 0;
+  int empty_topology_ticks_ = 0;
+};
+
+/**
+ * Management-privacy dispatcher.
+ *
+ * Holds at most one epoch. Every failure path leaves the shield UP and emits
+ * nothing: the node treats silence as "cannot prove", so an unanswered frame
+ * fails closed at the Server's deadline. Emitting an optimistic ack would let
+ * secret UI light up over pixels that were never shielded.
+ *
+ * This dispatcher is intentionally declared after WorkerRuntime: it invokes
+ * the runtime's privacy methods and consumes its nested result type, so a mere
+ * forward declaration cannot provide a complete C++ type here.
+ */
+class PrivacyDispatcher {
+ public:
+  PrivacyDispatcher(PipeWriter* writer, WorkerRuntime* runtime)
+      : writer_(writer), runtime_(runtime) {}
+
+  bool Handle(const Json::Value& root) {
+    const std::optional<PrivacyFrame> frame = ParsePrivacyFrame(root);
+    if (!frame) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame->kind == PrivacyFrameKind::kShield) return Shield(*frame);
+    return Release(*frame);
+  }
+
+  /**
+   * Re-publish the complete actual route set after PREPARE/STOP/maintenance,
+   * but only when it exactly equals the durable expected snapshot received in
+   * SHIELD. Re-emitting on every real change prevents an early subset from
+   * becoming a permanent deadlock without ever acknowledging that subset.
+   */
+  void Reconcile() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_) ReconcileLocked(false);
+  }
+
+  /** Pipe loss. The shield stays up: the owner may still be typing. */
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = false;
+    active_epoch_.clear();
+    expected_routes_.clear();
+  }
+
+ private:
+  bool Shield(const PrivacyFrame& frame) {
+    // A second concurrent epoch would make "which shield is up" ambiguous
+    // exactly when it must not be. A repeat of the SAME epoch is idempotent.
+    if (active_ && (active_epoch_ != frame.epoch_id ||
+                    frame.revision < active_revision_)) {
+      return true;
+    }
+
+    if (!active_ || frame.revision > active_revision_) {
+      active_ = true;
+      active_epoch_ = frame.epoch_id;
+      active_revision_ = frame.revision;
+      last_emitted_revision_ = -1;
+      last_emitted_generation_ = -1;
+      last_emitted_routes_.clear();
+      expected_routes_ = frame.expected_routes;
+      std::sort(expected_routes_.begin(), expected_routes_.end(),
+                [](const PrivacyRouteGeneration& left,
+                   const PrivacyRouteGeneration& right) {
+                  return left.route_id < right.route_id;
+                });
+    } else {
+      std::vector<PrivacyRouteGeneration> repeated = frame.expected_routes;
+      std::sort(repeated.begin(), repeated.end(),
+                [](const PrivacyRouteGeneration& left,
+                   const PrivacyRouteGeneration& right) {
+                  return left.route_id < right.route_id;
+                });
+      if (!SameRoutes(repeated, expected_routes_)) return true;
+    }
+    // Force re-emission for an idempotent BEGIN retry: the earlier ACK may
+    // have been lost between the node and the owning Server pod.
+    ReconcileLocked(true);
+    return true;
+  }
+
+  void ReconcileLocked(bool force) {
+    const WorkerRuntime::PrivacyShieldResult result =
+        runtime_->EngagePrivacyShield(active_epoch_, active_revision_);
+    // No ack unless input really came down and every current session carries
+    // the independent route generation. The shield itself remains engaged.
+    if (!result.epoch_accepted || !result.input_released ||
+        !result.route_generations_complete) {
+      return;
+    }
+    std::vector<PrivacyRouteGeneration> routes = result.routes;
+    std::sort(routes.begin(), routes.end(),
+              [](const PrivacyRouteGeneration& left,
+                 const PrivacyRouteGeneration& right) {
+                if (left.route_id != right.route_id) {
+                  return left.route_id < right.route_id;
+                }
+                return left.route_generation < right.route_generation;
+              });
+    if (!SameRoutes(routes, expected_routes_)) return;
+    const bool same_routes = SameRoutes(routes, last_emitted_routes_);
+    if (!force && last_emitted_revision_ == active_revision_ &&
+        last_emitted_generation_ == result.worker_generation && same_routes) {
+      return;
+    }
+    shield_generation_ = result.worker_generation;
+    if (!writer_->Emit(PrivacyShieldedEnvelope(
+            active_epoch_, active_revision_, result.worker_generation, true,
+            routes))) {
+      return;
+    }
+    last_emitted_revision_ = active_revision_;
+    last_emitted_generation_ = result.worker_generation;
+    last_emitted_routes_ = std::move(routes);
+  }
+
+  static bool SameRoutes(const std::vector<PrivacyRouteGeneration>& left,
+                         const std::vector<PrivacyRouteGeneration>& right) {
+    return left.size() == right.size() &&
+        std::equal(left.begin(), left.end(), right.begin(),
+                   [](const PrivacyRouteGeneration& a,
+                      const PrivacyRouteGeneration& b) {
+                     return a.route_id == b.route_id &&
+                         a.route_generation == b.route_generation;
+                   });
+  }
+
+  bool Release(const PrivacyFrame& frame) {
+    // Unknown, stale or wrong-epoch release is ignored, shield untouched.
+    if (!active_ || active_epoch_ != frame.epoch_id) return true;
+    if (frame.revision != active_revision_) return true;
+
+    if (!runtime_->ReleasePrivacyShield(frame.epoch_id, active_revision_)) {
+      return true;
+    }
+
+    // Prove a real frame captured strictly AFTER the shield came down. A
+    // cached pre-release frame cannot satisfy this: the counter advances only
+    // when BroadcastFrame actually runs again.
+    const int64_t deadline_generation = shield_generation_;
+    int64_t fresh = 0;
+    const DWORD started = GetTickCount();
+    for (;;) {
+      fresh = runtime_->PrivacyShieldGeneration();
+      if (fresh > deadline_generation) break;
+      if (GetTickCount() - started >= privacy_ipc::kFreshFrameTimeoutMs) {
+        // Could not prove freshness. Re-engage rather than leave a
+        // half-released state, and stay silent so the node fails closed.
+        runtime_->EngagePrivacyShield(frame.epoch_id, active_revision_);
+        return true;
+      }
+      Sleep(25);
+    }
+
+    if (!runtime_->CompletePrivacyRelease(frame.epoch_id, active_revision_)) {
+      runtime_->EngagePrivacyShield(frame.epoch_id, active_revision_);
+      return true;
+    }
+    active_ = false;
+    active_epoch_.clear();
+    expected_routes_.clear();
+    last_emitted_routes_.clear();
+    writer_->Emit(PrivacyReleasedEnvelope(frame.epoch_id, true, fresh));
+    return true;
+  }
+
+  PipeWriter* const writer_;
+  WorkerRuntime* const runtime_;
+  std::mutex mutex_;
+  bool active_ = false;
+  std::string active_epoch_;
+  int64_t active_revision_ = 0;
+  int64_t shield_generation_ = 0;
+  int64_t last_emitted_revision_ = -1;
+  int64_t last_emitted_generation_ = -1;
+  std::vector<PrivacyRouteGeneration> last_emitted_routes_;
+  std::vector<PrivacyRouteGeneration> expected_routes_;
+};
+
+struct WorkerArguments {
+  std::wstring pipe;
+  std::string nonce;
+  bool secure_console = false;
+  bool consent_only = false;
+  bool privacy_only = false;
+};
+
+std::optional<WorkerArguments> ParseArguments() {
+  int count = 0;
+  LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+  if (!arguments) return std::nullopt;
+  std::optional<std::wstring> pipe;
+  std::optional<std::string> nonce;
+  bool secure_console = false;
+  bool consent_only = false;
+  bool privacy_only = false;
+  for (int index = 1; index < count;) {
+    const std::wstring key = arguments[index];
+    if (key == L"--secure-console" && !secure_console) {
+      secure_console = true;
+      ++index;
+      continue;
+    }
+    if (key == L"--consent-only" && !consent_only) {
+      consent_only = true;
+      ++index;
+      continue;
+    }
+    if (key == L"--privacy-only" && !privacy_only) {
+      privacy_only = true;
+      ++index;
+      continue;
+    }
+    if (index + 1 >= count) {
+      LocalFree(arguments);
+      return std::nullopt;
+    }
+    if (key == L"--pipe" && !pipe) pipe = arguments[index + 1];
+    else if (key == L"--nonce" && !nonce)
+      nonce = WideToUtf8(arguments[index + 1]);
+    else {
+      LocalFree(arguments);
+      return std::nullopt;
+    }
+    index += 2;
+  }
+  LocalFree(arguments);
+  if (!pipe || !nonce || (consent_only && privacy_only) ||
+      (secure_console && consent_only) || !IsSafePipePath(*pipe) ||
+      !IsSafeCapability(*nonce)) {
+    return std::nullopt;
+  }
+  return WorkerArguments{
+      std::move(*pipe), std::move(*nonce), secure_console, consent_only,
+      privacy_only};
+}
+
+}  // namespace
+}  // namespace imcodes::rd
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  using namespace imcodes::rd;
+  int raw_count = 0;
+  LPWSTR* raw_arguments = CommandLineToArgvW(GetCommandLineW(), &raw_count);
+  const bool release_only = raw_arguments && raw_count == 2 &&
+                            lstrcmpW(raw_arguments[1],
+                                    L"--release-all-input") == 0;
+  const bool virtual_display_controller =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--virtual-display-controller") == 0;
+  const bool activate_virtual_display =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--activate-virtual-display") == 0;
+  const bool set_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--set-unlock-secret") == 0;
+  const bool clear_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--clear-unlock-secret") == 0;
+  const bool report_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--unlock-secret-state") == 0;
+  if (raw_arguments) LocalFree(raw_arguments);
+  if (release_only) {
+    return ReleaseAllSupportedInput() ? 0 : 13;
+  }
+  if (set_unlock_secret) {
+    if (!IsLocalSystemProcess()) return 18;
+    std::wstring secret;
+    const bool read = ReadSecretFromStdin(&secret);
+    const bool stored = read && UnlockSecret::Store(secret);
+    SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+    secret.clear();
+    return stored ? 0 : 21;
+  }
+  if (clear_unlock_secret) {
+    if (!IsLocalSystemProcess()) return 18;
+    return UnlockSecret::Clear() ? 0 : 21;
+  }
+  if (report_unlock_secret) {
+    // Exit code only: the secret itself is never readable, not even by the
+    // service that stored it.
+    return UnlockSecret::Configured() ? 0 : 22;
+  }
+  if (virtual_display_controller) return RunVirtualDisplayController();
+  if (activate_virtual_display) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    return ActivateVirtualDisplayForCurrentUser();
+  }
+  const auto arguments = ParseArguments();
+  if (!arguments) return 2;
+  if (arguments->secure_console && !IsLocalSystemProcess()) return 18;
+  if (!ConfigureResourceJob()) return 12;
+
+  // Authenticate the worker and publish its PID before initializing platform
+  // media. MFStartup and graphics/media providers are third-party OS code and
+  // can block indefinitely on a damaged per-session stack. If that happens
+  // before HELLO, the service cannot identify the launched process and its
+  // PREPARE watchdog can neither observe nor recycle it. Once HELLO is sent,
+  // the already-queued PREPARE arms that watchdog while initialization below
+  // proceeds; a stall is therefore bounded to this authenticated process.
+  PipeChannel pipe_channel;
+  if (!pipe_channel.Connect(arguments->pipe, std::chrono::seconds(10))) {
+    return 6;
+  }
+  PipeWriter writer(&pipe_channel);
+  lstrcpynA(g_crash_nonce, arguments->nonce.c_str(),
+            static_cast<int>(sizeof(g_crash_nonce)));
+  g_crash_pipe.store(&pipe_channel);
+  SetUnhandledExceptionFilter(ReportCrashToDaemon);
+  Json::Value hello(Json::objectValue);
+  hello["type"] = kWorkerHelloType;
+  hello["ipcVersion"] = kIpcVersion;
+  hello["nonce"] = arguments->nonce;
+  hello["pid"] = static_cast<Json::UInt>(GetCurrentProcessId());
+  // The service has to know which desktop this process actually owns: its own
+  // launch decision can already be stale, and the replacement after a desktop
+  // switch belongs on the other one.
+  hello["secureConsole"] = arguments->secure_console;
+  if (!writer.Emit(hello)) {
+    pipe_channel.Close();
+    return 7;
+  }
+
+  if (arguments->consent_only) {
+    const int result = RunConsentOnlyWorker(&pipe_channel, &writer);
+    g_crash_pipe.store(nullptr);
+    pipe_channel.Close();
+    return result;
+  }
+
+  // Native libwebrtc embedders own Winsock lifetime. Without this, ICE can
+  // expose TCP-active placeholders but cannot bind a real UDP host/STUN/TURN
+  // socket, leaving every browser peer permanently in `new`.
+  webrtc::WinsockInitializer winsock;
+  if (winsock.error() != 0) return 14;
+
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+    pipe_channel.Close();
+    return 3;
+  }
+  if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) {
+    pipe_channel.Close();
+    CoUninitialize();
+    return 4;
+  }
+  if (!webrtc::InitializeSSL()) {
+    pipe_channel.Close();
+    MFShutdown();
+    CoUninitialize();
+    return 5;
+  }
+
+  auto network_thread = webrtc::Thread::CreateWithSocketServer();
+  auto worker_thread = webrtc::Thread::Create();
+  auto signaling_thread = webrtc::Thread::Create();
+  network_thread->SetName("imcodes-rd-network", nullptr);
+  worker_thread->SetName("imcodes-rd-worker", nullptr);
+  signaling_thread->SetName("imcodes-rd-signaling", nullptr);
+  if (!network_thread->Start() || !worker_thread->Start() ||
+      !signaling_thread->Start()) {
+    pipe_channel.Close();
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 8;
+  }
+
+  // Probe the encoder once during startup, then construct one media factory
+  // per session.  libwebrtc invokes VideoEncoderFactory::Create from its
+  // worker/encoder thread, outside any signaling-thread scope; a factory
+  // carrying the immutable session id is therefore the only deterministic
+  // session-to-encoder binding under concurrent reconnects.
+  WindowsWebRtcEncoderFactoryAdapter probe_adapter(
+      std::make_unique<MfH264EncoderFactory>("probe"));
+  if (probe_adapter.ProbeReadiness() != common::ReadinessState::kReady) {
+    pipe_channel.Close();
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 20;
+  }
+  LoopbackAudioRouter audio_router;
+  auto session_factory =
+      [network_thread = network_thread.get(), worker_thread = worker_thread.get(),
+       signaling_thread = signaling_thread.get(),
+       &audio_router](std::string_view session_id)
+      -> webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> {
+    const std::string owned_session_id(session_id);
+    webrtc::PeerConnectionFactoryDependencies dependencies;
+    dependencies.network_thread = network_thread;
+    dependencies.worker_thread = worker_thread;
+    dependencies.signaling_thread = signaling_thread;
+    dependencies.env = webrtc::CreateEnvironment();
+    auto audio_buffer = audio_router.RegisterSession(owned_session_id);
+    dependencies.adm =
+        webrtc::make_ref_counted<LoopbackAudioDeviceModule>(std::move(audio_buffer));
+    if (!dependencies.adm) {
+      audio_router.UnregisterSession(owned_session_id);
+      return nullptr;
+    }
+    dependencies.audio_encoder_factory =
+        webrtc::CreateBuiltinAudioEncoderFactory();
+    dependencies.audio_decoder_factory =
+        webrtc::CreateBuiltinAudioDecoderFactory();
+    WindowsWebRtcEncoderFactoryAdapter encoder_adapter(
+        std::make_unique<MfH264EncoderFactory>(owned_session_id));
+    if (encoder_adapter.ProbeReadiness() != common::ReadinessState::kReady) {
+      audio_router.UnregisterSession(owned_session_id);
+      return nullptr;
+    }
+    dependencies.video_encoder_factory = encoder_adapter.TakeFactory();
+    if (!dependencies.video_encoder_factory) {
+      audio_router.UnregisterSession(owned_session_id);
+      return nullptr;
+    }
+    dependencies.video_decoder_factory =
+        webrtc::CreateBuiltinVideoDecoderFactory();
+    webrtc::EnableMedia(dependencies);
+    return webrtc::CreateModularPeerConnectionFactory(
+        std::move(dependencies));
+  };
+
+  LocalIndicator indicator;
+  // `--secure-console` is still accepted and echoed back for older services,
+  // but it no longer selects behaviour: this worker follows whichever desktop
+  // Windows is showing.
+  WorkerRuntime runtime(signaling_thread.get(), std::move(session_factory),
+                        &writer, &indicator, &audio_router);
+  ConsentDispatcher consent(&writer);
+  PrivacyDispatcher privacy(&writer, &runtime);
+  if (!runtime.StartPlatformAdapters()) {
+    runtime.Shutdown();
+    audio_router.Shutdown();
+    pipe_channel.Close();
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 10;
+  }
+
+  g_input_desktop_ready.store(!indicator.BoundDesktop().empty() &&
+                              indicator.BoundDesktop() ==
+                                  CurrentInputDesktopName());
+
+  std::atomic<bool> running{true};
+  std::thread maintenance([&] {
+    while (running.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      if (running.load()) {
+        runtime.Maintenance();
+        privacy.Reconcile();
+      }
+    }
+  });
+
+  bool protocol_ok = true;
+  std::string pending;
+  std::vector<char> buffer(8192);
+  while (protocol_ok) {
+    const size_t read = pipe_channel.Read(buffer.data(), buffer.size());
+    if (read == 0) break;
+    pending.append(buffer.data(), read);
+    if (pending.size() > kMaxIpcLineBytes) {
+      protocol_ok = false;
+      break;
+    }
+    for (;;) {
+      const size_t newline = pending.find('\n');
+      if (newline == std::string::npos) break;
+      std::string line = pending.substr(0, newline);
+      pending.erase(0, newline + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      Json::Value root;
+      if (!ParseJson(line, &root)) {
+        continue;
+      }
+      if (root["type"].asString() == common::kLocalAccessStateType &&
+          root["paused"].isBool()) {
+        indicator.UpdateAccessPaused(root["paused"].asBool());
+        continue;
+      }
+      bool handled = consent.Handle(root) || privacy.Handle(root);
+      if (!handled && runtime.Handle(root)) {
+        handled = true;
+        // PREPARE/STOP/CANCEL can replace the exact route set while an epoch
+        // remains active. The source was shielded before Start(); now publish
+        // the complete post-mutation set for Server-side exact comparison.
+        privacy.Reconcile();
+      }
+      if (!handled) {
+        // Reject this bounded message but keep the authenticated IPC alive;
+        // a stale ICE candidate must not terminate unrelated sessions.
+        continue;
+      }
+    }
+  }
+
+  consent.Shutdown();
+  privacy.Shutdown();
+
+  // A display-driver or DWM reset can leave a DXGI call permanently blocked.
+  // Once the authenticated pipe is gone there is no authority left to serve,
+  // so bound the entire graceful teardown, including the maintenance join,
+  // and let the next verified launch start clean.
+  HANDLE shutdown_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::thread shutdown_watchdog;
+  if (shutdown_complete) {
+    shutdown_watchdog = std::thread([shutdown_complete] {
+      if (WaitForSingleObject(shutdown_complete, kWorkerShutdownGraceMs) ==
+          WAIT_TIMEOUT) {
+        TerminateProcess(GetCurrentProcess(), 15);
+      }
+    });
+  }
+  running = false;
+  maintenance.join();
+  runtime.Shutdown();
+  runtime.StopPlatformAdapters();
+  audio_router.Shutdown();
+  signaling_thread->Stop();
+  worker_thread->Stop();
+  network_thread->Stop();
+  // The filter must not reach a channel that is about to go out of scope.
+  g_crash_pipe.store(nullptr);
+  pipe_channel.Close();
+  webrtc::CleanupSSL();
+  MFShutdown();
+  CoUninitialize();
+  if (shutdown_complete) {
+    SetEvent(shutdown_complete);
+    shutdown_watchdog.join();
+    CloseHandle(shutdown_complete);
+  }
+  return protocol_ok ? 0 : 11;
+}

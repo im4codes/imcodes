@@ -9,6 +9,14 @@ import { ServerList } from '../../src/components/ServerList.js';
 import { StatsBar } from '../../src/components/StatsBar.js';
 import type { TrackerIssue } from '../../src/types.js';
 
+vi.mock('react-i18next', async () => {
+  const { default: en } = await import('../../src/i18n/locales/en.json');
+  return { useTranslation: () => ({ t: (key: string, vars?: Record<string, string>) => {
+    const value = key.split('.').reduce((value: any, part) => value?.[part], en) ?? key;
+    return String(value).replace(/{{(\w+)}}/g, (_, name: string) => vars?.[name] ?? '');
+  } }) };
+});
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -117,5 +125,33 @@ describe('AutoFix dashboard widgets', () => {
 
     expect(onSelectServer).toHaveBeenCalledWith('srv-online', 'Online Box');
     expect(screen.getAllByRole('button', { name: 'Connect' })).toHaveLength(1);
+
+    const onDeleteServer = vi.fn();
+    const offlineServer = {
+      id: 'srv-stale',
+      name: 'Stale Box',
+      status: 'offline',
+      lastHeartbeatAt: Date.now() - 10 * 60_000,
+      createdAt: Date.UTC(2026, 4, 2),
+    };
+    rerender(
+      <ServerList
+        onSelectServer={onSelectServer}
+        onDeleteServer={onDeleteServer}
+        servers={[
+          {
+            id: 'srv-online',
+            name: 'Online Box',
+            status: 'online',
+            lastHeartbeatAt: Date.now() - 1_000,
+            createdAt: Date.UTC(2026, 4, 1),
+          },
+          offlineServer,
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('delete-server-srv-stale'));
+    expect(onDeleteServer).toHaveBeenCalledWith(offlineServer);
   });
 });

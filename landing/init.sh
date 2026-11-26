@@ -152,8 +152,105 @@ fi
 # ── 5. imcodes + agent CLIs ────────────────────────────────────────────────────
 # imcodes is the hard requirement; agents install independently so one missing
 # package (e.g. a momentary mirror lag) can't abort the others or imcodes.
+r2_channel_for_channel() {
+  case "$1" in
+    dev)    printf 'dev' ;;
+    latest) printf 'master' ;;
+    *)      return 1 ;;
+  esac
+}
+
+parse_daemon_r2_manifest() {
+  node -e '
+    const ch = process.argv[1];
+    let raw = "";
+    process.stdin.on("data", (c) => { raw += c; });
+    process.stdin.on("end", () => {
+      try {
+        const m = JSON.parse(raw);
+        if (!m || typeof m !== "object") process.exit(1);
+        if (m.channel !== ch || m.filename !== "imcodes-latest.tgz") process.exit(1);
+        if (typeof m.version !== "string" || !m.version.trim()) process.exit(1);
+        if (typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(m.sha256)) process.exit(1);
+        if (typeof m.sizeBytes !== "number" || !Number.isSafeInteger(m.sizeBytes) || m.sizeBytes <= 0) process.exit(1);
+        process.stdout.write(`${m.version.trim()}\t${m.sha256.toLowerCase()}\t${m.sizeBytes}\n`);
+      } catch {
+        process.exit(1);
+      }
+    });
+  ' "$1"
+}
+
+verify_sha256() {
+  local file="$1" expected="$2" actual=""
+  if have sha256sum; then
+    actual=$(sha256sum "$file" | awk '{print $1}')
+  elif have shasum; then
+    actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  elif have openssl; then
+    actual=$(openssl dgst -sha256 "$file" | awk '{print $NF}')
+  else
+    actual=$(node -e 'const fs=require("fs"),c=require("crypto");const h=c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex");process.stdout.write(h);' "$file" 2>/dev/null || true)
+  fi
+  actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
+try_install_from_r2() {
+  local ch="$1" npm_reg="$2"
+  local r2_opt_out="${IMCODES_USE_R2:-${USE_R2_ARTIFACT:-}}"
+  if [ "$r2_opt_out" = "false" ] || [ "$r2_opt_out" = "0" ]; then
+    return 1
+  fi
+  local r2_channel
+  r2_channel=$(r2_channel_for_channel "$ch") || return 1
+  local r2_base="${IMCODES_R2_BASE_URL:-https://dl.im.codes}"
+  r2_base="${r2_base%/}"
+  case "$r2_base" in
+    https://*) ;;
+    *) return 1 ;;
+  esac
+
+  local manifest_url="$r2_base/$r2_channel/npm/latest.json"
+  local tgz_url="$r2_base/$r2_channel/npm/imcodes-latest.tgz"
+  local manifest_json parsed r2_ver expected_sha expected_size r2_tmp tgz_file actual_size
+
+  manifest_json=$(curl -fsSL -m 15 "$manifest_url" 2>/dev/null) || return 1
+  parsed=$(printf '%s' "$manifest_json" | parse_daemon_r2_manifest "$r2_channel" 2>/dev/null) || return 1
+  IFS=$'\t' read -r r2_ver expected_sha expected_size <<< "$parsed"
+  [ -n "$r2_ver" ] && [ -n "$expected_sha" ] && [ -n "$expected_size" ] || return 1
+
+  r2_tmp="$(mktemp -d "${TMPDIR:-/tmp}/imcodes-r2-XXXXXX")" || return 1
+  tgz_file="$r2_tmp/imcodes-latest.tgz"
+  ok "downloading imcodes@$r2_ver from R2 ($r2_channel)..."
+  if ! curl -fsSL -m 300 -o "$tgz_file" "$tgz_url"; then
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  actual_size=$(wc -c < "$tgz_file" 2>/dev/null | tr -d '[:space:]')
+  if [ "$actual_size" != "$expected_size" ]; then
+    note "R2 size mismatch for imcodes-latest.tgz (expected $expected_size, got ${actual_size:-?}) — falling back to npm"
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  if ! verify_sha256 "$tgz_file" "$expected_sha"; then
+    note "R2 SHA-256 verification failed for imcodes-latest.tgz — falling back to npm"
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  if ! npm install -g "$tgz_file" --no-fund --no-audit --registry "$npm_reg"; then
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  rm -rf "$r2_tmp"
+  return 0
+}
+
 step "Installing imcodes@$CHANNEL ..."
-npm install -g --no-fund --no-audit --registry "$NPM_REGISTRY" "imcodes@$CHANNEL"
+if ! try_install_from_r2 "$CHANNEL" "$NPM_REGISTRY"; then
+  note "R2 install unavailable; falling back to npm ($NPM_REGISTRY)..."
+  npm install -g --no-fund --no-audit --registry "$NPM_REGISTRY" "imcodes@$CHANNEL"
+fi
 ok "imcodes $(imcodes --version 2>/dev/null || echo '?')"
 step "Installing agent CLIs (Claude Code / Codex / Qwen / Gemini)..."
 for pkg in @anthropic-ai/claude-code @openai/codex @qwen-code/qwen-code @google/gemini-cli; do

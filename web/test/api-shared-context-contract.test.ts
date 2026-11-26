@@ -29,6 +29,8 @@ function blobResponse(body = 'file', headers: Record<string, string> = {}): Resp
 
 class MockXmlHttpRequest {
   static instances: MockXmlHttpRequest[] = [];
+  static autoComplete = true;
+  static sendHook: ((xhr: MockXmlHttpRequest) => boolean) | null = null;
 
   method = '';
   url = '';
@@ -51,6 +53,8 @@ class MockXmlHttpRequest {
   onprogress: (() => void) | null = null;
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  aborted = false;
 
   constructor() {
     MockXmlHttpRequest.instances.push(this);
@@ -67,6 +71,8 @@ class MockXmlHttpRequest {
 
   send(body: unknown) {
     this.body = body;
+    if (MockXmlHttpRequest.sendHook?.(this)) return;
+    if (!MockXmlHttpRequest.autoComplete) return;
     this.upload.onprogress?.({ lengthComputable: true, loaded: 6, total: 12 } as ProgressEvent);
     this.upload.onprogress?.({ lengthComputable: true, loaded: 12, total: 12 } as ProgressEvent);
     this.responseText = JSON.stringify({
@@ -91,6 +97,11 @@ class MockXmlHttpRequest {
     }) + '\n';
     this.onload?.();
   }
+
+  abort() {
+    this.aborted = true;
+    this.onabort?.();
+  }
 }
 
 describe('shared-context and file API contracts', () => {
@@ -100,6 +111,8 @@ describe('shared-context and file API contracts', () => {
     vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
     browserOpenMock.mockReset();
     MockXmlHttpRequest.instances = [];
+    MockXmlHttpRequest.autoComplete = true;
+    MockXmlHttpRequest.sendHook = null;
     document.body.innerHTML = '';
     document.cookie = 'rcc_csrf=csrf-token';
   });
@@ -128,6 +141,7 @@ describe('shared-context and file API contracts', () => {
 
       if (path.endsWith('/shared-context/runtime-config') && method === 'GET') return jsonResponse({ snapshot: { enabled: true } });
       if (path.endsWith('/shared-context/runtime-config') && method === 'PUT') return jsonResponse({ snapshot: { enabled: false } });
+      if (path.endsWith('/shared-context/runtime-config') && method === 'PATCH') return jsonResponse({ snapshot: { patched: true } });
       if (path.includes('/workspaces') && method === 'GET') return jsonResponse({ workspaces: [{ id: 'ws-1', enterpriseId: 'ent-1', name: 'Platform' }] });
       if (path.includes('/workspaces') && method === 'POST') return jsonResponse({ id: 'ws-2', enterpriseId: 'ent-1', name: 'Tools' });
       if (path.includes('/projects/enroll-1/policy') && method === 'GET') {
@@ -243,15 +257,321 @@ describe('shared-context and file API contracts', () => {
     expect(nativeUpload.withCredentials).toBe(false);
   });
 
+  it('aborts an in-flight XHR upload through AbortSignal', async () => {
+    MockXmlHttpRequest.autoComplete = false;
+    const { uploadFile } = await import('../src/api.js');
+    const controller = new AbortController();
+    const pending = uploadFile('srv-1', new File(['hello'], 'cancel.txt'), undefined, 'client-upload', controller.signal);
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(MockXmlHttpRequest.instances[0].aborted).toBe(true);
+  });
+
+  it('retries an upload whose XHR never fires load after the daemon already finished it', async () => {
+    // Reproduces a live relay hang: the daemon completes the upload and the
+    // server closes its response, but the browser's XHR never observes
+    // `load` (an intermediate proxy held the connection open). Without a
+    // stall timeout this sat at 100% forever with nothing to retry.
+    vi.useFakeTimers();
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        // Browser finished sending; daemon "completed" server-side, but the
+        // XHR never fires load/error/progress again -- a true hang.
+        xhr.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 5 } as ProgressEvent);
+        return true;
+      }
+      xhr.responseText = JSON.stringify({
+        ok: true,
+        attachment: {
+          id: 'att-stall-recovered', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/stalled.txt',
+          createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+        },
+      });
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+    const pending = uploadFile('srv-1', new File(['hello'], 'stalled.txt'), undefined, 'client-stall-1234');
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    for (let step = 0; step < 10 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'att-stall-recovered' } });
+
+    expect(MockXmlHttpRequest.instances).toHaveLength(2);
+    expect(MockXmlHttpRequest.instances[0]!.aborted).toBe(true);
+  });
+
+  it('retries a failed browser upload chunk at the server-confirmed offset', async () => {
+    vi.useFakeTimers();
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = new File([new Uint8Array(size)], 'large.bin', {
+      type: 'application/octet-stream',
+      lastModified: 1234,
+    });
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          complete: false,
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+        queueMicrotask(() => xhr.onload?.());
+      } else if (call === 2) {
+        queueMicrotask(() => xhr.onerror?.());
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-resumed', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+        queueMicrotask(() => xhr.onload?.());
+      }
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+    const pending = uploadFile('srv-1', file, undefined, 'client-resume-1234');
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    for (let step = 0; step < 20 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'att-resumed' } });
+
+    expect(MockXmlHttpRequest.instances).toHaveLength(3);
+    const offsets = MockXmlHttpRequest.instances.map((xhr) => (
+      (xhr.body as FormData).get('uploadOffset')
+    ));
+    expect(offsets).toEqual([
+      '0',
+      String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES),
+      String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES),
+    ]);
+    expect((MockXmlHttpRequest.instances[1]!.body as FormData).get('clientUploadId')).toBe('client-resume-1234');
+  });
+
+  it('adopts a receiver-owned offset after a lost browser upload response', async () => {
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = new File([new Uint8Array(size)], 'large.bin', { lastModified: 5678 });
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        xhr.status = 409;
+        xhr.responseText = JSON.stringify({
+          error: 'upload_offset_mismatch',
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-reconciled', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+      }
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+
+    await expect(uploadFile('srv-1', file, undefined, 'client-reconcile-1234')).resolves.toMatchObject({
+      attachment: { id: 'att-reconciled' },
+    });
+    expect(MockXmlHttpRequest.instances.map((xhr) => (
+      (xhr.body as FormData).get('uploadOffset')
+    ))).toEqual(['0', String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES)]);
+  });
+
+  it('reports server-committed chunk progress when the WebView emits no upload events', async () => {
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = {
+      name: 'webview-large.bin',
+      type: 'application/octet-stream',
+      size,
+      lastModified: 42,
+      slice: (start: number, end: number) => new Blob([new Uint8Array(Math.max(0, end - start))], {
+        type: 'application/octet-stream',
+      }),
+    } as unknown as File;
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      // Deliberately do not emit xhr.upload.onprogress: this is the mobile
+      // WebView behavior that left a relay row at 0% while chunks committed.
+      if (call === 1) {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          complete: false,
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-webview-large', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/webview-large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+      }
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const progress: number[] = [];
+    const { uploadFile } = await import('../src/api.js');
+
+    await expect(uploadFile('srv-1', file, (pct) => progress.push(pct), 'client-webview-large'))
+      .resolves.toMatchObject({ attachment: { id: 'att-webview-large' } });
+    expect(progress).toContain(50);
+    expect(progress.at(-1)).toBe(100);
+  });
+
+  it('deletes uploaded attachments through the dedicated server route', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const { configure, deleteAttachment } = await import('../src/api.js');
+    configure('https://api.example/');
+
+    await deleteAttachment('srv/one', 'abc123.txt');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.example/api/server/srv%2Fone/uploads/abc123.txt',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+
+  it('carries the covered session through shared upload, delete, download, and image preview requests', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(blobResponse('preview'));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:shared') });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { buildAttachmentDownloadUrl, configure, deleteAttachment, downloadAttachment, previewAttachment, uploadFile } = await import('../src/api.js');
+    configure('https://api.example');
+
+    await uploadFile('srv-1', new File(['shared'], 'shared.txt'), undefined, 'client-upload', undefined, 'deck_project_brain');
+    expect(MockXmlHttpRequest.instances[0].url).toBe(
+      'https://api.example/api/server/srv-1/upload?sessionName=deck_project_brain',
+    );
+    await deleteAttachment('srv-1', 'att-delete', 'deck_project_brain');
+    await downloadAttachment('srv-1', 'att-download', 'deck_project_brain');
+    await previewAttachment('srv-1', 'att-preview', 'deck_project_brain');
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-url', 'deck_project_brain')).resolves.toBe(
+      'https://api.example/api/server/srv-1/uploads/att-url/download?sessionName=deck_project_brain',
+    );
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.example/api/server/srv-1/uploads/att-delete?sessionName=deck_project_brain',
+      'https://api.example/api/server/srv-1/uploads/att-preview/download?sessionName=deck_project_brain',
+    ]);
+  });
+
+  it('previews through the configured API origin and never sends a daemon path', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(blobResponse('image-bytes', { 'Content-Type': 'image/png' }));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:image') });
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { configure, previewAttachment } = await import('../src/api.js');
+    configure('https://215.example/proxy');
+
+    await previewAttachment('srv-1', 'f670d9589bc3d1b2647a7cd4a98efdeb', 'deck_215');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://215.example/proxy/api/server/srv-1/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/download?sessionName=deck_215',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
+  describe('previewAttachment never renders a script-capable file on the app origin', () => {
+    const SCRIPT_SVG = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>';
+    const SCRIPT_HTML = '<!doctype html><script>alert(document.domain)</script>';
+
+    async function preview(contentType: string | undefined, body: string, extra: Record<string, string> = {}) {
+      const objectUrls: Blob[] = [];
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn((blob: Blob) => { objectUrls.push(blob); return `blob:test-${objectUrls.length}`; }) });
+      Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+      const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+      const anchors: Array<{ download: string; href: string }> = [];
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+        anchors.push({ download: this.download, href: this.href });
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(blobResponse(body, { ...(contentType === undefined ? {} : { 'Content-Type': contentType }), ...extra }));
+      const { configure, previewAttachment } = await import('../src/api.js');
+      configure('https://api.example');
+      await previewAttachment('srv-1', 'att-x', 'deck_project_brain');
+      return { objectUrls, opened, anchors };
+    }
+
+    it.each([
+      ['image/svg+xml', SCRIPT_SVG, 'evil.svg'],
+      ['IMAGE/SVG+XML; charset=utf-8', SCRIPT_SVG, 'evil2.svg'],
+      ['text/html', SCRIPT_HTML, 'evil.html'],
+      ['application/xhtml+xml', SCRIPT_HTML, 'evil.xhtml'],
+      ['text/xml', SCRIPT_SVG, 'evil.xml'],
+      ['application/javascript', 'alert(1)', 'evil.js'],
+      ['application/pdf', '%PDF-1.4', 'doc.pdf'],
+      ['image/x-surprise', 'x', 'odd.img'],
+      [undefined, 'x', 'unknown.bin'],
+    ] as const)('%s is saved as a file (octet-stream), never opened', async (contentType, body, name) => {
+      const { objectUrls, opened, anchors } = await preview(contentType, body, { 'Content-Disposition': `attachment; filename="${name}"` });
+      expect(opened).not.toHaveBeenCalled();
+      expect(objectUrls).toHaveLength(1);
+      expect(objectUrls[0]!.type).toBe('application/octet-stream'); // a blob: document of this type cannot be script
+      expect(anchors).toEqual([{ download: name, href: 'blob:test-1' }]);
+    });
+
+    it.each(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp', 'IMAGE/PNG', 'image/png; foo=bar'])('%s is still opened for preview, re-wrapped with exactly its bare type', async (contentType) => {
+      const { objectUrls, opened, anchors } = await preview(contentType, 'bytes');
+      expect(opened).toHaveBeenCalledWith('blob:test-1', '_blank');
+      expect(objectUrls[0]!.type).toBe(contentType.split(';')[0]!.trim().toLowerCase());
+      expect(anchors).toEqual([]);
+    });
+
+    it('a raster label can never carry a document type onto the blob: it is re-typed from the bare type, and a malformed label is saved, not opened', async () => {
+      const valid = await preview('image/png; charset=utf-8', SCRIPT_HTML);
+      expect(valid.objectUrls[0]!.type).toBe('image/png'); // not text/html, whatever the bytes are
+      vi.restoreAllMocks();
+      const malformed = await preview('image/png; charset=text/html', SCRIPT_HTML);
+      expect(malformed.opened).not.toHaveBeenCalled();
+      expect(malformed.objectUrls[0]!.type).toBe('application/octet-stream');
+    });
+
+    it('the native shell hands the authenticated URL to the system browser instead of building a blob in its own WebView', async () => {
+      vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+      const createObjectURL = vi.fn(() => 'blob:never');
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+      vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ token: 'z'.repeat(32) }));
+      const { configure, previewAttachment } = await import('../src/api.js');
+      configure('https://api.example');
+      await previewAttachment('srv-1', 'att-native');
+      expect(browserOpenMock).toHaveBeenCalledWith({ url: `https://api.example/api/server/srv-1/uploads/att-native/download?token=${'z'.repeat(32)}` });
+      expect(createObjectURL).not.toHaveBeenCalled();
+    });
+  });
+
   it('downloads and previews attachments through desktop and native paths', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
     fetchMock
-      .mockResolvedValueOnce(blobResponse('desktop', {
-        'Content-Disposition': "attachment; filename*=UTF-8''report%20final.txt",
-      }))
-      .mockResolvedValueOnce(blobResponse('preview'))
-      .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }));
+      .mockResolvedValueOnce(blobResponse('preview', { 'Content-Type': 'image/png' }))
+      .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ token: 'y'.repeat(32) }));
 
     const objectUrlSpy = vi.fn(() => 'blob:imcodes');
     const revokeSpy = vi.fn();
@@ -266,8 +586,12 @@ describe('shared-context and file API contracts', () => {
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
 
-    const { configure, downloadAttachment, previewAttachment } = await import('../src/api.js');
+    const { buildAttachmentDownloadUrl, configure, downloadAttachment, previewAttachment } = await import('../src/api.js');
     configure('https://api.example');
+
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-media')).resolves.toBe(
+      'https://api.example/api/server/srv-1/uploads/att-media/download',
+    );
 
     await downloadAttachment('srv-1', 'att-1');
     const link = document.querySelector('a');
@@ -279,11 +603,97 @@ describe('shared-context and file API contracts', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(revokeSpy).toHaveBeenCalledWith('blob:imcodes');
 
-    vi.stubGlobal('Capacitor', {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
     await downloadAttachment('srv-1', 'att-3');
     expect(browserOpenMock).toHaveBeenCalledWith({
       url: `https://api.example/api/server/srv-1/uploads/att-3/download?token=${'x'.repeat(32)}`,
     });
-    expect(objectUrlSpy).toHaveBeenCalledTimes(2);
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-media')).resolves.toBe(
+      `https://api.example/api/server/srv-1/uploads/att-media/download?token=${'y'.repeat(32)}`,
+    );
+    expect(objectUrlSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('streams File Browser fallback bytes into its provided writable without creating a Blob', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'Content-Length': '4' },
+    }));
+    let releaseWrite!: () => void;
+    const writeSettled = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const write = vi.fn().mockReturnValue(writeSettled);
+    const onProgress = vi.fn();
+    const objectUrlSpy = vi.fn();
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: objectUrlSpy });
+    const { configure, streamAttachmentDownloadToWritable } = await import('../src/api.js');
+    configure('https://api.example');
+
+    const pending = streamAttachmentDownloadToWritable(
+      'srv-1',
+      'att-stream',
+      { write },
+      'deck_project_brain',
+      undefined,
+      onProgress,
+    );
+
+    await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 0, totalBytes: 4 });
+    releaseWrite();
+    await pending;
+
+    expect((write.mock.calls[0]?.[0] as Uint8Array | undefined)?.byteLength).toBe(4);
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 4, totalBytes: 4 });
+    expect(objectUrlSpy).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.example/api/server/srv-1/uploads/att-stream/download?sessionName=deck_project_brain',
+      expect.any(Object),
+    );
+  });
+
+  it('sends narrow PATCH payloads via patchSharedContextMemorySettings and falls back to PUT only when older servers lack the route', async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { configure, patchSharedContextMemorySettings } = await import('../src/api.js');
+    configure('https://api.example');
+
+    // 1. New server: sends narrow PATCH with only memoryRecallMinScore and no model keys.
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ snapshot: { patched: true } }), { status: 200 }));
+    await expect(
+      patchSharedContextMemorySettings('srv-1', { memoryRecallMinScore: 0.55 }, {
+        modelSelectionMode: 'manual',
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        memoryRecallMinScore: 0.55,
+      }),
+    ).resolves.toMatchObject({ snapshot: { patched: true } });
+    const patchInit = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(patchInit.method).toBe('PATCH');
+    expect(JSON.parse(String(patchInit.body))).toEqual({ memoryRecallMinScore: 0.55 });
+
+    // 2. Older server (unmatched PATCH -> plain 404 or 405): falls back to legacy PUT.
+    const fallbackConfig = {
+      modelSelectionMode: 'auto' as const,
+      primaryContextBackend: 'claude-code-sdk' as const,
+      primaryContextModel: 'MiniMax-M2.7',
+      primaryContextPreset: 'MiniMax',
+      memoryRecallMinScore: 0.55,
+    };
+    fetchMock.mockResolvedValueOnce(new Response('404 Not Found', { status: 404 }));
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ snapshot: { persisted: fallbackConfig } }), { status: 200 }));
+    await expect(
+      patchSharedContextMemorySettings('srv-1', { memoryRecallMinScore: 0.55 }, fallbackConfig),
+    ).resolves.toMatchObject({ snapshot: { persisted: fallbackConfig } });
+    const fallbackPutInit = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(fallbackPutInit.method).toBe('PUT');
+    expect(JSON.parse(String(fallbackPutInit.body))).toMatchObject({ primaryContextPreset: 'MiniMax', memoryRecallMinScore: 0.55 });
+
+    // 3. New server missing server (404 {"error":"not_found"}): rejects without falling back to PUT.
+    const beforeMissing = fetchMock.mock.calls.length;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'not_found' }), { status: 404 }));
+    await expect(
+      patchSharedContextMemorySettings('srv-missing', { memoryRecallMinScore: 0.55 }, fallbackConfig),
+    ).rejects.toThrow();
+    expect(fetchMock.mock.calls.length - beforeMissing).toBe(1);
   });
 });

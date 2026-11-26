@@ -28,9 +28,9 @@ const {
     allowCredentials: opts.allowCredentials ?? [],
   })),
   verifyRegistrationResponseMock: vi.fn(),
-  verifyAuthenticationResponseMock: vi.fn(async ({ authenticator }: Record<string, any>) => ({
+  verifyAuthenticationResponseMock: vi.fn(async ({ credential }: Record<string, any>) => ({
     verified: true,
-    authenticationInfo: { newCounter: Number(authenticator.counter ?? 0) + 1 },
+    authenticationInfo: { newCounter: Number(credential.counter ?? 0) + 1 },
   })),
 }));
 
@@ -103,7 +103,7 @@ function makeMemDb() {
   const challenges = new Map<string, MemChallenge>();
   const apiKeys = new Map<string, MemApiKey>();
   const authNonces = new Map<string, MemAuthNonce>();
-  const refreshTokens = new Map<string, { user_id: string; token_hash: string }>();
+  const refreshTokens = new Map<string, { user_id: string; token_hash: string, owner_status: 'active' }>();
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -118,6 +118,14 @@ function makeMemDb() {
           if (user.username === params[0]) return user as T;
         }
         return null;
+      }
+      if (s.includes('delete from passkey_challenges where id = $1 and expires_at > $2') && s.includes('returning')) {
+        const id = String(params[0]);
+        const row = challenges.get(id);
+        if (!row || row.expires_at <= Number(params[1])) return null;
+        if (s.includes('id not like $3') && id.startsWith(String(params[2]).replace(/%$/, ''))) return null;
+        challenges.delete(id);
+        return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
       }
       if (s.includes('from passkey_challenges where id')) {
         const row = challenges.get(String(params[0]));
@@ -222,7 +230,7 @@ function makeMemDb() {
         });
       }
       if (s.includes('insert into refresh_tokens')) {
-        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]) });
+        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]), owner_status: 'active' });
       }
       if (s.includes('insert into auth_nonces')) {
         authNonces.set(String(params[0]), {
@@ -332,9 +340,11 @@ describe('iOS native login backward compatibility', () => {
     verifyRegistrationResponseMock.mockResolvedValue({
       verified: true,
       registrationInfo: {
-        credentialID: 'new-cred-ios',
-        credentialPublicKey: Uint8Array.from(Buffer.from('new-public-key')),
-        counter: 0,
+        credential: {
+          id: 'new-cred-ios',
+          publicKey: Uint8Array.from(Buffer.from('new-public-key')),
+          counter: 0,
+        },
       },
     });
     mem = makeMemDb();

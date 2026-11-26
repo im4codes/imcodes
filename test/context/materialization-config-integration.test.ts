@@ -71,24 +71,25 @@ describe('MaterializationCoordinator config integration', () => {
 
   it('stores primaryContextPreset and backupContextPreset in model config', async () => {
     setContextModelRuntimeConfig({
-      primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen3-coder-plus',
-      primaryContextPreset: 'Qwen Team',
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen3-coder-plus',
-      backupContextPreset: 'Qwen Backup',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+      primaryContextPreset: 'Claude Team',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'MiniMax-M2.7',
+      backupContextPreset: 'Codex Backup',
     });
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor });
-    expect(coordinator.modelConfig.primaryContextPreset).toBe('Qwen Team');
-    expect(coordinator.modelConfig.backupContextPreset).toBe('Qwen Backup');
+    expect(coordinator.modelConfig.primaryContextPreset).toBe('Claude Team');
+    expect(coordinator.modelConfig.backupContextPreset).toBe('Codex Backup');
   });
 
   it('records model+backend in materialized projection content', async () => {
     setContextModelRuntimeConfig({
-      primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen3-coder-plus',
-      backupContextBackend: 'codex-sdk',
-      backupContextModel: 'gpt-4.1-mini',
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'agy-sdk',
+      primaryContextModel: 'gemini-3.8-flash-low',
+      backupContextBackend: 'opencode-sdk',
+      backupContextModel: 'opencode/big-pickle',
     });
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
@@ -99,9 +100,9 @@ describe('MaterializationCoordinator config integration', () => {
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     expect(result.summaryProjection.content).toMatchObject({
-      primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen3-coder-plus',
-      backupContextBackend: 'codex-sdk',
+      primaryContextBackend: 'agy-sdk',
+      primaryContextModel: 'gemini-3.8-flash-low',
+      backupContextBackend: 'opencode-sdk',
     });
     // backupContextModel is normalized by the config resolver — just verify it's present
     expect(typeof result.summaryProjection.content.backupContextModel).toBe('string');

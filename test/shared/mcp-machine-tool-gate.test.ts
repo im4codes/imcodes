@@ -1,0 +1,127 @@
+import { describe, it, expect } from 'vitest';
+import {
+  MEMORY_MCP_TOOL_NAMES,
+  MEMORY_MCP_TOOL_NAME_LIST,
+  MEMORY_MCP_TOOL_CONTRACTS,
+  FULL_ONLY_MCP_TOOLS,
+  isToolAvailableForRole,
+  advertisedMcpToolNames,
+} from '../../shared/memory-mcp-contracts.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import {
+  NODE_ROLE,
+  REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+} from '../../shared/remote-exec.js';
+import {
+  MACHINE_TARGET_MAX,
+  MACHINE_TARGET_PATTERN,
+} from '../../shared/machine-reference.js';
+import {
+  CONTROLLED_NODE_ID_LENGTH,
+  CONTROLLED_NODE_ID_PATTERN_SOURCE,
+} from '../../shared/controlled-node-identity.js';
+
+describe('machine MCP tools join the contract surface (10.12)', () => {
+  it('both tools are in the name list and have contracts', () => {
+    expect(MEMORY_MCP_TOOL_NAME_LIST).toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+    expect(MEMORY_MCP_TOOL_NAME_LIST).toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+    expect(MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MACHINES].name).toBe('list_machines');
+    expect(MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE].name).toBe('exec_remote');
+  });
+
+  it('exec_remote schema derives its limits from the named shared/remote-exec constants (no duplicate literals)', () => {
+    const c = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE];
+    const shell = c.inputSchema.properties?.shell;
+    const timeout = c.inputSchema.properties?.timeoutMs;
+    expect(REMOTE_EXEC_DEFAULT_TIMEOUT_MS).toBe(900_000);
+    expect(REMOTE_EXEC_MAX_TIMEOUT_MS).toBe(3_600_000);
+    expect(shell?.enum).toEqual([...REMOTE_EXEC_SHELLS]);
+    expect(timeout?.maximum).toBe(REMOTE_EXEC_MAX_TIMEOUT_MS);
+    expect(timeout?.description).toContain('defaults to 900000');
+    expect(timeout?.description).toContain('3600000');
+  });
+
+  it('treats list_machines as discovery only and publishes canonical nodeId output with bounded direct inputs', () => {
+    const list = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MACHINES];
+    expect(list.description).toContain('do not call it as a preflight');
+    expect(list.description).toContain('advisory availability');
+
+    for (const name of [
+      MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    ] as const) {
+      const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
+      const machine = contract.inputSchema.properties?.machine;
+      expect(contract.description).toMatch(/without (calling )?list_machines|do not call list_machines/i);
+      expect(machine).toMatchObject({ minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source });
+      expect(machine?.description).toMatch(/canonical nodeId/i);
+      expect(machine?.description).toMatch(/complete \^\^\(nodeId\) marker/i);
+      expect(machine?.description).toMatch(/legacy ref_name/i);
+      expect(contract.description).toMatch(/canonical 10-digit nodeId/i);
+      expect(contract.description).toMatch(/deprecated noncanonical legacy ref_name/i);
+    }
+
+    const listMachine = list.outputSchema.properties?.machines?.items?.properties?.name;
+    expect(listMachine).toMatchObject({
+      minLength: CONTROLLED_NODE_ID_LENGTH,
+      maxLength: CONTROLLED_NODE_ID_LENGTH,
+      pattern: CONTROLLED_NODE_ID_PATTERN_SOURCE,
+    });
+  });
+
+  it('the shared error enum carries the machine reasons', () => {
+    expect(MCP_ERROR_REASONS.MACHINE_NOT_FOUND).toBe('machine_not_found');
+    expect(MCP_ERROR_REASONS.MACHINE_AMBIGUOUS).toBe('machine_ambiguous');
+    expect(MCP_ERROR_REASONS.EXEC_OFFLINE).toBe('exec_offline');
+    expect(MCP_ERROR_REASONS.EXEC_DISABLED).toBe('exec_disabled');
+  });
+});
+
+describe('FULL-only role gate (10.12)', () => {
+  it('both machine tools are marked FULL-only', () => {
+    expect(FULL_ONLY_MCP_TOOLS.has(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES)).toBe(true);
+    expect(FULL_ONLY_MCP_TOOLS.has(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE)).toBe(true);
+  });
+
+  it('a controlled node cannot access the machine tools but can access ordinary tools', () => {
+    expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, NODE_ROLE.CONTROLLED)).toBe(false);
+    expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, NODE_ROLE.CONTROLLED)).toBe(false);
+    expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY, NODE_ROLE.CONTROLLED)).toBe(true);
+  });
+
+  it('a FULL node can access the machine tools', () => {
+    expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, NODE_ROLE.FULL)).toBe(true);
+    expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, NODE_ROLE.FULL)).toBe(true);
+  });
+
+  it("a controlled node's advertised tool list excludes all FULL-only machine and cloud-doc tools", () => {
+    const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);
+    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
+    // and still advertises the rest
+    expect(controlled).toContain(MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY);
+  });
+
+  it('includes cloud_docs in FULL_ONLY_MCP_TOOLS and advertises it only on FULL nodes', () => {
+    const cloudDocTools = [
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    ] as const;
+    const full = advertisedMcpToolNames(NODE_ROLE.FULL);
+    const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);
+    for (const tool of cloudDocTools) {
+      expect(FULL_ONLY_MCP_TOOLS).toContain(tool);
+      expect(full).toContain(tool);
+      expect(controlled).not.toContain(tool);
+    }
+  });
+
+  it('a FULL node advertises the complete list including both machine tools', () => {
+    const full = advertisedMcpToolNames(NODE_ROLE.FULL);
+    expect(full).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+  });
+});

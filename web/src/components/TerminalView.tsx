@@ -1,10 +1,18 @@
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
+import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
+import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { useGlobalFontDelta } from '../global-font.js';
+import { useUiScale } from '../ui-scale.js';
+import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
+import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
 interface Props {
   sessionName: string;
@@ -12,9 +20,12 @@ interface Props {
   connected?: boolean;
   /** When false, keep the terminal mounted but pause expensive live work. */
   active?: boolean;
+  /** When false, do not auto-focus the terminal on desktop mount (for previews/pinned/background views). */
+  autoFocus?: boolean;
   /** Optimize for embedded preview cards: coalesce raw writes and reduce idle work. */
   preview?: boolean;
-  onDiff?: (applyDiff: (diff: TerminalDiff) => void) => void;
+  /** Registers this view's frame handler; the returned function unregisters it. */
+  onDiff?: TerminalDiffRegistration;
   onHistory?: (applyHistory: (content: string) => void) => void;
   /** Receives a function that focuses the xterm terminal — call it to restore keyboard to xterm. */
   onFocusFn?: (fn: () => void) => void;
@@ -24,11 +35,29 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, allow keyboard input on mobile (for shell/ssh sessions). */
   mobileInput?: boolean;
+  /** Action shown when daemon recovery is exhausted instead of leaving a black pane. */
+  onRestart?: () => void;
 }
 
 const PREVIEW_RAW_FLUSH_MS = 32;
 const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
+const RAW_FLUSH_MS = 16;
+const RAW_MAX_BYTES = 64 * 1024;
 const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
+/**
+ * While a resync is pending the view discards every byte (a partial ANSI stream
+ * cannot be truncated), so it is only as live as the snapshot it is waiting for.
+ * That snapshot can be lost: the request raced a closing socket, the daemon was
+ * mid-capture, the server dropped the frame for a slow socket. The first retry
+ * comes quickly; later ones back off so a daemon that is genuinely gone is not
+ * hammered. There is no give-up: a view stuck on an old picture is the failure.
+ */
+const RESYNC_RETRY_FIRST_MS = 1_500;
+const RESYNC_RETRY_MAX_MS = 10_000;
+/** Returning to a tab that was hidden at least this long verifies the screen against the pane. */
+const VISIBILITY_RESYNC_MIN_HIDDEN_MS = 3_000;
+
+export { resolveDiffRows, isRenderableLineIndex };
 
 function requestFrame(callback: FrameRequestCallback): number | ReturnType<typeof setTimeout> {
   const raf = globalThis.requestAnimationFrame;
@@ -47,7 +76,27 @@ function concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
   return combined;
 }
 
-export function TerminalView({ sessionName, ws, connected, active = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
+/** Join only soft-wrapped xterm rows; preserve explicit newlines. */
+export function joinWrappedTerminalSelection(selection: string, continuationRows: readonly boolean[]): string {
+  const lines = selection.split('\n');
+  if (lines.length <= 1) return selection;
+  let joined = lines[0] ?? '';
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    // xterm pads a soft-wrapped row to the terminal width. Those padding
+    // spaces are visual only and must not enter copied URLs or other tokens.
+    if (continuationRows[i - 1]) {
+      joined = joined.replace(/\s+$/u, '');
+      joined += line;
+    } else {
+      joined += `\n${line}`;
+    }
+  }
+  return joined;
+}
+
+export function TerminalView({ sessionName, ws, connected, active = true, autoFocus = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, onRestart }: Props) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -56,12 +105,31 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   wsRef.current = ws;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const autoFocusRef = useRef(autoFocus);
+  autoFocusRef.current = autoFocus;
   const previewRef = useRef(preview);
   previewRef.current = preview;
   const pendingRawChunksRef = useRef<Uint8Array[]>([]);
   const pendingRawBytesRef = useRef(0);
+  // xterm's parser is asynchronous. Serialise *all* writes (raw PTY bytes and
+  // diff frames) so a timer flush cannot enter term.write while the previous
+  // frame is still being parsed. A bounded queue is essential here: when the
+  // parser/render loop is slower than a busy PTY, an unbounded queue displays
+  // old bytes seconds after the live screen has changed. We recover by asking
+  // the daemon for a fresh full-frame snapshot instead of dropping an
+  // arbitrary middle of an ANSI stream.
+  type TerminalWrite = { data: Uint8Array | string; bytes: number; fullFrame?: boolean; raw?: boolean };
+  const terminalWriteQueueRef = useRef<TerminalWrite[]>([]);
+  const terminalWriteQueuedBytesRef = useRef(0);
+  const terminalWriteInFlightRef = useRef(false);
+  const rawResyncPendingRef = useRef(false);
+  const resyncWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resyncAttemptRef = useRef(0);
   const rawFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRawWriteAtRef = useRef(0);
+  const rawSubscriptionGenerationRef = useRef(0);
+  const diffSubscriptionGenerationRef = useRef(0);
+  const controlSubscriptionGenerationRef = useRef(0);
 
   // Touch scroll tracking: suppress auto-scroll for 1s after user releases touch
   const lastTouchEndRef = useRef<number>(0);
@@ -71,23 +139,66 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // Only changed by real user scroll actions (onScroll), NOT by onLineFeed/writes.
   // This prevents intermediate xterm write states from corrupting the follow flag.
   const autoFollowRef = useRef(true);
-  // Count of in-progress term.write() calls. While > 0, onScroll must NOT update
-  // autoFollowRef — xterm fires onScroll internally during write (cursor-follow),
-  // which would corrupt the user's sticky intent.
-  const writingCountRef = useRef(0);
-  // True while a fit/resize is in progress — suppress scroll-up intent detection
-  // because fitAddon.fit() causes xterm buffer reflow which can fire onScroll
-  // with viewportY=0 even though the user never scrolled up.
-  const fittingRef = useRef(false);
+  // NOTE: two write-only refs used to live here. Nothing ever READ them, so
+  // they suppressed nothing while their comments claimed otherwise — which
+  // repeatedly misled freeze investigations. They are removed rather than
+  // "restored": rebuilding a scroll-intent guard from a stale comment risks
+  // swallowing real user scrolls, and that belongs in its own change with its
+  // own acceptance criteria.
 
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const [isMobile, setIsMobile] = useState(() => isMobileDevice());
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+
+  // Coalesced scroll-to-bottom for the diff data path. Repeat requests replace
+  // the pending frame instead of appending a new one, and the frame is
+  // cancelled on unmount. See useCoalescedFrame for the lock-screen rationale.
+  const scheduleFrame = useCoalescedFrame();
+  const scheduleScrollToBottom = useCallback(() => {
+    scheduleFrame(() => {
+      const term = termRef.current;
+      if (!term) return;
+      term.scrollToBottom();
+    });
+  }, [scheduleFrame]);
 
   // Scroll state: show button + progress bar when scrolled up
   const [scrolledUp, setScrolledUp] = useState(false);
   const [scrollProgress, setScrollProgress] = useState(1); // 0..1, 1 = bottom
   const scrollHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollbar, setShowScrollbar] = useState(false);
-  const useIosMacTextScale = shouldUseIosMacTextScale();
+  const [recoveryError, setRecoveryError] = useState(false);
+  const [useIosMacTextScale, setUseIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+  const [globalFontDelta] = useGlobalFontDelta();
+  const [uiScale] = useUiScale();
+  const globalFontDeltaRef = useRef(globalFontDelta);
+  globalFontDeltaRef.current = globalFontDelta;
+
+  useEffect(() => {
+    let rafId = 0;
+    const syncPlatform = () => {
+      const nextMobile = isMobileDevice();
+      const nextScale = shouldUseIosMacTextScale();
+      setIsMobile((prev) => (prev === nextMobile ? prev : nextMobile));
+      setUseIosMacTextScale((prev) => (prev === nextScale ? prev : nextScale));
+      const term = termRef.current;
+      if (term) {
+        const baseFontSize = nextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13;
+        term.options.fontSize = Math.max(8, baseFontSize + globalFontDeltaRef.current);
+        term.options.lineHeight = nextScale ? 1.45 : 1.4;
+        term.options.disableStdin = nextMobile && !mobileInput;
+        fitRef.current?.fit();
+        cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(() => fitRef.current?.fit());
+      }
+    };
+    syncPlatform();
+    const unsubscribe = subscribeDeviceLayoutChange(syncPlatform, { includeResize: false });
+    return () => {
+      cancelAnimationFrame(rafId);
+      unsubscribe();
+    };
+  }, [mobileInput, globalFontDelta, uiScale]);
 
   const clearRawFlushTimer = useCallback(() => {
     if (rawFlushTimerRef.current) {
@@ -96,25 +207,103 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     }
   }, []);
 
+  const clearResyncWatchdog = useCallback(() => {
+    if (resyncWatchdogRef.current) {
+      clearTimeout(resyncWatchdogRef.current);
+      resyncWatchdogRef.current = null;
+    }
+    resyncAttemptRef.current = 0;
+  }, []);
+
+  /**
+   * Stop trusting the incoming stream until a full frame arrives, and keep
+   * asking for one until it does. `requestNow` is false when the request was
+   * already sent by the caller (or by the reset handler in the socket client).
+   */
+  const beginResync = useCallback((requestNow: boolean) => {
+    rawResyncPendingRef.current = true;
+    if (requestNow) {
+      try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the watchdog asks again */ }
+    }
+    if (resyncWatchdogRef.current) return;
+    const arm = (): void => {
+      const delay = Math.min(RESYNC_RETRY_FIRST_MS * 2 ** resyncAttemptRef.current, RESYNC_RETRY_MAX_MS);
+      resyncWatchdogRef.current = setTimeout(() => {
+        resyncWatchdogRef.current = null;
+        if (!rawResyncPendingRef.current || !activeRef.current) return;
+        resyncAttemptRef.current += 1;
+        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* try again next round */ }
+        arm();
+      }, delay);
+    };
+    arm();
+  }, [sessionName]);
+
   const discardPendingRaw = useCallback(() => {
     clearRawFlushTimer();
     pendingRawChunksRef.current = [];
     pendingRawBytesRef.current = 0;
-  }, [clearRawFlushTimer]);
+    terminalWriteQueueRef.current = [];
+    terminalWriteQueuedBytesRef.current = 0;
+    rawResyncPendingRef.current = false;
+    clearResyncWatchdog();
+  }, [clearRawFlushTimer, clearResyncWatchdog]);
 
-  const writeRawToTerminal = useCallback((data: Uint8Array) => {
+  const drainTerminalWriteQueue = useCallback(() => {
+    if (terminalWriteInFlightRef.current) return;
     const term = termRef.current;
-    if (!term) return;
-    lastRawWriteAtRef.current = Date.now();
-    writingCountRef.current++;
-    term.write(data, () => {
-      writingCountRef.current--;
+    const item = terminalWriteQueueRef.current.shift();
+    if (!term || !item) return;
+    terminalWriteQueuedBytesRef.current = Math.max(0, terminalWriteQueuedBytesRef.current - item.bytes);
+    terminalWriteInFlightRef.current = true;
+    if (item.raw) lastRawWriteAtRef.current = Date.now();
+    term.write(item.data, () => {
       // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
       // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
       // ensures the viewport stays at the bottom showing the latest output.
       term.scrollToBottom();
+      terminalWriteInFlightRef.current = false;
+      drainTerminalWriteQueue();
     });
   }, []);
+
+  const writeTerminal = useCallback((data: Uint8Array | string, fullFrame = false, raw = false) => {
+    if (!activeRef.current || !termRef.current) return;
+    if (!fullFrame && rawResyncPendingRef.current) return;
+    const bytes = typeof data === 'string' ? data.length : data.byteLength;
+    const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
+    // Backlog = what is queued behind the parser plus the write it is chewing
+    // on. An idle writer has no backlog, so one large chunk (a big `cat`, a
+    // screen redraw) is accepted instead of being mistaken for congestion and
+    // answered by throwing the bytes away and resyncing.
+    const hasBacklog = terminalWriteQueuedBytesRef.current > 0 || terminalWriteInFlightRef.current;
+    if (!fullFrame && hasBacklog && terminalWriteQueuedBytesRef.current + bytes > maxBytes) {
+      // A partial ANSI stream cannot be safely truncated. Drop only the
+      // queued (not in-flight) bytes and resynchronise from a full snapshot.
+      terminalWriteQueueRef.current = [];
+      terminalWriteQueuedBytesRef.current = 0;
+      if (!rawResyncPendingRef.current) beginResync(true);
+      return;
+    }
+    if (fullFrame) {
+      // A full frame supersedes every queued partial/raw frame. It is the
+      // authoritative recovery point after an overflow or stream reset.
+      clearRawFlushTimer();
+      pendingRawChunksRef.current = [];
+      pendingRawBytesRef.current = 0;
+      terminalWriteQueueRef.current = [];
+      terminalWriteQueuedBytesRef.current = 0;
+      rawResyncPendingRef.current = false;
+      clearResyncWatchdog();
+      // The authoritative frame replaces the bytes that triggered recovery;
+      // preview diff suppression must not hide the first live partial frame
+      // after this point.
+      lastRawWriteAtRef.current = 0;
+    }
+    terminalWriteQueueRef.current.push({ data, bytes, fullFrame, raw });
+    terminalWriteQueuedBytesRef.current += bytes;
+    drainTerminalWriteQueue();
+  }, [beginResync, clearRawFlushTimer, clearResyncWatchdog, drainTerminalWriteQueue]);
 
   const flushPendingRaw = useCallback(() => {
     clearRawFlushTimer();
@@ -123,24 +312,22 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (chunks.length === 0 || totalBytes === 0) return;
     pendingRawChunksRef.current = [];
     pendingRawBytesRef.current = 0;
-    writeRawToTerminal(concatChunks(chunks, totalBytes));
-  }, [clearRawFlushTimer, writeRawToTerminal]);
+    writeTerminal(concatChunks(chunks, totalBytes), false, true);
+  }, [clearRawFlushTimer, writeTerminal]);
 
   const enqueueRawWrite = useCallback((data: Uint8Array) => {
-    if (!previewRef.current) {
-      writeRawToTerminal(data);
-      return;
-    }
+    if (!activeRef.current || rawResyncPendingRef.current) return;
     pendingRawChunksRef.current.push(data);
     pendingRawBytesRef.current += data.byteLength;
-    if (pendingRawBytesRef.current >= PREVIEW_RAW_MAX_BYTES) {
+    const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
+    if (pendingRawBytesRef.current >= maxBytes) {
       flushPendingRaw();
       return;
     }
     if (!rawFlushTimerRef.current) {
-      rawFlushTimerRef.current = setTimeout(flushPendingRaw, PREVIEW_RAW_FLUSH_MS);
+      rawFlushTimerRef.current = setTimeout(flushPendingRaw, previewRef.current ? PREVIEW_RAW_FLUSH_MS : RAW_FLUSH_MS);
     }
-  }, [flushPendingRaw, writeRawToTerminal]);
+  }, [flushPendingRaw]);
 
   useEffect(() => {
     const term = new Terminal({
@@ -151,7 +338,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         selectionBackground: '#1d4ed860',
       },
       fontFamily: "'Cascadia Code', 'Fira Code', 'SF Mono', monospace",
-      fontSize: useIosMacTextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13,
+      fontSize: Math.max(8, (useIosMacTextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13) + globalFontDeltaRef.current),
       lineHeight: useIosMacTextScale ? 1.45 : 1.4,
       convertEol: true,
       scrollback: preview ? 2000 : 5000,
@@ -159,13 +346,37 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       cursorBlink: !preview,
       // On mobile: disable xterm stdin unless mobileInput is set (shell sessions
       // need keyboard for interactive SSH-like input).
-      disableStdin: isMobile && !mobileInput,
+      disableStdin: isMobileRef.current && !mobileInput,
     });
+
+    // The isolated real-browser shell harness uses the xterm API to select and
+    // checksum wrapped output deterministically. This hook is opt-in and only
+    // exposed when the harness sets the test flag before app startup.
+    const testWindow = globalThis as typeof globalThis & {
+      __IMC_SHELL_BROWSER_TEST__?: boolean;
+      __imcShellTerminal?: Terminal;
+      __imcShellTerminals?: Record<string, Terminal>;
+      __imcShellLastCopied?: string;
+    };
+    if (testWindow.__IMC_SHELL_BROWSER_TEST__) {
+      testWindow.__imcShellTerminals ??= {};
+      testWindow.__imcShellTerminals[sessionName] = term;
+      if (!testWindow.__imcShellTerminal) testWindow.__imcShellTerminal = term;
+    }
 
     // Copy selected text to clipboard on Ctrl+C / Cmd+C when selection exists
     term.attachCustomKeyEventHandler((ev) => {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'c' && term.hasSelection()) {
-        void navigator.clipboard.writeText(term.getSelection());
+        const position = term.getSelectionPosition();
+        const continuationRows: boolean[] = [];
+        if (position) {
+          for (let row = position.start.y + 1; row <= position.end.y; row++) {
+            continuationRows.push(term.buffer.active.getLine(row)?.isWrapped ?? false);
+          }
+        }
+        const copiedText = joinWrappedTerminalSelection(term.getSelection(), continuationRows);
+        if (testWindow.__IMC_SHELL_BROWSER_TEST__) testWindow.__imcShellLastCopied = copiedText;
+        void navigator.clipboard.writeText(copiedText);
         return false; // prevent sending ^C to tmux when we're copying
       }
       return true;
@@ -184,9 +395,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (!activeRef.current) return;
         const el = containerRef.current;
         if (el && el.clientWidth > 0 && el.clientHeight > 0) {
-          fittingRef.current = true;
           fitAddon.fit();
-          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       };
@@ -198,15 +407,27 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       fitTimer = setTimeout(() => {
         if (!activeRef.current) return;
         if (!fitDone) {
-          fittingRef.current = true;
           fitAddon.fit();
-          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       }, 400);
-      // Auto-focus terminal on mount for desktop keyboard input
-      if (!isMobile) {
-        requestFrame(() => term.focus());
+      // Auto-focus terminal on mount for desktop keyboard input only when explicitly active, non-preview, autoFocus enabled, and container is visible
+      if (!isMobileRef.current && !previewRef.current && activeRef.current && autoFocusRef.current !== false) {
+        requestFrame(() => {
+          const el = containerRef.current;
+          if (
+            !isMobileRef.current
+            && !previewRef.current
+            && activeRef.current
+            && autoFocusRef.current !== false
+            && el
+            && el.isConnected
+            && el.clientWidth > 0
+            && el.clientHeight > 0
+          ) {
+            term.focus();
+          }
+        });
       }
     }
 
@@ -277,44 +498,153 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     onScrollBottomFn?.(() => { autoFollowRef.current = true; term.scrollToBottom(); });
 
     // Expose fit function so parent can trigger resize on send / focus
-    const doFitAndSnap = () => {
-      if (!activeRef.current) return;
-      fittingRef.current = true;
+    // Applies a fit only when xterm's own proposed dimensions actually change.
+    // Comparing the container rect is not enough: font loading, zoom and DPR
+    // changes move the cell metrics while the rect stays identical, and the two
+    // observed elements report different rects for the same layout.
+    // `force` bypasses the equality check for resume/refocus, where one explicit
+    // fit is wanted even if the dimensions look unchanged.
+    const applyFit = (force = false): boolean => {
+      if (!activeRef.current) return false;
+      const el = containerRef.current;
+      // display:none ancestors report 0x0; fitting against that yields garbage
+      // dimensions, so skip entirely until the element is laid out again.
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return false;
+      if (!force) {
+        const proposed = fitAddon.proposeDimensions?.();
+        if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return false;
+        if (proposed.cols === term.cols && proposed.rows === term.rows) return false;
+      }
       fitAddon.fit();
-      // Use rAF so the reflow onScroll events fire before we clear fittingRef
-      requestFrame(() => {
-        fittingRef.current = false;
-        term.scrollToBottom();
-        autoFollowRef.current = true;
+      return true;
+    };
+
+    // At most one pending fit frame. A ResizeObserver can fire many times per
+    // frame (two observed targets, layout settling after unlock) and focus can
+    // fire repeatedly on unlock; queueing one callback per event is what turns a
+    // resume into a burst of forced layouts.
+    let pendingFitFrame: ReturnType<typeof requestFrame> | null = null;
+    let pendingFitForce = false;
+    const cancelPendingFit = () => {
+      if (pendingFitFrame === null) return;
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(pendingFitFrame as number);
+      else clearTimeout(pendingFitFrame as ReturnType<typeof setTimeout>);
+      pendingFitFrame = null;
+    };
+    const scheduleFit = (force = false) => {
+      pendingFitForce = pendingFitForce || force;
+      if (pendingFitFrame !== null) return;
+      pendingFitFrame = requestFrame(() => {
+        pendingFitFrame = null;
+        const forceThisPass = pendingFitForce;
+        pendingFitForce = false;
+        if (applyFit(forceThisPass)) {
+          // Snap to bottom after fit (reflow can reset viewportY to 0)
+          term.scrollToBottom();
+          autoFollowRef.current = true;
+        }
       });
     };
+
+    const doFitAndSnap = () => { scheduleFit(true); };
     onFitFn?.(doFitAndSnap);
 
-    // Re-fit when window regains focus or tab becomes visible.
-    const onWindowFocus = () => { doFitAndSnap(); };
-    const onVisibilityChange = () => {
-      if (activeRef.current && document.visibilityState === 'visible') { doFitAndSnap(); }
+    // Track window blur and tab visibility deactivation separately, because
+    // macOS Space / app switches can deliver blur->focus without hiding or
+    // interleave hidden/blur and focus/visible in either order.
+    let hiddenAt: number | null = document.visibilityState === 'hidden' ? Date.now() : null;
+    let blurredAt: number | null = null;
+    let forcedResumeThisCycle = false;
+
+    const onWindowBlur = () => {
+      if (blurredAt === null) blurredAt = Date.now();
+      forcedResumeThisCycle = false;
     };
+
+    const onWindowFocus = () => {
+      if (!activeRef.current) {
+        blurredAt = null;
+        return;
+      }
+      // If the document is still hidden, wait for visibilityState === 'visible'
+      // so we don't fit/scroll prematurely or clear hiddenAt before snapshot resync runs.
+      if (document.visibilityState === 'hidden') return;
+
+      const now = Date.now();
+      const blurredFor = blurredAt === null ? null : Math.max(0, now - blurredAt);
+      const hiddenFor = hiddenAt === null ? null : Math.max(0, now - hiddenAt);
+      blurredAt = null;
+
+      const inactiveFor = blurredFor === null && hiddenFor === null
+        ? null
+        : Math.max(blurredFor ?? 0, hiddenFor ?? 0);
+
+      if (inactiveFor !== null && inactiveFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+        if (!forcedResumeThisCycle) {
+          forcedResumeThisCycle = hiddenAt !== null;
+          doFitAndSnap();
+        }
+        return;
+      }
+
+      // Short deactivation (< 3000ms) or repeat focus: avoid forced reflow/scroll;
+      // scheduleFit(false) only fits when container dimensions or cols/rows changed.
+      scheduleFit(false);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (hiddenAt === null) hiddenAt = Date.now();
+        forcedResumeThisCycle = false;
+        return;
+      }
+      if (document.visibilityState !== 'visible') return;
+
+      const now = Date.now();
+      const hiddenFor = hiddenAt === null ? null : Math.max(0, now - hiddenAt);
+      const blurredFor = blurredAt === null ? null : Math.max(0, now - blurredAt);
+      hiddenAt = null;
+      blurredAt = null;
+      const alreadyForced = forcedResumeThisCycle;
+      forcedResumeThisCycle = false;
+
+      if (!activeRef.current) return;
+
+      const inactiveFor = hiddenFor === null && blurredFor === null
+        ? null
+        : Math.max(hiddenFor ?? 0, blurredFor ?? 0);
+
+      if (inactiveFor !== null && inactiveFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+        if (!alreadyForced) doFitAndSnap();
+        // A hidden tab is throttled hard (timers, rendering, sometimes the socket
+        // itself). Whatever it missed or dropped there, the screen it comes back
+        // to must be verified against the pane rather than trusted. Governed by
+        // the socket client's per-session request spacing.
+        if (hiddenFor !== null && hiddenFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+          try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the next trigger recovers */ }
+        }
+        return;
+      }
+
+      // Short deactivation (< 3000ms) or duplicate resume: only fit if dims changed.
+      scheduleFit(false);
+    };
+
+    window.addEventListener('blur', onWindowBlur);
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    const handleResize = (rect?: DOMRectReadOnly) => {
-      if (!activeRef.current) return;
-      // Skip when container is hidden (display:none → dimensions are 0)
-      if (!rect || rect.width === 0 || rect.height === 0) return;
-      fittingRef.current = true;
-      fitAddon.fit();
-      // Snap to bottom immediately after fit (reflow can reset viewportY to 0)
-      term.scrollToBottom();
-      autoFollowRef.current = true;
-      requestFrame(() => { fittingRef.current = false; });
-      // NOTE: do NOT repaint linesRef.current here — xterm reflows on resize natively,
-      // and repainting with stale diff buffer clobbers live PTY output (especially on mobile
-      // where viewport resizes frequently due to address bar / keyboard show/hide).
-    };
-
+    // NOTE: do NOT repaint linesRef.current on resize — xterm reflows natively,
+    // and repainting with a stale diff buffer clobbers live PTY output (especially
+    // on mobile where the viewport resizes on address bar / keyboard show/hide).
     const observer = new ResizeObserver((entries) => {
-      handleResize(entries[0]?.contentRect);
+      if (!activeRef.current) return;
+      // Every entry in the batch is considered, not just entries[0]: two targets
+      // are observed and the interesting one is not always first. An all-zero
+      // batch means a hidden ancestor — nothing to fit against.
+      const laidOut = entries.some((e) => e.contentRect.width > 0 && e.contentRect.height > 0);
+      if (!laidOut) return;
+      scheduleFit(false);
     });
     const containerEl = containerRef.current;
     if (containerEl) {
@@ -325,9 +655,13 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     }
 
     return () => {
+      if (testWindow.__imcShellTerminal === term) delete testWindow.__imcShellTerminal;
+      if (testWindow.__imcShellTerminals?.[sessionName] === term) delete testWindow.__imcShellTerminals[sessionName];
       if (fitTimer) clearTimeout(fitTimer);
+      cancelPendingFit();
       discardPendingRaw();
       containerRef.current?.removeEventListener('paste', handlePaste, { capture: true });
+      window.removeEventListener('blur', onWindowBlur);
       window.removeEventListener('focus', onWindowFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       observer.disconnect();
@@ -335,7 +669,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [sessionName, useIosMacTextScale]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionName]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When WS reconnects (connected → true), re-send terminal dimensions so tmux
   // always matches xterm — prevents garbled/corrupted display (花屏).
@@ -343,11 +677,19 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   useEffect(() => {
     if (!connected || !active) return;
     const el = containerRef.current;
-    if (!el || el.clientWidth === 0 || el.clientHeight === 0) return; // hidden (chat mode)
+    const hidden = !el || el.clientWidth === 0 || el.clientHeight === 0; // hidden (chat mode)
     const term = termRef.current;
     const ws = wsRef.current;
     if (term && ws) {
-      ws.sendResize(sessionName, term.cols, term.rows);
+      // Dimensions only when visible: a hidden container reports 0x0 and the
+      // parent pins its own fallback size meanwhile.
+      if (!hidden) ws.sendResize(sessionName, term.cols, term.rows);
+      // The snapshot is requested either way. A view that is (re)mounted while
+      // hidden used to skip it, and nothing else repaints it: a re-mount inside
+      // the socket client's unsubscribe debounce reuses the live daemon
+      // subscription, so no bootstrap snapshot is sent, and a later layout that
+      // leaves the size unchanged produces no resize either - it stayed blank
+      // or stale until the next byte happened to redraw it.
       try { ws.sendSnapshotRequest(sessionName); } catch { /* ignore */ }
     }
   }, [active, connected, sessionName]);
@@ -357,9 +699,15 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // allowing multiple TerminalViews for the same session (e.g. preview card + window).
   useEffect(() => {
     if (!ws || !active) return;
-    const unsub = ws.onTerminalRaw(sessionName, enqueueRawWrite);
+    const generation = ++rawSubscriptionGenerationRef.current;
+    const guardedRawWrite = (data: Uint8Array) => {
+      if (!activeRef.current || generation !== rawSubscriptionGenerationRef.current) return;
+      enqueueRawWrite(data);
+    };
+    const unsub = ws.onTerminalRaw(sessionName, guardedRawWrite);
     return () => {
       unsub();
+      if (rawSubscriptionGenerationRef.current === generation) rawSubscriptionGenerationRef.current++;
       discardPendingRaw();
     };
   }, [active, discardPendingRaw, enqueueRawWrite, ws, sessionName]);
@@ -367,15 +715,29 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // Handle terminal.stream_reset — reset xterm state so stale ANSI doesn't corrupt (Task 5.4)
   useEffect(() => {
     if (!ws || !active) return;
+    const generation = ++controlSubscriptionGenerationRef.current;
     const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'terminal.stream_reset' && msg.session === sessionName) {
+      if (generation !== controlSubscriptionGenerationRef.current || !activeRef.current) return;
+      if (msg.type === TERMINAL_CONTROL.RECOVERY_EXHAUSTED && msg.session === sessionName) {
+        setRecoveryError(true);
+        return;
+      }
+      if (msg.type === TERMINAL_CONTROL.STREAM_RESET && msg.session === sessionName) {
         discardPendingRaw();
         termRef.current?.reset();
         linesRef.current = [];
+        // The picture can no longer be trusted. Painting the raw bytes that keep
+        // arriving mid-stream onto the blank screen just produces a half-drawn
+        // one, so wait for the snapshot the socket client is already requesting
+        // (and keep asking if it never comes).
+        beginResync(false);
       }
     });
-    return unsub;
-  }, [active, discardPendingRaw, ws, sessionName]);
+    return () => {
+      unsub();
+      if (controlSubscriptionGenerationRef.current === generation) controlSubscriptionGenerationRef.current++;
+    };
+  }, [active, beginResync, discardPendingRaw, ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
     if (!activeRef.current) return;
@@ -383,49 +745,49 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (!term) return;
     if (
       previewRef.current
+      && !diff.fullFrame
       && lastRawWriteAtRef.current > 0
       && Date.now() - lastRawWriteAtRef.current < PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS
     ) {
       return;
     }
 
-    const lines = linesRef.current;
-    for (const [lineIdx, content] of diff.lines) {
-      while (lines.length <= lineIdx) lines.push('');
-      lines[lineIdx] = content;
-    }
-    while (lines.length < diff.rows) lines.push('');
-    linesRef.current = lines.slice(0, diff.rows);
+    // `rows` and every `lineIdx` arrive over the wire and are bounded before any
+    // array grows (see applyDiffToRows / resolveDiffRows in terminal-frame.ts).
+    const { rows } = resolveDiffRows(diff.rows);
+    linesRef.current = applyDiffToRows(linesRef.current, diff);
 
     if (diff.fullFrame) {
-      // Full frame: rewrite entire screen from cursor home
-      let buf = '\x1b[H';
-      for (let i = 0; i < linesRef.current.length; i++) {
-        buf += (linesRef.current[i] ?? '') + '\x1b[K';
-        if (i < linesRef.current.length - 1) buf += '\r\n';
-      }
-      buf += '\x1b[J';
-      writingCountRef.current++;
-      term.write(buf, () => {
-        writingCountRef.current--;
-        autoFollowRef.current = true;
-        term.scrollToBottom();
-      });
+      // Full frame: repaint the whole screen AND restore what the raw bytes that
+      // follow assume (cursor cell, alternate screen) - see terminal-frame.ts.
+      writeTerminal(fullFrameWriteFromDiff(diff, linesRef.current), true);
     } else if (diff.lines.length > 0) {
       // Partial update: only write changed lines using cursor addressing
       let buf = '';
       for (const [lineIdx, content] of diff.lines) {
+        // Same predicate as the line-array path above. Bounding only by
+        // TERMINAL_MAX_ROWS was not enough: the array path additionally slices
+        // to `rows`, so a lineIdx between rows and the max was dropped from the
+        // array yet still written to xterm — the two disagreed about which rows
+        // exist, and the write addressed a row outside the declared screen.
+        if (!isRenderableLineIndex(lineIdx, rows)) continue;
         // CSI row;col H — 1-based row addressing
         buf += `\x1b[${lineIdx + 1};1H${content}\x1b[K`;
       }
-      term.write(buf);
+      writeTerminal(buf);
     }
 
     // Always scroll to bottom on new content (fullFrame handles its own scroll internally).
-    if (!diff.fullFrame) {
-      requestFrame(() => term.scrollToBottom());
-    }
-  }, []);
+    //
+    // Single-flight. This is the highest-frequency frame scheduler in the
+    // component: one `terminal.diff` arrives per PTY update, and diffs keep
+    // arriving while the display is asleep because WebSocket messages are I/O,
+    // not throttled timers. `requestAnimationFrame` on the other hand does not
+    // run at all with no frames being produced, so a naive rAF-per-diff builds
+    // an unbounded backlog for the whole lock and the browser executes every
+    // one of them inside the first frame after unlock.
+    if (!diff.fullFrame) scheduleScrollToBottom();
+  }, [scheduleScrollToBottom, writeTerminal]);
 
   const applyHistory = useCallback((content: string) => {
     if (!activeRef.current) return;
@@ -435,11 +797,20 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     // We use the normal buffer — history goes above current viewport.
     const historyLines = content.split('\n');
     const batch = historyLines.map((l) => l + '\r\n').join('');
-    term.write(batch);
-  }, []);
+    writeTerminal(batch);
+  }, [writeTerminal]);
 
   useEffect(() => {
-    onDiff?.(applyDiff);
+    const generation = ++diffSubscriptionGenerationRef.current;
+    const guardedApplyDiff = (diff: TerminalDiff) => {
+      if (generation !== diffSubscriptionGenerationRef.current || !activeRef.current) return;
+      applyDiff(diff);
+    };
+    const unregister = onDiff?.(guardedApplyDiff);
+    return () => {
+      if (diffSubscriptionGenerationRef.current === generation) diffSubscriptionGenerationRef.current++;
+      if (typeof unregister === 'function') unregister();
+    };
   }, [applyDiff, onDiff]);
 
   useEffect(() => {
@@ -511,6 +882,28 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         <button class="term-scroll-bottom" onClick={scrollToBottom} title="Scroll to bottom">
           ↓
         </button>
+      )}
+
+      {recoveryError && (
+        <div
+          role="alert"
+          data-testid="terminal-recovery-error"
+          style={{
+            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', flexDirection: 'column', gap: 12,
+            background: 'rgba(15, 15, 19, 0.94)', color: '#e2e8f0', padding: 24,
+            textAlign: 'center', zIndex: 3,
+          }}
+        >
+          <div>{t('session.terminal_recovery_exhausted')}</div>
+          <button
+            type="button"
+            class="btn"
+            onClick={() => { setRecoveryError(false); onRestart?.(); }}
+          >
+            {t('session.terminal_restart')}
+          </button>
+        </div>
       )}
     </div>
   );

@@ -25,7 +25,11 @@ describe('ClaudeCodeSdkProvider.listModels', () => {
     const result = await provider.listModels();
     expect(result.models.length).toBeGreaterThan(0);
     expect(result.models.every((m) => typeof m.id === 'string' && m.id.length > 0)).toBe(true);
-    expect(result.isAuthenticated).toBe(true);
+    // Claude authentication is deliberately limited to a reachable local
+    // auth UDS; this test process has no such session and must not fall back to
+    // credentials files or API keys.
+    expect(result.isAuthenticated).toBe(false);
+    expect(result.error).toContain('Claude local auth unavailable');
     // Default model is the first in the list
     expect(result.defaultModel).toBe(result.models[0]?.id);
   });
@@ -114,80 +118,13 @@ describe('CursorHeadlessProvider.listModels', () => {
   });
 });
 
-// ── GeminiSdkProvider ────────────────────────────────────────────────────────
-
-describe('GeminiSdkProvider.listModels', () => {
-  it('reports managed MCP ready after the ACP connection is live', async () => {
-    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
-    const provider = new GeminiSdkProvider();
-
-    expect(provider.getMemoryMcpStatus()).toMatchObject({
-      providerId: 'gemini-sdk',
-      status: MEMORY_MCP_STATUS.UNKNOWN,
-      connected: false,
-    });
-
-    (provider as any).config = {};
-    (provider as any).connection = {};
-
-    expect(provider.getMemoryMcpStatus()).toMatchObject({
-      providerId: 'gemini-sdk',
-      status: MEMORY_MCP_STATUS.READY,
-      connected: true,
-      degradedReasons: [],
-    });
-  });
-
-  it('probes for models via newSession if not cached', async () => {
-    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
-    const provider = new GeminiSdkProvider();
-
-    // Mock the connection and its prompt/newSession methods
-    const mockConnection = {
-      initialize: vi.fn().mockResolvedValue({}),
-      newSession: vi.fn().mockResolvedValue({
-        sessionId: 'test-session',
-        models: {
-          availableModels: [{ modelId: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' }],
-          currentModelId: 'gemini-2.0-flash',
-        },
-      }),
-      closeSession: vi.fn().mockResolvedValue({}),
-    };
-    (provider as any).connection = mockConnection;
-    (provider as any).initPromise = Promise.resolve();
-
-    const result = await provider.listModels();
-    expect(mockConnection.newSession).toHaveBeenCalled();
-    expect(result.models[0]?.id).toBe('gemini-2.0-flash');
-    expect(result.defaultModel).toBe('gemini-2.0-flash');
-    expect(result.isAuthenticated).toBe(true);
-  });
-
-  it('respects force=true by clearing cache', async () => {
-    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
-    const provider = new GeminiSdkProvider();
-    (provider as any).cachedModels = [{ id: 'old' }];
-    (provider as any).connection = {
-      newSession: vi.fn().mockResolvedValue({
-        sessionId: 'new',
-        models: { availableModels: [{ modelId: 'new' }] },
-      }),
-      closeSession: vi.fn().mockResolvedValue({}),
-    };
-    (provider as any).initPromise = Promise.resolve();
-
-    const result = await provider.listModels(true);
-    expect(result.models[0]?.id).toBe('new');
-  });
-});
-
 // ── KimiSdkProvider ──────────────────────────────────────────────────────────
 
 describe('KimiSdkProvider.listModels', () => {
   it('uses the supported `kimi acp` entrypoint, not deprecated `kimi --acp`', async () => {
     const source = await readFile('src/agent/providers/kimi-sdk.ts', 'utf8');
-    expect(source).toContain("const args = [...resolved.prependArgs, 'acp'];");
+    expect(source).toContain("args: ['acp']");
+    expect(source).toContain('...this.profile.args');
     expect(source).not.toContain("resolved.prependArgs, '--acp'");
   });
 
@@ -264,10 +201,12 @@ describe('ProviderModelList contract', () => {
     const { CodexSdkProvider } = await import('../../../src/agent/providers/codex-sdk.js');
     const { CopilotSdkProvider } = await import('../../../src/agent/providers/copilot-sdk.js');
     const { CursorHeadlessProvider } = await import('../../../src/agent/providers/cursor-headless.js');
-    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
     const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
+    const { GrokSdkProvider } = await import('../../../src/agent/providers/grok-sdk.js');
+    const { OpenCodeSdkProvider } = await import('../../../src/agent/providers/opencode-sdk.js');
+    const { AgySdkProvider } = await import('../../../src/agent/providers/agy-sdk.js');
 
-    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider]) {
+    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, KimiSdkProvider, GrokSdkProvider, OpenCodeSdkProvider, AgySdkProvider]) {
       const p = new Cls();
       expect(typeof (p as unknown as { listModels?: unknown }).listModels, `${Cls.name} must implement listModels()`).toBe('function');
     }

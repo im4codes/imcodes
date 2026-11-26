@@ -51,6 +51,7 @@ export function validateMcpCronAction(action: unknown, provenance: MemoryMcpSour
       ...(typeof action.reply === 'boolean' ? { reply: action.reply } : {}),
       ...(typeof action.broadcast === 'boolean' ? { broadcast: action.broadcast } : {}),
       ...(idempotencyKey ? { idempotencyKey } : {}),
+      ...(typeof action.onlyWhenIdle === 'boolean' ? { onlyWhenIdle: action.onlyWhenIdle } : {}),
     }, provenance),
   };
 }

@@ -1,0 +1,1788 @@
+/** @vitest-environment jsdom */
+import { inlineStyleValues } from './support/inline-style.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { REMOTE_DESKTOP_INPUT_CAPABILITY, REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_STOP_ORIGIN,
+} from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
+
+const api = vi.hoisted(() => ({
+  openRemoteDesktopWindow: vi.fn(),
+  listControllableMachines: vi.fn(),
+  getRemoteDesktopWall: vi.fn(),
+  mutateRemoteDesktopWall: vi.fn(),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) => values
+      ? `${key}:${Object.values(values).join(':')}`
+      : key,
+  }),
+}));
+
+vi.mock('../src/api/machines.js', () => ({
+  listControllableMachines: api.listControllableMachines,
+}));
+
+vi.mock('../src/remote-desktop-window.js', () => ({
+  openRemoteDesktopWindow: api.openRemoteDesktopWindow,
+}));
+
+vi.mock('../src/api/remote-desktop-wall.js', () => ({
+  getRemoteDesktopWall: api.getRemoteDesktopWall,
+  mutateRemoteDesktopWall: api.mutateRemoteDesktopWall,
+}));
+
+vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
+  RemoteDesktopWallTile: ({ host }: {
+    host: { hostId: string; displayName: string };
+  }) => <div>{`wall:${host.displayName}`}</div>,
+}));
+
+vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
+  RemoteDesktopPanel: ({ machine, active, visible, inputActive, menuBarHidden, onMobileKeyboardOpenChange }: {
+    machine: { serverId: string };
+    active: boolean;
+    visible?: boolean;
+    inputActive: boolean;
+    menuBarHidden?: boolean;
+    onMobileKeyboardOpenChange?: (open: boolean) => void;
+  }) => (
+    <div
+      data-testid={`panel-${machine.serverId}`}
+      data-visible={String(visible ?? active)}
+      data-menubar-hidden={String(Boolean(menuBarHidden))}
+      hidden={!active}
+    >
+      {String(active)}:{String(inputActive)}
+      <button
+        type="button"
+        data-testid={`panel-kb-open-${machine.serverId}`}
+        aria-label={`kb-open-${machine.serverId}`}
+        onClick={() => onMobileKeyboardOpenChange?.(true)}
+      />
+      <button
+        type="button"
+        data-testid={`panel-kb-close-${machine.serverId}`}
+        aria-label={`kb-close-${machine.serverId}`}
+        onClick={() => onMobileKeyboardOpenChange?.(false)}
+      />
+    </div>
+  ),
+}));
+
+vi.mock('../src/components/ChatView.js', () => ({
+  ChatView: () => <div data-testid="rd-mock-chat-view">Selectable chat text</div>,
+}));
+
+vi.mock('../src/components/StableSessionControls.js', () => ({
+  StableSessionControls: ({ activeSession, quotes, onRemoveQuote, onSend }: {
+    activeSession: { name: string };
+    quotes?: string[];
+    onRemoveQuote?: (index: number) => void;
+    onSend?: (sessionName: string, text: string, meta?: { commandId: string }) => void;
+  }) => (
+    <div>
+      <div data-testid="rd-mock-controls">{activeSession.name}</div>
+      {(quotes ?? []).map((q, idx) => (
+        <span key={`${idx}-${q}`} data-testid={`rd-mock-quote-${idx}`}>
+          {q}
+          <button
+            type="button"
+            data-testid={`rd-mock-quote-remove-${idx}`}
+            onClick={() => onRemoveQuote?.(idx)}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <button
+        type="button"
+        data-testid="rd-mock-send"
+        onClick={() => {
+          const quotePrefix = (quotes ?? []).map((q) => `> ${q}`).join('\n');
+          const fullText = quotePrefix ? `${quotePrefix}\n\ncheck screen` : 'check screen';
+          onSend?.(activeSession.name, fullText, { commandId: `cmd-${Date.now()}` });
+          for (let i = (quotes?.length ?? 0) - 1; i >= 0; i--) {
+            onRemoveQuote?.(i);
+          }
+        }}
+      >
+        Send
+      </button>
+    </div>
+  ),
+}));
+
+const timelineSpies = vi.hoisted(() => ({
+  addOptimisticUserMessage: vi.fn(),
+}));
+
+vi.mock('../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
+  useTimeline: () => ({
+    events: [],
+    loading: false,
+    refreshing: false,
+    historyStatus: 'ready',
+    loadingOlder: false,
+    hasOlderHistory: false,
+    loadOlderEvents: vi.fn(),
+    historyGap: false,
+    loadMessageContext: vi.fn(),
+    addOptimisticUserMessage: timelineSpies.addOptimisticUserMessage,
+    removeOptimisticMessage: vi.fn(),
+    markOptimisticFailed: vi.fn(),
+    retryOptimisticMessage: vi.fn(),
+    forceRefresh: vi.fn(),
+  }),
+}));
+
+import { installFullscreenStub, removeFullscreenStub } from './support/fullscreen-stub.js';
+import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
+import { KEYBOARD_SHORTCUTS_PREF_KEY } from '../src/keyboard-shortcuts.js';
+import {
+  REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY,
+  RemoteDesktopWorkspace,
+} from '../src/components/RemoteDesktopWorkspace.js';
+import {
+  isPointOverRemoteDesktopOverlay,
+  REMOTE_DESKTOP_OVERLAY_CLASS,
+} from '../src/remote-desktop-pointer-overlay.js';
+import type { CloudDocsMainChatContext } from '../src/components/CloudDocsMainChatFloat.js';
+import type { SessionInfo } from '../src/types.js';
+import type { WsClient } from '../src/ws-client.js';
+import { __resetMachinesForTests } from '../src/hooks/useMachines.js';
+import {
+  REMOTE_DESKTOP_WALL_TAB_ID,
+  REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  activateRemoteDesktopWorkspaceTab,
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+} from '../src/remote-desktop-workspace-state.js';
+
+const workspaceCss = readFileSync(
+  resolve(__dirname, '../src/components/remote-desktop-workspace.css'),
+  'utf8',
+);
+const originalConfirm = window.confirm;
+
+function machine(serverId: string) {
+  return {
+    serverId,
+    refName: serverId,
+    displayName: serverId.toUpperCase(),
+    os: 'win',
+    online: true,
+    execEnabled: true,
+    accessRole: 'owner' as const,
+    capabilities: [REMOTE_DESKTOP_CAPABILITY],
+  };
+}
+
+function macMachine(serverId: string, complete: boolean) {
+  return {
+    ...machine(serverId),
+    os: complete ? 'mac' : 'win',
+    capabilities: complete ? [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ] : [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+    ],
+  };
+}
+
+function setupManager() {
+  const events: string[] = [];
+  const releaseAll = vi.fn(() => events.push('release:a'));
+  const manager = {
+    connection: vi.fn(() => ({ releaseAll })),
+    releaseInput: vi.fn(() => releaseAll()),
+    stop: vi.fn((hostKey: string) => events.push(`stop:${hostKey}`)),
+    stopAll: vi.fn(() => events.push('stop:all')),
+  } as unknown as RemoteDesktopConnectionManager;
+  return { manager, events, releaseAll };
+}
+
+afterEach(() => {
+  cleanup();
+  localStorage.removeItem(`rcc_float_${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`);
+  localStorage.removeItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`);
+  vi.clearAllMocks();
+  window.confirm = originalConfirm;
+  removeFullscreenStub();
+  __resetMachinesForTests();
+});
+
+api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
+
+describe('RemoteDesktopWorkspace', () => {
+  it('double-clicks the workspace chrome to maximize in-page and restores normal geometry', () => {
+    const key = `rcc_float_${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`;
+    localStorage.setItem(key, JSON.stringify({ x: 80, y: 90, w: 700, h: 500 }));
+    const fullscreen = installFullscreenStub();
+    void fullscreen;
+    const { manager } = setupManager();
+    const onFocus = vi.fn();
+    const result = render(<RemoteDesktopWorkspace
+      state={openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'))}
+      manager={manager}
+      onOpenHost={vi.fn()} onActivateTab={vi.fn()} onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()} onCloseWorkspace={vi.fn()} onFocus={onFocus}
+    />);
+    const panel = screen.getByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`);
+    const chrome = result.container.querySelector('.remote-desktop-workspace-tabbar')!;
+    const normalStyle = inlineStyleValues(panel);
+    const savedGeometry = localStorage.getItem(key);
+    fireEvent.dblClick(screen.getByRole('tab', { name: 'A' }));
+    fireEvent.dblClick(screen.getByTestId('panel-a'));
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
+    fireEvent.dblClick(chrome);
+    expect(panel.style.borderWidth).toBe('2px');
+    expect(inlineStyleValues(panel)).not.toEqual(normalStyle);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+    expect(fullscreen.requests).toEqual([]);
+    fireEvent.dblClick(chrome);
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+  });
+
+  it('keeps sibling presentations mounted and releases active input before tab transfer', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager, events } = setupManager();
+    const activate = vi.fn((tabId: string) => events.push(`activate:${tabId}`));
+    const reorder = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={activate}
+      onCloseHost={vi.fn()}
+      onReorderHost={reorder}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    expect(screen.getByTestId('panel-a').textContent).toBe('false:false');
+    expect(screen.getByTestId('panel-b').textContent).toBe('true:true');
+    expect((screen.getByTestId('panel-a') as HTMLElement).hidden).toBe(true);
+    expect((screen.getByTestId('panel-b') as HTMLElement).hidden).toBe(false);
+    expect(workspaceCss).not.toMatch(/\.remote-desktop-workspace\s*>\s*\.remote-desktop-panel\[hidden\][^}]*display:\s*none/i);
+    expect(workspaceCss).not.toMatch(/\.remote-desktop-workspace-window\[hidden\][^}]*display:\s*none/i);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*>\s*\.remote-desktop-panel\[hidden\][\s\S]*?visibility:\s*hidden\s*!important/);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace-window\[hidden\][\s\S]*?visibility:\s*hidden\s*!important/);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace-window\[hidden\][\s\S]*?pointer-events:\s*none\s*!important/);
+    // Only the active host's tab (tab + its close control) is marked active,
+    // which is what visually lifts it off the tab rail into the toolbar.
+    expect(screen.getByRole('tab', { name: 'B' }).closest('.remote-desktop-workspace-host-tab')?.classList.contains('is-active')).toBe(true);
+    expect(screen.getByRole('tab', { name: 'A' }).closest('.remote-desktop-workspace-host-tab')?.classList.contains('is-active')).toBe(false);
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft' });
+    expect(events).toEqual(['release:a', 'activate:a']);
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft', altKey: true });
+    expect(reorder).toHaveBeenCalledWith('b', -1);
+  });
+
+  it('stops only the exact host selected by its integrated tab close control', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager, events } = setupManager();
+    const closeHost = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={closeHost}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:B' }));
+    expect(events).toEqual(['stop:b']);
+    expect(manager.stop).toHaveBeenCalledWith(
+      'b',
+      REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_HOST_CLOSE,
+    );
+    expect(closeHost).toHaveBeenCalledWith('b');
+    const closeIcon = screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:A' })
+      .querySelector('svg');
+    expect(closeIcon?.getAttribute('width')).toBe('16');
+    expect(closeIcon?.getAttribute('height')).toBe('16');
+  });
+
+  it('keeps minimize separate from close and confirms closing multiple tabs', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager } = setupManager();
+    const minimize = vi.fn();
+    const restore = vi.fn();
+    const closeWorkspace = vi.fn();
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const props = {
+      state,
+      manager,
+      onOpenHost: vi.fn(),
+      onActivateTab: vi.fn(),
+      onCloseHost: vi.fn(),
+      onReorderHost: vi.fn(),
+      onCloseWorkspace: closeWorkspace,
+      onMinimize: minimize,
+      onRestore: restore,
+    };
+    const result = render(<RemoteDesktopWorkspace {...props} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'window.minimize' }));
+    expect(minimize).toHaveBeenCalledTimes(1);
+    expect(manager.stop).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(confirm).toHaveBeenCalledWith('remote_desktop.workspace_close_confirm:2');
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(closeWorkspace).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(manager.stop).toHaveBeenCalledTimes(2);
+    expect(manager.stop).toHaveBeenCalledWith('a', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+    expect(manager.stop).toHaveBeenCalledWith('b', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+    expect(closeWorkspace).toHaveBeenCalledTimes(1);
+
+    result.rerender(<RemoteDesktopWorkspace {...props} minimized />);
+    expect(manager.releaseInput).toHaveBeenCalledWith('b');
+    expect(screen.getByTestId('panel-a').textContent).toBe('false:false');
+    expect(screen.getByTestId('panel-b').textContent).toBe('true:false');
+    expect(screen.getByTestId('panel-a').getAttribute('data-visible')).toBe('false');
+    expect(screen.getByTestId('panel-b').getAttribute('data-visible')).toBe('false');
+    const hiddenWindow = result.container.querySelector('.remote-desktop-workspace-window') as HTMLElement;
+    expect(hiddenWindow.hidden).toBe(true);
+    expect(hiddenWindow.getAttribute('aria-hidden')).toBe('true');
+    expect(hiddenWindow.hasAttribute('inert')).toBe(true);
+    const dock = screen.getByRole('button', { name: 'remote_desktop.workspace_restore:2' });
+    fireEvent.click(dock);
+    expect(restore).toHaveBeenCalledTimes(1);
+
+    result.rerender(<RemoteDesktopWorkspace {...props} minimized={false} />);
+    expect(screen.getByTestId('panel-b').getAttribute('data-visible')).toBe('true');
+    expect(hiddenWindow.hidden).toBe(false);
+    expect(hiddenWindow.getAttribute('aria-hidden')).toBeNull();
+    expect(hiddenWindow.hasAttribute('inert')).toBe(false);
+  });
+
+  it('releases remote desktop input and exits fullscreen when minimized while fullscreen is active', () => {
+    const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+    const origFsEl = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    const origExitFs = Object.getOwnPropertyDescriptor(document, 'exitFullscreen');
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const view = render(
+      <RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />,
+    );
+    const workspaceEl = view.container.querySelector('.remote-desktop-workspace') as HTMLDivElement;
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: workspaceEl });
+    Object.defineProperty(document, 'exitFullscreen', { configurable: true, value: exitFullscreen });
+    try {
+      expect(screen.getByTestId('panel-a').textContent).toBe('true:true');
+      view.rerender(
+        <RemoteDesktopWorkspace
+          state={state}
+          manager={manager}
+          minimized
+          onOpenHost={vi.fn()}
+          onActivateTab={vi.fn()}
+          onCloseHost={vi.fn()}
+          onReorderHost={vi.fn()}
+          onCloseWorkspace={vi.fn()}
+        />,
+      );
+      expect(manager.releaseInput).toHaveBeenCalledWith('a');
+      expect(screen.getByTestId('panel-a').textContent).toBe('true:false');
+      expect(exitFullscreen).toHaveBeenCalledTimes(1);
+    } finally {
+      if (origFsEl) Object.defineProperty(document, 'fullscreenElement', origFsEl);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+      if (origExitFs) Object.defineProperty(document, 'exitFullscreen', origExitFs);
+      else delete (document as { exitFullscreen?: () => Promise<void> }).exitFullscreen;
+    }
+  });
+
+  it('fills its own browser window instead of floating a panel when standalone', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const props = {
+      state,
+      manager,
+      onOpenHost: vi.fn(),
+      onActivateTab: vi.fn(),
+      onCloseHost: vi.fn(),
+      onReorderHost: vi.fn(),
+      onCloseWorkspace: vi.fn(),
+    };
+    const floating = render(<RemoteDesktopWorkspace {...props} />);
+    expect(floating.queryByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`)).not.toBeNull();
+    expect(floating.container.querySelector('.remote-desktop-workspace-standalone')).toBeNull();
+    floating.unmount();
+
+    const standalone = render(<RemoteDesktopWorkspace {...props} standalone />);
+    expect(standalone.queryByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`)).toBeNull();
+    const shell = standalone.container.querySelector('.remote-desktop-workspace-standalone');
+    expect(shell?.querySelector(':scope > .remote-desktop-workspace')).not.toBeNull();
+    expect(screen.getByTestId('panel-a')).not.toBeNull();
+    expect(workspaceCss).toMatch(
+      /\.remote-desktop-workspace-standalone\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*0;/,
+    );
+    expect(workspaceCss).toMatch(
+      /\.remote-desktop-workspace-standalone\s*>\s*\.remote-desktop-workspace\s*\{[^}]*flex:\s*1;/,
+    );
+  });
+
+  it('closes a single-tab workspace without an unnecessary confirmation', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const closeWorkspace = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={closeWorkspace}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(manager.stop).toHaveBeenCalledWith('a', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+    expect(closeWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the sole manager owner alive when closing a tab still represented on the wall', async () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+      wallHostKeys={new Set(['a'])}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:A' }));
+    expect(manager.stop).not.toHaveBeenCalled();
+  });
+
+  it('routes the mobile selector through the same release-before-activate action', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager, events } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={(tabId) => events.push(`activate:${tabId}`)}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const selector = screen.getByLabelText('remote_desktop.workspace_select') as HTMLSelectElement;
+    selector.value = 'a';
+    fireEvent.input(selector);
+    expect(events).toEqual(['release:a', 'activate:a']);
+  });
+
+  it('opens a picker selection through the shared upsert callback', async () => {
+    api.listControllableMachines.mockResolvedValue([machine('c')]);
+    const { manager } = setupManager();
+    const openHost = vi.fn();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={openHost}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    fireEvent.click(add);
+    expect(add.getAttribute('aria-expanded')).toBe('true');
+    const menu = await screen.findByRole('menu', { name: 'remote_desktop.workspace_picker' });
+    const row = await screen.findByRole('menuitem', { name: /C/ });
+    expect(menu.contains(row)).toBe(true);
+    fireEvent.click(row);
+    expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    expect(add.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('hangs the picker menu from the + button, right-aligned when it would overflow', async () => {
+    api.listControllableMachines.mockResolvedValue([machine('c')]);
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    const viewportWidth = window.innerWidth;
+    add.getBoundingClientRect = () => ({
+      left: viewportWidth - 40, right: viewportWidth - 12, top: 10, bottom: 38,
+      width: 28, height: 28, x: viewportWidth - 40, y: 10, toJSON: () => ({}),
+    }) as DOMRect;
+    fireEvent.click(add);
+    const menu = await screen.findByRole('menu');
+    expect(menu.classList.contains('controlled-node-quick-menu')).toBe(true);
+    expect(menu.style.top).toBe('44px');
+    const width = parseFloat(menu.style.width);
+    expect(parseFloat(menu.style.left) + width).toBe(viewportWidth - 12);
+
+    // Clicking + again closes it rather than reopening it.
+    fireEvent.pointerDown(add);
+    fireEvent.click(add);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('keeps open hosts pickable at the host limit and disables the rest', async () => {
+    let state = createRemoteDesktopWorkspaceState();
+    const open = Array.from({ length: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS }, (_, index) => machine(`open${index}`));
+    for (const host of open) state = openRemoteDesktopWorkspaceHost(state, host);
+    api.listControllableMachines.mockResolvedValue([open[0], machine('extra')]);
+    const { manager } = setupManager();
+    const openHost = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={openHost}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const extra = await screen.findByRole('menuitem', { name: /EXTRA/ });
+    const limitText = `remote_desktop.workspace_limit:${REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS}`;
+    expect(screen.getByRole('status').textContent).toBe(limitText);
+    expect(extra.getAttribute('aria-disabled')).toBe('true');
+    expect(extra.getAttribute('title')).toBe(limitText);
+    fireEvent.click(extra);
+    expect(openHost).not.toHaveBeenCalled();
+
+    const already = screen.getByRole('menuitem', { name: /OPEN0/ });
+    expect(already.getAttribute('aria-disabled')).toBeNull();
+    fireEvent.click(already);
+    expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'open0' }));
+  });
+
+  it('reports a failed machine load in the picker', async () => {
+    api.listControllableMachines.mockRejectedValue(new Error('offline'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('remote_desktop.workspace_picker_failed');
+  });
+
+  it('renders the picker inside the workspace while it is fullscreen', async () => {
+    const stub = installFullscreenStub();
+    api.listControllableMachines.mockResolvedValue([machine('c')]);
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const workspace = result.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    act(() => stub.setElement(workspace));
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const menu = await screen.findByRole('menu');
+    expect(workspace.contains(menu)).toBe(true);
+  });
+
+  it('uses the real capability gate for complete and incomplete macOS profiles', async () => {
+    api.listControllableMachines.mockResolvedValue([
+      macMachine('mac-complete', true),
+      macMachine('mac-incomplete', false),
+    ]);
+    const { manager } = setupManager();
+    const openHost = vi.fn();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={openHost}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const complete = await screen.findByRole('menuitem', { name: /MAC-COMPLETE/ });
+    const incomplete = screen.getByRole('menuitem', { name: /MAC-INCOMPLETE/ });
+    expect(complete.getAttribute('aria-disabled')).toBeNull();
+    expect(incomplete.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(incomplete);
+    expect(openHost).not.toHaveBeenCalled();
+    fireEvent.click(complete);
+    expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'mac-complete' }));
+  });
+
+  it('renders canonical nodeId in the picker without exposing raw serverId', async () => {
+    api.listControllableMachines.mockResolvedValue([{
+      ...machine('internal-routing-secret'),
+      nodeId: '1000000007',
+      refName: '',
+      displayName: 'Public workstation',
+    }]);
+    const { manager } = setupManager();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const menu = await screen.findByRole('menu');
+    await waitFor(() => expect(menu.textContent).toContain('1000000007'));
+    expect(menu.textContent).toContain('Public workstation');
+    expect(menu.textContent).not.toContain('internal-routing-secret');
+    expect(result.container.textContent).not.toContain('internal-routing-secret');
+  });
+
+  it('renders only the compact tab strip and keeps the add control adjacent to it', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager } = setupManager();
+    const props = {
+      state,
+      manager,
+      onOpenHost: vi.fn(),
+      onActivateTab: vi.fn(),
+      onCloseHost: vi.fn(),
+      onReorderHost: vi.fn(),
+      onCloseWorkspace: vi.fn(),
+    };
+    const result = render(<RemoteDesktopWorkspace {...props} />);
+    expect(screen.getByTestId('panel-a')).toBeDefined();
+    expect(screen.getByTestId('panel-b')).toBeDefined();
+    expect(result.container.querySelector('.remote-desktop-workspace-header')).toBeNull();
+    expect(result.container.querySelector('.remote-desktop-minimized-dock')).toBeNull();
+    const tabbar = result.container.querySelector('.remote-desktop-workspace-tabbar');
+    const tablist = tabbar?.querySelector('[role="tablist"]');
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    expect(tablist?.nextElementSibling).toBe(add);
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.stopAll).not.toHaveBeenCalled();
+  });
+
+  it('keeps workspace chrome out of native long-press selection and context menus', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const workspace = result.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    const tab = screen.getByRole('tab', { name: 'A' });
+    const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    expect(tab.dispatchEvent(contextMenu)).toBe(false);
+    expect(contextMenu.defaultPrevented).toBe(true);
+    const dragStart = new Event('dragstart', { bubbles: true, cancelable: true });
+    expect(tab.dispatchEvent(dragStart)).toBe(false);
+    expect(dragStart.defaultPrevented).toBe(true);
+
+    const concreteTargetRule = workspaceCss.match(
+      /\.remote-desktop-workspace,\s*\.remote-desktop-workspace \*\s*\{[^}]*\}/,
+    )?.[0];
+    expect(concreteTargetRule).toBeTruthy();
+    expect(concreteTargetRule).toMatch(/-webkit-touch-callout:\s*none\s*!important/);
+    expect(concreteTargetRule).toMatch(/-webkit-user-select:\s*none\s*!important/);
+    expect(concreteTargetRule).toMatch(/-webkit-user-drag:\s*none/);
+    expect(concreteTargetRule).toMatch(/-webkit-tap-highlight-color:\s*transparent/);
+    expect(workspace).toBeTruthy();
+  });
+
+  it('tears the active machine off into its own window, and only then drops the tab', () => {
+    // The button had stopped rendering anywhere: it lived behind `!embedded`
+    // inside the panel, and the workspace mounts every panel embedded.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager, events } = setupManager();
+    const closeHost = vi.fn();
+    api.openRemoteDesktopWindow.mockReturnValue({} as Window);
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      allowStandaloneWindow
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={closeHost}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_open_new_window' }));
+    // The active tab is the one that moves -- B, not whichever was opened first.
+    expect(api.openRemoteDesktopWindow).toHaveBeenCalledWith('b');
+    expect(closeHost).toHaveBeenCalledWith('b');
+    // And the session here is stopped, so the machine is not being driven from
+    // two places at once.
+    expect(events).toEqual(['stop:b']);
+  });
+
+  it('keeps the tab when the popup was blocked', () => {
+    // Closing on a blocked popup would lose the session to something the
+    // person cannot even see happening.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager, events } = setupManager();
+    const closeHost = vi.fn();
+    api.openRemoteDesktopWindow.mockReturnValue(null);
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      allowStandaloneWindow
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={closeHost}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_open_new_window' }));
+    expect(api.openRemoteDesktopWindow).toHaveBeenCalledWith('a');
+    expect(closeHost).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it('offers no tear-off where a popup cannot come back', () => {
+    // Mobile, where the default is off.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_open_new_window' })).toBeNull();
+  });
+
+  it('puts the whole workspace fullscreen, tab bar included, and reports which way it is', async () => {
+    const fullscreen = installFullscreenStub();
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const button = screen.getByRole('button', { name: 'remote_desktop.workspace_fullscreen' });
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+    await act(async () => { fireEvent.click(button); });
+
+    // The workspace element, not the active panel: fullscreening the panel
+    // would take the tab bar away and strand every other machine you had open.
+    expect(fullscreen.requests).toEqual([result.container.querySelector('.remote-desktop-workspace')]);
+    const pressed = screen.getByRole('button', { name: 'remote_desktop.workspace_exit_fullscreen' });
+    expect(pressed.getAttribute('aria-pressed')).toBe('true');
+
+    // Esc is the usual way out, and the button has to follow it.
+    await act(async () => { fullscreen.setElement(null); });
+    expect(screen.getByRole('button', { name: 'remote_desktop.workspace_fullscreen' })
+      .getAttribute('aria-pressed')).toBe('false');
+    const fullscreenRule = /\.remote-desktop-workspace:fullscreen\s*\{([^}]*)\}/.exec(workspaceCss)?.[1] ?? '';
+    expect(fullscreenRule).toMatch(/width:\s*var\(--imcodes-ui-vw,\s*100vw\)/);
+    expect(fullscreenRule).toMatch(/height:\s*var\(--imcodes-ui-(?:dvh|vh),\s*100(?:dvh|vh)\)/);
+  });
+
+  it('offers no fullscreen button in a browser that would refuse it', () => {
+    // An iframe without `allowfullscreen` reports `fullscreenEnabled: false`.
+    installFullscreenStub({ enabled: false });
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_fullscreen' })).toBeNull();
+  });
+
+  it('auto-mounts resizable active-session mini chat in workspace corner, persists height, preserves text selection/contextmenu, and blocks desktop pointer bleed', async () => {
+    localStorage.clear();
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const makeMainChat = (sessionName: string, label: string): CloudDocsMainChatContext => {
+      const session: SessionInfo = {
+        name: sessionName,
+        label,
+        project: 'codedeck',
+        role: 'brain',
+        agentType: 'claude-code',
+        runtimeType: 'transport',
+        state: 'idle',
+        projectDir: '/repo',
+      };
+      return {
+        session,
+        sessions: [session],
+        subSessions: [],
+        ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+        connected: true,
+        serverId: 'srv-1',
+        quickData: {
+          loaded: true,
+          history: [],
+          commands: [],
+          phrases: [],
+          reload: vi.fn(),
+          recordHistory: vi.fn(),
+          addCommand: vi.fn(),
+          updateCommand: vi.fn(),
+          removeCommand: vi.fn(),
+          addPhrase: vi.fn(),
+          removePhrase: vi.fn(),
+        } as unknown as CloudDocsMainChatContext['quickData'],
+      };
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_proj_brain', 'MainBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => fab)).toBe(true);
+
+    fireEvent.click(fab);
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(screen.getByTestId('rd-mock-controls').textContent).toBe('deck_proj_brain');
+    expect(screen.getByText('MainBrain')).toBeTruthy();
+
+    // Pointer inside resize handle / mini-chat is protected by overlay hit-test
+    const handle = screen.getByTestId('mini-chat-resize-handle');
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => handle)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => screen.getByTestId('rd-mock-chat-view'))).toBe(true);
+
+    // Drag resize handle upward by 80px -> 500px and saved to imcodes_rd_mini_chat_height_v1
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientY: 300, pointerId: 11,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 220, pointerId: 11,
+    }));
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientY: 220, pointerId: 11,
+    }));
+    expect(miniChat.style.height).toBe('500px');
+    expect(localStorage.getItem(REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY)).toBe('500');
+
+    // Dragging header activates interaction shield with overlay class and blocks pointer fallthrough
+    const miniHeader = screen.getByTestId('cloud-docs-mini-chat-header');
+    fireEvent(miniHeader, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 300, clientY: 300, pointerId: 12,
+    }));
+    const shield = screen.getByTestId('cloud-docs-mini-chat-interaction-shield');
+    expect(shield.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => shield)).toBe(true);
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(true);
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 300, clientY: 300, pointerId: 12,
+    }));
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+
+    // Right-clicking inside mini-chat messages is NOT preventDefault'd by workspace chrome
+    const chatMsgEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    expect(screen.getByTestId('rd-mock-chat-view').dispatchEvent(chatMsgEvent)).toBe(true);
+    expect(chatMsgEvent.defaultPrevented).toBe(false);
+
+    // Switching active session updates mini-chat target immediately
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_other_brain', 'OtherBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.getByTestId('rd-mock-controls').textContent).toBe('deck_other_brain');
+    expect(screen.getByText('OtherBrain')).toBeTruthy();
+
+    // CSS contract restores text selection inside mini-chat messages and enables relative anchor positioning
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*\{[^}]*position:\s*relative;/);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace \.cloud-docs-mini-chat-messages[\s\S]*user-select:\s*text\s*!important/);
+
+    // Reopening workspace restores saved 500px height
+    view.unmount();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_other_brain', 'OtherBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    expect((await screen.findByTestId('cloud-docs-mini-chat')).style.height).toBe('500px');
+  });
+
+  it('replays the floating robot entrance animation when RemoteDesktopWorkspace restores from minimized', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={false}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains('is-entering')).toBe(true);
+    const endEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(endEv, 'animationName', { value: 'cloudDocsFabEntrance' });
+    fireEvent(fab, endEv);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Minimize hides workspace window cleanly and clears any active entrance flag
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={true}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Restore from minimized replays entrance animation
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={false}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(fab.classList.contains('is-entering')).toBe(true);
+  });
+
+  it('binds mini chat quote to the active remote desktop host, updates on tab switch without carrying dismissal, and attaches [RemoteDesktop: ...] on send', async () => {
+    localStorage.clear();
+    const hostA = {
+      ...machine('srv-alpha'),
+      nodeId: '6000000011',
+      displayName: 'Alpha [Lab] Node',
+    };
+    const hostB = {
+      ...machine('srv-beta'),
+      displayName: 'Beta Daemon | QA',
+    };
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, hostA);
+    state = openRemoteDesktopWorkspaceHost(state, hostB);
+    const { manager } = setupManager();
+    const sendSessionCommand = vi.fn();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0')).toBeTruthy());
+    expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Beta Daemon QA | id=srv-beta]');
+
+    // Dismissing on host B reveals reattach strip
+    fireEvent.click(screen.getByTestId('rd-mock-quote-remove-0'));
+    await waitFor(() => expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull());
+    expect(screen.getByTestId('cloud-docs-mini-chat-reattach')).toBeTruthy();
+
+    // Switching to host A immediately binds host A's nodeId without carrying dismissal from host B
+    const hostAKey = state.orderedHostKeys[0]!;
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Sending prepends [RemoteDesktop: ...]
+    timelineSpies.addOptimisticUserMessage.mockClear();
+    fireEvent.click(screen.getByTestId('rd-mock-send'));
+    expect(timelineSpies.addOptimisticUserMessage).toHaveBeenCalledWith(
+      expect.stringContaining('[RemoteDesktop: Alpha Lab Node | id=6000000011]'),
+      expect.any(String),
+      expect.any(Object),
+    );
+
+    // Reattach host A's quote so it is actively attached before switching to Wall
+    fireEvent.click(screen.getByTestId('cloud-docs-mini-chat-reattach'));
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Wall tab clears active host quote AND reattach strip while quote is active, sending no RemoteDesktop token
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, REMOTE_DESKTOP_WALL_TAB_ID)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull());
+    expect(screen.queryByTestId('cloud-docs-mini-chat-reattach')).toBeNull();
+    timelineSpies.addOptimisticUserMessage.mockClear();
+    fireEvent.click(screen.getByTestId('rd-mock-send'));
+    expect(timelineSpies.addOptimisticUserMessage).toHaveBeenCalledWith(
+      'check screen',
+      expect.any(String),
+      expect.any(Object),
+    );
+
+    // Switching back to host A restores host A's RemoteDesktop quote immediately
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.getByTestId('rd-mock-quote-0').textContent).toContain('[RemoteDesktop: Alpha Lab Node | id=6000000011]'));
+
+    // Even when dismissed on host A (reattach strip showing), switching to Wall clears reattach strip too
+    fireEvent.click(screen.getByTestId('rd-mock-quote-remove-0'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat-reattach')).toBeTruthy());
+    view.rerender(<RemoteDesktopWorkspace
+      state={activateRemoteDesktopWorkspaceTab(state, REMOTE_DESKTOP_WALL_TAB_ID)}
+      manager={manager}
+      mainChat={mainChat}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await waitFor(() => expect(screen.queryByTestId('cloud-docs-mini-chat-reattach')).toBeNull());
+    expect(screen.queryByTestId('rd-mock-quote-0')).toBeNull();
+  });
+
+  it('hides only the robot FAB when panel or system soft keyboards open (preserving expanded mini chat) and restores it when closed', async () => {
+    localStorage.clear();
+    document.documentElement.classList.remove('kb-open', 'input-focused');
+
+    const hostA = machine('srv-alpha');
+    const hostB = machine('srv-beta');
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, hostA);
+    state = openRemoteDesktopWorkspaceHost(state, hostB);
+    const [hostAKey, hostBKey] = state.orderedHostKeys as [string, string];
+    const { manager } = setupManager();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const origInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const origVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const origMatchMedia = window.matchMedia;
+    let vvHeight = 800;
+    const vvListeners = new Map<string, Set<() => void>>();
+    const mockVv = {
+      get height() { return vvHeight; },
+      offsetTop: 0,
+      addEventListener: (name: string, cb: () => void) => {
+        if (!vvListeners.has(name)) vvListeners.set(name, new Set());
+        vvListeners.get(name)!.add(cb);
+      },
+      removeEventListener: (name: string, cb: () => void) => {
+        vvListeners.get(name)?.delete(cb);
+      },
+    };
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: mockVv });
+    let coarsePointer = false;
+    window.matchMedia = vi.fn((query: string) => ({
+      matches: query === '(pointer: coarse)' ? coarsePointer : false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+
+    try {
+      const view = render(<RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+
+      // Expand mini chat first; robot FAB is visible initially
+      const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+      fireEvent.click(fab);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy());
+
+      // Desktop text input focus with no viewport shrink and non-coarse pointer does NOT hide robot FAB
+      const desktopInput = document.createElement('textarea');
+      document.body.appendChild(desktopInput);
+      desktopInput.focus();
+      fireEvent.focusIn(desktopInput);
+      expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy();
+      fireEvent.focusOut(desktopInput);
+      desktopInput.remove();
+
+      // 1. Active RemoteDesktopPanel keyboard opens -> hides FAB, keeps mini chat visible
+      fireEvent.click(screen.getByTestId('panel-kb-open-srv-beta'));
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+
+      // Switching to tab hostA (whose keyboard is closed) restores FAB without losing hostB state
+      view.rerender(<RemoteDesktopWorkspace
+        state={activateRemoteDesktopWorkspaceTab(state, hostAKey)}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // Switching back to hostB hides FAB again, then closing hostB's keyboard restores FAB
+      view.rerender(<RemoteDesktopWorkspace
+        state={activateRemoteDesktopWorkspaceTab(state, hostBKey)}
+        manager={manager}
+        mainChat={mainChat}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      fireEvent.click(screen.getByTestId('panel-kb-close-srv-beta'));
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 2. System keyboard via :root.kb-open hides FAB while keeping mini chat visible, then restores
+      act(() => { document.documentElement.classList.add('kb-open'); });
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+      act(() => { document.documentElement.classList.remove('kb-open'); });
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 3. System keyboard via visualViewport shrink (standalone mode without app.tsx) hides & restores FAB
+      vvHeight = 480;
+      act(() => {
+        for (const cb of vvListeners.get('resize') ?? []) cb();
+      });
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+
+      vvHeight = 800;
+      act(() => {
+        for (const cb of vvListeners.get('resize') ?? []) cb();
+      });
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+
+      // 4. Coarse pointer + text input focus hides FAB and focusout restores it
+      coarsePointer = true;
+      const touchInput = document.createElement('textarea');
+      document.body.appendChild(touchInput);
+      touchInput.focus();
+      fireEvent.focusIn(touchInput);
+      await waitFor(() => expect(screen.queryByTestId('cloud-docs-main-chat-fab')).toBeNull());
+      expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy();
+      touchInput.blur();
+      fireEvent.focusOut(touchInput);
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-main-chat-fab')).toBeTruthy());
+      touchInput.remove();
+    } finally {
+      document.documentElement.classList.remove('kb-open', 'input-focused');
+      window.matchMedia = origMatchMedia;
+      if (origInnerHeight) Object.defineProperty(window, 'innerHeight', origInnerHeight);
+      if (origVisualViewport) Object.defineProperty(window, 'visualViewport', origVisualViewport);
+      else delete (window as { visualViewport?: VisualViewport }).visualViewport;
+    }
+  });
+
+  it('cycles multi-tab hosts via tabPrev/tabNext shortcuts ONLY in standalone mode, releasing input and swallowing matching keydown/keyup', async () => {
+    const fullscreen = installFullscreenStub();
+    void fullscreen;
+    const { manager } = setupManager();
+    const releaseSpy = manager.releaseInput as ReturnType<typeof vi.fn>;
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('c'));
+    state = activateRemoteDesktopWorkspaceTab(state, 'a');
+
+    const activated: string[] = [];
+    const view = render(<RemoteDesktopWorkspace
+      standalone
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={(tabId) => {
+        activated.push(tabId);
+        state = activateRemoteDesktopWorkspaceTab(state, tabId);
+      }}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    // Focus inside a remote desktop stage/panel surface and verify capture swallows keydown + keyup
+    const panelA = screen.getByTestId('panel-a');
+    const stage = document.createElement('div');
+    stage.className = 'remote-desktop-panel';
+    stage.setAttribute('data-remote-desktop-surface', 'true');
+    stage.tabIndex = 0;
+    const bubbleKeyDown = vi.fn();
+    const bubbleKeyUp = vi.fn();
+    stage.addEventListener('keydown', bubbleKeyDown);
+    stage.addEventListener('keyup', bubbleKeyUp);
+    panelA.appendChild(stage);
+    stage.focus();
+
+    // 1. Default Alt+L (including macOS dead/glyph Option+L key='¬', code='KeyL') switches a -> b
+    const nextDown = new KeyboardEvent('keydown', {
+      key: '¬',
+      code: 'KeyL',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    stage.dispatchEvent(nextDown);
+    expect(nextDown.defaultPrevented).toBe(true);
+    expect(activated).toEqual(['b']);
+    expect(releaseSpy).toHaveBeenCalledWith('a');
+    expect(bubbleKeyDown).not.toHaveBeenCalled();
+
+    const nextUp = new KeyboardEvent('keyup', {
+      key: 'l',
+      code: 'KeyL',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    stage.dispatchEvent(nextUp);
+    expect(nextUp.defaultPrevented).toBe(true);
+    expect(bubbleKeyUp).not.toHaveBeenCalled();
+
+    // Re-render with state='b', then test fullscreen mode + wrap-around Alt+J (b -> a -> c)
+    view.rerender(<RemoteDesktopWorkspace
+      standalone
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={(tabId) => {
+        activated.push(tabId);
+        state = activateRemoteDesktopWorkspaceTab(state, tabId);
+      }}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(view.container.querySelector('.remote-desktop-workspace-fullscreen')!);
+    expect(document.fullscreenElement).toBe(view.container.querySelector('.remote-desktop-workspace'));
+
+    const prevDown1 = new KeyboardEvent('keydown', {
+      key: '∆',
+      code: 'KeyJ',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    stage.dispatchEvent(prevDown1);
+    expect(prevDown1.defaultPrevented).toBe(true);
+    expect(activated.at(-1)).toBe('a');
+    expect(releaseSpy).toHaveBeenLastCalledWith('b');
+
+    // Rapid second keypress before React re-renders wraps a -> c and releases 'a'
+    const prevDown2 = new KeyboardEvent('keydown', {
+      key: '∆',
+      code: 'KeyJ',
+      altKey: true,
+      repeat: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    stage.dispatchEvent(prevDown2);
+    expect(prevDown2.defaultPrevented).toBe(true);
+    expect(activated.at(-1)).toBe('c');
+    expect(releaseSpy).toHaveBeenLastCalledWith('a');
+
+    // Clear one-shot keyup tracking via blur, and verify non-shortcut keys still reach stage normally
+    window.dispatchEvent(new Event('blur'));
+    const normalDown = new KeyboardEvent('keydown', { key: 'x', code: 'KeyX', bubbles: true, cancelable: true });
+    stage.dispatchEvent(normalDown);
+    expect(normalDown.defaultPrevented).toBe(false);
+    expect(bubbleKeyDown).toHaveBeenCalledTimes(1);
+
+    // Non-tab navigation shortcuts (e.g. Alt+I serverPrev) are NOT intercepted in standalone RD window
+    const serverPrevDown = new KeyboardEvent('keydown', {
+      key: 'i',
+      code: 'KeyI',
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    stage.dispatchEvent(serverPrevDown);
+    expect(serverPrevDown.defaultPrevented).toBe(false);
+    expect(bubbleKeyDown).toHaveBeenCalledTimes(2);
+  });
+
+  it('supports macOS secondary Ctrl+A/Ctrl+D and live custom overrides from KEYBOARD_SHORTCUTS_PREF_KEY in standalone mode', async () => {
+    const origPlatform = Object.getOwnPropertyDescriptor(window.navigator, 'platform');
+    Object.defineProperty(window.navigator, 'platform', { value: 'MacIntel', configurable: true });
+    try {
+      const { manager } = setupManager();
+      let state = createRemoteDesktopWorkspaceState();
+      state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+      state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+      state = activateRemoteDesktopWorkspaceTab(state, 'a');
+      const onActivateTab = vi.fn((tabId: string) => {
+        state = activateRemoteDesktopWorkspaceTab(state, tabId);
+      });
+
+      const view = render(<RemoteDesktopWorkspace
+        standalone
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={onActivateTab}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+
+      // macOS secondary Ctrl+D -> b, Ctrl+A -> a
+      const ctrlD = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlD);
+      expect(ctrlD.defaultPrevented).toBe(true);
+      expect(onActivateTab).toHaveBeenLastCalledWith('b');
+
+      view.rerender(<RemoteDesktopWorkspace
+        standalone
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={onActivateTab}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+
+      const ctrlA = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlA);
+      expect(ctrlA.defaultPrevented).toBe(true);
+      expect(onActivateTab).toHaveBeenLastCalledWith('a');
+
+      // Live preference sync via StorageEvent updates custom tabNext chord without reloading
+      const prefStorageKey = `rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`;
+      const customPayload = JSON.stringify({ t: Date.now() + 1000, v: { tabNext: 'Meta+]' } });
+      localStorage.setItem(prefStorageKey, customPayload);
+      act(() => {
+        window.dispatchEvent(new StorageEvent('storage', { key: prefStorageKey, newValue: customPayload }));
+      });
+
+      await waitFor(() => {
+        const metaBracket = new KeyboardEvent('keydown', {
+          key: ']',
+          code: 'BracketRight',
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        window.dispatchEvent(metaBracket);
+        expect(metaBracket.defaultPrevented).toBe(true);
+      });
+      expect(onActivateTab).toHaveBeenLastCalledWith('b');
+    } finally {
+      if (origPlatform) Object.defineProperty(window.navigator, 'platform', origPlatform);
+      else delete (window.navigator as { platform?: string }).platform;
+    }
+  });
+
+  it('passes shortcuts through in single-tab standalone, non-standalone workspace, and local inputs/pickers/IME', async () => {
+    const { manager } = setupManager();
+
+    // 1. Single-tab standalone: Alt+L / Ctrl+A must pass through untouched
+    const singleState = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('solo'));
+    const singleActivate = vi.fn();
+    const soloView = render(<RemoteDesktopWorkspace
+      standalone
+      state={singleState}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={singleActivate}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const soloBubble = vi.fn();
+    const soloPanel = screen.getByTestId('panel-solo');
+    soloPanel.addEventListener('keydown', soloBubble);
+    const soloAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    soloPanel.dispatchEvent(soloAltL);
+    expect(soloAltL.defaultPrevented).toBe(false);
+    expect(soloBubble).toHaveBeenCalledTimes(1);
+    expect(singleActivate).not.toHaveBeenCalled();
+    soloView.unmount();
+
+    // 2. Non-standalone workspace with 2+ hosts: handler must NOT be active
+    let multiState = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    multiState = openRemoteDesktopWorkspaceHost(multiState, machine('b'));
+    const inlineActivate = vi.fn();
+    const inlineView = render(<RemoteDesktopWorkspace
+      state={multiState}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={inlineActivate}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const inlineBubble = vi.fn();
+    const inlinePanel = screen.getByTestId('panel-a');
+    inlinePanel.addEventListener('keydown', inlineBubble);
+    const inlineAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    inlinePanel.dispatchEvent(inlineAltL);
+    expect(inlineAltL.defaultPrevented).toBe(false);
+    expect(inlineBubble).toHaveBeenCalledTimes(1);
+    expect(inlineActivate).not.toHaveBeenCalled();
+    inlineView.unmount();
+
+    // 3. Standalone multi-tab suppresses during IME composition, local inputs, and open picker
+    const standaloneActivate = vi.fn();
+    const standaloneView = render(<RemoteDesktopWorkspace
+      standalone
+      state={multiState}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={standaloneActivate}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const imeEvt = new KeyboardEvent('keydown', {
+      key: 'l',
+      code: 'KeyL',
+      altKey: true,
+      isComposing: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(imeEvt);
+    expect(imeEvt.defaultPrevented).toBe(false);
+
+    const localInput = document.createElement('input');
+    document.body.appendChild(localInput);
+    localInput.focus();
+    const inputEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    localInput.dispatchEvent(inputEvt);
+    expect(inputEvt.defaultPrevented).toBe(false);
+    localInput.remove();
+
+    fireEvent.click(standaloneView.container.querySelector('.remote-desktop-workspace-add')!);
+    const pickerEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(pickerEvt);
+    expect(pickerEvt.defaultPrevented).toBe(false);
+    expect(standaloneActivate).not.toHaveBeenCalled();
+  });
+
+  it('toggles menu bar visibility across workspace tabbar, mobile selector, embedded panel, and floating restore pill', () => {
+    const { manager } = setupManager();
+    let state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const workspaceEl = view.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    const tabbar = view.container.querySelector('.remote-desktop-workspace-tabbar') as HTMLElement;
+    const mobileSelector = view.container.querySelector('.remote-desktop-workspace-mobile-selector') as HTMLElement;
+    const hideBtn = view.container.querySelector('.remote-desktop-workspace-menubar-toggle') as HTMLButtonElement;
+    expect(hideBtn).toBeTruthy();
+    expect(hideBtn.getAttribute('aria-label')).toBe('remote_desktop.hide_menubar');
+    expect(hideBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(tabbar.hidden).toBe(false);
+    expect(mobileSelector.hidden).toBe(false);
+    expect(screen.getByTestId('panel-a').getAttribute('data-menubar-hidden')).toBe('false');
+    expect(view.container.querySelector('.remote-desktop-menubar-restore')).toBeNull();
+
+    // Open host picker first; hiding the menu bar should dismiss it too.
+    fireEvent.click(view.container.querySelector('.remote-desktop-workspace-add')!);
+    expect(view.container.querySelector('.remote-desktop-workspace-add')?.getAttribute('aria-expanded')).toBe('true');
+
+    fireEvent.click(hideBtn);
+
+    expect(workspaceEl.classList.contains('is-menubar-hidden')).toBe(true);
+    expect(tabbar.hidden).toBe(true);
+    expect(mobileSelector.hidden).toBe(true);
+    expect(view.container.querySelector('.remote-desktop-workspace-add')?.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByTestId('panel-a').getAttribute('data-menubar-hidden')).toBe('true');
+    expect(screen.getByTestId('panel-b').getAttribute('data-menubar-hidden')).toBe('true');
+
+    const restoreBtn = view.container.querySelector('.remote-desktop-menubar-restore') as HTMLButtonElement;
+    expect(restoreBtn).toBeTruthy();
+    expect(restoreBtn.getAttribute('aria-label')).toBe('remote_desktop.show_menubar');
+    expect(restoreBtn.classList.contains('remote-desktop-file-window')).toBe(true);
+
+    fireEvent.click(restoreBtn);
+
+    expect(workspaceEl.classList.contains('is-menubar-hidden')).toBe(false);
+    expect(tabbar.hidden).toBe(false);
+    expect(mobileSelector.hidden).toBe(false);
+    expect(screen.getByTestId('panel-a').getAttribute('data-menubar-hidden')).toBe('false');
+    expect(view.container.querySelector('.remote-desktop-menubar-restore')).toBeNull();
+    view.unmount();
+
+    // Standalone workspace mode keeps the same toggle & restore pill
+    const standaloneView = render(<RemoteDesktopWorkspace
+      standalone
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(standaloneView.container.querySelector('.remote-desktop-workspace-menubar-toggle')!);
+    expect(standaloneView.container.querySelector('.remote-desktop-workspace-tabbar')?.hasAttribute('hidden')).toBe(true);
+    const standaloneRestore = standaloneView.container.querySelector('.remote-desktop-menubar-restore') as HTMLButtonElement;
+    expect(standaloneRestore).toBeTruthy();
+    fireEvent.click(standaloneRestore);
+    expect(standaloneView.container.querySelector('.remote-desktop-workspace-tabbar')?.hasAttribute('hidden')).toBe(false);
+    standaloneView.unmount();
+  });
+});

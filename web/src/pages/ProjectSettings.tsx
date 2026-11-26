@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'preact/hooks';
+import { PROJECT_ROLE_AGENT_TYPES } from '../components/session-agent-options.js';
 
 interface ProjectSettings {
   name: string;
@@ -29,7 +30,7 @@ export function ProjectSettings({ apiKey, serverId, projectName, onSaved, onCanc
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'copilot-sdk', 'cursor-headless', 'opencode', 'gemini', 'gemini-sdk', 'kimi-sdk', 'qwen'];
+  const agentTypes = PROJECT_ROLE_AGENT_TYPES;
 
   useEffect(() => {
     fetch(`/api/server/${serverId}/projects/${projectName}`, {

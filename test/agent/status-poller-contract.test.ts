@@ -129,6 +129,19 @@ describe('StatusPoller', () => {
     );
   });
 
+  it('skips removed or non-process agent types without calling getDriver or logging poll errors', async () => {
+    const poller = new StatusPoller({ pollIntervalMs: 10 });
+    poller.addSession({ ...session('deck_cd_legacy'), agentType: 'gemini' as SessionRecord['agentType'] });
+    poller.addSession({ ...session('deck_cd_legacy_sdk'), agentType: 'gemini-sdk' as SessionRecord['agentType'] });
+    poller.addSession({ ...session('deck_cd_transport'), agentType: 'codex-sdk' });
+
+    await poll(poller);
+
+    expect(getDriverMock).not.toHaveBeenCalled();
+    expect(capturePaneMock).not.toHaveBeenCalled();
+    expect(loggerWarnMock).not.toHaveBeenCalled();
+  });
+
   it('starts and stops its interval timer', () => {
     vi.useFakeTimers();
     try {

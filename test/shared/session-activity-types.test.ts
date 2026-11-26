@@ -1,10 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildCodexLifecycleIdempotencyKey,
+  buildCodexLifecycleTerminalMetadata,
   evaluateProviderSnapshot,
   hasProviderActiveWork,
+  isCodexLifecycleTerminalMetadata,
   isAuthoritativeCleanIdlePayload,
+  isOlderActivityGeneration,
+  isWorkingSessionState,
   reduceTimelineActivity,
+  toPrivacySafeLifecycleMetadata,
 } from '../../shared/session-activity-types.js';
+import {
+  CODEX_APP_SERVER_SCHEMA_BASELINE_NOTE,
+  codexAppServerLifecycleReplay,
+  codexLifecycleProjectionEvents,
+} from '../fixtures/codex-app-server-lifecycle.js';
 
 const authoritativeIdlePayload = {
   state: 'idle',
@@ -20,6 +31,19 @@ const authoritativeIdlePayload = {
 } as const;
 
 describe('session activity shared contract', () => {
+  it('treats permission waits as foreground work, but terminal states as inactive', () => {
+    for (const state of ['running', 'queued', 'streaming', 'thinking', 'tool_running', 'permission']) {
+      expect(isWorkingSessionState(state)).toBe(true);
+    }
+    for (const state of ['idle', 'error', 'stopped', 'stopping', 'unknown', null, undefined]) {
+      expect(isWorkingSessionState(state)).toBe(false);
+    }
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: { state: 'permission' } },
+    ])).toMatchObject({ active: true });
+  });
+
   it('requires generation and zero blocking counts for authoritative clean idle', () => {
     expect(isAuthoritativeCleanIdlePayload(authoritativeIdlePayload)).toBe(true);
     expect(isAuthoritativeCleanIdlePayload(authoritativeIdlePayload, { scope: 'session', sessionName: 'deck_test', generation: 1 })).toBe(true);
@@ -127,6 +151,34 @@ describe('session activity shared contract', () => {
     });
   });
 
+  it('does not count SDK sub-agent timeline rows as parent active work', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_test:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ])).toMatchObject({ active: false, degraded: false, openToolCount: 0 });
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+      { type: 'tool.result', payload: { toolCallId: 'agent-1', detail: { ...sdkDetail, meta: { ...sdkDetail.meta, normalizedStatus: 'complete', active: false, terminal: true } } } },
+    ])).toMatchObject({ active: false, degraded: false, openToolCount: 0 });
+  });
+
   it('treats stale-generation authoritative idle as weak over open tools', () => {
     expect(reduceTimelineActivity([
       {
@@ -174,6 +226,170 @@ describe('session activity shared contract', () => {
       openToolCount: 0,
       lastTerminalStatus: 'stale',
       lastTerminalReason: 'daemon_restart_orphan',
+    });
+  });
+
+  it('validates Codex lifecycle terminal metadata and stable idempotency keys', () => {
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: 'deck_test',
+      terminalStatus: 'cancelled',
+      terminalReason: 'user_cancelled',
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'local_stop',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test', generation: 4 },
+      itemId: 'item-1',
+      toolCallId: 'tool-1',
+      turnId: 'turn-1',
+      itemKind: 'web_search',
+    });
+    expect(isCodexLifecycleTerminalMetadata(metadata)).toBe(true);
+    expect(metadata.idempotencyKey).toBe(buildCodexLifecycleIdempotencyKey({
+      sessionId: 'deck_test',
+      terminalStatus: 'cancelled',
+      terminalReason: 'user_cancelled',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test', generation: 4 },
+      itemId: 'item-1',
+      toolCallId: 'tool-1',
+      turnId: 'turn-1',
+    }));
+
+    expect(isCodexLifecycleTerminalMetadata({
+      ...metadata,
+      terminalReason: 'not-a-reason',
+    })).toBe(false);
+    expect(isCodexLifecycleTerminalMetadata({
+      ...metadata,
+      source: 'rollout_jsonl_diagnostic',
+      terminalReason: 'thread_idle_settle',
+      itemKind: 'context_compaction',
+    })).toBe(true);
+  });
+
+  it('keeps lifecycle diagnostic metadata privacy-bounded', () => {
+    const safe = toPrivacySafeLifecycleMetadata({
+      sessionId: 'deck_test',
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+      idempotencyKey: 'stable-key',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test', generation: 2 },
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      rawUserMessage: 'SECRET_USER_BODY',
+      prompt: 'SECRET_PROMPT',
+      toolInput: 'SECRET_TOOL_INPUT',
+      commandOutput: 'SECRET_COMMAND_OUTPUT',
+      providerPayload: { token: 'SECRET_PROVIDER_PAYLOAD' },
+      env: { SECRET_ENV: 'SECRET_ENV_VALUE' },
+      childTranscript: 'SECRET_CHILD_TRANSCRIPT',
+    });
+    expect(safe).toMatchObject({
+      sessionId: 'deck_test',
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+      idempotencyKey: 'stable-key',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+    });
+    expect(JSON.stringify(safe)).not.toContain('SECRET_');
+  });
+
+  it('uses the maintained Codex app-server fixture baseline for projection parity', () => {
+    expect(CODEX_APP_SERVER_SCHEMA_BASELINE_NOTE).toContain('schema is not available');
+    expect(codexAppServerLifecycleReplay.map((event) => event.method)).toEqual([
+      'thread/resume',
+      'turn/start',
+      'item/started',
+      'item/started',
+      'item/completed',
+      'turn/completed',
+    ]);
+    expect(reduceTimelineActivity(codexLifecycleProjectionEvents)).toMatchObject({
+      active: false,
+      degraded: false,
+      openToolCount: 0,
+      lastTerminalStatus: 'succeeded',
+      lastTerminalReason: 'app_server_completed',
+    });
+  });
+
+  it('orders participant frames by activity generation without crossing sessions', () => {
+    expect(isOlderActivityGeneration(
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 3 },
+    )).toBe(true);
+    expect(isOlderActivityGeneration('session:deck_sub_other:1', 'session:deck_sub_child:2')).toBe(false);
+    expect(isOlderActivityGeneration('provider-turn-a', 'provider-turn-b')).toBe(false);
+  });
+
+  it('fails open for malformed generation objects from legacy or unknown frames', () => {
+    expect(() => isOlderActivityGeneration(
+      { scope: 'session', sessionName: null, generation: 1 } as never,
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+    )).not.toThrow();
+    expect(isOlderActivityGeneration(
+      { scope: 'session', sessionName: null, generation: 1 } as never,
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+    )).toBe(false);
+  });
+
+  it('clears open tool calls when idle follows user_cancel stopping or carries command_handler_cancel_idle even across generation mismatch', () => {
+    const preRestartRunning = {
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 5 },
+    };
+    const openTool = { toolCallId: 'tool-open-1', tool: 'Read' };
+    const stoppingCancel = { state: 'stopping', reason: 'user_cancel' };
+    const weakCancelIdle = {
+      state: 'idle',
+      pendingCount: 0,
+      queueSnapshot: { source: 'command_handler_cancel_idle' },
+    };
+    const mismatchedGenCancelIdle = {
+      state: 'idle',
+      authoritative: true,
+      activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 0 },
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      pendingCount: 0,
+      pendingVersion: 1,
+      decisionReason: 'command_handler_cancel_idle',
+      clearInputs: [{ source: 'command_handler', reason: 'clear', count: 0 }],
+    };
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: preRestartRunning },
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: stoppingCancel },
+      { type: 'session.state', payload: weakCancelIdle },
+    ])).toMatchObject({
+      active: false,
+      openToolCount: 0,
+    });
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: preRestartRunning },
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: stoppingCancel },
+      { type: 'session.state', payload: mismatchedGenCancelIdle },
+    ])).toMatchObject({
+      active: false,
+      openToolCount: 0,
+    });
+
+    // Generic weak idle without user cancel must continue preserving open keyed tool calls.
+    expect(reduceTimelineActivity([
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: { state: 'idle' } },
+    ])).toMatchObject({
+      active: true,
+      openToolCount: 1,
+      degradedReasons: ['weak_idle_with_open_work'],
     });
   });
 });

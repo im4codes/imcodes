@@ -77,9 +77,9 @@ describe('shared-agent-context continuity integration', () => {
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
       modelConfig: {
         primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.2',
-        backupContextBackend: 'qwen',
-        backupContextModel: 'qwen',
+        primaryContextModel: 'gpt-6-luna',
+        backupContextBackend: 'agy-sdk',
+        backupContextModel: 'gemini-3.8-flash-low',
         enablePersonalMemorySync: true,
       },
     });
@@ -89,9 +89,9 @@ describe('shared-agent-context continuity integration', () => {
     const materialized = await coordinator.materializeTarget(target, 'manual', 200);
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.2',
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen',
+      primaryContextModel: 'gpt-6-luna',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
       enablePersonalMemorySync: true,
     });
 

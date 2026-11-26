@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { getActiveThinkingTs, getTailSessionState, hasActiveToolCall } from '../src/thinking-utils.js';
+import { getActiveStatusText, getActiveThinkingTs, getTailSessionState, hasActiveToolCall } from '../src/thinking-utils.js';
 
 const authoritativeIdlePayload = {
   state: 'idle',
@@ -65,6 +65,27 @@ describe('hasActiveToolCall', () => {
     ] as any)).toBe(false);
   });
 
+  it('does not treat a backgrounded SDK sub-agent heartbeat after idle as an active parent tool call', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_main:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+    expect(hasActiveToolCall([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ] as any)).toBe(false);
+  });
+
   it('does not close one keyed tool when another keyed tool completes', () => {
     expect(hasActiveToolCall([
       { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
@@ -83,6 +104,87 @@ describe('getActiveThinkingTs', () => {
       { type: 'agent.status', ts: 12, payload: { label: 'still thinking' } },
     ] as any)).toBe(10);
   });
+
+  it('walks through metadata events so the thinking timer survives memory injection', () => {
+    // memory.context / memory.compression / file.change are telemetry: they must
+    // not end a thinking sequence. Before the fix, memory.context terminated the
+    // scan and the elapsed-thinking timer silently disappeared.
+    expect(getActiveThinkingTs([
+      { type: 'assistant.thinking', ts: 10 },
+      { type: 'memory.context', ts: 11, payload: { query: 'x' } },
+      { type: 'file.change', ts: 12, payload: { batch: {} } },
+      { type: 'agent.status', ts: 13, payload: { label: 'Thinking (1.9k tokens)' } },
+    ] as any)).toBe(10);
+  });
+
+  it('still ends thinking on real user/assistant turn boundaries', () => {
+    expect(getActiveThinkingTs([
+      { type: 'assistant.thinking', ts: 10 },
+      { type: 'assistant.text', ts: 11, payload: { text: 'answered', streaming: false } },
+      { type: 'memory.context', ts: 12, payload: {} },
+    ] as any)).toBe(null);
+  });
+});
+
+describe('getActiveStatusText', () => {
+  it('keeps an automatic peer-audit status visible across protocol events and automation notes', () => {
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'supervision_audit_waiting', label: 'Peer audit running' } },
+      { type: 'assistant.text', payload: { text: 'Audit started', automation: true, memoryExcluded: true } },
+      { type: 'peer_audit.status', payload: { phase: 'waiting_reply', trigger: 'automatic' } },
+    ])).toBe('Peer audit running');
+  });
+
+  it('does not carry supervision status across ordinary assistant activity', () => {
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'supervision_audit_waiting', label: 'Peer audit running' } },
+      { type: 'assistant.text', payload: { text: 'ordinary assistant reply' } },
+    ])).toBeNull();
+  });
+
+  it('preserves Running background task across usage.update and session.state(running) (ORD 5513..5517)', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBe('Running background task');
+  });
+
+  it('clears background status immediately on session.state(idle) or session.state(stopped)', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'idle' } },
+    ])).toBeNull();
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'session.state', payload: { state: 'stopped' } },
+    ])).toBeNull();
+  });
+
+  it('does not leak finished tool status across tool.result followed by session.state(running)', () => {
+    expect(getActiveStatusText([
+      { type: 'tool.call', payload: { tool: 'Read' } },
+      { type: 'agent.status', payload: { label: 'Reading file...' } },
+      { type: 'tool.result', payload: { ok: true } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 1, busyReasons: ['runtime_dispatch'] } },
+    ])).toBeNull();
+  });
+
+  it('falls back to Running background task for background_monitor-only running tail unless explicitly cleared with label:null', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBe('Running background task');
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { label: null } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBeNull();
+  });
 });
 
 describe('getTailSessionState', () => {
@@ -99,5 +201,58 @@ describe('getTailSessionState', () => {
       { type: 'assistant.thinking', ts: 1 },
       { type: 'tool.call', payload: { tool: 'Read' } },
     ] as any)).toBe(null);
+  });
+
+  it('keeps the tail session state idle while backgrounded SDK sub-agent heartbeats continue', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_main:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+    expect(getTailSessionState([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ] as any)).toBe('idle');
+  });
+
+  it('ignores neutral started notifications when deriving the active tail state', () => {
+    expect(getTailSessionState([
+      { type: 'session.state', ts: 1, payload: authoritativeIdlePayload },
+      { type: 'session.state', ts: 2, payload: { state: 'started' } },
+    ] as any)).toBe('idle');
+
+    expect(getTailSessionState([
+      { type: 'session.state', ts: 2, payload: { state: 'started' } },
+    ] as any)).toBe(null);
+  });
+
+  it('clears open tool calls and thinking after stopping (user_cancel) + command_handler_cancel_idle', () => {
+    const events = [
+      { type: 'assistant.thinking', ts: 100, payload: { text: 'thinking' } },
+      { type: 'tool.call', ts: 200, payload: { toolCallId: 'tool-1', tool: 'Read' } },
+      { type: 'session.state', ts: 300, payload: { state: 'stopping', reason: 'user_cancel' } },
+      {
+        type: 'session.state',
+        ts: 310,
+        payload: {
+          state: 'idle',
+          pendingCount: 0,
+          queueSnapshot: { source: 'command_handler_cancel_idle' },
+        },
+      },
+    ];
+    expect(hasActiveToolCall(events as any)).toBe(false);
+    expect(getActiveThinkingTs(events as any)).toBeNull();
+    expect(getTailSessionState(events as any)).toBe('idle');
   });
 });

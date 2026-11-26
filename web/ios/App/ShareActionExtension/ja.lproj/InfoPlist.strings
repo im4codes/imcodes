@@ -1,0 +1,7 @@
+"CFBundleDisplayName" = "IM.codes に送信";
+"share.notificationBody" = "%d 件のファイルを保存しました。タップして IM.codes で送信します。";
+"share.notificationBodyText" = "共有内容を保存しました。タップして IM.codes で送信します。";
+"share.openApp" = "ファイルを保存しました。通知バナーをタップするか、IM.codes を開いてサーバーとセッションを選択してください。";
+"share.openAppText" = "共有内容を保存しました。通知バナーをタップするか、IM.codes を開いてサーバーとセッションを選択してください。";
+"share.done" = "完了";
+"share.error" = "共有内容を読み込めませんでした。もう一度お試しください。";

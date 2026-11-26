@@ -16,3 +16,7 @@ tmp
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+**/._*
+server/controlled-node-artifacts/installers
+server/controlled-node-artifacts/daemon-runtime/*.tar.gz
+server/controlled-node-artifacts/daemon-runtime/*.zip

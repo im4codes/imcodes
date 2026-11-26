@@ -112,7 +112,11 @@ export class DiscordHandler implements PlatformHandler {
   }
 
   async sendOutbound(msg: OutboundMessage, config: BotConfig): Promise<void> {
-    const channelId = msg.channelId.includes(':') ? msg.channelId.split(':')[1] : msg.channelId;
+    const parts = msg.channelId.split(':');
+    const channelId = parts.length === 2 ? parts[1]! : msg.channelId;
+    if (!/^\d{15,25}$/.test(channelId)) {
+      throw new Error('Invalid Discord channelId');
+    }
     const caps = this.getCapabilities();
     const chunks = splitMessage(msg.content, caps.maxMessageLength);
 

@@ -3,6 +3,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { ensureCursorMcpJsonHasImcodesEntry } from '../../src/daemon/cursor-mcp-config.js';
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -44,7 +48,7 @@ describe('ensureCursorMcpJsonHasImcodesEntry', () => {
     expect(second.changed).toBe(false);
     expect(second.degraded).toBe(false);
     expect(parsed.mcpServers.user).toEqual({ command: 'node', args: ['server.js'], env: { KEEP: 'yes' } });
-    expect(parsed.mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]).toEqual({ command: 'imcodes', args: ['memory', 'mcp'] });
+    expect(parsed.mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]).toEqual({ command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND, args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS] });
     expect(await readFile(first.backupPath!, 'utf8')).toContain('"user"');
     expect(await readFile(noticeMarkerPath, 'utf8')).toContain('Remove it by deleting');
   });
@@ -62,6 +66,6 @@ describe('ensureCursorMcpJsonHasImcodesEntry', () => {
 
     expect(result.serverName).toBe(`${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`);
     expect(parsed.mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]).toEqual({ command: 'custom', args: [] });
-    expect(parsed.mcpServers[`${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`]).toEqual({ command: 'imcodes', args: ['memory', 'mcp'] });
+    expect(parsed.mcpServers[`${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`]).toEqual({ command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND, args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS] });
   });
 });

@@ -22,27 +22,51 @@ const {
   configureApiKeyMock,
   exchangeNonceWithRetryMock,
   storeAuthKeyMock,
-  preferencesSetMock,
+  storeAuthKeyIdMock,
 } = vi.hoisted(() => ({
   authSessionStartMock: vi.fn(),
   configureApiKeyMock: vi.fn(),
   exchangeNonceWithRetryMock: vi.fn(),
   storeAuthKeyMock: vi.fn(),
-  preferencesSetMock: vi.fn(),
+  storeAuthKeyIdMock: vi.fn(),
 }));
 
-const passwordLoginMock = vi.hoisted(() => vi.fn());
+const {
+  passkeyLoginBeginMock,
+  passkeyLoginCompleteMock,
+  passkeyRegisterBeginMock,
+  passkeyRegisterCompleteMock,
+  passwordLoginMock,
+  passwordChangeMock,
+  passwordRegisterMock,
+} = vi.hoisted(() => ({
+  passkeyLoginBeginMock: vi.fn(),
+  passkeyLoginCompleteMock: vi.fn(),
+  passkeyRegisterBeginMock: vi.fn(),
+  passkeyRegisterCompleteMock: vi.fn(),
+  passwordLoginMock: vi.fn(),
+  passwordChangeMock: vi.fn(),
+  passwordRegisterMock: vi.fn(),
+}));
+const ApiErrorMock = vi.hoisted(() => class ApiErrorMock extends Error {
+  code: string | null;
+  constructor(public status: number, public body: string) {
+    super(`API ${status}`);
+    this.code = (() => { try { return (JSON.parse(body) as { error?: string }).error ?? null; } catch { return null; } })();
+  }
+});
 
 vi.mock('../../src/api.js', () => ({
   configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
   exchangeNonceWithRetry: (...args: unknown[]) => exchangeNonceWithRetryMock(...args),
-  passkeyLoginBegin: vi.fn(),
-  passkeyLoginComplete: vi.fn(),
-  passkeyRegisterBegin: vi.fn(),
-  passkeyRegisterComplete: vi.fn(),
+  passkeyLoginBegin: (...args: unknown[]) => passkeyLoginBeginMock(...args),
+  passkeyLoginComplete: (...args: unknown[]) => passkeyLoginCompleteMock(...args),
+  passkeyRegisterBegin: (...args: unknown[]) => passkeyRegisterBeginMock(...args),
+  passkeyRegisterComplete: (...args: unknown[]) => passkeyRegisterCompleteMock(...args),
   passwordLogin: (...args: unknown[]) => passwordLoginMock(...args),
-  passwordChange: vi.fn(),
-  passwordRegister: vi.fn(),
+  passwordChange: (...args: unknown[]) => passwordChangeMock(...args),
+  passwordRegister: (...args: unknown[]) => passwordRegisterMock(...args),
+  ApiError: ApiErrorMock,
 }));
 
 vi.mock('../../src/native.js', () => ({
@@ -55,12 +79,7 @@ vi.mock('../../src/plugins/auth-session.js', () => ({
 
 vi.mock('../../src/biometric-auth.js', () => ({
   storeAuthKey: (...args: unknown[]) => storeAuthKeyMock(...args),
-}));
-
-vi.mock('@capacitor/preferences', () => ({
-  Preferences: {
-    set: (...args: unknown[]) => preferencesSetMock(...args),
-  },
+  storeAuthKeyId: (...args: unknown[]) => storeAuthKeyIdMock(...args),
 }));
 
 import { LoginPage } from '../../src/pages/LoginPage.js';
@@ -87,9 +106,9 @@ describe('LoginPage native auth nonce exchange', () => {
 
     await waitFor(() => {
       expect(exchangeNonceWithRetryMock).toHaveBeenCalledWith('https://app.im.codes', 'nonce-123');
-      expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-1');
+      expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-1', 'https://app.im.codes');
       expect(configureApiKeyMock).toHaveBeenCalledWith('api-key-1');
-      expect(preferencesSetMock).toHaveBeenCalledWith({ key: 'deck_api_key_id', value: 'key-1' });
+      expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-1', 'https://app.im.codes');
       expect(onLoginSuccess).toHaveBeenCalledWith('user-1', 'https://app.im.codes');
     });
   });
@@ -103,11 +122,43 @@ describe('LoginPage native auth nonce exchange', () => {
 
     await waitFor(() => {
       expect(exchangeNonceWithRetryMock).not.toHaveBeenCalled();
-      expect(storeAuthKeyMock).toHaveBeenCalledWith('legacy-key');
+      expect(storeAuthKeyMock).toHaveBeenCalledWith('legacy-key', 'https://app.im.codes');
       expect(configureApiKeyMock).toHaveBeenCalledWith('legacy-key');
-      expect(preferencesSetMock).toHaveBeenCalledWith({ key: 'deck_api_key_id', value: 'key-2' });
+      expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-2', 'https://app.im.codes');
       expect(onLoginSuccess).toHaveBeenCalledWith('user-2', 'https://app.im.codes');
     });
+  });
+
+  it('drops an in-flight native login before any credential write when its parent generation expires', async () => {
+    authSessionStartMock.mockResolvedValue({ url: 'imcodes://auth?nonce=nonce-stale' });
+    let resolveExchange!: (value: { apiKey: string; userId: string; keyId: string }) => void;
+    exchangeNonceWithRetryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveExchange = resolve;
+    }));
+    let current = true;
+    const finish = vi.fn();
+    const onLoginSuccess = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={() => ({ isCurrent: () => current, finish })}
+        onLoginSuccess={onLoginSuccess}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'login.passkey_signin' }));
+    await waitFor(() => {
+      expect(exchangeNonceWithRetryMock).toHaveBeenCalledWith('https://app.im.codes', 'nonce-stale');
+    });
+
+    current = false;
+    resolveExchange({ apiKey: 'must-not-store', userId: 'stale-user', keyId: 'stale-key' });
+
+    await waitFor(() => expect(finish).toHaveBeenCalledTimes(1));
+    expect(storeAuthKeyMock).not.toHaveBeenCalled();
+    expect(configureApiKeyMock).not.toHaveBeenCalled();
+    expect(storeAuthKeyIdMock).not.toHaveBeenCalled();
+    expect(onLoginSuccess).not.toHaveBeenCalled();
   });
 
   it('shows a connection failure message when nonce exchange fails', async () => {
@@ -118,6 +169,114 @@ describe('LoginPage native auth nonce exchange', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'login.passkey_signin' }));
 
     expect(await screen.findByText('login.nonce_exchange_failed')).toBeDefined();
+  });
+
+  it('rejects a second native password attempt while Secure Storage is pending', async () => {
+    passwordLoginMock.mockResolvedValue({
+      apiKey: 'api-key-a',
+      userId: 'user-a',
+      keyId: 'key-a',
+    });
+    let resolveStore!: () => void;
+    storeAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveStore = resolve;
+    }));
+    storeAuthKeyIdMock.mockResolvedValue(undefined);
+    const beginAuthAttempt = vi.fn(() => ({
+      isCurrent: () => true,
+      finish: vi.fn(),
+    }));
+    const onLoginSuccess = vi.fn();
+    const onChangeServer = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLoginSuccess={onLoginSuccess}
+        onChangeServer={onChangeServer}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    const username = screen.getByPlaceholderText('login.username_placeholder');
+    const password = screen.getByPlaceholderText('login.password_placeholder');
+    fireEvent.input(username, { target: { value: 'user-a' } });
+    fireEvent.input(password, { target: { value: 'password-a' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(storeAuthKeyMock).toHaveBeenCalledWith(
+      'api-key-a',
+      'https://app.im.codes',
+    ));
+    fireEvent.keyDown(password, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
+    const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });
+    expect((changeServer as HTMLButtonElement).disabled).toBe(true);
+    (changeServer as HTMLButtonElement).click();
+    expect(passwordLoginMock).toHaveBeenCalledTimes(1);
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(onChangeServer).not.toHaveBeenCalled();
+
+    resolveStore();
+    await waitFor(() => expect(onLoginSuccess).toHaveBeenCalledWith(
+      'user-a',
+      'https://app.im.codes',
+    ));
+    expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-a', 'https://app.im.codes');
+  });
+
+  it('rejects a second native password attempt while server key-id storage is pending', async () => {
+    passwordLoginMock.mockResolvedValue({
+      apiKey: 'api-key-b',
+      userId: 'user-b',
+      keyId: 'key-b',
+    });
+    storeAuthKeyMock.mockResolvedValue(undefined);
+    let resolvePreference!: () => void;
+    storeAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolvePreference = resolve;
+    }));
+    const beginAuthAttempt = vi.fn(() => ({
+      isCurrent: () => true,
+      finish: vi.fn(),
+    }));
+    const onLoginSuccess = vi.fn();
+    const onChangeServer = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLoginSuccess={onLoginSuccess}
+        onChangeServer={onChangeServer}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    const username = screen.getByPlaceholderText('login.username_placeholder');
+    const password = screen.getByPlaceholderText('login.password_placeholder');
+    fireEvent.input(username, { target: { value: 'user-b' } });
+    fireEvent.input(password, { target: { value: 'password-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(storeAuthKeyIdMock).toHaveBeenCalledWith(
+      'key-b',
+      'https://app.im.codes',
+    ));
+    fireEvent.keyDown(password, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
+    const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });
+    expect((changeServer as HTMLButtonElement).disabled).toBe(true);
+    (changeServer as HTMLButtonElement).click();
+    expect(passwordLoginMock).toHaveBeenCalledTimes(1);
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(onChangeServer).not.toHaveBeenCalled();
+
+    resolvePreference();
+    await waitFor(() => expect(onLoginSuccess).toHaveBeenCalledWith(
+      'user-b',
+      'https://app.im.codes',
+    ));
+    expect(storeAuthKeyMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -202,6 +361,51 @@ describe('LoginPage password login: remember-password', () => {
     });
   });
 
+  it('claims the parent auth generation before starting a Web password login', async () => {
+    let resolveLogin!: (value: Record<string, never>) => void;
+    passwordLoginMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveLogin = resolve;
+    }));
+    let generation = 0;
+    const staleMountGeneration = generation;
+    const finish = vi.fn();
+    const beginAuthAttempt = vi.fn(() => {
+      generation += 1;
+      const claimedGeneration = generation;
+      return {
+        isCurrent: () => generation === claimedGeneration,
+        finish,
+      };
+    });
+    const onLogin = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLogin={onLogin}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), {
+      target: { value: 'new-user' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), {
+      target: { value: 'new-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(passwordLoginMock).toHaveBeenCalledTimes(1));
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(generation).not.toBe(staleMountGeneration);
+    expect(onLogin).not.toHaveBeenCalled();
+
+    resolveLogin({});
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(finish).toHaveBeenCalledTimes(1);
+  });
+
   it('immediately wipes saved credentials when the user unchecks the box', () => {
     localStorage.setItem('rcc_login_remember', '1');
     localStorage.setItem('rcc_login_username', 'alice');
@@ -231,5 +435,250 @@ describe('LoginPage password login: remember-password', () => {
     expect(localStorage.getItem('rcc_login_remember')).toBe('0');
     expect(localStorage.getItem('rcc_login_username')).toBeNull();
     expect(localStorage.getItem('rcc_login_password')).toBeNull();
+  });
+
+  it('shows a localized lockout message with the remaining minutes', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(429, JSON.stringify({ error: 'too_many_attempts', retryAfterMs: 121000 })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'bad' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.too_many_attempts')).toBeTruthy());
+  });
+
+  it('shows a localized invalid-credentials message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(401, JSON.stringify({ error: 'invalid_credentials' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'bad' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.invalid_credentials')).toBeTruthy());
+  });
+
+  it('shows a localized pending-account message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_pending' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.account_pending')).toBeTruthy());
+  });
+
+  it('shows a localized disabled-account message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_disabled' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.account_disabled')).toBeTruthy());
+  });
+
+  it('shows a localized network/server-error message for a 5xx response', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(500, ''));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.network_error')).toBeTruthy());
+  });
+
+  it('shows a localized network/server-error message for a raw network failure (not an ApiError)', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new TypeError('Failed to fetch: network error'));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.network_error')).toBeTruthy());
+  });
+
+  it('shows a generic "login failed" message plus the raw code for an unrecognized error code', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(400, JSON.stringify({ error: 'some_unrecognized_code' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.login_failed_code')).toBeTruthy());
+  });
+
+  it('falls back to a generic "login failed" message with no code at all', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new Error('something unexpected'));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.login_failed')).toBeTruthy());
+  });
+
+  it('shows a localized message on register failure too (same authErrorMessage wiring as login)', async () => {
+    passwordRegisterMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_disabled' })));
+    openPasswordMode();
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'newuser' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'Passw0rd1' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'Passw0rd1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register_btn' }));
+    await waitFor(() => expect(screen.getByText('login.account_disabled')).toBeTruthy());
+  });
+
+  it('explains itself instead of bouncing back to login when a prior login did not keep its session', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} sessionNotStuck />);
+    expect(screen.getByText('login.session_not_stuck')).toBeTruthy();
+  });
+
+  it('never shows the session-not-stuck message on an ordinary mount', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  });
+});
+
+describe('LoginPage OAuth desktop_callback forwarding', () => {
+  const validCallback = 'http://127.0.0.1:43751/setup/callback?state=state_0123456789abcdef';
+  const encodedCallback = encodeURIComponent(validCallback);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nativeState.value = false;
+    const fakeLocation: Partial<Location> = {
+      ...window.location,
+      search: `?desktop_callback=${encodedCallback}`,
+      href: `https://app.im.codes/?desktop_callback=${encodedCallback}`,
+      reload: vi.fn(),
+      assign: vi.fn(),
+      replace: vi.fn(),
+    };
+    vi.stubGlobal('location', fakeLocation);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders both GitHub and Google sign-in buttons and forwards desktop_callback for Google OAuth', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} showGithub />);
+    expect(screen.getByRole('button', { name: 'login.github_signin' })).toBeTruthy();
+    const googleBtn = screen.getByRole('button', { name: 'login.google_signin' });
+    fireEvent.click(googleBtn);
+    const navUrl = new URL(window.location.href, 'https://app.im.codes');
+    expect(navUrl.pathname).toBe('/api/auth/google');
+    expect(navUrl.searchParams.get('desktop_callback')).toBe(validCallback);
+  });
+
+  it('forwards desktop_callback for GitHub OAuth', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} showGithub />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.github_signin' }));
+    const navUrl = new URL(window.location.href, 'https://app.im.codes');
+    expect(navUrl.pathname).toBe('/api/auth/github');
+    expect(navUrl.searchParams.get('desktop_callback')).toBe(validCallback);
+  });
+});
+
+describe('LoginPage completionMode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nativeState.value = false;
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.stubGlobal('location', {
+      ...window.location,
+      reload: vi.fn(),
+      assign: vi.fn(),
+      replace: vi.fn(),
+      href: window.location.href,
+    } as Partial<Location>);
+    vi.stubGlobal('PublicKeyCredential', function PublicKeyCredential() {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it('calls onLogin without reloading across password, passkey, register, and change-password when completionMode="callback"', async () => {
+    const onLogin = vi.fn();
+
+    // 1. Password login
+    passwordLoginMock.mockResolvedValueOnce({});
+    const view1 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view1.unmount();
+
+    // 2. Password register
+    passwordRegisterMock.mockResolvedValueOnce({ ok: true });
+    const view2 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'bobuser' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'Passw0rd1!' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'Passw0rd1!' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(2));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view2.unmount();
+
+    // 3. Passkey login
+    passkeyLoginBeginMock.mockResolvedValueOnce({ challengeId: 'c1' });
+    startAuthenticationMock.mockResolvedValueOnce({ id: 'cred-1' });
+    passkeyLoginCompleteMock.mockResolvedValueOnce({ ok: true });
+    const view3 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.passkey_signin' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(3));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view3.unmount();
+
+    // 4. Passkey register
+    passkeyRegisterBeginMock.mockResolvedValueOnce({ challengeId: 'c2' });
+    startRegistrationMock.mockResolvedValueOnce({ id: 'cred-2' });
+    passkeyRegisterCompleteMock.mockResolvedValueOnce({ ok: true });
+    const view4 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" initialMode="register" onLogin={onLogin} />);
+    fireEvent.input(screen.getByPlaceholderText('login.display_name_placeholder'), { target: { value: 'Alice' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.passkey_register_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(4));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view4.unmount();
+
+    // 5. Forced password change
+    passwordLoginMock.mockResolvedValueOnce({ passwordMustChange: true });
+    passwordChangeMock.mockResolvedValueOnce(undefined);
+    const view5 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'oldpass' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await screen.findByText('login.must_change_password');
+    fireEvent.input(screen.getByPlaceholderText('login.new_password_placeholder'), { target: { value: 'NewPassw0rd1!' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'NewPassw0rd1!' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.change_password_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(5));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view5.unmount();
+  });
+
+  it('keeps default reload completion behavior for ordinary/standalone login', async () => {
+    const onLogin = vi.fn();
+    passwordLoginMock.mockResolvedValueOnce({});
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(window.location.reload).toHaveBeenCalledTimes(1));
+    expect(onLogin).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders the Obsidian HUD brand logo above the login heading', () => {
+    const { container } = render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    const logo = container.querySelector('img.login-brand-logo') as HTMLImageElement | null;
+    expect(logo).toBeTruthy();
+    expect(logo?.getAttribute('src')).toBe('/imcodes-brand-logo.png');
+    expect(logo?.getAttribute('aria-hidden')).toBe('true');
+    expect(screen.getByRole('heading', { name: 'IM.codes' })).toBeTruthy();
   });
 });

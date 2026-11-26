@@ -60,6 +60,29 @@ describe('jsonl-parse-core', () => {
     expect(typesOf(emits)).toEqual(['assistant.text', 'usage.update']);
   });
 
+  it('suppresses the Claude resume synthetic seed assistant line', () => {
+    const ctx = createParseContext();
+    const line = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        id: 'msg_seed',
+        model: '<synthetic>',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'No response requested.' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    });
+
+    const { emits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line, lineByteOffset: 0 }],
+      presetContextWindow: 200_000,
+    });
+
+    expect(emits).toEqual([]);
+  });
+
   it('emits assistant.thinking for thinking blocks', () => {
     const ctx = createParseContext();
     const line = jsonlLine({
@@ -137,6 +160,42 @@ describe('jsonl-parse-core', () => {
     expect(typesOf(secondEmits)).toEqual(['tool.result']);
     // After a successful take, pending map entry is cleared.
     expect(ctx.pendingToolCalls.get('s1')?.has('tu_1') ?? false).toBe(false);
+  });
+
+  it('preserves complete multiline commands and long tool output', () => {
+    const ctx = createParseContext();
+    const command = `printf 'FIRST_LINE'\n${'printf command-segment\n'.repeat(20)}printf 'COMMAND_TAIL_9f6e'`;
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
+    const useLine = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        content: [{ type: 'tool_use', id: 'tu_long', name: 'Bash', input: { command } }],
+      },
+    });
+    const resultLine = jsonlLine({
+      type: 'user',
+      timestamp: '2026-04-24T00:00:01.000Z',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'tu_long', content: output }],
+      },
+    });
+
+    const { emits: callEmits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line: useLine, lineByteOffset: 0 }],
+    });
+    const { emits: resultEmits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line: resultLine, lineByteOffset: 1 }],
+    });
+
+    expect(command.length).toBeGreaterThan(240);
+    expect(output.length).toBeGreaterThan(200);
+    expect(callEmits[0].payload.input).toBe(command);
+    expect(resultEmits[0].payload.output).toBe(output);
+    expect(String(callEmits[0].payload.input)).toContain('COMMAND_TAIL_9f6e');
+    expect(String(resultEmits[0].payload.output)).toContain('OUTPUT_TAIL_4c21');
   });
 
   it('emits file.change + hidden tool rows for Edit tool once the result arrives', () => {
@@ -281,5 +340,39 @@ describe('jsonl-parse-core', () => {
     forgetSession(ctx, 'sA');
     expect(ctx.pendingToolCalls.has('sA')).toBe(false);
     expect(ctx.pendingToolCalls.get('sB')?.has('tu_b')).toBe(true);
+  });
+  it('puts the tool_use_id on both tool.call and tool.result payloads', () => {
+    // The web view pairs call/result by `toolCallId`. This producer already
+    // knew the id (it builds the eventId from it) but kept it off the payload,
+    // so the view fell back to adjacency and mispaired concurrent tools.
+    const ctx = createParseContext();
+    const useLine = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        content: [{ type: 'tool_use', id: 'tu_pair', name: 'Bash', input: { command: 'ls' } }],
+      },
+    });
+    const resultLine = jsonlLine({
+      type: 'user',
+      timestamp: '2026-04-24T00:00:01.000Z',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'tu_pair', content: 'output' }],
+      },
+    });
+
+    const { emits: callEmits } = parseLines(ctx, {
+      sessionName: 'pair1',
+      items: [{ line: useLine, lineByteOffset: 0 }],
+    });
+    expect(callEmits[0].payload.toolCallId).toBe('tu_pair');
+
+    const { emits: resultEmits } = parseLines(ctx, {
+      sessionName: 'pair1',
+      items: [{ line: resultLine, lineByteOffset: 1 }],
+    });
+    expect(resultEmits[0].payload.toolCallId).toBe('tu_pair');
+
+    forgetSession(ctx, 'pair1');
   });
 });

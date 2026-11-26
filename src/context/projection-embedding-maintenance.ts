@@ -32,8 +32,9 @@ import { projectionEmbedSourceText } from '../../shared/memory-content-hash.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import type { ProjectionEmbeddingRow, ProjectionMissingEmbeddingRow } from '../store/context-store.js';
 import logger from '../util/logger.js';
-import { encodeEmbedding, generateEmbedding, isEmbeddingAvailable } from './embedding.js';
+import { encodeEmbedding, generateEmbedding, isEmbeddingAvailable, getEmbeddingMode } from './embedding.js';
 import { resolveMemoryConfigForNamespace } from './memory-config-resolver.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 /** Default rows scanned per backfill batch. Small enough that a single batch
  *  never blocks the loop for long even on a cold model, large enough that the
@@ -73,6 +74,7 @@ export async function ensureProjectionEmbedding(
   projectionId: string,
   embedSourceText: string,
 ): Promise<boolean> {
+  if (!isMemoryDaemonEnabled()) return false;
   try {
     // Idempotency / staleness: skip when the stored vector already matches the
     // exact source text the recall reader would compare against.
@@ -146,8 +148,11 @@ export interface BackfillProjectionEmbeddingsResult {
 export async function backfillProjectionEmbeddings(
   opts: { batchSize?: number; maxBatches?: number } = {},
 ): Promise<BackfillProjectionEmbeddingsResult> {
+  if (!isMemoryDaemonEnabled()) return { filled: 0, scanned: 0, remaining: 0 };
+  const mode = getEmbeddingMode();
+  const defaultMaxBatches = mode === 'server' ? 2 : DEFAULT_BACKFILL_MAX_BATCHES;
   const batchSize = Math.max(1, opts.batchSize ?? DEFAULT_BACKFILL_BATCH_SIZE);
-  const maxBatches = Math.max(1, opts.maxBatches ?? DEFAULT_BACKFILL_MAX_BATCHES);
+  const maxBatches = Math.max(1, opts.maxBatches ?? defaultMaxBatches);
 
   let filled = 0;
   let scanned = 0;

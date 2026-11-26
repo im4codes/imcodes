@@ -1,18 +1,22 @@
 /**
  * Security tests: cookie path, per-user rate limiting, JWT_SIGNING_KEY length
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
+import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
+import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
 function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number; is_admin: boolean; status: string }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
-  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null }>();
+  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null, owner_status: 'active' }>();
   // auth_lockout: identity → { fail_count, first_fail_at, locked_until }
   const lockout = new Map<string, { identity: string; fail_count: number; first_fail_at: Date; locked_until: Date | null }>();
   const auditLog: unknown[] = [];
@@ -23,6 +27,7 @@ function makeMemDb(): Database {
 
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
 
       if (s.includes('from users where id')) {
@@ -30,7 +35,18 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id, user_status: 'active' } as T;
+        }
+        return null;
+      }
+      if (s.includes('update refresh_tokens set used_at = $1 where token_hash = $2') && s.includes('returning')) {
+        const now = params[0] as number;
+        const tokenHash = params[1] as string;
+        for (const rt of refreshTokens.values()) {
+          if (rt.token_hash === tokenHash && rt.used_at === null && rt.expires_at > now) {
+            rt.used_at = now;
+            return { id: rt.id, user_id: rt.user_id, family_id: rt.family_id } as T;
+          }
         }
         return null;
       }
@@ -96,7 +112,7 @@ function makeMemDb(): Database {
         refreshTokens.set(params[0] as string, {
           id: params[0] as string,
           user_id: params[1] as string,
-          token_hash: params[2] as string,
+          token_hash: params[2] as string, owner_status: 'active',
           family_id: params[3] as string,
           expires_at: params[4] as number,
           created_at: params[5] as number,
@@ -185,6 +201,98 @@ describe('share ticket auth boundary', () => {
 
     expect(bearerAuth).toBeNull();
     expect(cookieAuth).toBeNull();
+  });
+
+  it('does not accept shared machine authority as ordinary API auth', async () => {
+    const env = makeEnv();
+    const { resolveAuth } = await import('../src/security/authorization.js');
+    const { signJwt } = await import('../src/security/crypto.js');
+    const token = signJwt({
+      type: 'shared-session-machine-authority', sub: 'participant-1', sourceServerId: 'srv-1',
+      sessionName: 'deck_a', projectName: 'project-a',
+      shareTarget: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a' }, actionId: 'action-1',
+    }, env.JWT_SIGNING_KEY, 60);
+    for (const headers of [
+      { authorization: `Bearer ${token}` },
+      { cookie: `${COOKIE_SESSION}=${encodeURIComponent(token)}` },
+    ]) {
+      await expect(resolveAuth({
+        env,
+        req: { header: (name: string) => headers[name.toLowerCase() as keyof typeof headers] },
+      } as never)).resolves.toBeNull();
+    }
+  });
+});
+
+/**
+ * tsk_854675e1e2: a special-purpose JWT (the 24 h shared-session machine authority minted for a share participant, the capability
+ * blob token, a relay token) is signed with the same key and carries `sub`. The account-session checks in /api/auth/* excluded only
+ * the two ws tickets by name, so such a token was accepted as the user's login: a malicious daemon that saw a participant's
+ * machine-authority token could mint a persistent API key for that participant. Account auth now accepts ONLY tokens that are login
+ * tokens (no `type`, or type `web`), whatever other types are added later.
+ */
+describe('special-purpose JWTs are not account sessions', () => {
+  const SPECIAL_TYPES = ['shared-session-machine-authority', 'capability-blob', 'auth-relay', 'ws-ticket', 'share-ws-ticket', 'something-added-next-year'];
+
+  it.each(SPECIAL_TYPES)('%s is refused as a Bearer token and as a session cookie, a login token is accepted', async (type) => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const { signJwt } = await import('../src/security/crypto.js');
+    const registered = await app.request('/api/auth/register', { method: 'POST' });
+    const { userId } = await registered.json() as { userId: string };
+
+    const special = signJwt({ type, sub: userId, sourceServerId: 'srv-1' }, env.JWT_SIGNING_KEY, 60);
+    const viaBearer = await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${special}` } });
+    const viaCookie = await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(special)}` } });
+    expect(viaBearer.status).toBe(401);
+    expect(viaCookie.status).toBe(401);
+
+    for (const login of [signJwt({ sub: userId }, env.JWT_SIGNING_KEY, 60), signJwt({ sub: userId, type: 'web' }, env.JWT_SIGNING_KEY, 60)]) {
+      expect((await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${login}` } })).status).toBe(200);
+      expect((await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(login)}` } })).status).toBe(200);
+    }
+  });
+});
+
+describe('isAccountSessionJwt (the one place that decides what a login token is)', () => {
+  it('accepts a subject with no type or the web type, and nothing else', async () => {
+    const { isAccountSessionJwt } = await import('../src/security/account-session-jwt.js');
+    expect(isAccountSessionJwt({ sub: 'u' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'web' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'ws-ticket' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'shared-session-machine-authority' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: null })).toBe(false);
+    expect(isAccountSessionJwt({ type: 'web' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 7 })).toBe(false);
+    expect(isAccountSessionJwt(null)).toBe(false);
+    expect(isAccountSessionJwt(undefined)).toBe(false);
+  });
+});
+
+describe('browser identity expectation boundary', () => {
+  it('rejects a stale rendered identity before an authenticated route executes', async () => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const register = await app.request('/api/auth/register', { method: 'POST' });
+    const { userId, apiKey } = await register.json() as { userId: string; apiKey: string };
+
+    const matching = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}`, [EXPECTED_USER_ID_HEADER]: userId },
+    });
+    expect(matching.status).toBe(200);
+
+    const legacy = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    expect(legacy.status).toBe(200);
+
+    const changed = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}`, [EXPECTED_USER_ID_HEADER]: 'another-user' },
+    });
+    expect(changed.status).toBe(409);
+    expect(await changed.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.CHANGED });
   });
 });
 
@@ -419,17 +527,20 @@ describe('OAuth origin allowlist', () => {
 // ── GitHub OAuth refresh cookie path test ───────────────────────────────────
 
 describe('GitHub OAuth callback sets rcc_refresh with path=/', () => {
-  it('rcc_refresh cookie path is / in github-auth route (verified by code inspection and existing test)', async () => {
-    // Read the github-auth source and verify the cookie path is '/'
-    // This is a structural test: we import and check the route source
+  it('rcc_refresh cookie path is / in github-auth/google-auth shared primary OAuth route', async () => {
     const { readFile } = await import('node:fs/promises');
     const { join, dirname } = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const __dirname = dirname(fileURLToPath(import.meta.url));
-    const source = await readFile(join(__dirname, '..', 'src', 'routes', 'github-auth.ts'), 'utf-8');
+    const githubSource = await readFile(join(__dirname, '..', 'src', 'routes', 'github-auth.ts'), 'utf-8');
+    const googleSource = await readFile(join(__dirname, '..', 'src', 'routes', 'google-auth.ts'), 'utf-8');
+    const primarySource = await readFile(join(__dirname, '..', 'src', 'routes', 'oauth-primary.ts'), 'utf-8');
+
+    expect(githubSource).toContain('createPrimaryOAuthRoutes');
+    expect(googleSource).toContain('createPrimaryOAuthRoutes');
 
     // Find the rcc_refresh setCookie call — it should have path: '/'
-    const refreshMatch = source.match(/setCookie\(c,\s*'rcc_refresh'[\s\S]*?path:\s*'([^']*)'/);
+    const refreshMatch = primarySource.match(/setCookie\(c,\s*'rcc_refresh'[\s\S]*?path:\s*'([^']*)'/);
     expect(refreshMatch).toBeTruthy();
     expect(refreshMatch![1]).toBe('/');
   });
@@ -460,8 +571,11 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain("'Referrer-Policy': 'no-referrer'");
     expect(source).toContain('Permissions-Policy');
     expect(source).toContain('Content-Security-Policy');
-    expect(source).toContain("worker-src 'self' blob:");
-    expect(source).toContain("frame-ancestors 'none'");
+    // The policy itself is one shared definition; the header is built from it.
+    expect(source).toContain('buildAppContentSecurityPolicy()');
+    const csp = buildAppContentSecurityPolicy();
+    expect(csp).toContain("worker-src 'self' blob:");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 
   it('SECURITY_HEADERS are applied to HTML responses, not non-HTML', async () => {
@@ -475,5 +589,56 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain("if (ext === 'html') Object.assign(headers, SECURITY_HEADERS)");
     // SPA fallback should also include them
     expect(source).toContain('...SECURITY_HEADERS');
+  });
+});
+
+describe('/api/auth/user/me r2RelayEnabled capability', () => {
+  it('returns false when R2 relay is unconfigured or invalid, and true without leaking credentials when configured', async () => {
+    const { signJwt } = await import('../src/security/crypto.js');
+    const r2Env = {
+      USE_R2_RELAY: 'true',
+      R2_ACCOUNT_ID: 'a'.repeat(32),
+      R2_BUCKET: 'private-staging',
+      R2_ACCESS_KEY_ID: 'r2-access-key-test',
+      R2_SECRET_ACCESS_KEY: 'r2-secret-key-test',
+    };
+
+    for (const override of [
+      {},
+      { ...r2Env, USE_R2_RELAY: 'false' },
+      { USE_R2_RELAY: 'true', R2_ACCOUNT_ID: '../invalid' },
+      { ...r2Env, R2_SECRET_ACCESS_KEY: undefined },
+    ]) {
+      const env = { ...makeEnv(), ...override };
+      const app = buildApp(env);
+      const registered = await app.request('/api/auth/register', { method: 'POST' });
+      const { userId } = await registered.json() as { userId: string };
+      const token = signJwt({ sub: userId }, env.JWT_SIGNING_KEY, 60);
+      const res = await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${token}` } });
+      expect(res.status).toBe(200);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.r2RelayEnabled).toBe(false);
+    }
+
+    const configuredEnv = { ...makeEnv(), ...r2Env };
+    const configuredApp = buildApp(configuredEnv);
+    const regConfigured = await configuredApp.request('/api/auth/register', { method: 'POST' });
+    const { userId: configuredUserId } = await regConfigured.json() as { userId: string };
+    const configuredToken = signJwt({ sub: configuredUserId }, configuredEnv.JWT_SIGNING_KEY, 60);
+    const configuredRes = await configuredApp.request('/api/auth/user/me', {
+      headers: { Authorization: `Bearer ${configuredToken}` },
+    });
+    expect(configuredRes.status).toBe(200);
+    const text = await configuredRes.text();
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    expect(parsed.r2RelayEnabled).toBe(true);
+    expect(text).not.toContain(r2Env.R2_ACCOUNT_ID);
+    expect(text).not.toContain(r2Env.R2_BUCKET);
+    expect(text).not.toContain(r2Env.R2_ACCESS_KEY_ID);
+    expect(text).not.toContain(r2Env.R2_SECRET_ACCESS_KEY);
+    expect('R2_ACCOUNT_ID' in parsed).toBe(false);
+    expect('R2_BUCKET' in parsed).toBe(false);
+    expect('R2_ACCESS_KEY_ID' in parsed).toBe(false);
+    expect('R2_SECRET_ACCESS_KEY' in parsed).toBe(false);
   });
 });

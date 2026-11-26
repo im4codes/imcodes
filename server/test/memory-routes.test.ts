@@ -143,7 +143,7 @@ async function authDaemon(bridge: WsBridge, daemon: MockWs, db: Database) {
   // Daemon auth flow expects: row from `SELECT token_hash FROM servers WHERE id`.
   const dbWithAuth = {
     ...db,
-    queryOne: async () => ({ token_hash: 'valid-hash' }),
+    queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active' }),
   } as unknown as Database;
   bridge.handleDaemonConnection(daemon as never, dbWithAuth, {} as never);
   daemon.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId: 'irrelevant', token: 'tok' })));

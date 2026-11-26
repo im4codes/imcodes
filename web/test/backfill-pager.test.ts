@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  pageIsIncomplete,
   runNewestWindowBackfill,
   CATCHUP_TAIL_MAX_PAGES,
   type BackfillPage,
@@ -147,7 +148,7 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     expect(outcome.pageCount).toBe(1);
   });
 
-  it('dropped / truncatedEvents / cursorReset / recoverable page → terminal truncated', async () => {
+  it('dropped / cursorReset / recoverable page → terminal truncated; per-event truncatedEvents with droppedEvents=0 → caught_up', async () => {
     const dropped = await runNewestWindowBackfill(0, {
       limit: 2,
       fetchPage: async () => ({ events: [{ ts: 1 }], hasMore: true, droppedEvents: 3 }),
@@ -155,12 +156,35 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     });
     expect(dropped.terminal).toBe('truncated');
 
-    const truncatedEvents = await runNewestWindowBackfill(0, {
+    const droppedWithCounts = await runNewestWindowBackfill(0, {
       limit: 2,
-      fetchPage: async () => ({ events: [{ ts: 1 }], hasMore: false, truncatedEvents: 2 }),
+      fetchPage: async () => ({ events: [{ ts: 1 }], hasMore: true, payloadTruncated: true, droppedEvents: 5, truncatedEvents: 38 }),
       mergePage: countingMerge,
     });
-    expect(truncatedEvents.terminal).toBe('truncated');
+    expect(droppedWithCounts.terminal).toBe('truncated');
+
+    // Per-event detail trimming (truncatedEvents > 0, droppedEvents === 0) returns ALL events
+    // in the slice (details hydrate lazily via detailRefs), so it must NOT abort pagination.
+    const trimmedDetailsOnly = await runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => ({ events: [{ ts: 1 }], hasMore: false, payloadTruncated: true, droppedEvents: 0, truncatedEvents: 33 }),
+      mergePage: countingMerge,
+    });
+    expect(trimmedDetailsOnly.terminal).toBe('caught_up');
+
+    const trimmedDetailsMultiPage = [
+      { events: [{ ts: 50 }, { ts: 40 }], hasMore: false, payloadTruncated: true, droppedEvents: 0, truncatedEvents: 2 },
+      { events: [{ ts: 30 }], hasMore: false, payloadTruncated: true, droppedEvents: 0, truncatedEvents: 1 },
+    ];
+    let pageIdx = 0;
+    const multiOutcome = await runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => trimmedDetailsMultiPage[pageIdx++] ?? null,
+      mergePage: countingMerge,
+    });
+    expect(multiOutcome.terminal).toBe('caught_up');
+    expect(multiOutcome.pageCount).toBe(2);
+    expect(multiOutcome.totalNew).toBe(3);
 
     const reset = await runNewestWindowBackfill(0, {
       limit: 2,
@@ -211,6 +235,64 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     expect(outcome.pageCount).toBe(1);
   });
 
+  it('V-W2c: cap_hit while still making progress carries a resumeBeforeTs the next page would have used', async () => {
+    let top = 100;
+    const outcome = await runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => { const p = { events: [{ ts: top }, { ts: top - 1 }], hasMore: false } as BackfillPage; top -= 10; return p; },
+      mergePage: countingMerge,
+    });
+    expect(outcome.terminal).toBe('cap_hit');
+    // 5 full pages of {top, top-1} starting at 100, each descending by 10:
+    // page5's minTs is 100-4*10-1=59, so the next page would start at 60.
+    expect(outcome.resumeBeforeTs).toBe(60);
+  });
+
+  it('V-W2d: a resume (real progress every time) reaches caught_up without re-walking already-merged pages', async () => {
+    // Real backend shape: a long, steadily-descending backlog spanning MORE
+    // pages than one round's budget (7 full pages, then a short one — 8
+    // total against a 5-page-per-round cap). First round caps at page 5;
+    // a second round resumes from resumeBeforeTs and finishes the window
+    // in its own 3 pages, well inside its own budget.
+    const merged: number[] = [];
+    const mergePage = (events: unknown[]) => {
+      for (const e of events as Array<{ ts: number }>) merged.push(e.ts);
+      return countingMerge(events);
+    };
+    let top = 200;
+    let fetches = 0;
+    const seenBeforeTs: Array<number | undefined> = [];
+    const fetchPage = async ({ beforeTs }: { afterTs: number | undefined; beforeTs?: number }) => {
+      seenBeforeTs.push(beforeTs);
+      fetches += 1;
+      if (fetches > 7) return { events: [{ ts: top }], hasMore: false } as BackfillPage; // short (page 8) → caught_up
+      const events = [{ ts: top }, { ts: top - 1 }];
+      top -= 10;
+      return { events, hasMore: false } as BackfillPage;
+    };
+    const first = await runNewestWindowBackfill(0, { limit: 2, fetchPage, mergePage });
+    expect(first.terminal).toBe('cap_hit');
+    expect(first.pageCount).toBe(CATCHUP_TAIL_MAX_PAGES);
+    const firstMergedCount = merged.length;
+    expect(firstMergedCount).toBe(CATCHUP_TAIL_MAX_PAGES * 2);
+
+    const second = await runNewestWindowBackfill(0, {
+      limit: 2, fetchPage, mergePage, initialBeforeTs: first.resumeBeforeTs,
+    });
+    // The resumed round never re-requests a beforeTs the first round already
+    // used (no wasted re-fetch of already-merged pages).
+    const firstRoundBeforeTs = seenBeforeTs.slice(0, CATCHUP_TAIL_MAX_PAGES);
+    const secondRoundBeforeTs = seenBeforeTs.slice(CATCHUP_TAIL_MAX_PAGES);
+    for (const bt of secondRoundBeforeTs) expect(firstRoundBeforeTs).not.toContain(bt);
+    expect(second.terminal).toBe('caught_up');
+    expect(second.pageCount).toBe(3);
+    expect(merged.length).toBeGreaterThan(firstMergedCount);
+    // The FULL backlog (8 pages' worth) ends up merged across both rounds —
+    // this is the actual bug fix: without a resume, a backlog past one
+    // round's budget stayed permanently unrecovered.
+    expect(merged.length).toBe(CATCHUP_TAIL_MAX_PAGES * 2 + 2 * 2 + 1);
+  });
+
   it('respects an explicit maxPages override', async () => {
     let top = 100;
     const fetchPage = vi.fn(async () => { const p = { events: [{ ts: top }, { ts: top - 1 }], hasMore: false } as BackfillPage; top -= 10; return p; });
@@ -234,5 +316,54 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     expect(outcome.terminal).toBe('caught_up');
     expect(seenArgs.map((a) => a.afterTs)).toEqual([undefined, undefined]);
     expect(seenArgs.map((a) => a.beforeTs)).toEqual([undefined, 81]);
+  });
+
+  it('pageIsIncomplete separates missing events from per-event detail trimming while preserving legacy skew', () => {
+    // Per-event detail trimming with 0 dropped events: NOT incomplete
+    expect(pageIsIncomplete({
+      events: [{ ts: 1 }],
+      hasMore: false,
+      payloadTruncated: true,
+      droppedEvents: 0,
+      truncatedEvents: 33,
+    })).toBe(false);
+    // Actually dropped events: incomplete
+    expect(pageIsIncomplete({
+      events: [{ ts: 1 }],
+      hasMore: true,
+      payloadTruncated: true,
+      droppedEvents: 5,
+      truncatedEvents: 38,
+    })).toBe(true);
+    // Legacy daemon without counts (both undefined): payloadTruncated=true stays incomplete
+    expect(pageIsIncomplete({
+      events: [{ ts: 1 }],
+      hasMore: false,
+      payloadTruncated: true,
+    })).toBe(true);
+  });
+
+  it('awaits async page merges so large backfills can yield between chunks', async () => {
+    const turns: string[] = [];
+    let timerObserved = false;
+    const timer = new Promise<void>((resolve) => setTimeout(() => {
+      timerObserved = true;
+      turns.push('timer');
+      resolve();
+    }, 0));
+    const outcomePromise = runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => ({ events: [{ ts: 2 }, { ts: 1 }], hasMore: false } as BackfillPage),
+      maxPages: 1,
+      mergePage: async (events) => {
+        turns.push('merge-start');
+        await timer;
+        turns.push('merge-end');
+        return countingMerge(events);
+      },
+    });
+    await outcomePromise;
+    expect(timerObserved).toBe(true);
+    expect(turns).toEqual(['merge-start', 'timer', 'merge-end']);
   });
 });

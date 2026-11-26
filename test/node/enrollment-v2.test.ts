@@ -1,0 +1,635 @@
+import { CONTROLLED_NODE_ABI_GLIBC217 } from '../../shared/controlled-node-abi.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, open, readdir, rename, rm, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import {
+  buildEnrollRedeemV2Request,
+  allowedEnrollmentServerOrigin,
+  copyCleanExecutable,
+  createEnrollmentStagingFs,
+  encodeEnrollmentBlob,
+  generateInstallIdentity,
+  hashNodeToken,
+  loadInstallIdentity,
+  openVerifiedEnrollmentSource,
+  parseEnrollmentBlob,
+  persistInstallIdentity,
+  readEnrollmentBlob,
+  readExactly,
+  redeemEnrollmentV2,
+  writeExactly,
+} from '../../src/node/enrollment.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+
+// Staging applies Windows ACLs through `icacls`, which does not exist on the
+// machines this suite runs on. Only that one export is replaced; everything
+// else in the module stays real.
+vi.mock('../../src/node/installer.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/node/installer.js')>()),
+  applyWindowsAclCommands: vi.fn(),
+}));
+import {
+  buildWindowsAuthenticodeEnrollmentPlan,
+  inspectWindowsAuthenticodeEnrollmentContainer,
+} from '../../shared/windows-authenticode-enrollment.js';
+
+function fakeSignedPe(): Buffer {
+  const file = Buffer.alloc(528, 0x5a);
+  file.writeUInt32LE(0x80, 0x3c);
+  file.writeUInt32LE(0x00004550, 0x80);
+  const optional = 0x80 + 24;
+  file.writeUInt16LE(0x20b, optional);
+  file.writeUInt32LE(16, optional + 108);
+  const securityEntry = optional + 112 + 4 * 8;
+  file.writeUInt32LE(512, securityEntry);
+  file.writeUInt32LE(16, securityEntry + 4);
+  file.writeUInt32LE(16, 512);
+  file.writeUInt16LE(0x0200, 516);
+  file.writeUInt16LE(0x0002, 518);
+  return file;
+}
+
+function redeemResponse(
+  value: unknown,
+  options: { url?: string; redirected?: boolean; ok?: boolean; status?: number } = {},
+): Response {
+  return {
+    ok: options.ok ?? true,
+    status: options.status ?? 200,
+    url: options.url ?? 'https://im.example/api/enroll/v2/redeem',
+    redirected: options.redirected ?? false,
+    json: async () => value,
+  } as Response;
+}
+
+afterEach(() => vi.unstubAllEnvs());
+
+describe('controlled node enrollment v2', () => {
+  it('round-trips an enrollment blob appended to arbitrary executable bytes', () => {
+    const encoded = encodeEnrollmentBlob({ serverUrl: 'https://im.example/', enrollToken: 'once-123' });
+    expect(parseEnrollmentBlob(Buffer.concat([Buffer.from('binary-prefix'), encoded]))).toEqual({
+      serverUrl: 'https://im.example',
+      enrollToken: 'once-123',
+    });
+  });
+
+  it('buildEnrollRedeemV2Request includes required D-A fields', () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
+    const identity = generateInstallIdentity();
+    const req = buildEnrollRedeemV2Request(blob, identity, { platform: 'darwin', arch: 'arm64', hostname: 'box' });
+    expect(req.version).toBe(2);
+    expect(req.installId).toBe(identity.installId);
+    expect(req.nodeTokenHash).toBe(hashNodeToken(identity.nodeToken));
+    expect(req.os).toBe('mac');
+    expect(req.arch).toBe('arm64');
+  });
+
+  it.each([
+    ['win32', 'win'],
+    ['darwin', 'mac'],
+    ['linux', 'linux'],
+  ] as const)('uses canonical v2 OS value for Node platform %s', (platform, expected) => {
+    const req = buildEnrollRedeemV2Request(
+      { serverUrl: 'https://im.example', enrollToken: 'tok' },
+      generateInstallIdentity(),
+      { platform, arch: 'x64', hostname: 'box' },
+    );
+    expect(req.os).toBe(expected);
+  });
+
+  it('redeemEnrollmentV2 rejects a response that returns a raw token', async () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
+    const identity = generateInstallIdentity();
+    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED, token: 'server-minted' })) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(blob, identity, fetchFn)).rejects.toThrow(/raw_token/);
+  });
+
+  it('redeemEnrollmentV2 builds credential from local nodeToken when response has no token', async () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
+    const identity = generateInstallIdentity();
+    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeId: '1234567890', nodeRole: NODE_ROLE.CONTROLLED, refName: 'box-1234' })) as unknown as typeof fetch;
+    const cred = await redeemEnrollmentV2(blob, identity, fetchFn);
+    expect(cred.token).toBe(identity.nodeToken);
+    expect(cred.serverId).toBe('s1');
+    expect(cred.nodeId).toBe('1234567890');
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(fetchFn.mock.calls[0]?.[0]).toBe('https://im.example/api/enroll/v2/redeem');
+    const body = JSON.parse(String((fetchFn.mock.calls[0] as [string, RequestInit])[1]?.body));
+    expect(body.installId).toBe(identity.installId);
+    expect(body.nodeTokenHash).toBe(identity.nodeTokenHash);
+    expect(body.version).toBe(2);
+    expect((fetchFn.mock.calls[0] as [string, RequestInit])[1].redirect).toBe('error');
+  });
+
+  it.each([1234567890, '0123456789', '0000000001', '１２３４５６７８９０'])
+  ('rejects a non-canonical redeem nodeId %j', async (nodeId) => {
+    const fetchFn = vi.fn(async () => redeemResponse({
+      serverId: 's1', nodeId, nodeRole: NODE_ROLE.CONTROLLED,
+    })) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(
+      { serverUrl: 'https://im.example', enrollToken: 'tok' },
+      generateInstallIdentity(),
+      fetchFn,
+    )).rejects.toThrow(/invalid_response/);
+  });
+
+  it('permits HTTP only for explicitly enabled local development origins', () => {
+    expect(() => allowedEnrollmentServerOrigin('http://localhost:8787')).toThrow(/must_be_https/);
+    vi.stubEnv('IMCODES_NODE_ALLOW_HTTP_ENROLL', '1');
+    expect(allowedEnrollmentServerOrigin('http://localhost:8787')).toBe('http://localhost:8787');
+    expect(allowedEnrollmentServerOrigin('http://127.0.0.1:8787')).toBe('http://127.0.0.1:8787');
+    expect(() => allowedEnrollmentServerOrigin('http://relay.example')).toThrow(/must_be_https/);
+    expect(() => allowedEnrollmentServerOrigin('https://relay.example/path')).toThrow(/must_be_origin/);
+  });
+
+  it('rejects a cross-origin or silently redirected redeem response', async () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
+    const identity = generateInstallIdentity();
+    const crossOrigin = vi.fn(async () => redeemResponse(
+      { serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED },
+      { url: 'https://evil.example/api/enroll/v2/redeem' },
+    )) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(blob, identity, crossOrigin)).rejects.toThrow(/origin_mismatch/);
+
+    const redirected = vi.fn(async () => redeemResponse(
+      { serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED },
+      { redirected: true },
+    )) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(blob, identity, redirected)).rejects.toThrow(/redirect_rejected/);
+  });
+
+  it('rejects an unverifiable response URL instead of accepting a custom fetch silently', async () => {
+    const fetchFn = vi.fn(async () => redeemResponse(
+      { serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED },
+      { url: '' },
+    )) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(
+      { serverUrl: 'https://im.example', enrollToken: 'tok' },
+      generateInstallIdentity(),
+      fetchFn,
+    )).rejects.toThrow(/response_url_invalid/);
+  });
+
+  it('durably persists and reloads the same install identity', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-identity-'));
+    try {
+      const path = join(dir, 'protected', 'install-identity.json');
+      const identity = { ...generateInstallIdentity(), sourceExePath: '/tmp/imcodes-node' };
+      await persistInstallIdentity(identity, path);
+      await expect(loadInstallIdentity(path)).resolves.toEqual(identity);
+      if (process.platform !== 'win32') {
+        expect((await stat(path)).mode & 0o077).toBe(0);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when an existing install identity is corrupt', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-identity-corrupt-'));
+    try {
+      const path = join(dir, 'install-identity.json');
+      await writeFile(path, '{bad json', { mode: 0o600 });
+      await expect(loadInstallIdentity(path)).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('staging over a locked destination', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-locked-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('displaces a running Windows image, then sweeps what earlier runs stranded', async () => {
+    // Windows keeps a running image locked and refuses a rename onto it, so a
+    // re-install has to take the name from the incumbent instead. The incumbent
+    // is still executing and cannot be deleted in the same run, so the sweep has
+    // to happen on the NEXT one -- otherwise every re-install strands another
+    // ~80MB copy in the protected directory forever.
+    const platform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+      const source = join(dir, 'source.bin');
+      const dest = join(dir, 'imcodes-node.exe');
+      await writeFile(source, Buffer.concat([Buffer.alloc(128, 0x42), blob]));
+      await writeFile(dest, Buffer.alloc(8, 0x01));
+      const stranded = `${dest}.replaced-11111111-1111-1111-1111-111111111111`;
+      await writeFile(stranded, Buffer.alloc(8, 0x02));
+
+      let lockedOnce = false;
+      const stagingFs = createEnrollmentStagingFs({
+        rename: async (from, to) => {
+          if (to === dest && !lockedOnce && from !== stranded) {
+            lockedOnce = true;
+            throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+          }
+          await rename(from, to);
+        },
+      });
+      const opened = await openVerifiedEnrollmentSource(source, stagingFs);
+      try {
+        const receipt = await opened.stageTrailerFreeExecutable(dest, 128);
+        expect(receipt.size).toBe(128);
+      } finally {
+        await opened.close();
+      }
+
+      // The locked-destination fallback actually ran, rather than the plain
+      // rename quietly succeeding and making the rest of this vacuous.
+      expect(lockedOnce).toBe(true);
+      // The copy an earlier run had to strand is swept.
+      expect(await readdir(dir)).not.toContain(basename(stranded));
+      // And the new bytes own the stable name.
+      expect((await readFile(dest)).length).toBe(128);
+      // Retaining the copy displaced by THIS run is Windows-only -- there the
+      // file is still the running image and cannot be deleted. This host has no
+      // such lock, so it is removed immediately and the state is not asserted.
+    } finally {
+      Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    }
+  });
+});
+
+describe('readEnrollmentBlob', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-read-blob-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('reads the trailer before releasing the handle', async () => {
+    // The helper opened the source, returned the read promise WITHOUT awaiting
+    // it, and let `finally` close the handle underneath the in-flight read, so
+    // every call died with EBADF "file closed". Nothing exercised it until the
+    // installer started reading its own trailer to name the server, and then it
+    // crashed the install outright.
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const source = join(dir, 'installer.bin');
+    await writeFile(source, Buffer.concat([Buffer.alloc(128, 0x42), blob]));
+
+    await expect(readEnrollmentBlob(source)).resolves.toMatchObject({
+      serverUrl: 'https://im.example',
+      enrollToken: 'once',
+    });
+  });
+
+  it('reports no trailer rather than throwing for an ordinary file', async () => {
+    const plain = join(dir, 'plain.bin');
+    await writeFile(plain, Buffer.alloc(64, 0x11));
+    await expect(readEnrollmentBlob(plain)).resolves.toBeNull();
+  });
+});
+
+describe('copyCleanExecutable', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-stage-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('copies only the trailer-free prefix bytes', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const source = join(dir, 'source.bin');
+    const dest = join(dir, 'dest.bin');
+    const prefix = Buffer.alloc(128, 0x42);
+    await writeFile(source, Buffer.concat([prefix, blob]));
+    const receipt = await copyCleanExecutable(source, prefix.length, dest);
+    const staged = await readFile(dest);
+    expect(staged.equals(prefix)).toBe(true);
+    expect(staged.length).toBe(128);
+    expect(receipt).toMatchObject({
+      path: dest,
+      size: 128,
+    });
+    expect(receipt.sha256).toMatch(/^[a-f0-9]{64}$/);
+    if (process.platform !== 'win32') {
+      expect(((await stat(dest)).mode & 0o777) & 0o002).toBe(0);
+    }
+  });
+
+  it('restores a personalized Windows certificate-table package to byte-identical signed bytes', async () => {
+    const original = fakeSignedPe();
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const plan = buildWindowsAuthenticodeEnrollmentPlan(original, original.length, blob)!;
+    const personalized = Buffer.concat([Buffer.from(original), plan.certificateEntry]);
+    plan.patchedCertificateTableSize.copy(personalized, plan.sizeFieldOffset);
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      personalized,
+      personalized.length,
+      personalized,
+      0,
+      plan.trailerStart,
+      blob.length,
+    )!;
+    const sourcePath = join(dir, 'signed-personalized.exe');
+    const destPath = join(dir, 'signed-staged.exe');
+    await writeFile(sourcePath, personalized);
+    const source = await openVerifiedEnrollmentSource(sourcePath);
+    try {
+      const receipt = await source.stageTrailerFreeExecutable(destPath, plan.trailerStart, restore);
+      expect(receipt.size).toBe(original.length);
+      await expect(readFile(destPath)).resolves.toEqual(original);
+    } finally {
+      await source.close();
+    }
+  });
+
+  it('rejects symlink and non-regular enrollment sources before opening them', async () => {
+    const directorySource = join(dir, 'directory-source');
+    await (await import('node:fs/promises')).mkdir(directorySource);
+    await expect(openVerifiedEnrollmentSource(directorySource)).rejects.toThrow(/not_regular/);
+
+    if (process.platform !== 'win32') {
+      const realSource = join(dir, 'real-source.bin');
+      const linkedSource = join(dir, 'linked-source.bin');
+      await writeFile(realSource, Buffer.from('source'));
+      await symlink(realSource, linkedSource);
+      await expect(openVerifiedEnrollmentSource(linkedSource)).rejects.toThrow(/is_symlink/);
+    }
+  });
+
+  it('removes private staging temps after write, sync, chmod, or rename failure', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const prefix = Buffer.alloc(64, 0x52);
+    const sourcePath = join(dir, 'failure-source.bin');
+    await writeFile(sourcePath, Buffer.concat([prefix, blob]));
+    const base = createEnrollmentStagingFs();
+    const cases: Array<{ name: string; stagingFs: ReturnType<typeof createEnrollmentStagingFs> }> = [
+      {
+        name: 'write',
+        stagingFs: createEnrollmentStagingFs({
+          openDestination: async (path, flags, mode) => {
+            const handle = await open(path, flags, mode);
+            return {
+              write: vi.fn(async () => { throw new Error('injected staging write failure'); }),
+              sync: handle.sync.bind(handle),
+              close: handle.close.bind(handle),
+            };
+          },
+        }),
+      },
+      {
+        name: 'sync',
+        stagingFs: createEnrollmentStagingFs({
+          openDestination: async (path, flags, mode) => {
+            const handle = await open(path, flags, mode);
+            return {
+              write: handle.write.bind(handle),
+              sync: vi.fn(async () => { throw new Error('injected staging sync failure'); }),
+              close: handle.close.bind(handle),
+            };
+          },
+        }),
+      },
+      ...(process.platform === 'win32' ? [] : [{
+        name: 'chmod',
+        stagingFs: createEnrollmentStagingFs({
+          chmod: async (path, mode) => {
+            if (path.endsWith('.tmp')) throw new Error('injected staging chmod failure');
+            await base.chmod(path, mode);
+          },
+        }),
+      }]),
+      {
+        name: 'rename',
+        stagingFs: createEnrollmentStagingFs({
+          rename: async () => { throw new Error('injected staging rename failure'); },
+        }),
+      },
+    ];
+
+    for (const failure of cases) {
+      const destPath = join(dir, `dest-${failure.name}.bin`);
+      const source = await openVerifiedEnrollmentSource(sourcePath, failure.stagingFs);
+      try {
+        await expect(source.stageTrailerFreeExecutable(destPath, prefix.length)).rejects.toThrow(/injected staging/);
+      } finally {
+        await source.close();
+      }
+      await expect(stat(destPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await readdir(dir)).filter((entry) => entry.startsWith(`dest-${failure.name}.bin.`))).toEqual([]);
+    }
+  });
+
+  it('leaves only complete bytes on parent-fsync failure and succeeds on retry', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const prefix = Buffer.alloc(64, 0x61);
+    const sourcePath = join(dir, 'parent-fsync-source.bin');
+    const destPath = join(dir, 'parent-fsync-dest.bin');
+    await writeFile(sourcePath, Buffer.concat([prefix, blob]));
+    const base = createEnrollmentStagingFs();
+    let failOnce = true;
+    const source = await openVerifiedEnrollmentSource(sourcePath, createEnrollmentStagingFs({
+      fsyncParentDirectory: async (path) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('injected parent fsync failure');
+        }
+        await base.fsyncParentDirectory(path);
+      },
+    }));
+    try {
+      await expect(source.stageTrailerFreeExecutable(destPath, prefix.length)).rejects.toThrow(/parent fsync/);
+      await expect(readFile(destPath)).resolves.toEqual(prefix);
+      expect((await readdir(dir)).filter((entry) => entry.startsWith('parent-fsync-dest.bin.'))).toEqual([]);
+      const receipt = await source.stageTrailerFreeExecutable(destPath, prefix.length);
+      expect(receipt).toMatchObject({ path: destPath, size: prefix.length });
+      await expect(readFile(destPath)).resolves.toEqual(prefix);
+    } finally {
+      await source.close();
+    }
+  });
+
+  it('readExactly loops across partial reads and fails on early EOF', async () => {
+    const chunks = [Buffer.from('ab'), Buffer.from('cd'), Buffer.from('e')];
+    const handle = {
+      read: vi.fn(async (buffer: Buffer, offset: number) => {
+        const chunk = chunks.shift();
+        if (!chunk) return { bytesRead: 0, buffer };
+        chunk.copy(buffer, offset);
+        return { bytesRead: chunk.length, buffer };
+      }),
+    };
+    await expect(readExactly(handle as never, 0, 5)).resolves.toEqual(Buffer.from('abcde'));
+    expect(handle.read).toHaveBeenCalledTimes(3);
+
+    await expect(readExactly({
+      read: vi.fn(async () => ({ bytesRead: 0, buffer: Buffer.alloc(1) })),
+    } as never, 0, 1)).rejects.toThrow(/read_exactly_eof/);
+  });
+
+  it('writeExactly loops across partial writes and fails on no-progress writes', async () => {
+    const writes = [2, 1, 2];
+    const seen: Array<{ offset: number; length: number; position: number }> = [];
+    const handle = {
+      write: vi.fn(async (_buffer: Buffer, offset: number, length: number, position: number) => {
+        seen.push({ offset, length, position });
+        return { bytesWritten: writes.shift() ?? 0, buffer: _buffer };
+      }),
+    };
+    await expect(writeExactly(handle as never, Buffer.from('abcde'), 10)).resolves.toBeUndefined();
+    expect(seen).toEqual([
+      { offset: 0, length: 5, position: 10 },
+      { offset: 2, length: 3, position: 12 },
+      { offset: 3, length: 2, position: 13 },
+    ]);
+
+    await expect(writeExactly({
+      write: vi.fn(async () => ({ bytesWritten: 0, buffer: Buffer.alloc(1) })),
+    } as never, Buffer.from('x'), 0)).rejects.toThrow(/write_exactly_no_progress/);
+  });
+
+  it('cleanup skips a pathname replacement instead of mutating the wrong file', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const sourcePath = join(dir, 'source.bin');
+    const prefix = Buffer.alloc(16, 0x42);
+    await writeFile(sourcePath, Buffer.concat([prefix, blob]));
+    const source = await openVerifiedEnrollmentSource(sourcePath);
+    await writeFile(sourcePath, Buffer.from('replacement'));
+    try {
+      await expect(source.cleanupEnrollmentSource(prefix.length, blob.length)).resolves.toBe('skipped');
+      await expect(readFile(sourcePath)).resolves.toEqual(Buffer.from('replacement'));
+    } finally {
+      await source.close();
+    }
+  });
+
+  it.runIf(process.platform === 'linux')('atomically strips the trailer when Linux reports the running image as busy', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const sourcePath = join(dir, 'busy-source.bin');
+    const prefix = Buffer.alloc(32, 0x62);
+    await writeFile(sourcePath, Buffer.concat([prefix, blob]), { mode: 0o751 });
+    const original = await stat(sourcePath);
+    const source = await openVerifiedEnrollmentSource(sourcePath, createEnrollmentStagingFs({
+      openSourceWritable: async () => {
+        const error = new Error('text file busy') as NodeJS.ErrnoException;
+        error.code = 'ETXTBSY';
+        throw error;
+      },
+    }));
+    try {
+      await expect(source.cleanupEnrollmentSource(prefix.length, blob.length)).resolves.toBe('cleaned');
+      await expect(readFile(sourcePath)).resolves.toEqual(prefix);
+      const cleaned = await stat(sourcePath);
+      expect(cleaned.mode & 0o777).toBe(original.mode & 0o777);
+      expect(cleaned.uid).toBe(original.uid);
+      expect(cleaned.gid).toBe(original.gid);
+      expect((await readdir(dir)).filter((entry) => entry.endsWith('.cleanup'))).toEqual([]);
+    } finally {
+      await source.close();
+    }
+  });
+});
+
+describe('enrollment ABI identity', () => {
+  it('round-trips explicit compat and rejects a trailer for another executable profile', () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'abi-ticket', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 };
+    expect(parseEnrollmentBlob(Buffer.concat([Buffer.from('prefix'), encodeEnrollmentBlob(blob)]))).toEqual(blob);
+    const identity = generateInstallIdentity();
+    const runtime = { platform: 'linux', arch: 'x64', hostname: 'abi-test', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 } as const;
+    expect(buildEnrollRedeemV2Request(blob, identity, runtime)).toMatchObject({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217 });
+    expect(() => buildEnrollRedeemV2Request({ ...blob, abiProfile: undefined }, identity, runtime)).toThrow('enrollment_abi_profile_mismatch');
+    expect(() => buildEnrollRedeemV2Request(blob, identity)).toThrow('enrollment_abi_profile_mismatch');
+  });
+});
+
+describe('enrollDirectV2 client', () => {
+  const mockJsonResponse = (body: unknown, status: number, url: string) => {
+    const res = new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+    Object.defineProperty(res, 'url', { value: url });
+    return res;
+  };
+
+  it('posts install identity + optional hostServerId with Bearer apiKey and builds local credential', async () => {
+    const { enrollDirectV2 } = await import('../../src/node/enrollment.js');
+    const identity = generateInstallIdentity();
+    const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      expect(url).toBe('https://app.im.codes/api/enroll/v2/direct');
+      expect(init?.redirect).toBe('error');
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer deck_api_key_1');
+      const sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      expect(sent.installId).toBe(identity.installId);
+      expect(sent.nodeTokenHash).toBe(identity.nodeTokenHash);
+      expect(sent.hostServerId).toBe('srv-host-9');
+      return mockJsonResponse({
+        ok: true,
+        serverId: 'srv-ctrl-9',
+        nodeId: '5556667778',
+        nodeRole: NODE_ROLE.CONTROLLED,
+        displayName: 'desktop-host',
+        idempotent: false,
+        hostServerId: 'srv-host-9',
+      }, 200, url);
+    }) as unknown as typeof fetch;
+
+    const cred = await enrollDirectV2({
+      relayUrl: 'https://app.im.codes',
+      apiKey: 'deck_api_key_1',
+      identity,
+      hostServerId: 'srv-host-9',
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'desktop-host',
+      fetchFn,
+    });
+    expect(cred).toMatchObject({
+      serverId: 'srv-ctrl-9',
+      nodeId: '5556667778',
+      token: identity.nodeToken,
+      serverUrl: 'https://app.im.codes',
+      nodeRole: NODE_ROLE.CONTROLLED,
+      displayName: 'desktop-host',
+      abiProfile: 'modern',
+    });
+  });
+
+  it('rejects 404 as EnrollDirectUnsupportedError, rejects raw token in response, and enforces origin/HTTPS', async () => {
+    const { enrollDirectV2, EnrollDirectUnsupportedError } = await import('../../src/node/enrollment.js');
+    const identity = generateInstallIdentity();
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://app.im.codes/unexpected-path',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+    })).rejects.toThrow('enrollment_server_url_must_be_origin');
+
+    await expect(enrollDirectV2({
+      relayUrl: 'http://remote.example.com',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+    })).rejects.toThrow(/https/i);
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://old.example.com',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+      fetchFn: (async () => mockJsonResponse('missing', 404, 'https://old.example.com/api/enroll/v2/direct')) as unknown as typeof fetch,
+    })).rejects.toThrow(EnrollDirectUnsupportedError);
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://app.im.codes',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+      fetchFn: (async () => mockJsonResponse({
+        ok: true,
+        serverId: 's',
+        nodeId: '1234567890',
+        nodeRole: NODE_ROLE.CONTROLLED,
+        token: 'forged-server-token',
+      }, 200, 'https://app.im.codes/api/enroll/v2/direct')) as unknown as typeof fetch,
+    })).rejects.toThrow(/raw_token/i);
+  });
+});

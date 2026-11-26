@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const upgradeBlockedOutboxMock = vi.hoisted(() => ({
+  flushOnReconnect: vi.fn(async () => false),
+  acknowledge: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/daemon/upgrade-blocked-outbox.js', () => ({
+  getDefaultUpgradeBlockedOutbox: () => upgradeBlockedOutboxMock,
+}));
+
 // Mock WebSocket before importing ServerLink
 const mockWsInstance = {
   send: vi.fn(),
@@ -15,11 +24,29 @@ vi.mock('../../src/util/daemon-status.js', () => ({
   recordDaemonServerLinkStatus: vi.fn(),
 }));
 
-import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
+import {
+  ServerLink,
+  __setServerLinkDataPlaneQueueConfigForTests,
+  directFileTransferDaemonCapabilities,
+  setServerLinkReconnectResyncHandler,
+} from '../../src/daemon/server-link.js';
+import { CoreLaneSocket } from '../../src/daemon/core-lane-socket.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
+import {
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
+  DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
+} from '../../shared/direct-file-transfer.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+} from '../../shared/daemon-upgrade.js';
 
 const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
@@ -28,6 +55,7 @@ describe('ServerLink', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    upgradeBlockedOutboxMock.flushOnReconnect.mockResolvedValue(false);
     link = new ServerLink({
       workerUrl: 'wss://test.workers.dev',
       serverId: 'srv-123',
@@ -52,6 +80,76 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledWith(
       expect.stringContaining('wss://test.workers.dev'),
     );
+  });
+
+  it('replays one persisted terminal upgrade failure after the link opens', async () => {
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    expect(openHandler).toBeDefined();
+
+    openHandler?.();
+
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledTimes(1);
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledWith(
+      expect.any(Function),
+      link.daemonVersion,
+    );
+  });
+
+  it('advertises blocker-sync support and certifies the connection only after outbox replay settles', async () => {
+    let resolveFlush!: (value: boolean) => void;
+    upgradeBlockedOutboxMock.flushOnReconnect.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => { resolveFlush = resolve; }),
+    );
+
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+
+    const beforeFlush = mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(beforeFlush[0]).toMatchObject({
+      type: 'auth',
+      [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+        DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    });
+    expect(beforeFlush.some((message) => message.type === DAEMON_MSG.UPGRADE_BLOCKED_SYNC)).toBe(false);
+
+    resolveFlush(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)))).toContainEqual(expect.objectContaining({
+      type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+      revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    }));
+  });
+
+  it('records the server acknowledgement without exposing it to ordinary message handlers', async () => {
+    link.connect();
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    const ordinaryHandler = vi.fn();
+    link.onMessage(ordinaryHandler);
+
+    messageHandler?.({
+      data: JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-1',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      }),
+    } as MessageEvent);
+    await Promise.resolve();
+
+    expect(upgradeBlockedOutboxMock.acknowledge).toHaveBeenCalledWith(
+      'failure-1',
+      DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+    );
+    expect(ordinaryHandler).not.toHaveBeenCalled();
   });
 
   it('send() silently drops messages when not connected (fire-and-forget safe)', () => {
@@ -85,6 +183,14 @@ describe('ServerLink', () => {
     expect(link.getDaemonCapabilities()).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   });
 
+  it('advertises the complete direct-file v2 lease capability set only with an available runtime', () => {
+    expect(directFileTransferDaemonCapabilities(false)).toEqual([]);
+    expect(directFileTransferDaemonCapabilities(true)).toEqual([
+      ...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
+      DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
+    ]);
+  });
+
   it('send() adds monotonic seq counter', () => {
     link.connect();
     link.send({ type: 'msg1' });
@@ -106,6 +212,50 @@ describe('ServerLink', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('turns a core-lane normal queue rejection into a priority preview error', async () => {
+    const sends: Array<{ raw: string; priority?: string }> = [];
+    const coreLane = Object.create(CoreLaneSocket.prototype) as CoreLaneSocket & {
+      readyState: number;
+      bufferedAmount: number;
+      send(raw: string, priority?: string): void;
+    };
+    coreLane.readyState = CoreLaneSocket.OPEN;
+    coreLane.bufferedAmount = 0;
+    (coreLane as unknown as { worker: { postMessage: () => void; terminate: () => Promise<void> } }).worker = {
+      postMessage: vi.fn(),
+      terminate: vi.fn(async () => {}),
+    };
+    let first = true;
+    coreLane.send = (raw, priority) => {
+      if (first) {
+        first = false;
+        throw new Error('core lane normal queue is full');
+      }
+      sends.push({ raw, priority });
+    };
+    (link as unknown as { ws: CoreLaneSocket }).ws = coreLane;
+
+    link.send({
+      type: 'fs.read_response',
+      requestId: 'preview-overloaded',
+      path: '/repo/large.log',
+      status: 'ok',
+      content: 'x'.repeat(256),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.priority).toBe('priority');
+    expect(JSON.parse(sends[0]!.raw)).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'preview-overloaded',
+      status: 'error',
+      error: 'preview_worker_queue_full',
+      recoverable: true,
+    });
+    expect(link.dataPlaneQueueStatsForTests().depth).toBe(0);
   });
 
   it('does not queue live timeline events behind bulk history sends', async () => {
@@ -283,6 +433,358 @@ describe('ServerLink', () => {
     expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
   });
 
+  it('bounds retained data-plane payload bytes while the server link is unavailable', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 100,
+      maxBytes: 32 * 1024,
+      staleMs: 60_000,
+    });
+    mockWsInstance.readyState = 3; // CLOSED
+
+    for (let index = 0; index < 20; index += 1) {
+      link.send({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: `hist-${index}`,
+        sessionName: 'deck_test_brain',
+        events: [{ text: `${index}:`.padEnd(16 * 1024, 'x') }],
+      });
+    }
+
+    const stats = link.dataPlaneQueueStatsForTests();
+    expect(stats.bytes).toBeLessThanOrEqual(32 * 1024);
+    expect(stats.depth).toBeLessThanOrEqual(20);
+
+    mockWsInstance.readyState = 1;
+    link.connect();
+    link.flushDataPlaneAfterReconnect();
+    for (let index = 0; index < stats.depth + 1; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const sentHistory = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === TIMELINE_MESSAGES.HISTORY);
+    expect(sentHistory).toHaveLength(stats.depth);
+    expect(sentHistory.filter((message) => message.errorReason === 'queue_full').length).toBeGreaterThan(0);
+  });
+
+  it('returns a compact recoverable response instead of retaining a timeline payload beyond the byte cap', () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 100,
+      maxBytes: 20 * 1024,
+      overloadReserveBytes: 1024,
+      staleMs: 60_000,
+    });
+    link.connect();
+
+    link.send({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-kept',
+      sessionName: 'deck_test_brain',
+      events: [{ text: 'x'.repeat(16 * 1024) }],
+    });
+    link.send({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-rejected',
+      sessionName: 'deck_test_brain',
+      events: [{ text: 'y'.repeat(16 * 1024) }],
+    });
+
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 2 });
+  });
+
+  it('never bypasses a stuck WebSocket watermark with queue-full data responses', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 32,
+      maxBytes: 32 * 1024,
+      overloadReserveBytes: 8 * 1024,
+      overloadReserveItems: 8,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+
+    for (let index = 0; index < 64; index += 1) {
+      link.send({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: `hist-overload-${index}`,
+        sessionName: 'deck_test_brain',
+        events: [{ text: `${index}`.padEnd(16 * 1024, 'x') }],
+      });
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests().bytes).toBeLessThanOrEqual(32 * 1024);
+    expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+    expect(mockWsInstance.close).toHaveBeenCalledWith(1013, 'data_plane_backpressure');
+
+    mockWsInstance.bufferedAmount = 0;
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+    for (let index = 0; index < 40; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const sent = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-overload-1',
+      sessionName: 'deck_test_brain',
+      status: 'error',
+      source: 'error',
+      errorReason: 'queue_full',
+      events: [],
+      recoverable: true,
+    }));
+  });
+
+  it('holds bulk sends above WebSocket high-water, keeps ACKs live, then drains in order below low-water', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 1024 * 1024,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+    link.send({ type: 'fs.ls_response', requestId: 'ls-1', path: '/a', status: 'ok', entries: [] });
+    link.send({ type: 'fs.git_status_response', requestId: 'git-2', path: '/a', status: 'ok', files: [] });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 2, socketBackpressured: true });
+
+    link.send({ type: 'command.ack', commandId: 'ack-while-bulk-paused' });
+    expect(JSON.parse(String(mockWsInstance.send.mock.calls[0][0]))).toMatchObject({
+      type: 'command.ack',
+      commandId: 'ack-while-bulk-paused',
+    });
+
+    mockWsInstance.bufferedAmount = 256;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const sentData = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type !== 'command.ack');
+    expect(sentData.map((message) => message.requestId)).toEqual(['ls-1', 'git-2']);
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 0, bytes: 0, socketBackpressured: false });
+  });
+
+  it('stamps heartbeats with a send time and limits bulk socket backlog while the uplink round trip is congested', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.send.mockClear();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const heartbeat = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .find((message) => message.type === 'heartbeat');
+    expect(heartbeat?.[CLOCK_SYNC_FIELD.SENT_AT]).toEqual(expect.any(Number));
+    expect(link.isUplinkCongested()).toBe(false);
+
+    // A 100 KiB socket backlog is nothing for the default 8 MiB high-water...
+    mockWsInstance.bufferedAmount = 100 * 1024;
+    // ...but the server's ack shows the round trip took 4s: congested.
+    messageHandler?.({
+      data: JSON.stringify({ type: 'heartbeat_ack', [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() - 4_000 }),
+    } as MessageEvent);
+    expect(link.isUplinkCongested()).toBe(true);
+
+    mockWsInstance.send.mockClear();
+    link.send({ type: 'fs.ls_response', requestId: 'bulk-while-congested', path: '/a', status: 'ok', entries: [] });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 1, socketBackpressured: true });
+
+    // Control frames still go straight out.
+    link.send({ type: 'command.ack', commandId: 'ack-while-congested' });
+    expect(JSON.parse(String(mockWsInstance.send.mock.calls[0]![0]))).toMatchObject({ type: 'command.ack' });
+
+    // A fast round trip clears congestion and the held bulk reply drains.
+    messageHandler?.({
+      data: JSON.stringify({ type: 'heartbeat_ack', [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() - 200 }),
+    } as MessageEvent);
+    mockWsInstance.bufferedAmount = 16 * 1024;
+    await vi.advanceTimersByTimeAsync(50);
+    expect(link.isUplinkCongested()).toBe(false);
+    const drained = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === 'fs.ls_response');
+    expect(drained.map((message) => message.requestId)).toEqual(['bulk-while-congested']);
+    mockWsInstance.bufferedAmount = 0;
+  });
+
+  it('counts an unacked heartbeat that has waited long enough as congestion', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(200_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+    await vi.advanceTimersByTimeAsync(5_000); // heartbeat sent, never acked
+    expect(link.isUplinkCongested()).toBe(false);
+    vi.setSystemTime(Date.now() + 3_500);
+    expect(link.isUplinkCongested()).toBe(true);
+  });
+
+  it('never force-reconnects on the ack watchdog when this connection has never received a heartbeat_ack (legacy server, silence/pong recycling only)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(300_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+    recordDaemonServerLinkStatusMock.mockClear();
+
+    // An older self-hosted server that only ever answers with a ws pong,
+    // never an application-level heartbeat_ack. Unrelated frames keep
+    // `lastPong` fresh so the connection is genuinely alive, not silent --
+    // the ack-based watchdog must not fire for a connection that has never
+    // proven it gets acks at all, well past what used to be one ack-timeout
+    // window every heartbeat interval.
+    for (let i = 0; i < 14; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'daemon.stats' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+  });
+
+  it('still reconnects within the bound once a connection that had acks stops getting them', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(350_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+    recordDaemonServerLinkStatusMock.mockClear();
+
+    // This server proves it sends heartbeat_ack once...
+    await vi.advanceTimersByTimeAsync(5_000);
+    messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+
+    // ...then stops, while unrelated frames keep `lastPong` fresh so silence
+    // alone would not explain a reconnect -- only the ack watchdog does.
+    for (let i = 0; i < 14; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'daemon.stats' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).toHaveBeenCalled();
+    expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'disconnected',
+      lastError: 'heartbeat_ack_timeout',
+    }));
+  });
+
+  it('accepts legacy heartbeat acks without a clock echo across repeated timeout windows', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(400_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+
+    // An older server acknowledges every heartbeat but has no sentAt echo. The
+    // FIFO fallback must retire each proof and keep the healthy link open.
+    for (let i = 0; i < 30; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+  });
+
+  it('drops only the cancelled request\'s queued reply and keeps fan-out replies for other requesters', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 1024 * 1024,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+    link.send({ type: TIMELINE_MESSAGES.HISTORY, requestId: 'req-a', sessionName: 's', events: [] });
+    link.send({ type: TIMELINE_MESSAGES.HISTORY, requestId: 'req-b', sessionName: 's', events: [] });
+    link.send({ type: 'fs.read_response', requestId: 'req-a', requestIds: ['req-a', 'req-c'], status: 'ok' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(link.dataPlaneQueueStatsForTests().depth).toBe(3);
+
+    expect(link.cancelQueuedDataPlaneRequest('req-a')).toBe(1);
+    expect(link.cancelQueuedDataPlaneRequest('req-unknown')).toBe(0);
+
+    mockWsInstance.bufferedAmount = 0;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    for (let i = 0; i < 4; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const sent = mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(sent.map((message) => `${message.type}:${message.requestId}`)).toEqual([
+      `${TIMELINE_MESSAGES.HISTORY}:req-b`,
+      'fs.read_response:req-a',
+    ]);
+  });
+
+  it('keeps a mixed one-megabyte flood under the configured retained-byte ceiling', () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 128 * 1024,
+      wsHighWaterBytes: 64 * 1024,
+      wsLowWaterBytes: 16 * 1024,
+      staleMs: 60_000,
+    });
+    mockWsInstance.readyState = 3;
+    const types = [TIMELINE_MESSAGES.HISTORY, 'fs.ls_response', 'fs.git_status_response', 'transport.models_response'];
+    for (let index = 0; index < 256; index += 1) {
+      const type = types[index % types.length];
+      link.send({
+        type,
+        requestId: `mixed-${index}`,
+        sessionName: 'deck_test_brain',
+        path: '/repo',
+        status: 'ok',
+        events: [{ text: `${index}`.padEnd(4096, 'x') }],
+        entries: [{ name: `${index}`.padEnd(4096, 'x') }],
+        files: [{ path: `${index}`.padEnd(4096, 'x') }],
+        models: [{ id: `${index}`.padEnd(4096, 'x') }],
+      });
+    }
+    expect(link.dataPlaneQueueStatsForTests().bytes).toBeLessThanOrEqual(128 * 1024);
+  });
+
   it('drain leaves the queued data-plane item intact when the socket is not OPEN and resends it after reconnect', async () => {
     // Section-10 (post-deploy audit fix for commit f25f72e7) anchor:
     // before the fix, the drain loop ran `shift()` and then `trySend()`
@@ -342,5 +844,180 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledTimes(2);
     // The previous WS instance must have been explicitly closed.
     expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts content-bearing timeline events dropped while the link is down', () => {
+    // This branch is where a chat message vanishes: live timeline events are
+    // control-plane, so a non-OPEN socket drops them with no queue and no replay.
+    // The browser now heals it via a no-lower-bound backfill, so without this
+    // counter a rising drop rate would be masked by the recovery.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3; // CLOSED
+
+    const before = getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' });
+    expect(link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e1', sessionId: 's', ts: 1, payload: { text: 'lost' } },
+    })).toBeUndefined();
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' }))
+      .toBe(before + 1);
+    expect(link.timelineDropCountWhileLinkDown).toBe(1);
+  });
+
+  it('does not count high-frequency status chatter as a lost message', () => {
+    // agent.status fires ~1/s during a turn; counting it would bury the signal.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3;
+
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'agent.status', eventId: 'e2', sessionId: 's', ts: 2, payload: { status: 'thinking' } },
+    });
+    link.send({ type: 'heartbeat' });
+
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'agent.status' })).toBe(0);
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
+  });
+
+  it('counts nothing while the link is OPEN', () => {
+    resetMetricsForTests();
+    mockWsInstance.readyState = 1; // OPEN
+    link.connect();
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e3', sessionId: 's', ts: 3, payload: { text: 'delivered' } },
+    });
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
+  });
+
+  it('fires the reconnect state-resync handler on RE-connect only, not the first connect', async () => {
+    // Regression for deck_sub_26624c1t: live timeline events (incl. the
+    // authoritative session.state idle) are control-plane and silently dropped
+    // while the socket is down — with no replay, a turn that settles during an
+    // outage leaves every browser rendering "working" forever. The open handler
+    // must invoke the registered resync hook after every reconnect so the
+    // session layer can re-broadcast current authoritative states. The FIRST
+    // connect must NOT fire it (daemon startup already runs a full session sync).
+    const resync = vi.fn();
+    setServerLinkReconnectResyncHandler(resync);
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      expect(openHandler).toBeDefined();
+
+      // First successful open — startup path, no resync.
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0); // flush the scheduled setImmediate
+      expect(resync).not.toHaveBeenCalled();
+
+      // Re-connect (same socket object in this harness; the handler's stale-ws
+      // guard passes because this.ws is unchanged).
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(resync).toHaveBeenCalledTimes(1);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
+  });
+
+  it('survives a throwing resync handler without breaking the open handshake', async () => {
+    setServerLinkReconnectResyncHandler(() => {
+      throw new Error('resync boom');
+    });
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      openHandler?.();
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      // No throw escaped to the test — the handler failure is contained.
+      expect(link.isConnected()).toBe(true);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
+  });
+
+  it('auth_failed loop: backoff doubles on each close when no server message is received', () => {
+    // Regression for the win-201 bug: the daemon was retrying auth_failed at
+    // ~500 ms indefinitely because backoffMs was reset on socket open, before
+    // the server sent auth_failed (code 4001) and closed. With the fix, the
+    // backoff only resets when the server has actually sent a message (auth ok).
+    //
+    // scheduleReconnect() fires the timer and doubles backoffMs INSIDE the callback.
+    // So we advance fake timers after each close to observe the doubled value.
+    vi.useFakeTimers();
+    link.connect();
+
+    const calls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler = calls.find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const closeHandler = calls.find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+    expect(openHandler).toBeDefined();
+    expect(closeHandler).toBeDefined();
+
+    // A fresh link starts at INITIAL_BACKOFF_MS; read it instead of duplicating the literal.
+    const INITIAL = link.__backoffMsForTests();
+    expect(INITIAL).toBeGreaterThan(0);
+
+    // Cycle 1: open (no message) → close (auth_failed) → timer fires → backoff doubles.
+    openHandler!();
+    expect(link.__backoffMsForTests()).toBe(INITIAL); // not yet confirmed
+
+    closeHandler!({ code: 4001, reason: 'auth_failed' });
+    vi.advanceTimersByTime(2_000); // fire the reconnect timer; doubling happens inside it
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // backed off
+
+    // Cycle 2: open again (still no server message) → close → timer → doubled again.
+    // The handlers registered on the new connect() call share the same mock object;
+    // the most-recently-added handlers are the live ones.
+    const allCalls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler2 = [...allCalls].reverse().find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const closeHandler2 = [...allCalls].reverse().find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+
+    openHandler2?.();
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // NOT reset — no message received
+
+    closeHandler2?.({ code: 4001, reason: 'auth_failed' });
+    vi.advanceTimersByTime(10_000);
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 4); // doubled again — exponential back-off
+  });
+
+  it('normal reconnect: backoff resets to initial after server sends the first message', () => {
+    // Complement: when the server accepts auth and sends a message, the next
+    // reconnect (e.g. after a network drop) starts fresh at INITIAL_BACKOFF_MS.
+    vi.useFakeTimers();
+    link.connect();
+
+    const calls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler = calls.find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const messageHandler = calls.find(([type]) => type === 'message')?.[1] as
+      ((e: { data: string }) => void) | undefined;
+    const closeHandler = calls.find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+    expect(openHandler).toBeDefined();
+    expect(messageHandler).toBeDefined();
+    expect(closeHandler).toBeDefined();
+
+    // A fresh link starts at INITIAL_BACKOFF_MS; read it instead of duplicating the literal.
+    const INITIAL = link.__backoffMsForTests();
+    expect(INITIAL).toBeGreaterThan(0);
+
+    // Simulate: connect, server sends a message (auth confirmed), then network drops.
+    openHandler!();
+    messageHandler!({ data: JSON.stringify({ type: 'heartbeat_ack', ts: 1 }) });
+    expect(link.__backoffMsForTests()).toBe(INITIAL); // reset on first message
+
+    // After the drop, scheduleReconnect() uses INITIAL (fast reconnect — good).
+    // The timer callback doubles it so the next attempt is INITIAL*2 if it also fails.
+    closeHandler!({ code: 1001, reason: 'going away' });
+    vi.advanceTimersByTime(2_000);
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // doubled for next attempt
   });
 });

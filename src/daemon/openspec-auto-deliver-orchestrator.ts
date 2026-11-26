@@ -1,14 +1,13 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
-import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import {
   activeOpenSpecPromptIdForAutoDeliverStage,
   evaluateOpenSpecAutoDeliverComboCompatibility,
@@ -66,6 +65,7 @@ import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import { REAL_DEVICE_AUTHORIZATION_GUIDANCE } from '../../shared/transport-runtime-prompts.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -88,8 +88,9 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
-import { enqueueResend, getResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, removeResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
 /**
  * Parent stage owning the Auto Deliver IMPLEMENTATION prompt's task semantics.
@@ -97,6 +98,9 @@ import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js'
  * shared tuple. Reference to the shared union, not a second string definition.
  */
 const AUTO_DELIVER_IMPLEMENTATION_STAGE: ExecutionCloneParentStage = 'auto_deliver_implementation';
+
+const AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION =
+  `Run reasonable local validation for the touched code when available. Use all applicable testing tools and device environments in scope for this request, including focused unit, integration, end-to-end, and real-device checks where relevant and safe. ${REAL_DEVICE_AUTHORIZATION_GUIDANCE} Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands, devices/environments, and outcomes, or explain why validation could not run.`;
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
@@ -209,6 +213,12 @@ interface AutoDeliverRun {
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
   taskStats: OpenSpecAutoDeliverTaskStats;
+  /** Skippable-task allowance accepted from the completed implementation marker:
+   *  the count of unchecked tasks that are external / deployment-only /
+   *  authorization-gated / explicitly deferred. Final acceptance may PASS while
+   *  up to this many tasks remain unchecked — those external gates are surfaced
+   *  as deferred follow-ups, never auto-checked, so they cannot block delivery. */
+  acceptedSkippableTaskCount?: number;
   terminalReason?: string;
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
@@ -218,6 +228,7 @@ interface AutoDeliverRun {
     markerPath: string;
     spec: P2pExecutionMarkerSpec;
     retryCount: number;
+    createdAt: number;
     /** Unchecked-task count at the previous reminder; lets the reminder loop
      *  reset retryCount when the implementation makes progress between idles. */
     lastUncheckedCount?: number;
@@ -313,15 +324,30 @@ const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationReminderTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceAuditIdleRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Implementation advances are launched from timeline/timer callbacks that
+// cannot be awaited by the emitter. Track them so the test-only reset can
+// quiesce the real async lifecycle before fixtures and shared mocks are reset.
+// Without this, an old run can settle before one test's teardown, then finish
+// collecting Git evidence and call startP2pRun after the next test has cleared
+// its spies -- producing both cross-test mock calls and filesystem teardown
+// races under coverage contention.
+const implementationAdvancesInFlight = new Set<Promise<void>>();
+const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
-const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
 // Minimum spacing between implementation "marker missing" reminders. Unless the
 // implementation just made task progress, a reminder is throttled to at least
 // this interval so a fast-flapping idle cannot spam the agent.
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS = process.env.NODE_ENV === 'test' ? 20 : 1_000;
+const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS = process.env.NODE_ENV === 'test' ? 250 : 5_000;
+const OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS = process.env.NODE_ENV === 'test' ? 40 : 20_000;
+const OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS = process.env.NODE_ENV === 'test' ? 40 : 250;
+const OPENSPEC_AUTO_DELIVER_PROMPT_IDLE_ADVANCE_POLL_MS = process.env.NODE_ENV === 'test' ? 40 : 1_000;
 const OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS = process.env.NODE_ENV === 'test' ? 50 : 1_000;
 // A transport runtime can be briefly absent while a session reconnects or its SDK
 // transport is restored (e.g. a relaunch) — it comes back on its own. Wait this
@@ -347,20 +373,55 @@ function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTran
   return runtime.providerSessionId ?? null;
 }
 
-function emitAutoDeliverQueuedState(
-  sessionName: string,
-  entries: Array<{ commandId: string; text: string }>,
-  pendingMessageVersion?: number,
+function preemptBusyRuntimeBeforeAutoDeliverPrompt(
+  run: AutoDeliverRun,
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
 ): void {
+  const snapshot = runtime as typeof runtime & {
+    getStatus?: () => string;
+    getDiagnosticSnapshot?: (nowMs?: number) => {
+      status?: string;
+      sending?: boolean;
+      activeDispatchCount?: number;
+      activeToolCount?: number;
+    };
+    settleActiveDispatchFromExternalCompletion?: (reason?: string) => boolean;
+    cancelStaleActiveTurnWithPending?: (options?: { reason?: string; nowMs?: number; staleMs?: number }) => boolean;
+    sending?: boolean;
+    activeDispatchEntries?: unknown[];
+  };
+  const nowMs = Date.now();
+  const diagnostic = snapshot.getDiagnosticSnapshot?.(nowMs);
+  const status = diagnostic?.status ?? (typeof snapshot.getStatus === 'function' ? snapshot.getStatus() : undefined);
+  const sending = diagnostic?.sending ?? snapshot.sending === true;
+  const activeDispatchCount = diagnostic?.activeDispatchCount
+    ?? (Array.isArray(snapshot.activeDispatchEntries) ? snapshot.activeDispatchEntries.length : 0);
+  const activeToolCount = diagnostic?.activeToolCount ?? 0;
+  const inProgress = status === 'streaming'
+    || status === 'thinking'
+    || status === 'permission'
+    || status === 'tool_running';
+  if ((!inProgress && !sending && activeDispatchCount <= 0) || activeToolCount > 0) return;
+
+  const reason = `openspec-auto-deliver-pre-send:${run.status}`;
+  const settled = snapshot.settleActiveDispatchFromExternalCompletion?.(reason) === true;
+  const cancelled = settled
+    ? false
+    : snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs, staleMs: 0 }) === true;
+  if (!settled && !cancelled) return;
+
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Auto Deliver prompt preempted a stale busy transport turn before send: ${reason}.`,
+    stale: false,
+  }]);
+}
+
+function emitAutoDeliverQueuedState(sessionName: string): void {
+  const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'openspec_auto_deliver');
   timelineEmitter.emit(sessionName, 'session.state', {
-    state: 'queued',
-    pendingCount: entries.length,
-    pendingMessages: entries.map((entry) => entry.text),
-    pendingMessageEntries: entries.map((entry) => ({
-      clientMessageId: entry.commandId,
-      text: entry.text,
-    })),
-    ...(typeof pendingMessageVersion === 'number' ? { pendingMessageVersion } : {}),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -372,12 +433,23 @@ function queueAutoDeliverPromptForTransportResend(
 ): AutoDeliverPromptSendMode {
   if (isOpenSpecAutoDeliverTerminalStage(run.status)) return 'skipped_terminal';
   const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
+    ...(recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) ? { recipient: recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) } : {}),
     text: prompt,
     commandId,
+    clientMessageId: `auto-deliver:${randomUUID()}`,
+    // Projected when the resend drains; a daemon prompt, not the human's input.
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
     queuedAt: Date.now(),
   });
-  const queued = getResendEntries(run.targetImplementationSessionName);
-  emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, enqueueResult.pendingVersion);
+  if (!enqueueResult.accepted) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Auto Deliver prompt was not queued because the transport queue authority rejected enqueue: ${enqueueResult.reason}.`,
+      stale: false,
+    }]);
+    return 'skipped_terminal';
+  }
+  emitAutoDeliverQueuedState(run.targetImplementationSessionName);
   // Trigger the runtime (re)launch so the resend queue actually drains. Manual
   // sends do this inline (command-handler); Auto-Deliver delivers outside that
   // path, so without this an enqueued prompt for a transport session with no
@@ -416,26 +488,20 @@ async function sendAutoDeliverPromptToImplementationSession(
     return queueAutoDeliverPromptForTransportResend(run, prompt, commandId, 'transport_runtime_not_initialized');
   }
   try {
-    const result = runtime.send(prompt, commandId);
+    preemptBusyRuntimeBeforeAutoDeliverPrompt(run, runtime);
+    // The origin rides a queued copy too: the drain projects its user.message.
+    const result = runtime.send(prompt, commandId, undefined, undefined, { messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
     if (result === 'sent') {
       timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
         text: prompt,
         allowDuplicate: true,
         commandId,
+        // A daemon prompt, not the human's input (shared/chat-message-origin.ts).
+        [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
       }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
     }
     if (result === 'queued') {
-      const pendingEntries = Array.isArray(runtime.pendingEntries) ? runtime.pendingEntries : [];
-      emitAutoDeliverQueuedState(
-        run.targetImplementationSessionName,
-        pendingEntries.map((entry) => ({
-          commandId: entry.clientMessageId,
-          text: entry.text,
-        })),
-        typeof runtime.pendingVersion === 'number'
-          ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion)
-          : undefined,
-      );
+      emitAutoDeliverQueuedState(run.targetImplementationSessionName);
     }
     return result;
   } catch (error) {
@@ -475,17 +541,14 @@ function purgeQueuedAutoDeliverPrompts(run: AutoDeliverRun, reason: string): voi
   );
 
   if (runtimeRemoved > 0) {
+    const queuePayload = buildTransportQueueSnapshotPayload(run.targetImplementationSessionName, 'openspec_auto_deliver');
     timelineEmitter.emit(run.targetImplementationSessionName, 'session.state', {
-      state: runtime?.pendingCount && runtime.pendingCount > 0 ? 'queued' : 'idle',
-      pendingCount: runtime?.pendingCount ?? 0,
-      pendingMessages: runtime?.pendingMessages ?? [],
-      pendingMessageEntries: runtime?.pendingEntries ?? [],
-      pendingMessageVersion: runtime ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion) : getTransportQueueRevision(run.targetImplementationSessionName),
+      state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+      ...queuePayload,
     }, { source: 'daemon', confidence: 'high' });
   }
   if (resendRemoved > 0) {
-    const queued = getResendEntries(run.targetImplementationSessionName);
-    emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, getTransportQueueRevision(run.targetImplementationSessionName));
+    emitAutoDeliverQueuedState(run.targetImplementationSessionName);
   }
   if (runtimeRemoved + resendRemoved > 0) {
     run.evidence = mergeEvidence(run.evidence, [{
@@ -531,10 +594,61 @@ function clearImplementationMarkerPollTimer(runId: string): void {
   implementationMarkerPollTimers.delete(runId);
 }
 
+function clearImplementationAwaitingDispatchIdleTimer(runId: string): void {
+  const timer = implementationAwaitingDispatchIdleTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  implementationAwaitingDispatchIdleTimers.delete(runId);
+}
+
+function clearPromptIdleAdvanceTimer(runId: string): void {
+  const timer = promptIdleAdvanceTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  promptIdleAdvanceTimers.delete(runId);
+}
+
 function clearAcceptanceResultFilePollTimer(runId: string): void {
   const timer = acceptanceResultFilePollTimers.get(runId);
   if (timer) clearTimeout(timer);
   acceptanceResultFilePollTimers.delete(runId);
+}
+
+function clearAcceptanceAuditIdleRecheckTimer(runId: string): void {
+  const timer = acceptanceAuditIdleRecheckTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.delete(runId);
+}
+
+/**
+ * Preserve a real idle edge that arrived before the transport runtime finished
+ * its active turn. Timeline state dedupe may suppress the later idle snapshot,
+ * so merely returning from the listener can otherwise strand the acceptance
+ * audit forever. This timer is intentionally distinct from result-file polling:
+ * polling may consume an already-written result while busy, but it must not
+ * independently dispatch a repair prompt.
+ */
+function schedulePostRepairAcceptanceAuditIdleRecheck(run: AutoDeliverRun): void {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
+  if (!run.activeAcceptanceAudit || !run.activeCommandId || run.status !== run.activeAcceptanceAudit.stage) return;
+  const attemptId = run.activeAcceptanceAudit.attemptId;
+  const commandId = run.activeCommandId;
+  const stage = run.status;
+  acceptanceAuditIdleRecheckTimers.set(run.runId, setTimeout(() => {
+    acceptanceAuditIdleRecheckTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (
+      current.activeAcceptanceAudit?.attemptId !== attemptId
+      || current.activeCommandId !== commandId
+      || current.status !== stage
+    ) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePostRepairAcceptanceAuditIdleRecheck(current);
+      return;
+    }
+    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_recheck_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
 }
 
 function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
@@ -545,11 +659,7 @@ function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
     if (!current.activeAcceptanceAudit || !current.activeCommandId || current.status !== current.activeAcceptanceAudit.stage) return;
-    if (isTransportRuntimeBusyForIdleAdvance(current)) {
-      schedulePostRepairAcceptanceResultFilePoll(current);
-      return;
-    }
-    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+    void advanceAfterPostRepairAcceptanceAuditIdle(current, { allowResultFileRepairPrompt: false }).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_result_file_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
@@ -562,10 +672,54 @@ function scheduleImplementationMarkerPoll(run: AutoDeliverRun): void {
     implementationMarkerPollTimers.delete(run.runId);
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
-    void advanceAfterImplementationMarkerPoll(current).catch((error) => {
+    void trackImplementationAdvance(advanceAfterImplementationMarkerPoll(current)).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_marker_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS));
+}
+
+function schedulePromptIdleAdvancePoll(run: AutoDeliverRun): void {
+  clearPromptIdleAdvanceTimer(run.runId);
+  promptIdleAdvanceTimers.set(run.runId, setTimeout(() => {
+    promptIdleAdvanceTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status) || !current.activeCommandId) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePromptIdleAdvancePoll(current);
+      return;
+    }
+    if (current.status === 'spec_audit_repair' && !current.activeAcceptanceAudit) {
+      void advanceAfterSpecRepairIdle(current).catch((error) => {
+        terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'spec_repair_idle_poll_advance_failed');
+      });
+      return;
+    }
+  }, OPENSPEC_AUTO_DELIVER_PROMPT_IDLE_ADVANCE_POLL_MS));
+}
+
+function scheduleImplementationAwaitingDispatchIdleRecheck(run: AutoDeliverRun): void {
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
+  implementationAwaitingDispatchIdleTimers.set(run.runId, setTimeout(() => {
+    implementationAwaitingDispatchIdleTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (current.status !== 'implementation_task_loop' || !current.activeCommandId || !current.activeImplementationPromptAwaitingDispatch) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      scheduleImplementationAwaitingDispatchIdleRecheck(current);
+      return;
+    }
+    current.activeImplementationPromptAwaitingDispatch = false;
+    void trackImplementationAdvance(advanceAfterImplementationIdle(current)).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_awaiting_dispatch_idle_recheck_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS));
+}
+
+function trackImplementationAdvance(advance: Promise<void>): Promise<void> {
+  implementationAdvancesInFlight.add(advance);
+  return advance.finally(() => {
+    implementationAdvancesInFlight.delete(advance);
+  });
 }
 
 function cloneTaskStats(stats: OpenSpecAutoDeliverTaskStats): OpenSpecAutoDeliverTaskStats {
@@ -712,6 +866,7 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     marker.summary,
     marker.changedFiles?.length ? `changedFiles=${marker.changedFiles.join(',')}` : undefined,
     marker.tests?.length ? `tests=${marker.tests.join(',')}` : undefined,
+    `skippableTaskCount=${marker.skippableTaskCount ?? 0}`,
   ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
@@ -721,6 +876,27 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     ...(run.activeCommandId ? { command: run.activeCommandId } : {}),
     stale: false,
   }]);
+}
+
+function implementationMarkerTaskGate(
+  marker: P2pExecutionMarker,
+  taskStats: OpenSpecAutoDeliverTaskStats,
+): { accepted: boolean; allowed: number } {
+  const allowed = marker.skippableTaskCount ?? 0;
+  return { accepted: taskStats.unchecked <= allowed, allowed };
+}
+
+async function dispatchImplementationTaskGateReminder(
+  run: AutoDeliverRun,
+  allowed: number,
+): Promise<void> {
+  const projection = await dispatchImplementationMarkerReminder(
+    run,
+    `implementation_tasks_exceed_marker_skip_allowance:unchecked=${run.taskStats.unchecked}:allowed=${allowed}`,
+  );
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  }
 }
 
 function elapsedLimitExceeded(run: AutoDeliverRun): boolean {
@@ -789,7 +965,11 @@ function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
     || status === 'permission';
   const busy = inProgress || sending || activeDispatchCount > 0 || pendingCount > 0;
   if (busy && pendingCount > 0 && (inProgress || sending || activeDispatchCount > 0)) {
-    snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs });
+    snapshot.cancelStaleActiveTurnWithPending?.({
+      reason,
+      nowMs,
+      staleMs: OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS,
+    });
   }
   return busy;
 }
@@ -940,6 +1120,7 @@ async function buildImplementationMarkerContract(
       nonce: randomUUID(),
     },
     retryCount: 0,
+    createdAt: Date.now(),
   };
 }
 
@@ -1019,15 +1200,30 @@ async function readTaskStatsForRun(run: AutoDeliverRun): Promise<OpenSpecAutoDel
   // tasks.md can be transiently unreadable/half-written while the agent is
   // checking tasks off; retry a few times before treating it as unreadable so a
   // momentary read race does not hard-fail the run.
+  //
+  // A truncated read does not throw, so the retry above never saw the worst
+  // case. `writeFile` truncates before it writes, and an agent checking a task
+  // off rewrites tasks.md exactly that way, so a poll landing inside the write
+  // parses an EMPTY file and reports `total: 0`. Callers read that as
+  // tasks_missing_checkboxes and terminalize the run -- permanently, for a
+  // file that was intact microseconds later. A run that has already observed
+  // checkboxes cannot legitimately lose every one of them, so treat that
+  // reading as transient too and put it on the same retry budget. A tasks.md
+  // that is genuinely empty still answers zero once the retries are spent.
+  const observedTasksBefore = run.taskStats.total > 0;
   let lastError: unknown;
+  let emptyStats: OpenSpecAutoDeliverTaskStats | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return await readTaskStats(run.changeRoot);
+      const stats = await readTaskStats(run.changeRoot);
+      if (!observedTasksBefore || stats.total > 0) return stats;
+      emptyStats = stats;
     } catch (error) {
       lastError = error;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  if (emptyStats) return emptyStats;
   throw lastError instanceof Error ? lastError : new Error('tasks_unreadable');
 }
 
@@ -1247,7 +1443,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
-    'Run reasonable local validation for the touched code when available. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
     '',
     'Remaining tasks:',
     remainingBlock,
@@ -1265,7 +1461,10 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
 function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   const active = run.activeImplementationMarker;
   if (!active) return 'Implementation completion marker: unavailable.';
-  const completedMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(active.spec, 'completed')).trimEnd();
+  const completedMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(active.spec, 'completed'),
+    skippableTaskCount: 0,
+  }).trimEnd();
   const failedMarker = stringifyP2pExecutionMarker({
     ...buildP2pExecutionMarker(active.spec, 'failed'),
     error: 'short reason',
@@ -1273,8 +1472,10 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   return [
     'Implementation completion marker (required):',
     `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
-    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.',
-    '- Use the failed marker only when external input or an unrecoverable blocker prevents further implementation. If work is merely incomplete, keep working and overwrite any old failed marker with the completed marker after finishing.',
+    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. The sole required value to calculate before writing is skippableTaskCount: set it to the exact number of currently unchecked tasks that are external, deployment-only, authorization-gated, or explicitly deferred; keep it 0 when every unchecked task is still implementable. Do not write the marker before doing the work.',
+    '- The orchestrator re-reads tasks.md and accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount. A completed marker cannot bypass more unchecked tasks than it explicitly declares.',
+    '- When code/tests are complete and only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, you MUST write the completed marker with the matching skippableTaskCount. Do NOT write a failed marker for those tasks.',
+    '- Use the failed marker only for an unrecoverable implementation/infrastructure failure that prevents an honest completed handoff. A failed marker terminates Auto Deliver as needs_human and is not retried. If implementable work is merely incomplete, keep working and do not write either marker yet.',
     '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
     '',
     'Completed marker:',
@@ -1344,6 +1545,8 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
+  } else if (sendMode === 'queued') {
+    scheduleImplementationAwaitingDispatchIdleRecheck(run);
   }
   run.latestMessage = repairReason
     ? `implementation_repair_prompt_dispatched:${repairReason}`
@@ -1372,9 +1575,13 @@ async function advanceAfterCompletedImplementationMarker(
   marker: P2pExecutionMarker,
 ): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
+  // Carry the accepted external/deferred allowance forward so final acceptance
+  // can PASS with these gates still unchecked instead of re-blocking on them.
+  run.acceptedSkippableTaskCount = marker.skippableTaskCount ?? 0;
   recordImplementationMarkerEvidence(run, marker);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, 'openspec-auto-deliver-implementation-marker-completed');
   delete run.activeCommandId;
   delete run.activeImplementationPromptAwaitingDispatch;
@@ -1391,7 +1598,7 @@ async function advanceAfterCompletedImplementationMarker(
   await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
 }
 
-async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): Promise<void> {
+function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): void {
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
     summary: `Implementation completion marker reported failure: ${reason}`,
@@ -1399,16 +1606,21 @@ async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: str
     stale: false,
   }]);
   clearImplementationMarkerPollTimer(run.runId);
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, `openspec-auto-deliver-implementation-marker-failed:${reason}`);
-  const projection = await dispatchImplementationMarkerReminder(run, `implementation_marker_failed:${reason}`);
-  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-  }
+  terminalizeAndSend(run, 'needs_human', `implementation_marker_failed:${reason}`);
 }
 
 async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId || !run.activeImplementationMarker) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -1422,21 +1634,45 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+      return;
+    }
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
   if (run.taskStats.unchecked > 0) {
     scheduleImplementationMarkerPoll(run);
     return;
   }
 
-  const markerState = await readImplementationCompletionMarker(run);
-  if (markerState.ok) {
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+  const activeMarker = run.activeImplementationMarker;
+  if (!activeMarker) return;
+  const markerAgeMs = Date.now() - activeMarker.createdAt;
+  // The reminder counter is capped, so poll-driven nudges must never outrun the
+  // session they are nudging. `markerAgeMs` is frozen at contract creation and
+  // is never refreshed by a reminder, so once the first grace window elapsed
+  // every poll went straight back into the reminder path: with all tasks
+  // already checked (nothing left to count as progress, so the counter can
+  // never reset) the poll cadence walked the entire cap and terminalized the
+  // run as needs_human within a few poll intervals of the prompt being sent —
+  // before a session that was simply slow to answer had written anything. Gate
+  // the poll on a quiet window measured from the last thing Auto Deliver
+  // actually sent this session (initial prompt or latest reminder), so each
+  // nudge costs the agent a real grace window.
+  const quietSinceLastDispatchMs = Date.now() - Math.max(activeMarker.createdAt, activeMarker.lastReminderAt ?? 0);
+  const busyDuringPoll = isTransportRuntimeBusyForIdleAdvance(run);
+  if (quietSinceLastDispatchMs < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS
+    || (busyDuringPoll && markerAgeMs < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS)) {
+    scheduleImplementationMarkerPoll(run);
     return;
   }
-  if (markerState.failedByAgent) {
-    await handleFailedImplementationMarker(run, markerState.reason);
-    return;
+  const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   }
-  scheduleImplementationMarkerPoll(run);
 }
 
 function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: string): string {
@@ -1453,8 +1689,9 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     `Reason: ${reason}`,
     '',
     'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
-    'Run the appropriate validation for the files you touched. If validation fails, fix the failure and validate again.',
-    'Write the completed marker only after the implementation is genuinely finished and validated. Use a failed marker only for external input or unrecoverable blockers; incomplete checklist work means continue implementing, not stop.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
+    'If validation fails, fix the failure and validate again.',
+    'Write the completed marker only after the implementation is genuinely finished and validated. If only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, write completed with their exact skippableTaskCount; do not write failed. Use failed only for an unrecoverable implementation/infrastructure failure; incomplete implementable work means continue without writing a marker.',
     'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
     '',
     buildImplementationCompletionMarkerBlock(run),
@@ -1516,7 +1753,7 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
           implementationReminderTimers.delete(run.runId);
           const current = runsById.get(run.runId);
           if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
-          void advanceAfterImplementationIdle(current).catch((error) => {
+          void trackImplementationAdvance(advanceAfterImplementationIdle(current)).catch((error) => {
             terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
           });
         }, waitMs));
@@ -1535,6 +1772,8 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
+  } else if (sendMode === 'queued') {
+    scheduleImplementationAwaitingDispatchIdleRecheck(run);
   }
   run.latestMessage = recovered
     ? `implementation_marker_contract_recreated:${reason}`
@@ -1608,6 +1847,7 @@ async function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): Pr
   const prompt = buildSpecRepairPrompt(run, reason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   if (sendMode === 'skipped_terminal') return buildProjection(run);
+  if (sendMode === 'sent' || sendMode === 'queued') schedulePromptIdleAdvancePoll(run);
   run.latestMessage = `spec_repair_prompt_dispatched:${reason}`;
   return broadcastProjection(run);
 }
@@ -1717,7 +1957,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '- repair_completion.previous_items_complete must answer whether ALL previous required_changes, unchecked/falsely-complete tasks, repair scorecard gates, and repair task checklist/fallback plan items are now completed.',
     '- Use status="incomplete" and previous_items_complete=false when the prior repair checklist was not fully completed; list exact unfinished prior items in incomplete_items.',
     '- Use status="complete" and previous_items_complete=true only when the prior repair checklist is complete. If the checklist is complete but new or deeper issues still make the score low, put those new issues in required_changes.',
-    '- Use status="blocked" only for external blockers that cannot be repaired in this repository; list blockers in blocked_items.',
+    '- Use status="blocked" ONLY when NO in-repo repair remains and progress is impossible without external action (deployment, authorization, CI/release, physical hardware/device evidence). If ANY remaining gap is fixable or testable in this repository, use status="incomplete" — even if you also list genuinely external items in blocked_items.',
+    '- blocked_items are surfaced to the human but do NOT by themselves stop the automated repair loop: while incomplete_items remain, Auto Deliver keeps repairing the fixable work and only hands off to a human once nothing fixable is left. Never park a repairable/testable gap in blocked_items to force a stop; put it in incomplete_items.',
     '- Fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
@@ -1726,7 +1967,7 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     `Verdict scope for this final ${specStage ? 'specification' : 'implementation'} acceptance audit:`,
     passScope,
     reworkScope,
-    '- BLOCKED only for external blockers that cannot be repaired in this repository.',
+    '- BLOCKED (status="blocked") only when NO in-repo repair remains; a fixable/testable gap is REWORK/incomplete, not blocked, even if external items are also listed in blocked_items.',
     scoreScope,
     '',
     'Scoring discipline:',
@@ -1739,7 +1980,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     specStage
       ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
       : '- For implementation-stage scoring, tests means actual test coverage plus executed validation. If product validation was not run after repair, cap implementation and risk at 7 and cap tests at 6 even if the code looks plausible.',
-    '- If any previous finding remains unresolved or only unverified, verdict must be REWORK and the affected module score must be 5 or lower.',
+    '- External / deployment-only / authorization-gated / physical-hardware / real-reboot / CI-release gates that are CORRECTLY kept unchecked-and-deferred are accepted deferrals, NOT defects: do not lower any module score for them, do not treat their unverifiability as an unresolved finding, and do not make the verdict REWORK because of them. Score only the in-repo work that CAN be verified here; surface the deferred external gates in evidence/blocked_items so a human can complete them. A run whose only remaining gaps are these accepted external gates should PASS.',
+    '- If any previous finding remains unresolved or only unverified — and it is fixable or verifiable IN THIS REPOSITORY — verdict must be REWORK and the affected module score must be 5 or lower. (This does NOT apply to the accepted external/deferred gates above.)',
     '- Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS.',
     '',
     'The top-level auto_deliver object must exactly equal this metadata object:',
@@ -1846,6 +2088,7 @@ function buildPostRepairAcceptanceAuditResultRepairPrompt(
 }
 
 async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
   const stage: AuditRepairStage = run.postRepairAcceptanceStage ?? 'implementation_audit_repair';
@@ -1911,6 +2154,7 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
   reason: string,
 ): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const repairAttemptNumber = markResultFileRepairPromptDispatched(active);
   run.activeAcceptanceAudit = active;
   run.activeCommandId = `${active.attemptId}:result-file-repair:${repairAttemptNumber}`;
@@ -2389,7 +2633,7 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
     `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
     'Final acceptance audits must include repair_completion with fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     'evidence.source is informational only; use any useful label, or "none" when no label is available.',
-    'PASS must leave unchecked_tasks and required_changes empty.',
+    'PASS must leave required_changes empty. PASS may leave the external / deployment-only / authorization-gated / explicitly-deferred tasks unchecked (they are accepted deferrals, surfaced as follow-ups, not defects): do NOT list those in unchecked_tasks or required_changes, and do NOT lower any module score for them — record them in evidence (and blocked_items) instead. unchecked_tasks must contain only genuinely IMPLEMENTABLE work that still remains; if any such implementable work remains, the verdict is REWORK, not PASS.',
   ];
 }
 
@@ -2590,8 +2834,15 @@ function repairSummaryText(repairs: OpenSpecAutoDeliverRepairSummary[]): string 
 function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerdictPayload, changedFiles: string[] = []): string | null {
   if (verdict.verdict !== 'PASS') return null;
   if (run.taskStats.total <= 0) return 'tasks_missing_checkboxes';
-  if (run.taskStats.unchecked > 0) return 'audit_pass_with_unchecked_tasks';
-  if (verdict.unchecked_tasks.length > 0) return 'audit_pass_with_reported_unchecked_tasks';
+  // External / deployment-only / authorization-gated / explicitly-deferred tasks
+  // that the completed implementation marker declared skippable are accepted
+  // deferrals: PASS may leave up to that many tasks unchecked so real-world
+  // release/verification gates never block delivery. They stay unchecked (never
+  // auto-closed) and are surfaced as follow-ups. Only IMPLEMENTABLE unchecked
+  // work beyond the allowance blocks a PASS.
+  const allowedSkip = run.acceptedSkippableTaskCount ?? 0;
+  if (run.taskStats.unchecked > allowedSkip) return 'audit_pass_with_unchecked_tasks';
+  if (verdict.unchecked_tasks.length > allowedSkip) return 'audit_pass_with_reported_unchecked_tasks';
   if (verdict.required_changes.length > 0) return 'audit_pass_with_required_changes';
   const repairedFiles = new Set(verdict.repairs_applied.flatMap((repair) => repair.files));
   const uncoveredChangedFiles = changedFiles.filter((file) => !repairedFiles.has(file));
@@ -2731,6 +2982,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   }
   run.activeAcceptanceAudit = undefined;
   clearAcceptanceResultFilePollTimer(run.runId);
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   clearAuditFixRetryTimer(run.runId);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -2811,14 +3063,19 @@ type RepairCompletionDecision = 'complete' | 'incomplete' | 'blocked' | 'unknown
 function repairCompletionDecision(verdict: OpenSpecAutoDeliverVerdictPayload): RepairCompletionDecision {
   const completion = verdict.repair_completion;
   if (!completion) return 'unknown';
-  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
-  if (
-    completion.status === 'incomplete'
+  // In-repo fixable work takes PRIORITY over external blockers. The auditor uses
+  // blocked_items to surface external blockers (deploy/CI/hardware/authorization)
+  // for the human while STILL asking for a REWORK of the locally-fixable gaps in
+  // incomplete_items. A non-empty blocked_items list alone MUST NOT hard-stop the
+  // run — doing so throws away the auto-repair round for work that can actually be
+  // fixed here (the exact `status:incomplete + blocked_items:[…]` → needs_human
+  // over-trigger). Only a run with NO fixable work left and genuine blockers is
+  // handed to a human.
+  const hasFixableWork = completion.status === 'incomplete'
     || completion.previous_items_complete === false
-    || completion.incomplete_items.length > 0
-  ) {
-    return 'incomplete';
-  }
+    || completion.incomplete_items.length > 0;
+  if (hasFixableWork) return 'incomplete';
+  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
   if (completion.status === 'complete' && completion.previous_items_complete === true) return 'complete';
   return 'unknown';
 }
@@ -3333,6 +3590,13 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
   if (run.activeImplementationPromptAwaitingDispatch) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -3348,20 +3612,20 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  if (run.taskStats.unchecked <= 0) {
-    const markerState = await readImplementationCompletionMarker(run);
-    if (!markerState.ok) {
-      if (markerState.failedByAgent) {
-        await handleFailedImplementationMarker(run, markerState.reason);
-        return;
-      }
-      const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
-      if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-      }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
       return;
     }
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
+  if (run.taskStats.unchecked <= 0) {
+    const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    }
     return;
   }
   const projection = await dispatchImplementationMarkerReminder(run, 'implementation_tasks_still_unchecked');
@@ -3383,14 +3647,63 @@ async function advanceAfterSpecRepairIdle(run: AutoDeliverRun): Promise<void> {
   await dispatchPostRepairAcceptanceAuditPrompt(run);
 }
 
-async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): Promise<void> {
+async function advanceAfterPostRepairAcceptanceAuditIdle(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean } = {},
+): Promise<void> {
   if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
-  delete run.activeCommandId;
+  const active = run.activeAcceptanceAudit;
+  const activeCommandId = run.activeCommandId;
+  const advanceKey = `${run.runId}:${active.attemptId}`;
+  const existingAdvance = acceptanceAuditAdvancesInFlight.get(advanceKey);
+  if (existingAdvance) {
+    await existingAdvance;
+    // A result-file poll deliberately avoids dispatching a repair prompt. If a
+    // real idle arrives while that weaker observation is in flight, replay the
+    // idle after the poll only when the same command is still active. Successful
+    // consumption or a repair dispatch changes the active audit/command and
+    // therefore does not run twice.
+    if (
+      (options.allowResultFileRepairPrompt ?? true)
+      && run.activeAcceptanceAudit?.attemptId === active.attemptId
+      && run.activeCommandId === activeCommandId
+      && run.status === active.stage
+    ) {
+      await advanceAfterPostRepairAcceptanceAuditIdle(run, options);
+    }
+    return;
+  }
+  const advance = advanceAfterPostRepairAcceptanceAuditIdleOnce(run, options);
+  acceptanceAuditAdvancesInFlight.set(advanceKey, advance);
+  try {
+    await advance;
+  } finally {
+    if (acceptanceAuditAdvancesInFlight.get(advanceKey) === advance) {
+      acceptanceAuditAdvancesInFlight.delete(advanceKey);
+    }
+  }
+}
+
+async function advanceAfterPostRepairAcceptanceAuditIdleOnce(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean },
+): Promise<void> {
+  if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
+  const allowResultFileRepairPrompt = options.allowResultFileRepairPrompt ?? true;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
   const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
   if (!verdict) {
+    if (!allowResultFileRepairPrompt) {
+      schedulePostRepairAcceptanceResultFilePoll(run);
+      return;
+    }
+    if (isTransportRuntimeBusyForIdleAdvance(run)) {
+      schedulePostRepairAcceptanceResultFilePoll(run);
+      return;
+    }
+    delete run.activeCommandId;
     const reason = run.latestMessage ?? 'invalid_audit_result';
     if (isRetryableAuditResultError(reason)) {
       if (!canDispatchResultFileRepairPrompt(active)) {
@@ -3410,6 +3723,7 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  delete run.activeCommandId;
   run.activeAcceptanceAudit = undefined;
   await advanceAfterAuditVerdict(run, active.stage, verdict, {
     roundIndex: active.roundIndex,
@@ -3483,7 +3797,10 @@ function ensureTimelineListener(): void {
       && !!candidate.activeAcceptanceAudit
     );
     if (acceptanceAuditRun) {
-      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) return;
+      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) {
+        schedulePostRepairAcceptanceAuditIdleRecheck(acceptanceAuditRun);
+        return;
+      }
       void advanceAfterPostRepairAcceptanceAuditIdle(acceptanceAuditRun).catch((error) => {
         terminalizeAndSend(acceptanceAuditRun, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_advance_failed');
       });
@@ -3504,11 +3821,15 @@ function ensureTimelineListener(): void {
     const run = activeCandidates.find((candidate) =>
       candidate.status === 'implementation_task_loop'
       && !!candidate.activeCommandId
-      && !candidate.activeImplementationPromptAwaitingDispatch
     );
     if (!run) return;
+    if (run.activeImplementationPromptAwaitingDispatch) {
+      if (isTransportRuntimeBusyForIdleAdvance(run)) return;
+      scheduleImplementationAwaitingDispatchIdleRecheck(run);
+      return;
+    }
     if (isTransportRuntimeBusyForIdleAdvance(run)) return;
-    void advanceAfterImplementationIdle(run).catch((error) => {
+    void trackImplementationAdvance(advanceAfterImplementationIdle(run)).catch((error) => {
       terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
     });
   });
@@ -3835,7 +4156,75 @@ export function getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade(): OpenSpe
     }));
 }
 
-export function clearOpenSpecAutoDeliverRunsForTests(): void {
+/**
+ * Stage of every live run, for test diagnostics only.
+ *
+ * A session goes idle once per turn, and the idle handler matches a run by
+ * stage: an edge that lands while a run is between stages matches nothing and
+ * is not retried. When that happens the only visible symptom is a wait that
+ * times out having observed nothing at all, which says nothing about which
+ * stage the run was actually in. This makes that answerable at the point of
+ * failure rather than by re-running until it happens again.
+ */
+export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
+  runId: string;
+  status: string;
+  session: string;
+  hasActiveCommand: boolean;
+  acceptanceAuditStage: string | null;
+  awaitingDispatch: boolean;
+}> {
+  return [...runsById.values()].map((run) => ({
+    runId: run.runId,
+    status: run.status,
+    session: run.targetImplementationSessionName,
+    hasActiveCommand: !!run.activeCommandId,
+    acceptanceAuditStage: run.activeAcceptanceAudit?.stage ?? null,
+    awaitingDispatch: run.activeImplementationPromptAwaitingDispatch === true,
+  }));
+}
+
+export async function clearOpenSpecAutoDeliverRunsForTests(options: {
+  drainTimeoutMs?: number;
+  maxDrainPasses?: number;
+} = {}): Promise<void> {
+  // Timeline events intentionally launch async advances without blocking the
+  // emitter. Quiesce the tracked acceptance advances before test fixtures tear
+  // down their project roots or reset shared transport mocks; otherwise a
+  // completion from the previous test can observe the removed tasks.md and
+  // publish a misleading `tasks_unreadable` terminal into the next test.
+  const acceptanceAdvances = [...acceptanceAuditAdvancesInFlight.values()];
+  if (acceptanceAdvances.length > 0) {
+    await Promise.allSettled(acceptanceAdvances);
+  }
+  // Timer and timeline callbacks also launch implementation advances without
+  // awaiting them. Drain to a fixed point: an advance may schedule or enter a
+  // successor before its own promise settles. Clearing the fixture first would
+  // let that old work write into a removed project root or call freshly-reset
+  // mocks in the following test.
+  const drainTimeoutMs = options.drainTimeoutMs ?? 30_000;
+  const maxDrainPasses = options.maxDrainPasses ?? 100;
+  const drainDeadline = Date.now() + drainTimeoutMs;
+  let drainPasses = 0;
+  while (implementationAdvancesInFlight.size > 0) {
+    drainPasses += 1;
+    const remainingMs = drainDeadline - Date.now();
+    if (drainPasses > maxDrainPasses || remainingMs <= 0) {
+      throw new Error('openspec_auto_deliver_test_reset_drain_timeout');
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled([...implementationAdvancesInFlight]),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('openspec_auto_deliver_test_reset_drain_timeout')),
+          remainingMs,
+        );
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+  }
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
   for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);
@@ -3844,8 +4233,16 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   implementationReminderTimers.clear();
   for (const timer of implementationMarkerPollTimers.values()) clearTimeout(timer);
   implementationMarkerPollTimers.clear();
+  for (const timer of implementationAwaitingDispatchIdleTimers.values()) clearTimeout(timer);
+  implementationAwaitingDispatchIdleTimers.clear();
+  for (const timer of promptIdleAdvanceTimers.values()) clearTimeout(timer);
+  promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
+  for (const timer of acceptanceAuditIdleRecheckTimers.values()) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.clear();
+  acceptanceAuditAdvancesInFlight.clear();
+  implementationAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

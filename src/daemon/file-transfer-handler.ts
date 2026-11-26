@@ -1,18 +1,29 @@
+import { sniffAttachmentFileMime } from '../../shared/attachment-mime-file.js';
+import { FILE_RELAY_MODE, R2_RELAY_MSG, R2_RELAY_LIMITS, createR2Progress, type R2RelayDownloadRequest, type R2RelayProgressMessage } from '../../shared/r2-relay.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
-import { createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, rm, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferUploadTimeoutMs,
+  fileTransferStorageId,
+  FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_MSG,
+  FILE_TRANSFER_DELETE_ERROR,
+  FILE_TRANSFER_UPLOAD_ERROR_CODE,
+  FILE_PATH_HANDLE_ERROR,
+  FILE_TRANSFER_DIRECTORY_LIST_ERROR,
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
   type AttachmentRef,
   type FileUploadRequest,
   type FileUploadFetchRequest,
@@ -24,15 +35,65 @@ import {
   type FileDownloadDone,
   type FileDownloadStreamReady,
   type FileDownloadError,
+  validateFilePathHandleRequest,
+  type FilePathHandleErrorReason,
+  type FileDirectoryEntry,
+  type FileDirectoryListDone,
+  type FileDirectoryListQuery,
+  type FileDirectoryListError,
+  type FileDeleteDone,
+  type FileDeleteError,
+  type MacosOpenFullDiskAccessDone,
+  type MacosOpenFullDiskAccessError,
+  validateFileDeleteRequest,
+  validateFileDirectoryListRequest,
+  FILE_TRANSFER_RELAY_HEADER,
+  FILE_TRANSFER_HTTP_HEADER,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
 } from '../../shared/transport/file-transfer.js';
+import {
+  resolveWellKnownDirectoryDetailed,
+  wellKnownDirectoryCandidates,
+  isPermissionDeniedError,
+  WELL_KNOWN_DIRECTORY,
+  type WellKnownDirectoryKind,
+} from './well-known-directories.js';
+import {
+  createDelegatedListingProvider,
+  createDirectListingProvider,
+  directoryListingErrorForAppAnswer,
+  resolvePermittedRequestedPath,
+  listDirectoryUnderPolicy,
+  type DirectoryListing,
+} from './directory-listing-policy.js';
+import { MACOS_FS_DELEGATE_REASON } from '../../shared/macos-fs-delegate.js';
+import { listDirectoryViaMacosApp, type MacosFsDelegateClientDeps } from '../node/macos-fs-delegate-client.js';
+import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
+import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import type { ServerLink } from './server-link.js';
+import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
+import { sanitizeUploadFilename } from '../../shared/upload-filename.js';
+import { isPreConnectNetworkError, withPreConnectRetry } from '../util/pre-connect-retry.js';
 import { validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
 
+/** Sentinel path -> the directory it names. */
+const WELL_KNOWN_DIRECTORY_BY_SENTINEL: Record<string, WellKnownDirectoryKind> = {
+  [FILE_TRANSFER_DIRECTORY_PATH.HOME]: WELL_KNOWN_DIRECTORY.HOME,
+  [FILE_TRANSFER_DIRECTORY_PATH.DESKTOP]: WELL_KNOWN_DIRECTORY.DESKTOP,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS]: WELL_KNOWN_DIRECTORY.DOWNLOADS,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS]: WELL_KNOWN_DIRECTORY.DOCUMENTS,
+};
+
+/** Minimal reusable sender boundary implemented by both ServerLink and the thin node runtime. */
+export interface FileTransferSender {
+  send(message: unknown): unknown;
+}
+
 /** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
-const UPLOAD_DIR = path.join(homedir(), '.imcodes', 'uploads');
+function uploadDir(): string { return path.join(resolveImcodesHome(), 'uploads'); }
 
 // ── Attachment registry ─────────────────────────────────────────────────────
 
@@ -55,6 +116,18 @@ interface AttachmentEntry {
   size?: number;
   createdAt: number;
   expiresAt: number;
+  /** Stable browser upload identity used to deduplicate direct → relay fallback. */
+  clientUploadId?: string;
+  /** Authorized session name bound at upload time for single-tab share isolation. */
+  sessionName?: string;
+  /** Local-handle identity prevents path replacement between mint and read. */
+  device?: number;
+  inode?: number;
+  mtimeMs?: number;
+}
+
+function normalizeAttachmentSessionName(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 interface DownloadTarget {
@@ -65,7 +138,68 @@ interface DownloadTarget {
   size: number;
 }
 
+/**
+ * A daemon-validated source for the direct-file data plane.  It deliberately
+ * contains the resolved daemon path only after the existing attachment-handle
+ * and file-preview checks have run; callers must never accept a browser path.
+ */
+export interface DirectFileDownloadSource {
+  readPath: string;
+  filename: string;
+  mime?: string;
+  size: number;
+}
+
 const attachmentRegistry = new Map<string, AttachmentEntry>();
+const clientUploadClaims = new Map<string, {
+  token: symbol;
+  released: Promise<void>;
+  release: () => void;
+  lastProgressAt: number;
+}>();
+
+// A direct sender can disappear after claiming an id (for example when its
+// worker crashes).  Relay retries must never wait forever for that claim to be
+// released; callers get a terminal error and may reconcile/retry later.
+export const CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS = (() => {
+  const override = Number.parseInt(process.env.IMC_CLAIM_WAIT_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(override) && override > 0 ? override : 60_000;
+})();
+
+/**
+ * Serialize direct transfer and relay fallback attempts that share the same
+ * browser-generated identity. This closes the ambiguous-completion window:
+ * relay waits for the direct writer to either commit or release its claim.
+ */
+export function tryClaimClientUpload(clientUploadId: string): symbol | null {
+  if (clientUploadClaims.has(clientUploadId)) return null;
+  const token = Symbol(clientUploadId);
+  let release = () => {};
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  clientUploadClaims.set(clientUploadId, { token, released, release, lastProgressAt: Date.now() });
+  return token;
+}
+
+/** Refresh liveness for a claim-holder that is still receiving bytes. */
+export function touchClientUploadClaim(clientUploadId: string, token: symbol): void {
+  const claim = clientUploadClaims.get(clientUploadId);
+  if (claim?.token === token) claim.lastProgressAt = Date.now();
+}
+
+export function clientUploadClaimLastProgressAt(clientUploadId: string): number | null {
+  return clientUploadClaims.get(clientUploadId)?.lastProgressAt ?? null;
+}
+
+export function waitForClientUploadClaim(clientUploadId: string): Promise<void> | null {
+  return clientUploadClaims.get(clientUploadId)?.released ?? null;
+}
+
+export function releaseClientUploadClaim(clientUploadId: string, token: symbol): void {
+  const claim = clientUploadClaims.get(clientUploadId);
+  if (!claim || claim.token !== token) return;
+  clientUploadClaims.delete(clientUploadId);
+  claim.release();
+}
 
 function randomHex(bytes: number): string {
   return randomBytes(bytes).toString('hex');
@@ -98,7 +232,7 @@ function sanitizeLocalDownloadError(err: unknown): LocalDownloadErrorMessage {
 }
 
 function sendDownloadError(
-  serverLink: ServerLink,
+  serverLink: FileTransferSender,
   downloadId: string,
   attachmentId: string,
   entry: AttachmentEntry | undefined,
@@ -116,55 +250,43 @@ function sendDownloadError(
   serverLink.send(response);
 }
 
-async function resolveDownloadTarget(
-  attachmentId: string,
-  serverLink: ServerLink,
-  downloadId: string,
-): Promise<DownloadTarget | null> {
+export async function resolveDirectFileDownloadSource(attachmentId: string): Promise<DirectFileDownloadSource> {
   const entry = attachmentRegistry.get(attachmentId);
 
   if (!entry) {
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'not_found',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('not_found');
   }
 
   if (Date.now() > entry.expiresAt) {
     attachmentRegistry.delete(attachmentId);
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'expired',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('expired');
   }
 
   const resolved = path.resolve(entry.daemonPath);
-  const uploadDirResolved = path.resolve(UPLOAD_DIR);
+  const uploadDirResolved = path.resolve(uploadDir());
   const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
   if (!isUpload && entry.source !== 'local') {
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'not_found',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('not_found');
   }
 
-  const readPath = entry.source === 'local'
-    ? await validateProjectFilePath(entry.daemonPath)
-    : resolved;
+  if (entry.source === 'local') {
+    const current = await lstat(entry.daemonPath);
+    if (current.isSymbolicLink() || !current.isFile()) throw new Error('download_failed');
+    if ((entry.device !== undefined && current.dev !== entry.device)
+      || (entry.inode !== undefined && current.ino !== entry.inode)
+      // Overlay/container filesystems can immediately reuse an inode when a
+      // path is unlinked and recreated. Preserve the minted size as an
+      // additional identity component so that replacement still fails closed.
+      || (entry.size !== undefined && current.size !== entry.size)
+      || (entry.mtimeMs !== undefined && current.mtimeMs !== entry.mtimeMs)) {
+      throw new Error('download_failed');
+    }
+  }
+  const readPath = entry.source === 'local' ? await validateProjectFilePath(entry.daemonPath) : resolved;
   const fileStat = await stat(readPath);
   if (!fileStat.isFile()) throw new Error('download_failed');
 
   return {
-    entry,
     readPath,
     filename: entry.originalName || attachmentId,
     mime: entry.mime,
@@ -172,13 +294,148 @@ async function resolveDownloadTarget(
   };
 }
 
-function resolveUploadPath(filename: string): string {
-  const filePath = path.join(UPLOAD_DIR, filename);
+async function resolveDownloadTarget(
+  attachmentId: string,
+  serverLink: FileTransferSender,
+  downloadId: string,
+): Promise<DownloadTarget | null> {
+  const entry = attachmentRegistry.get(attachmentId);
+  try {
+    const source = await resolveDirectFileDownloadSource(attachmentId);
+    return { entry: entry!, ...source };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === 'not_found' || message === 'expired') {
+      serverLink.send({
+        type: 'file.download_error',
+        downloadId,
+        message,
+      } satisfies FileDownloadError);
+      return null;
+    }
+    sendDownloadError(serverLink, downloadId, attachmentId, entry, err);
+    return null;
+  }
+}
+
+export function resolveUploadPath(filename: string, originalName?: string): string {
+  return resolveUploadPathForName(filename, originalName);
+}
+
+const UPLOAD_ID_RE = /^[a-f0-9]{32}$/i;
+
+export function resolveUploadPathForName(filename: string, originalName?: string): string {
+  const storageId = fileTransferStorageId(filename);
+  const filePath = originalName !== undefined && UPLOAD_ID_RE.test(storageId)
+    ? path.join(uploadDir(), storageId, sanitizeUploadFilename(originalName))
+    : path.join(uploadDir(), filename);
   const resolved = path.resolve(filePath);
-  if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+  if (!resolved.startsWith(path.resolve(uploadDir()) + path.sep)) {
     throw new Error('path_traversal');
   }
   return resolved;
+}
+
+function uploadMetadataPath(resolved: string): string {
+  const parent = path.dirname(resolved);
+  return UPLOAD_ID_RE.test(path.basename(parent))
+    ? path.join(parent, '.meta.json')
+    : `${resolved}.meta.json`;
+}
+
+function validateDestinationFileName(originalName: string): string {
+  const stem = originalName.replace(/[. ]+$/g, '').split('.')[0]?.toUpperCase() ?? '';
+  if (!originalName || originalName === '.' || originalName === '..'
+    || originalName !== path.basename(originalName)
+    || Buffer.byteLength(originalName, 'utf8') > 255
+    || /[\u0000-\u001f<>:"/\\|?*]/.test(originalName)
+    || /[. ]$/.test(originalName)
+    || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) {
+    throw new Error('invalid_destination_name');
+  }
+  return originalName;
+}
+
+async function commitUploadedFileToDirectory(
+  stagedPath: string,
+  destinationDirectory: string,
+  originalName: string,
+): Promise<string> {
+  const safeName = validateDestinationFileName(originalName);
+  const requestedDirectory = path.resolve(destinationDirectory);
+  const directoryStat = await lstat(requestedDirectory);
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+    throw new Error('invalid_destination_directory');
+  }
+  const directory = await validateProjectFilePath(requestedDirectory);
+  const destination = path.join(directory, safeName);
+  if (path.dirname(destination) !== directory) throw new Error('invalid_destination_name');
+  const existing = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (existing) throw new Error('destination_exists');
+
+  const siblingTemp = path.join(directory, `.${safeName}.imcodes-${randomHex(12)}.part`);
+  try {
+    await copyFile(stagedPath, siblingTemp, fsConstants.COPYFILE_EXCL);
+    const handle = await open(siblingTemp, 'r+');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // The sibling hard-link is the atomic, no-overwrite commit point. It keeps
+    // a complete target invisible until every byte has been written and synced.
+    await link(siblingTemp, destination);
+    await unlink(siblingTemp);
+    await unlink(stagedPath).catch(() => {});
+    return destination;
+  } catch (error) {
+    await unlink(siblingTemp).catch(() => {});
+    throw error;
+  }
+}
+
+async function commitUploadedAttachmentEntry(params: {
+  id: string;
+  daemonPath: string;
+  originalName: string;
+  mime?: string;
+  size: number;
+  clientUploadId?: string;
+  sessionName?: string;
+}): Promise<AttachmentEntry> {
+  const boundSessionName = normalizeAttachmentSessionName(params.sessionName);
+  const metaPath = uploadMetadataPath(params.daemonPath);
+  const metaPayload = JSON.stringify({
+    originalName: params.originalName,
+    mime: params.mime,
+    clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+  });
+  if (boundSessionName) {
+    // Session-bound uploads rely on the sidecar to survive daemon restarts;
+    // fail closed if persistence fails instead of committing an unrecoverable binding.
+    await writeFile(metaPath, metaPayload);
+  } else {
+    await writeFile(metaPath, metaPayload).catch(() => {});
+  }
+  const now = Date.now();
+  const entry: AttachmentEntry = {
+    id: params.id,
+    daemonPath: params.daemonPath,
+    source: 'upload',
+    originalName: params.originalName,
+    mime: params.mime,
+    size: params.size,
+    createdAt: now,
+    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+    clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+  };
+  attachmentRegistry.set(params.id, entry);
+  return entry;
 }
 
 async function finalizeUploadedFile(params: {
@@ -188,37 +445,50 @@ async function finalizeUploadedFile(params: {
   mime?: string;
   resolved: string;
   size: number;
-  serverLink: ServerLink;
+  serverLink: FileTransferSender;
+  clientUploadId?: string;
+  destinationDirectory?: string;
+  sessionName?: string;
 }): Promise<void> {
-  const { uploadId, filename, originalName, mime, resolved, size, serverLink } = params;
+  const {
+    uploadId,
+    filename,
+    originalName,
+    mime,
+    resolved,
+    size,
+    serverLink,
+    clientUploadId,
+    destinationDirectory,
+    sessionName,
+  } = params;
 
-  const metaPath = resolved + '.meta.json';
-  await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime })).catch(() => {});
+  if (destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(resolved, destinationDirectory, originalName ?? '');
+    const destinationStat = await lstat(destination);
+    const attachment = createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      originalName ?? path.basename(destination),
+      mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      clientUploadId,
+    );
+    serverLink.send({ type: FILE_TRANSFER_MSG.UPLOAD_DONE, uploadId, attachment } satisfies FileUploadDone);
+    logger.info({ uploadId, size }, 'File upload committed to selected directory');
+    return;
+  }
 
-  const now = Date.now();
-  const attachment: AttachmentRef = {
+  const entry = await commitUploadedAttachmentEntry({
     id: filename,
-    source: 'upload',
-    serverId: '', // server fills this before returning to client
     daemonPath: resolved,
     originalName: originalName || filename,
     mime,
     size,
-    createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS).toISOString(),
-    downloadable: true,
-  };
-
-  attachmentRegistry.set(filename, {
-    id: filename,
-    daemonPath: resolved,
-    source: 'upload',
-    originalName: originalName || filename,
-    mime,
-    size,
-    createdAt: now,
-    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+    clientUploadId,
+    sessionName,
   });
+  const attachment = attachmentEntryToRef(entry);
 
   const response: FileUploadDone = {
     type: 'file.upload_done',
@@ -230,18 +500,138 @@ async function finalizeUploadedFile(params: {
   logger.info({ uploadId, filename, size }, 'File upload complete');
 }
 
-function sendUploadError(serverLink: ServerLink, uploadId: string, filename: string | undefined, err: unknown): void {
+/**
+ * Generate the stable daemon-owned attachment id. The original filename is
+ * persisted as the basename inside this id directory after shared sanitization.
+ */
+export function createDirectUploadFilename(originalName: string): string {
+  void originalName;
+  return randomHex(16);
+}
+
+/** Return a committed upload for idempotent direct/relay retry handling. */
+export function lookupAttachmentByClientUploadId(clientUploadId: string): AttachmentRef | undefined {
+  for (const entry of attachmentRegistry.values()) {
+    if (entry.clientUploadId !== clientUploadId) continue;
+    return attachmentEntryToRef(entry);
+  }
+  return undefined;
+}
+
+async function acquireRelayUploadTurn(clientUploadId: string): Promise<
+  { attachment: AttachmentRef; claim?: never } | { attachment?: never; claim: symbol }
+> {
+  while (true) {
+    const attachment = lookupAttachmentByClientUploadId(clientUploadId);
+    if (attachment) return { attachment };
+    const claim = tryClaimClientUpload(clientUploadId);
+    if (claim) {
+      // The prior writer may have committed between the lookup and this claim.
+      // Re-check while holding the claim so a relay never duplicates that file.
+      const committed = lookupAttachmentByClientUploadId(clientUploadId);
+      if (!committed) return { claim };
+      releaseClientUploadClaim(clientUploadId, claim);
+      return { attachment: committed };
+    }
+    const released = waitForClientUploadClaim(clientUploadId);
+    if (released) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        released,
+        new Promise<never>((_, reject) => {
+          const check = () => {
+            const lastProgressAt = clientUploadClaimLastProgressAt(clientUploadId);
+            if (lastProgressAt === null || Date.now() - lastProgressAt >= CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS) {
+              reject(new Error('client_upload_claim_timeout'));
+              return;
+            }
+            timeout = setTimeout(check, CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+            timeout.unref?.();
+          };
+          timeout = setTimeout(check, CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+          timeout.unref?.();
+        }),
+      ]).finally(() => { if (timeout) clearTimeout(timeout); });
+    }
+  }
+}
+
+function attachmentEntryToRef(entry: AttachmentEntry): AttachmentRef {
+  return {
+    id: entry.id,
+    source: entry.source,
+    serverId: '',
+    daemonPath: entry.daemonPath,
+    originalName: entry.originalName,
+    mime: entry.mime,
+    size: entry.size,
+    createdAt: new Date(entry.createdAt).toISOString(),
+    expiresAt: new Date(entry.expiresAt).toISOString(),
+    downloadable: true,
+  };
+}
+
+/** Commit a fully written direct-transfer temporary file into the attachment registry. */
+export async function finalizeDirectUploadedFile(params: {
+  clientUploadId: string;
+  filename: string;
+  originalName: string;
+  mime?: string;
+  resolved: string;
+  size: number;
+  destinationDirectory?: string;
+  sessionName?: string;
+}): Promise<AttachmentRef> {
+  if (params.destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(
+      params.resolved,
+      params.destinationDirectory,
+      params.originalName,
+    );
+    const destinationStat = await lstat(destination);
+    return createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      params.originalName,
+      params.mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      params.clientUploadId,
+    );
+  }
+  const entry = await commitUploadedAttachmentEntry({
+    id: params.filename,
+    daemonPath: params.resolved,
+    originalName: params.originalName,
+    mime: params.mime,
+    size: params.size,
+    clientUploadId: params.clientUploadId,
+    sessionName: params.sessionName,
+  });
+  return attachmentEntryToRef(entry);
+}
+
+/** ENOSPC — the disk filled up mid-write. libuv surfaces it as error.code on
+ *  both POSIX and Windows; the message text is a defensive fallback. */
+function isNoSpaceError(err: unknown): boolean {
+  if ((err as { code?: unknown } | null)?.code === 'ENOSPC') return true;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes('enospc') || msg.includes('no space left');
+}
+
+function sendUploadError(serverLink: FileTransferSender, uploadId: string, filename: string | undefined, err: unknown): void {
   const errMsg = err instanceof Error ? err.message : String(err);
-  logger.error({ uploadId, filename, err }, 'File upload failed');
+  const code = isNoSpaceError(err) ? FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY : undefined;
+  logger.error({ uploadId, filename, err, code }, 'File upload failed');
   const response: FileUploadError = {
     type: 'file.upload_error',
     uploadId,
     message: errMsg,
+    ...(code ? { code } : {}),
   };
   serverLink.send(response);
 }
 
-function sendUploadProgress(serverLink: ServerLink, uploadId: string, loaded: number, total: number): void {
+function sendUploadProgress(serverLink: FileTransferSender, uploadId: string, loaded: number, total: number): void {
   const response: FileUploadProgress = {
     type: 'file.upload_progress',
     uploadId,
@@ -260,14 +650,38 @@ async function fetchRelayUpload(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await fetch(downloadUrl);
+      let loaded = await stat(resolved).then((entry) => entry.size).catch(() => 0);
+      if (loaded > expectedSize) {
+        await unlink(resolved).catch(() => {});
+        loaded = 0;
+      }
+      // Connect-phase failures (timeout, DNS, TLS dropped before handshake)
+      // sent nothing, so they are retried with spaced backoff here instead of
+      // burning one of the three outer attempts that follow sub-second delays.
+      const resumeFrom = loaded;
+      const response = await withPreConnectRetry(() => fetch(downloadUrl, {
+        ...(resumeFrom > 0 ? { headers: { Range: formatFileTransferRangeRequest(resumeFrom) } } : {}),
+        signal: AbortSignal.timeout(fileTransferUploadTimeoutMs(expectedSize)),
+      }));
+      if (response.status === 416 && loaded === expectedSize) return loaded;
       if (!response.ok) {
         throw new Error(`relay_fetch_${response.status}`);
       }
       if (!response.body) {
         throw new Error('relay_fetch_empty_body');
       }
-      let loaded = 0;
+      if (loaded > 0) {
+        const range = response.status === 206
+          ? parseFileTransferContentRange(response.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE))
+          : null;
+        if (range) {
+          if (range.start !== loaded || range.total !== expectedSize) throw new Error('relay_resume_mismatch');
+        } else {
+          // Rolling compatibility with an older Server that ignored Range:
+          // restart explicitly rather than appending a second whole file.
+          loaded = 0;
+        }
+      }
       let lastPct = -1;
       let lastSentAt = 0;
       const reportProgress = (force = false) => {
@@ -291,7 +705,7 @@ async function fetchRelayUpload(
       await pipeline(
         Readable.fromWeb(response.body as never),
         progress,
-        createWriteStream(resolved),
+        createWriteStream(resolved, loaded > 0 ? { flags: 'a' } : undefined),
       );
       const fileStat = await stat(resolved);
       if (fileStat.size !== expectedSize) {
@@ -302,7 +716,9 @@ async function fetchRelayUpload(
       return fileStat.size;
     } catch (err) {
       lastErr = err;
-      await unlink(resolved).catch(() => {});
+      // withPreConnectRetry already spent its spaced budget on this class;
+      // repeating it here would only multiply the wait on a dead network.
+      if (isPreConnectNetworkError(err)) break;
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
@@ -315,10 +731,23 @@ async function fetchRelayUpload(
 
 let initialized = false;
 
+/**
+ * Make the upload directory exist. Nothing more.
+ *
+ * Separated from `initFileTransfer` so a caller that only needs somewhere to
+ * write — the transfer worker, which owns no attachment state — does not also
+ * build a second copy of the attachment registry in its own isolate. A
+ * registry that is written in one isolate and read in another is the exact
+ * split-brain the host-call boundary exists to prevent.
+ */
+export async function ensureUploadDirectory(): Promise<void> {
+  await mkdir(uploadDir(), { recursive: true }).catch(() => {});
+}
+
 export async function initFileTransfer(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await ensureUploadDirectory();
   await cleanupExpiredUploads();
   await recoverRegistry();
 }
@@ -326,25 +755,66 @@ export async function initFileTransfer(): Promise<void> {
 /** Scan upload dir and rebuild attachment registry for surviving files. */
 async function recoverRegistry(): Promise<void> {
   try {
-    const files = await readdir(UPLOAD_DIR);
+    const files = await readdir(uploadDir());
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
+      if (file.startsWith(MACHINE_DIRECT_RESUME_FILE_PREFIX)) continue;
+      // A commit intent describes an upload mid-publish; it is bookkeeping, not
+      // an uploaded file, and must never surface as a downloadable attachment.
+      if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
       if (attachmentRegistry.has(file)) continue;
       try {
-        const filePath = path.join(UPLOAD_DIR, file);
+        const filePath = path.join(uploadDir(), file);
         const fileStat = await stat(filePath);
+        if (fileStat.isDirectory() && UPLOAD_ID_RE.test(file)) {
+          const children = (await readdir(filePath)).filter((name) => name !== '.meta.json');
+          const child = children[0];
+          if (!child) continue;
+          const childPath = path.join(filePath, child);
+          const childStat = await stat(childPath);
+          let origName = child;
+          let mime: string | undefined;
+          let clientUploadId: string | undefined;
+          let sessionName: string | undefined;
+          try {
+            const meta = JSON.parse(await readFile(path.join(filePath, '.meta.json'), 'utf8')) as { originalName?: string; mime?: string; clientUploadId?: string; sessionName?: string };
+            if (meta.originalName) origName = meta.originalName;
+            if (meta.mime) mime = meta.mime;
+            if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
+            sessionName = normalizeAttachmentSessionName(meta.sessionName);
+          } catch { /* no sidecar or invalid */ }
+          if (now - childStat.mtimeMs > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
+          attachmentRegistry.set(file, {
+            id: file,
+            daemonPath: path.resolve(childPath),
+            source: 'upload',
+            originalName: origName,
+            mime,
+            size: childStat.size,
+            createdAt: childStat.mtimeMs,
+            expiresAt: childStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+            clientUploadId,
+            ...(sessionName ? { sessionName } : {}),
+          });
+          continue;
+        }
+        if (!fileStat.isFile()) continue;
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
 
         // Try to read metadata sidecar
         let origName: string = file;
         let mime: string | undefined;
+        let clientUploadId: string | undefined;
+        let sessionName: string | undefined;
         try {
           const metaRaw = await readFile(filePath + '.meta.json', 'utf-8');
-          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string };
+          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string; clientUploadId?: string; sessionName?: string };
           if (meta.originalName) origName = meta.originalName;
           if (meta.mime) mime = meta.mime;
+          if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
+          sessionName = normalizeAttachmentSessionName(meta.sessionName);
         } catch { /* no sidecar or invalid */ }
 
         attachmentRegistry.set(file, {
@@ -356,6 +826,8 @@ async function recoverRegistry(): Promise<void> {
           size: fileStat.size,
           createdAt: fileStat.mtimeMs,
           expiresAt: fileStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+          clientUploadId,
+          ...(sessionName ? { sessionName } : {}),
         });
       } catch { /* skip unreadable files */ }
     }
@@ -367,9 +839,10 @@ async function recoverRegistry(): Promise<void> {
 
 // ── Upload ──────────────────────────────────────────────────────────────────
 
-export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadRequest;
-  const { uploadId, filename, originalName, mime, content } = msg;
+  const { uploadId, filename, originalName, sanitizedName, mime, content } = msg;
+  let uploadClaim: symbol | null = null;
 
   try {
     await initFileTransfer();
@@ -377,7 +850,18 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
     // Opportunistic cleanup before writing
     await cleanupExpiredUploads();
 
-    const resolved = resolveUploadPath(filename);
+    if (msg.clientUploadId) {
+      const turn = await acquireRelayUploadTurn(msg.clientUploadId);
+      if (turn.attachment) {
+        serverLink.send({ type: 'file.upload_done', uploadId, attachment: turn.attachment } satisfies FileUploadDone);
+        return;
+      }
+      uploadClaim = turn.claim;
+    }
+
+    const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
+    const storageId = fileTransferStorageId(filename);
+    await mkdir(path.dirname(resolved), { recursive: true });
 
     const buffer = Buffer.from(content, 'base64');
     if (buffer.length > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -390,27 +874,44 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
 
     await finalizeUploadedFile({
       uploadId,
-      filename,
+      filename: storageId,
       originalName,
       mime,
       resolved,
       size: buffer.length,
       serverLink,
+      clientUploadId: msg.clientUploadId,
+      destinationDirectory: msg.destinationDirectory,
+      sessionName: msg.sessionName,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
+  } finally {
+    if (msg.clientUploadId && uploadClaim) releaseClientUploadClaim(msg.clientUploadId, uploadClaim);
   }
 }
 
-export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadFetchRequest;
-  const { uploadId, filename, originalName, mime, downloadUrl } = msg;
+  const { uploadId, filename, originalName, sanitizedName, mime, downloadUrl } = msg;
+  let uploadClaim: symbol | null = null;
 
   try {
     await initFileTransfer();
     await cleanupExpiredUploads();
 
-    const resolved = resolveUploadPath(filename);
+    if (msg.clientUploadId) {
+      const turn = await acquireRelayUploadTurn(msg.clientUploadId);
+      if (turn.attachment) {
+        serverLink.send({ type: 'file.upload_done', uploadId, attachment: turn.attachment } satisfies FileUploadDone);
+        return;
+      }
+      uploadClaim = turn.claim;
+    }
+
+    const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
+    const storageId = fileTransferStorageId(filename);
+    await mkdir(path.dirname(resolved), { recursive: true });
     if (typeof msg.size !== 'number' || msg.size < 0 || msg.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
       throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
     }
@@ -423,15 +924,69 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
     });
     await finalizeUploadedFile({
       uploadId,
-      filename,
+      filename: storageId,
       originalName,
-      mime,
+      mime: msg.relayMode === FILE_RELAY_MODE.R2 ? await sniffAttachmentFileMime(resolved) : mime,
       resolved,
       size,
       serverLink,
+      clientUploadId: msg.clientUploadId,
+      destinationDirectory: msg.destinationDirectory,
+      sessionName: msg.sessionName,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
+  } finally {
+    if (msg.clientUploadId && uploadClaim) releaseClientUploadClaim(msg.clientUploadId, uploadClaim);
+  }
+}
+
+async function deleteUploadedAttachment(entry: AttachmentEntry): Promise<void> {
+  if (entry.source !== 'upload') throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  const resolved = path.resolve(entry.daemonPath);
+  const uploadRoot = path.resolve(uploadDir());
+  if (!resolved.startsWith(`${uploadRoot}${path.sep}`)) throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  try {
+    await unlink(resolved);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
+  }
+  await unlink(uploadMetadataPath(resolved)).catch((error) => {
+    if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload metadata');
+  });
+  const parent = path.dirname(resolved);
+  if (path.basename(parent) === entry.id && UPLOAD_ID_RE.test(entry.id)) {
+    await rm(parent, { recursive: true, force: true }).catch((error) => {
+      if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload directory');
+    });
+  }
+  attachmentRegistry.delete(entry.id);
+}
+
+export async function handleFileDelete(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
+  const parsed = validateFileDeleteRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) serverLink.send({
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId,
+      error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED,
+    } satisfies FileDeleteError);
+    return;
+  }
+  try {
+    await initFileTransfer();
+    const entry = attachmentRegistry.get(parsed.value.attachmentId);
+    // Deletion is idempotent: an expired/already-removed upload is already in
+    // the state requested by the user.
+    if (entry) await deleteUploadedAttachment(entry);
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: parsed.value.requestId } satisfies FileDeleteDone);
+  } catch (error) {
+    const reason = error instanceof Error && error.message === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      ? FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    logger.error({ requestId: parsed.value.requestId, attachmentId: parsed.value.attachmentId, error }, 'Failed to delete uploaded attachment');
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_ERROR, requestId: parsed.value.requestId, error: reason } satisfies FileDeleteError);
   }
 }
 
@@ -444,7 +999,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
  * inline round-trip is far faster than the relay's PUT + readiness handshake
  * (repo rule: never copy code).
  */
-async function sendInlineDownload(serverLink: ServerLink, downloadId: string, target: DownloadTarget): Promise<void> {
+async function sendInlineDownload(serverLink: FileTransferSender, downloadId: string, target: DownloadTarget): Promise<void> {
   const buffer = await readFile(target.readPath);
   const response: FileDownloadDone = {
     type: 'file.download_done',
@@ -457,7 +1012,7 @@ async function sendInlineDownload(serverLink: ServerLink, downloadId: string, ta
   serverLink.send(response);
 }
 
-export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileDownloadRequest;
   const { downloadId, attachmentId } = msg;
   let target: DownloadTarget | null = null;
@@ -471,8 +1026,8 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
   }
 }
 
-export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const msg = cmd as unknown as FileDownloadStreamRequest;
+export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
+  const msg = cmd as unknown as FileDownloadStreamRequest | R2RelayDownloadRequest;
   const { downloadId, attachmentId, uploadUrl } = msg;
   let target: DownloadTarget | null = null;
 
@@ -480,14 +1035,26 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
     if (!uploadUrl || typeof uploadUrl !== 'string') {
       throw new Error('missing_upload_url');
     }
+    // Resume point for an interrupted HTTP download. The full-daemon path hands
+    // us the raw command, so it is validated here rather than trusted.
+    const offset = msg.offset === undefined ? 0 : msg.offset;
+    if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('invalid_offset');
+    }
     target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
     if (!target) return;
+    if (offset > target.size) {
+      throw new Error('range_not_satisfiable');
+    }
 
+    const r2Relay = cmd.type === R2_RELAY_MSG.DOWNLOAD;
+    if (r2Relay && offset !== 0) throw new Error('invalid_offset');
     // Small files: skip the relay and reply inline in a single round-trip. The
     // relay's PUT + readiness handshake is pure latency for these (and times out
     // entirely if the relay is unhealthy), so only genuinely large files stream.
-    // The server returns the inline bytes immediately on receiving this.
-    if (typeof target.size === 'number' && target.size >= 0
+    // The server returns the inline bytes immediately on receiving this (and
+    // slices them itself for a resumed request).
+    if (!r2Relay && typeof target.size === 'number' && target.size >= 0
         && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
       await sendInlineDownload(serverLink, downloadId, target);
       return;
@@ -499,23 +1066,48 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       mime: target.mime,
       filename: target.filename,
       size: target.size,
+      ...(offset > 0 ? { offset } : {}),
     };
-    serverLink.send(ready);
+    if (!r2Relay) serverLink.send(ready);
+    const progress = createR2Progress(target.size);
+    let loaded = 0; let lastPublished = 0;
+    const emitProgress = () => serverLink.send({ type: R2_RELAY_MSG.PROGRESS, downloadId, ...progress(loaded) } satisfies R2RelayProgressMessage);
+    if (r2Relay) emitProgress();
+    const readPath = target.readPath;
+    const source = r2Relay ? Readable.from((async function* () {
+      for await (const chunk of createReadStream(readPath)) {
+        loaded += (chunk as Buffer).byteLength;
+        if (Date.now() - lastPublished >= R2_RELAY_LIMITS.PROGRESS_INTERVAL_MS) {
+          lastPublished = Date.now(); emitProgress();
+        }
+        yield chunk;
+      }
+    })()) : createReadStream(readPath, offset > 0 ? { start: offset } : undefined);
 
     const headers: Record<string, string> = {
       'content-type': target.mime || 'application/octet-stream',
-      'content-length': String(target.size),
-      'x-imcodes-filename': encodeURIComponent(target.filename),
+      'content-length': String(target.size - offset),
+      [FILE_TRANSFER_RELAY_HEADER.FILENAME]: encodeURIComponent(target.filename),
+      ...(offset > 0 ? { [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset) } : {}),
     };
-    const response = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers,
-      body: createReadStream(target.readPath) as never,
-      duplex: 'half',
-    } as RequestInit & { duplex: 'half' });
-    if (!response.ok) {
-      throw new Error(`relay_upload_${response.status}`);
-    }
+    try {
+      const response = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers,
+        body: source as never,
+        duplex: 'half',
+        signal: AbortSignal.timeout(r2Relay ? fileTransferUploadTimeoutMs(target.size) : FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
+      } as RequestInit & { duplex: 'half' });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`relay_upload_${response.status}`);
+      }
+      await response.body?.cancel();
+      if (r2Relay) {
+        emitProgress();
+        serverLink.send({ ...ready, type: R2_RELAY_MSG.DONE });
+      }
+    } finally { source.destroy(); }
   } catch (err) {
     sendDownloadError(serverLink, downloadId, attachmentId, target?.entry, err);
   }
@@ -543,14 +1135,16 @@ export function lookupAttachmentById(id: string): AttachmentEntry | undefined {
 
 /**
  * Register a controlled, short-lived path handle for an already validated
- * project file. The handle points at the current path and is not an immutable
- * content snapshot.
+ * project file. The handle binds the path's filesystem identity; replacement or
+ * symbolic-link substitution invalidates it before any bytes are read.
  */
 export function createProjectFileHandleFromValidatedPath(
   validatedRealPath: ValidatedRealPath,
   originalName: string,
   mime?: string,
   size?: number,
+  identity?: { device: number; inode: number; mtimeMs?: number },
+  clientUploadId?: string,
 ): AttachmentRef {
   const daemonPath = String(validatedRealPath);
   const validated = validateCanonicalRealPath(daemonPath);
@@ -568,6 +1162,12 @@ export function createProjectFileHandleFromValidatedPath(
     size,
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS,
+    ...(identity ? {
+      device: identity.device,
+      inode: identity.inode,
+      ...(identity.mtimeMs !== undefined ? { mtimeMs: identity.mtimeMs } : {}),
+    } : {}),
+    ...(clientUploadId ? { clientUploadId } : {}),
   });
 
   return {
@@ -624,6 +1224,270 @@ export async function tryCreateProjectFileHandle(
   }
 }
 
+function stablePathHandleError(err: unknown): FilePathHandleErrorReason {
+  const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined;
+  if (code === 'ENOENT' || code === 'ENOTDIR') return FILE_PATH_HANDLE_ERROR.NOT_FOUND;
+  const message = err instanceof Error ? err.message : '';
+  if (message === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH) return FILE_PATH_HANDLE_ERROR.FORBIDDEN_PATH;
+  if (message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE) return FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE;
+  if (message === 'not_regular_file' || message === 'symbolic_link') return FILE_PATH_HANDLE_ERROR.NOT_REGULAR_FILE;
+  return FILE_PATH_HANDLE_ERROR.HANDLE_FAILED;
+}
+
+function sendDirectoryListError(sender: FileTransferSender, requestId: string, error: string): void {
+  sender.send({
+    type: FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR,
+    requestId,
+    error,
+  } satisfies FileDirectoryListError);
+}
+
+/** Bounded controlled-node browser used by the integrated remote desktop file manager. */
+/**
+ * Free and total bytes for the volume a path sits on, or nothing.
+ *
+ * Reported only for volume ROOTS. Running this per entry would be one syscall
+ * per row for a number identical across all of them, and a 512-entry listing
+ * is on the critical path of a click.
+ *
+ * `statfs` is unavailable on older runtimes and can fail on a drive that is
+ * present but not ready (an empty card reader, a disconnected network drive),
+ * so a failure degrades to "no capacity shown" rather than dropping the drive
+ * from the listing entirely.
+ */
+async function volumeCapacity(target: string): Promise<{ totalBytes?: number; freeBytes?: number }> {
+  try {
+    const info = await statfs(target);
+    const total = Number(info.blocks) * Number(info.bsize);
+    const free = Number(info.bavail) * Number(info.bsize);
+    if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) return {};
+    return { totalBytes: total, freeBytes: Math.max(0, Math.min(free, total)) };
+  } catch {
+    return {};
+  }
+}
+
+/** Test seam for the macOS app delegation (see listDirectoryViaMacosAppOrThrow). */
+let macosFsDelegateDepsForTests: MacosFsDelegateClientDeps | undefined;
+export function setMacosFsDelegateDepsForTests(deps: MacosFsDelegateClientDeps | undefined): void { macosFsDelegateDepsForTests = deps; }
+
+/**
+ * The node was refused a directory for permission. Ask the aiDesk.to app to read it and return the listing, judged by the same policy
+ * as the node's own reads. Otherwise THROW what the node would have thrown without delegation: the original permission error (the
+ * caller turns that into the long-standing Full Disk Access error for a well-known folder), a not-found/not-a-directory answer, or the
+ * app-specific Full Disk Access error when the app answered and macOS refused the app itself.
+ *
+ * `sentinelKind` is set when the node could not even stat the well-known folder, so which of its candidate paths exists is unknown:
+ * the app is asked for each in turn.
+ */
+async function listDirectoryViaMacosAppOrThrow(
+  requestedPath: string,
+  sentinelKind: WellKnownDirectoryKind | undefined,
+  originalError: unknown,
+  query?: FileDirectoryListQuery,
+): Promise<DirectoryListing> {
+  const candidates = sentinelKind ? await wellKnownDirectoryCandidates(sentinelKind).catch(() => []) : [requestedPath];
+  for (const candidate of candidates) {
+    // The policy applied to the path as written (made absolute), before the app is asked to read it.
+    const absolute = await resolvePermittedRequestedPath(candidate);
+    if (absolute === null) continue;
+    const outcome = await listDirectoryViaMacosApp(absolute, macosFsDelegateDepsForTests, { withMetadata: query !== undefined });
+    if (outcome.kind === 'ok') {
+      return await listDirectoryUnderPolicy(candidate, createDelegatedListingProvider(outcome), {}, query);
+    }
+    if (outcome.kind === 'app_denied') {
+      throw new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP);
+    }
+    if (outcome.kind === 'unavailable') break; // no usable app: the node's own behaviour stands
+    // refused: not_found / not_directory. For a sentinel try the next candidate; for a typed path that is the answer.
+    if (!sentinelKind) {
+      throw directoryListingErrorForAppAnswer(outcome.reason === MACOS_FS_DELEGATE_REASON.NOT_DIRECTORY ? 'not_directory' : 'not_found');
+    }
+  }
+  throw originalError;
+}
+
+export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const parsed = validateFileDirectoryListRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) sendDirectoryListError(sender, requestId, 'invalid_path');
+    return;
+  }
+
+  try {
+    if (process.platform === 'win32' && parsed.value.path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES) {
+      const entries = (await Promise.all(
+        Array.from({ length: 26 }, (_, index) => `${String.fromCharCode(65 + index)}:\\`)
+          .map(async (drive): Promise<FileDirectoryEntry | null> => {
+            try {
+              await readdir(drive);
+              return { name: drive, path: drive, isDir: true, hidden: false, ...(await volumeCapacity(drive)) };
+            } catch {
+              return null;
+            }
+          }),
+      )).filter((entry): entry is FileDirectoryEntry => entry !== null);
+      sender.send({
+        type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+        requestId: parsed.value.requestId,
+        path: parsed.value.path,
+        resolvedPath: FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT,
+        entries,
+      } satisfies FileDirectoryListDone);
+      return;
+    }
+
+    // A well-known sentinel becomes a concrete path HERE, before the gate --
+    // never instead of it. `resolveCanonical` and the sensitive-path denylist
+    // still decide whether the resolved directory may be listed, so a shortcut
+    // can only ever reach somewhere the user could already have typed.
+    let requestedPath = parsed.value.path;
+    let sentinelKind: WellKnownDirectoryKind | undefined;
+    let sentinelDenied = false;
+    if (isFileTransferWellKnownDirectoryPath(parsed.value.path)) {
+      sentinelKind = WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path];
+      const resolved = await resolveWellKnownDirectoryDetailed(sentinelKind);
+      // Access to the well-known folder itself was denied (the macOS Full
+      // Disk Access signature): report that distinctly rather than silently
+      // listing the fallback home directory mislabeled as the folder the
+      // user actually asked for -- the bug this whole branch exists to fix.
+      if (resolved.permissionDenied) sentinelDenied = true;
+      else requestedPath = resolved.path;
+    }
+
+    // The node's own reads first, exactly as before. On macOS a refusal for permission (the node's bare executable lacks Full Disk
+    // Access) is retried through the signed aiDesk.to app, whose identity the user can see and grant; the SAME policy decision judges
+    // what the app returns (directory-listing-policy.ts).
+    let listing: DirectoryListing | undefined;
+    let permissionError: unknown = sentinelDenied ? new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED) : undefined;
+    if (!sentinelDenied) {
+      try {
+        listing = await listDirectoryUnderPolicy(requestedPath, createDirectListingProvider({ surfacePermissionErrors: process.platform === 'darwin' }), {}, parsed.value.query);
+      } catch (error) {
+        if (process.platform !== 'darwin' || !isPermissionDeniedError(error)) throw error;
+        permissionError = error;
+      }
+    }
+    if (!listing) listing = await listDirectoryViaMacosAppOrThrow(requestedPath, sentinelDenied ? sentinelKind : undefined, permissionError, parsed.value.query);
+    sender.send({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: parsed.value.requestId,
+      path: parsed.value.path,
+      resolvedPath: listing.realPath,
+      entries: listing.entries,
+      ...(listing.truncated ? { truncated: true as const, total: listing.total as number } : {}),
+      ...(listing.partial ? { partial: true as const } : {}),
+    } satisfies FileDirectoryListDone);
+  } catch (error) {
+    // Covers both the explicit throw above (well-known resolution already
+    // determined FDA is missing) and a later `lstat`/`readdir` failing with
+    // EPERM/EACCES on a well-known sentinel that the resolution step's own
+    // stat happened to let through -- TCC enforces some macOS protections at
+    // `readdir` rather than `stat`.
+    const isMacosFdaDenial = process.platform === 'darwin'
+      && isFileTransferWellKnownDirectoryPath(parsed.value.path)
+      && (
+        (error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED)
+        || isPermissionDeniedError(error)
+      );
+    const code = error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP
+      ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP
+      : isMacosFdaDenial
+      ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
+      : isNotFoundError(error)
+        ? 'not_found'
+        : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
+          ? error.message
+          : 'directory_list_failed';
+    sendDirectoryListError(sender, parsed.value.requestId, code);
+  }
+}
+
+/**
+ * macOS-only: reveal the native Full Disk Access settings pane in the
+ * signed-in user's own session so they can grant it to this binary
+ * themselves, after a well-known-directory listing failed for exactly that
+ * reason. Fire-and-forget once launched -- there is no callback for "the
+ * user flipped the switch"; the next directory-list retry is the real test.
+ */
+export async function handleMacosOpenFullDiskAccess(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!requestId) return;
+  if (process.platform !== 'darwin') {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.UNSUPPORTED_PLATFORM,
+    } satisfies MacosOpenFullDiskAccessError);
+    return;
+  }
+  try {
+    const user = await resolveMacosUserSession();
+    launchMacosUserSessionCommand(user, {
+      executable: '/usr/bin/open',
+      args: ['x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'],
+    });
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE,
+      requestId,
+    } satisfies MacosOpenFullDiskAccessDone);
+  } catch {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.NO_ACTIVE_GUI_SESSION,
+    } satisfies MacosOpenFullDiskAccessError);
+  }
+}
+
+/** Controlled-node explicit-path registration; bytes still use the existing download path. */
+export async function handleFilePathHandle(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const parsed = validateFilePathHandleRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) sender.send({ type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR, requestId, error: FILE_PATH_HANDLE_ERROR.INVALID_PATH });
+    return;
+  }
+  try {
+    const requested = path.resolve(parsed.value.path);
+    const requestedStat = await lstat(requested);
+    if (requestedStat.isSymbolicLink()) throw new Error('symbolic_link');
+    if (!requestedStat.isFile()) throw new Error('not_regular_file');
+    if (requestedStat.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
+    const validated = await validateProjectFilePath(requested).catch((err) => {
+      if (isNotFoundError(err)) throw err;
+      throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+    });
+    const attachment = createProjectFileHandleFromValidatedPath(
+      validated,
+      path.basename(requested),
+      undefined,
+      requestedStat.size,
+      { device: requestedStat.dev, inode: requestedStat.ino, mtimeMs: requestedStat.mtimeMs },
+    );
+    sender.send({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: parsed.value.requestId,
+      attachment,
+      sourceIdentity: {
+        size: requestedStat.size,
+        mtimeMs: requestedStat.mtimeMs,
+        device: requestedStat.dev,
+        inode: requestedStat.ino,
+      },
+    });
+  } catch (err) {
+    sender.send({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR,
+      requestId: parsed.value.requestId,
+      error: stablePathHandleError(err),
+    });
+  }
+}
+
 // ── Lifecycle cleanup ───────────────────────────────────────────────────────
 
 async function cleanupExpiredUploads(): Promise<void> {
@@ -638,15 +1502,19 @@ async function cleanupExpiredUploads(): Promise<void> {
 
   // Clean actual files in upload dir
   try {
-    const files = await readdir(UPLOAD_DIR);
+    const files = await readdir(uploadDir());
     for (const file of files) {
       try {
-        const filePath = path.join(UPLOAD_DIR, file);
+        const filePath = path.join(uploadDir(), file);
         const fileStat = await stat(filePath);
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) {
-          await unlink(filePath);
-          await unlink(filePath + '.meta.json').catch(() => {});
+          if (fileStat.isDirectory() && UPLOAD_ID_RE.test(file)) {
+            await rm(filePath, { recursive: true, force: true });
+          } else if (fileStat.isFile()) {
+            await unlink(filePath);
+            await unlink(filePath + '.meta.json').catch(() => {});
+          }
           logger.debug({ file }, 'Cleaned up expired upload');
         }
       } catch { /* ignore individual file errors */ }

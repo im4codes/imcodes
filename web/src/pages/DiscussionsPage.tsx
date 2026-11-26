@@ -18,6 +18,12 @@ import {
   normalizeOpenSpecAutoDeliverProjection,
   openSpecAutoDeliverRowFromProjection,
 } from '../openspec-auto-deliver-normalize.js';
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
+import {
+  CHAT_USER_SCROLL_UP_HOLD_MS,
+  computeFollowThresholds,
+} from '../components/chat-follow-thresholds.js';
 
 interface P2pDiscussion {
   id: string;
@@ -33,6 +39,8 @@ interface Props {
   initialSelectedId?: string | null;
   initialTab?: 'auto' | 'team';
   requestScope?: P2pWorkflowRequestScope;
+  /** tsk_5rf: needed to build authenticated URLs for streamed image previews. */
+  serverId?: string | null;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: P2pProgressDiscussion[];
   onStopDiscussion?: (id: string) => void;
@@ -40,7 +48,7 @@ interface Props {
 
 // Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
-export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, serverId, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
   const [listTab, setListTab] = useState<'auto' | 'team'>(initialTab);
@@ -61,6 +69,9 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollAnimFrameRef = useRef<number | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
+  const userScrollUpUntilRef = useRef(0);
+  const touchStartYRef = useRef(0);
+  const scheduleFollowFrame = useCoalescedFrame();
 
   useEffect(() => {
     setListTab(initialTab);
@@ -134,6 +145,46 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     if (!el) return;
     scrollDetailTo(el.scrollHeight, mode);
   }, [scrollDetailTo]);
+
+  const disengageDetailFollow = useCallback(() => {
+    setAutoFollow((current) => {
+      if (!current) return current;
+      return false;
+    });
+  }, []);
+
+  const handleDetailScrollUpIntent = useCallback(() => {
+    userScrollUpUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
+    disengageDetailFollow();
+  }, [disengageDetailFollow]);
+
+  const handleDetailWheel = useCallback((event: WheelEvent) => {
+    if (event.deltaY < 0) handleDetailScrollUpIntent();
+  }, [handleDetailScrollUpIntent]);
+
+  const handleDetailTouchStart = useCallback((event: TouchEvent) => {
+    touchStartYRef.current = event.touches[0]?.clientY ?? 0;
+  }, []);
+
+  const handleDetailTouchMove = useCallback((event: TouchEvent) => {
+    const y = event.touches[0]?.clientY ?? 0;
+    if (y - touchStartYRef.current > 6) handleDetailScrollUpIntent();
+  }, [handleDetailScrollUpIntent]);
+
+  const handleDetailScroll = useCallback(() => {
+    const element = detailScrollRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const { disengageThreshold, reengageThreshold } = computeFollowThresholds(
+      element.clientHeight,
+      element.scrollHeight,
+    );
+    setAutoFollow((current) => {
+      if (current && distance > disengageThreshold) return false;
+      if (!current && distance < reengageThreshold && Date.now() >= userScrollUpUntilRef.current) return true;
+      return current;
+    });
+  }, []);
 
   // Audit fix (DiscussionsPage spam-fetch loop) — stabilize the
   // request-scope identity by content. See the long comment on
@@ -441,10 +492,10 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
 
   useEffect(() => {
     if (!selected || content === null || !autoFollow) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       scrollDetailToBottom(content.length > 4000 ? 'auto' : 'follow');
     });
-  }, [selected, content, autoFollow, scrollDetailToBottom]);
+  }, [selected, content, autoFollow, scheduleFollowFrame, scrollDetailToBottom]);
 
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
   const formatAutoStatus = (status: string) => t(`openspec.auto.status.${status}`, status);
@@ -459,6 +510,15 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     () => (selected ? discussions.find((d) => d.id === selected) ?? null : null),
     [discussions, selected],
   );
+  const loadDiscussionImagePreview = useCallback((path: string) => {
+    if (!ws) return Promise.reject(new Error(t('file_browser.preview_error')));
+    return loadFsLocalImagePreview(ws, path, {
+      sessionName: stableRequestScope?.sessionName,
+      serverId: serverId ?? undefined,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('file_browser.timeout'),
+    });
+  }, [serverId, stableRequestScope?.sessionName, t, ws]);
   const selectedAutoDeliverRow = useMemo(
     () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
     [autoDeliverRows, selectedAutoRunId],
@@ -671,7 +731,14 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
               </div>
             </div>
           )}
-          <div ref={detailScrollRef} class="discussions-detail-scroll">
+          <div
+            ref={detailScrollRef}
+            class="discussions-detail-scroll"
+            onScroll={handleDetailScroll}
+            onWheel={handleDetailWheel}
+            onTouchStart={handleDetailTouchStart}
+            onTouchMove={handleDetailTouchMove}
+          >
             {!selected && (
               <div class="discussions-empty">{t('p2p.discussions.select')}</div>
             )}
@@ -680,7 +747,16 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
             )}
             {selected && content !== null && (
               <div class="discussions-file-preview">
-                <FilePreviewPane content={content} path={`${selected}.md`} />
+                <FilePreviewPane
+                  content={content}
+                  path={selectedDiscussion?.path ?? `${selected}.md`}
+                  allowedRootPath={selectedDiscussion?.path ? stableRequestScope?.projectDir : undefined}
+                  // A synthetic filename is sufficient for Markdown syntax
+                  // detection, but it is not an authoritative filesystem
+                  // location. Only let document content trigger a local image
+                  // read when the discussion list supplied the real path.
+                  onImagePreview={ws && selectedDiscussion?.path ? loadDiscussionImagePreview : undefined}
+                />
               </div>
             )}
           </div>

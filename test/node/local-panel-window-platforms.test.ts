@@ -1,0 +1,436 @@
+/**
+ * The three thin OS adapters of the local-panel window, driven with fake machines: which user/display a window is started for, which
+ * command lines are run, how the running window is found and focused. Real-device behavior is checked separately on real machines.
+ */
+import { describe, expect, it } from 'vitest';
+import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_WINDOWS_HOST, LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32, LOCAL_PANEL_WINDOW_REASON, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
+import { createLinuxLocalPanelWindowPlatform } from '../../src/node/local-panel-window-linux.js';
+import { createMacosLocalPanelWindowPlatform } from '../../src/node/local-panel-window-macos.js';
+import {
+  buildWindowsPanelWindowCommand,
+  createWindowsLocalPanelWindowPlatform,
+} from '../../src/node/local-panel-window-windows.js';
+
+const PASSWD = 'root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000:Alice:/home/alice:/bin/bash\nbob:x:1001:1001:Bob:/home/bob:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n';
+
+/** What the verification of an installed host returns (path, and the identity of the file it was verified as). */
+const HOST = { path: 'C:\\Program Files\\IM.codes\\aidesk-local-ui\\win32-x64\\aidesk-local-ui.exe', sha256: 'ab'.repeat(32), size: 4_096, mtimeMs: 1_790_000_000_123, source: 'record' as const };
+
+function decodePowerShell(command: string): string {
+  const encoded = /-EncodedCommand (\S+)/u.exec(command)?.[1] ?? '';
+  return Buffer.from(encoded, 'base64').toString('utf16le');
+}
+const decodeB64 = (text: string): string => Buffer.from(text, 'base64').toString('utf8');
+
+describe('Linux adapter', () => {
+  function linux(over: Partial<Parameters<typeof createLinuxLocalPanelWindowPlatform>[0]> = {}) {
+    const commands: Array<{ file: string; args: readonly string[]; asUser?: string; display?: string }> = [];
+    const spawned: Array<{ file: string; args: readonly string[]; asUser?: string; env: NodeJS.ProcessEnv }> = [];
+    const platform = createLinuxLocalPanelWindowPlatform({
+      uid: () => 0,
+      env: { PATH: '/usr/bin:/bin' },
+      readPasswd: () => PASSWD,
+      exists: (path) => ['/home/alice', '/usr/bin/chromium', '/usr/bin/xdotool', '/usr/bin/google-chrome'].includes(path),
+      listDisplays: () => [0],
+      now: () => 1_000_000,
+      run: async (file, args, options) => {
+        commands.push({ file, args, ...(options.asUser ? { asUser: options.asUser.name } : {}), ...(options.env.DISPLAY ? { display: options.env.DISPLAY } : {}) });
+        if (file === 'pgrep') return { code: 0, stdout: '4242\n4300\n' };
+        if (file === 'ps') return { code: 0, stdout: ' 120\n' };
+        return { code: 0, stdout: '' };
+      },
+      spawnDetached: async (file, args, options) => { spawned.push({ file, args, ...(options.asUser ? { asUser: options.asUser.name } : {}), env: options.env }); return true; },
+      prepareProfileParent: async () => undefined,
+      nativeUiPath: async () => '/opt/imcodes/aidesk-local-ui',
+      ...over,
+    });
+    return { platform, commands, spawned };
+  }
+
+  it('a root service starts the window as the desktop user, on that user\'s display, with their home -- never as root', async () => {
+    const { platform, spawned } = linux();
+    expect(await platform.hasDesktop()).toBe(true);
+    expect(await platform.launchAppMode('/usr/bin/chromium')).toBe(true);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({ file: '/usr/bin/chromium', asUser: 'alice' });
+    expect(spawned[0]!.env).toMatchObject({ DISPLAY: ':0', HOME: '/home/alice', USER: 'alice', XDG_RUNTIME_DIR: '/run/user/1000' });
+    expect(spawned[0]!.args).toContain(`--app=${localPanelUrl()}`);
+    expect(spawned[0]!.args.join(' ')).toContain('--user-data-dir=/home/alice/.imcodes/local-panel/browser-profile');
+    // the window's WM_CLASS / app_id is aiDesk's own, so the desktop shell maps it to the desktop entry's name and icon (not the browser's)
+    expect(spawned[0]!.args).toEqual(expect.arrayContaining([`--class=${LOCAL_PANEL_LINUX_WM_CLASS}`, `--name=${LOCAL_PANEL_LINUX_WM_CLASS}`]));
+    expect(platform.profileDir()).toBe('/home/alice/.imcodes/local-panel/browser-profile');
+  });
+
+  it('an absolute profile override replaces the home-based profile directory (relative ones are ignored)', async () => {
+    const { platform, spawned } = linux({ env: { PATH: '/usr/bin:/bin', IMCODES_LOCAL_PANEL_PROFILE_DIR: '/tmp/scoped-profile' } });
+    expect(platform.profileDir()).toBe('/tmp/scoped-profile');
+    await platform.launchAppMode('/usr/bin/chromium');
+    expect(spawned[0]!.args).toContain('--user-data-dir=/tmp/scoped-profile');
+    expect(linux({ env: { PATH: '/usr/bin:/bin', IMCODES_LOCAL_PANEL_PROFILE_DIR: 'relative/dir' } }).platform.profileDir()).toBe('/home/alice/.imcodes/local-panel/browser-profile');
+  });
+
+  it('no desktop: a root service with no X display, with no desktop user, or a user session without DISPLAY/WAYLAND', async () => {
+    expect(await linux({ listDisplays: () => [] }).platform.hasDesktop()).toBe(false);
+    expect(await linux({ readPasswd: () => 'root:x:0:0::/root:/bin/bash\n' }).platform.hasDesktop()).toBe(false);
+    expect(await linux({ uid: () => 1000, env: { HOME: '/home/alice', PATH: '/usr/bin' } }).platform.hasDesktop()).toBe(false);
+    expect(await linux({ uid: () => 1000, env: { HOME: '/home/alice', PATH: '/usr/bin', DISPLAY: ':1' } }).platform.hasDesktop()).toBe(true);
+    expect(await linux({ uid: () => 1000, env: { HOME: '/home/alice', PATH: '/usr/bin', WAYLAND_DISPLAY: 'wayland-0', XDG_RUNTIME_DIR: '/run/user/1000' } }).platform.hasDesktop()).toBe(true);
+  });
+
+  it('started by the user it spawns directly with their own environment (no uid switch)', async () => {
+    const { platform, spawned } = linux({ uid: () => 1000, env: { HOME: '/home/alice', PATH: '/usr/bin', DISPLAY: ':1' } });
+    await platform.launchAppMode('/usr/bin/chromium');
+    expect(spawned[0]).not.toHaveProperty('asUser');
+    expect(spawned[0]!.env.DISPLAY).toBe(':1');
+  });
+
+  it('finds app-mode browsers in preference order and de-duplicates', async () => {
+    const { platform } = linux({ exists: (path) => ['/home/alice', '/usr/bin/chromium', '/usr/bin/google-chrome'].includes(path) });
+    expect(await platform.findAppModeBrowsers()).toEqual(['/usr/bin/google-chrome', '/usr/bin/chromium']);
+    expect(await linux({ exists: (path) => path === '/home/alice' }).platform.findAppModeBrowsers()).toEqual([]);
+  });
+
+  it('finds the window by its profile (lowest pid) and its start time from the process age', async () => {
+    const { platform, commands } = linux();
+    expect(await platform.findWindowProcess()).toEqual({ pid: 4242, startedAtMs: 1_000_000 - 120_000 });
+    expect(commands[0]).toMatchObject({ file: 'pgrep' });
+    expect(commands[0]!.args.join(' ')).toContain('/home/alice/.imcodes/local-panel/browser-profile');
+  });
+
+  it('a dead pid is not alive', async () => {
+    const { platform } = linux({ run: async () => ({ code: 1, stdout: '' }) });
+    expect(await platform.probePid(7)).toEqual({ alive: false });
+  });
+
+  it('focus uses xdotool as the desktop user, falls back to wmctrl, and is refused without an X display', async () => {
+    const { platform, commands } = linux();
+    expect(await platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(true);
+    expect(commands.at(-1)).toMatchObject({ file: '/usr/bin/xdotool', asUser: 'alice', display: ':0' });
+    // a bare X server (no window manager) refuses windowactivate: raising + focusing is the fallback
+    const bare = linux({ run: async (file, args) => ({ code: args.includes('windowactivate') ? 1 : 0, stdout: file === 'pgrep' ? '1\n' : '' }) });
+    expect(await bare.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(true);
+    const none = linux({ listDisplays: () => [] });
+    expect(await none.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
+    const wm = linux({ exists: (path) => ['/home/alice', '/usr/bin/wmctrl'].includes(path) });
+    expect(await wm.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(true);
+    expect(wm.commands.at(-1)?.file).toBe('/usr/bin/wmctrl');
+    const neither = linux({ exists: (path) => path === '/home/alice' });
+    expect(await neither.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
+  });
+
+  it('the default browser is xdg-open as the desktop user with the panel URL', async () => {
+    const { platform, commands } = linux();
+    expect(await platform.openDefaultBrowser(localPanelUrl())).toBe(true);
+    expect(commands.at(-1)).toMatchObject({ file: 'xdg-open', args: [localPanelUrl()], asUser: 'alice' });
+  });
+
+  it('the native window is whatever the verifier returned (nothing when it did not verify)', async () => {
+    expect(await linux({ nativeUiPath: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
+    expect(await linux().platform.nativeUiPath()).toBe('/opt/imcodes/aidesk-local-ui');
+  });
+});
+
+describe('macOS adapter', () => {
+  const user = { name: 'k', uid: 501, gid: 20, home: '/Users/k', tempDir: '/var/folders/x/T/' };
+  function mac(over: Partial<Parameters<typeof createMacosLocalPanelWindowPlatform>[0]> = {}) {
+    const started: Array<{ user?: string; file: string; args: readonly string[] }> = [];
+    const inSession: Array<{ file: string; args: readonly string[] }> = [];
+    const runs: Array<{ file: string; args: readonly string[] }> = [];
+    const platform = createMacosLocalPanelWindowPlatform({
+      uid: () => 0, env: {}, now: () => 10_000_000, resolveUser: async () => user,
+      exists: (path) => ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'].includes(path),
+      run: async (file, args) => {
+        runs.push({ file, args });
+        if (file === '/usr/bin/pgrep') return { code: 0, stdout: '900\n' };
+        if (file === '/bin/ps') return { code: 0, stdout: ' 1-02:03:04\n' };
+        return { code: 0, stdout: '' };
+      },
+      runInSession: async (_user, file, args) => { inSession.push({ file, args }); return true; },
+      startInSession: async (u, file, args) => { started.push({ ...(u ? { user: u.name } : {}), file, args }); return true; },
+      prepareProfileParent: async () => undefined,
+      panelHostApp: async () => '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app',
+      ...over,
+    });
+    return { platform, started, inSession, runs };
+  }
+
+  it('as root it starts the browser in the console user\'s session with that user\'s profile; with no console user there is no desktop', async () => {
+    const { platform, started } = mac();
+    expect(await platform.hasDesktop()).toBe(true);
+    expect(await platform.findAppModeBrowsers()).toEqual([
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ]);
+    await platform.launchAppMode('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+    expect(started[0]).toMatchObject({ user: 'k', file: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+    expect(started[0]!.args.join(' ')).toContain('--user-data-dir=/Users/k/.imcodes/local-panel/browser-profile');
+    expect(await mac({ resolveUser: async () => { throw new Error('no console user'); } }).platform.hasDesktop()).toBe(false);
+    expect(await mac({ uid: () => 501, env: { HOME: '/Users/k' }, resolveUser: async () => { throw new Error('unused'); } }).platform.hasDesktop()).toBe(true);
+  });
+
+  it('an absolute profile override moves the macOS browser profile too', async () => {
+    const { platform, started } = mac({ env: { IMCODES_LOCAL_PANEL_PROFILE_DIR: '/private/tmp/scoped-profile' } });
+    expect(await platform.profileDir()).toBe('/private/tmp/scoped-profile');
+    await platform.launchAppMode('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+    expect(started[0]!.args).toContain('--user-data-dir=/private/tmp/scoped-profile');
+  });
+
+  it('finds the window and converts the process age [dd-]hh:mm:ss into a start time', async () => {
+    const { platform } = mac();
+    const age = ((1 * 24 + 2) * 60 + 3) * 60 + 4;
+    expect(await platform.findWindowProcess()).toEqual({ pid: 900, startedAtMs: 10_000_000 - age * 1000 });
+    expect(await mac({ run: async () => ({ code: 0, stdout: ' 05:07\n' }) }).platform.probePid(1)).toEqual({ alive: true, startedAtMs: 10_000_000 - (5 * 60 + 7) * 1000 });
+    expect(await mac({ run: async () => ({ code: 1, stdout: '' }) }).platform.probePid(1)).toEqual({ alive: false });
+  });
+
+  it('focuses by process id through System Events in the user\'s session, and opens the default browser with /usr/bin/open', async () => {
+    const { platform, inSession } = mac();
+    expect(await platform.focusWindow({ pid: 900, startedAtMs: 1 })).toBe(true);
+    expect(inSession[0]!.file).toBe('/usr/bin/osascript');
+    expect(inSession[0]!.args.join(' ')).toContain('unix id is 900');
+    expect(await platform.openDefaultBrowser(localPanelUrl())).toBe(true);
+    expect(inSession[1]).toEqual({ file: '/usr/bin/open', args: [localPanelUrl()] });
+  });
+
+  it('the native host is the installed aiDesk app that declares it shows the panel itself, or nothing; it keeps its own single instance', async () => {
+    const { platform } = mac();
+    expect(platform.nativeHostsOwnInstance).toBe(true);
+    expect(await platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+    expect(await mac({ panelHostApp: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
+  });
+
+  it('the app is installed (or confirmed) from the upgrade archive BEFORE the marker is read, and a failing install never fails the click', async () => {
+    const order: string[] = [];
+    const { platform } = mac({
+      ensureAppInstalled: async () => { order.push('install'); },
+      panelHostApp: async () => { order.push('probe'); return '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app'; },
+    });
+    expect(await platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+    expect(order).toEqual(['install', 'probe']);
+    const broken = mac({ ensureAppInstalled: async () => { throw new Error('archive unreadable'); } });
+    expect(await broken.platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+  });
+
+  it('starting the host is `open <app>` in the user\'s session with the open-panel arguments (a running app just gets the reopen); as the user it is a plain open', async () => {
+    const app = '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app';
+    const asRoot = mac();
+    expect(await asRoot.platform.launchNative(app)).toBe(true);
+    expect(asRoot.inSession[0]).toEqual({ file: '/usr/bin/open', args: [app, '--args', '--aidesk-background', '--aidesk-open-panel'] });
+    expect(asRoot.started).toEqual([]);
+    const asUser = mac({ uid: () => 501, env: { HOME: '/Users/k' }, resolveUser: async () => { throw new Error('unused'); } });
+    expect(await asUser.platform.launchNative(app)).toBe(true);
+    expect(asUser.runs.some((run) => run.file === '/usr/bin/open' && run.args.join(' ').includes('--aidesk-open-panel'))).toBe(true);
+  });
+});
+
+describe('Windows adapter', () => {
+  it('the app-mode script resolves the browser from App Paths in the user\'s session, builds the profile under LOCALAPPDATA and passes the shared arguments', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_app', browser: 'msedge.exe' }, 'C:\\Temp\\result.txt'));
+    expect(script).toContain('App Paths');
+    expect(script).toContain('$env:LOCALAPPDATA');
+    expect(script).toContain('IM.codes\\local-panel\\browser-profile');
+    expect(script).toContain('Start-Process');
+    const embedded = [...script.matchAll(/D '([A-Za-z0-9+/=]+)'/gu)].map((match) => decodeB64(match[1]!));
+    expect(embedded).toContain('msedge.exe');
+    expect(embedded).toContain('C:\\Temp\\result.txt');
+    const args = JSON.parse(embedded.find((value) => value.startsWith('[')) ?? '[]') as string[];
+    expect(args).toContain(`--app=${localPanelUrl()}`);
+    expect(args).toContain(`--proxy-server=${LOCAL_PANEL_REFUSING_PROXY}`);
+    expect(args.map((arg) => arg.split('=')[0]!).filter((name) => LOCAL_PANEL_WARNING_BAR_FLAGS.includes(name))).toEqual([]);
+    expect(args.some((arg) => arg.includes('__LOCAL_PANEL_PROFILE__'))).toBe(true);
+  });
+
+  it('the focus script targets the window by process id and by title, restores it if minimised and activates it', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'focus', pid: 4321 }));
+    expect(script).toContain('Focus(4321,');
+    expect(script).toContain('SetForegroundWindow');
+    expect(script).toContain('IsIconic');
+    expect(script).not.toContain('Report $resultPath');
+  });
+
+  it('the default-browser script opens exactly the URL it is given', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'default_browser', url: localPanelUrl() }));
+    expect([...script.matchAll(/D '([A-Za-z0-9+/=]+)'/gu)].map((match) => decodeB64(match[1]!))).toContain(localPanelUrl());
+    expect(script).toContain('Start-Process');
+  });
+
+  it('every script reports failed on error, and never reads credentials or the daemon directories', () => {
+    for (const op of [{ kind: 'launch_app', browser: 'chrome.exe' }, { kind: 'focus', pid: 1 }, { kind: 'default_browser', url: localPanelUrl() }] as const) {
+      const script = decodePowerShell(buildWindowsPanelWindowCommand(op));
+      expect(script).toContain("trap{Report 'failed'");
+      expect(script).not.toMatch(/credential|ProgramData|\.imcodes\b|imcodes-node/iu);
+    }
+  });
+
+  it('the find script looks for the one window title in the user\'s session and answers pid and start time', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'find' }));
+    expect([...script.matchAll(/D '([A-Za-z0-9+/=]+)'/gu)].map((match) => decodeB64(match[1]!))).toContain(LOCAL_PANEL_WINDOW_TITLE);
+    expect(script).toContain('MainWindowTitle');
+    expect(script).toContain("'ok:{0}:{1}'");
+    expect(script).not.toMatch(/Get-CimInstance|Win32_Process|Get-WmiObject/iu);
+  });
+
+  it('as SYSTEM, a desktop exists only while a user session runs explorer (read from tasklist, never WMI); the window comes from the find script and its pid is checked against the window images', async () => {
+    const env = { USERNAME: 'DESKTOP-1$' };
+    const base = { env, exists: () => false, runOp: async () => 'ok', nativeUi: async () => HOST };
+    const explorer = (session: string) => async () => `"explorer.exe","4242","Console","${session}","80,000 K"\r\n`;
+    // The desktop check is only a hint (a listing that does not finish counts as "try"), so it never waits as long as the other process queries.
+    const timeouts: Array<number | undefined> = [];
+    await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async (_args, timeoutMs) => { timeouts.push(timeoutMs); return explorer('1')(); } }).hasDesktop();
+    expect(timeouts).toEqual([LOCAL_PANEL_WINDOWS_HOST.desktopCheckTimeoutMilliseconds]);
+    expect(LOCAL_PANEL_WINDOWS_HOST.desktopCheckTimeoutMilliseconds).toBeLessThan(10_000);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: explorer('1') }).hasDesktop()).toBe(true);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: explorer('0') }).hasDesktop()).toBe(false);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => 'INFO: No tasks are running which match the specified criteria.\r\n' }).hasDesktop()).toBe(false);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, env: { USERNAME: 'alice' }, tasklist: async () => '' }).hasDesktop()).toBe(true);
+    // A listing that never completed (a slow node: tasklist timed out) is "could not tell", never "no desktop": the launch is still attempted.
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => undefined }).hasDesktop()).toBe(true);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => '' }).hasDesktop()).toBe(true);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => undefined }).probePid(5120)).toEqual({ alive: false });
+    const found = createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => '', runOp: async () => 'ok:5120:1790000000123' });
+    expect(await found.findWindowProcess()).toEqual({ pid: 5120, startedAtMs: 1_790_000_000_123 });
+    for (const answer of ['not_found', 'failed', undefined, 'ok:1', 'ok:0:5']) {
+      expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => '', runOp: async () => answer }).findWindowProcess(), String(answer)).toBeUndefined();
+    }
+    const alive = (image: string) => createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => `"${image}","5120","Console","1","90,000 K"\r\n` });
+    expect(await alive('msedge.exe').probePid(5120)).toEqual({ alive: true });
+    expect(await alive('aidesk-local-ui.exe').probePid(5120)).toEqual({ alive: true });
+    expect(await alive('notepad.exe').probePid(5120)).toEqual({ alive: false }); // the pid was recycled by something else
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => 'INFO: No tasks are running which match the specified criteria.' }).probePid(5120)).toEqual({ alive: false });
+  });
+
+  it('operations map the script word to success; only an absolute native path is offered; browsers are the shared list', async () => {
+    const ops: string[] = [];
+    const platform = createWindowsLocalPanelWindowPlatform({
+      env: { USERNAME: 'alice' }, tasklist: async () => '',
+      runOp: async (op) => { ops.push(op.kind); return op.kind === 'launch_app' && op.browser === 'msedge.exe' ? 'ok' : 'not_found'; },
+      exists: () => true, nativeUi: async () => HOST,
+    });
+    expect(await platform.launchAppMode('msedge.exe')).toBe(true);
+    expect(await platform.launchAppMode('chrome.exe')).toBe(false);
+    expect(await platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
+    expect(await platform.findAppModeBrowsers()).toEqual(['msedge.exe', 'chrome.exe', 'brave.exe']);
+    expect(await platform.nativeUiPath()).toBe(HOST.path);
+    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', runOp: async () => 'ok', exists: () => true, nativeUi: async () => ({ ...HOST, path: 'relative\\aidesk-local-ui.exe' }) }).nativeUiPath()).toBeUndefined();
+    // Offering the host costs no user-session script at all (the host itself says whether its WebView2 runtime exists).
+    expect(ops).toEqual(['launch_app', 'launch_app', 'focus']);
+  });
+
+  it('the native host is offered without any pre-check script; a host that reports its runtime missing is not started again for a while, then looked at again', async () => {
+    const calls: string[] = [];
+    let now = 1_000_000;
+    let answer = 'exited:3';
+    const platform = createWindowsLocalPanelWindowPlatform({
+      env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true, now: () => now,
+      statFile: () => ({ size: HOST.size, mtimeMs: HOST.mtimeMs }),
+      spawnHost: async () => { calls.push('spawn'); return answer; },
+      runOp: async (op) => { calls.push(op.kind); return 'ok'; },
+      nativeUi: async () => { calls.push('verify'); return HOST; },
+    });
+    expect(platform.nativeHostsOwnInstance).toBe(true);
+    expect(await platform.nativeUiPath()).toBe(HOST.path);
+    expect(platform.nativeUnavailableReason?.()).toBeUndefined();
+    expect(calls).toEqual(['verify']);
+    expect(await platform.launchNative(HOST.path)).toBe(false);
+    expect(platform.nativeUnavailableReason?.()).toBe(LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING);
+    // The next clicks go straight to the browser window: no verification, no launch.
+    calls.length = 0;
+    now += LOCAL_PANEL_WINDOWS_HOST.runtimeMissingRememberMilliseconds - 1;
+    expect(await platform.nativeUiPath()).toBeUndefined();
+    expect(platform.nativeUnavailableReason?.()).toBe(LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING);
+    expect(calls).toEqual([]);
+    // The user may have installed the runtime since: after the wait the host is tried again (and now it starts).
+    now += 2;
+    answer = 'ok';
+    expect(await platform.nativeUiPath()).toBe(HOST.path);
+    expect(platform.nativeUnavailableReason?.()).toBeUndefined();
+    expect(await platform.launchNative(HOST.path)).toBe(true);
+    // no host installed at all: not reported as a missing runtime
+    const none = createWindowsLocalPanelWindowPlatform({ env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true, runOp: async () => 'ok', nativeUi: async () => undefined });
+    expect(await none.nativeUiPath()).toBeUndefined();
+    expect(none.nativeUnavailableReason?.()).toBeUndefined();
+  });
+
+  it('starting the host reports how it went: running or a raised second instance is started; a host that exits non-zero is a failed attempt; only the verified, unchanged file is ever started', async () => {
+    let answer = 'ok';
+    const ops: Array<Record<string, unknown>> = [];
+    const spawned: string[] = [];
+    let stat: { size: number; mtimeMs: number } | undefined = { size: HOST.size, mtimeMs: HOST.mtimeMs };
+    const make = (env: NodeJS.ProcessEnv) => createWindowsLocalPanelWindowPlatform({
+      env, tasklist: async () => '', exists: () => true, nativeUi: async () => HOST, statFile: () => stat,
+      runOp: async (op) => { ops.push(op as unknown as Record<string, unknown>); return answer; },
+      spawnHost: async (path, watchMs) => { spawned.push(`${path}|${watchMs}`); return answer; },
+    });
+    // The service (session 0) has the user's session start it: one script, carrying what the file was verified as.
+    const service = make({ USERNAME: 'DESKTOP-1$' });
+    expect(await service.nativeUiPath()).toBe(HOST.path);
+    expect(await service.launchNative(HOST.path)).toBe(true);
+    expect(ops).toEqual([{ kind: 'launch_host', path: HOST.path, size: HOST.size, mtimeMs: HOST.mtimeMs }]);
+    expect(spawned).toEqual([]);
+    answer = 'exited:1';
+    expect(await service.launchNative(HOST.path)).toBe(false);
+    expect(service.nativeUnavailableReason?.()).toBeUndefined();
+    answer = 'failed';
+    expect(await service.launchNative(HOST.path)).toBe(false);
+    answer = 'exited:3';
+    expect(await service.launchNative(HOST.path)).toBe(false);
+    expect(service.nativeUnavailableReason?.()).toBe(LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING);
+    // A node on the user's desktop starts the host itself (no PowerShell), and watches it for the short window.
+    answer = 'ok';
+    ops.length = 0;
+    const user = make({ USERNAME: 'alice' });
+    expect(await user.nativeUiPath()).toBe(HOST.path);
+    expect(await user.launchNative(HOST.path)).toBe(true);
+    expect(spawned).toEqual([`${HOST.path}|${LOCAL_PANEL_WINDOWS_HOST.directWatchMilliseconds}`]);
+    expect(ops).toEqual([]);
+    // A file that changed after the verification (size or last write time) or a different path than the verified one is not started.
+    stat = { size: HOST.size, mtimeMs: HOST.mtimeMs + 1 };
+    expect(await user.launchNative(HOST.path)).toBe(false);
+    stat = { size: HOST.size + 1, mtimeMs: HOST.mtimeMs };
+    expect(await user.launchNative(HOST.path)).toBe(false);
+    stat = undefined;
+    expect(await user.launchNative(HOST.path)).toBe(false);
+    stat = { size: HOST.size, mtimeMs: HOST.mtimeMs };
+    expect(await user.launchNative('C:\\elsewhere\\aidesk-local-ui.exe')).toBe(false);
+    expect(spawned).toHaveLength(1);
+    // Nothing verified in this click: nothing is started.
+    const fresh = make({ USERNAME: 'alice' });
+    expect(await fresh.launchNative(HOST.path)).toBe(false);
+    // unreadable answers (a timed-out user session) are not "started"
+    answer = undefined as unknown as string;
+    expect(await service.launchNative(HOST.path)).toBe(false);
+  });
+
+  it('the launch script checks the file is still the verified one by size and last write time (no hash), waits for an early exit, and only ever starts the path it was given as data', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\x y\\aidesk-local-ui.exe', size: 4096, mtimeMs: 1_790_000_000_123 }));
+    const embedded = [...script.matchAll(/D '([A-Za-z0-9+/=]*)'/gu)].map((match) => decodeB64(match[1]!));
+    expect(embedded).toContain('C:\\x y\\aidesk-local-ui.exe');
+    expect(script).not.toContain('Get-FileHash');
+    expect(script).toContain('$item.Length -ne 4096');
+    expect(script).toContain('.ToUnixTimeMilliseconds() -ne 1790000000123');
+    expect(script.indexOf('$item.Length')).toBeLessThan(script.indexOf('Start-Process'));
+    expect(script).toContain(`WaitForExit(${LOCAL_PANEL_WINDOWS_HOST.launchWaitMilliseconds})`);
+    expect(script).toContain("Report ('exited:'+$p.ExitCode)");
+    expect(script).not.toContain('cmd /c');
+    // the numbers are data, never script text taken from anywhere else
+    const hostile = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\a.exe', size: 1.9, mtimeMs: 2.9 }));
+    expect(hostile).toContain('$item.Length -ne 1');
+    expect(hostile).toContain('.ToUnixTimeMilliseconds() -ne 2)');
+    // no identity to compare (none recorded): the file is still started, never with an empty comparison
+    const none = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\a.exe' }));
+    expect(none).not.toContain('$item.Length');
+  });
+
+  it('focus and find only ever adopt the panel window when its owner is one of aiDesk\'s own images (browser in app mode or the native host), never a same-titled window of anything else', () => {
+    const focus = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'focus', pid: 4321 }));
+    const find = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'find' }));
+    const images = JSON.stringify(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32);
+    const embedded = (script: string): string[] => [...script.matchAll(/D '([A-Za-z0-9+/=]+)'/gu)].map((match) => decodeB64(match[1]!));
+    expect(embedded(focus)).toContain(images);
+    expect(embedded(find)).toContain(images);
+    expect(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32).toEqual(['msedge', 'chrome', 'brave', 'aidesk-local-ui']);
+    expect(focus).toContain('Ours(owner,images)');
+    expect(focus).toContain('owner==pid||(sb.ToString()==title&&Ours(owner,images))');
+    expect(find).toContain('$images -contains $_.ProcessName.ToLowerInvariant()');
+  });
+
+});

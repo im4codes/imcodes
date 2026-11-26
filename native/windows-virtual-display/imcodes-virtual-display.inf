@@ -1,0 +1,69 @@
+; IM.codes on-demand headless virtual display (UMDF IddCx)
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+Class=Display
+ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=imcodes-virtual-display.cat
+DriverVer=08/13/2026,1.0.0.1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0
+
+[Standard.NTamd64.10.0]
+%DeviceName%=VirtualDisplay_Install,Root\ImcodesVirtualDisplay
+%DeviceName%=VirtualDisplay_Install,ImcodesVirtualDisplay
+
+[SourceDisksFiles]
+imcodes-virtual-display.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[VirtualDisplay_Install.NT]
+CopyFiles=UmdfDriverCopy
+
+[VirtualDisplay_Install.NT.hw]
+AddReg=VirtualDisplay_HardwareSettings
+
+[VirtualDisplay_HardwareSettings]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"ImcodesVirtualDisplayGroup"
+
+[VirtualDisplay_Install.NT.Services]
+; WUDFRD.inf is present only on Windows 11. Explicitly associating the
+; reflector keeps this package installable on supported Windows 10 hosts too;
+; Microsoft documents this form as still valid on Windows 11.
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName="Windows Driver Frameworks - User-mode Driver Framework Reflector"
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[VirtualDisplay_Install.NT.Wdf]
+UmdfService=imcodes-virtual-display,VirtualDisplay_UmdfInstall
+UmdfServiceOrder=imcodes-virtual-display
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[VirtualDisplay_UmdfInstall]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\imcodes-virtual-display.dll
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UmdfDriverCopy=12,UMDF
+
+[UmdfDriverCopy]
+imcodes-virtual-display.dll
+
+[Strings]
+ManufacturerName="IM.codes"
+DiskName="IM.codes Virtual Display Installation"
+DeviceName="IM.codes Headless Display"
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000

@@ -73,7 +73,7 @@ export function GettingStarted({ keys, onKeyCreated, onDeviceAppeared }: Props) 
       ? `${serverUrl}/bind/<your-api-key>`
       : '';
   const fullCmd = bindUrl
-    ? `npm i -g imcodes && imcodes bind ${bindUrl}`
+    ? `curl -fsSL https://im.codes/install.sh | bash && imcodes bind ${bindUrl}`
     : '';
 
   return (
@@ -117,6 +117,7 @@ export function GettingStarted({ keys, onKeyCreated, onDeviceAppeared }: Props) 
             <div style={{ marginTop: 12, fontSize: 12, color: '#64748b' }}>
               Installs imcodes and binds this machine to your account.
               Auto-starts on login (macOS/Linux).
+              {'\n'}Windows PowerShell: <code>irm https://im.codes/install.ps1 | iex</code> · Fallback: <code>npm install -g imcodes</code>.
               {'\n'}Re-binding on the same machine will replace the previous server connection.
             </div>
           </div>

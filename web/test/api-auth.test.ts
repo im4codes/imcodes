@@ -27,9 +27,36 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+class TestRefreshChannel {
+  static instances: TestRefreshChannel[] = [];
+  private readonly listeners = new Set<(event: MessageEvent) => void>();
+  readonly sent: unknown[] = [];
+  get listenerCount(): number { return this.listeners.size; }
+
+  constructor() {
+    TestRefreshChannel.instances.push(this);
+  }
+
+  addEventListener(_type: string, listener: (event: MessageEvent) => void): void {
+    this.listeners.add(listener);
+  }
+
+  postMessage(message: unknown): void {
+    this.sent.push(message);
+  }
+
+  emit(data: unknown): void {
+    const event = { data } as MessageEvent;
+    for (const listener of this.listeners) listener(event);
+  }
+
+  close(): void {}
+}
+
 describe('auth nonce exchange API', () => {
   beforeEach(() => {
     vi.resetModules();
+    TestRefreshChannel.instances = [];
     vi.stubGlobal('fetch', vi.fn());
     vi.stubGlobal('Capacitor', {
       getPlatform: () => 'android',
@@ -58,6 +85,7 @@ describe('auth nonce exchange API', () => {
     }));
 
     const { exchangeNonce } = await import('../src/api.js');
+    expect((globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor?.getPlatform?.()).toBe('android');
     const result = await exchangeNonce('https://server.example', 'nonce-123');
 
     expect(result).toEqual({
@@ -99,6 +127,111 @@ describe('auth nonce exchange API', () => {
     const headers = new Headers(init.headers);
     expect(headers.has('Authorization')).toBe(false);
     expect(init.credentials).toBe('include');
+  });
+
+  it('keeps the session when refresh is rate-limited', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValue(new Response(JSON.stringify({ error: 'too_many_attempts', retryAfterMs: 120000 }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      }));
+    const { configure, apiFetch } = await import('../src/api.js');
+    configure('');
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/auth/user/me'))).toBe(false);
+  });
+
+  it('waits for another tab to finish refresh and verifies the session before retrying', async () => {
+    vi.stubGlobal('BroadcastChannel', TestRefreshChannel);
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'user-1' }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    const channel = TestRefreshChannel.instances.find((candidate) => candidate.listenerCount === 1);
+    expect(channel).not.toBeNull();
+    expect(globalThis.BroadcastChannel).toBe(TestRefreshChannel);
+    expect(channel!.listenerCount).toBe(1);
+    channel!.emit('refresh-start');
+
+    const request = apiFetch('/api/protected');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    channel!.emit('refresh-done');
+
+    await expect(request).resolves.toEqual({ ok: true });
+    expect(expired).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/protected',
+      '/api/auth/user/me',
+      '/api/protected',
+    ]);
+  });
+
+  it('does not assume a stale cross-tab lock succeeded after a fixed delay', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('BroadcastChannel', TestRefreshChannel);
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'user-1' }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    const channel = TestRefreshChannel.instances.find((candidate) => candidate.listenerCount === 1);
+    channel!.emit({ type: 'refresh-start', owner: 'crashed-tab', startedAt: Date.now() });
+
+    const request = apiFetch('/api/protected');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(request).resolves.toEqual({ ok: true });
+    expect(expired).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('keeps auth on a transient refresh network failure', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockRejectedValueOnce(new TypeError('network down'));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 503 });
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('only ends auth after invalid refresh and an independently failed /me check', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 401 });
+    expect(expired).toHaveBeenCalledOnce();
+  });
+
+  it('does not clear auth when a successful refresh response did not repair the original request', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 401 });
+    expect(expired).not.toHaveBeenCalled();
   });
 
   it('retries transient failures with exponential backoff', async () => {
@@ -324,6 +457,61 @@ describe('auth nonce exchange API', () => {
     expect(fetchMock).toHaveBeenCalledTimes(cases.length);
   });
 
+  it('attaches the rendered account identity to authenticated requests', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true }));
+    const { apiFetch, configureExpectedUserId } = await import('../src/api.js');
+
+    configureExpectedUserId('user-rock');
+    await apiFetch('/api/machines');
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get('x-imcodes-expected-user-id')).toBe('user-rock');
+  });
+
+  it('clears stale client auth when the server detects an account mismatch', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'auth_identity_changed' }, 409));
+    const expired = vi.fn();
+    const { apiFetch, configureExpectedUserId, onAuthExpired, ApiError } = await import('../src/api.js');
+
+    configureExpectedUserId('user-rock');
+    onAuthExpired(expired);
+
+    await expect(apiFetch('/api/machines')).rejects.toBeInstanceOf(ApiError);
+    expect(expired).toHaveBeenCalledOnce();
+    expect(expired).toHaveBeenCalledWith('auth_identity_changed');
+  });
+
+  it('does not clear a valid mobile login for an endpoint-specific bearer 401', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401))
+      .mockResolvedValueOnce(jsonResponse({ id: 'mobile-user' }))
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401));
+    const expired = vi.fn();
+    const {
+      ApiError,
+      apiFetch,
+      configureApiKey,
+      getApiKey,
+      onAuthExpired,
+    } = await import('../src/api.js');
+
+    configureApiKey('deck_mobile_account_key');
+    onAuthExpired(expired);
+
+    await expect(apiFetch('/api/remote-desktop/guest/host?hostId=host-1'))
+      .rejects.toMatchObject({ status: 401 } satisfies Partial<InstanceType<typeof ApiError>>);
+    expect(expired).not.toHaveBeenCalled();
+    expect(getApiKey()).toBe('deck_mobile_account_key');
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/remote-desktop/guest/host?hostId=host-1',
+      '/api/auth/user/me',
+      '/api/remote-desktop/guest/host?hostId=host-1',
+    ]);
+  });
+
   it('propagates JSON decode failures from successful API responses', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(new Response('not json', {
@@ -388,11 +576,13 @@ describe('auth nonce exchange API', () => {
 
     const browserHeaders = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
     expect(browserHeaders.get('X-CSRF-Token')).toBe('csrf token');
+    expect(browserHeaders.get('x-client-timezone')).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
     expect(browserHeaders.has('Authorization')).toBe(false);
     expect((fetchMock.mock.calls[0][1] as RequestInit).credentials).toBe('include');
 
     const nativeHeaders = new Headers((fetchMock.mock.calls[1][1] as RequestInit).headers);
     expect(nativeHeaders.get('Authorization')).toBe('Bearer native-key-1');
+    expect(nativeHeaders.get('x-client-timezone')).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
     expect(nativeHeaders.has('X-CSRF-Token')).toBe(false);
     expect((fetchMock.mock.calls[1][1] as RequestInit).credentials).toBe('omit');
 
@@ -528,6 +718,16 @@ describe('auth nonce exchange API', () => {
       transport_config: { supervision: { enabled: false } },
     });
     expect(JSON.parse(String(requests[4].body))).toEqual({ ids: ['sub-2', 'sub-1'] });
+  });
+
+  it('distinguishes failed preference reads from missing values for strict reconciliation', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'unavailable' }, 503));
+    const { getUserPref } = await import('../src/api.js');
+    await expect(getUserPref('server_pinned')).resolves.toBeNull();
+    await expect(getUserPref('server_pinned', { strict: true })).rejects.toMatchObject({ status: 503 });
+    fetchMock.mockResolvedValue(jsonResponse({ value: null }));
+    await expect(getUserPref('server_pinned', { strict: true })).resolves.toBeNull();
   });
 
   it('keeps current user, admin, and preference wrappers on stable contracts', async () => {
@@ -694,5 +894,319 @@ describe('auth nonce exchange API', () => {
     expect(JSON.parse(String(requests[2].body))).toEqual({});
     expect(JSON.parse(String(requests[6].body))).toEqual({ username: 'kai', password: 'pw', displayName: 'Kai', native: true });
     expect(JSON.parse(String(requests[8].body))).toEqual({ oldPassword: 'old-pw', newPassword: 'new-pw' });
+  });
+  it.each([['account_disabled'], ['account_pending']])(
+    'ends the login (onAuthExpired) when any request is refused with %s, instead of leaving a signed-in shell of failing calls',
+    async (code) => {
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockResolvedValue(jsonResponse({ error: code }, 403));
+      const { apiFetch, configure, onAuthExpired, ApiError } = await import('../src/api.js');
+      configure('https://im.example');
+      const expired = vi.fn();
+      onAuthExpired(expired);
+      await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
+      expect(expired).toHaveBeenCalledWith(code);
+    },
+  );
+
+  it('does not end the login for an ordinary 403', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'forbidden' }, 403));
+    const { apiFetch, configure, onAuthExpired, ApiError } = await import('../src/api.js');
+    configure('https://im.example');
+    const expired = vi.fn();
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('preserves stubbed global Capacitor and avoids duplicate FileTransferKeepAlive registration warnings across module resets', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const capStub = { getPlatform: () => 'android' };
+    vi.stubGlobal('Capacitor', capStub);
+
+    await import('../src/api.js');
+    expect((globalThis as { Capacitor?: unknown }).Capacitor).toBe(capStub);
+
+    for (let i = 0; i < 2; i += 1) {
+      vi.resetModules();
+      vi.stubGlobal('Capacitor', { getPlatform: () => 'web', isNativePlatform: () => false });
+      const keepalive = await import('../src/background-transfer-keepalive.js');
+      keepalive.setBackgroundTransferKeepAliveLabels({ title: 'Uploading', text: 'Working' });
+      const release = keepalive.acquireBackgroundTransferKeepAlive();
+      release();
+      await keepalive.withBackgroundTransferKeepAlive(async () => 'ok');
+    }
+
+    const warnings = [...warnSpy.mock.calls, ...errorSpy.mock.calls].flat().map(String);
+    expect(warnings.some((line) => line.includes('FileTransferKeepAlive') && line.includes('already registered'))).toBe(false);
+  });
+
+  it('throws invalid_credentials immediately on passwordLogin 401 without calling /api/auth/refresh or sleeping', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (url) => {
+      if (String(url).includes('/api/auth/refresh')) {
+        return jsonResponse({ error: 'invalid_body' }, 400);
+      }
+      return jsonResponse({ error: 'invalid_credentials' }, 401);
+    });
+    const expired = vi.fn();
+    const { ApiError, onAuthExpired, passwordLogin } = await import('../src/api.js');
+    onAuthExpired(expired);
+
+    let rejected: unknown;
+    try {
+      await passwordLogin('wrong-user', 'wrong-pass');
+    } catch (err) {
+      rejected = err;
+    }
+
+    expect(rejected).toBeInstanceOf(ApiError);
+    expect(rejected).toMatchObject({
+      status: 401,
+      code: 'invalid_credentials',
+      body: JSON.stringify({ error: 'invalid_credentials' }),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/auth/password/login');
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('throws invalid_credentials immediately on native Bearer passwordLogin 401 without /user/me verification', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'invalid_credentials' }, 401));
+    const expired = vi.fn();
+    const { ApiError, configureApiKey, onAuthExpired, passwordLogin } = await import('../src/api.js');
+    configureApiKey('deck_stale_native_key');
+    onAuthExpired(expired);
+
+    let rejected: unknown;
+    try {
+      await passwordLogin('wrong-user', 'wrong-pass', true);
+    } catch (err) {
+      rejected = err;
+    }
+
+    expect(rejected).toBeInstanceOf(ApiError);
+    expect(rejected).toMatchObject({
+      status: 401,
+      code: 'invalid_credentials',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/auth/password/login');
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '/api/auth/password/login',
+    '/api/auth/password/login?foo=1',
+    '/API/AUTH/PASSWORD/LOGIN/',
+    '/api/auth/password/register',
+    '/api/auth/passkey/login/begin',
+    '/api/auth/passkey/login/complete',
+    '/api/auth/passkey/login/complete?native=1',
+    '/api/auth/passkey/register/begin',
+    '/api/auth/passkey/register/complete',
+    '/api/auth/token-exchange',
+    '/api/auth/logout',
+    '/api/auth/refresh',
+  ])('skips 401 refresh/verify for non-session auth path %s', async (path) => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: 'ceremony_401' }, 401))
+      .mockResolvedValue(jsonResponse({ error: 'invalid_body' }, 400));
+    const expired = vi.fn();
+    const { ApiError, apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+
+    await expect(apiFetch(path, { method: 'POST', body: '{}' })).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 401,
+      code: 'ceremony_401',
+    } satisfies Partial<InstanceType<typeof ApiError>>);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'invalid_credentials',
+    'invalid_old_password',
+  ])('throws credential-verification 401 (%s) on /api/auth/password/change without refresh or logout', async (code) => {
+    for (const bearer of [false, true]) {
+      vi.resetModules();
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValue(jsonResponse({ error: code }, 401));
+      const expired = vi.fn();
+      const { ApiError, configureApiKey, onAuthExpired, passwordChange } = await import('../src/api.js');
+      if (bearer) configureApiKey('deck_valid_native_key');
+      onAuthExpired(expired);
+
+      await expect(passwordChange('wrong-old', 'NewPassw0rd1!')).rejects.toMatchObject({
+        name: 'ApiError',
+        status: 401,
+        code,
+      } satisfies Partial<InstanceType<typeof ApiError>>);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(expired).not.toHaveBeenCalled();
+    }
+  });
+
+  it('still refreshes expired sessions on /api/auth/password/change and /api/auth/passkey/credentials when 401 is unauthorized', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: 'unauthorized' }, 401))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ error: 'unauthorized' }, 401))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ credentials: [] }));
+    const { listPasskeys, passwordChange } = await import('../src/api.js');
+
+    await expect(passwordChange('old-pw', 'NewPassw0rd1!')).resolves.toBeUndefined();
+    await expect(listPasskeys()).resolves.toEqual({ credentials: [] });
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/auth/password/change',
+      '/api/auth/refresh',
+      '/api/auth/password/change',
+      '/api/auth/passkey/credentials',
+      '/api/auth/refresh',
+      '/api/auth/passkey/credentials',
+    ]);
+  });
+
+  it('does not throw JSON parse error on non-JSON or empty 401 bodies across ceremony and session routes', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('Unauthorized plain text', { status: 401 }))
+      .mockResolvedValueOnce(new Response('not json', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const { ApiError, apiFetch } = await import('../src/api.js');
+
+    await expect(apiFetch('/api/auth/password/login', { method: 'POST', body: '{}' })).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 401,
+      body: 'Unauthorized plain text',
+      code: null,
+    } satisfies Partial<InstanceType<typeof ApiError>>);
+
+    await expect(apiFetch('/api/servers')).resolves.toEqual({ ok: true });
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/auth/password/login',
+      '/api/servers',
+      '/api/auth/refresh',
+      '/api/servers',
+    ]);
+  });
+
+  it('preserves caller AbortSignal cancellation before and during 401 body reads', async () => {
+    const preAborted = new AbortController();
+    const fetchMock = vi.mocked(fetch);
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+
+    preAborted.abort(new DOMException('Cancelled before fetch', 'AbortError'));
+    await expect(apiFetch('/api/servers', { signal: preAborted.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const midReadController = new AbortController();
+    const pendingRes = {
+      status: 401,
+      ok: false,
+      text: () => new Promise<string>(() => {}),
+    } as unknown as Response;
+    fetchMock.mockResolvedValueOnce(pendingRes);
+
+    const pending = apiFetch('/api/auth/password/change', {
+      method: 'POST',
+      body: '{}',
+      signal: midReadController.signal,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    midReadController.abort(new DOMException('Cancelled during 401 body read', 'AbortError'));
+    await expect(pending).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('starts 401 recovery immediately for normal routes before a delayed response body settles (cookie & bearer)', async () => {
+    for (const bearer of [false, true]) {
+      vi.resetModules();
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockClear();
+      let resolveDelayedBody!: (text: string) => void;
+      const delayedBody = new Promise<string>((resolve) => {
+        resolveDelayedBody = resolve;
+      });
+      fetchMock.mockImplementation(async () => {
+        if (fetchMock.mock.calls.length === 1) {
+          return {
+            status: 401,
+            ok: false,
+            text: () => delayedBody,
+          } as unknown as Response;
+        }
+        return jsonResponse({ ok: true });
+      });
+
+      const expired = vi.fn();
+      const { apiFetch, clearApiKey, configureApiKey, onAuthExpired } = await import('../src/api.js');
+      clearApiKey();
+      if (bearer) configureApiKey('deck_valid_native_key');
+      onAuthExpired(expired);
+
+      let settled = false;
+      const request = apiFetch('/api/servers').then((val) => {
+        settled = true;
+        return val;
+      });
+
+      await vi.waitFor(() => expect(settled).toBe(true));
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        '/api/servers',
+        bearer ? '/api/auth/user/me' : '/api/auth/refresh',
+        '/api/servers',
+      ]);
+      expect(expired).not.toHaveBeenCalled();
+
+      resolveDelayedBody(JSON.stringify({ error: 'unauthorized' }));
+      await expect(request).resolves.toEqual({ ok: true });
+    }
+  });
+
+  it('falls back to normal 401 recovery when /api/auth/password/change 401 body stalls past the classification timeout', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce({
+        status: 401,
+        ok: false,
+        text: () => new Promise<string>(() => {}),
+      } as unknown as Response)
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const expired = vi.fn();
+    const { onAuthExpired, passwordChange } = await import('../src/api.js');
+    onAuthExpired(expired);
+
+    const request = passwordChange('old-pw', 'NewPassw0rd1!');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(request).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/auth/password/change',
+      '/api/auth/refresh',
+      '/api/auth/password/change',
+    ]);
+    expect(expired).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 });

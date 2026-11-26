@@ -1,0 +1,237 @@
+/**
+ * A `kind: 'server'` target names no session, so the per-session coverage check
+ * cannot run on it. `filterShareDaemonMessage` used to answer that by skipping
+ * the check entirely, which delivered the message to every share socket on the
+ * server — a socket shared one tab, in viewer role, received whole-server
+ * `discussion.*` and `p2p.run.*` payloads. Neither group has a redact, so the
+ * round text, participant session names and hop output paths went out verbatim.
+ *
+ * The decision now rests on the RECEIVER's scope: a server-scoped share covers
+ * everything, and a narrower one may only receive a server-targeted message
+ * when the entry's own redact re-scopes it (`session_list` does; nothing else).
+ */
+import { describe, expect, it } from 'vitest';
+import { filterShareDaemonMessage } from '../src/ws/share-policy.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import type { EffectiveCoverage, ShareTarget } from '../../shared/tab-sharing.js';
+
+const serverId = 'srv-scope-1';
+const now = 1_800_000_000_000;
+
+function coverage(target: ShareTarget, effectiveRole: EffectiveCoverage['effectiveRole'] = 'viewer'): EffectiveCoverage {
+  return {
+    target,
+    effectiveRole,
+    historyCutoffAt: 0,
+    nextCoverageRecheckAt: null,
+    coveringShareIds: ['share-1'],
+    primaryShareId: 'share-1',
+    authorizedAt: now,
+  };
+}
+
+function socket(target: ShareTarget, effectiveRole: EffectiveCoverage['effectiveRole'] = 'viewer') {
+  return {
+    userId: 'shared-user',
+    target,
+    connectedAt: now,
+    ticketId: 'ticket-1',
+    snapshot: coverage(target, effectiveRole),
+  };
+}
+
+const tabScoped: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+const serverScoped: ShareTarget = { kind: 'server', serverId };
+
+const serverStamped = { shareScope: { target: serverScoped } };
+
+describe('server-targeted messages vs a narrower share', () => {
+  it.each([
+    ['discussion.started'],
+    ['discussion.update'],
+    ['discussion.done'],
+    ['discussion.error'],
+    ['discussion.list'],
+  ])('drops %s carrying a server-wide scope', (type) => {
+    const delivered = filterShareDaemonMessage(
+      { type, ...serverStamped, response: 'whole-server discussion text' },
+      socket(tabScoped),
+    );
+    expect(delivered).toBeNull();
+  });
+
+  it.each([
+    [P2P_WORKFLOW_MSG.RUN_STARTED],
+    [P2P_WORKFLOW_MSG.RUN_UPDATE],
+    [P2P_WORKFLOW_MSG.RUN_COMPLETE],
+    [P2P_WORKFLOW_MSG.RUN_ERROR],
+  ])('drops %s carrying a server-wide scope', (type) => {
+    const delivered = filterShareDaemonMessage(
+      { type, run: { shareScope: { target: serverScoped }, hops: [{ output_path: '/Users/host/secret' }] } },
+      socket(tabScoped),
+    );
+    expect(delivered).toBeNull();
+  });
+
+  it('still delivers a server-wide discussion to a server-scoped share', () => {
+    const delivered = filterShareDaemonMessage(
+      { type: 'discussion.started', ...serverStamped, response: 'text' },
+      socket(serverScoped),
+    );
+    expect(delivered).not.toBeNull();
+  });
+
+  it('still delivers session_list to a narrower share, because its redact re-scopes it', () => {
+    // The one server-targeted entry that opts in. Losing this would blank the
+    // shared session list, so it is pinned here alongside the denials.
+    const delivered = filterShareDaemonMessage(
+      {
+        type: 'session_list',
+        serverId,
+        sessions: [
+          { name: 'deck_proj_brain', state: 'idle' },
+          { name: 'deck_other_brain', state: 'idle' },
+        ],
+      },
+      socket(tabScoped),
+    );
+    const names = (delivered?.sessions as Array<{ name: string }> | undefined)?.map((row) => row.name);
+    expect(names).toEqual(['deck_proj_brain']);
+  });
+});
+
+describe('session_list row redaction', () => {
+  const row = {
+    name: 'deck_proj_brain',
+    state: 'idle',
+    projectDir: '/Users/host/private/project',
+    transportConfig: { apiBase: 'https://internal.example', env: { TOKEN: 'x' } },
+    providerId: 'claude-code-sdk',
+    providerSessionId: 'provider-session-abc',
+    qwenAuthType: 'oauth',
+    qwenAuthLimit: 100,
+    qwenAvailableModels: ['qwen-max'],
+    copilotAvailableModels: ['gpt-5'],
+    cursorAvailableModels: ['cursor-fast'],
+    codexAvailableModels: ['o3'],
+    planLabel: 'Max 5x',
+    permissionLabel: 'all',
+    quotaLabel: '7d 55% 5d05h 9/26 18:39',
+    quotaUsageLabel: '4/5',
+    quotaMeta: {
+      primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      plan: 'enterprise',
+    },
+    contextNamespace: 'host-namespace',
+    contextNamespaceDiagnostics: { note: 'host detail' },
+    effort: 'high',
+    ccPreset: 'preset-host',
+    requestedModel: 'claude-opus-5',
+  };
+
+  it.each([
+    ['a tab-scoped share', tabScoped],
+    ['a server-scoped share', serverScoped],
+  ])('preserves the project directory but strips private host/provider fields for %s', (_label, target) => {
+    const delivered = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [row] },
+      socket(target),
+    );
+    const [out] = delivered?.sessions as Array<Record<string, unknown>>;
+    expect(out.name).toBe('deck_proj_brain');
+    expect(out.state).toBe('idle');
+    expect(out.projectDir).toBe('/Users/host/private/project');
+    // Allowlist, so assert the complement: nothing outside the visible set may
+    // survive. A denylist version of this test passed while planLabel,
+    // permissionLabel and the *AvailableModels arrays still went out.
+    const allowed = new Set(['name', 'state', 'projectDir']);
+    for (const key of Object.keys(out)) {
+      expect(allowed.has(key), `${key} must not reach a share recipient`).toBe(true);
+    }
+  });
+
+  it.each([
+    ['a tab-scoped participant', tabScoped],
+    ['a server-scoped participant', serverScoped],
+  ])('keeps display-only provider quota for %s without exposing account/provider configuration', (_label, target) => {
+    const delivered = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [row] },
+      socket(target, 'participant'),
+    );
+    const [out] = delivered?.sessions as Array<Record<string, unknown>>;
+    expect(out.quotaLabel).toBe('7d 55% 5d05h 9/26 18:39');
+    expect(out.quotaUsageLabel).toBe('4/5');
+    expect(out.quotaMeta).toEqual({
+      primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+    });
+    expect(out).not.toHaveProperty('planLabel');
+    expect(out).not.toHaveProperty('providerId');
+    expect(out).not.toHaveProperty('codexCreditsBalance');
+  });
+
+  it('exposes the cancel guard token only to participants', () => {
+    const withDispatch = { ...row, activeDispatchId: 'dispatch-current' };
+    const viewer = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [withDispatch] },
+      socket(tabScoped, 'viewer'),
+    );
+    const participant = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [withDispatch] },
+      socket(tabScoped, 'participant'),
+    );
+
+    expect((viewer?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('activeDispatchId');
+    expect((participant?.sessions as Array<Record<string, unknown>>)[0]).toMatchObject({
+      activeDispatchId: 'dispatch-current',
+    });
+    expect(filterShareDaemonMessage({
+      type: 'command.ack',
+      session: 'deck_proj_brain',
+      commandId: 'command-1',
+      status: 'accepted',
+      activeDispatchId: 'dispatch-current',
+    }, socket(tabScoped, 'viewer'))).not.toHaveProperty('activeDispatchId');
+    expect(filterShareDaemonMessage({
+      type: 'command.ack',
+      session: 'deck_proj_brain',
+      commandId: 'command-1',
+      status: 'accepted',
+      activeDispatchId: 'dispatch-current',
+    }, socket(tabScoped, 'participant'))).toMatchObject({ activeDispatchId: 'dispatch-current' });
+  });
+});
+
+describe('original audit-card timeline delivery', () => {
+  it.each([
+    ['main', 'deck_proj_brain'],
+    ['covered sub-session', 'deck_sub_child'],
+  ])('keeps trusted PASS/REWORK events for the %s participant timeline', (_label, sessionId) => {
+    const state = {
+      ...socket(tabScoped, 'participant'),
+      coveredSessionNames: ['deck_proj_brain', 'deck_sub_child'],
+    };
+    for (const event of [
+      {
+        eventId: `delegation-${sessionId}`,
+        sessionId,
+        type: 'delegation.reply',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { verdict: 'PASS', round: 2, result: 'Exact findings.' },
+      },
+      {
+        eventId: `audit-${sessionId}`,
+        sessionId,
+        type: 'peer_audit.result',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { outcome: 'rework', round: 3, findingsPreview: 'Repair required.' },
+      },
+    ]) {
+      expect(filterShareDaemonMessage({ type: 'timeline.event', event }, state)).toEqual({
+        type: 'timeline.event',
+        event,
+      });
+    }
+  });
+});

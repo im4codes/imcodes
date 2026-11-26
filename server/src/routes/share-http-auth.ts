@@ -1,11 +1,14 @@
 import type { Database } from '../db/client.js';
+import { getSubSessionById, isExecutionCloneRow } from '../db/queries.js';
 import { listActiveSharesForUser, resolveEffectiveShareCoverage, type ShareTarget } from '../db/tab-sharing.js';
-import { resolveServerRole, type ServerRole } from '../security/authorization.js';
-import { resolveEffectiveActor, type ResolveEffectiveActorResult } from '../../../shared/tab-sharing.js';
+import { resolveServerMembershipRole, resolveServerRole, type ServerRole } from '../security/authorization.js';
+import { resolveEffectiveActor, rawSubSessionIdFromDisplayName, type ResolveEffectiveActorResult } from '../../../shared/tab-sharing.js';
 
 export interface HttpShareAccess {
   membership: ServerRole;
   actor: ResolveEffectiveActorResult;
+  /** Grant class supplying participant write authority for this request. */
+  shareProvenance?: 'server' | 'session' | null;
 }
 
 export type ServerMemberAccessOrShareDeny =
@@ -17,18 +20,83 @@ export async function resolveHttpShareAccess(
   params: { serverId: string; userId: string; target: ShareTarget; now?: number },
 ): Promise<HttpShareAccess> {
   const now = params.now ?? Date.now();
-  const membership = await resolveServerRole(db, params.serverId, params.userId);
+  // Preserve share provenance. `resolveServerRole` deliberately maps a whole-
+  // server participant to owner-equivalent operational authority, but doing
+  // that here would erase the shared-server actor before command stamping and
+  // would make a delegated action indistinguishable from the real owner.
+  const membership = await resolveServerMembershipRole(db, params.serverId, params.userId);
   if (membership !== 'none') {
     return {
       membership,
       actor: resolveEffectiveActor(membership, null),
+      shareProvenance: null,
     };
+  }
+  // The WS path refuses a target belonging to another server before resolving
+  // coverage (`resolveShareCoverageFromDb`); this one did not. Every caller
+  // currently builds the target from the route's own serverId, so the two can
+  // never disagree today — but a caller that starts reading the target from a
+  // request body would turn that into cross-server access with no guard here
+  // to stop it.
+  if (params.target.serverId && params.target.serverId !== params.serverId) {
+    return { membership, actor: resolveEffectiveActor(null, null), shareProvenance: null };
   }
   const coverage = await resolveEffectiveShareCoverage(db, { userId: params.userId, target: params.target, now });
   return {
     membership,
     actor: resolveEffectiveActor(null, coverage),
+    shareProvenance: coverage
+      ? (coverage.serverParticipantAuthority === true ? 'server' : 'session')
+      : null,
   };
+}
+
+/**
+ * Resolve HTTP access to one concrete session using the same coverage model as
+ * the share-scoped WebSocket. A main-session share includes its ordinary child
+ * sub-sessions, but never execution clones.
+ *
+ * Direct membership, server shares, and explicit sub-session shares are
+ * resolved first. The parent lookup is only needed for an otherwise-denied
+ * sub-session target, keeping the common path unchanged.
+ */
+export async function resolveHttpShareAccessForCoveredSession(
+  db: Database,
+  params: { serverId: string; userId: string; target: ShareTarget; now?: number },
+): Promise<HttpShareAccess> {
+  const direct = await resolveHttpShareAccess(db, params);
+  if (direct.actor.kind !== 'none' || params.target.kind !== 'subsession') return direct;
+
+  let currentSubId: string | null = params.target.subSessionId;
+  const visited = new Set<string>();
+
+  while (currentSubId && !visited.has(currentSubId)) {
+    visited.add(currentSubId);
+    const child = await getSubSessionById(db, currentSubId, params.serverId);
+    if (!child || child.closed_at !== null || isExecutionCloneRow(child) || !child.parent_session) break;
+
+    const parentSubId = rawSubSessionIdFromDisplayName(child.parent_session)
+      || (/^[a-z0-9]{8}$/i.test(child.parent_session) ? child.parent_session : null);
+    if (parentSubId) {
+      const parentSubAccess = await resolveHttpShareAccess(db, {
+        ...params,
+        target: { kind: 'subsession', serverId: params.serverId, subSessionId: parentSubId },
+      });
+      if (parentSubAccess.actor.kind !== 'none') return parentSubAccess;
+      currentSubId = parentSubId;
+    } else {
+      return resolveHttpShareAccess(db, {
+        ...params,
+        target: {
+          kind: 'main',
+          serverId: params.serverId,
+          sessionName: child.parent_session,
+        },
+      });
+    }
+  }
+
+  return direct;
 }
 
 export async function resolveServerMemberAccessOrShareDeny(

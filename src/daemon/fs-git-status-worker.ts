@@ -3,6 +3,7 @@ import * as nodePath from 'node:path';
 import { readdir as fsReaddir } from 'node:fs/promises';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
+import { mergeFsGitStatusWithIgnored } from '../shared/transport/fs.js';
 import type {
   FsGitStatusBuildJobInput,
   FsGitStatusWorkerError,
@@ -12,7 +13,9 @@ import type {
 } from './fs-git-status-worker-types.js';
 
 const execFileAsync = promisify(execFileCb);
-const GIT_STATUS_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const GIT_STATUS_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+const GIT_NUMSTAT_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const GIT_CHECK_IGNORE_MAX_BUFFER_BYTES = 1024 * 1024;
 const GIT_STATUS_TIMEOUT_MS = 5_000;
 
 function decodeGitPath(rawPath: string): string {
@@ -50,14 +53,58 @@ function isPathInside(root: string, candidate: string): boolean {
   return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(normalizedRoot + nodePath.sep);
 }
 
-async function execGit(repoRoot: string, args: string[]): Promise<string> {
+async function execGit(repoRoot: string, args: string[], maxBuffer = GIT_STATUS_MAX_BUFFER_BYTES): Promise<string> {
   const { stdout } = await execFileAsync('git', args, {
     cwd: repoRoot,
     timeout: GIT_STATUS_TIMEOUT_MS,
     encoding: 'utf8',
-    maxBuffer: GIT_STATUS_MAX_BUFFER_BYTES,
+    maxBuffer,
   });
   return stdout;
+}
+
+function execGitWithStdin(
+  repoRoot: string,
+  args: string[],
+  stdinText: string,
+  maxBuffer = GIT_CHECK_IGNORE_MAX_BUFFER_BYTES,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = execFileCb(
+      'git',
+      args,
+      {
+        cwd: repoRoot,
+        timeout: GIT_STATUS_TIMEOUT_MS,
+        encoding: 'utf8',
+        maxBuffer,
+      },
+      (error, stdout = '') => {
+        if (!error) {
+          resolve(stdout);
+          return;
+        }
+        // `git check-ignore` exits with code 1 when none of the paths are ignored.
+        if ((error as { code?: unknown }).code === 1) {
+          resolve('');
+          return;
+        }
+        reject(error);
+      },
+    );
+    child?.stdin?.on?.('error', () => {});
+    child?.stdin?.end?.(stdinText);
+  });
+}
+
+function isNonRetryableGitReadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const err = error as { code?: unknown; killed?: unknown; signal?: unknown; message?: unknown };
+  if (err.killed === true || err.code === 'ETIMEDOUT' || err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    return true;
+  }
+  const msg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+  return msg.includes('maxbuffer') || msg.includes('timed out');
 }
 
 async function loadRepoStatusFiles(repoRoot: string): Promise<FsGitStatusWorkerFile[]> {
@@ -81,7 +128,7 @@ async function loadRepoStatusFiles(repoRoot: string): Promise<FsGitStatusWorkerF
   return files;
 }
 
-async function loadDirectIgnoredChildren(repoRoot: string, requestedPath: string): Promise<FsGitStatusWorkerFile[]> {
+export async function loadDirectIgnoredChildren(repoRoot: string, requestedPath: string): Promise<FsGitStatusWorkerFile[]> {
   if (!isPathInside(repoRoot, requestedPath)) return [];
   let entries: Array<{ name: string }>;
   try {
@@ -97,7 +144,7 @@ async function loadDirectIgnoredChildren(repoRoot: string, requestedPath: string
 
   let stdout = '';
   try {
-    stdout = await execGit(repoRoot, ['check-ignore', '-z', '--', ...relativeChildren]);
+    stdout = await execGitWithStdin(repoRoot, ['check-ignore', '-z', '--stdin'], `${relativeChildren.join('\0')}\0`);
   } catch {
     return [];
   }
@@ -110,12 +157,14 @@ async function loadDirectIgnoredChildren(repoRoot: string, requestedPath: string
 async function loadRepoNumstat(repoRoot: string): Promise<Map<string, { additions?: number; deletions?: number }>> {
   let stdout = '';
   try {
-    stdout = await execGit(repoRoot, ['diff', '--numstat', '-z', 'HEAD']);
-  } catch {
-    try {
-      stdout = await execGit(repoRoot, ['diff', '--numstat', '-z']);
-    } catch {
-      stdout = '';
+    stdout = await execGit(repoRoot, ['diff', '--numstat', '-z', 'HEAD'], GIT_NUMSTAT_MAX_BUFFER_BYTES);
+  } catch (err) {
+    if (!isNonRetryableGitReadError(err)) {
+      try {
+        stdout = await execGit(repoRoot, ['diff', '--numstat', '-z'], GIT_NUMSTAT_MAX_BUFFER_BYTES);
+      } catch {
+        stdout = '';
+      }
     }
   }
   const stats = new Map<string, { additions?: number; deletions?: number }>();
@@ -147,29 +196,48 @@ export async function scanFsGitStatusSnapshot(input: FsGitStatusBuildJobInput): 
   repoSignature: string;
   requestedPath: string;
   includeStats: boolean;
+  summaryOnly: boolean;
   files: FsGitStatusWorkerFile[];
+  totalCount: number;
+  truncated: boolean;
 }> {
-  const statusFiles = await loadRepoStatusFiles(input.repoRoot);
-  const directIgnored = input.includeStats ? [] : await loadDirectIgnoredChildren(input.repoRoot, input.requestedPath);
-  const stats = input.includeStats ? await loadRepoNumstat(input.repoRoot) : null;
-  const filesByPath = new Map<string, FsGitStatusWorkerFile>();
-  for (const file of statusFiles
-    .filter((file) => isPathInside(input.requestedPath, file.path))
-    .map((file) => {
-      const fileStats = stats?.get(file.path);
-      return fileStats ? { ...file, ...fileStats } : file;
-    })) {
-    filesByPath.set(file.path, file);
+  const summaryOnly = input.summaryOnly === true;
+  const includeStats = !summaryOnly && input.includeStats;
+  const statusFiles = (await loadRepoStatusFiles(input.repoRoot))
+    .filter((file) => isPathInside(input.requestedPath, file.path));
+
+  if (summaryOnly) {
+    const totalCount = statusFiles.length;
+    return {
+      repoRoot: input.repoRoot,
+      repoSignature: input.repoSignature,
+      requestedPath: input.requestedPath,
+      includeStats: false,
+      summaryOnly: true,
+      files: [],
+      totalCount,
+      truncated: totalCount > 0,
+    };
   }
-  for (const file of directIgnored) {
-    if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
-  }
+
+  const directIgnored = includeStats ? [] : await loadDirectIgnoredChildren(input.repoRoot, input.requestedPath);
+  const capped = mergeFsGitStatusWithIgnored(statusFiles, directIgnored);
+  const stats = includeStats && capped.files.length > 0 ? await loadRepoNumstat(input.repoRoot) : null;
+  const files = stats
+    ? capped.files.map((file) => {
+        const fileStats = stats.get(file.path);
+        return fileStats ? { ...file, ...fileStats } : file;
+      })
+    : capped.files;
   return {
     repoRoot: input.repoRoot,
     repoSignature: input.repoSignature,
     requestedPath: input.requestedPath,
-    includeStats: input.includeStats,
-    files: [...filesByPath.values()],
+    includeStats,
+    summaryOnly: false,
+    files,
+    totalCount: capped.totalCount,
+    truncated: capped.truncated,
   };
 }
 

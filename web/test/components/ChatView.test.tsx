@@ -4,7 +4,15 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView, __clearChatLocalImagePreviewCacheForTests } from '../../src/components/ChatView.js';
+import {
+  ChatView,
+  __buildViewItemsForTests,
+  __buildViewItemsTailForTests,
+  __clearChatLocalImagePreviewCacheForTests,
+  formatChatDateTime,
+} from '../../src/components/ChatView.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../../shared/daemon-user-notices.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../../shared/chat-message-origin.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -20,6 +28,22 @@ import {
   PREVIEW_EVENT_TAIL_LIMIT,
   PREVIEW_RENDER_ITEM_LIMIT,
 } from '../../src/chat-render-limits.js';
+import {
+  PEER_AUDIT_REWORK_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_CONTINUE_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+} from '../../../shared/supervision-config.js';
+import { TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -63,6 +87,95 @@ function selectText(node: Text, start: number, end: number) {
   document.dispatchEvent(new Event('selectionchange'));
 }
 
+function installRenderedLineMeasurement(initialLines: number) {
+  let renderedLines = initialLines;
+  const callbacks = new Set<ResizeObserverCallback>();
+  const originalResizeObserver = globalThis.ResizeObserver;
+  const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockImplementation(function () {
+    return this.classList.contains('chat-user-message-fold-content') ? renderedLines * 20 : 0;
+  });
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  const computedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+    const style = originalGetComputedStyle(element, pseudoElement);
+    if (!element.classList.contains('chat-user-message-fold-content')) return style;
+    return new Proxy(style, {
+      get(target, property, receiver) {
+        if (property === 'lineHeight') return '20px';
+        if (property === 'fontSize') return '14px';
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  });
+  class ControlledResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      callbacks.add(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    writable: true,
+    value: ControlledResizeObserver,
+  });
+  return {
+    setRenderedLines(lines: number) {
+      renderedLines = lines;
+      act(() => {
+        for (const callback of callbacks) callback([], {} as ResizeObserver);
+      });
+    },
+    restore() {
+      scrollHeightSpy.mockRestore();
+      computedStyleSpy.mockRestore();
+      Object.defineProperty(globalThis, 'ResizeObserver', {
+        configurable: true,
+        writable: true,
+        value: originalResizeObserver,
+      });
+    },
+  };
+}
+
+describe('formatChatDateTime', () => {
+  const now = new Date(2026, 6, 11, 18, 0, 0).getTime();
+
+  it('shows seconds without a date for messages from today', () => {
+    const ts = new Date(2026, 6, 11, 17, 50, 9).getTime();
+    expect(formatChatDateTime(ts, now)).toBe(new Date(ts).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+  });
+
+  it('adds the date for messages outside today', () => {
+    const ts = new Date(2026, 6, 10, 17, 50, 9).getTime();
+    expect(formatChatDateTime(ts, now)).toBe(new Date(ts).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+  });
+
+  it('formats dates with the active i18n locale instead of the system locale', () => {
+    const ts = new Date(2026, 6, 10, 17, 50, 9).getTime();
+    const formatted = formatChatDateTime(ts, now, 'zh-CN');
+    expect(formatted).toBe(new Date(ts).toLocaleString('zh-CN', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+    expect(formatted).not.toMatch(/\bJul\b/i);
+  });
+});
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
@@ -82,34 +195,431 @@ vi.mock('react-i18next', () => ({
         'share.role.serverMember': 'Server member',
         'share.role.serverManager': 'Server manager',
         'share.role.system': 'System',
+        'chat.execution_status.waiting': 'Waiting',
+        'chat.execution_status.needs_input': 'Needs input',
+        'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+        'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+        'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+        'chat.supervision_prompt.pair_heartbeat': 'Pair heartbeat',
+        'chat.supervision_prompt.continue': 'Supervision continuation',
+        'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+        'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+        'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+        'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+        'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+        'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+        'chat.supervision_prompt.generic': 'Supervision automation',
+        'chat.supervision_prompt.show_details': 'Show supervision prompt details',
+        'chat.supervision_prompt.hide_details': 'Hide supervision prompt details',
+        'chat.supervision_status_run.heartbeats_one': '{{count}} heartbeat',
+        'chat.supervision_status_run.heartbeats_other': '{{count}} heartbeats',
+        'chat.supervision_status_run.waiting_one': '{{count}} waiting marker',
+        'chat.supervision_status_run.waiting_other': '{{count}} waiting markers',
+        'chat.supervision_status_run.expand': 'Show repeated supervision status',
+        'chat.supervision_status_run.collapse': 'Hide repeated supervision status',
+        'chat.supervision_status_run.summary': '{{heartbeats}} · {{waiting}} · {{timeRange}}',
+        'chat.daemon_notice.supervision_human_input_blocker': '⚠️ Localized human-input blocker warning.',
       };
-      const template = translations[key] ?? key;
+      const pluralKey = typeof options?.count === 'number'
+        ? `${key}_${options.count === 1 ? 'one' : 'other'}`
+        : key;
+      const template = translations[pluralKey] ?? translations[key] ?? key;
       return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
 }));
 
-vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {
-    chatMarkdownRenderSpy(text);
-    const url = text.match(/https?:\/\/\S+/)?.[0];
-    if (url) {
-      return (
-        <a
-          class="chat-external-link"
-          href={url}
-          onClick={(e) => {
-            e.preventDefault();
-            onUrlClick?.(url);
-          }}
-        >
-          {url}
-        </a>
+describe('assistant execution status chips', () => {
+  const assistant = (
+    text: string,
+    payload: Record<string, unknown> = {},
+    eventId = 'assistant-status',
+  ) => ({
+    eventId,
+    type: 'assistant.text',
+    ts: 1_700_000_000_001,
+    payload: { text, ...payload },
+  }) as any;
+
+  it('renders a trusted structured daemon warning through i18n instead of its English fallback', () => {
+    const event = {
+      ...assistant('⚠️ Automation returned control because the executing session reported a human-input blocker.', {
+        streaming: false,
+        automation: true,
+        automationKind: 'supervision-warning',
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Localized human-input blocker warning');
+    expect(container.textContent).not.toContain('Automation returned control because');
+  });
+
+  it('keeps legacy and unknown notice text as the readable fallback', () => {
+    const legacy = assistant('Legacy daemon warning', { streaming: false }, 'legacy-warning');
+    const unknown = {
+      ...assistant('Future daemon warning', {
+        streaming: false,
+        noticeCode: 'future_notice_code',
+        noticeParams: {},
+      }, 'future-warning'),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[legacy, unknown]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Legacy daemon warning');
+    expect(container.textContent).toContain('Future daemon warning');
+  });
+
+  it('does not let an agent-authored payload spoof a trusted daemon notice', () => {
+    const event = {
+      ...assistant('Agent-authored text remains intact', {
+        streaming: false,
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'provider',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Agent-authored text remains intact');
+    expect(container.textContent).not.toContain('Localized human-input blocker warning');
+  });
+
+  it.each([
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting', '⏳'],
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input', '⏸️'],
+  ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass, glyph) => {
+    const { container } = render(
+      <ChatView
+        events={[assistant(`Visible answer\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const chip = container.querySelector(`.chat-execution-status-chip.${stateClass}`);
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toBe(`${glyph}${label}`);
+    expect(chip?.getAttribute('aria-label')).toBe(label);
+    expect(chip?.getAttribute('title')).toBe(label);
+    expect(container.textContent).toContain('Visible answer');
+    expect(container.textContent).not.toContain(marker);
+  });
+
+  it('uses the shared authored-line parser so quoted, inline and fenced examples stay visible without chips', () => {
+    const waiting = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const needsInput = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const examples = [
+      `> ${waiting}`,
+      `inline ${needsInput}`,
+      ['```md', waiting, '```'].join('\n'),
+    ];
+    const { container } = render(
+      <ChatView
+        events={examples.map((text, index) => assistant(text, { streaming: false }, `example-${index}`))}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip')).toBeNull();
+    for (const marker of [waiting, needsInput]) expect(container.textContent).toContain(marker);
+  });
+
+  it('does not show a chip for an in-progress streaming marker and shows it after the stable event completes', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const initial = render(
+      <ChatView
+        events={[assistant(`Partial\n${marker}`, { streaming: true })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip')).toBeNull();
+
+    initial.rerender(
+      <ChatView
+        events={[assistant(`Complete\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip.waiting')).not.toBeNull();
+  });
+
+  it('renders a marker-only completed message as only the status chip without an empty rich-text bubble', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const { container } = render(
+      <ChatView
+        events={[assistant(marker, { streaming: false })]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelector('.chat-rich-text')).toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only')).not.toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only .chat-bubble-time')).toBeNull();
+    expect(container.textContent).not.toContain(marker);
+  });
+});
+
+describe('supervision automation prompt labels', () => {
+  const prompt = '[Contract: supervision_waiting_heartbeat_v1] {"contractRefs":["supervision_messaging_v1"]}';
+  const userMessage = (
+    automationKind: string | undefined,
+    automation = true,
+    eventId = 'automation-prompt',
+  ) => ({
+    eventId,
+    type: 'user.message',
+    ts: 1_700_000_000_002,
+    payload: { text: prompt, automation, ...(automationKind ? { automationKind } : {}) },
+  }) as any;
+  const expectedLabelByKey: Record<string, string> = {
+    'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+    'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+    'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+    'chat.supervision_prompt.pair_heartbeat': 'Pair heartbeat',
+    'chat.supervision_prompt.continue': 'Supervision continuation',
+    'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+    'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+    'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+    'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+    'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+    'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+  };
+  const knownPromptCases = [
+    [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.supervision_heartbeat'],
+    [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.audit_heartbeat'],
+    [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.implementation_heartbeat'],
+    [TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.pair_heartbeat'],
+    [SUPERVISION_CONTINUE_AUTOMATION_KIND, 'chat.supervision_prompt.continue'],
+    [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND, 'chat.supervision_prompt.post_audit_finalization'],
+    [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_delegation'],
+    [SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND, 'chat.supervision_prompt.audit_target_recovery'],
+    [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_marker_correction'],
+    [PEER_AUDIT_REWORK_AUTOMATION_KIND, 'chat.supervision_prompt.peer_audit_rework'],
+    [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND, 'chat.supervision_prompt.auto_audit_mode_control'],
+  ] as const;
+
+  it.each(knownPromptCases)(
+    'renders known kind %s as its one-line label without exposing prompt JSON while collapsed',
+    (automationKind, labelKey) => {
+      expect(SUPERVISION_USER_PROMPT_LABEL_KEYS[automationKind]).toBe(labelKey);
+      const { container } = render(
+        <ChatView
+          events={[userMessage(automationKind, true, `known-${automationKind}`)]}
+          loading={false}
+          sessionId={automationKind.includes('audit') ? 'deck_sub_auditor' : 'deck_main_brain'}
+        />,
       );
-    }
-    return <div>{text}</div>;
-  },
-}));
+
+      const disclosure = container.querySelector('.chat-supervision-prompt-toggle');
+      const heartbeat = [
+        SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+        TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
+      ].includes(automationKind as never);
+      expect(disclosure?.textContent).toBe(`${heartbeat ? '❤️' : ''}${expectedLabelByKey[labelKey]}`);
+      expect(container.querySelector('.chat-supervision-prompt')?.classList.contains('is-heartbeat')).toBe(heartbeat);
+      expect(disclosure?.getAttribute('aria-expanded')).toBe('false');
+      expect(container.querySelector('.chat-supervision-prompt-details')).toBeNull();
+      expect(container.textContent).not.toContain('contractRefs');
+      expect(container.querySelector('.chat-user-message-fold')).toBeNull();
+    },
+  );
+
+  it('uses a generic label for unknown supervision kinds but leaves other automation and ordinary messages unchanged', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          userMessage(`${SUPERVISION_AUTOMATION_KIND_PREFIX}future-kind`, true, 'future-supervision'),
+          userMessage('other-automation', true, 'other-automation'),
+          userMessage(SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, false, 'non-automation-known-kind'),
+          userMessage(undefined, false, 'ordinary-user'),
+        ]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-supervision-prompt-toggle')?.textContent).toBe('Supervision automation');
+    expect(container.querySelectorAll('.chat-user-message-fold')).toHaveLength(3);
+    expect(container.textContent?.match(/contractRefs/g)).toHaveLength(3);
+  });
+
+  it('reveals the complete original prompt on demand inside a bounded debug panel', () => {
+    const firstKind = SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND;
+    const { container } = render(
+      <ChatView
+        events={[userMessage(firstKind)]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+    const disclosure = container.querySelector('.chat-supervision-prompt-toggle') as HTMLButtonElement;
+    fireEvent.click(disclosure);
+
+    expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.chat-supervision-prompt-details')?.textContent).toBe(prompt);
+    expect(disclosure.getAttribute('title')).toBe('Hide supervision prompt details');
+  });
+});
+
+describe('repeated supervision heartbeat and WAITING presentation', () => {
+  const heartbeat = (eventId: string, ts: number) => ({
+    eventId,
+    type: 'user.message',
+    ts,
+    payload: {
+      text: '[heartbeat contract]',
+      automation: true,
+      automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+    },
+  }) as any;
+  const marker = (eventId: string, ts: number, value = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING) => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text: value, streaming: false },
+  }) as any;
+  const content = (eventId: string, ts: number, text = 'Real assistant content') => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text, streaming: false },
+  }) as any;
+
+  it('folds only consecutive heartbeat/marker-only WAITING rows and expands to the unchanged original chips', () => {
+    const events = [
+      heartbeat('h1', 1_700_000_000_001),
+      marker('w1', 1_700_000_000_002),
+      heartbeat('h2', 1_700_000_000_003),
+      content('answer', 1_700_000_000_004),
+      marker('needs-input', 1_700_000_000_005, SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT),
+      heartbeat('h3', 1_700_000_000_006),
+      marker('w2', 1_700_000_000_007),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const summaries = container.querySelectorAll('.chat-supervision-status-run-toggle');
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('false');
+    expect(summaries[0]?.textContent).toContain('2 heartbeats');
+    expect(summaries[0]?.textContent).toContain('1 waiting marker');
+    expect(container.textContent).toContain('Real assistant content');
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(0);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(0);
+
+    (summaries[0] as HTMLButtonElement).focus();
+    fireEvent.click(summaries[0]);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(summaries[0]);
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(2);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(1);
+  });
+
+  it('forms and extends one run on live append without touching a singleton', () => {
+    const first = heartbeat('live-h1', 1_700_000_001_001);
+    const view = render(
+      <ChatView events={[first]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(view.container.querySelector('.chat-supervision-status-run-toggle')).toBeNull();
+    expect(view.container.querySelector('.chat-supervision-prompt-toggle')).not.toBeNull();
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const firstSummary = view.container.querySelector('.chat-supervision-status-run-toggle') as HTMLButtonElement;
+    expect(firstSummary).not.toBeNull();
+    fireEvent.click(firstSummary);
+    expect(firstSummary.getAttribute('aria-expanded')).toBe('true');
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002), heartbeat('live-h2', 1_700_000_001_003)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const summary = view.container.querySelector('.chat-supervision-status-run-toggle');
+    expect(summary).toBe(firstSummary);
+    expect(summary?.getAttribute('aria-expanded')).toBe('true');
+    expect(summary?.textContent).toContain('2 heartbeats');
+    expect(summary?.textContent).toContain('1 waiting marker');
+  });
+
+  it('keeps a 3000-event restored run as one bounded view item with the full count', () => {
+    const events = Array.from({ length: 3_000 }, (_, index) => (
+      index % 2 === 0
+        ? heartbeat(`bulk-h-${index}`, 1_700_001_000_000 + index)
+        : marker(`bulk-w-${index}`, 1_700_001_000_000 + index)
+    ));
+
+    const allItems = __buildViewItemsForTests(events, true);
+    expect(allItems).toHaveLength(1);
+    expect(allItems[0]).toMatchObject({
+      type: 'supervision-status-run',
+      heartbeatCount: 1_500,
+      waitingCount: 1_500,
+    });
+    expect((allItems[0] as any).statusItems).toHaveLength(3_000);
+
+    const tail = __buildViewItemsTailForTests(events, true, 100);
+    expect(tail.windowStartIndex).toBe(0);
+    expect(tail.items).toHaveLength(1);
+    expect(tail.items[0]).toMatchObject({ heartbeatCount: 1_500, waitingCount: 1_500 });
+  });
+});
+
+vi.mock('../../src/components/ChatMarkdown.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/components/ChatMarkdown.js')>('../../src/components/ChatMarkdown.js');
+  return {
+    ChatMarkdown: (props: Parameters<typeof actual.ChatMarkdown>[0]) => {
+      chatMarkdownRenderSpy(props.text);
+      if (props.onCloudDocClick || props.onRemoteDesktopClick) {
+        return <actual.ChatMarkdown {...props} />;
+      }
+      const { text, onUrlClick } = props;
+      const url = text.match(/https?:\/\/\S+/)?.[0];
+      if (url) {
+        return (
+          <a
+            class="chat-external-link"
+            href={url}
+            onClick={(e) => {
+              e.preventDefault();
+              onUrlClick?.(url);
+            }}
+          >
+            {url}
+          </a>
+        );
+      }
+      return <div>{text}</div>;
+    },
+  };
+});
 
 vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
@@ -141,6 +651,33 @@ vi.mock('../../src/hooks/usePref.js', () => ({
 }));
 
 describe('ChatView', () => {
+  it('canonicalizes hidden chat paths before dispatching preview reads', () => {
+    const onPreviewFile = vi.fn();
+    const ws = { onMessage: vi.fn(() => () => undefined) };
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'hidden-preview',
+          type: 'user.message',
+          ts: Date.now(),
+          payload: {
+            text: 'Open ./.hidden/../.config/settings.json',
+            [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
+          },
+        }] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/home/ai/project/"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+    fireEvent.click(container.querySelector('.chat-path-link') as HTMLElement);
+    expect(onPreviewFile).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/home/ai/project/.config/settings.json',
+    }));
+  });
+
   const originalVisualViewport = window.visualViewport;
   const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
 
@@ -191,7 +728,127 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
-  it('reveals locally cached older messages at the top without preserving the previous anchor', async () => {
+  it('keeps cached messages on screen while a background refresh is still loading', () => {
+    const events = [
+      { eventId: 'u1', type: 'user.message', ts: 1_700_000_000_000, payload: { text: 'cached-question' } },
+      { eventId: 'a1', type: 'assistant.text', ts: 1_700_000_000_001, payload: { text: 'cached-answer' } },
+    ];
+
+    render(
+      <ChatView
+        events={events as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cached_refresh_brain"
+      />,
+    );
+
+    // `loading` means "a refresh is in flight", NOT "there is nothing to show".
+    // History restored from the local cache must paint immediately. The list
+    // used to be gated behind `!loading`, so a pane whose events were already
+    // in state was blanked and replaced by the spinner until the network
+    // answered — the reported "open a chat and it's empty for a while".
+    expect(screen.getByText('cached-question')).toBeTruthy();
+    expect(screen.getByText('cached-answer')).toBeTruthy();
+    expect(screen.queryByText('chat.loading')).toBeNull();
+  });
+
+  it('keeps the bottom visible when a foreground cache replay replaces a long virtualized tail', async () => {
+    const makeEvents = (count: number) => Array.from({ length: count }, (_, index) => ({
+      eventId: `resume-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `resume-message-${index}` },
+    }));
+    const { container, rerender } = render(
+      <ChatView events={makeEvents(40) as any} loading={false} sessionId="deck_resume_bottom" />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_880;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+    await waitFor(() => expect(scrollTopValue).toBe(2_880));
+
+    const originalVisibility = document.visibilityState;
+    try {
+      // A fast foreground replay can temporarily publish a shorter cache tail
+      // while the old scrollTop is still retained by WebKit. Exercise the
+      // actual hide/show path that captures and restores the logical anchor.
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      scrollHeightValue = 1_800;
+      rerender(<ChatView events={makeEvents(25) as any} loading={false} sessionId="deck_resume_bottom" />);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(scrollTopValue).toBe(1_800));
+      expect(screen.getByText('resume-message-24')).toBeTruthy();
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: originalVisibility });
+    }
+  });
+
+  it('preserves a reader anchor while a foreground history delta arrives', async () => {
+    const makeEvents = (suffix: string) => Array.from({ length: 40 }, (_, index) => ({
+      eventId: `anchor-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `anchor-${suffix}-${index}` },
+    }));
+    const { container, rerender } = render(
+      <ChatView events={makeEvents('before') as any} loading={false} sessionId="deck_resume_reader" />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_880;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+    await waitFor(() => expect(scrollTopValue).toBe(2_880));
+    scrollTopValue = 900;
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+    const originalVisibility = document.visibilityState;
+    try {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      scrollHeightValue = 3_000;
+      rerender(<ChatView events={makeEvents('after') as any} loading={false} sessionId="deck_resume_reader" />);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(screen.getByText('anchor-after-6')).toBeTruthy());
+      expect(scrollTopValue).toBe(900);
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: originalVisibility });
+    }
+  });
+
+  it('shows the loading placeholder only when nothing is cached yet', () => {
+    render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cold_open_brain"
+      />,
+    );
+
+    // The spinner still has a job: a genuinely cold pane. And it must not be
+    // mistaken for "no messages" — that placeholder is a different claim.
+    expect(screen.getByText('chat.loading')).toBeTruthy();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
+  });
+
+  it('reveals locally cached older messages at the top while preserving the reading position', async () => {
     const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
       eventId: `user-${index}`,
       type: 'user.message',
@@ -232,7 +889,64 @@ describe('ChatView', () => {
     await waitFor(() => {
       expect(screen.getByText('message-0')).toBeTruthy();
     });
-    expect(scrollTopValue).toBe(0);
+    // Mounting the older items grows scrollHeight 1200 → 1800 ABOVE the
+    // viewport. The anchor must re-add that 600px delta so the message the user
+    // was reading stays under their eyes. Leaving scrollTop at 0 (the previous
+    // behaviour) silently teleported the viewport a whole reveal-chunk back into
+    // older history — reported on mobile as "scrolled to the end and it jumps up
+    // a section". The revealed content is still reachable by scrolling up.
+    expect(scrollTopValue).toBe(600);
+  });
+
+  it('does not move the viewport when a near-top scroll auto-reveals older items', async () => {
+    // Mobile repro: the auto-trigger fires at scrollTop < 100, so the user is
+    // near — but not at — the top. Without anchoring, the reveal jumped them up
+    // by the whole added height AND left them inside the < 100 trigger zone, so
+    // the next cooldown tick jumped again. Anchoring must both hold the position
+    // and carry them out of the trigger zone.
+    const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `message-${index}` },
+    }));
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_reveal_no_jump_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => (container.textContent?.includes('message-0') ? 5000 : 1200),
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 50; // near the top, inside the auto-reveal trigger zone
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => {
+      expect(screen.getByText('message-0')).toBeTruthy();
+    });
+    // 50 + (5000 - 1200) = 3850: same content under the viewport, and safely
+    // out of the < 100 re-trigger zone so the reveal cannot loop.
+    expect(scrollTopValue).toBe(3850);
+    expect(scrollTopValue).toBeGreaterThanOrEqual(100);
   });
 
   it('collapses sent user messages longer than ten hard lines by default', () => {
@@ -256,33 +970,190 @@ describe('ChatView', () => {
     const content = container.querySelector('.chat-user-message-fold-content');
     expect(fold?.classList.contains('is-folded')).toBe(true);
     expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
+    expect(screen.getByRole('button', { name: 'chat.user_message_expand' }).getAttribute('aria-expanded')).toBe('false');
 
     fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
 
     expect(fold?.classList.contains('is-folded')).toBe(false);
     expect(content?.classList.contains('is-folded')).toBe(false);
-    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' }).getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_collapse' }));
+    expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
   });
 
-  it('does not collapse sent user messages with ten hard lines', () => {
-    const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+  it('folds a long soft-wrapped paragraph from rendered overflow rather than newline count', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'A single paragraph with enough words to soft-wrap across more than ten visual lines. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-soft-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_soft_wrapped_user_message"
+        />,
+      );
 
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(true);
+      expect(container.querySelector('.chat-user-message-fold-content')?.classList.contains('is-folded')).toBe(true);
+      expect(screen.getByRole('button', { name: 'chat.user_message_expand' })).toBeTruthy();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('keeps unmeasured content capped before layout without dropping its text', () => {
+    const paragraph = 'Content remains capped until the browser can report its rendered height. '.repeat(20);
     const { container } = render(
       <ChatView
         events={[{
-          eventId: 'evt-user-ten-lines',
+          eventId: 'evt-user-awaiting-layout',
           type: 'user.message',
           ts: 1_700_000_000_000,
-          payload: { text: tenLineText },
+          payload: { text: paragraph },
         }] as any}
         loading={false}
         hasOlderHistory={false}
-        sessionId="deck_ten_line_user_message"
+        sessionId="deck_awaiting_layout_user_message"
+      />,
+    );
+    const content = container.querySelector('.chat-user-message-fold-content');
+    expect(content?.classList.contains('is-measuring')).toBe(true);
+    expect(content?.textContent).toBe(paragraph);
+    expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+  });
+
+  it('does not expose a fold toggle for content that renders to ten lines', () => {
+    const layout = installRenderedLineMeasurement(10);
+    const tenLineText = 'A paragraph measured at exactly ten rendered lines.';
+
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-ten-lines',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: tenLineText },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_ten_line_user_message"
+        />,
+      );
+
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('re-measures width changes without losing the user\'s expanded intent', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'Soft wrapping must track the rendered width without losing expansion state. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-responsive-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_responsive_user_message"
+        />,
+      );
+      const content = container.querySelector('.chat-user-message-fold-content');
+      fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(8);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_collapse' })).toBeNull();
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(12);
+      const collapse = screen.getByRole('button', { name: 'chat.user_message_collapse' });
+      expect(collapse.getAttribute('aria-expanded')).toBe('true');
+      expect(content?.classList.contains('is-folded')).toBe(false);
+      expect(content?.textContent).toContain('Soft wrapping');
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('parses escaped newlines for timeline display while preserving code examples', () => {
+    const rawText = 'Task: inspect\\n\\nContext:\\n- one\\nsource: `"a\\nb"`';
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'ordinary-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: rawText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_timeline_display_newline"
       />,
     );
 
-    expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
-    expect(screen.queryByText('chat.user_message_expand')).toBeNull();
+    expect(container.querySelector('.chat-user-message-fold-content')?.textContent)
+      .toBe('Task: inspect\n\nContext:\n- one\nsource: `"a\\nb"`');
+  });
+
+  it('keeps the original timeline payload when retrying a failed message', () => {
+    const onResendFailed = vi.fn();
+    const rawText = String.raw`Task: inspect\nContext: retry`;
+    render(
+      <ChatView
+        events={[{
+          eventId: 'failed-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: {
+            text: rawText,
+            commandId: 'failed-command',
+            failed: true,
+          },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_timeline_retry_raw"
+        onResendFailed={onResendFailed}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.retrySend' }));
+
+    expect(onResendFailed).toHaveBeenCalledWith('failed-command', rawText);
+  });
+
+  it('parses escaped newlines before rendering assistant timeline markdown', () => {
+    render(
+      <ChatView
+        events={[{
+          eventId: 'assistant-display-newline',
+          type: 'assistant.text',
+          ts: 1_700_000_000_000,
+          payload: { text: 'First\\nSecond with `code\\nvalue`' },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_assistant_display_newline"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy).toHaveBeenCalledWith('First\nSecond with `code\\nvalue`');
   });
 
   it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
@@ -391,7 +1262,10 @@ describe('ChatView', () => {
       eventId: 'user-html-path',
       type: 'user.message',
       ts: Date.now(),
-      payload: { text: 'Open ./dist/index.HTML' },
+      payload: {
+        text: 'Open ./dist/index.HTML',
+        [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
+      },
     }];
 
     const { container, rerender } = render(
@@ -408,7 +1282,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     fireEvent.click(htmlButton!);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/index.HTML');
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/index.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(onPreviewFile).not.toHaveBeenCalled();
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
@@ -471,7 +1345,10 @@ describe('ChatView', () => {
       eventId: 'user-html-path-offline',
       type: 'user.message',
       ts: Date.now(),
-      payload: { text: 'Open ./dist/offline.HTML' },
+      payload: {
+        text: 'Open ./dist/offline.HTML',
+        [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
+      },
     }];
 
     const { container } = render(
@@ -487,7 +1364,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     expect(() => fireEvent.click(htmlButton!)).not.toThrow();
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/offline.HTML');
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/offline.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(container.textContent).toContain('Open ./dist/offline.HTML');
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
     expect(document.body.textContent).toContain('upload.daemon_offline');
@@ -501,7 +1378,8 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const opened = { opener: window } as unknown as Window;
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(opened);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -516,7 +1394,10 @@ describe('ChatView', () => {
         eventId: 'user-html-path',
         type: 'user.message',
         ts: Date.now(),
-        payload: { text: 'Open ./dist/index.html' },
+        payload: {
+          text: 'Open ./dist/index.html',
+          [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
+        },
       }];
 
       const { container } = render(
@@ -543,7 +1424,8 @@ describe('ChatView', () => {
       });
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
+      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank');
+      expect(opened.opener).toBeNull();
       expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
       vi.runOnlyPendingTimers();
@@ -571,7 +1453,10 @@ describe('ChatView', () => {
       eventId: 'user-image-path',
       type: 'user.message',
       ts: Date.now(),
-      payload: { text: 'See ./screenshots/result.png' },
+      payload: {
+        text: 'See ./screenshots/result.png',
+        [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
+      },
     }];
 
     const { container, unmount } = render(
@@ -585,7 +1470,7 @@ describe('ChatView', () => {
     );
 
     await waitFor(() => {
-      expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./screenshots/result.png');
+      expect(ws.fsReadFile).toHaveBeenCalledWith('./screenshots/result.png', 'deck_image_preview', { chatFileReference: true });
     });
 
     act(() => {
@@ -694,6 +1579,52 @@ describe('ChatView', () => {
     expect(onViewRepo).toHaveBeenCalledTimes(1);
   });
 
+  it('threads serverId into ChatView repo branch summary and isolates identical session/project across servers', () => {
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      serverId: 'srv-1',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/srv-1' },
+        repoGeneration: 1,
+      },
+    });
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      serverId: 'srv-2',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/srv-2' },
+        repoGeneration: 1,
+      },
+    });
+
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_test_brain"
+        workdir="/repo/project"
+        serverId="srv-1"
+      />,
+    );
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).toContain('feature/srv-1');
+
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_test_brain"
+        workdir="/repo/project"
+        serverId="srv-2"
+      />,
+    );
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).toContain('feature/srv-2');
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).not.toContain('feature/srv-1');
+  });
+
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {
     const initialEvents = [
       {
@@ -780,6 +1711,44 @@ describe('ChatView', () => {
     expect(screen.getByRole('status').textContent).toContain('chat.loading_older');
     expect(container.querySelector('.chat-load-older-status .chat-refreshing-spinner')).not.toBeNull();
     expect(screen.queryByText('chat.load_older')).toBeNull();
+  });
+
+  it('shows the earlier-messages-loading marker between the cached block and the stitched newest block, and drops it when the hole closes', () => {
+    const events = [
+      { eventId: 'old-1', type: 'assistant.text', ts: 1000, payload: { text: 'cached older message' } },
+      { eventId: 'old-2', type: 'user.message', ts: 1100, payload: { text: 'cached older question' } },
+      { eventId: 'new-1', type: 'assistant.text', ts: 900_000, payload: { text: 'stitched newest message' } },
+    ] as any;
+    const { container, rerender } = render(
+      <ChatView events={events} loading={false} historyGap={{ lowerTs: 1100, upperTs: 900_000 }} sessionId="deck_gap_marker_brain" />,
+    );
+
+    const marker = container.querySelector('[data-testid="chat-history-gap-marker"]');
+    expect(marker).not.toBeNull();
+    expect(marker!.textContent).toContain('chat.history_gap_loading');
+    // It is a row of the list itself: after the cached rows, before the newest one.
+    const rows = [...container.querySelectorAll('.chat-virtual-item, [data-testid="chat-history-gap-marker"], .chat-event, .chat-assistant-block')];
+    const text = container.textContent ?? '';
+    expect(text.indexOf('cached older question')).toBeLessThan(text.indexOf('chat.history_gap_loading'));
+    expect(text.indexOf('chat.history_gap_loading')).toBeLessThan(text.indexOf('stitched newest message'));
+    expect(rows.length).toBeGreaterThan(0);
+    // Reader-anchor capture only looks at event rows: the marker must not be one.
+    expect(marker!.getAttribute('data-event-id')).toBeNull();
+
+    rerender(<ChatView events={events} loading={false} historyGap={null} sessionId="deck_gap_marker_brain" />);
+    expect(container.querySelector('[data-testid="chat-history-gap-marker"]')).toBeNull();
+  });
+
+  it('shows the marker as a top row when the hole lies above everything rendered, and only one marker at a time', () => {
+    const events = [
+      { eventId: 'new-1', type: 'assistant.text', ts: 900_000, payload: { text: 'stitched newest message A' } },
+      { eventId: 'new-2', type: 'assistant.text', ts: 901_000, payload: { text: 'stitched newest message B' } },
+    ] as any;
+    const { container } = render(
+      <ChatView events={events} loading={false} historyGap={{ lowerTs: 1100, upperTs: 900_000 }} sessionId="deck_gap_marker_top_brain" />,
+    );
+    expect(container.querySelectorAll('[data-testid="chat-history-gap-marker"]')).toHaveLength(1);
+    expect(container.querySelector('.chat-virtual-item [data-testid="chat-history-gap-marker"]')).toBeNull();
   });
 
   it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
@@ -934,51 +1903,59 @@ describe('ChatView', () => {
   });
 
   it('does not force bottom scroll for non-rendered status updates', async () => {
-    const initialEvents = [
-      {
-        eventId: 'evt-1',
-        type: 'assistant.text',
-        ts: 1000,
-        payload: { text: 'hello' },
-      },
-    ] as any;
+    vi.useFakeTimers();
+    try {
+      const initialEvents = [
+        {
+          eventId: 'evt-1',
+          type: 'assistant.text',
+          ts: 1000,
+          payload: { text: 'hello' },
+        },
+      ] as any;
 
-    const { container, rerender } = render(
-      <ChatView
-        events={initialEvents}
-        loading={false}
-        sessionId="deck_main_brain"
-      />,
-    );
+      const { container, rerender } = render(
+        <ChatView
+          events={initialEvents}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
 
-    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
-    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
-    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+      const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+      Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+      Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+      Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
 
-    await waitFor(() => {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1600);
+      });
       expect(scrollEl.scrollTop).toBe(1200);
-    });
 
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
-    rerender(
-      <ChatView
-        events={[
-          ...initialEvents,
-          {
-            eventId: 'usage-1',
-            type: 'usage.update',
-            ts: 2000,
-            payload: { inputTokens: 10, outputTokens: 20 },
-          },
-        ] as any}
-        loading={false}
-        sessionId="deck_main_brain"
-      />,
-    );
+      Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+      rerender(
+        <ChatView
+          events={[
+            ...initialEvents,
+            {
+              eventId: 'usage-1',
+              type: 'usage.update',
+              ts: 2000,
+              payload: { inputTokens: 10, outputTokens: 20 },
+            },
+          ] as any}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(scrollEl.scrollTop).toBe(1200);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(scrollEl.scrollTop).toBe(1200);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not move the main chat viewport when a newer-timestamp message arrives while follow is paused', async () => {
@@ -1344,6 +2321,49 @@ describe('ChatView', () => {
     });
   });
 
+  it('labels supplemental summaries in the existing expandable related-history card', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-summary-sync',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Continue the sibling work' },
+          },
+          {
+            eventId: 'evt-summary-sync',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user-summary-sync',
+              reason: 'message',
+              items: [
+                {
+                  id: 'summary-from-sibling',
+                  projectId: 'codedeck',
+                  summary: 'Sibling session completed the transport retry fix',
+                  projectionClass: 'recent_summary',
+                },
+              ],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelectorAll('.chat-memory-context')).toHaveLength(1);
+    expect(container.textContent).not.toContain('Sibling session completed the transport retry fix');
+    fireEvent.click(getByText('chat.memory_context_supplemental_title'));
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.memory_context_section_recent');
+      expect(container.textContent).toContain('Sibling session completed the transport retry fix');
+    });
+  });
+
   it('renders status-only memory context hints collapsed by default — only the one-line reason is visible', async () => {
     const { container, getByText } = render(
       <ChatView
@@ -1523,6 +2543,7 @@ describe('ChatView', () => {
               items: [
                 {
                   id: 'mem-transport-1',
+                  ref: 'proj:transportrefa',
                   projectId: 'repo-1',
                   summary: 'Fixed transport recall visibility',
                   relevanceScore: 0.91,
@@ -1543,6 +2564,8 @@ describe('ChatView', () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain('Fixed transport recall visibility');
+      expect(container.textContent).toContain('proj:transportrefa');
+      expect(container.querySelector('.chat-memory-context-ref')?.textContent).toBe('proj:transportrefa');
       expect(container.querySelector('.chat-memory-context')?.getAttribute('data-related-to')).toBe('evt-user-transport');
     });
   });
@@ -1803,6 +2826,55 @@ describe('ChatView', () => {
     expect(container.querySelector('.dialog-box')).toBeNull();
     expect(dialog?.getAttribute('role')).toBe('dialog');
     expect(container.querySelector('.external-link-url')?.textContent).toBe('https://example.com/release-notes');
+  });
+
+  it('copies the complete external URL using only an icon without opening or closing the dialog', async () => {
+    const url = 'https://example.com/%E6%96%87%E4%BB%B6.zip?X-Amz-Signature=' + 'abc123'.repeat(80) + '&key=a%2Bb#download';
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'copy-external-url', type: 'assistant.text', ts: 1000, payload: { text: url },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      expect(button).toBeTruthy();
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(button.textContent).toBe('');
+      expect(button.querySelector('svg')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+      expect(clipboardWriteText).toHaveBeenCalledWith(url);
+      expect(open).not.toHaveBeenCalled();
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      expect(container.querySelector('.external-link-warning')).toBeTruthy();
+      const cancel = [...container.querySelectorAll('.external-link-btn')].find(el => el.textContent === 'chat.external_link_cancel')!;
+      fireEvent.click(cancel);
+      expect(container.querySelector('.external-link-dialog')).toBeNull();
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      expect(container.querySelector('.external-link-copy')?.getAttribute('aria-label')).toBe('common.copy');
+    } finally { open.mockRestore(); }
+  });
+
+  it('does not claim a failed clipboard write succeeded or navigate away', async () => {
+    const originalExecCommand = document.execCommand;
+    const fallback = vi.fn().mockReturnValue(false);
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: fallback });
+    clipboardWriteText.mockRejectedValueOnce(new Error('clipboard denied'));
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'failed-external-copy', type: 'assistant.text', ts: 1000, payload: { text: 'https://example.com/retry' },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      fireEvent.click(button);
+      await waitFor(() => expect(fallback).toHaveBeenCalledWith('copy'));
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+    } finally {
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand });
+    }
   });
 
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {
@@ -2078,7 +3150,7 @@ describe('ChatView', () => {
     }
   });
 
-  it('shows date and time in the pinned last-sent banner', async () => {
+  it('shows date and time with seconds in the pinned last-sent banner', async () => {
     const originalIntersectionObserver = globalThis.IntersectionObserver;
     let observerCallback: IntersectionObserverCallback | null = null;
     class IntersectionObserverMock {
@@ -2139,7 +3211,7 @@ describe('ChatView', () => {
       expect(container.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('chat.pinned_last_sent_label');
       expect(container.querySelector('.chat-pinned-last-sent-actor')?.textContent).toBe('Ada Shared · Participant');
       const timeText = container.querySelector('.chat-pinned-last-sent-time')?.textContent ?? '';
-      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }));
       expect(container.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('Pull latest code');
     } finally {
       globalThis.IntersectionObserver = originalIntersectionObserver;
@@ -2309,5 +3381,533 @@ describe('ChatView', () => {
     } finally {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
     }
+  });
+
+  it('renders CloudDoc quote chips in user messages and pairs CloudDoc filenames/IDs in assistant replies without triggering local file preview', () => {
+    const onCloudDocClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-clouddoc',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56] 帮我填一下' },
+          },
+          {
+            eventId: 'evt-assistant-clouddoc',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: {
+              text: '已改名为 `芝加哥机房配件箱设备清单.xlsx`（`id=cdoc_503c1c6e391e458b9e56`，版本 `v2`）。另附本地文件 `/tmp/local.xlsx`。',
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onCloudDocClick={onCloudDocClick}
+      />,
+    );
+
+    const chip = container.querySelector('.chat-user .chat-cloud-doc-chip') as HTMLElement | null;
+    expect(chip).toBeTruthy();
+    expect(chip?.textContent).toContain('无标题表格.xlsx');
+    expect(container.querySelector('.chat-user .chat-dl-btn')).toBeNull();
+
+    const cloudLinks = Array.from(container.querySelectorAll('.chat-assistant .chat-cloud-doc-link'));
+    expect(cloudLinks.map((el) => el.textContent)).toEqual([
+      '芝加哥机房配件箱设备清单.xlsx',
+      'id=cdoc_503c1c6e391e458b9e56',
+    ]);
+
+    // Only /tmp/local.xlsx should keep the local path action & download icon
+    const assistantDlBtns = Array.from(container.querySelectorAll('.chat-assistant .chat-dl-btn'));
+    expect(assistantDlBtns).toHaveLength(1);
+    const localLink = container.querySelector('.chat-assistant .chat-path-link') as HTMLElement | null;
+    expect(localLink?.textContent).toBe('/tmp/local.xlsx');
+
+    fireEvent.click(chip!);
+    fireEvent.click(cloudLinks[0]!);
+    fireEvent.click(cloudLinks[1]!);
+    expect(onCloudDocClick).toHaveBeenCalledTimes(3);
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(1, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(2, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(3, 'cdoc_503c1c6e391e458b9e56');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+
+    fireEvent.click(localLink!);
+    expect(onPreviewFile).toHaveBeenCalledTimes(1);
+    expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
+  });
+
+  it('renders [RemoteDesktop: ...] chips in user and assistant messages and invokes onRemoteDesktopClick', () => {
+    const onRemoteDesktopClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-rd',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[RemoteDesktop: Alpha Node | id=6000000001] 帮我检查桌面' },
+          },
+          {
+            eventId: 'evt-assistant-rd',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: { text: '已打开 [RemoteDesktop: Beta Host | id=srv_beta_01] 并检查完成。' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const userChip = container.querySelector('.chat-user .chat-remote-desktop-chip') as HTMLElement | null;
+    const assistantChip = container.querySelector('.chat-assistant .chat-remote-desktop-chip') as HTMLElement | null;
+    expect(userChip).toBeTruthy();
+    expect(assistantChip).toBeTruthy();
+    expect(userChip?.textContent).toContain('Alpha Node');
+    expect(assistantChip?.textContent).toContain('Beta Host');
+
+    fireEvent.click(userChip!);
+    fireEvent.click(assistantChip!);
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(1, '6000000001');
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(2, 'srv_beta_01');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+  });
+
+  it('hides split file panel toggle and right file browser when hideFilePanel is true', () => {
+    const mockWs = {
+      fsReadFile: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const findFilePanelToggle = (root: HTMLElement) =>
+      Array.from(root.querySelectorAll('button.chat-panel-toggle')).find((btn) => btn.textContent?.trim() === '⊞') ?? null;
+
+    localStorage.setItem('chatFilePanelOpen:deck_minichat_fp', '1');
+    try {
+      const { container: normalContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+        />,
+      );
+      expect(findFilePanelToggle(normalContainer)).toBeTruthy();
+      expect(normalContainer.querySelector('.chat-split')).toBeTruthy();
+
+      const { container: hiddenContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+          hideFilePanel
+        />,
+      );
+      expect(findFilePanelToggle(hiddenContainer)).toBeNull();
+      expect(hiddenContainer.querySelector('.chat-split')).toBeNull();
+    } finally {
+      localStorage.removeItem('chatFilePanelOpen:deck_minichat_fp');
+    }
+  });
+
+  it('hides TaskPairStatusPanelHost when hideTaskPairPanel is true while keeping it visible by default', () => {
+    const taskPairEvents = [
+      {
+        eventId: 'tp-1',
+        sessionId: 'deck_minichat_tp',
+        ts: 1000,
+        seq: 1,
+        type: TASK_PAIR_TIMELINE_EVENT,
+        payload: {
+          taskId: 'tsk_hide_panel',
+          toStatus: 'working',
+          title: 'Mini chat task status',
+          executor: 'deck_sub_1',
+          auditor: 'deck_sub_2',
+          round: 0,
+        },
+      },
+    ];
+
+    const { container: normalContainer } = render(
+      <ChatView
+        events={taskPairEvents}
+        loading={false}
+        sessionId="deck_minichat_tp"
+      />,
+    );
+    expect(normalContainer.querySelector('[data-testid="task-pair-status-panel"]')).toBeTruthy();
+
+    const { container: hiddenContainer } = render(
+      <ChatView
+        events={taskPairEvents}
+        loading={false}
+        sessionId="deck_minichat_tp"
+        hideTaskPairPanel
+      />,
+    );
+    expect(hiddenContainer.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+  });
+
+  it('resets scroll to bottom per (serverId, sessionId) and snaps to bottom when async history hydrates after mount', async () => {
+    const makeServerEvents = (serverId: string, count: number) => Array.from({ length: count }, (_, idx) => ({
+      eventId: `${serverId}-evt-${idx}`,
+      sessionId: 'deck_shared_brain',
+      ts: 1_700_000_000_000 + idx,
+      epoch: 1,
+      seq: idx + 1,
+      type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+      payload: { text: `${serverId} message ${idx}` },
+    }));
+
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 200;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+
+    // Async history arrives after empty initial mount -> snaps cleanly to bottom.
+    scrollHeightValue = 2_400;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-1', 12) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await waitFor(() => expect(scrollTopValue).toBe(2_400));
+
+    // User manually scrolls up -> auto-scroll pauses for subsequent live messages on srv-1.
+    scrollTopValue = 400;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    scrollHeightValue = 2_600;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-1', 13) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(scrollTopValue).toBe(400);
+
+    // Switching serverId with identical sessionId resets auto-follow and lands at srv-2 bottom,
+    // even when srv-2 history hydrates asynchronously after a loading state.
+    scrollTopValue = 0;
+    scrollHeightValue = 200;
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    scrollHeightValue = 3_100;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-2', 16) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await waitFor(() => expect(scrollTopValue).toBe(3_100));
+
+    // Manual scroll-up on srv-2 still pauses auto-scroll on subsequent live messages.
+    scrollTopValue = 500;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    scrollHeightValue = 3_300;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-2', 17) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(scrollTopValue).toBe(500);
+  });
+
+  it('settles cleanly when switching to a brand-new empty session with 0 events', async () => {
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-empty"
+        sessionId="deck_brand_new"
+      />,
+    );
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.no_events');
+    });
+  });
+
+  it('keeps follow engaged and ignores spurious scrollTop=0 during pre-seeded mount and server switch', async () => {
+    const onLoadOlder = vi.fn();
+    const makeServerEvents = (serverTag: string, count: number) =>
+      Array.from({ length: count }, (_, idx) => ({
+        eventId: `${serverTag}-evt-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_shared_brain',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `${serverTag} message ${idx + 1}`, streaming: false },
+      }));
+
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_400;
+    const { container, rerender } = render(
+      <ChatView
+        events={makeServerEvents('srv-cached-a', 15) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-a"
+        sessionId="deck_shared_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, get: () => 400 });
+
+    // Simulate a layout/browser scroll event at scrollTop=0 before the initial pin rAF completes.
+    scrollTopValue = 0;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(2_400));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Switch to another server with the same session name (scrollTop resets to 0 transiently).
+    scrollTopValue = 0;
+    scrollHeightValue = 3_200;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-cached-b', 20) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-b"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(3_200));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+  });
+
+  it('pins pre-seeded initial mount synchronously before any requestAnimationFrame flushes', () => {
+    const queuedFrames: FrameRequestCallback[] = [];
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      queuedFrames.push(cb);
+      return queuedFrames.length;
+    });
+    const cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+
+    let scrollTopValue = 0;
+    const isChatViewEl = (el: HTMLElement) =>
+      el.classList.contains('chat-view') && !el.classList.contains('chat-view-preview');
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? scrollTopValue : 0; },
+      set(this: HTMLElement, v: number) { if (isChatViewEl(this)) scrollTopValue = v; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 2_400 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 400 : 0; },
+    });
+
+    try {
+      const preSeeded = Array.from({ length: 15 }, (_, idx) => ({
+        eventId: `preseeded-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_preseeded_sync',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `message ${idx + 1}`, streaming: false },
+      }));
+
+      render(
+        <ChatView
+          events={preSeeded as any}
+          loading={false}
+          hasOlderHistory={false}
+          serverId="srv-preseeded-sync"
+          sessionId="deck_preseeded_sync"
+        />,
+      );
+
+      // Before flushing any rAF, synchronous layout commit must already be pinned at the bottom.
+      expect(scrollTopValue).toBeGreaterThanOrEqual(2_400 - 400);
+      expect(queuedFrames.length).toBeGreaterThan(0);
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      for (const prop of ['scrollTop', 'scrollHeight', 'clientHeight']) {
+        delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
+      }
+    }
+  });
+
+  it('does not format bare slash prose or file paths in human user-sent messages while preserving URLs, CloudDoc, RemoteDesktop, attachments, folding, and assistant paths', () => {
+    const onPreviewFile = vi.fn();
+    const onCloudDocClick = vi.fn();
+    const onRemoteDesktopClick = vi.fn();
+    const ws = { onMessage: vi.fn(() => () => undefined) };
+
+    const longSlashLines = Array.from({ length: 12 }, (_, idx) => `line-${idx + 1} .imcodes/project/ A/B HTTP/HTTPS`).join('\n');
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'u-plain-slashes',
+            type: 'user.message',
+            ts: 1_000,
+            payload: { text: '检查 .imcodes/project/ 和 HTTP/HTTPS 以及 A/B测试 还有 src/foo/bar.ts 和 /usr/local/bin' },
+          },
+          {
+            eventId: 'u-mixed',
+            type: 'user.message',
+            ts: 2_000,
+            payload: {
+              text: '看一下 .imcodes/project/ 和 https://example.com/a/b 以及 [CloudDoc: test | id=cdoc_1] 和 [RemoteDesktop: DevBox | id=1234567890]',
+            },
+          },
+          {
+            eventId: 'u-att',
+            type: 'user.message',
+            ts: 3_000,
+            payload: {
+              text: '附件 HTTP/HTTPS 与 foo/bar',
+              attachments: [{ id: 'att-1', originalName: 'log.txt', mime: 'text/plain', size: 64 }],
+            },
+          },
+          {
+            eventId: 'u-long-slashes',
+            type: 'user.message',
+            ts: 4_000,
+            payload: { text: longSlashLines },
+          },
+          {
+            eventId: 'a-paths',
+            type: 'assistant.text',
+            ts: 5_000,
+            payload: { text: 'Updated `src/foo/bar.ts` and `/var/log/app.log`', streaming: false },
+          },
+        ] as any}
+        loading={false}
+        serverId="srv-1"
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/home/ai/project/"
+        onPreviewFile={onPreviewFile}
+        onCloudDocClick={onCloudDocClick}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const userBubbles = container.querySelectorAll('.chat-user.chat-user-origin-user');
+    expect(userBubbles).toHaveLength(4);
+
+    // 1. Plain slash prose / bare paths -> zero path links or badges, verbatim text preserved
+    expect(userBubbles[0].querySelectorAll('.chat-path-link')).toHaveLength(0);
+    expect(userBubbles[0].querySelectorAll('.chat-path-actions-badge')).toHaveLength(0);
+    expect(userBubbles[0].textContent).toContain('.imcodes/project/');
+    expect(userBubbles[0].textContent).toContain('HTTP/HTTPS');
+    expect(userBubbles[0].textContent).toContain('A/B测试');
+    expect(userBubbles[0].textContent).toContain('src/foo/bar.ts');
+    expect(userBubbles[0].textContent).toContain('/usr/local/bin');
+
+    // 2. Mixed content -> bare path stays plain text while URL, CloudDoc, RemoteDesktop remain interactive
+    expect(userBubbles[1].querySelectorAll('.chat-path-link')).toHaveLength(0);
+    expect(userBubbles[1].textContent).toContain('.imcodes/project/');
+    const extLink = userBubbles[1].querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(extLink?.getAttribute('href')).toBe('https://example.com/a/b');
+    fireEvent.click(extLink!);
+    expect(container.querySelector('.external-link-dialog')).not.toBeNull();
+    const docChip = userBubbles[1].querySelector('[data-cloud-doc-id="cdoc_1"]') as HTMLElement | null;
+    expect(docChip).toBeTruthy();
+    fireEvent.click(docChip!);
+    expect(onCloudDocClick).toHaveBeenCalledWith('cdoc_1');
+    const rdChip = userBubbles[1].querySelector('[data-remote-desktop-id="1234567890"]') as HTMLElement | null;
+    expect(rdChip).toBeTruthy();
+    fireEvent.click(rdChip!);
+    expect(onRemoteDesktopClick).toHaveBeenCalledWith('1234567890');
+
+    // 3. Attachments + slash text -> AttachmentDownloadButton preserved, slash text stays plain text
+    expect(userBubbles[2].querySelector('.chat-user-attachments')).toBeTruthy();
+    expect(userBubbles[2].querySelectorAll('.chat-path-link')).toHaveLength(0);
+    expect(userBubbles[2].textContent).toContain('HTTP/HTTPS');
+    expect(userBubbles[2].textContent).toContain('foo/bar');
+
+    // 4. Long user message with slashes -> still folds/expands cleanly
+    expect(userBubbles[3].querySelectorAll('.chat-path-link')).toHaveLength(0);
+    const foldToggle = userBubbles[3].querySelector('.chat-user-message-fold-toggle') as HTMLButtonElement | null;
+    expect(foldToggle).toBeTruthy();
+    expect(foldToggle?.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(foldToggle!);
+    expect(foldToggle?.getAttribute('aria-expanded')).toBe('true');
+
+    // 5. Assistant message paths continue formatting clickable links unchanged
+    const assistantLinks = Array.from(container.querySelectorAll('.chat-assistant .chat-path-link')).map((el) => el.textContent);
+    expect(assistantLinks).toEqual(['src/foo/bar.ts', '/var/log/app.log']);
   });
 });

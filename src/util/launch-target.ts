@@ -16,7 +16,7 @@
  * exec's the real Node entry. systemd / launchctl never has to know.
  *
  * This helper picks the right launch target:
- *   - launcher present  → `imcodes-launch.sh start --foreground`
+ *   - launcher present  → `imcodes-launch.sh start --foreground`  (Linux systemd; the macOS plist runs node, see above)
  *   - launcher missing  → `node dist/src/index.js start --foreground`
  *
  * The fallback exists so older installs that pre-date the launcher still
@@ -26,6 +26,7 @@
  */
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { MACOS_DAEMON_LAUNCH } from '../../shared/macos-daemon-launch.js';
 
 export interface DaemonLaunchTarget {
   /** Absolute path to the program systemd/launchctl should exec. */
@@ -35,40 +36,34 @@ export interface DaemonLaunchTarget {
 }
 
 /**
- * @param entry  Path to `dist/src/index.js` (or whatever the install
- *               surfaced as `process.argv[1]` at install time). Defaults
- *               to the running daemon's own `process.argv[1]`.
- * @param node   Absolute path to the node binary. Defaults to
- *               `process.execPath`.
+ * The package root (the directory holding `bin/` and `package.json`) above an entry path, or undefined. Walks up from the entry
+ * path capped at 8 levels to bound the search on weird installs (we expect the root exactly 2 levels up from `dist/src/index.js`,
+ * but global installs vs nvm vs source checkouts all nest slightly differently).
+ */
+export function findDaemonPackageRoot(entry: string = process.argv[1]): string | undefined {
+  let dir = resolve(entry);
+  for (let i = 0; i < 8; i++) {
+    dir = dirname(dir);
+    if (!dir || dir === '/' || dir === '.') break;
+    if (existsSync(resolve(dir, MACOS_DAEMON_LAUNCH.PREFLIGHT_RELATIVE)) && existsSync(resolve(dir, 'package.json'))) return dir;
+  }
+  return undefined;
+}
+
+/**
+ * The Linux (systemd) launch target. macOS does NOT use this: its launch agent runs node itself
+ * (shared/macos-daemon-launch.ts, src/util/macos-launch-agent.ts) so that Full Disk Access is attributed to node.
+ *
+ * @param entry  Path to `dist/src/index.js` (or whatever the install surfaced as `process.argv[1]` at install time).
+ * @param node   Absolute path to the node binary. Defaults to `process.execPath`.
  */
 export function resolveDaemonLaunchTarget(
   entry: string = process.argv[1],
   node: string = process.execPath,
 ): DaemonLaunchTarget {
-  // Walk up from the entry path looking for a sibling `bin/` containing
-  // `imcodes-launch.sh`. Capped at 8 levels to bound the search on weird
-  // installs (we expect the launcher exactly 2 levels up from
-  // `dist/src/index.js`, but global installs vs nvm vs source checkouts
-  // all nest slightly differently).
-  let dir = resolve(entry);
-  for (let i = 0; i < 8; i++) {
-    dir = dirname(dir);
-    if (!dir || dir === '/' || dir === '.') break;
-    const launcher = resolve(dir, 'bin/imcodes-launch.sh');
-    const pkg = resolve(dir, 'package.json');
-    if (existsSync(launcher) && existsSync(pkg)) {
-      return { program: launcher, args: ['start', '--foreground'] };
-    }
-  }
-  return { program: node, args: [entry, 'start', '--foreground'] };
-}
-
-/** Render `args` as a `<string>` array for an Apple plist body. */
-export function renderPlistProgramArguments(target: DaemonLaunchTarget): string {
-  const parts = [target.program, ...target.args].map(
-    (s) => `    <string>${s}</string>`,
-  );
-  return parts.join('\n');
+  const root = findDaemonPackageRoot(entry);
+  if (root) return { program: resolve(root, MACOS_DAEMON_LAUNCH.PREFLIGHT_RELATIVE), args: [...MACOS_DAEMON_LAUNCH.START_ARGS] };
+  return { program: node, args: [entry, ...MACOS_DAEMON_LAUNCH.START_ARGS] };
 }
 
 /** Render an `ExecStart=` line value for a systemd unit. */

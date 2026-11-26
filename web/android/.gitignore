@@ -96,5 +96,6 @@ app/src/main/assets/public
 
 # Generated Config files
 app/src/main/assets/capacitor.config.json
-app/src/main/assets/capacitor.plugins.json
+# Track capacitor.plugins.json so local `cap copy android` builds keep @imcodes/streaming-speech registered.
+!app/src/main/assets/capacitor.plugins.json
 app/src/main/res/xml/config.xml

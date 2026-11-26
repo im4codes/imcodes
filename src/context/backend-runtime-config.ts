@@ -1,5 +1,9 @@
 import type { ContextModelConfig } from '../../shared/context-types.js';
-import { normalizeSharedContextRuntimeConfig } from '../../shared/shared-context-runtime-config.js';
+import {
+  normalizeSharedContextRuntimeConfig,
+  SHARED_CONTEXT_RUNTIME_BACKENDS,
+  SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL,
+} from '../../shared/shared-context-runtime-config.js';
 import type { BackendAuthoredContextCredentials } from './backend-authored-context.js';
 
 interface BackendSharedContextRuntimeConfigResponse {
@@ -13,6 +17,7 @@ export async function fetchBackendSharedContextRuntimeConfig(
     method: 'GET',
     headers: {
       Authorization: `Bearer ${credentials.token}`,
+      [SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.HTTP_BACKENDS_HEADER]: SHARED_CONTEXT_RUNTIME_BACKENDS.join(','),
     },
   });
   if (!response.ok) {

@@ -1,7 +1,29 @@
 import { render } from 'preact';
 import { marked } from 'marked';
 import { App } from './app.js';
-import { applyNativePlatformClasses } from './native-platform.js';
+import { CloudDocsPanel } from './components/CloudDocsPanel.js';
+import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
+import { RemoteDesktopStandalone } from './components/RemoteDesktopStandalone.js';
+import { RemoteDesktopWallStandalone } from './components/RemoteDesktopWallStandalone.js';
+import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
+import {
+  REMOTE_DESKTOP_NATIVE_STEP_UP_PATH,
+  RemoteDesktopNativeStepUp,
+} from './pages/RemoteDesktopNativeStepUp.js';
+import { applyNativePlatformClasses, NATIVE_HOST_EVENT } from './native-platform.js';
+import { initGlobalFontScale } from './global-font.js';
+import { applyUiScale, initUiScale, readUiScale } from './ui-scale.js';
+import {
+  isRemoteDesktopWallWindow,
+  readRemoteDesktopWindowServerId,
+  resolveRemoteDesktopAppEntry,
+} from './remote-desktop-window.js';
+import {
+  isCloudDocsStandaloneWindow,
+  readCloudDocsWindowParams,
+} from './cloud-docs-window.js';
+import { hydrateStandaloneAuthFromStorage } from './standalone-auth.js';
+import { ensureRemoteDesktopAppManifestLink, installPwaInstallCapture } from './pwa-install.js';
 import './styles.css';
 import './i18n/index.js';
 // Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
@@ -27,5 +49,58 @@ marked.use({
 });
 
 applyNativePlatformClasses();
+initGlobalFontScale();
+initUiScale();
+window.addEventListener(NATIVE_HOST_EVENT, () => {
+  applyNativePlatformClasses();
+  applyUiScale(readUiScale());
+});
 
-render(<App />, document.getElementById('app')!);
+// The installable remote desktop app (`/remote-desktop/app/`) reuses the two standalone-window screens: the machine wall, or the one
+// machine a `?machine=` deep link names. The manifest link is added here so an installed app's own start page keeps it up to date.
+const remoteDesktopAppEntry = resolveRemoteDesktopAppEntry(window.location.pathname, window.location.search);
+if (remoteDesktopAppEntry) ensureRemoteDesktopAppManifestLink();
+// Chromium fires its install prompt once per page load: listen from the start, whatever UI asks for it later.
+installPwaInstallCapture();
+const remoteDesktopServerId = readRemoteDesktopWindowServerId() ?? remoteDesktopAppEntry?.machineId ?? null;
+const remoteDesktopWallEntry = isRemoteDesktopWallWindow() || (remoteDesktopAppEntry !== null && remoteDesktopAppEntry.machineId === null);
+const remoteDesktopNativeStepUpEntry = window.location.pathname === REMOTE_DESKTOP_NATIVE_STEP_UP_PATH;
+const remoteDesktopGuestEntry = window.__IMCODES_REMOTE_DESKTOP_INVITE_REQUESTED__ === true
+  || window.location.pathname === '/remote-desktop/access';
+const cloudDocsStandaloneEntry = isCloudDocsStandaloneWindow();
+if (remoteDesktopNativeStepUpEntry) {
+  render(<RemoteDesktopNativeStepUp />, document.getElementById('app')!);
+} else if (remoteDesktopGuestEntry) {
+  document.documentElement.classList.add('remote-desktop-standalone-root');
+  render(
+    <RemoteDesktopGuestAccess bootstrap={window.__IMCODES_REMOTE_DESKTOP_INVITE_BOOTSTRAP__} />,
+    document.getElementById('app')!,
+  );
+} else if (remoteDesktopServerId || remoteDesktopWallEntry) {
+  hydrateStandaloneAuthFromStorage();
+  document.documentElement.classList.add('remote-desktop-standalone-root');
+  render(
+    remoteDesktopWallEntry
+      ? <RemoteDesktopWallStandalone />
+      : <RemoteDesktopStandalone serverId={remoteDesktopServerId!} />,
+    document.getElementById('app')!,
+  );
+} else if (cloudDocsStandaloneEntry) {
+  hydrateStandaloneAuthFromStorage();
+  const cloudDocsParams = readCloudDocsWindowParams();
+  document.documentElement.classList.add('cloud-docs-standalone-root');
+  render(
+    <>
+      <CloudDocsPanel
+        standalone
+        initialTab={cloudDocsParams.tab}
+        initialFolderId={cloudDocsParams.folderId ?? null}
+        initialDocId={cloudDocsParams.docId ?? null}
+      />
+      <DownloadTransferCenter />
+    </>,
+    document.getElementById('app')!,
+  );
+} else {
+  render(<App />, document.getElementById('app')!);
+}

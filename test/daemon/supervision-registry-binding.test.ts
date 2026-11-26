@@ -1,0 +1,252 @@
+/**
+ * The supervision MCP tools must be BOUND to the real registry in production.
+ *
+ * They were not. `createMemoryMcpServerFromEnv()` constructed the server with
+ * three arguments, so the fourth (`supervisionToolDeps`) fell back to `{}` and
+ * every call answered `unavailable: supervision registry not bound`. The tools
+ * were published on the surface and permanently inert — a shape no unit test of
+ * the handlers could catch, because every handler test injected its own port.
+ *
+ * These tests therefore go through the REAL construction path.
+ */
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+
+// Supervision authority now resolves the caller's LIVE identity from the daemon
+// session store. These tests exercise the PRODUCTION entry point, so the caller
+// must exist as a live session; the real store is the user's sessions.json and
+// must never be written by a test.
+const LIVE_CALLER = vi.hoisted(() => ({
+  name: 'deck_alpha_brain',
+  role: 'w1' as const,
+  projectName: 'alpha',
+  agentType: 'codex-sdk',
+  sessionInstanceId: 'instance-deck_alpha_brain',
+  runtimeEpoch: 'epoch-deck_alpha_brain',
+  state: 'idle',
+  projectDir: '/work/alpha',
+}));
+vi.mock('../../src/store/session-store.js', () => ({
+  listSessions: () => [LIVE_CALLER],
+  getSession: (name: string) => (name === LIVE_CALLER.name ? LIVE_CALLER : undefined),
+  upsertSession: () => {},
+}));
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
+import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
+import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
+import { createSupervisionMcpToolDeps } from '../../src/daemon/supervision-registry-port.js';
+import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
+import { resolvePeerAuditProviderFamily } from '../../src/daemon/peer-audit-candidates.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+  setSupervisionLiveParticipantsResolver,
+} from '../../src/daemon/supervision-state-store.js';
+
+const SESSION = 'deck_alpha_brain';
+const namespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
+
+function serverEnv() {
+  return {
+    [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+    [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify(namespace),
+    [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: SESSION,
+    [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: 'alpha',
+    [MEMORY_MCP_ENV_KEYS.PROJECT_ROOT]: '/work/alpha',
+  };
+}
+
+/** Connect a client to the server built by the PRODUCTION entry point. */
+async function connectProductionServer() {
+  const server = createMemoryMcpServerFromEnv({ env: serverEnv() });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'supervision-binding-test', version: '0.1.0' });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+  await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: SUPERVISION_MCP_TOOLS.LIST },
+  });
+  return { client, close: () => client.close() };
+}
+
+async function callList(client: Client): Promise<Record<string, unknown>> {
+  const res = await client.callTool({ name: SUPERVISION_MCP_TOOLS.LIST, arguments: {} });
+  return (res as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
+}
+
+/** A task the caller participates in, so LIST has something real to project. */
+function seedTaskOwnedByCaller(taskKey: string, scopeFiles: string[] = []): string {
+  const registry = getSupervisionTaskRegistry();
+  const task = registry.createOrGet({
+    objective: `objective ${taskKey}`, idempotencyKey: taskKey, projectName: LIVE_CALLER.projectName,
+  });
+  if (!task.ok) throw new Error(`seed failed: ${task.reason}`);
+  const assignment = registry.createAssignment({
+    taskId: task.value.taskId,
+    role: 'implementer',
+    identity: {
+      sessionName: LIVE_CALLER.name,
+      sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+      runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+      agentType: LIVE_CALLER.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
+    },
+    scopeFiles,
+    idempotencyKey: taskKey,
+  });
+  if (!assignment.ok) throw new Error(`assignment failed: ${assignment.reason}`);
+  return task.value.taskId;
+}
+
+beforeEach(() => resetSupervisionTaskRegistryForTests());
+afterEach(() => resetSupervisionTaskRegistryForTests());
+
+describe('supervision registry binding', () => {
+  it('finishes through the production port when the MCP project hint is absent', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'finish-without-project-hint';
+    expect(registry.createOrGet({
+      taskId, projectName: LIVE_CALLER.projectName,
+      classification: 'independent_top_level', objective: 'finish without raw project hint',
+    })).toMatchObject({ ok: true });
+    const created = registry.createAssignment({
+      taskId, role: 'implementer',
+      identity: {
+        sessionName: LIVE_CALLER.name,
+        sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+        runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+        agentType: LIVE_CALLER.agentType,
+        providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
+      },
+    });
+    if (!created.ok) throw new Error(`assignment failed: ${created.reason}`);
+    const assignment = created.value;
+    const revision = 'finish-without-project-hint-r1';
+    expect(registry.updateTask({ taskId, currentRevision: revision })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: assignment.assignmentId,
+      identity: assignment.identity,
+      status: 'implementing',
+      revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
+      taskId,
+      assignmentId: assignment.assignmentId,
+      identity: assignment.identity,
+      intent: 'record_validation',
+      toStatus: 'validated',
+      validationState: 'passed',
+    })).toMatchObject({ ok: true });
+
+    const handlers = createSupervisionMcpToolHandlers(
+      // Production MCP children can legitimately omit the project hint. The
+      // daemon session store remains the authority for the effective project.
+      { sessionName: LIVE_CALLER.name } as never,
+      createSupervisionMcpToolDeps(),
+    );
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      expectedRevision: registry.getAssignment(assignment.assignmentId)?.auditRevision ?? registry.getTaskRecord(registry.getAssignment(assignment.assignmentId)?.taskId ?? '')?.currentRevision ?? SUPERVISION_UNBOUND_REVISION,
+      intent: 'finish', taskId, assignmentId: assignment.assignmentId,
+    })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+    expect(registry.getAssignment(assignment.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', leaseId: '', auditRevision: revision,
+    });
+  });
+
+  it('stays bound across a registry reopen, as happens on daemon restart', async () => {
+    seedTaskOwnedByCaller('binding-before-restart');
+    const port = createSupervisionRegistryPort();
+    expect(port.list({ ownerSessionName: SESSION }).length).toBeGreaterThan(0);
+
+    // Simulate the restart: the singleton is closed and the database reopened.
+    // A port that captured the registry once would now hold a CLOSED handle and
+    // report itself bound while failing -- strictly worse than the unbound
+    // error, because it fails silently.
+    resetSupervisionTaskRegistryForTests();
+    const reseededTaskId = seedTaskOwnedByCaller('binding-after-restart');
+
+    const rows = port.list({ ownerSessionName: SESSION });
+    expect(rows.map((row) => (row as { taskId: string }).taskId)).toContain(reseededTaskId);
+    // 'delegated', not 'planned': creating the assignment advances the task.
+    // Reading it through the port at all is the point -- a stale handle could
+    // not answer.
+    expect(port.getStatus(reseededTaskId)).toBe('delegated');
+  });
+
+  it('binds bounded housekeeping to the current real registry rather than a captured handle', () => {
+    seedTaskOwnedByCaller('housekeeping-before-reopen');
+    const port = createSupervisionRegistryPort();
+    expect(port.housekeeping({ mode: 'dryRun', projectName: LIVE_CALLER.projectName, limit: 1 })).toMatchObject({
+      mode: 'dryRun', scanned: 1, applyAuthorized: false,
+    });
+    resetSupervisionTaskRegistryForTests();
+    seedTaskOwnedByCaller('housekeeping-after-reopen');
+    expect(port.housekeeping({ mode: 'dryRun', projectName: LIVE_CALLER.projectName, limit: 10 })).toMatchObject({
+      mode: 'dryRun', scanned: expect.any(Number), applyAuthorized: false,
+    });
+  });
+
+  it('keeps durable authority stable before and after MCP construction', async () => {
+    setSupervisionLiveParticipantsResolver(undefined); // a fresh MCP process
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_mcp_rotate';
+    expect(registry.createOrGet({
+      taskId, projectName: LIVE_CALLER.projectName, classification: 'independent_top_level',
+      objective: 'mcp resolver wiring', currentRevision: 'rev-mcp-1',
+    } as never)).toMatchObject({ ok: true });
+    const stale = {
+      sessionName: LIVE_CALLER.name,
+      sessionInstanceId: 'instance-before',
+      runtimeEpoch: 'epoch-before',
+      agentType: LIVE_CALLER.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
+    };
+    const owner = registry.createAssignment({
+      taskId, role: 'implementer', identity: stale, scopeFiles: ['src/exact.ts'],
+    } as never);
+    if (!owner.ok) throw new Error('owner: ' + owner.reason);
+    const rotated = {
+      ...stale,
+      sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+      runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+    };
+
+    // Ordinary ownership does not depend on an eventually hydrated runtime
+    // census. Project + session is the durable authority boundary.
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: rotated, status: 'implementing',
+    } as never)).toMatchObject({ ok: true });
+
+    // Constructing the real MCP server must not change that authority rule.
+    const { close } = await connectProductionServer();
+    try {
+      const afterMcp = { ...rotated, sessionInstanceId: 'instance-after-mcp', runtimeEpoch: 'epoch-after-mcp' };
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: afterMcp, status: 'implementing',
+      } as never)).toMatchObject({ ok: true });
+      const bound = registry.getAssignment(owner.value.assignmentId)!;
+      expect(bound.assignmentId).toBe(owner.value.assignmentId); // same object
+      expect(bound.identity.runtimeEpoch).toBe('epoch-after-mcp');
+
+      // Agent/provider are observational metadata too.
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId,
+        identity: { ...afterMcp, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+        status: 'implementing',
+      } as never)).toMatchObject({ ok: true });
+      // A different durable session remains forbidden.
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId,
+        identity: { ...afterMcp, sessionName: 'deck_alpha_other' },
+        status: 'implementing',
+      } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    } finally {
+      await close();
+    }
+  });
+});

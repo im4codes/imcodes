@@ -3,10 +3,23 @@ import { useTranslation } from 'react-i18next';
 import type { ComponentChildren } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
+import type { CallbackTaskRecord } from '@shared/callback-types.js';
+import { REPO_CALLBACK_RECENT_HISTORY_LIMIT } from '@shared/repo-callback.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
 import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
+import {
+  getRepoPageCache,
+  makeRepoPageCacheKey,
+  readSafeLocalStorageItem,
+  REPO_PAGE_CACHE_FRESH_TTL_MS,
+  setRepoPageCache,
+  writeSafeLocalStorageItem,
+} from '../repo-page-cache.js';
+import { RepoCallbackModal, type RepoCallbackTargetOption } from '../components/RepoCallbackModal.js';
+import { loadRepoCallbackPrefs } from '../repo-callback-prefs.js';
 
 // ── Pull-to-refresh component ────────────────────────────────────────────
 
@@ -48,18 +61,19 @@ function PullToRefresh({ children, loading, onRefresh }: { children: ComponentCh
   return (
     <div
       ref={containerRef}
-      style={{ flex: 1, overflowY: 'auto', position: 'relative' }}
+      class="repo-scroll"
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
     >
       {(pullDistance > 0 || loading) && (
-        <div style={{
-          textAlign: 'center', padding: '8px 0', fontSize: 11, color: '#64748b',
-          transition: pulling.current ? 'none' : 'height 0.2s',
-          height: loading ? 28 : pullDistance > 0 ? Math.min(pullDistance, 40) : 0,
-          overflow: 'hidden', lineHeight: '28px',
-        }}>
+        <div
+          class="repo-ptr-banner"
+          style={{
+            transition: pulling.current ? 'none' : 'height 0.2s',
+            height: loading ? 28 : pullDistance > 0 ? Math.min(pullDistance, 40) : 0,
+          }}
+        >
           {loading ? '↻ refreshing...' : pullDistance >= PTR_THRESHOLD ? '↑ release to refresh' : '↓ pull to refresh'}
         </div>
       )}
@@ -74,12 +88,16 @@ interface Props {
   ws: WsClient;
   sessionId?: string | null;
   projectDir: string;
+  serverId?: string | null;
+  callbackTargets?: RepoCallbackTargetOption[];
   onBack?: () => void;
   focusLatestAction?: { token: number; failedJobName?: string; failedStepName?: string } | null;
   /** Called when a CI/CD run completes (success/failure). */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string; failedJobName?: string; failedStepName?: string }) => void;
   initialTab?: RepoPageTabKey;
   initialTabToken?: number;
+  scopeToSessionRoot?: boolean;
+  readOnly?: boolean;
 }
 
 export type RepoPageTabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
@@ -104,16 +122,26 @@ interface TabState<T = any> {
   page: number;
   hasMore: boolean;
   loading: boolean;
-  /** Silent background refresh — no loading indicator, just a small spinner */
+  /** Foreground/manual refresh — shows refresh feedback while keeping items visible */
   refreshing: boolean;
+  /** Silent background SWR/auto refresh — keeps UI visible without tab spinner */
+  backgroundRefreshing?: boolean;
   error: string | null;
   fetched: boolean; // true once first fetch completed (for lazy load)
+  fetchedAt?: number;
+  pageLengths?: number[];
+  truncated?: boolean;
+  branchStale?: boolean;
+  cursorBranch?: string;
+  cursorRepoGeneration?: number;
 }
 
 interface TabRequestMeta {
   key: TabKey;
   page: number;
   force: boolean;
+  seq: number;
+  background?: boolean;
   branch?: string;
   repoGeneration?: number;
 }
@@ -159,7 +187,52 @@ function mapDetectToContext(raw: any): RepoContext {
 }
 
 function emptyTab<T = any>(): TabState<T> {
-  return { items: [], page: 1, hasMore: false, loading: false, refreshing: false, error: null, fetched: false };
+  return { items: [], page: 1, hasMore: false, loading: false, refreshing: false, backgroundRefreshing: false, error: null, fetched: false };
+}
+
+function isTimestampFresh(ts?: number | null): boolean {
+  return typeof ts === 'number' && Number.isFinite(ts) && ts >= 0 && (Date.now() - ts) <= REPO_PAGE_CACHE_FRESH_TTL_MS;
+}
+
+function isTabStale(tab: TabState): boolean {
+  return tab.fetched && (tab.truncated === true || !isTimestampFresh(tab.fetchedAt));
+}
+
+function getTabItemDedupeKey(tabKey: TabKey, item: any): string | null {
+  if (!item) return null;
+  if (tabKey === 'issues' || tabKey === 'prs') {
+    if (item.number != null) return String(item.number);
+    if (item.id != null) return String(item.id);
+    return null;
+  }
+  if (tabKey === 'branches') {
+    return typeof item === 'string' ? item : (typeof item.name === 'string' ? item.name : null);
+  }
+  if (tabKey === 'commits') {
+    const sha = item.sha ?? item.oid ?? item.hash;
+    return typeof sha === 'string' && sha ? sha : null;
+  }
+  if (item.id != null) return String(item.id);
+  if (item.runId != null) return String(item.runId);
+  return null;
+}
+
+function mergePaginatedItems(tabKey: TabKey, existingItems: any[], incomingItems: any[]): any[] {
+  const merged = [...existingItems];
+  const seen = new Set<string>();
+  for (const item of existingItems) {
+    const k = getTabItemDedupeKey(tabKey, item);
+    if (k !== null) seen.add(k);
+  }
+  for (const item of incomingItems) {
+    const k = getTabItemDedupeKey(tabKey, item);
+    if (k !== null) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
+    merged.push(item);
+  }
+  return merged;
 }
 
 const MAX_SILENT_RETRIES = 3;
@@ -184,41 +257,94 @@ function isTransientWsSendError(err: unknown): boolean {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken }: Props) {
-  const { t } = useTranslation();
+export function RepoPage(props: Props) {
+  const [callbackModalOpen, setCallbackModalOpen] = useState(false);
+  const repoCacheKey = makeRepoPageCacheKey({
+    serverId: props.serverId,
+    sessionId: props.sessionId,
+    scopeToSessionRoot: props.scopeToSessionRoot,
+    projectDir: props.projectDir,
+  });
+  return (
+    <RepoPageInner
+      key={repoCacheKey}
+      {...props}
+      repoCacheKey={repoCacheKey}
+      callbackModalOpen={callbackModalOpen}
+      setCallbackModalOpen={setCallbackModalOpen}
+    />
+  );
+}
 
-  const [context, setContext] = useState<RepoContext | null>(null);
-  const [detectLoading, setDetectLoading] = useState(true);
+function RepoPageInner({ ws, sessionId, projectDir, serverId, callbackTargets, focusLatestAction, onCiEvent, initialTab, initialTabToken, scopeToSessionRoot = false, readOnly = false, repoCacheKey, callbackModalOpen, setCallbackModalOpen }: Props & { repoCacheKey: string; callbackModalOpen: boolean; setCallbackModalOpen: (open: boolean) => void }) {
+  const { t } = useTranslation();
+  const requestProjectDir = scopeToSessionRoot ? FS_SESSION_ROOT_PATH : projectDir;
+  const sessionScope = scopeToSessionRoot && sessionId ? { sessionName: sessionId } : {};
+  const responseMatchesProject = useCallback(
+    (responseProjectDir: unknown) => {
+      if (scopeToSessionRoot) return true;
+      if (responseProjectDir === projectDir) return true;
+      if (typeof responseProjectDir !== 'string') return false;
+      const normalize = (value: string) => {
+        const trimmed = value.trim();
+        if (trimmed === '/') return '/';
+        return trimmed.replace(/[\\/]+$/, '');
+      };
+      return normalize(responseProjectDir) === normalize(projectDir);
+    },
+    [projectDir, scopeToSessionRoot],
+  );
+
+  const initialRepoCacheRef = useRef<ReturnType<typeof getRepoPageCache> | undefined>(undefined);
+  if (initialRepoCacheRef.current === undefined) {
+    initialRepoCacheRef.current = getRepoPageCache(repoCacheKey);
+  }
+  const initialRepoCache = initialRepoCacheRef.current;
+
+  const [context, setContext] = useState<RepoContext | null>(() => initialRepoCache?.context ?? null);
+  const [detectLoading, setDetectLoading] = useState(() => !initialRepoCache?.context);
   const [detectError, setDetectError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
     if (initialTab) return initialTab;
-    const saved = localStorage.getItem('repo-active-tab');
+    const saved = readSafeLocalStorageItem('repo-active-tab');
     return saved && ['issues', 'prs', 'branches', 'commits', 'actions'].includes(saved) ? saved as TabKey : 'issues';
   });
 
-  const [tabs, setTabs] = useState<Record<TabKey, TabState>>({
-    issues: emptyTab(),
-    prs: emptyTab(),
-    branches: emptyTab(),
-    commits: emptyTab(),
-    actions: emptyTab(),
-  });
+  const [tabs, setTabs] = useState<Record<TabKey, TabState>>(() => (
+    initialRepoCache?.tabs ?? {
+      issues: emptyTab(),
+      prs: emptyTab(),
+      branches: emptyTab(),
+      commits: emptyTab(),
+      actions: emptyTab(),
+    }
+  ));
 
   // ── Expand/collapse detail state ──────────────────────────────────────
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  const [detailData, setDetailData] = useState<Map<string, any>>(new Map());
-  const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+  const [expandedKey, setExpandedKey] = useState<string | null>(() => initialRepoCache?.expandedKey ?? null);
+  const [detailData, setDetailData] = useState<Map<string, any>>(() => new Map(initialRepoCache?.detailData ?? []));
+  const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(
+    () => new Map((initialRepoCache?.detailData ?? []).map(([k]) => [k, 'loaded' as const])),
+  );
   const [checkoutPendingBranch, setCheckoutPendingBranch] = useState<string | null>(null);
   const [checkoutFeedback, setCheckoutFeedback] = useState<CheckoutFeedback>(null);
+  const [callbacks, setCallbacks] = useState<CallbackTaskRecord[]>(() => initialRepoCache?.callbacks ?? []);
+  const [callbackRuntimeEnabled, setCallbackRuntimeEnabled] = useState(() => initialRepoCache?.callbackRuntimeEnabled ?? false);
+  const [callbackChecking, setCallbackChecking] = useState(false);
+  const [callbackLastCheckedAt, setCallbackLastCheckedAt] = useState<number | undefined>(() => initialRepoCache?.callbackLastCheckedAt);
+  const [callbackLastError, setCallbackLastError] = useState<string | undefined>(() => initialRepoCache?.callbackLastError);
 
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
   const detailReqRef = useRef<Map<string, DetailRequestMeta>>(new Map());
   const tabReqRef = useRef<Map<string, TabRequestMeta>>(new Map());
-  const detailDataRef = useRef<Map<string, any>>(new Map());
-  const detailStateRef = useRef<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+  const detailDataRef = useRef<Map<string, any>>(new Map(initialRepoCache?.detailData ?? []));
+  const detailStateRef = useRef<Map<string, 'loading' | 'loaded' | 'error'>>(
+    new Map((initialRepoCache?.detailData ?? []).map(([k]) => [k, 'loaded' as const])),
+  );
   // Track detect requestId separately
-  const detectReqRef = useRef<string | null>(null);
+  const detectReqRef = useRef<{ id: string; force: boolean; preserveUi: boolean; background: boolean } | null>(null);
+  const detectSeqRef = useRef(0);
   const checkoutReqRef = useRef<string | null>(null);
   const checkoutPendingBranchRef = useRef<string | null>(null);
   const processedCheckoutGenerationsRef = useRef<Set<number>>(new Set());
@@ -233,16 +359,28 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
   const deliveredCiEventRef = useRef<Set<string>>(new Set());
   const lastFocusTokenRef = useRef<number | undefined>(undefined);
   const actionJobRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const callbackLiveStatusReceivedRef = useRef(false);
   const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
   const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
-  const contextRef = useRef<RepoContext | null>(null);
+  const contextRef = useRef<RepoContext | null>(initialRepoCache?.context ?? null);
+  const contextFetchedAtRef = useRef<number | undefined>(initialRepoCache?.contextFetchedAt);
+  const lastDetectAttemptRef = useRef<number>(0);
   const tabsRef = useRef(tabs);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const onCiEventRef = useRef(onCiEvent);
+  onCiEventRef.current = onCiEvent;
+  const tabLatestSeqRef = useRef<Map<TabKey, number>>(new Map());
+  const lastRevalidateAttemptRef = useRef<Map<TabKey, number>>(new Map());
+  const pendingLoadMoreAfterRebuildRef = useRef<Set<TabKey>>(new Set());
+  const pendingForceInitialTabsRef = useRef(false);
+  const fetchTabRef = useRef<((key: TabKey, page?: number, force?: boolean, opts?: { preserveUi?: boolean; background?: boolean }) => void) | null>(null);
 
   useEffect(() => {
     if (!initialTab) return;
     setActiveTab(initialTab);
-    localStorage.setItem('repo-active-tab', initialTab);
+    writeSafeLocalStorageItem('repo-active-tab', initialTab);
   }, [initialTab, initialTabToken]);
 
   useEffect(() => {
@@ -255,10 +393,41 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     detailStateRef.current = detailState;
   }, [detailState]);
 
+  useEffect(() => {
+    const hasAnyTab = (Object.values(tabs) as TabState[]).some((tab) => tab.fetched);
+    if (!context && !hasAnyTab && detailData.size === 0 && callbacks.length === 0) return;
+    setRepoPageCache(repoCacheKey, {
+      context,
+      contextFetchedAt: contextFetchedAtRef.current,
+      tabs,
+      expandedKey,
+      detailData: [...detailData.entries()],
+      callbacks,
+      callbackRuntimeEnabled,
+      callbackLastCheckedAt,
+      callbackLastError,
+      updatedAt: Date.now(),
+    });
+  }, [
+    repoCacheKey,
+    context,
+    tabs,
+    expandedKey,
+    detailData,
+    callbacks,
+    callbackRuntimeEnabled,
+    callbackLastCheckedAt,
+    callbackLastError,
+  ]);
+
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   const updateTab = useCallback((key: TabKey, patch: Partial<TabState>) => {
-    setTabs(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
+    setTabs(prev => {
+      const next = { ...prev, [key]: { ...prev[key], ...patch } };
+      tabsRef.current = next;
+      return next;
+    });
   }, []);
 
   const getActiveBranch = useCallback(() => {
@@ -271,18 +440,97 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     return typeof generation === 'number' && Number.isFinite(generation) ? generation : undefined;
   }, []);
 
-  const applyDetectContext = useCallback((rawContext: unknown): boolean => {
-    const accepted = ingestSessionRepoContext({ sessionId, projectDir, context: rawContext });
+  const applyDetectContext = useCallback((rawContext: unknown, opts?: { skipBranchInvalidation?: boolean; background?: boolean }): boolean => {
+    const accepted = ingestSessionRepoContext({ sessionId, projectDir, serverId, context: rawContext });
+    const realDir = (rawContext as any)?.projectDir;
+    if (typeof realDir === 'string' && realDir.trim() && realDir !== projectDir) {
+      ingestSessionRepoContext({ sessionId, projectDir: realDir.trim(), serverId, context: rawContext });
+    }
     if (!accepted) return false;
-    const shared = getSessionRepoContext(sessionId, projectDir);
+    const shared = getSessionRepoContext(sessionId, projectDir, serverId);
     const nextContext = mapDetectToContext(rawContext);
     if (shared?.currentBranch && !nextContext.currentBranch) nextContext.currentBranch = shared.currentBranch;
     if (typeof shared?.repoGeneration === 'number') nextContext.repoGeneration = shared.repoGeneration;
     if (typeof shared?.detectedAt === 'number') nextContext.detectedAt = shared.detectedAt;
+
+    const prevContext = contextRef.current;
+    const prevBranch = prevContext?.currentBranch?.trim() ?? '';
+    const nextBranch = nextContext.currentBranch?.trim() ?? '';
+    const prevGen = prevContext?.repoGeneration;
+    const nextGen = nextContext.repoGeneration;
+    const branchOrGenChanged = !opts?.skipBranchInvalidation
+      && Boolean(prevContext)
+      && (prevBranch !== nextBranch || (typeof prevGen === 'number' && typeof nextGen === 'number' && prevGen !== nextGen));
+
+    contextFetchedAtRef.current = Date.now();
     contextRef.current = nextContext;
     setContext(nextContext);
+
+    if (branchOrGenChanged) {
+      for (const [requestId, meta] of tabReqRef.current) {
+        if (meta.key === 'branches' || meta.key === 'commits') {
+          pendingRef.current.delete(requestId);
+          tabReqRef.current.delete(requestId);
+        }
+      }
+      for (const key of ['branches', 'commits'] as const) {
+        tabLatestSeqRef.current.set(key, (tabLatestSeqRef.current.get(key) ?? 0) + 1);
+        lastRevalidateAttemptRef.current.delete(key);
+        pendingLoadMoreAfterRebuildRef.current.delete(key);
+        tabRetryCountRef.current.delete(key);
+        const retryTimer = tabRetryTimersRef.current.get(key);
+        if (retryTimer) clearTimeout(retryTimer);
+        tabRetryTimersRef.current.delete(key);
+      }
+      for (const [requestId, meta] of detailReqRef.current) {
+        if (meta.tab === 'commits') {
+          pendingRef.current.delete(requestId);
+          detailReqRef.current.delete(requestId);
+        }
+      }
+      setExpandedKey((key) => key?.startsWith('commits:') ? null : key);
+      detailDataRef.current = new Map([...detailDataRef.current].filter(([key]) => !key.startsWith('commits:')));
+      setDetailData(prev => new Map([...prev].filter(([key]) => !key.startsWith('commits:'))));
+      setDetailState(prev => new Map([...prev].filter(([key]) => !key.startsWith('commits:'))));
+
+      const curActive = activeTabRef.current;
+      const curBranches = tabsRef.current.branches;
+      const curCommits = tabsRef.current.commits;
+      setTabs(prev => {
+        const next = {
+          ...prev,
+          branches: {
+            ...prev.branches,
+            fetchedAt: undefined,
+            loading: false,
+            refreshing: false,
+            backgroundRefreshing: false,
+            branchStale: true,
+          },
+          commits: {
+            ...prev.commits,
+            fetchedAt: undefined,
+            loading: false,
+            refreshing: false,
+            backgroundRefreshing: false,
+            branchStale: true,
+          },
+        };
+        tabsRef.current = next;
+        return next;
+      });
+
+      if (curActive === 'commits' || curActive === 'branches') {
+        const existing = curActive === 'commits' ? curCommits : curBranches;
+        const isForegroundRefresh = existing.refreshing || opts?.background === false;
+        fetchTabRef.current?.(curActive, 1, true, {
+          preserveUi: existing.fetched,
+          background: existing.fetched ? !isForegroundRefresh : false,
+        });
+      }
+    }
     return true;
-  }, [projectDir, sessionId]);
+  }, [projectDir, serverId, sessionId]);
 
   const isBranchScopedRequestStale = useCallback((meta: Pick<TabRequestMeta, 'key' | 'branch' | 'repoGeneration'>) => {
     if (meta.key !== 'branches' && meta.key !== 'commits') return false;
@@ -322,56 +570,72 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       const branch = tab === 'commits' ? getActiveBranch() : undefined;
       const repoGeneration = tab === 'commits' ? getActiveRepoGeneration() : undefined;
       if (tab === 'commits') {
-        rid = ws.repoCommitDetail(projectDir, id as string);
+        rid = ws.repoCommitDetail(requestProjectDir, id as string, sessionScope);
       } else if (tab === 'prs') {
-        rid = ws.repoPRDetail(projectDir, id as number);
+        rid = ws.repoPRDetail(requestProjectDir, id as number, sessionScope);
       } else {
-        rid = ws.repoIssueDetail(projectDir, id as number);
+        rid = ws.repoIssueDetail(requestProjectDir, id as number, sessionScope);
       }
       pendingRef.current.add(rid);
       detailReqRef.current.set(rid, { key, tab, branch, repoGeneration });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
-  }, [ws, projectDir, expandedKey, detailData, getActiveBranch, getActiveRepoGeneration]);
+  }, [ws, requestProjectDir, sessionId, expandedKey, detailData, getActiveBranch, getActiveRepoGeneration]);
 
   const fetchActionDetail = useCallback((runId: number, opts?: { force?: boolean }) => {
     const key = `actions:${runId}`;
-    if (detailState.get(key) === 'loading') return;
+    if (detailStateRef.current.get(key) === 'loading') return;
     setDetailState(prev => new Map(prev).set(key, 'loading'));
     try {
-      const rid = ws.repoActionDetail(projectDir, runId, opts);
+      const rid = ws.repoActionDetail(requestProjectDir, runId, { ...opts, ...sessionScope });
       pendingRef.current.add(rid);
       detailReqRef.current.set(rid, { key, tab: 'actions' });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
-  }, [ws, projectDir, detailState]);
+  }, [ws, requestProjectDir, sessionId]);
 
   // ── Detect on mount ──────────────────────────────────────────────────────
 
   const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const doDetect = useCallback((opts?: { preserveUi?: boolean; force?: boolean }) => {
+  const doDetect = useCallback((opts?: { preserveUi?: boolean; force?: boolean; background?: boolean; _isRetry?: boolean }) => {
     const preserveUi = opts?.preserveUi === true;
+    const force = opts?.force === true;
+    const background = opts?.background ?? preserveUi;
+    const seq = ++detectSeqRef.current;
+    if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+    detectTimeoutRef.current = null;
+    if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+    detectRetryTimerRef.current = null;
+    if (detectReqRef.current) {
+      pendingRef.current.delete(detectReqRef.current.id);
+      detectReqRef.current = null;
+    }
     const currentContext = contextRef.current;
     if (!preserveUi || !currentContext) {
       setDetectLoading(true);
     }
+    if (!opts?._isRetry) {
+      detectRetryCountRef.current = 0;
+    }
     if (!preserveUi) {
       setDetectError(null);
-      detectRetryCountRef.current = 0;
     }
 
     let rid: string;
     try {
-      rid = ws.repoDetect(projectDir, { ...(opts?.force ? { force: true } : {}) });
+      rid = ws.repoDetect(requestProjectDir, { ...(force ? { force: true } : {}), ...sessionScope });
     } catch (err) {
       const nextRetry = detectRetryCountRef.current + 1;
       if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
         detectRetryCountRef.current = nextRetry;
-        if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
-        detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+        detectRetryTimerRef.current = setTimeout(() => {
+          detectRetryTimerRef.current = null;
+          if (detectSeqRef.current !== seq) return;
+          doDetect({ preserveUi: Boolean(preserveUi || contextRef.current), force, background, _isRetry: true });
+        }, RETRY_DELAY_MS);
         if (!currentContext) {
           setDetectLoading(true);
           setDetectError(null);
@@ -385,19 +649,23 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       return;
     }
 
-    detectReqRef.current = rid;
+    detectReqRef.current = { id: rid, force, preserveUi, background };
     pendingRef.current.add(rid);
 
     // Timeout: if no response within 10s, show error with debug info
-    if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
     detectTimeoutRef.current = setTimeout(() => {
-      if (detectReqRef.current === rid && pendingRef.current.has(rid)) {
+      if (detectReqRef.current?.id === rid && pendingRef.current.has(rid)) {
         pendingRef.current.delete(rid);
+        detectReqRef.current = null;
         const nextRetry = detectRetryCountRef.current + 1;
         detectRetryCountRef.current = nextRetry;
         if (nextRetry <= MAX_SILENT_RETRIES) {
           if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
-          detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+          detectRetryTimerRef.current = setTimeout(() => {
+            detectRetryTimerRef.current = null;
+            if (detectSeqRef.current !== seq) return;
+            doDetect({ preserveUi: Boolean(preserveUi || contextRef.current), force, background, _isRetry: true });
+          }, RETRY_DELAY_MS);
           if (!currentContext) {
             setDetectLoading(true);
             setDetectError(null);
@@ -410,48 +678,20 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         }
       }
     }, 10_000);
-  }, [ws, projectDir]);
+  }, [ws, requestProjectDir, sessionId]);
 
   useEffect(() => {
-    contextRef.current = null;
-    setContext(null);
-    setDetectLoading(true);
-    setDetectError(null);
-    for (const requestId of detailReqRef.current.keys()) {
-      pendingRef.current.delete(requestId);
+    if (!contextRef.current || !isTimestampFresh(contextFetchedAtRef.current)) {
+      lastDetectAttemptRef.current = Date.now();
+      doDetect({ preserveUi: Boolean(contextRef.current), background: Boolean(contextRef.current) });
     }
-    setExpandedKey(null);
-    setDetailData(new Map());
-    setDetailState(new Map());
-    setCheckoutPendingBranch(null);
-    checkoutPendingBranchRef.current = null;
-    setCheckoutFeedback(null);
-    setFocusedActionTargetKey(null);
-    detailDataRef.current = new Map();
-    detailStateRef.current = new Map();
-    detailReqRef.current.clear();
-    tabReqRef.current.clear();
-    checkoutReqRef.current = null;
-    processedCheckoutGenerationsRef.current.clear();
-    latestActionDetailRef.current = null;
-    detectRetryCountRef.current = 0;
-    if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
-    detectRetryTimerRef.current = null;
-    for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
-    tabRetryTimersRef.current.clear();
-    tabRetryCountRef.current.clear();
-    pendingCiFailureRef.current.clear();
-    deliveredCiEventRef.current.clear();
-    actionJobRefs.current.clear();
-    actionStepRefs.current.clear();
-    for (const timer of detailRetryTimersRef.current.values()) clearTimeout(timer);
-    detailRetryTimersRef.current.clear();
-    detailRetryCountRef.current.clear();
-  }, [projectDir]);
-
-  useEffect(() => {
-    doDetect();
     return () => {
+      detectSeqRef.current += 1;
+      detectReqRef.current = null;
+      checkoutReqRef.current = null;
+      pendingRef.current.clear();
+      tabReqRef.current.clear();
+      detailReqRef.current.clear();
       if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
       if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
       for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
@@ -463,37 +703,57 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
-  const fetchTab = useCallback((key: TabKey, page = 1, force = false, opts?: { preserveUi?: boolean }) => {
+  const fetchTab = useCallback((key: TabKey, page = 1, force = false, opts?: { preserveUi?: boolean; background?: boolean; _isRetry?: boolean }) => {
+    const seq = (tabLatestSeqRef.current.get(key) ?? 0) + 1;
+    tabLatestSeqRef.current.set(key, seq);
+    if (page === 1) {
+      if (!opts?._isRetry) tabRetryCountRef.current.delete(key);
+      for (const [reqId, existingMeta] of tabReqRef.current) {
+        if (existingMeta.key === key) {
+          pendingRef.current.delete(reqId);
+          tabReqRef.current.delete(reqId);
+        }
+      }
+      const pendingRetry = tabRetryTimersRef.current.get(key);
+      if (pendingRetry) clearTimeout(pendingRetry);
+      tabRetryTimersRef.current.delete(key);
+    }
     const preserveUi = opts?.preserveUi === true;
+    const background = opts?.background === true;
+    const existingTab = tabsRef.current[key];
+    const hasExistingData = preserveUi && existingTab.fetched;
     if (!preserveUi) {
-      updateTab(key, { loading: true, error: null });
-      if (page === 1) tabRetryCountRef.current.delete(key);
+      updateTab(key, { loading: true, refreshing: false, backgroundRefreshing: false, error: null });
+    } else if (hasExistingData) {
+      updateTab(key, background
+        ? { loading: false, refreshing: false, backgroundRefreshing: true }
+        : { loading: false, refreshing: true, backgroundRefreshing: false });
     } else {
-      updateTab(key, { loading: true });
+      updateTab(key, { loading: true, refreshing: false, backgroundRefreshing: false });
     }
     let rid: string;
     try {
       const branch = key === 'commits' ? getActiveBranch() : undefined;
       switch (key) {
         case 'issues':
-          rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListIssues(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'prs':
-          rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListPRs(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'branches':
-          rid = ws.repoListBranches(projectDir, { ...(force ? { force: true } : {}) });
+          rid = ws.repoListBranches(requestProjectDir, { ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'commits':
-          rid = ws.repoListCommits(projectDir, { page, ...(branch ? { branch } : {}), ...(force ? { force: true } : {}) });
+          rid = ws.repoListCommits(requestProjectDir, { page, ...(branch ? { branch } : {}), ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'actions':
-          rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListActions(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
       }
     } catch (err) {
-      const existingTab = tabsRef.current[key];
-      const hasExistingData = existingTab.fetched;
+      const latestTab = tabsRef.current[key];
+      const hasCachedData = latestTab.fetched;
       const nextRetry = (tabRetryCountRef.current.get(key) ?? 0) + 1;
       if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
         tabRetryCountRef.current.set(key, nextRetry);
@@ -501,11 +761,13 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         if (existingTimer) clearTimeout(existingTimer);
         tabRetryTimersRef.current.set(key, setTimeout(() => {
           tabRetryTimersRef.current.delete(key);
-          fetchTab(key, page, force, { preserveUi: hasExistingData || preserveUi });
+          if (seq !== tabLatestSeqRef.current.get(key)) return;
+          fetchTab(key, page, force, { preserveUi: hasCachedData || preserveUi, background, _isRetry: true });
         }, RETRY_DELAY_MS));
         updateTab(key, {
-          loading: !hasExistingData,
-          refreshing: false,
+          loading: !hasCachedData,
+          refreshing: Boolean(hasCachedData && !background),
+          backgroundRefreshing: Boolean(hasCachedData && background),
           error: null,
         });
         return;
@@ -515,8 +777,9 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       updateTab(key, {
         loading: false,
         refreshing: false,
-        error: hasExistingData ? null : `Send failed: ${message}`,
-        fetched: hasExistingData,
+        backgroundRefreshing: false,
+        error: hasCachedData ? null : `Send failed: ${message}`,
+        fetched: hasCachedData,
       });
       return;
     }
@@ -525,32 +788,86 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       key,
       page,
       force,
+      seq,
+      background,
       ...(key === 'commits' && getActiveBranch() ? { branch: getActiveBranch() } : {}),
       ...(getActiveRepoGeneration() !== undefined ? { repoGeneration: getActiveRepoGeneration() } : {}),
     });
-  }, [ws, projectDir, updateTab, getActiveBranch, getActiveRepoGeneration]);
+  }, [ws, requestProjectDir, sessionId, updateTab, getActiveBranch, getActiveRepoGeneration]);
+  fetchTabRef.current = fetchTab;
 
-  // Lazy-load: fetch tab data on first activation
+  // Lazy-load: fetch tab data on first activation, or silently refresh expired/truncated tab
   useEffect(() => {
     if (!context) return; // wait until detect completes
     const tab = tabs[activeTab];
-    if (!tab.fetched && !tab.loading) {
-      fetchTab(activeTab);
+    const forceAfterReconnect = pendingForceInitialTabsRef.current;
+    if (!tab.fetched && !tab.loading && !tab.error) {
+      if (forceAfterReconnect && activeTab !== 'actions') pendingForceInitialTabsRef.current = false;
+      fetchTab(activeTab, 1, forceAfterReconnect);
+    } else if (
+      tab.fetched
+      && isTabStale(tab)
+      && !tab.refreshing
+      && !tab.backgroundRefreshing
+      && !tab.loading
+      && !isTimestampFresh(lastRevalidateAttemptRef.current.get(activeTab))
+    ) {
+      lastRevalidateAttemptRef.current.set(activeTab, Date.now());
+      fetchTab(activeTab, 1, false, { preserveUi: true, background: true });
     }
   }, [activeTab, context, tabs, fetchTab]);
 
   // Auto-fetch CI/CD on detect complete (so auto-refresh works even if tab not visited)
   useEffect(() => {
-    if (!context || tabs.actions.fetched || tabs.actions.loading) return;
-    fetchTab('actions');
-  }, [context, tabs.actions.fetched, tabs.actions.loading, fetchTab]);
+    if (!context) return;
+    const actionsTab = tabs.actions;
+    const forceAfterReconnect = pendingForceInitialTabsRef.current;
+    if (!actionsTab.fetched && !actionsTab.loading && !actionsTab.error) {
+      pendingForceInitialTabsRef.current = false;
+      fetchTab('actions', 1, forceAfterReconnect);
+    } else if (
+      actionsTab.fetched
+      && isTabStale(actionsTab)
+      && !actionsTab.refreshing
+      && !actionsTab.backgroundRefreshing
+      && !actionsTab.loading
+      && !isTimestampFresh(lastRevalidateAttemptRef.current.get('actions'))
+    ) {
+      lastRevalidateAttemptRef.current.set('actions', Date.now());
+      fetchTab('actions', 1, false, { preserveUi: true, background: true });
+    }
+  }, [context, tabs.actions, fetchTab]);
 
   useEffect(() => {
     if (!focusLatestAction?.token || lastFocusTokenRef.current === focusLatestAction.token) return;
     lastFocusTokenRef.current = focusLatestAction.token;
     setActiveTab('actions');
-    localStorage.setItem('repo-active-tab', 'actions');
+    writeSafeLocalStorageItem('repo-active-tab', 'actions');
   }, [focusLatestAction]);
+
+  useEffect(() => {
+    if (scopeToSessionRoot) return;
+    let cancelled = false;
+    callbackLiveStatusReceivedRef.current = false;
+    if (serverId && requestProjectDir) {
+      void loadRepoCallbackPrefs(serverId, requestProjectDir)
+        .then((loaded) => {
+          if (cancelled || callbackLiveStatusReceivedRef.current) return;
+          setCallbackRuntimeEnabled(Boolean(loaded.repoConfig.enabled));
+        })
+        .catch(() => {
+          // Ignore until live CALLBACK_STATUS_RESPONSE arrives.
+        });
+    }
+    try {
+      ws.repoCallbackStatus?.(requestProjectDir);
+    } catch {
+      // Ignore while connecting; RECONNECTED handler refreshes once live.
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [ws, serverId, requestProjectDir, scopeToSessionRoot]);
 
   // ── Message handler ──────────────────────────────────────────────────────
 
@@ -561,6 +878,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         pendingRef.current.clear();
         detailReqRef.current.clear();
         tabReqRef.current.clear();
+        detectSeqRef.current += 1;
         detectReqRef.current = null;
         checkoutReqRef.current = null;
         setCheckoutPendingBranch(null);
@@ -569,6 +887,30 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
         detectRetryTimerRef.current = null;
         detectRetryCountRef.current = 0;
+        lastDetectAttemptRef.current = Date.now();
+        lastRevalidateAttemptRef.current.clear();
+        pendingLoadMoreAfterRebuildRef.current.clear();
+        for (const key of ['issues', 'prs', 'branches', 'commits', 'actions'] as TabKey[]) {
+          tabLatestSeqRef.current.set(key, (tabLatestSeqRef.current.get(key) ?? 0) + 1);
+        }
+        const prevTabs = tabsRef.current;
+        const actionsWasInFlight = prevTabs.actions.loading || prevTabs.actions.refreshing || prevTabs.actions.backgroundRefreshing;
+        const clearedTabs: Record<TabKey, TabState> = {
+          issues: { ...prevTabs.issues, loading: false, refreshing: false, backgroundRefreshing: false },
+          prs: { ...prevTabs.prs, loading: false, refreshing: false, backgroundRefreshing: false },
+          branches: { ...prevTabs.branches, loading: false, refreshing: false, backgroundRefreshing: false },
+          commits: { ...prevTabs.commits, loading: false, refreshing: false, backgroundRefreshing: false },
+          actions: { ...prevTabs.actions, loading: false, refreshing: false, backgroundRefreshing: false },
+        };
+        tabsRef.current = clearedTabs;
+        setTabs(clearedTabs);
+        if (!scopeToSessionRoot) {
+          try {
+            ws.repoCallbackStatus?.(requestProjectDir);
+          } catch {
+            // ignore
+          }
+        }
         for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
         tabRetryTimersRef.current.clear();
         tabRetryCountRef.current.clear();
@@ -578,19 +920,31 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         latestActionDetailRef.current = null;
         pendingCiFailureRef.current.clear();
         deliveredCiEventRef.current.clear();
-        doDetect({ preserveUi: true });
+        doDetect({ preserveUi: Boolean(contextRef.current), force: true, background: Boolean(contextRef.current) });
+        const currentActiveTab = activeTabRef.current;
+        if (contextRef.current) {
+          const activeFetched = clearedTabs[currentActiveTab].fetched;
+          fetchTab(currentActiveTab, 1, true, { preserveUi: activeFetched, background: activeFetched });
+          if (currentActiveTab !== 'actions' && (clearedTabs.actions.fetched || actionsWasInFlight)) {
+            fetchTab('actions', 1, true, { preserveUi: clearedTabs.actions.fetched, background: clearedTabs.actions.fetched });
+          }
+        } else {
+          pendingForceInitialTabsRef.current = true;
+        }
         return;
       }
 
       // Detect response
       if (msg.type === REPO_MSG.DETECT_RESPONSE) {
-        if (msg.requestId !== detectReqRef.current) return;
+        if (msg.requestId !== detectReqRef.current?.id) return;
+        const completedDetect = detectReqRef.current;
+        detectReqRef.current = null;
         pendingRef.current.delete(msg.requestId);
         if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
         if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
         detectRetryTimerRef.current = null;
         detectRetryCountRef.current = 0;
-        applyDetectContext((msg as any).context ?? msg);
+        applyDetectContext((msg as any).context ?? msg, { background: completedDetect.background });
         setDetectLoading(false);
         setDetectError(null);
         return;
@@ -598,8 +952,8 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
       // Passive detect push — only accept if projectDir matches
       if (msg.type === REPO_MSG.DETECTED) {
-        if (msg.projectDir !== projectDir) return;
-        applyDetectContext(msg.context);
+        if (!responseMatchesProject(msg.projectDir)) return;
+        applyDetectContext(msg.context, { background: true });
         return;
       }
 
@@ -622,7 +976,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
           const retryKey = detailKey;
           const existingDetail = detailDataRef.current.get(detailKey);
           const nextRetry = (detailRetryCountRef.current.get(retryKey) ?? 0) + 1;
-          const latestAction = tabs.actions.items[0] as any;
+          const latestAction = tabsRef.current.actions.items[0] as any;
           const isLatestActionDetail = detailKey === `actions:${latestAction?.id}`;
           const latestActionStatus = latestAction?.status;
           const runId = detailKey.startsWith('actions:') ? Number(detailKey.slice('actions:'.length)) : null;
@@ -655,24 +1009,36 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
           return;
         }
         // Could be detect error or tab error
-        if (msg.requestId === detectReqRef.current) {
+        if (msg.requestId === detectReqRef.current?.id) {
+          const failedDetect = detectReqRef.current;
+          detectReqRef.current = null;
+          const retrySeq = detectSeqRef.current;
           if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+          detectTimeoutRef.current = null;
           const nextRetry = detectRetryCountRef.current + 1;
           detectRetryCountRef.current = nextRetry;
-          if (context && nextRetry <= MAX_SILENT_RETRIES) {
+          if (contextRef.current && nextRetry <= MAX_SILENT_RETRIES) {
             if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
-            detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
-          } else if (!context) {
+            detectRetryTimerRef.current = setTimeout(() => {
+              detectRetryTimerRef.current = null;
+              if (detectSeqRef.current !== retrySeq) return;
+              doDetect({ preserveUi: Boolean(failedDetect.preserveUi || contextRef.current), force: failedDetect.force, background: failedDetect.background, _isRetry: true });
+            }, RETRY_DELAY_MS);
+            setDetectLoading(false);
+          } else if (!contextRef.current) {
             setDetectError(msg.error);
+            setDetectLoading(false);
+          } else {
             setDetectLoading(false);
           }
         } else {
           const meta = tabReqRef.current.get(msg.requestId);
           if (meta) {
             tabReqRef.current.delete(msg.requestId);
+            if (meta.seq !== tabLatestSeqRef.current.get(meta.key)) return;
             const retryKey = meta.key;
             const nextRetry = (tabRetryCountRef.current.get(retryKey) ?? 0) + 1;
-            const existingTab = tabs[meta.key];
+            const existingTab = tabsRef.current[meta.key];
             const hasExistingData = existingTab.fetched;
             if (hasExistingData && nextRetry <= MAX_SILENT_RETRIES) {
               tabRetryCountRef.current.set(retryKey, nextRetry);
@@ -680,9 +1046,10 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
               if (existingTimer) clearTimeout(existingTimer);
               tabRetryTimersRef.current.set(retryKey, setTimeout(() => {
                 tabRetryTimersRef.current.delete(retryKey);
-                fetchTab(meta.key, meta.page, meta.force, { preserveUi: hasExistingData });
+                if (meta.seq !== tabLatestSeqRef.current.get(meta.key)) return;
+                fetchTab(meta.key, meta.page, meta.force, { preserveUi: hasExistingData, background: meta.background, _isRetry: true });
               }, RETRY_DELAY_MS));
-              updateTab(meta.key, { loading: false, refreshing: false, error: msg.error });
+              updateTab(meta.key, { loading: false, refreshing: Boolean(hasExistingData && !meta.background), backgroundRefreshing: Boolean(hasExistingData && meta.background), error: msg.error });
             } else {
               tabRetryCountRef.current.delete(retryKey);
               const existingTimer = tabRetryTimersRef.current.get(retryKey);
@@ -691,8 +1058,9 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
               updateTab(meta.key, {
                 loading: false,
                 refreshing: false,
+                backgroundRefreshing: false,
                 error: hasExistingData ? null : msg.error,
-                fetched: existingTab.fetched || !hasExistingData,
+                fetched: existingTab.fetched,
               });
             }
           }
@@ -702,7 +1070,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
       if (msg.type === REPO_MSG.CHECKOUT_BRANCH_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (!m.requestId || m.requestId !== checkoutReqRef.current) return;
         pendingRef.current.delete(m.requestId);
         checkoutReqRef.current = null;
@@ -723,7 +1091,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
           defaultBranch: previousContext?.defaultBranch,
           repoGeneration: m.repoGeneration,
           detectedAt: m.detectedAt,
-        });
+        }, { skipBranchInvalidation: true });
         setCheckoutFeedback({ kind: 'success', branch: m.currentBranch });
 
         const generation = typeof m.repoGeneration === 'number' && Number.isFinite(m.repoGeneration)
@@ -752,10 +1120,18 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
             branches: emptyTab(),
             commits: emptyTab(),
           }));
+          lastRevalidateAttemptRef.current.delete('branches');
+          lastRevalidateAttemptRef.current.delete('commits');
           doDetect({ preserveUi: true, force: true });
-          fetchTab('branches', 1, true, { preserveUi: true });
-          fetchTab('commits', 1, true, { preserveUi: true });
-          forceRefreshSharedChangesForCheckout(ws, projectDir, generation ?? undefined);
+          fetchTab('branches', 1, true);
+          fetchTab('commits', 1, true);
+          forceRefreshSharedChangesForCheckout(
+            ws,
+            requestProjectDir,
+            generation ?? undefined,
+            scopeToSessionRoot ? sessionId ?? undefined : undefined,
+            serverId,
+          );
         }
         return;
       }
@@ -763,7 +1139,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       // Detail responses
       if (msg.type === REPO_MSG.ACTION_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'actions') return;
@@ -786,7 +1162,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.COMMIT_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (!m.requestId) return;
         const meta = detailReqRef.current.get(m.requestId);
         if (!meta || meta.tab !== 'commits' || isCommitDetailRequestStale(meta)) {
@@ -804,7 +1180,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.PR_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'prs') return;
@@ -818,7 +1194,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.ISSUE_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'issues') return;
@@ -828,6 +1204,27 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         detailDataRef.current = new Map(detailDataRef.current).set(`issues:${m.detail.number}`, m.detail);
         setDetailData(prev => new Map(prev).set(`issues:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`issues:${m.detail.number}`, 'loaded'));
+        return;
+      }
+
+      if (msg.type === REPO_MSG.CALLBACK_STATUS_RESPONSE) {
+        if (!responseMatchesProject(msg.projectDir)) return;
+        callbackLiveStatusReceivedRef.current = true;
+        setCallbacks(Array.isArray(msg.callbacks) ? msg.callbacks : []);
+        setCallbackRuntimeEnabled(Boolean(msg.enabled));
+        setCallbackChecking(Boolean(msg.checking));
+        setCallbackLastCheckedAt(msg.lastCheckedAt);
+        setCallbackLastError(msg.lastError);
+        return;
+      }
+      if (msg.type === REPO_MSG.CALLBACK_EVENT) {
+        if (!responseMatchesProject(msg.projectDir)) return;
+        const incoming = msg.callback;
+        setCallbacks((prev) => {
+          const next = [incoming, ...prev.filter((item) => item.callbackId !== incoming.callbackId)];
+          next.sort((a, b) => (b.updatedAt - a.updatedAt) || (b.createdAt - a.createdAt));
+          return next.slice(0, REPO_CALLBACK_RECENT_HISTORY_LIMIT);
+        });
         return;
       }
 
@@ -855,18 +1252,31 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         const retryTimer = tabRetryTimersRef.current.get(tabKey);
         if (retryTimer) clearTimeout(retryTimer);
         tabRetryTimersRef.current.delete(tabKey);
-        // Stale response check — projectDir must match
-        if (m.projectDir !== projectDir) return;
-        if (isBranchScopedRequestStale(meta)) return;
+        // Stale response check — projectDir, request generation, and branch scope must match
+        if (!responseMatchesProject(m.projectDir)) return;
+        if (meta.seq !== tabLatestSeqRef.current.get(tabKey)) return;
+        if (isBranchScopedRequestStale(meta)) {
+          if (tabKey === activeTabRef.current) {
+            fetchTab(tabKey, 1, meta.force, { preserveUi: Boolean(tabsRef.current[tabKey]?.fetched), background: meta.background });
+          } else {
+            updateTab(tabKey, { loading: false, refreshing: false, backgroundRefreshing: false, fetchedAt: undefined });
+          }
+          return;
+        }
+        const isLoadMore = m.page > 1;
+        const currentTabSnapshot = tabsRef.current[tabKey];
+        if (isLoadMore && (currentTabSnapshot.branchStale || ((tabKey === 'commits' || tabKey === 'branches') && ((currentTabSnapshot.cursorBranch !== undefined && currentTabSnapshot.cursorBranch !== (meta.branch ?? '')) || (currentTabSnapshot.cursorRepoGeneration !== undefined && currentTabSnapshot.cursorRepoGeneration !== meta.repoGeneration))))) {
+          fetchTab(tabKey, 1, meta.force, { preserveUi: Boolean(currentTabSnapshot.fetched), background: meta.background });
+          return;
+        }
         setTabs(prev => {
           const existing = prev[tabKey];
-          const isLoadMore = m.page > 1;
           // Detect newly completed CI/CD runs (was running/queued, now success/failure)
-          if (tabKey === 'actions' && !isLoadMore && existing.fetched && onCiEvent) {
+          if (tabKey === 'actions' && !isLoadMore && existing.fetched && onCiEventRef.current) {
             const oldStatuses = new Map(existing.items.map((r: any) => [r.id, r.status]));
             for (const run of m.items) {
-              const prev = oldStatuses.get(run.id);
-              if (prev && (prev === 'running' || prev === 'queued') && (run.status === 'success' || run.status === 'failure')) {
+              const prevStatus = oldStatuses.get(run.id);
+              if (prevStatus && (prevStatus === 'running' || prevStatus === 'queued') && (run.status === 'success' || run.status === 'failure')) {
                 if (run.status === 'failure') {
                   const detail = detailDataRef.current.get(`actions:${run.id}`);
                   if (detail) {
@@ -880,22 +1290,53 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
               }
             }
           }
-          return {
+          const nextItems = isLoadMore
+            ? mergePaginatedItems(tabKey, existing.items, m.items)
+            : mergePaginatedItems(tabKey, [], m.items);
+          const addedUniqueCount = isLoadMore ? (nextItems.length - existing.items.length) : nextItems.length;
+          const nextPageLengths = isLoadMore
+            ? [...(existing.pageLengths ?? [existing.items.length]), addedUniqueCount]
+            : [nextItems.length];
+          const next = {
             ...prev,
             [tabKey]: {
-              items: isLoadMore ? [...existing.items, ...m.items] : m.items,
+              items: nextItems,
               page: m.page,
               hasMore: m.hasMore,
               loading: false,
               refreshing: false,
+              backgroundRefreshing: false,
               error: null,
               fetched: true,
+              fetchedAt: Date.now(),
+              pageLengths: nextPageLengths,
+              truncated: false,
+              branchStale: false,
+              ...(meta.branch !== undefined ? { cursorBranch: meta.branch } : {}),
+              ...(meta.repoGeneration !== undefined ? { cursorRepoGeneration: meta.repoGeneration } : {}),
             },
           };
+          tabsRef.current = next;
+          return next;
         });
+        if (!isLoadMore && pendingLoadMoreAfterRebuildRef.current.has(tabKey)) {
+          pendingLoadMoreAfterRebuildRef.current.delete(tabKey);
+          if (m.hasMore) {
+            fetchTab(tabKey, 2);
+          }
+        }
       }
     });
-  }, [ws, projectDir, doDetect, onCiEvent, tabs.actions.items, fetchActionDetail]);
+  }, [
+    ws,
+    projectDir,
+    requestProjectDir,
+    sessionId,
+    scopeToSessionRoot,
+    responseMatchesProject,
+    doDetect,
+    fetchActionDetail,
+  ]);
 
   useEffect(() => {
     if (!tabs.actions.fetched || tabs.actions.items.length === 0) return;
@@ -951,11 +1392,25 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
-  /** Silently refresh a tab — keep existing items visible while loading. */
+  /** Silently refresh a tab in background — keep existing items visible without tab spinner. */
   const silentRefreshTab = useCallback((key: TabKey) => {
-    updateTab(key, { refreshing: true });
-    fetchTab(key, 1, true);
-  }, [fetchTab, updateTab]);
+    fetchTab(key, 1, true, { preserveUi: true, background: true });
+  }, [fetchTab]);
+
+  const handleManualRefresh = useCallback(() => {
+    lastDetectAttemptRef.current = Date.now();
+    doDetect({ preserveUi: Boolean(contextRef.current), force: true, background: false });
+    const curTab = activeTabRef.current;
+    lastRevalidateAttemptRef.current.set(curTab, Date.now());
+    fetchTab(curTab, 1, true, { preserveUi: Boolean(tabsRef.current[curTab]?.fetched) });
+    if (!scopeToSessionRoot) {
+      try {
+        ws.repoCallbackStatus?.(requestProjectDir);
+      } catch {
+        // ignore transient send errors
+      }
+    }
+  }, [doDetect, fetchTab, requestProjectDir, scopeToSessionRoot, ws]);
 
   const checkoutErrorMessage = useCallback((error: string) => {
     const keyByError: Record<string, string> = {
@@ -979,7 +1434,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     setCheckoutPendingBranch(branch);
     checkoutPendingBranchRef.current = branch;
     try {
-      const rid = ws.repoCheckoutBranch(projectDir, branch, { sessionId });
+      const rid = ws.repoCheckoutBranch(requestProjectDir, branch, { sessionId });
       checkoutReqRef.current = rid;
       pendingRef.current.add(rid);
     } catch {
@@ -988,7 +1443,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       setCheckoutPendingBranch(null);
       setCheckoutFeedback({ kind: 'error', error: 'checkout_failed', branch });
     }
-  }, [checkoutPendingBranch, projectDir, sessionId, ws]);
+  }, [checkoutPendingBranch, requestProjectDir, sessionId, ws]);
 
   // ── CI/CD auto-refresh: 10s when running, 30s otherwise (always active) ─
   useEffect(() => {
@@ -1003,13 +1458,22 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
-    if (tab.loading || !tab.hasMore) return;
+    if (tab.loading || tab.branchStale || !tab.hasMore) return;
+    if (tab.refreshing || tab.backgroundRefreshing) {
+      pendingLoadMoreAfterRebuildRef.current.add(activeTab);
+      return;
+    }
+    if (tab.truncated) {
+      pendingLoadMoreAfterRebuildRef.current.add(activeTab);
+      fetchTab(activeTab, 1, false, { preserveUi: true, background: true });
+      return;
+    }
     fetchTab(activeTab, tab.page + 1);
   }, [activeTab, tabs, fetchTab]);
 
   const handleTabClick = useCallback((key: TabKey) => {
     setActiveTab(key);
-    localStorage.setItem('repo-active-tab', key);
+    writeSafeLocalStorageItem('repo-active-tab', key);
   }, []);
 
   // ── Render helpers ───────────────────────────────────────────────────────
@@ -1024,45 +1488,52 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     actions: t('repo.tab_cicd'),
   };
 
-  const shouldPreserveTabContent = (tab: TabState) => tab.items.length > 0;
+  const shouldPreserveTabContent = (tab: TabState) => tab.fetched;
+
+  const statusPillClass = (status: unknown, conclusion?: unknown): string => {
+    if (status === 'in_progress' || status === 'running') return 'is-running';
+    if (status === 'queued' || status === 'waiting' || status === 'pending') return 'is-queued';
+    const raw = typeof conclusion === 'string' && conclusion ? conclusion : (typeof status === 'string' ? status : '');
+    const val = raw.toLowerCase();
+    if (val === 'open' || val === 'success') return 'is-open';
+    if (val === 'merged') return 'is-merged';
+    if (val === 'closed' || val === 'failure') return 'is-failure';
+    if (val === 'cancelled') return 'is-cancelled';
+    return '';
+  };
+
+  const renderDiffStats = (additions: number, deletions: number, filesCount: number, suffix?: ComponentChildren) => (
+    <div class="repo-detail-stats">
+      <span class="repo-stat-add">+{additions}</span>
+      <span class="repo-stat-del">-{deletions}</span>
+      <span class="repo-stat-files">{filesCount} {t('repo.files')}</span>
+      {suffix}
+    </div>
+  );
 
   const renderError = (error: string, tabKey: TabKey) => {
     const kind = classifyError(error);
     return (
-      <div style={{ padding: 24, textAlign: 'center', color: '#f87171' }}>
-        <div style={{ marginBottom: 8, fontSize: 14 }}>{error}</div>
+      <div class="repo-state-box is-error">
+        <div class="repo-state-title">{error}</div>
         {kind === 'cli_missing' && (
-          <div style={{ fontSize: 12, color: '#94a3b8' }}>
+          <div class="repo-state-hint">
             {t('repo.error_cli_missing_hint')}{' '}
-            <a href="https://cli.github.com" target="_blank" rel="noopener" style={{ color: '#60a5fa' }}>
+            <a href="https://cli.github.com" target="_blank" rel="noopener">
               cli.github.com
             </a>
           </div>
         )}
         {kind === 'unauthorized' && (
-          <div style={{ fontSize: 12, color: '#94a3b8' }}>
+          <div class="repo-state-hint">
             {t('repo.error_unauthorized_hint')}
-            <code style={{ background: '#1e293b', padding: '2px 6px', borderRadius: 4, marginLeft: 4 }}>
-              gh auth login
-            </code>
+            <code>gh auth login</code>
           </div>
         )}
-        {kind === 'rate_limited' && (
+        {(kind === 'rate_limited' || kind === 'generic') && (
           <button
-            class="btn btn-sm"
-            style={{ marginTop: 8 }}
-            onClick={() => {
-              updateTab(tabKey, { error: null, fetched: false });
-              fetchTab(tabKey);
-            }}
-          >
-            {t('repo.retry')}
-          </button>
-        )}
-        {kind === 'generic' && (
-          <button
-            class="btn btn-sm"
-            style={{ marginTop: 8 }}
+            class="repo-detail-retry"
+            style={{ marginTop: 10 }}
             onClick={() => {
               updateTab(tabKey, { error: null, fetched: false });
               fetchTab(tabKey);
@@ -1076,75 +1547,78 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
   };
 
   const renderEmpty = (tabKey: TabKey) => (
-    <div style={{ padding: 32, textAlign: 'center', color: '#64748b', fontSize: 13 }}>
+    <div class="repo-state-box">
       {t(`repo.empty_${tabKey}`)}
     </div>
   );
 
   const renderSpinner = () => (
-    <div style={{ padding: 32, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+    <div class="repo-state-box">
       {t('common.loading')}
     </div>
   );
 
-  const renderIssueItem = (item: any) => (
-    <div key={item.number ?? item.id}>
-      <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('issues', item.number)}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ color: item.state === 'open' ? '#4ade80' : '#f87171', fontSize: 11, fontWeight: 600 }}>
-            {item.state?.toUpperCase()}
-          </span>
-          <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
-          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {item.title}
-          </span>
-        </div>
-        {item.labels?.length > 0 && (
-          <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
-            {item.labels.map((l: any) => (
-              <span key={l.name ?? l} style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#334155', color: '#94a3b8' }}>
-                {typeof l === 'string' ? l : l.name}
-              </span>
-            ))}
+  const renderIssueItem = (item: any) => {
+    const issueKey = `issues:${item.number}`;
+    const isExpanded = expandedKey === issueKey;
+    return (
+      <div key={item.number ?? item.id} class={`repo-card-wrap${isExpanded ? ' is-expanded' : ''}`}>
+        <div class="repo-card repo-card-interactive" onClick={() => fetchDetail('issues', item.number)}>
+          <div class="repo-card-row">
+            <span class={`repo-status-pill ${statusPillClass(item.state)}`}>
+              {item.state?.toUpperCase()}
+            </span>
+            <span class="repo-num-chip">#{item.number}</span>
+            <span class="repo-card-title">{item.title}</span>
           </div>
-        )}
-        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-          {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+          {item.labels?.length > 0 && (
+            <div class="repo-labels-row">
+              {item.labels.map((l: any) => (
+                <span key={l.name ?? l} class="repo-label-chip">
+                  {typeof l === 'string' ? l : l.name}
+                </span>
+              ))}
+            </div>
+          )}
+          <div class="repo-card-meta">
+            <span>{item.author ?? item.user?.login}</span>
+            {item.createdAt && <span>· {formatTime(new Date(item.createdAt).getTime())}</span>}
+          </div>
         </div>
+        {renderDetailPanel('issues', item.number)}
       </div>
-      {renderDetailPanel('issues', item.number)}
-    </div>
-  );
+    );
+  };
 
-  const renderPrItem = (item: any) => (
-    <div key={item.number ?? item.id}>
-      <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('prs', item.number)}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{
-            color: item.state === 'open' ? '#4ade80' : item.state === 'merged' ? '#a78bfa' : '#f87171',
-            fontSize: 11, fontWeight: 600,
-          }}>
-            {item.state?.toUpperCase()}
-          </span>
-          <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
-          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {item.title}
-          </span>
-        </div>
-        {item.head && (
-          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.head}</code>
-            {' → '}
-            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.base}</code>
+  const renderPrItem = (item: any) => {
+    const prKey = `prs:${item.number}`;
+    const isExpanded = expandedKey === prKey;
+    return (
+      <div key={item.number ?? item.id} class={`repo-card-wrap${isExpanded ? ' is-expanded' : ''}`}>
+        <div class="repo-card repo-card-interactive" onClick={() => fetchDetail('prs', item.number)}>
+          <div class="repo-card-row">
+            <span class={`repo-status-pill ${statusPillClass(item.state)}`}>
+              {item.state?.toUpperCase()}
+            </span>
+            <span class="repo-num-chip">#{item.number}</span>
+            <span class="repo-card-title">{item.title}</span>
           </div>
-        )}
-        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-          {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+          {item.head && (
+            <div class="repo-branch-flow">
+              <code class="repo-mono-chip">{item.head}</code>
+              <span class="repo-branch-arrow">→</span>
+              <code class="repo-mono-chip">{item.base}</code>
+            </div>
+          )}
+          <div class="repo-card-meta">
+            <span>{item.author ?? item.user?.login}</span>
+            {item.createdAt && <span>· {formatTime(new Date(item.createdAt).getTime())}</span>}
+          </div>
         </div>
+        {renderDetailPanel('prs', item.number)}
       </div>
-      {renderDetailPanel('prs', item.number)}
-    </div>
-  );
+    );
+  };
 
   const renderBranchItem = (item: any) => {
     const name = typeof item === 'string' ? item : item.name;
@@ -1157,7 +1631,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       ? item.checkoutBlockedReason || (!localPresent ? 'invalid_checkout_target' : null)
       : null;
     const isPending = checkoutPendingBranch === name;
-    const canSwitch = checkoutable && !isCurrent && !checkoutPendingBranch;
+    const canSwitch = !readOnly && checkoutable && !isCurrent && !checkoutPendingBranch;
     const disabledTitle = !canSwitch && !isCurrent
       ? disabledReason === 'invalid_checkout_target' && !localPresent
         ? t('repo.checkout_remote_only_disabled')
@@ -1167,52 +1641,53 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       : undefined;
 
     return (
-      <div key={name} style={listItemStyle}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <code style={{ color: '#e2e8f0', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</code>
-          {isCurrent && (
-            <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#166534', color: '#4ade80', flexShrink: 0 }}>
-              {t('repo.current_branch')}
-            </span>
+      <div key={name} class={`repo-card-wrap${isCurrent ? ' is-current' : ''}`}>
+        <div class="repo-card">
+          <div class="repo-card-row">
+            <code class="repo-branch-name">{name}</code>
+            {isCurrent && (
+              <span class="repo-status-pill is-current">
+                {t('repo.current_branch')}
+              </span>
+            )}
+            {isDefault && (
+              <span class="repo-chip-pill is-default">
+                {t('repo.default_branch')}
+              </span>
+            )}
+            {localPresent && (
+              <span title={t('repo.branch_local_label')} class="repo-chip-pill is-local">{t('repo.branch_local_short')}</span>
+            )}
+            {remotePresent && (
+              <span title={t('repo.branch_remote_label')} class="repo-chip-pill is-remote">{t('repo.branch_remote_short')}</span>
+            )}
+            <span style={{ flex: 1 }} />
+            {isCurrent || readOnly ? null : (
+              <button
+                class="repo-switch-btn"
+                disabled={!canSwitch}
+                title={isPending ? t('repo.checkout_pending', { branch: name }) : disabledTitle ?? t('repo.checkout_switch_to', { branch: name })}
+                aria-label={isPending ? t('repo.checkout_pending', { branch: name }) : t('repo.checkout_switch_to', { branch: name })}
+                onClick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  handleCheckoutBranch(name);
+                }}
+              >
+                {isPending ? t('repo.checkout_switching') : t('repo.checkout_switch')}
+              </button>
+            )}
+          </div>
+          {disabledTitle && (
+            <div class="repo-branch-note">
+              {disabledTitle}
+            </div>
           )}
-          {isDefault && (
-            <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#1e293b', color: '#94a3b8', flexShrink: 0 }}>
-              {t('repo.default_branch')}
-            </span>
-          )}
-          {localPresent && (
-            <span title={t('repo.branch_local_label')} style={{ fontSize: 10, color: '#93c5fd', flexShrink: 0 }}>{t('repo.branch_local_short')}</span>
-          )}
-          {remotePresent && (
-            <span title={t('repo.branch_remote_label')} style={{ fontSize: 10, color: '#c4b5fd', flexShrink: 0 }}>{t('repo.branch_remote_short')}</span>
-          )}
-          <span style={{ flex: 1 }} />
-          {isCurrent ? null : (
-            <button
-              class="btn btn-sm"
-              disabled={!canSwitch}
-              title={isPending ? t('repo.checkout_pending', { branch: name }) : disabledTitle ?? t('repo.checkout_switch_to', { branch: name })}
-              aria-label={isPending ? t('repo.checkout_pending', { branch: name }) : t('repo.checkout_switch_to', { branch: name })}
-              onClick={(e: MouseEvent) => {
-                e.stopPropagation();
-                handleCheckoutBranch(name);
-              }}
-              style={{ flexShrink: 0, opacity: canSwitch || isPending ? 1 : 0.48 }}
-            >
-              {isPending ? t('repo.checkout_switching') : t('repo.checkout_switch')}
-            </button>
+          {typeof item !== 'string' && (item.lastCommitDate || item.lastCommit) && (
+            <div class="repo-card-meta">
+              {item.lastCommitDate ? formatTime(item.lastCommitDate) : item.lastCommit}
+            </div>
           )}
         </div>
-        {disabledTitle && (
-          <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
-            {disabledTitle}
-          </div>
-        )}
-        {typeof item !== 'string' && (item.lastCommitDate || item.lastCommit) && (
-          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-            {item.lastCommitDate ? formatTime(item.lastCommitDate) : item.lastCommit}
-          </div>
-        )}
       </div>
     );
   };
@@ -1231,7 +1706,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       if (filesDetail || detailStateRef.current.get(commitKey) === 'loading') return;
       setDetailState(prev => new Map(prev).set(commitKey, 'loading'));
       try {
-        const rid = ws.repoCommitDetail(projectDir, sha);
+        const rid = ws.repoCommitDetail(requestProjectDir, sha, sessionScope);
         pendingRef.current.add(rid);
         detailReqRef.current.set(rid, {
           key: commitKey,
@@ -1259,41 +1734,35 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     };
 
     return (
-      <div key={sha}>
-        <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={handleClick}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <code style={{ color: '#60a5fa', fontSize: 11, flexShrink: 0 }}>
+      <div key={sha} class={`repo-card-wrap${isExpanded ? ' is-expanded' : ''}`}>
+        <div class="repo-card repo-card-interactive" onClick={handleClick}>
+          <div class="repo-card-row">
+            <code class="repo-sha-chip">
               {sha.slice(0, 7)}
             </code>
-            <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span class="repo-card-title">
               {firstLine}
             </span>
           </div>
-          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-            {item.author?.name ?? item.author ?? ''} {item.date ? `· ${formatTime(new Date(item.date).getTime())}` : ''}
+          <div class="repo-card-meta">
+            <span>{item.author?.name ?? item.author ?? ''}</span>
+            {item.date && <span>· {formatTime(new Date(item.date).getTime())}</span>}
           </div>
         </div>
         {isExpanded && (
           <div class="repo-detail-panel">
             {body && <pre class="repo-detail-body">{body}</pre>}
-            {/* Show files button / loaded files */}
             {filesDetail ? (
               <>
-                <div class="repo-detail-stats">
-                  <span style={{ color: '#4ade80' }}>+{filesDetail.stats.additions}</span>
-                  {' '}
-                  <span style={{ color: '#ef4444' }}>-{filesDetail.stats.deletions}</span>
-                  {' '}
-                  <span style={{ color: '#94a3b8' }}>{filesDetail.stats.filesChanged} {t('repo.files')}</span>
-                </div>
+                {renderDiffStats(filesDetail.stats.additions, filesDetail.stats.deletions, filesDetail.stats.filesChanged)}
                 <div class="repo-detail-files">
                   {filesDetail.files.map((f: any) => (
                     <div key={f.filename} class="repo-detail-file">
                       <span class="repo-file-name">{f.filename}</span>
                       {f.additions !== undefined && (
                         <span class="repo-file-stats">
-                          <span style={{ color: '#4ade80' }}>+{f.additions}</span>
-                          <span style={{ color: '#ef4444' }}>-{f.deletions}</span>
+                          <span class="repo-stat-add">+{f.additions}</span>
+                          <span class="repo-stat-del">-{f.deletions}</span>
                         </span>
                       )}
                     </div>
@@ -1360,12 +1829,13 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
   }
 
   function emitCiEvent(run: { id: number; name: string; status: string; conclusion?: string; url: string; updatedAt?: number }, detail?: any): void {
-    if (!onCiEvent) return;
+    const cb = onCiEventRef.current;
+    if (!cb) return;
     const key = `${run.id}:${run.status}:${run.updatedAt ?? 0}`;
     if (deliveredCiEventRef.current.has(key)) return;
     deliveredCiEventRef.current.add(key);
     const failure = run.status === 'failure' ? extractFailedLocation(detail) : {};
-    onCiEvent({
+    cb({
       name: run.name,
       status: run.status,
       conclusion: run.conclusion,
@@ -1378,21 +1848,15 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     return (
       <div class="repo-detail-panel">
         {detail.body && <pre class="repo-detail-body">{detail.body}</pre>}
-        <div class="repo-detail-stats">
-          <span style={{ color: '#4ade80' }}>+{detail.stats.additions}</span>
-          {' '}
-          <span style={{ color: '#ef4444' }}>-{detail.stats.deletions}</span>
-          {' '}
-          <span style={{ color: '#94a3b8' }}>{detail.stats.filesChanged} {t('repo.files')}</span>
-        </div>
+        {renderDiffStats(detail.stats.additions, detail.stats.deletions, detail.stats.filesChanged)}
         <div class="repo-detail-files">
           {detail.files.map((f: any) => (
             <div key={f.filename} class="repo-detail-file">
               <span class="repo-file-name">{f.filename}</span>
               {f.additions !== undefined && (
                 <span class="repo-file-stats">
-                  <span style={{ color: '#4ade80' }}>+{f.additions}</span>
-                  <span style={{ color: '#ef4444' }}>-{f.deletions}</span>
+                  <span class="repo-stat-add">+{f.additions}</span>
+                  <span class="repo-stat-del">-{f.deletions}</span>
                 </span>
               )}
             </div>
@@ -1421,12 +1885,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
           {detail.mergeable === true && <span class="repo-badge" style={{ borderColor: '#4ade80', color: '#4ade80' }}>{t('repo.mergeable')}</span>}
           {detail.mergeable === false && <span class="repo-badge" style={{ borderColor: '#ef4444', color: '#ef4444' }}>{t('repo.conflicts')}</span>}
         </div>
-        <div class="repo-detail-stats">
-          <span style={{ color: '#4ade80' }}>+{detail.additions}</span>{' '}
-          <span style={{ color: '#ef4444' }}>-{detail.deletions}</span>{' '}
-          <span style={{ color: '#94a3b8' }}>{detail.changedFiles} {t('repo.files')}</span>
-          {' · '}{detail.comments} {t('repo.comments_count')}
-        </div>
+        {renderDiffStats(
+          detail.additions,
+          detail.deletions,
+          detail.changedFiles,
+          <span>· {detail.comments} {t('repo.comments_count')}</span>,
+        )}
         <a href={detail.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>
       </div>
     );
@@ -1492,11 +1956,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     return '#94a3b8';
   };
 
-  const actionStatusLabel = (status: string, conclusion: string | null | undefined) => {
+  const actionStatusLabel = (status: unknown, conclusion: unknown) => {
     if (status === 'in_progress' || status === 'running') return 'RUNNING';
     if (status === 'queued' || status === 'waiting' || status === 'pending') return 'QUEUED';
-    if (conclusion) return conclusion.toUpperCase();
-    return status?.toUpperCase() ?? '';
+    if (typeof conclusion === 'string' && conclusion) return conclusion.toUpperCase();
+    if (typeof status === 'string') return status.toUpperCase();
+    return '';
   };
 
   const renderJobStatusIcon = (status: string, conclusion: string | null | undefined) => {
@@ -1507,15 +1972,10 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         <span
           aria-label={label}
           title={label}
+          class="repo-job-spinner"
           style={{
-            width: 10,
-            height: 10,
-            borderRadius: '50%',
             border: `2px solid ${color}33`,
             borderTopColor: color,
-            display: 'inline-block',
-            flexShrink: 0,
-            animation: 'repo-spin 0.8s linear infinite',
           }}
         />
       );
@@ -1525,14 +1985,8 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       <span
         aria-label={label}
         title={label}
-        style={{
-          width: 8,
-          height: 8,
-          borderRadius: '50%',
-          background: color,
-          display: 'inline-block',
-          flexShrink: 0,
-        }}
+        class="repo-job-dot"
+        style={{ background: color }}
       />
     );
   };
@@ -1561,10 +2015,11 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     const isLatestAction = tabs.actions.items[0]?.id === item.id;
     const showCollapsedJobSummary = isLatestAction && (item.status === 'running' || item.status === 'failure');
     const visibleJobs = showCollapsedJobSummary && Array.isArray(actionDetail?.jobs) ? actionDetail.jobs : [];
+    const isPulsing = item.status === 'running' || item.status === 'in_progress' || item.status === 'queued';
     return (
-      <div key={item.id ?? item.runId}>
+      <div key={item.id ?? item.runId} class={`repo-card-wrap${isExpanded ? ' is-expanded' : ''}`}>
         <div
-          style={{ ...listItemStyle, cursor: 'pointer' }}
+          class="repo-card repo-card-interactive"
           onClick={() => {
             if (isExpanded) {
               setExpandedKey(null);
@@ -1576,25 +2031,26 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
             }
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{
-              width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0,
-              display: 'inline-block',
-            }} />
-            <span style={{ fontSize: 11, fontWeight: 600, color, flexShrink: 0 }}>
+          <div class="repo-card-row">
+            <span class={`repo-status-dot${isPulsing ? ' is-pulsing' : ''}`} style={{ background: color, color }} />
+            <span class={`repo-status-pill ${statusPillClass(item.status, item.conclusion)}`}>
               {actionStatusLabel(item.status, item.conclusion)}
             </span>
-            <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span class="repo-card-title">
               {item.name ?? item.workflowName ?? ''}
             </span>
             {item.runNumber && (
-              <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>#{item.runNumber}</span>
+              <span class="repo-num-chip">#{item.runNumber}</span>
             )}
             {item.event && (
-              <span style={{
-                fontSize: 9, padding: '1px 6px', borderRadius: 9999,
-                background: `${eventColor}20`, color: eventColor, flexShrink: 0, fontWeight: 500,
-              }}>
+              <span
+                class="repo-event-chip"
+                style={{
+                  background: `${eventColor}20`,
+                  color: eventColor,
+                  borderColor: `${eventColor}44`,
+                }}
+              >
                 {item.event}
               </span>
             )}
@@ -1603,24 +2059,16 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
                 href={item.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                style={{ fontSize: 11, color: '#60a5fa', flexShrink: 0, textDecoration: 'none' }}
+                class="repo-inline-link"
                 onClick={(e: MouseEvent) => e.stopPropagation()}
               >
                 {t('repo.actions_view')}
               </a>
             )}
           </div>
-          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            {branch && (
-              <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>
-                {branch}
-              </code>
-            )}
-            {item.commitSha && (
-              <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10, color: '#94a3b8' }}>
-                {item.commitSha}
-              </code>
-            )}
+          <div class="repo-card-meta">
+            {branch && <code class="repo-mono-chip">{branch}</code>}
+            {item.commitSha && <code class="repo-sha-chip">{item.commitSha}</code>}
             {actor && <span>{actor}</span>}
             {duration != null && duration > 0 && <span>⏱ {formatDuration(duration)}</span>}
             {(item.status === 'running' || item.status === 'queued') && item.createdAt && (
@@ -1631,35 +2079,24 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
             )}
             {item.createdAt && <span>{formatTime(item.createdAt)} ({formatRelativeTs(item.createdAt)})</span>}
           </div>
-          {/* Commit message summary — max 2 lines */}
           {commitMsg && (
-            <div style={{ fontSize: 11, color: '#475569', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+            <div class="repo-action-commit-msg">
               {commitMsg}
             </div>
           )}
           {!isExpanded && visibleJobs.length > 0 && (
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+            <div class="repo-job-pills">
               {visibleJobs.map((job: any) => {
                 const jobColor = actionStatusColor(job.status, job.conclusion);
                 return (
                   <span
                     key={job.id}
                     title={`${job.name} · ${actionStatusLabel(job.status, job.conclusion)}`}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      maxWidth: 220,
-                      padding: '2px 8px',
-                      borderRadius: 9999,
-                      border: `1px solid ${jobColor}40`,
-                      background: 'rgba(15,23,42,0.45)',
-                      color: '#cbd5e1',
-                      fontSize: 10,
-                    }}
+                    class="repo-job-pill"
+                    style={{ borderColor: `${jobColor}44` }}
                   >
                     {renderJobStatusIcon(job.status, job.conclusion)}
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
+                    <span class="repo-job-pill-name">{job.name}</span>
                   </span>
                 );
               })}
@@ -1669,14 +2106,14 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         {isExpanded && (
           <div class="repo-detail-panel">
             {item.workflowPath && (
-              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
+              <div class="repo-detail-workflow-path">
                 {item.workflowPath}
               </div>
             )}
             {fullCommitMsg && (
               <pre class="repo-detail-body">{fullCommitMsg}</pre>
             )}
-            <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            <div class="repo-action-meta-grid">
               {item.conclusion && <span>Conclusion: <strong style={{ color }}>{item.conclusion}</strong></span>}
               {item.event && <span>Trigger: <strong>{item.event}</strong></span>}
               {duration != null && duration > 0 && <span>Duration: <strong>{formatDuration(duration)}</strong></span>}
@@ -1702,7 +2139,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
               </div>
             )}
             {actionDetail?.jobs?.length > 0 && (
-              <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div class="repo-action-jobs">
                 {actionDetail.jobs.map((job: any) => {
                   const jobColor = actionStatusColor(job.status, job.conclusion);
                   const steps = Array.isArray(job.steps) ? job.steps.filter((step: any) => step?.name) : [];
@@ -1717,23 +2154,19 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
                         else actionJobRefs.current.delete(jobFocusKey);
                       }}
                       style={{
-                        border: '1px solid rgba(148,163,184,0.18)',
-                        borderRadius: 8,
-                        padding: '8px 10px',
-                        background: 'rgba(15,23,42,0.45)',
                         ['--repo-action-focus-color' as string]: jobColor,
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: jobColor, flexShrink: 0, display: 'inline-block' }} />
-                        <span style={{ fontSize: 11, fontWeight: 600, color: jobColor }}>{actionStatusLabel(job.status, job.conclusion)}</span>
-                        <span style={{ color: '#cbd5e1', fontSize: 12, flex: 1 }}>{job.name}</span>
+                      <div class="repo-action-job-head">
+                        <span class="repo-status-dot" style={{ background: jobColor, color: jobColor }} />
+                        <span class={`repo-status-pill ${statusPillClass(job.status, job.conclusion)}`}>{actionStatusLabel(job.status, job.conclusion)}</span>
+                        <span class="repo-action-job-name">{job.name}</span>
                         {job.url && (
                           <a
                             href={job.url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            style={{ fontSize: 11, color: '#60a5fa', textDecoration: 'none' }}
+                            class="repo-inline-link"
                             onClick={(e: MouseEvent) => e.stopPropagation()}
                           >
                             {t('repo.actions_view')}
@@ -1741,7 +2174,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
                         )}
                       </div>
                       {steps.length > 0 && (
-                        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <div class="repo-action-steps">
                           {steps.map((step: any) => {
                             const stepColor = actionStatusColor(step.status, step.conclusion);
                             const isTestStep = isLikelyTestStep(step.name);
@@ -1756,20 +2189,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
                                   else actionStepRefs.current.delete(stepFocusKey);
                                 }}
                                 style={{
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  gap: 8,
-                                  paddingLeft: 16,
-                                  paddingTop: 3,
-                                  paddingBottom: 3,
-                                  paddingRight: 8,
-                                  borderRadius: 6,
                                   ['--repo-action-focus-color' as string]: stepColor,
                                 }}
                               >
-                                <span style={{ width: 6, height: 6, borderRadius: '50%', background: stepColor, flexShrink: 0, display: 'inline-block' }} />
+                                <span class="repo-job-dot" style={{ width: 6, height: 6, background: stepColor }} />
                                 <span style={{ fontSize: 10, fontWeight: 600, color: stepColor, flexShrink: 0 }}>{actionStatusLabel(step.status, step.conclusion)}</span>
-                                <span style={{ fontSize: 11, color: isTestStep ? '#bfdbfe' : '#94a3b8', fontWeight: isTestStep ? 600 : 400, flex: 1 }}>
+                                <span class="repo-action-step-name">
                                   {isTestStep ? `🧪 ${step.name}` : step.name}
                                 </span>
                               </div>
@@ -1805,10 +2230,9 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     if (detectLoading && !context && !shouldPreserveTabContent(tab)) return renderSpinner();
     // Detect failed AND we have no previous data — show retry prompt
     if (detectError && !context && !shouldPreserveTabContent(tab)) return (
-      <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
-        <div style={{ marginBottom: 12, color: '#f87171' }}>{detectError}</div>
-        <div style={{ marginBottom: 12, fontSize: 11, color: '#475569' }}>{t('repo.retry')}</div>
-        <button class="btn btn-sm" onClick={() => doDetect()}>{t('repo.retry')}</button>
+      <div class="repo-state-box is-error">
+        <div class="repo-state-title">{detectError}</div>
+        <button class="repo-detail-retry" onClick={() => doDetect()}>{t('repo.retry')}</button>
       </div>
     );
     // If detect is re-running but we have cached data, show tabs normally
@@ -1820,7 +2244,9 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     const renderer = RENDERERS[key];
     return (
       <PullToRefresh loading={tab.loading && !tab.refreshing} onRefresh={() => silentRefreshTab(key)}>
-        {tab.items.map(renderer)}
+        <div class="repo-list">
+          {tab.items.map(renderer)}
+        </div>
         {tab.loading && !tab.refreshing && (
           <div style={{ padding: 12, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
             {t('common.loading')}
@@ -1828,8 +2254,8 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         )}
         {!tab.loading && tab.hasMore && (
           <button
-            class="btn btn-sm"
-            style={{ display: 'block', margin: '12px auto' }}
+            class="repo-load-more-btn"
+            disabled={Boolean(tab.branchStale)}
             onClick={handleLoadMore}
           >
             {t('repo.load_more')}
@@ -1839,78 +2265,100 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     );
   };
 
-  // ── Styles ───────────────────────────────────────────────────────────────
-
-  const listItemStyle: Record<string, any> = {
-    padding: '10px 16px',
-    borderBottom: '1px solid #1e293b',
-    cursor: 'default',
-  };
-
   // ── Main render ──────────────────────────────────────────────────────────
+
+  const hasRunningActions = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'in_progress' || r.status === 'queued');
 
   return (
     <div class="repo-page">
-      <style>{'@keyframes repo-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }'}</style>
       {/* Header bar */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 12,
-        padding: '10px 16px', borderBottom: '1px solid #1e293b',
-        flexShrink: 0,
-      }}>
+      <div class="repo-header">
         {detectLoading && !context && (
-          <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('common.loading')}</span>
+          <span class="repo-header-loading">{t('common.loading')}</span>
         )}
 
         {detectError && !context && (
-          <span style={{ color: '#f87171', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{detectError}</span>
+          <span class="repo-header-error">{detectError}</span>
         )}
 
         {context && (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 12, overflow: 'hidden' }}>
+          <div class="repo-header-identity">
             {context.provider && (
-              <span style={{
-                fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 9999,
-                background: context.provider === 'github' ? '#1e3a5f' : '#3b2d6b',
-                color: context.provider === 'github' ? '#60a5fa' : '#a78bfa',
-                textTransform: 'uppercase', flexShrink: 0,
-              }}>
+              <span class={`repo-provider-badge${context.provider === 'gitlab' ? ' is-gitlab' : ''}`}>
                 {context.provider}
               </span>
             )}
-            <span style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span class="repo-title">
               {context.owner && context.repo ? `${context.owner}/${context.repo}` : projectDir}
             </span>
             {context.defaultBranch && (
-              <code style={{ fontSize: 11, color: '#64748b', background: '#1e293b', padding: '1px 6px', borderRadius: 4, flexShrink: 0 }}>
+              <code class="repo-branch-chip">
                 {context.defaultBranch}
               </code>
             )}
             {context.cliInstalled === false && (
-              <span style={{ fontSize: 11, color: '#f87171', flexShrink: 0 }}>
+              <span class="repo-cli-missing">
                 {t('repo.cli_not_installed')}
               </span>
             )}
           </div>
         )}
 
-        {context?.lastRefresh && (
-          <span style={{ fontSize: 10, color: '#475569', flexShrink: 0, whiteSpace: 'nowrap' }}>
-            {formatTime(context.lastRefresh)}
-          </span>
-        )}
+        <div class="repo-header-actions">
+          {context?.lastRefresh && (
+            <span class="repo-refresh-time">
+              {formatTime(context.lastRefresh)}
+            </span>
+          )}
+
+          <button
+            type="button"
+            class={`btn btn-sm repo-refresh-btn${tabs[activeTab].refreshing ? ' is-refreshing' : ''}`}
+            title={t('repo.refresh')}
+            aria-label={t('repo.refresh')}
+            disabled={!context && detectLoading}
+            onClick={handleManualRefresh}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="23 4 23 10 17 10" />
+              <polyline points="1 20 1 14 7 14" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
+          </button>
+
+          {!scopeToSessionRoot && (
+            <button
+              type="button"
+              class="btn btn-sm repo-callback-trigger"
+              onClick={() => setCallbackModalOpen(true)}
+            >
+              <span
+                class="repo-callback-dot"
+                style={{
+                  background: callbackLastError ? '#ef4444' : callbackRuntimeEnabled ? '#22c55e' : '#64748b',
+                }}
+              />
+              <span>{t('repo.callback_button')}</span>
+              {(() => {
+                const activeCount = callbacks.filter((cb) => cb.status === 'pending' || cb.status === 'in_progress').length;
+                const failedCount = callbacks.filter((cb) => cb.status === 'failed').length;
+                const badgeCount = failedCount > 0 ? failedCount : activeCount;
+                if (badgeCount === 0) return null;
+                return (
+                  <span class={`repo-callback-badge${failedCount > 0 ? ' is-failed' : ''}`}>
+                    {badgeCount}
+                  </span>
+                );
+              })()}
+            </button>
+          )}
+        </div>
       </div>
 
       {checkoutFeedback && (
         <div
           role={checkoutFeedback.kind === 'error' ? 'alert' : 'status'}
-          style={{
-            padding: '8px 16px',
-            borderBottom: '1px solid #1e293b',
-            color: checkoutFeedback.kind === 'error' ? '#fecaca' : '#bbf7d0',
-            background: checkoutFeedback.kind === 'error' ? 'rgba(127,29,29,0.24)' : 'rgba(20,83,45,0.22)',
-            fontSize: 12,
-          }}
+          class={`repo-feedback-banner${checkoutFeedback.kind === 'error' ? ' is-error' : ''}`}
         >
           {checkoutFeedback.kind === 'error'
             ? checkoutErrorMessage(checkoutFeedback.error)
@@ -1919,47 +2367,62 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       )}
 
       {/* Tab bar */}
-      <div style={{
-        display: 'flex', borderBottom: '1px solid #1e293b', flexShrink: 0,
-      }}>
-        {(['issues', 'prs', 'branches', 'commits', 'actions'] as TabKey[]).map(key => (
-          (() => {
-            const tabError = tabs[key].error;
-            return (
-          <button
-            key={key}
-            onClick={() => handleTabClick(key)}
-            title={tabError || undefined}
-            style={{
-              flex: 1, padding: '8px 0', fontSize: 13, fontWeight: 500,
-              background: 'none', border: 'none', cursor: 'pointer',
-              color: activeTab === key ? '#e2e8f0' : '#64748b',
-              borderBottom: activeTab === key ? '2px solid #3b82f6' : '2px solid transparent',
-              transition: 'color 0.15s, border-color 0.15s',
-            }}
-          >
-            {TAB_LABELS[key]}
-            {tabError && (
-              <span
-                style={{ marginLeft: 6, fontSize: 11, color: '#ef4444', fontWeight: 700 }}
-                aria-label={`${TAB_LABELS[key]} error`}
-              >
-                !
-              </span>
-            )}
-            {(tabs[key].loading || tabs[key].refreshing) && (
-              <span style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8', display: 'inline-block', animation: 'spin 1s linear infinite' }}>↻</span>
-            )}
-          </button>
-            );
-          })()
-        ))}
+      <div class="repo-tabs" role="tablist">
+        {(['issues', 'prs', 'branches', 'commits', 'actions'] as TabKey[]).map(key => {
+          const tabError = tabs[key].error;
+          const isActive = activeTab === key;
+          return (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => handleTabClick(key)}
+              title={tabError || undefined}
+              class={`repo-tab${isActive ? ' is-active' : ''}`}
+            >
+              <span>{TAB_LABELS[key]}</span>
+              {key === 'actions' && hasRunningActions && !tabError && (
+                <span class="repo-tab-live-dot" aria-hidden="true" />
+              )}
+              {tabError && (
+                <span
+                  class="repo-tab-error-badge"
+                  aria-label={`${TAB_LABELS[key]} error`}
+                >
+                  !
+                </span>
+              )}
+              {(tabs[key].loading || tabs[key].refreshing) && (
+                <span class="repo-tab-spinner">↻</span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       {/* Tab content */}
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      <div class="repo-content">
         {renderTabContent(activeTab)}
       </div>
+
+      {!scopeToSessionRoot && (
+        <RepoCallbackModal
+          open={callbackModalOpen}
+          onClose={() => setCallbackModalOpen(false)}
+          ws={ws}
+          serverId={serverId}
+          projectDir={projectDir}
+          readOnly={readOnly}
+          callbackTargets={callbackTargets}
+          callbacks={callbacks}
+          runtimeEnabled={callbackRuntimeEnabled}
+          checking={callbackChecking}
+          lastCheckedAt={callbackLastCheckedAt}
+          lastError={callbackLastError}
+          onConfigSaved={(cfg) => setCallbackRuntimeEnabled(cfg.enabled)}
+        />
+      )}
     </div>
   );
 }

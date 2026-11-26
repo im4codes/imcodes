@@ -16,6 +16,8 @@ import type { WsClient } from '../ws-client.js';
 import type { PinnedPanel } from '../app.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
+import type { SessionContextBootstrapState } from '@shared/session-context-bootstrap.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -29,27 +31,66 @@ export interface PanelRenderContext {
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
+  /** Open a Remote Desktop window by nodeId or serverId. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
   onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */
   activeProjectDir?: string;
+  /** True while the active server's initial/switched session list is still loading. */
+  sessionsLoading?: boolean;
+  /** Present only while connected through a received share entry. */
+  sharedAccessRole?: 'viewer' | 'participant' | null;
+  /** Share target kind: 'server' for whole-server share, 'main' or 'subsession' for tab share */
+  shareTargetKind?: 'main' | 'subsession' | 'server' | null;
+  /** Whether the current actor can open/manage server DocShare controls. */
+  canManageFileShares?: boolean;
+  /** Canonical session name for shared scope authorization */
+  sharedSessionName?: string;
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */
-  sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string; projectDir?: string }>;
+  sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string; projectDir?: string; contextNamespace?: SessionContextBootstrapState['contextNamespace'] }>;
   /** All servers — for cron manager cross-server view */
   servers?: Array<{ id: string; name: string }>;
   /** Translation function for panel headers and status copy. */
   t: TFunction;
   /** Persist declarative pinned-panel props updates. */
   updatePanelProps?: (panelId: string, props: Record<string, unknown>) => void;
+  /** Submit an inline AskQuestion answer for a session. */
+  onAskAnswer?: (sessionName: string, toolUseId: string, answer: string) => boolean | void;
+  /** Open the Controlled Nodes management dialog/tab (e.g. from DocShareDialog when no groups exist). */
+  onOpenNodeGroups?: () => void;
 }
 
 export interface PanelTypeRegistration {
   title: (panel: PinnedPanel, ctx?: PanelRenderContext) => string;
   render: (panel: PinnedPanel, ctx: PanelRenderContext) => ComponentChildren;
+}
+
+/** Return the non-empty serverId stamped onto a pinned panel's props, if any. */
+export function getPinnedPanelServerId(panel: { props?: Record<string, unknown> }): string | undefined {
+  const raw = panel.props?.serverId;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
+/**
+ * Positive server-provenance check for pinned panels.
+ * Returns true only when both the panel and target server carry matching non-empty server IDs.
+ */
+export function hasPinnedPanelServerProvenance(
+  panel: { props?: Record<string, unknown> },
+  serverId: string | null | undefined,
+): boolean {
+  const panelServerId = getPinnedPanelServerId(panel);
+  const currentServerId = typeof serverId === 'string' && serverId.trim() ? serverId.trim() : undefined;
+  return Boolean(panelServerId && currentServerId && panelServerId === currentServerId);
 }
 
 const registry = new Map<string, PanelTypeRegistration>();

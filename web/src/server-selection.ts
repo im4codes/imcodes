@@ -8,6 +8,7 @@ export interface SelectableServerInfo {
 export interface OnlineServerInfo extends SelectableServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   createdAt?: number;
 }
 
@@ -27,6 +28,30 @@ export interface AutoEntrySelection {
   sessionName: string | null;
 }
 
+/** Resolve a remembered tab against the current server's navigable sessions. */
+export function resolveServerSessionSnapshot(
+  serverId: string,
+  rememberedSession: string | null | undefined,
+  candidates: readonly RecentSessionCandidate[],
+  fallbackRememberedSession?: string | null,
+): string | null {
+  const serverCandidates = candidates.filter((candidate) => candidate.serverId === serverId);
+  const isNavigable = (candidate: RecentSessionCandidate): boolean => (
+    !candidate.isSubSession && !isWorkerSessionName(candidate.sessionName)
+  );
+  if (rememberedSession && serverCandidates.some((candidate) => (
+    candidate.sessionName === rememberedSession && isNavigable(candidate)
+  ))) {
+    return rememberedSession;
+  }
+  if (fallbackRememberedSession && serverCandidates.some((candidate) => (
+    candidate.sessionName === fallbackRememberedSession && isNavigable(candidate)
+  ))) {
+    return fallbackRememberedSession;
+  }
+  return pickMostRecentMainSession(serverCandidates)?.sessionName ?? null;
+}
+
 export function isServerOnline(server: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined): boolean {
   if (!server) return false;
   if (server.status === 'offline') return false;
@@ -40,6 +65,22 @@ export function hasSelectedServer(
 ): boolean {
   if (!selectedServerId) return false;
   return servers.some((server) => server.id === selectedServerId);
+}
+
+/** Refresh full-server data without dropping visited, still-shared navigation entries.
+ * This list is not an ownership/coverage grant; callers keep that authority separate.
+ */
+export function mergeServerNavigation<T extends SelectableServerInfo>(
+  incoming: readonly T[],
+  previous: readonly T[],
+  activeSharedServerIds: ReadonlySet<string>,
+): T[] {
+  const ids = new Set(incoming.map((server) => server.id));
+  return [...incoming, ...previous.filter((server) => {
+    if (ids.has(server.id) || !activeSharedServerIds.has(server.id)) return false;
+    ids.add(server.id);
+    return true;
+  })];
 }
 
 export function getSelectedServerName(

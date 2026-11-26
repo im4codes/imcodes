@@ -16,6 +16,10 @@
 # debugging stack traces.
 #-keepattributes SourceFile,LineNumberTable
 
+# Keep custom native foreground transfer service and Capacitor plugin for release builds.
+-keep class com.im.codes.FileTransferForegroundService { *; }
+-keep class com.im.codes.FileTransferKeepAlivePlugin { *; }
+
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile

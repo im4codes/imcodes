@@ -44,7 +44,11 @@ if (!distReady && distRequired) {
         expect(two).toMatchObject({ phase: 'preflight', kind: 'success', realPath: secondRealPath });
 
         const missing = await pool.dispatch({ phase: 'preflight', rawPath: join(project, 'missing.txt') });
-        expect(missing).toMatchObject({ phase: 'preflight', kind: 'error', error: FS_READ_ERROR_CODES.INTERNAL_ERROR, sanitized: true });
+        // ENOENT/ENOTDIR now maps to the more actionable PARENT_NOT_FOUND
+        // reason instead of a generic internal error (chat download errors
+        // must state a concrete cause: not found / forbidden / too large /
+        // invalid path).
+        expect(missing).toMatchObject({ phase: 'preflight', kind: 'error', error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND, sanitized: true });
         expect(JSON.stringify(missing)).not.toContain(project);
       } finally {
         await pool.shutdown();

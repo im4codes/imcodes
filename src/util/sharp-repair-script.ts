@@ -12,16 +12,16 @@
  * Trigger condition (both bash and batch):
  *   - any of {sharp, detect-libc, semver, @img/colour} is missing or empty
  *
- * Repair: `npm install --no-save --ignore-scripts sharp@0.34.5` from inside
+ * Repair: `npm install --no-save --ignore-scripts sharp@0.35.5` from inside
  * the global imcodes package. The nested install does not hit the same
  * empty-dir edge case as the top-level global install and reconciles every
  * sharp transitive dep at once.
  *
- * The list of deps is intentionally derived from sharp@0.34.5's actual
+ * The list of deps is intentionally derived from sharp@0.35.5's actual
  * `dependencies` field — keep it in sync if sharp's deps change.
  */
 
-/** Sharp@0.34.5's runtime dependencies that must be present after global install. */
+/** Sharp@0.35.5's runtime dependencies that must be present after global install. */
 export const SHARP_REQUIRED_DEPS = ['sharp', 'detect-libc', 'semver', '@img/colour'] as const;
 
 /**
@@ -49,7 +49,7 @@ export function buildBashSharpRepair(): string {
 # crashed on \`Cannot find module 'detect-libc'\` and semantic search
 # permanently sticky-disabled. This costs ~2 s when needed, ~0 s when
 # the install was clean.
-GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
+GLOBAL_ROOT_CHECK="\${IMCODES_REPAIR_ROOT:-$(eval "$NPM_RUN root -g" 2>/dev/null)}"
 SHARP_BROKEN=0
 SHARP_BROKEN_DEP=""
 for dep in ${SHARP_REQUIRED_DEPS.join(' ')}; do
@@ -67,7 +67,7 @@ if [ "$SHARP_BROKEN" = "1" ]; then
       rmdir "$GLOBAL_ROOT_CHECK/imcodes/node_modules/$dep" 2>/dev/null || true
     fi
   done
-  if (cd "$GLOBAL_ROOT_CHECK/imcodes" && eval "$NPM_RUN install --no-save --ignore-scripts sharp@0.34.5") >> "$LOG" 2>&1; then
+  if (cd "$GLOBAL_ROOT_CHECK/imcodes" && eval "$NPM_RUN install --no-save --ignore-scripts sharp@0.35.5") >> "$LOG" 2>&1; then
     log "[step 2.1] sharp repair succeeded"
   else
     log "[step 2.1] sharp repair FAILED (exit $?) — semantic memory recall will sticky-disable"
@@ -122,7 +122,7 @@ export function buildBatchSharpRepair(opts: { npmCmd: string }): string {
     `  echo sharp subtree broken [!SHARP_BROKEN_DEP!/package.json missing] -- repairing via nested npm install >> "%LOG_FILE%"\r`,
     `${depCleanups}\r`,
     `  pushd "!GLOBAL_ROOT_CHECK!\\imcodes" >nul 2>&1\r`,
-    `  call "${npmCmd}" install --no-save --ignore-scripts sharp@0.34.5 >> "%LOG_FILE%" 2>&1\r`,
+    `  call "${npmCmd}" install --no-save --ignore-scripts sharp@0.35.5 >> "%LOG_FILE%" 2>&1\r`,
     `  set "REPAIR_EXIT=!errorlevel!"\r`,
     `  popd >nul 2>&1\r`,
     `  if !REPAIR_EXIT! equ 0 (\r`,

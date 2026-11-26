@@ -1,0 +1,3100 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { h } from 'preact';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) => (values ? `${key}:${JSON.stringify(values)}` : key),
+  }),
+}));
+
+import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
+import { TaskPairStatusPanel, TaskPairStatusPanelHost, collapsedStorageKey } from '../../src/components/TaskPairStatusPanel.js';
+import { resolveOrderedTaskPairRows } from '../../src/task-pair-panel-order.js';
+import { SubSessionTaskTitle } from '../../src/components/SubSessionTaskTitle.js';
+import { SupervisionTaskPairSnapshotBridge, taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
+import { formatElapsedDuration } from '../../src/util/tool-duration.js';
+import { watchProjectionStore } from '../../src/watch-projection.js';
+import { clearApiKey, configure as configureApi, configureApiKey } from '../../src/api.js';
+import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
+import {
+  SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+  clearAllSupervisionTaskConsoleCaches,
+  writeSupervisionTaskConsoleCache,
+} from '../../src/supervision-task-console-cache.js';
+import {
+  SUPERVISION_TASK_CONSOLE_PHASE,
+  SUPERVISION_TASK_CONSOLE_SYNC_STATE,
+  createSupervisionTaskConsoleState,
+} from '../../src/supervision-task-console-reducer.js';
+import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../../shared/supervision-config.js';
+import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
+  SUPERVISION_TASK_CONSOLE_MSG,
+  SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+} from '../../../shared/supervision-task-console.js';
+import {
+  TASK_PAIR_STATUSES,
+  TASK_PAIR_VERBS,
+  TASK_PAIR_TERMINAL_STATUSES,
+  TASK_PAIR_TIMELINE_EVENT,
+  TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_EVENT_VERB,
+} from '../../../shared/task-pair.js';
+
+describe('TaskPairEventChip', () => {
+  afterEach(() => { vi.useRealTimers(); cleanup(); });
+
+  function stubDesktopHover(matches: boolean) {
+    const previous = Object.getOwnPropertyDescriptor(window, 'matchMedia');
+    const impl = ((query: string) => ({
+      matches: query.includes('hover: hover') && query.includes('pointer: fine') ? matches : false,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      onchange: null,
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: impl });
+    return () => {
+      if (previous) Object.defineProperty(window, 'matchMedia', previous);
+      else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia;
+    };
+  }
+
+  it('shows on a waiting-for-Brain card whether Brain was actually notified, and nothing when the daemon sends no notice state', () => {
+    const base = { taskId: 'wait-task', title: 'Waiting', writer: 'executor-1', verb: 'DONE', toStatus: 'awaiting_brain_decision' };
+    const at = Date.UTC(2026, 0, 2, 6, 18, 5);
+    for (const status of ['sent', 'queued', 'no_session', 'failed'] as const) {
+      const { container, unmount } = render(<TaskPairEventChip eventId={`brain-notice-${status}`} payload={{ ...base, brainNotice: { status, at, reason: 'brain-line-done-no-auditor' } }} />);
+      const line = container.querySelector('[data-brain-notice]');
+      expect(line?.getAttribute('data-brain-notice')).toBe(status);
+      expect(line?.textContent).toContain(`taskPair.brain_notice_${status}`);
+      unmount();
+    }
+    const { container: oldDaemon } = render(<TaskPairEventChip eventId="brain-notice-absent" payload={base} />);
+    expect(oldDaemon.querySelector('[data-brain-notice]')).toBeNull();
+    const { container: unknown } = render(<TaskPairEventChip eventId="brain-notice-unknown" payload={{ ...base, brainNotice: { status: 'future_status', at, reason: 'x' } }} />);
+    expect(unknown.querySelector('[data-brain-notice]')).toBeNull();
+  });
+
+  it('opens a delayed desktop hover preview with readable details and closes after leaving', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-hover" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} sessions={[
+      { name: 'exec-session', activeModel: 'provider/model-x', effort: 'high' },
+    ]} payload={{
+      taskId: 'hover-task', title: 'Inspect handoff context', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+      executor: 'exec-session', executorLabel: 'Executor', noticeText: 'Readable human summary for the hover preview.',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    act(() => vi.advanceTimersByTime(179));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.textContent).toContain('Inspect handoff context');
+    expect(preview.textContent).toContain('taskPair.status.passed');
+    expect(preview.textContent).toContain('provider/model-x');
+    expect(preview.textContent).toContain('exec-session');
+    expect(preview.textContent).not.toContain('taskPair.card_thinking');
+    expect(preview.textContent).toContain('Readable human summary');
+    expect(preview.textContent).not.toContain('"taskId"');
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(139));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
+
+  it('does not open a hover preview for touch pointers, while click still expands details', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-touch" payload={{
+      taskId: 'touch-task', title: 'Touch task', writer: 'daemon', verb: 'DISPATCH', toStatus: 'queued',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const touchEnter = createEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!);
+    Object.defineProperty(touchEnter, 'pointerType', { value: 'touch' });
+    fireEvent(card.querySelector('.task-pair-title-preview-trigger')!, touchEnter);
+    act(() => vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-body')).toBeTruthy();
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
+
+  it('closes open preview and suppresses pointer hover on shortcut navigation until real pointer move without resetting open debounce', async () => {
+    const { suppressHoverPreviewsUntilPointerMove, resetHoverPreviewGateForTests } = await import('../../src/hover-preview-gate.js');
+    resetHoverPreviewGateForTests();
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-gate" payload={{
+      taskId: 'gate-task', title: 'Gated hover task', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const trigger = card.querySelector('.task-pair-title-preview-trigger')!;
+    const icon = card.querySelector('.task-pair-title-preview-icon')!;
+
+    act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 300, clientY: 120 })); });
+    fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(180));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+
+    // Shortcut suppresses and immediately closes the open preview.
+    act(() => { suppressHoverPreviewsUntilPointerMove(); });
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+
+    const dispatchPointerMove = (el: Element, clientX: number, clientY: number, pointerType = 'mouse') => {
+      const build = (type: string) => {
+        const evt = new MouseEvent(type, { bubbles: true, clientX, clientY }) as MouseEvent & { pointerType?: string };
+        Object.defineProperty(evt, 'pointerType', { value: pointerType, configurable: true });
+        return evt;
+      };
+      act(() => {
+        if ('onpointermove' in el) {
+          el.dispatchEvent(build('pointermove'));
+        } else {
+          el.dispatchEvent(build('pointermove'));
+          el.dispatchEvent(build('PointerMove'));
+        }
+      });
+    };
+
+    // pointerEnter and same-coordinate pointerMove on both title and icon stay blocked.
+    fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
+    dispatchPointerMove(trigger, 300, 120);
+    fireEvent.pointerEnter(icon, { pointerType: 'mouse' });
+    dispatchPointerMove(icon, 300, 120);
+    act(() => vi.advanceTimersByTime(250));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+
+    // Real pointer movement on the icon schedules hover preview; a second move does not reset the 180ms timer.
+    dispatchPointerMove(icon, 305, 120);
+    act(() => vi.advanceTimersByTime(150));
+    dispatchPointerMove(icon, 306, 120);
+    act(() => vi.advanceTimersByTime(30));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+
+    restoreMatchMedia();
+    resetHoverPreviewGateForTests();
+    vi.useRealTimers();
+  });
+
+  it('keeps the click/keyboard expansion path explicitly accessible', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-focus" payload={{
+      taskId: 'focus-task', title: 'Keyboard task', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+    }} />);
+    const toggle = container.querySelector('.task-pair-card-toggle')!;
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    expect(toggle.getAttribute('title')).toBe('taskPair.card_expand');
+    fireEvent.click(toggle);
+    expect(container.querySelector('.task-pair-card-body')).toBeTruthy();
+  });
+
+  it('shows the task, writer, verb, new status and non-zero severity counts', () => {
+    const { container } = render(<TaskPairEventChip eventId="e1" payload={{
+      taskId: 'T42', title: 'Fix login', writer: 'deck_sub_aud', verb: 'REWORK', toStatus: 'rework',
+      severityCounts: { P0: 1, P1: 0, P2: 2, P3: 0, P4: 0 }, verdictJudgement: 'consistent', unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    expect(chip.querySelector('.task-pair-card-body')).toBeNull();
+    expect(chip.textContent).toContain('Fix login');
+    expect(chip.textContent).not.toContain('T42');
+    const toggle = chip.querySelector('.task-pair-card-toggle')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    expect(toggle.querySelector('.task-pair-card-toggle-label')).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).not.toContain('"taskId"');
+    expect((chip.querySelector('.task-pair-card-payload') as HTMLDetailsElement).open).toBe(false);
+    expect(chip.getAttribute('data-task-id')).toBe('T42');
+    expect(chip.textContent).toContain('Fix login');
+    expect(chip.textContent).toContain('taskPair.chip:{"writer":"deck_sub_aud","verb":"taskPair.verb.rework"}');
+    expect(chip.textContent).toContain('taskPair.status.rework');
+    expect(chip.textContent).toContain('taskPair.severity:{"level":"P0","count":1}');
+    expect(chip.textContent).toContain('taskPair.severity:{"level":"P2","count":2}');
+    expect(chip.textContent).toContain('taskPair.card_verdict:{"value":"consistent"}');
+    expect(chip.textContent).not.toContain('"level":"P1"');
+    expect(chip.textContent).not.toContain('taskPair.verdict_held');
+    fireEvent.click(toggle);
+    expect(chip.querySelector('.task-pair-card-body')).toBeNull();
+  });
+
+  it('labels a NEXT_ROUND event with its own verb and the resulting working status', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-next" payload={{
+      taskId: 'T9', title: 'Staged', writer: 'deck_proj_brain', verb: 'NEXT_ROUND', toStatus: 'working', deliveryRound: 2, unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
+    expect(chip.textContent).toContain('taskPair.verb.next_round');
+    expect(chip.textContent).toContain('taskPair.status.working');
+  });
+
+  it('renders the title without task id and opens labelled sessions', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    const { container } = render(<TaskPairEventChip eventId="e-label" payload={{
+      taskId: 'T7', title: 'Readable task', writer: 'brain', verb: 'DISPATCH',
+      executor: 'deck_sub_worker', executorLabel: 'Cx6', unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    const task = container.querySelector('.task-pair-chip-task')!;
+    expect(task.querySelector('strong')?.textContent).toBe('Readable task');
+    expect(task.querySelector('small')).toBeNull();
+    expect(chip.textContent).not.toContain('T7');
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    fireEvent.click(screen.getByRole('button', { name: 'Cx6 (deck_sub_worker)' }));
+    expect(navigate).toHaveBeenCalledWith('deck_sub_worker');
+    window.removeEventListener('deck:navigate', listener);
+  });
+
+  it('shows desktop identities and models without expanding and keeps them visible when expanded', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
+      { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
+      { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
+    ]} payload={{
+      taskId: 'model-task', title: 'Model task', writer: 'daemon', verb: 'WORKING', toStatus: 'working',
+      executor: 'deck_sub_exec', executorLabel: 'Executor', auditor: 'deck_sub_aud', auditorLabel: 'Auditor', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('provider/active-executor');
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"high"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"medium"}');
+  });
+
+  it('displays payload models for roles while hiding thinking levels', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-model-payload" payload={{
+      taskId: 'model-payload', title: 'Payload model', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+      executor: 'deck_exec', executorLabel: 'Executor', executorModel: 'provider/pinned', executorThinking: 'low', auditor: 'deck_aud', auditorLabel: 'Auditor', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.textContent).toContain('provider/pinned');
+    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"taskPair.card_model_unknown"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"low"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}');
+  });
+
+  it('marks a held verdict and an unusual event, and names the daemon', () => {
+    const { container } = render(<TaskPairEventChip eventId="e2" payload={{
+      taskId: 'T42', writer: 'daemon', verb: 'PASS', verdictJudgement: 'inconsistent', unusual: true,
+    }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
+    expect(chip.classList.contains('task-pair-chip--held')).toBe(true);
+    expect(chip.textContent).toContain('taskPair.verdict_held');
+    expect(chip.textContent).toContain('taskPair.unusual');
+    expect(chip.textContent).toContain('"writer":"taskPair.daemon"');
+  });
+
+  it('shows a compact locale-aware event time while keeping the exact timestamp in details', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-time" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'T-time', title: 'Timed task', writer: 'daemon', verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.querySelector('.task-pair-card-time')).toBeTruthy();
+    expect(card.querySelector('.task-pair-card-time')?.textContent).not.toContain('taskPair.card_time');
+    expect(card.querySelector('.task-pair-card-toggle')?.textContent).not.toContain('taskPair.card_expand');
+    expect(card.querySelector('.task-pair-card-body')).toBeNull();
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('_eventTimestamp');
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
+  });
+
+  it('shows a desktop notice preview immediately and the full reason after expanding', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-notice" payload={{
+      taskId: 'T-notice', title: 'Needs input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'rework',
+      noticeText: 'Needs your decision: an executor is waiting. Why: verify the exact head.', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('verify the exact head');
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('verify the exact head');
+  });
+
+  it('renders structured findings and safe fallback details in the expanded card', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-findings" payload={{
+      taskId: 'T-findings', title: 'Audit details', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      severityCounts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      auditDetails: { findings: [{ severity: 'P0', invariant: 'owner identity is preserved', location: 'src/daemon/foo.ts:42', evidence: 'reproduced on 211', proposal: 'persist server lifetime', tradeoffs: 'keep foreign-owner rejection' }], validation: 'focused test fails on base and passes on head' },
+      noticeText: 'Original auditor notice',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('P0');
+    expect(details.textContent).toContain('src/daemon/foo.ts:42');
+    expect(details.textContent).toContain('reproduced on 211');
+    expect(details.textContent).toContain('persist server lifetime');
+    expect(details.textContent).toContain('focused test fails on base');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('Original auditor notice');
+  });
+
+  it('does not invent findings when an old payload only has counts', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-old" payload={{ taskId: 'T-old', writer: 'daemon', verb: 'PASS', toStatus: 'passed', severityCounts: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 } }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-detail-line')?.textContent).toContain('taskPair.card_no_blocking');
+    expect(card.querySelectorAll('.task-pair-card-finding')).toHaveLength(0);
+  });
+
+  it('parses Chinese rework notice into findings and reasons without unavailable placeholder', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-rework-zh" payload={{
+      taskId: 'tsk_service_accept_fee_entry_fix_20261011', title: '修正接单后的费用审批入口', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      severityCounts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      noticeText: '第二轮仍REWORK：**[P0] 验收4未闭合**。21项API结果不等于新增列表、双按钮及异人审批开始的正式页面验证；多租户证据也未覆盖。\n\n已给出窄补验方案及报告更正项。已有API结果保留，不要求重跑无关套件。',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('P0');
+    expect(details.textContent).toContain('验收4未闭合');
+    expect(details.textContent).toContain('已给出窄补验方案');
+    expect(details.querySelector('.task-pair-card-details-unavailable')).toBeNull();
+  });
+
+  it('does not render empty audit details placeholder for non-verdict events like BRIEF_UPDATED', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-brief" payload={{
+      taskId: 'tsk_service_accept_fee_entry_fix_20261011', title: '修正接单后的费用审批入口', writer: 'daemon', verb: 'BRIEF_UPDATED', toStatus: 'rework',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-audit-details')).toBeNull();
+  });
+
+  it('shows a blocked note for NEEDS_INPUT and respects configured blocking levels', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-blocked" payload={{
+      taskId: 'T-blocked', title: 'Waiting for input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'awaiting_brain_decision',
+      blockedNote: 'Provide the exact audit head or choose a replacement machine.', blocking: ['P2'],
+      severityCounts: { P0: 0, P1: 0, P2: 1, P3: 0, P4: 0 },
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-audit-details')?.textContent).toContain('Provide the exact audit head');
+    expect(card.querySelector('.task-pair-card-detail-line')?.textContent).toContain('taskPair.card_reason');
+  });
+
+  it('masks POSIX and Windows private home paths in expanded summaries and hover previews', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-private-paths" payload={{
+      taskId: 'T-private-paths', title: 'Private paths', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      auditDetails: { findings: [{ severity: 'P0', evidence: 'see /Users/alice/secret and C:\\Users\\alice\\secret' }] },
+      noticeText: 'see /Users/alice/secret and /home/alice/private and C:\\Users\\alice\\private token=super-secret',
+      authorization: 'Bearer super-secret',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(180));
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.textContent).toContain('<user-home>');
+    expect(preview.textContent).not.toContain('alice');
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(140));
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('<user-home>');
+    expect(details.textContent).not.toContain('alice');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('<user-home>');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).not.toContain('alice');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).not.toContain('super-secret');
+    const payload = card.querySelector('.task-pair-card-payload pre')?.textContent ?? '';
+    expect(payload).not.toContain('super-secret');
+    expect(payload).toContain('•••');
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
+
+  it('renders split view button in expanded event chip on desktop and dispatches deck:pair-split', () => {
+    const onSplit = vi.fn();
+    const handler = (e: Event) => onSplit((e as CustomEvent).detail);
+    window.addEventListener('deck:pair-split', handler);
+    try {
+      const { container } = render(<TaskPairEventChip eventId="e-split" payload={{
+        taskId: 'task-chip-split',
+        title: 'Event Chip Task',
+        writer: 'daemon',
+        verb: 'WORKING',
+        toStatus: 'working',
+        executor: 'exec-sub-1',
+        auditor: 'audit-sub-1',
+      }} />);
+      // Initially collapsed, toggle expands
+      const toggle = container.querySelector('.task-pair-card-toggle') as HTMLButtonElement;
+      fireEvent.click(toggle);
+
+      const splitBtn = container.querySelector('.task-pair-split-btn') as HTMLButtonElement;
+      expect(splitBtn).toBeTruthy();
+      expect(splitBtn.getAttribute('aria-label')).toBe('taskPair.panel_open_split');
+
+      fireEvent.click(splitBtn);
+      expect(onSplit).toHaveBeenCalledWith({
+        taskId: 'task-chip-split',
+        title: 'Event Chip Task',
+        executor: 'exec-sub-1',
+        auditor: 'audit-sub-1',
+        action: 'open',
+      });
+    } finally {
+      window.removeEventListener('deck:pair-split', handler);
+    }
+  });
+
+  it('renders aggregate multi-pair notices with card_aggregate_title and omits unassigned executor/auditor rows across desktop, hover, and mobile', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    try {
+      for (const variant of [
+        { eventId: 'agg-flag', payload: { taskId: '__aggregate__', aggregate: true, writer: 'daemon', verb: 'NOTICE', noticeText: '2 pairs reported decision-pending: - a' } },
+        { eventId: 'agg-kept', payload: { taskId: '__workspace_kept', writer: 'daemon', verb: 'NOTICE', noticeText: 'Kept workspace digest' } },
+        { eventId: 'agg-legacy', payload: { taskId: 'pairs', writer: 'daemon', verb: 'NOTICE', noticeText: '2 pairs reported decision-pending: - a' } },
+      ]) {
+        const { container, unmount } = render(<TaskPairEventChip eventId={variant.eventId} payload={variant.payload} />);
+        expect(container.textContent).toContain('taskPair.card_aggregate_title');
+        expect(container.textContent).not.toContain('taskPair.card_untitled');
+        expect(container.querySelector('.task-pair-card-overview-roles')).toBeNull();
+        expect(container.textContent).not.toContain('taskPair.card_unassigned');
+        expect(container.querySelector('.task-pair-split-btn')).toBeNull();
+
+        fireEvent.pointerEnter(container.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+        act(() => vi.advanceTimersByTime(180));
+        const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+        expect(preview.textContent).toContain('taskPair.card_aggregate_title');
+        expect(preview.textContent).not.toContain('taskPair.card_untitled');
+        expect(preview.querySelector('.task-pair-card-hover-role')).toBeNull();
+        expect(preview.textContent).not.toContain('taskPair.card_unassigned');
+        unmount();
+      }
+
+      // Single-pair untitled card continues to fall back to card_untitled and show role rows.
+      const { container: single, unmount: unmountSingle } = render(<TaskPairEventChip eventId="single-untitled" payload={{
+        taskId: 'tsk_real_untitled', writer: 'daemon', verb: 'WORKING', toStatus: 'working',
+      }} />);
+      expect(single.textContent).toContain('taskPair.card_untitled');
+      expect(single.textContent).not.toContain('taskPair.card_aggregate_title');
+      expect(single.querySelector('.task-pair-card-overview-roles')).toBeTruthy();
+      expect(single.textContent).toContain('taskPair.card_unassigned');
+      unmountSingle();
+
+      // Mobile expanded view also omits unassigned role rows for aggregate notices while preserving them for single-pair cards.
+      const origUa = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+      Object.defineProperty(window.navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' });
+      try {
+        const { container: mobAgg, unmount: unmountMobAgg } = render(<TaskPairEventChip eventId="mob-agg" payload={{
+          taskId: '__aggregate__', aggregate: true, writer: 'daemon', verb: 'NOTICE', noticeText: '2 pairs reported decision-pending: - a',
+        }} />);
+        fireEvent.click(mobAgg.querySelector('.task-pair-card-toggle')!);
+        expect(mobAgg.querySelector('.task-pair-card-body')).toBeTruthy();
+        expect(mobAgg.textContent).toContain('taskPair.card_aggregate_title');
+        expect(mobAgg.querySelector('.task-pair-card-role')).toBeNull();
+        expect(mobAgg.textContent).not.toContain('taskPair.card_unassigned');
+        unmountMobAgg();
+
+        const { container: mobSingle } = render(<TaskPairEventChip eventId="mob-single" payload={{
+          taskId: 'tsk_mob_single', writer: 'daemon', verb: 'WORKING', toStatus: 'working',
+        }} />);
+        fireEvent.click(mobSingle.querySelector('.task-pair-card-toggle')!);
+        expect(mobSingle.querySelector('.task-pair-card-role')).toBeTruthy();
+        expect(mobSingle.textContent).toContain('taskPair.card_unassigned');
+      } finally {
+        if (origUa) Object.defineProperty(window.navigator, 'userAgent', origUa);
+        else delete (window.navigator as Navigator & { userAgent?: string }).userAgent;
+      }
+    } finally {
+      restoreMatchMedia();
+      vi.useRealTimers();
+    }
+  });
+
+  it('omits unassigned roles, suppresses duplicate notice verb, and redacts raw task ids on role-less NOTICE cards', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    try {
+      const { container, unmount } = render(<TaskPairEventChip eventId="e-notice-decision" payload={{
+        taskId: 'tsk_6a94a81d84',
+        title: 'Audit decision wait',
+        writer: 'daemon',
+        verb: 'NOTICE',
+        noticeText: 'Pair tsk_6a94a81d84 has been in in_audit for 30m (ref tsk_deadbeef01)',
+      }} />);
+
+      expect(container.querySelector('.task-pair-chip-status')?.textContent).toBe('taskPair.card_notice_status');
+      const overview = container.querySelector('.task-pair-card-overview')!;
+      expect(overview).toBeTruthy();
+      expect(overview.querySelector('.task-pair-card-event-meta')).toBeNull();
+      expect(overview.querySelector('.task-pair-card-overview-roles')).toBeNull();
+      expect(overview.textContent).not.toContain('taskPair.card_unassigned');
+      const overviewNote = overview.querySelector('.task-pair-card-overview-note')?.textContent ?? '';
+      expect(overviewNote).not.toContain('tsk_6a94a81d84');
+      expect(overviewNote).not.toContain('tsk_deadbeef01');
+      expect(overviewNote).toContain('Pair has been in in_audit for 30m');
+
+      fireEvent.pointerEnter(container.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
+      act(() => vi.advanceTimersByTime(180));
+      const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+      expect(preview).toBeTruthy();
+      expect(preview.querySelector('.task-pair-card-hover-preview-event')).toBeNull();
+      expect(preview.querySelector('.task-pair-card-hover-role')).toBeNull();
+      expect(preview.textContent).not.toContain('taskPair.card_unassigned');
+      expect(preview.textContent).not.toContain('tsk_6a94a81d84');
+      expect(preview.textContent).not.toContain('tsk_deadbeef01');
+
+      fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+      const expandedNotice = container.querySelector('.task-pair-card-notice')?.textContent ?? '';
+      expect(expandedNotice).not.toContain('tsk_6a94a81d84');
+      expect(expandedNotice).not.toContain('tsk_deadbeef01');
+      expect(expandedNotice).toContain('Pair has been in in_audit for 30m');
+      unmount();
+
+      // NOTICE with assigned role metadata still renders role rows and omits duplicate verb only when matching status.
+      const { container: roleNotice, unmount: unmountRoleNotice } = render(<TaskPairEventChip eventId="e-notice-with-roles" payload={{
+        taskId: 'tsk_role_notice',
+        title: 'Notice with roles',
+        writer: 'daemon',
+        verb: 'NOTICE',
+        executor: 'deck_sub_w1',
+        executorLabel: 'Worker 1',
+        auditor: 'none',
+        noticeText: 'Worker update',
+      }} />);
+      expect(roleNotice.querySelector('.task-pair-card-overview-roles')).toBeTruthy();
+      expect(roleNotice.textContent).toContain('Worker 1');
+      expect(roleNotice.textContent).toContain('taskPair.panel_no_audit');
+      expect(roleNotice.querySelector('.task-pair-card-overview .task-pair-card-event-meta')).toBeNull();
+      unmountRoleNotice();
+
+      // Non-NOTICE lifecycle event without assigned sessions continues showing unassigned role rows.
+      const { container: queueView, unmount: unmountQueue } = render(<TaskPairEventChip eventId="e-queue-unassigned" payload={{
+        taskId: 'tsk_queue_1',
+        title: 'Queued check',
+        writer: 'brain',
+        verb: 'QUEUE',
+        toStatus: 'queued',
+      }} />);
+      expect(queueView.querySelector('.task-pair-card-overview-roles')).toBeTruthy();
+      expect(queueView.querySelector('.task-pair-card-overview .task-pair-card-event-meta')).toBeTruthy();
+      expect(queueView.textContent).toContain('taskPair.card_unassigned');
+      unmountQueue();
+
+      // Mobile expanded view omits unassigned roles for role-less NOTICE.
+      const origUa = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+      Object.defineProperty(window.navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' });
+      try {
+        const { container: mobNotice, unmount: unmountMob } = render(<TaskPairEventChip eventId="e-mob-notice" payload={{
+          taskId: 'tsk_mob_notice',
+          title: 'Mobile notice',
+          writer: 'daemon',
+          verb: 'NOTICE',
+          noticeText: 'Pair tsk_mob_notice awaiting input',
+        }} />);
+        fireEvent.click(mobNotice.querySelector('.task-pair-card-toggle')!);
+        expect(mobNotice.querySelector('.task-pair-card-role')).toBeNull();
+        expect(mobNotice.textContent).not.toContain('taskPair.card_unassigned');
+        expect(mobNotice.querySelector('.task-pair-card-notice')?.textContent).not.toContain('tsk_mob_notice');
+        unmountMob();
+      } finally {
+        if (origUa) Object.defineProperty(window.navigator, 'userAgent', origUa);
+        else delete (window.navigator as Navigator & { userAgent?: string }).userAgent;
+      }
+    } finally {
+      vi.useRealTimers();
+      restoreMatchMedia();
+    }
+  });
+});
+
+describe('TaskPairEventChip workspace events', () => {
+  afterEach(() => cleanup());
+
+  it('tells the user where a kept deliverable was saved, or why it was not', () => {
+    const saved = render(<TaskPairEventChip eventId="w1" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED,
+      outputPath: '/home/u/proj/reports/summary.md', toStatus: 'done', unusual: false,
+    }} />);
+    fireEvent.click(saved.container.querySelector('.task-pair-card-toggle')!);
+    expect(saved.container.textContent).toContain('taskPair.output_saved:{"path":"/home/u/proj/reports/summary.md"}');
+    expect(saved.container.textContent).not.toContain('taskPair.chip');
+    cleanup();
+    const failed = render(<TaskPairEventChip eventId="w2" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED,
+      outputError: 'outside_workspace', toStatus: 'done', unusual: true,
+    }} />);
+    fireEvent.click(failed.container.querySelector('.task-pair-card-toggle')!);
+    expect(failed.container.textContent).toContain('taskPair.output_failed:{"reason":"outside_workspace"}');
+    cleanup();
+    const kept = render(<TaskPairEventChip eventId="w3" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.KEPT, toStatus: 'cancelled', unusual: true,
+    }} />);
+    fireEvent.click(kept.container.querySelector('.task-pair-card-toggle')!);
+    expect(kept.container.textContent).toContain('taskPair.workspace_kept');
+  });
+
+  it('has every workspace chip string in all seven locales', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      for (const key of ['output_saved', 'output_failed', 'workspace_removed', 'workspace_kept']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+      }
+      expect(taskPair.card_untitled, `${locale}.card_untitled`).toBeTruthy();
+      expect(taskPair.output_saved).toContain('{{path}}');
+      expect(taskPair.output_failed).toContain('{{reason}}');
+    }
+  });
+});
+describe('TaskPairStatusPanel', () => {
+  let originalMaxTouchPoints: PropertyDescriptor | undefined;
+  beforeEach(() => {
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    originalMaxTouchPoints = Object.getOwnPropertyDescriptor(window.navigator, 'maxTouchPoints');
+  });
+  afterEach(() => {
+    if (originalMaxTouchPoints) Object.defineProperty(window.navigator, 'maxTouchPoints', originalMaxTouchPoints);
+    else delete (window.navigator as Navigator & { maxTouchPoints?: number }).maxTouchPoints;
+    cleanup();
+  });
+  it('keeps the title as the headline and expands the full brief with two checklist columns', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'brief-task', title: 'Readable title', brief: '# Goal\n\nDetails **matter**.\n\n- [x][ ] Implement it', pair: { status: 'working', updatedAt: 1 } }],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="brief" />);
+    expect(screen.getByText('Readable title')).toBeTruthy();
+    expect(screen.queryByText('Details matter.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
+    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter.');
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
+    expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement it');
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
+  });
+  it('updates checklist progress live when the daemon snapshot changes', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'live-brief', title: 'Live checklist', brief: '- [ ][ ] Implement it', pair: { status: 'working', updatedAt: 1 } }],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="live-brief" />);
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('0/1 :');
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'live-brief', title: 'Live checklist', brief: '- [x][x] Implement it', pair: { status: 'working', updatedAt: 2 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :'));
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain(': 1/1');
+  });
+  it('scopes sub-window rows to its own assignments and expands its active brief by default', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [
+        { taskId: 'mine', title: 'Mine', brief: '- [x][ ] Mine it', pair: { status: 'working', executor: 'sub-window', updatedAt: 1 } },
+        { taskId: 'other', title: 'Other', brief: '- [ ][x] Other it', pair: { status: 'working', executor: 'another-session', updatedAt: 2 } },
+      ],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="sub-scope" scopeSessionId="sub-window" />);
+    expect(screen.getByText('Mine')).toBeTruthy();
+    expect(screen.queryByText('Other')).toBeNull();
+    expect(view.container.querySelector('.task-pair-brief-content')).toBeTruthy();
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
+  });
+  it('keeps all 30 pair rows in a scroll container so the last row is reachable', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: Array.from({ length: 30 }, (_, index) => ({
+        taskId: `scroll-${index}`,
+        title: `Scrollable task ${index + 1}`,
+        pair: { status: 'working', updatedAt: index + 1 },
+      })),
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="scroll" />);
+    const rows = view.container.querySelector('[data-testid="task-pair-status-rows"]') as HTMLElement | null;
+    expect(rows).toBeTruthy();
+    expect(rows?.className).toContain('task-pair-status-rows');
+    expect(view.container.querySelectorAll('.task-pair-status-row')).toHaveLength(30);
+    expect(view.container.querySelector('.task-pair-status-row .task-pair-status-sequence')?.textContent).toBe('1');
+    expect(view.container.querySelectorAll('.task-pair-status-sequence')[29]?.textContent).toBe('30');
+    expect(screen.getByText('Scrollable task 30')).toBeTruthy();
+  });
+  it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {
+    const originalMatchMedia = window.matchMedia;
+    const matchMedia = vi.fn(() => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }));
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMedia });
+    render(<TaskPairStatusPanelHost events={[]} serverId="ordinary" />);
+    expect(screen.queryByTestId('task-pair-status-panel')).toBeNull();
+    expect(matchMedia).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'host-task', title: 'Host task', pair: { status: 'working' } }] };
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot }));
+    expect(await waitFor(() => screen.getByTestId('task-pair-status-panel'))).toBeTruthy();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
+  });
+  it('renders every authoritative open pair beyond loaded chat history and buckets blocked rows for Brain', async () => {
+    const tasks = Array.from({ length: 7 }, (_, index) => ({
+      taskId: `authoritative-${index}`,
+      title: `Authoritative task ${index}`,
+      pair: {
+        status: index < 3 ? 'working' : index === 3 ? 'in_audit' : index < 6 ? 'awaiting_brain_decision' : 'queued',
+        flags: index < 3 ? [] : index < 6 ? ['blocked'] : [],
+        startedAt: 1_790_476_778_973 + index,
+        updatedAt: 1_790_476_778_973 + index,
+        executor: `executor-${index}`,
+        auditor: 'none',
+      },
+    }));
+    render(<TaskPairStatusPanelHost events={[{ eventId: 'history-only', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'history-only', title: 'History only', toStatus: 'working' } }] as never} serverId="authoritative" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks, assignments: [], authoritative: true } }));
+    await waitFor(() => expect(screen.getAllByText(/Authoritative task/)).toHaveLength(7));
+    expect(screen.getByText(/taskPair.status.awaiting_brain_decision \(2\)/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_group_queued/).textContent).toContain('(1)');
+    expect(screen.queryByText('History only')).toBeNull();
+    expect(screen.getByText(/Authoritative task 0/).parentElement?.textContent).toContain('taskPair.panel_started');
+  });
+  it('stays silent while authority is unavailable: no partial list and no covering box', async () => {
+    const { container } = render(<TaskPairStatusPanelHost events={[{ eventId: 'partial', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'partial', title: 'Partial', toStatus: 'working' } }] as never} serverId="unsupported" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true } }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
+    expect(screen.queryByText('Partial')).toBeNull();
+    expect(screen.queryByText('supervision_task_console.unsupported')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+  it('stays silent on a scope reset and shows the panel again once a fresh snapshot arrives', async () => {
+    const { container } = render(<TaskPairStatusPanelHost events={[]} serverId="unsupported-empty" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true, error: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE } }));
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true } }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'fresh', title: 'Fresh task', status: 'planned', pair: { status: 'working', round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 1 } }], assignments: [], authoritative: true } }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeTruthy());
+  });
+  it('maps authoritative decision flags while preserving pair timestamps', () => {
+    const snapshot = taskConsoleStateToPairSnapshot({
+      tasks: {
+        blocked: {
+          taskId: 'blocked', title: 'Blocked', phase: 'active', updatedAt: 200,
+          pair: { status: 'working', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 100, startedAt: 123, updatedAt: 200, brief: 'Keep this brief' },
+        },
+        done: {
+          taskId: 'done', title: 'Done', phase: 'final', updatedAt: 300,
+          pair: { status: 'done', flags: [], round: 1, blocking: [], createdAt: 100, startedAt: 100, updatedAt: 300 },
+        },
+      },
+      assignments: {},
+    } as never);
+    expect(snapshot.tasks).toHaveLength(2);
+    const blockedRow = snapshot.tasks.find((t) => t.taskId === 'blocked');
+    const doneRow = snapshot.tasks.find((t) => t.taskId === 'done');
+    expect(blockedRow?.pair.status).toBe('awaiting_brain_decision');
+    expect(blockedRow?.pair.startedAt).toBe(123);
+    expect(blockedRow?.brief).toBe('Keep this brief');
+    expect(doneRow?.pair.status).toBe('done');
+  });
+  it('does not resurrect terminal rows whose historical flags still request Brain attention and caps recent terminal rows at 20 while keeping all open rows', () => {
+    const snapshot = taskConsoleStateToPairSnapshot({
+      tasks: Object.fromEntries(TASK_PAIR_TERMINAL_STATUSES.map((status, index) => [status, {
+        taskId: status,
+        title: `${status} history`,
+        phase: 'final',
+        updatedAt: 300 + index,
+        pair: {
+          status,
+          flags: ['blocked', 'needs_input'],
+          round: 1,
+          blocking: ['P0'],
+          createdAt: 100,
+          startedAt: 100,
+          updatedAt: 300 + index,
+        },
+      }])),
+      assignments: {},
+    } as never);
+    expect(snapshot.tasks.map((t) => [t.taskId, t.pair.status])).toEqual([
+      ['cancelled', 'cancelled'],
+      ['done', 'done'],
+    ]);
+
+    // Stale blocked/needs_input flags on terminal rows never inflate active counts, and panel starts with Recent collapsed
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { ...snapshot, serverId: 'terminal-flags' };
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="terminal-flags" />);
+      expect(container.querySelector('.task-pair-status-panel')).toBeTruthy();
+      expect(container.querySelector('.task-pair-chip--awaiting_brain_decision')?.textContent).toContain('(0)');
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentDetails).toBeTruthy();
+      expect(recentDetails!.open).toBe(false);
+      expect(recentDetails!.querySelector('summary h4')?.textContent).toContain('(2)');
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      cleanup();
+    }
+
+    // 25 terminal rows + 3 open rows -> keeps all 3 open rows + newest 20 terminal rows
+    const manyTasks: Record<string, unknown> = {};
+    for (let i = 1; i <= 3; i += 1) {
+      manyTasks[`open-${i}`] = {
+        taskId: `open-${i}`,
+        title: `Open ${i}`,
+        phase: 'active',
+        updatedAt: 100 + i,
+        pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], createdAt: 100, startedAt: 100, updatedAt: 100 + i, executor: 'deck_exec_s1', auditor: 'deck_aud_s1' },
+      };
+    }
+    for (let i = 1; i <= 25; i += 1) {
+      manyTasks[`term-${i}`] = {
+        taskId: `term-${i}`,
+        title: `Term ${i}`,
+        phase: 'final',
+        updatedAt: 1000 + i * 10,
+        pair: { status: i % 2 === 0 ? 'cancelled' : 'done', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 500, startedAt: 500, updatedAt: 1000 + i * 10, endedAt: 1000 + i * 10, executor: 'deck_exec_s1', auditor: 'none' },
+      };
+    }
+    const capped = taskConsoleStateToPairSnapshot({ tasks: manyTasks, assignments: {} } as never);
+    expect(capped.tasks.slice(0, 3).map((t) => t.taskId)).toEqual(['open-1', 'open-2', 'open-3']);
+    const recentIds = capped.tasks.slice(3).map((t) => t.taskId);
+    expect(recentIds).toHaveLength(20);
+    expect(recentIds[0]).toBe('term-25');
+    expect(recentIds[19]).toBe('term-6');
+    expect(recentIds).not.toContain('term-5');
+
+    // scopeSessionId filtering still displays up to 20 scoped recent rows collapsed by default
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { ...capped, serverId: 'scoped-20' };
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="scoped-20" scopeSessionId="deck_exec_s1" />);
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentDetails).toBeTruthy();
+      expect(recentDetails!.open).toBe(false);
+      expect(recentDetails!.querySelector('summary h4')?.textContent).toContain('(20)');
+      expect(recentDetails!.querySelectorAll('.task-pair-status-row')).toHaveLength(20);
+      recentDetails!.open = true;
+      expect(recentDetails!.open).toBe(true);
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      cleanup();
+    }
+  });
+  it('clears the prior scope snapshot before the next authoritative sync', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'old-scope', title: 'Old scope', pair: { status: 'working' } }] };
+    render(<TaskPairStatusPanelHost events={[]} serverId="scope-a" />);
+    expect(screen.getByText('Old scope')).toBeTruthy();
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey: 'scope-b' } }));
+    await waitFor(() => expect(screen.queryByText('Old scope')).toBeNull());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'new-scope', title: 'New scope', pair: { status: 'working' } }], assignments: [], authoritative: true } }));
+    expect(await waitFor(() => screen.getByText('New scope'))).toBeTruthy();
+  });
+  it('clears historical compact rows when the authoritative active snapshot is empty', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'stale', title: 'Stale history', pair: { status: 'awaiting_brain_decision', flags: [] } }],
+      assignments: [],
+      authoritative: true,
+    };
+    const { container } = render(<TaskPairStatusPanelHost events={[]} serverId="active-empty" />);
+    expect(screen.getByText('Stale history')).toBeTruthy();
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+      detail: { tasks: [], assignments: [], authoritative: true },
+    }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
+    expect(screen.queryByText('Stale history')).toBeNull();
+  });
+  it('shows "round N in progress" for a working pair in a later delivery round instead of a passed/plain working label', () => {
+    const at = Date.now();
+    const events = [
+      { eventId: 'nr-1', type: 'task_pair.event', ts: at - 2000, payload: { taskId: 'nr', title: 'Staged task', toStatus: 'passed', round: 1, blocking: ['P0'] } },
+      { eventId: 'nr-2', type: 'task_pair.event', ts: at - 1000, payload: { taskId: 'nr', title: 'Staged task', toStatus: 'working', round: 1, deliveryRound: 2, blocking: ['P0'] } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="next-round" />);
+    const row = container.querySelector('[data-status="working"]')!;
+    expect(row).toBeTruthy();
+    expect(row.textContent).toContain('taskPair.panel_round_in_progress:{"round":2}');
+    expect(row.textContent).not.toContain('taskPair.status.passed');
+    expect(row.textContent).not.toContain('taskPair.status.working');
+    expect(container.querySelector('[data-status="passed"]')).toBeNull();
+    // The audit-round chip names both numbers so the two rounds are never confused.
+    expect(row.textContent).toContain('taskPair.panel_round_of:{"delivery":2,"audit":1}');
+  });
+
+  it('keeps the ordinary first-round rendering: plain working label and the audit-round chip only', () => {
+    const events = [{ eventId: 'r1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'r1', title: 'One round', toStatus: 'working', round: 2, blocking: ['P0'] } }] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="first-round" />);
+    const row = container.querySelector('[data-status="working"]')!;
+    expect(row.textContent).toContain('taskPair.status.working');
+    expect(row.textContent).toContain('taskPair.panel_round:{"round":2}');
+    expect(row.textContent).not.toContain('panel_round_in_progress');
+    expect(row.textContent).not.toContain('panel_round_of');
+  });
+
+  it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
+    const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    const originalWidth = window.innerWidth;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: (query: string) => ({ matches: query.includes('max-width'), media: query, addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 500 });
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="layout" />);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    cleanup();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    render(<TaskPairStatusPanel events={events} serverId="layout" />);
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:layout:mobile')).toBeNull();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth });
+  });
+
+  it('treats a phone user agent as mobile even when the viewport is wider than the breakpoint', () => {
+    const events = [{ eventId: 'wide-phone', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'wide-phone', title: 'Wide phone', toStatus: 'working' } }] as never;
+    const originalMatch = window.matchMedia;
+    const originalUa = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window.navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36' });
+    try {
+      window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:wide-phone:mobile');
+      const { container } = render(<TaskPairStatusPanel events={events} serverId="wide-phone" />);
+      const panel = container.querySelector('.task-pair-status-panel');
+      expect(panel?.classList.contains('is-mobile')).toBe(true);
+      expect(panel?.classList.contains('is-collapsed')).toBe(true);
+      expect(container.querySelector('.task-pair-status-collapse-icon')).toBeNull();
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatch });
+      if (originalUa) Object.defineProperty(window.navigator, 'userAgent', originalUa);
+      else delete (window.navigator as { userAgent?: string }).userAgent;
+    }
+  });
+
+  it('uses the mobile compact strip as the only expand control and keeps collapse visible when expanded', () => {
+    const events = [{ eventId: 'mobile-compact', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-compact', title: 'Mobile task', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="mobile-compact" />);
+    const compact = container.querySelector('.task-pair-status-compact') as HTMLElement | null;
+    expect(compact?.tagName).toBe('DIV');
+    expect(container.querySelector('button.task-pair-status-toggle')).toBeNull();
+    expect(compact?.getAttribute('role')).toBe('button');
+    expect(compact?.getAttribute('aria-label')).toContain('taskPair.panel_expand');
+    // Owner rule: the collapsed mobile strip has no separate expand arrow.
+    expect(compact?.querySelector('.task-pair-status-collapse-icon')).toBeNull();
+
+    fireEvent.click(compact!);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    expect(screen.getByRole('button', { name: /taskPair\.panel_collapse/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+
+    const compactAgain = container.querySelector('.task-pair-status-compact') as HTMLElement;
+    fireEvent.keyDown(compactAgain, { key: 'Enter' });
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    fireEvent.keyDown(container.querySelector('.task-pair-status-compact') as HTMLElement, { key: ' ' });
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('mobile: an expanded panel is bounded to the measured chat area; when almost nothing is left it presents the strip without touching the stored choice', async () => {
+    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working', executor: 'sub-fit' } }] as never;
+    const originalMedia = window.matchMedia;
+    const originalRaf = window.requestAnimationFrame;
+    const originalObserver = globalThis.ResizeObserver;
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const frames: FrameRequestCallback[] = [];
+    window.requestAnimationFrame = ((callback: FrameRequestCallback) => { frames.push(callback); return frames.length; }) as never;
+    let resize: (() => void) | undefined;
+    globalThis.ResizeObserver = class { constructor(cb: () => void) { resize = cb; } observe() {} disconnect() {} unobserve() {} } as never;
+    const viewport = { offsetTop: 0, height: 844, addEventListener: () => {}, removeEventListener: () => {} };
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    window.localStorage.setItem(collapsedStorageKey('fit-server', true), '0');
+    const rect = (top: number, bottom: number) => ({ top, bottom, left: 0, right: 390, width: 390, height: bottom - top, x: 0, y: top, toJSON: () => ({}) }) as DOMRect;
+    const main = document.createElement('div'); main.className = 'chat-main';
+    const titlebar = document.createElement('div'); titlebar.className = 'chat-titlebar';
+    main.appendChild(titlebar); document.body.appendChild(main);
+    let mainBottom = 600;
+    main.getBoundingClientRect = () => rect(0, mainBottom);
+    titlebar.getBoundingClientRect = () => rect(40, 80);
+    const flush = async () => { const pending = frames.splice(0); await waitFor(() => { pending.forEach((cb) => cb(0)); }); };
+    try {
+      render(<TaskPairStatusPanel events={events} serverId="fit-server" scopeSessionId="sub-fit" />, { container: titlebar });
+      const panel = () => titlebar.querySelector('.task-pair-status-panel') as HTMLElement;
+      expect(panel().classList.contains('is-collapsed')).toBe(false);
+      expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);
+
+      mainBottom = 120; // e.g. software keyboard / a tiny sub-window: < 96px usable
+      resize?.();
+      await flush();
+      await waitFor(() => expect(panel().classList.contains('is-collapsed')).toBe(true));
+      expect(titlebar.querySelector('.task-pair-status-rows')).toBeNull();
+      expect(window.localStorage.getItem(collapsedStorageKey('fit-server', true))).toBe('0');
+
+      mainBottom = 600; // keyboard closes: the user's stored (expanded) choice returns
+      resize?.();
+      await flush();
+      await waitFor(() => expect(panel().classList.contains('is-collapsed')).toBe(false));
+      expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);
+    } finally {
+      cleanup();
+      main.remove();
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMedia });
+      window.requestAnimationFrame = originalRaf;
+      globalThis.ResizeObserver = originalObserver;
+      if (originalViewport) Object.defineProperty(window, 'visualViewport', originalViewport);
+      else delete (window as { visualViewport?: unknown }).visualViewport;
+    }
+  });
+
+  it('portals the collapsed mobile status into the pinned-message header row', async () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const titlebar = document.createElement('div');
+    const pin = document.createElement('button');
+    pin.dataset.testid = 'pinned-message-control';
+    titlebar.append(pin);
+    document.body.append(titlebar);
+    const events = [{ eventId: 'mobile-inline', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-inline', title: 'Inline task', toStatus: 'working' } }] as never;
+    render(<TaskPairStatusPanelHost events={events} serverId="mobile-inline" mobileAnchor={titlebar} />);
+    await waitFor(() => expect(titlebar.querySelector('.task-pair-status-panel')).toBeTruthy());
+    const panel = titlebar.querySelector('.task-pair-status-panel')!;
+    expect(panel.classList.contains('is-mobile')).toBe(true);
+    expect(panel.classList.contains('is-collapsed')).toBe(true);
+    expect(titlebar.querySelector('[data-testid="pinned-message-control"]')?.nextElementSibling).toBe(panel);
+    expect(panel.querySelector('.task-pair-status-mobile-label')).toBeTruthy();
+    expect(panel.querySelector('.task-pair-status-collapse-icon')).toBeNull();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('keeps the mobile status in the equivalent header row when no pinned message exists', async () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const titlebar = document.createElement('div');
+    document.body.append(titlebar);
+    const events = [{ eventId: 'mobile-header', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-header', title: 'Header task', toStatus: 'working' } }] as never;
+    render(<TaskPairStatusPanelHost events={events} serverId="mobile-header" mobileAnchor={titlebar} />);
+    await waitFor(() => expect(titlebar.querySelector('.task-pair-status-panel')).toBeTruthy());
+    expect(titlebar.children).toHaveLength(1);
+    expect(titlebar.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('uses a stored layout preference and labels the visible collapse control', () => {
+    const events = [{ eventId: 'layout-stored', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-stored', title: 'Stored', toStatus: 'working' } }] as never;
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:stored:desktop', '1');
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="stored" />);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    expect(screen.getByRole('button', { name: /panel_expand.*panel_title/ })).toBeTruthy();
+  });
+
+  it('closes only from the collapse control and ignores Escape/outside taps on both layouts', () => {
+    const events = [{ eventId: 'close-persist', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'close-persist', title: 'Close', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:close:desktop');
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:close:mobile');
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const { container, unmount } = render(<TaskPairStatusPanel events={events} serverId="close" />);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.pointerDown(document.body);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    unmount();
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    render(<TaskPairStatusPanel events={events} serverId="close" />);
+    const compact = document.querySelector('.task-pair-status-compact') as HTMLElement;
+    fireEvent.click(compact);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.pointerDown(document.body);
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+  it('renders four compact status icons when collapsed, highlights Brain decisions, and scopes persistence per server', () => {
+    window.localStorage.clear();
+    const events = [
+      { eventId: 'compact-working', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-w', title: 'Working', toStatus: 'working' } },
+      { eventId: 'compact-audit', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-a', title: 'Audit', toStatus: 'in_audit' } },
+      { eventId: 'compact-queue', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-q', title: 'Queued', toStatus: 'queued' } },
+      { eventId: 'compact-brain', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-b', title: 'Decision', toStatus: 'awaiting_brain_decision' } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="server-a" />);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    const icons = container.querySelectorAll('.task-pair-status-icon');
+    expect(icons).toHaveLength(4);
+    expect(container.querySelector('.task-pair-status-icon--awaiting.is-highlighted')).toBeTruthy();
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-a:desktop')).toBe('1');
+    cleanup();
+    render(<TaskPairStatusPanel events={events} serverId="server-b" />);
+    expect(document.querySelector('.task-pair-status-icons')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-b:desktop')).toBe('1');
+  });
+
+  it('groups live pair state, keeps counts while collapsed, and persists collapse', () => {
+    const events = [
+      { eventId: 'p1', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'T1', title: 'Build panel', toStatus: 'working', executor: 'deck_sub_w', executorLabel: 'Cx6', round: 1 } },
+      { eventId: 'p2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'T2', title: 'Audit panel', toStatus: 'in_audit', auditor: 'deck_sub_a', auditorLabel: 'CC2', round: 2 } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText('Build panel')).toBeTruthy();
+    expect(screen.getByText('Cx6')).toBeTruthy();
+    expect(screen.getByText('CC2')).toBeTruthy();
+    expect(screen.queryByText('Cx6 (deck_sub_w)')).toBeNull();
+    expect(screen.queryByText('CC2 (deck_sub_a)')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(screen.queryByText('Build panel')).toBeNull();
+    expect(container.querySelector('.task-pair-status-icons')).toBeTruthy();
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:desktop')).toBe('1');
+  });
+
+  it('shows queued pairs in queue order with assignment fallback and urgency', () => {
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed');
+    const events = [
+      { eventId: 'q1', type: 'task_pair.event', ts: Date.now() - 5_000, payload: { taskId: 'Q1', title: 'Urgent queued', toStatus: 'queued', queuePosition: 1, urgent: true, executor: 'deck_sub_e', executorLabel: 'Cx6' } },
+      { eventId: 'q2', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'Q2', title: 'Second queued', toStatus: 'queued', queuePosition: 2 } },
+    ] as never;
+    render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText(/Urgent queued/)).toBeTruthy();
+    expect(screen.getByText(/Second queued/)).toBeTruthy();
+    expect(screen.getByText('Cx6')).toBeTruthy();
+    expect(screen.getAllByText(/taskPair.panel_unassigned/).length).toBeGreaterThan(0);
+    expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('shows a one-based rework count when the audit round is still zero', () => {
+    const events = [{
+      eventId: 'rework-1', type: 'task_pair.event', ts: Date.now() - 100,
+      payload: { taskId: 'RW1', title: 'Needs rework', toStatus: 'rework', verb: 'REWORK', round: 0 },
+    }, {
+      eventId: 'rework-2', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'RW1', title: 'Needs rework', toStatus: 'rework', verb: 'REWORK', round: 0 },
+    }] as never;
+    render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText('taskPair.panel_rework_count:{"count":2}')).toBeTruthy();
+    expect(screen.queryByText(/rework_round.*0/)).toBeNull();
+    expect(screen.queryByText(/taskPair.panel_round/)).toBeNull();
+  });
+
+  it('shows unassigned roles with requested models and no audit for auditor=none', () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'queued-models', type: 'task_pair.event', ts: Date.now(),
+      payload: {
+        taskId: 'Q-models', title: 'Queued models', toStatus: 'queued', queuePosition: 1,
+        executorModel: 'gpt-6-luna', auditorModel: 'gpt-6-sol', auditor: undefined,
+      },
+    }, {
+      eventId: 'queued-none', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'Q-none', title: 'Queued no audit', toStatus: 'queued', auditor: 'none', executorModel: 'gpt-6-luna' },
+    }] as never} />);
+    expect(screen.getAllByText(/taskPair\.panel_unassigned/).length).toBe(3);
+    expect(screen.getAllByText(/gpt-6-luna/).length).toBe(2);
+    expect(screen.getByText(/gpt-6-sol/)).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
+  });
+
+  it('renders an authoritative console snapshot even when chat history has no pair events', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'S1', title: 'Snapshot task', updatedAt: Date.now(), pair: { status: 'queued', createdAt: Date.now() - 4_000, executor: 'deck_sub_e', urgent: true, queueOrder: 1 } }],
+      assignments: [{ taskId: 'S1', role: 'implementer', ownerSessionName: 'deck_sub_e', ownerSessionLabel: 'Cx6', sessionState: 'running' }],
+    } }));
+    await waitFor(() => expect(screen.getByText('Snapshot task')).toBeTruthy());
+    expect(screen.getByText('Cx6')).toBeTruthy();
+    expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('renders a terminal snapshot as done and freezes its elapsed duration', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    try {
+      render(<TaskPairStatusPanel events={[{
+        eventId: 'stale-rework', type: 'task_pair.event', ts: 10_000,
+        payload: { taskId: 'terminal-1', title: 'Finished pair', toStatus: 'rework', round: 1 },
+      }] as never} />);
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+        tasks: [{ taskId: 'terminal-1', title: 'Finished pair', updatedAt: 15_000, pair: { status: 'done', createdAt: 5_000, startedAt: 6_000, updatedAt: 15_000 } }],
+        assignments: [],
+      } }));
+      await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+      const meta = document.querySelector('[data-status="done"] .task-pair-status-row-meta')!;
+      const before = meta.textContent;
+      vi.advanceTimersByTime(30_000);
+      await waitFor(() => expect(meta.textContent).toBe(before));
+      expect(screen.queryByText(/panel_rework_count/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies a live authoritative DONE snapshot over the prior row without waiting for chat history', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'live-done', title: 'Live finish', updatedAt: 10_000, pair: { status: 'rework', createdAt: 1_000, startedAt: 2_000, updatedAt: 10_000 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="rework"]')).toBeTruthy());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'live-done', title: 'Live finish', updatedAt: 12_000, pair: { status: 'done', createdAt: 1_000, startedAt: 2_000, updatedAt: 12_000 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-status="done"]')).toBeTruthy();
+      expect(document.querySelector('[data-status="rework"]')).toBeNull();
+    });
+  });
+
+  it('ignores an out-of-order non-terminal full snapshot after a terminal row', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'ordered-snapshot', title: 'Ordered snapshot', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'ordered-snapshot', title: 'Ordered snapshot', updatedAt: 90, pair: { status: 'rework', createdAt: 10, startedAt: 20, updatedAt: 90 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-status="done"]')).toBeTruthy();
+      expect(document.querySelector('[data-status="rework"]')).toBeNull();
+    });
+  });
+
+  it('replaces a stale row when reconnect resync delivers the authoritative snapshot', async () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'stale', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'resync-1', title: 'Resync pair', toStatus: 'rework' },
+    }] as never} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'resync-1', title: 'Resync pair', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+    expect(document.querySelector('[data-status="rework"]')).toBeNull();
+  });
+
+  it('renders the complete title without exposing the task id in metadata', () => {
+    const title = 'A deliberately long task title that must remain fully readable';
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'title-only', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'secret-id', title, toStatus: 'working' },
+    }] as never} />);
+    expect(screen.getByText(title)).toBeTruthy();
+    expect(screen.queryByText(/secret-id/)).toBeNull();
+  });
+
+  it('resolves a missing payload label from the watch session store', () => {
+    watchProjectionStore.updateFromSessionList(
+      { id: 'server-test', name: 'Test', baseUrl: 'http://test' },
+      [{ name: 'deck_sub_store', project: 'p', role: 'w1', agentType: 'codex', state: 'running', label: 'Store Cx' }],
+    );
+    try {
+      render(<TaskPairStatusPanel events={[{
+        eventId: 'store-label', type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: 'store-task', title: 'Store label', toStatus: 'working', executor: 'deck_sub_store' },
+      }] as never} />);
+      expect(screen.getByText('Store Cx')).toBeTruthy();
+      expect(screen.queryByText('deck_sub_store')).toBeNull();
+      expect(document.querySelector('[data-session-name="deck_sub_store"]')).toBeTruthy();
+    } finally {
+      watchProjectionStore.setSnapshotStatus('switching');
+    }
+  });
+
+  it('shows live names and models, keeps exact routing ids, and navigates roles', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    render(<TaskPairStatusPanel sessions={[{ name: 'deck_sub_exec', label: 'Cx1', requestedModel: 'gpt-6-luna' }, { name: 'deck_sub_aud', label: 'Auditor', activeModel: 'gpt-6-astra' }]} events={[{
+      eventId: 'models', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'model-task', title: 'Models', toStatus: 'working', executor: 'deck_sub_exec', executorLabel: 'Executor', executorModel: 'gpt-6-sol', auditor: 'deck_sub_aud' },
+    }] as never} />);
+    expect(screen.getByText('Cx1')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
+    expect(screen.getByText('gpt-6-sol')).toBeTruthy();
+    expect(screen.getByText('gpt-6-astra')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /Cx1.*gpt-6-sol/ }));
+    expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
+    window.removeEventListener('deck:navigate', listener);
+  });
+
+  it('does not show thinking levels or unknown-thinking placeholders', () => {
+    render(<TaskPairStatusPanel sessions={[
+      { name: 'deck_sub_exec', label: 'Executor', activeModel: 'provider/executor', effort: 'high' },
+      { name: 'deck_sub_aud', label: 'Auditor', requestedModel: 'provider/auditor' },
+    ]} events={[{
+      eventId: 'thinking-panel', type: 'task_pair.event', ts: Date.now(),
+      payload: {
+        taskId: 'thinking-panel-task', title: 'Thinking panel', toStatus: 'working',
+        executor: 'deck_sub_exec', auditor: 'deck_sub_aud',
+      },
+    }] as never} />);
+    expect(screen.queryByText(/taskPair.card_thinking/)).toBeNull();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
+  });
+
+  it('uses localized neutral role fallbacks when labels are missing', () => {
+    render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
+    expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
+  });
+
+  const readCss = () => {
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    return readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+  };
+  const cssRule = (css: string, selector: string) =>
+    new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+
+  it('shrinks a collapsed titlebar panel to its strip instead of keeping the expanded height', () => {
+    const css = readCss();
+    const desktop = cssRule(css, '.chat-titlebar > .task-pair-status-panel.is-collapsed');
+    expect(desktop).toMatch(/height:\s*auto/);
+    expect(desktop).toMatch(/max-height:\s*none/);
+    const mobile = css.slice(css.indexOf('@media (max-width: 720px)'));
+    expect(cssRule(mobile, '.task-pair-status-panel.is-collapsed')).toMatch(/height:\s*auto/);
+    expect(cssRule(mobile, '.chat-titlebar > .task-pair-status-panel.is-collapsed')).toMatch(/height:\s*auto/);
+  });
+
+  it('keeps the collapsed mobile strip borderless and no taller than the titlebar line', () => {
+    const css = readCss();
+    // Keyed on .is-mobile, not a width query: wide mobile WebViews must match too.
+    const mobile = css.slice(0, css.indexOf('@media (max-width: 720px) {\n  .task-pair-status-panel {'));
+    const container = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed');
+    expect(container).toMatch(/border:\s*0/);
+    expect(container).toMatch(/background:\s*transparent/);
+    expect(container).toMatch(/box-shadow:\s*none/);
+    const strip = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact');
+    expect(strip).toMatch(/min-height:\s*0/);
+    expect(strip).not.toMatch(/min-height:\s*44px/);
+    expect(strip).not.toMatch(/border:\s*1px/);
+  });
+
+  it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
+    const css = readCss();
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    expect(panelRule).toMatch(/bottom:\s*0/);
+    expect(panelRule).toMatch(/display:\s*flex/);
+    expect(panelRule).toMatch(/flex-direction:\s*column/);
+    const rowsRule = cssRule(css, '.task-pair-status-rows');
+    expect(rowsRule).toMatch(/flex:\s*1/);
+    expect(rowsRule).toMatch(/min-height:\s*0/);
+    expect(rowsRule).toMatch(/overflow-y:\s*auto/);
+    expect(rowsRule).not.toMatch(/max-height/);
+  });
+
+  it('anchors the expanded panel to chat-main and reserves scroll room for the final row', () => {
+    const css = readCss();
+    const directPanel = /\.chat-main > \.task-pair-status-panel:not\(\.is-collapsed\) \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(directPanel).toMatch(/top:\s*40px/);
+    expect(directPanel).toMatch(/bottom:\s*0/);
+    expect(directPanel).toMatch(/height:\s*auto/);
+    expect(directPanel).toMatch(/max-height:\s*none/);
+    const rowsRule = cssRule(css, '.task-pair-status-rows');
+    expect(rowsRule).toMatch(/scroll-padding-bottom:\s*16px/);
+    expect(rowsRule).toMatch(/padding:\s*0 8px 16px/);
+  });
+
+  it('starts below the sidebar toolbar cluster instead of z-index-stacking over it (which would still block its clicks)', () => {
+    const css = readCss();
+    // .chat-top-actions floats at top:6px, its tallest button is 24px, and the
+    // count badge extends 4px above that -- roughly y=2..30. The panel must
+    // start at or below that band so the toolbar's buttons stay reachable
+    // (an overlapping panel, even with header padding to clear the *text*,
+    // still intercepts clicks meant for the toolbar underneath it).
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    const topOffset = /top:\s*(\d+)px/.exec(panelRule)?.[1];
+    expect(Number(topOffset)).toBeGreaterThanOrEqual(34);
+  });
+
+  it('keeps the desktop collapsed toolbar in titlebar flow while expanding below controls', () => {
+    const css = readCss();
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*static/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*margin:\s*0 0 0 auto/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*100%/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
+    // Mobile expanded rules bound the height by the measured chat area (--task-pair-panel-max-h, see
+    // task-pair-panel-fit.ts); the viewport-relative value survives as the fallback inside var().
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.65\)/);
+  });
+
+  it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {
+    const css = readCss();
+    const rootVars = new Set(
+      [...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]),
+    );
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    const background = /background:\s*([^;]+);/.exec(panelRule)?.[1] ?? '';
+    expect(background).toBeTruthy();
+    // Every var(--x, ...) reference in the background must resolve: either
+    // --x itself is a defined :root token, or its fallback chain bottoms out
+    // at one. A var() with no defined property anywhere in the chain (like
+    // the retired --panel-bg / --surface-2 pair) computes to nothing, which
+    // silently makes the whole declaration (and therefore the background)
+    // transparent -- exactly the bug this guards against.
+    const varRefs = [...background.matchAll(/var\(\s*(--[\w-]+)/g)].map((match) => match[1].slice(2));
+    expect(varRefs.length).toBeGreaterThan(0);
+    for (const name of varRefs) expect(rootVars.has(name)).toBe(true);
+  });
+
+  it('renders every group -- including a tall rework group -- so the list can scroll to reach it, never dropping rows from the DOM', () => {
+    const events = [
+      { eventId: 'w1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W1', title: 'Working one', toStatus: 'working', executor: 'deck_sub_w1' } },
+      { eventId: 'w2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W2', title: 'Working two', toStatus: 'working', executor: 'deck_sub_w2' } },
+      { eventId: 'w3', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W3', title: 'Working three', toStatus: 'working', executor: 'deck_sub_w3' } },
+      { eventId: 'r1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'R1', title: 'Needs rework', toStatus: 'rework', executor: 'deck_sub_r1', round: 2 } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} />);
+    // Not clipped away by MAX_ROWS or any render-time truncation -- only CSS
+    // (overflow-y: auto on .task-pair-status-rows, asserted above) is
+    // responsible for keeping this reachable by scrolling instead of visible.
+    expect(container.querySelector('.task-pair-status-group-working')).toBeTruthy();
+    expect(container.querySelector('.task-pair-status-group-rework')).toBeTruthy();
+    expect(screen.getByText('Needs rework')).toBeTruthy();
+  });
+
+  it('keeps the header total in sync with the sum of every rendered group -- including rework', () => {
+    const events = [
+      { eventId: 'c1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C1', title: 'A', toStatus: 'working' } },
+      { eventId: 'c2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C2', title: 'B', toStatus: 'working' } },
+      { eventId: 'c3', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C3', title: 'C', toStatus: 'rework' } },
+      { eventId: 'c4', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C4', title: 'D', toStatus: 'in_audit' } },
+      { eventId: 'c5', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C5', title: 'E', toStatus: 'queued', queuePosition: 1 } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} />);
+    // 'working' + 'rework' both count toward the header's "working" bucket.
+    expect(screen.getByText('taskPair.panel_count_working:{"count":3}')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_audit:{"count":1}')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_queued:{"count":1}')).toBeTruthy();
+    const groupCount = (key: string) => Number(container.querySelector(`.task-pair-status-group-${key} small`)?.textContent?.replace(/[()]/g, '') ?? 0);
+    expect(groupCount('working') + groupCount('rework')).toBe(3);
+    expect(groupCount('audit')).toBe(1);
+    expect(groupCount('queued')).toBe(1);
+  });
+
+  it('shows a non-clickable "no audit needed" label for auditor=none instead of a dangling session button', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[{
+        eventId: 'no-audit', type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: 'NA1', title: 'Solo task', toStatus: 'working', executor: 'deck_sub_solo', auditor: 'none' },
+      }] as never} />);
+      expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
+      const buttons = [...container.querySelectorAll('.task-pair-status-session')];
+      expect(buttons).toHaveLength(1);
+      expect(buttons[0].getAttribute('data-session-name')).toBe('deck_sub_solo');
+      fireEvent.click(screen.getByText('taskPair.panel_no_audit'));
+      expect(navigate).not.toHaveBeenCalledWith('none');
+    } finally {
+      window.removeEventListener('deck:navigate', listener);
+    }
+  });
+
+  it('gives every card the same task-pair-chip--STATUS class its badge uses, so both share one colour token instead of a duplicated palette', () => {
+    for (const toStatus of TASK_PAIR_STATUSES) {
+      const { container } = render(<TaskPairStatusPanel events={[{
+        eventId: `badge-${toStatus}`, type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: `B-${toStatus}`, title: 'Badge task', toStatus, executor: 'deck_sub_b' },
+      }] as never} />);
+      const row = container.querySelector('.task-pair-status-row')!;
+      expect(row.classList.contains(`task-pair-chip--${toStatus}`), toStatus).toBe(true);
+      const badge = row.querySelector('.task-pair-status-badge')!;
+      expect(badge.classList.contains(`task-pair-chip--${toStatus}`), toStatus).toBe(true);
+      cleanup();
+    }
+  });
+
+  it('replaces the retired single-string header counts with three separate status badges', () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'header-badges', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'HB1', title: 'Header badges', toStatus: 'working' },
+    }] as never} />);
+    expect(screen.getByText(/taskPair.panel_count_working/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_audit/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_queued/)).toBeTruthy();
+    expect(screen.queryByText(/taskPair.panel_counts(?!:)/)).toBeNull();
+  });
+
+  it('derives the panel width, .chat-view padding-right, and the pinned "last sent" margin-right from one shared token, so they can never drift apart again', () => {
+    const css = readCss();
+    const varRef = (rule: string) => /var\(\s*(--[\w-]+)/.exec(rule)?.[1];
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    // Both the panel's own max-width and its min()-clamped width must read the
+    // same token as .chat-view and the last-sent banner below -- a flat
+    // literal (or a different vw-based formula) here is exactly the bug this
+    // guards against: the panel and its neighbours silently disagreeing on
+    // how wide the panel actually renders.
+    expect(varRef(/max-width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
+    expect(varRef(/width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
+    const chatViewRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-view \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const lastSentRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-pinned-last-sent \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const scrollBtnRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(varRef(chatViewRule)).toBe('--task-pair-panel-width');
+    expect(varRef(lastSentRule)).toBe('--task-pair-panel-width');
+    expect(varRef(scrollBtnRule)).toBe('--task-pair-panel-width');
+    expect(scrollBtnRule).toContain('calc(var(--task-pair-panel-width) + 12px)');
+    expect(scrollBtnRule).toContain('calc(100% - 48px)');
+
+    // Collapsed, mobile-fullscreen, and mobile media query reset .chat-scroll-btn back to right: 12px.
+    const collapsedScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\.is-collapsed\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const mobileFullscreenScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\.is-mobile\.is-fullscreen\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(collapsedScrollBtn).toMatch(/right:\s*12px\s*;/);
+    expect(mobileFullscreenScrollBtn).toMatch(/right:\s*12px\s*;/);
+
+    const scrollBtnOffsetIdx = css.indexOf('.chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn');
+    const mobileBlockStart = css.indexOf('@media (max-width: 720px)', scrollBtnOffsetIdx);
+    expect(mobileBlockStart).toBeGreaterThan(scrollBtnOffsetIdx);
+    const mobileCss = css.slice(mobileBlockStart);
+    const mobileScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-scroll-btn \{([^}]*)\}/.exec(mobileCss)?.[1] ?? '';
+    expect(mobileScrollBtn).toMatch(/right:\s*12px\s*;/);
+
+    const rootVars = new Set([...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]));
+    expect(rootVars.has('task-pair-panel-width')).toBe(true);
+  });
+
+  it('has every new badge/count-count i18n key in all seven locales, and no leftover panel_counts key', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      for (const key of ['panel_count_working', 'panel_count_audit', 'panel_count_queued']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+        expect(taskPair[key], `${locale}.${key}`).toContain('{{count}}');
+      }
+      for (const key of ['panel_icon_working', 'panel_icon_audit', 'panel_icon_queued', 'panel_icon_awaiting_brain', 'panel_rework_count']) expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+      expect(taskPair.panel_counts, `${locale}.panel_counts should be removed`).toBeUndefined();
+    }
+  });
+
+  it('renders split view toggle button on desktop for tasks with executor and auditor and dispatches deck:pair-split', () => {
+    localStorage.setItem(collapsedStorageKey({ serverId: 's1', mobile: false }), 'false');
+    const onSplit = vi.fn();
+    const handler = (e: Event) => onSplit((e as CustomEvent).detail);
+    window.addEventListener('deck:pair-split', handler);
+    try {
+      const events = [
+        {
+          id: 'e1',
+          type: TASK_PAIR_TIMELINE_EVENT,
+          payload: {
+            taskId: 'task-split-1',
+            title: 'Split View Task',
+            verb: 'WORKING',
+            toStatus: 'working',
+            executor: 'exec-sub',
+            auditor: 'audit-sub',
+          },
+        },
+        {
+          id: 'e2',
+          type: TASK_PAIR_TIMELINE_EVENT,
+          payload: {
+            taskId: 'task-no-audit',
+            title: 'No Audit Task',
+            verb: 'WORKING',
+            toStatus: 'working',
+            executor: 'exec-sub',
+            auditor: 'none',
+          },
+        },
+      ];
+      const { container } = render(<TaskPairStatusPanel events={events as any} serverId="s1" />);
+      const rows = container.querySelectorAll('.task-pair-status-row');
+      expect(rows.length).toBe(2);
+
+      // Row 1 has both executor and auditor -> split button exists
+      const splitBtn = rows[0].querySelector('.task-pair-split-btn') as HTMLButtonElement;
+      expect(splitBtn).toBeTruthy();
+      expect(splitBtn.textContent).toContain('taskPair.panel_open_split');
+
+      // Row 2 has auditor='none' -> split button must NOT exist
+      const splitBtn2 = rows[1].querySelector('.task-pair-split-btn');
+      expect(splitBtn2).toBeNull();
+
+      // Clicking split button dispatches deck:pair-split
+      fireEvent.click(splitBtn);
+      expect(onSplit).toHaveBeenCalledWith({
+        taskId: 'task-split-1',
+        title: 'Split View Task',
+        executor: 'exec-sub',
+        auditor: 'audit-sub',
+        action: 'open',
+      });
+
+      // Closing belongs to the split windows' titlebars, not this card.
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: 'task-split-1' } }));
+      });
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+      });
+      expect(rows[0].querySelector('.task-pair-split-btn')?.textContent).toContain('taskPair.panel_open_split');
+    } finally {
+      window.removeEventListener('deck:pair-split', handler);
+      localStorage.clear();
+    }
+  });
+
+  it('leaves closing an active split to the titlebar instead of the expanded event body', () => {
+    const { container } = render(<TaskPairEventChip eventId="split-titlebar" payload={{
+      taskId: 'task-split-header', title: 'Split', verb: 'WORKING', toStatus: 'working',
+      executor: 'exec-sub', auditor: 'audit-sub',
+    }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', {
+      detail: { activeTaskId: 'task-split-header' },
+    })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeNull();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+  });
+
+  it('orders visible sequence badges consistently with resolveOrderedTaskPairRows, keeps auditor=none numbered, and puts shortcut hint on split buttons', () => {
+    localStorage.setItem(collapsedStorageKey('s1', false), 'false');
+    try {
+      const snapshot = {
+        authoritative: true,
+        serverId: 's1',
+        tasks: [
+          { taskId: 't-queued-2', title: 'Queued second', status: 'queued', updatedAt: 10, pair: { status: 'queued', queuePosition: 2, executor: 'exec-1', auditor: 'audit-1' } },
+          { taskId: 't-no-audit', title: 'No auditor task', status: 'working', updatedAt: 20, pair: { status: 'working', executor: 'exec-2', auditor: 'none' } },
+          { taskId: 't-working-1', title: 'Working task', status: 'working', updatedAt: 30, pair: { status: 'working', executor: 'exec-3', auditor: 'audit-3' } },
+          { taskId: 't-queued-1', title: 'Queued first', status: 'queued', updatedAt: 40, pair: { status: 'queued', queuePosition: 1, executor: 'exec-4', auditor: 'audit-4' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      const ordered = resolveOrderedTaskPairRows({ snapshot, events: [], serverId: 's1' });
+      expect(ordered.map((r) => r.payload.taskId)).toEqual(['t-no-audit', 't-working-1', 't-queued-1', 't-queued-2']);
+
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="s1" />);
+      const rows = [...container.querySelectorAll('.task-pair-status-row')];
+      expect(rows.map((row) => row.querySelector('.task-pair-status-sequence')?.textContent)).toEqual(['1', '2', '3', '4']);
+      expect(rows.map((row) => row.querySelector('.task-pair-status-row-title')?.textContent)).toEqual([
+        'No auditor task',
+        'Working task',
+        '#1 Queued first',
+        '#2 Queued second',
+      ]);
+      // Row 1 has auditor='none' so no split button, while rows 2..4 show shortcut hints with their sequence numbers
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      expect(rows[1].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('2');
+      expect(rows[2].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('3');
+      expect(rows[3].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('4');
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      localStorage.clear();
+    }
+  });
+
+  it('has panel_open_split and panel_close_split i18n keys across all seven locales', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      expect(taskPair.panel_open_split, `${locale}.panel_open_split`).toBeTruthy();
+      expect(taskPair.panel_close_split, `${locale}.panel_close_split`).toBeTruthy();
+    }
+  });
+});
+
+describe('formatElapsedDuration', () => {
+  const en = { day: 'd', hour: 'h', minute: 'm', second: 's', separator: ' ' };
+  const zh = { day: '天', hour: '小时', minute: '分', second: '秒', separator: '' };
+  it.each([
+    [0, '0s'], [59, '59s'], [60, '1m 0s'], [3599, '59m 59s'],
+    [3600, '1h 0m'], [86_399, '23h 59m'], [86_400, '1d 0h'],
+  ])('formats %s seconds in English', (seconds, expected) => {
+    expect(formatElapsedDuration(seconds, en)).toBe(expected);
+  });
+  it.each([
+    [0, '0秒'], [59, '59秒'], [60, '1分0秒'], [3599, '59分59秒'],
+    [3600, '1小时0分'], [86_399, '23小时59分'], [86_400, '1天0小时'],
+  ])('formats %s seconds in Simplified Chinese', (seconds, expected) => {
+    expect(formatElapsedDuration(seconds, zh)).toBe(expected);
+  });
+});
+
+describe('TaskPairEventChip status colours', () => {
+  afterEach(() => cleanup());
+  const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+  const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+  /** The `--task-pair-status-text` value a status class sets, e.g. `var(--status-pass-text)`. */
+  const statusTextToken = (status: string): string | undefined => {
+    const rule = new RegExp(`\\.task-pair-chip--${status} \\{([^}]*)\\}`).exec(css)?.[1];
+    return /--task-pair-status-text:\s*([^;]+);/.exec(rule ?? '')?.[1]?.trim();
+  };
+
+  it('gives every pair status its own class and its own colour', () => {
+    for (const status of TASK_PAIR_STATUSES) {
+      const { container } = render(<TaskPairEventChip eventId={`e-${status}`} payload={{ taskId: 'T1', writer: 'w', verb: 'WORKING', toStatus: status }} />);
+      const chip = container.querySelector('.task-pair-chip')!;
+      expect(chip.classList.contains(`task-pair-chip--${status}`), status).toBe(true);
+      expect(chip.getAttribute('data-task-status')).toBe(status);
+      cleanup();
+    }
+    const tokens = TASK_PAIR_STATUSES.map((status) => statusTextToken(status));
+    expect(tokens.every(Boolean), JSON.stringify(tokens)).toBe(true);
+    expect(new Set(tokens).size).toBe(TASK_PAIR_STATUSES.length);
+  });
+
+  it('shows PASS and REWORK in the shared verdict colours, not the same one', () => {
+    expect(statusTextToken('passed')).toBe('var(--status-pass-text)');
+    expect(statusTextToken('rework')).toBe('var(--status-rework-text)');
+    // The same tokens drive the peer-audit verdict pill, so one verdict has one colour.
+    expect(css).toContain('.peer-audit-result-outcome--pass { border-color: var(--status-pass-border); color: var(--status-pass-text); }');
+    expect(css).toContain('.peer-audit-result-outcome--rework { border-color: var(--status-rework-border); color: var(--status-rework-text); }');
+  });
+
+  it('uses the dark-tech theme for participant chips and every status badge', () => {
+    const chipRule = /\.task-pair-event-card \.task-pair-chip-session\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(chipRule).toContain('background: rgba(8, 20, 36, 0.86);');
+    expect(chipRule).toContain('border: 1px solid rgba(125, 211, 252, 0.3);');
+    expect(css).toContain('.task-pair-event-card .task-pair-chip-session:focus-visible');
+    expect(css).toContain('.task-pair-card-hover-preview {');
+    expect(css).toContain('position: fixed;');
+    expect(css).toContain('overflow-wrap: anywhere;');
+    expect(css).toContain('.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong');
+    expect(css).toContain('text-overflow: ellipsis;');
+    for (const status of TASK_PAIR_STATUSES) {
+      const rule = new RegExp(`\\.task-pair-chip--${status} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+      expect(rule, `${status} should define a themed background`).toContain('--task-pair-status-bg:');
+    }
+  });
+
+  it('clamps long task-card titles to two lines and reveals the full text when expanded', () => {
+    const longTitle = 'P0：时间线出站队列在正常负载下触发背压，并逐帧发送 secure://remote.example/'
+      + 'a'.repeat(96)
+      + ' 🔒 混合文本';
+    const view = render(<>
+      <TaskPairEventChip eventId="e-long-a" payload={{ taskId: 'long-a', title: longTitle, verb: 'PASS', toStatus: 'passed' }} />
+      <TaskPairEventChip eventId="e-long-b" payload={{ taskId: 'long-b', title: '第二张卡片也应独立折叠', verb: 'REWORK', toStatus: 'rework' }} />
+    </>);
+    const cards = view.container.querySelectorAll('.task-pair-event-card');
+    expect(cards).toHaveLength(2);
+    const firstTitle = cards[0]!.querySelector('.task-pair-chip-task strong')!;
+    expect(firstTitle.textContent).toBe(longTitle);
+    const rule = /\.task-pair-event-card:not\(\.is-expanded\) \.task-pair-chip-task strong\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(rule).toContain('display: -webkit-box;');
+    expect(rule).toContain('-webkit-line-clamp: 2;');
+    expect(rule).toContain('line-clamp: 2;');
+    expect(rule).toContain('white-space: normal;');
+    expect(rule).toContain('overflow-wrap: anywhere;');
+    fireEvent.click(cards[0]!.querySelector('.task-pair-card-toggle')!);
+    expect(cards[0]!.classList.contains('is-expanded')).toBe(true);
+    expect(firstTitle.textContent).toBe(longTitle);
+    expect(cards[1]!.classList.contains('is-expanded')).toBe(false);
+  });
+
+  it('keeps event metadata ahead of the title so flex wrapping moves the title as one unit', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-layout" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'layout-task', title: 'A long title that may move to the second row', writer: 'daemon',
+      verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const toggle = container.querySelector('.task-pair-card-toggle')!;
+    const children = [...toggle.children] as HTMLElement[];
+    expect(children.map((child) => child.className)).toEqual([
+      'task-pair-card-heading', 'task-pair-card-meta', 'task-pair-chip-task',
+    ]);
+    expect(children[0]!.querySelector('.task-pair-card-kicker')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-chip-status')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-card-time')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-card-chevron')).toBeTruthy();
+    expect(children[2]!.querySelector('strong')?.textContent).toContain('A long title');
+    const toggleRule = /\.task-pair-card-toggle\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const titleRule = /\.task-pair-event-card \.task-pair-chip-task\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const metaRule = /\.task-pair-card-meta\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(toggleRule).toContain('flex-wrap: wrap;');
+    expect(titleRule).toContain('order: 3;');
+    expect(titleRule).toContain('min-width: min(100%, 12rem);');
+    expect(metaRule).toContain('order: 2;');
+    expect(metaRule).toContain('margin-left: auto;');
+  });
+
+  it('adds no status class to an event that changed no status', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-none" payload={{ taskId: '-', writer: 'w', verb: 'BOGUS' }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    expect([...chip.classList].some((name) => /^task-pair-chip--(?!held|unusual)/.test(name))).toBe(false);
+  });
+
+  it('uses safe fallbacks for empty titles, unknown statuses and unassigned roles', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-fallback" payload={{
+      taskId: 'x'.repeat(160), title: '   ', verb: 'BOGUS', toStatus: 'future_status', unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-event-card')!;
+    expect(chip.textContent).toContain('taskPair.card_untitled');
+    expect(chip.textContent).not.toContain('x'.repeat(160));
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
+    expect(chip.textContent).toContain('taskPair.card_unknown_status');
+    expect(chip.textContent).toContain('taskPair.card_unassigned');
+    expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');
+    expect(chip.getAttribute('data-task-id')).toHaveLength(160);
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).not.toContain('x'.repeat(160));
+  });
+
+  it('overrides the chat-system centering rule so every card body remains left aligned', () => {
+    const rule = /\.task-pair-event-card\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(rule).toContain('text-align: left;');
+    expect(rule).toContain('width: 100%;');
+    expect(rule).toContain('max-width: 100%;');
+  });
+
+  it('keeps cancelled as data status and never treats the chevron as a cancel action', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-cancelled" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'cancelled-task', title: 'Cancelled task', writer: 'daemon', verb: 'CANCEL', toStatus: 'cancelled', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const toggle = card.querySelector('.task-pair-card-toggle')!;
+    expect(card.getAttribute('data-task-status')).toBe('cancelled');
+    expect(card.querySelector('.task-pair-chip-status')?.textContent).toContain('taskPair.status.cancelled');
+    expect(card.querySelector('.task-pair-card-time')?.textContent).not.toContain('taskPair.card_time');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    fireEvent.click(toggle);
+    expect(card.getAttribute('data-task-status')).toBe('cancelled');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
+    expect(card.querySelector('[data-cancel-provenance="true"]')).toBeTruthy();
+    expect(card.textContent).toContain('taskPair.card_cancel_reason:');
+    expect(card.textContent).toContain('taskPair.card_cancel_reason_unknown');
+    expect(card.textContent).toContain('taskPair.card_cancel_actor:');
+    expect(card.textContent).toContain('taskPair.card_cancel_source:');
+    expect(card.textContent).toContain('taskPair.card_cancel_unknown');
+  });
+
+  it('shows explicit cancellation provenance and keeps other lifecycle events free of cancel details', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-cancel-detail" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'cancel-detail', title: 'Handoff verification', writer: 'deck_pairsproj_brain', role: 'brain',
+      verb: 'CANCEL', source: 'marker', cancelActor: 'deck_pairsproj_brain', cancelSource: 'marker',
+      cancelReason: 'User requested cancellation', toStatus: 'cancelled', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const provenance = card.querySelector('[data-cancel-provenance="true"]')!;
+    expect(provenance.textContent).toContain('deck_pairsproj_brain');
+    expect(provenance.textContent).toContain('User requested cancellation');
+    expect(provenance.textContent).toContain('taskPair.cancel_source.marker');
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
+    cleanup();
+    const { container: passContainer } = render(<TaskPairEventChip eventId="e-pass-no-cancel" payload={{
+      taskId: 'passed', writer: 'auditor', verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const pass = passContainer.querySelector('.task-pair-event-card')!;
+    fireEvent.click(pass.querySelector('.task-pair-card-toggle')!);
+    expect(pass.querySelector('[data-cancel-provenance="true"]')).toBeNull();
+    expect(pass.getAttribute('data-task-status')).toBe('passed');
+  });
+
+  it('keeps all cancellation provenance labels present in every supported locale', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const sourceKeys = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue', 'mcp', 'daemon'];
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, any> }).taskPair;
+      for (const key of ['card_cancel_actor', 'card_cancel_source', 'card_cancel_reason', 'card_cancel_reason_unknown', 'card_cancel_unknown']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+      }
+      expect(taskPair.card_cancel_reason).toContain('{{value}}');
+      for (const source of sourceKeys) expect(taskPair.cancel_source?.[source], `${locale}.cancel_source.${source}`).toBeTruthy();
+    }
+  });
+
+  it('renders compact overview on desktop without increasing height, while keeping mobile collapsed overview null and accessible on expansion', () => {
+    // 1. Cancelled event with cancelReason, roles, and models on desktop
+    const { container: cancelView } = render(<TaskPairEventChip eventId="e-mobile-cancel" payload={{
+      taskId: 'cancel-m', title: 'Cancelled boundary', writer: 'daemon',
+      verb: 'CANCEL', toStatus: 'cancelled',
+      executor: 'deck_sub_w1', executorLabel: 'Worker', executorModel: 'gpt-6.1-sol',
+      auditor: 'deck_sub_a1', auditorLabel: 'Auditor', auditorModel: 'MiniMax-M3',
+      cancelReason: 'Explicit cancel reason for boundary check',
+    }} />);
+    const cancelOverview = cancelView.querySelector('.task-pair-card-overview')!;
+    expect(cancelOverview).toBeTruthy();
+    expect(cancelOverview.textContent).toContain('Worker');
+    expect(cancelOverview.textContent).toContain('gpt-6.1-sol');
+    expect(cancelOverview.textContent).toContain('Auditor');
+    expect(cancelOverview.textContent).toContain('MiniMax-M3');
+    expect(cancelOverview.textContent).toContain('Explicit cancel reason for boundary check');
+    expect(cancelOverview.querySelector('.task-pair-card-overview-note')?.getAttribute('title')).toBe('Explicit cancel reason for boundary check');
+    cleanup();
+
+    // 2. Active working event with notice text and auditor='none'
+    const { container: noticeView } = render(<TaskPairEventChip eventId="e-notice-none" payload={{
+      taskId: 'notice-none', title: 'Notice with no auditor', writer: 'daemon',
+      verb: 'WORKING', toStatus: 'working',
+      executor: 'deck_sub_w2', executorLabel: 'SoloWorker', executorModel: 'claude-3-7-sonnet',
+      auditor: 'none',
+      noticeText: 'A concise notice for compact chip display',
+    }} />);
+    const noticeOverview = noticeView.querySelector('.task-pair-card-overview')!;
+    expect(noticeOverview).toBeTruthy();
+    expect(noticeOverview.textContent).toContain('SoloWorker');
+    expect(noticeOverview.textContent).toContain('taskPair.panel_no_audit');
+    expect(noticeOverview.textContent).toContain('A concise notice for compact chip display');
+    cleanup();
+
+    // 3. Role with unassigned auditor and long model title
+    const { container: unassignedView } = render(<TaskPairEventChip eventId="e-unassigned" payload={{
+      taskId: 'unassigned-aud', title: 'Unassigned check', writer: 'brain',
+      verb: 'DISPATCH', toStatus: 'queued',
+      executor: 'deck_sub_w3', executorModel: 'anthropic/claude-3-7-sonnet-20250219-thought',
+      auditor: undefined,
+    }} />);
+    const unassignedOverview = unassignedView.querySelector('.task-pair-card-overview')!;
+    expect(unassignedOverview).toBeTruthy();
+    expect(unassignedOverview.textContent).toContain('taskPair.card_unassigned');
+    expect(unassignedOverview.querySelector('.task-pair-card-role-model')?.getAttribute('title')).toBe('anthropic/claude-3-7-sonnet-20250219-thought');
+  });
+});
+
+describe('TaskPairSettingsSection', () => {
+  afterEach(() => cleanup());
+
+  it('retires the supervision engine selector and edits max parallel pairs from default 5', () => {
+    let value: TaskPairSettingsValue = {};
+    const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+    render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+    expect(screen.queryByTestId('task-pair-engine')).toBeNull();
+    expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('5');
+    expect(screen.queryByTestId(/task-pair-allowlist-row-/)).toBeNull();
+
+    fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
+    expect(value.pairMaxConcurrency).toBe(8);
+  });
+
+  it('transparently preserves hidden pairEngine values when updating max parallel pairs', () => {
+    for (const persistedEngine of ['pairs', 'legacy'] as const) {
+      cleanup();
+      let value: TaskPairSettingsValue = { pairEngine: persistedEngine, pairMaxConcurrency: 3 };
+      const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+      render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+      expect(screen.queryByTestId('task-pair-engine')).toBeNull();
+
+      fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '6' } });
+      expect(onChange).toHaveBeenCalledWith({ pairEngine: persistedEngine, pairMaxConcurrency: 6 });
+    }
+  });
+});
+
+
+describe('Pair concrete event actions', () => {
+  afterEach(cleanup);
+  it.each(['SEND', 'TITLE', 'MATERIAL', 'CHECKLIST_AUTO_TICK', 'BRAIN_RESOLVED', 'DECISION', 'DECISION_REQUEST', 'BRIEF_UPDATED', 'IMPORT', 'CORRECT', 'CLAIM', 'CHECK'])('labels known %s instead of a generic record', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="action" payload={{ taskId: 'action-task', title: 'Action title', verb, toStatus: 'working' }} />);
+    expect(container.querySelector('.task-pair-card-overview > .task-pair-card-event-meta')?.textContent).toBe(`taskPair.verb.${verb.toLowerCase()}`);
+  });
+  it.each([undefined, null, 17, {}, 'FUTURE_EVENT'])('omits unknown %j action rows without losing state or safe diagnostics', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="unknown" payload={{ taskId: 'action-task', title: 'Kept title', verb, toStatus: 'rework', writer: 'daemon', executor: 'exec-real', executorLabel: 'Executor', executorModel: 'model-x', noticeText: 'Safe reason', password: 'private-secret' }} />);
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    expect(container.textContent).toContain('Kept title');
+    expect(container.textContent).toContain('taskPair.status.rework');
+    const toggle = container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    act(() => toggle.focus());
+    fireEvent.keyDown(toggle, { key: 'ArrowDown' });
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.querySelector('.task-pair-card-hover-preview-event')).toBeNull();
+    expect(preview.textContent).toContain('exec-real');
+    fireEvent.click(toggle);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    const raw = container.querySelector('.task-pair-card-payload pre')!.textContent!;
+    expect(raw).toContain('Safe reason');
+    expect(raw).not.toContain('private-secret');
+    expect(container.textContent).not.toContain('taskPair.verb.other');
+  });
+  it('normalizes legacy case, omits missing writers, and preserves ordinary verdict status', () => {
+    const { container } = render(<TaskPairEventChip eventId="legacy" payload={{ taskId: 'legacy', title: 'Legacy title', verb: ' pAsS ', toStatus: 'passed' }} />);
+    expect(container.querySelector('.task-pair-card-event-meta')!.textContent).toBe('taskPair.verb.pass');
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')!.textContent).toBe('taskPair.verb.pass');
+    expect(container.textContent).toContain('taskPair.status.passed');
+  });
+  it('does not infer a removed workspace from an unknown effect', () => {
+    const { container } = render(<TaskPairEventChip eventId="future-workspace" payload={{ taskId: 'future', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: 'future_workspace_effect', toStatus: 'working' }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelector('.task-pair-card-event-meta')).toBeNull();
+    expect(container.querySelector('.task-pair-card-payload pre')!.textContent).toContain('future_workspace_effect');
+  });
+  it.each(Object.values(TASK_PAIR_WORKSPACE_EFFECTS))('uses an explicit action for workspace %s', (effect) => {
+    const { container } = render(<TaskPairEventChip eventId="workspace-action" payload={{ taskId: 'workspace', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect }} />);
+    const label = container.querySelector('.task-pair-card-event-meta')!.textContent!;
+    expect(label).not.toContain('taskPair.verb.other');
+    expect(label).not.toBe('');
+  });
+});
+
+
+describe('standard Pair verb translations', () => {
+  for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+    it.each(TASK_PAIR_VERBS)(`${locale} has a concrete label for %s`, (verb) => {
+      const web = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+      const taskPair = JSON.parse(readFileSync(join(web, 'src/i18n/locales', `${locale}.json`), 'utf8')).taskPair;
+      expect(taskPair.verb[verb.toLowerCase()]).toBeTruthy();
+    });
+  }
+});
+
+describe('intentional title-only Pair preview', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('matchMedia', (media: string) => ({ matches: media.includes('hover: hover'), media, addEventListener() {}, removeEventListener() {} }));
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+  const payload = { taskId:'title-only', title:'Intentional preview', verb:'CHECK', toStatus:'working', executor:'canonical-exec', auditor:'canonical-audit' };
+  it.each(['.task-pair-event-card','.task-pair-card-kicker','.task-pair-chip-status','.task-pair-card-time','.task-pair-card-role','.task-pair-card-chevron','.task-pair-card-overview'])('non-title %s never starts a preview', selector => {
+    const {container}=render(<TaskPairEventChip eventId="title-only" timestamp={1700000000000} payload={payload} />);
+    fireEvent.pointerEnter(container.querySelector(selector)!,{pointerType:'mouse'});
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('ordinary toggle focus never opens a preview', () => {
+    const {container}=render(<TaskPairEventChip eventId="mouse-focus" payload={payload} />);
+    act(()=>container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!.focus());
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps title→portal operations usable and closes after mouse leaves even after a click', () => {
+    const navigate=vi.fn();window.addEventListener('deck:navigate',navigate);
+    const {container}=render(<TaskPairEventChip eventId="handoff" payload={payload} />);
+    const title=container.querySelector('.task-pair-title-preview-trigger')!;
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(100));
+    fireEvent.pointerLeave(title);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    fireEvent.keyDown(window,{key:'Escape'});
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    const preview=document.body.querySelector('.task-pair-card-hover-preview')!;
+    fireEvent.pointerLeave(title);fireEvent.pointerEnter(preview);act(()=>vi.advanceTimersByTime(200));
+    expect(document.body.contains(preview)).toBe(true);
+    const role=preview.querySelector<HTMLButtonElement>('.task-pair-chip-session')!;
+    act(()=>role.focus());fireEvent.click(role);
+    expect(navigate.mock.calls[0][0].detail.session).toBe('canonical-exec');
+    fireEvent.pointerLeave(preview);act(()=>vi.advanceTimersByTime(140));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    window.removeEventListener('deck:navigate',navigate);
+  });
+  it('uses one existing tab stop with deliberate keyboard preview, Escape return and normal expansion', () => {
+    const {container}=render(<TaskPairEventChip eventId="keyboard-preview" payload={payload} />);
+    const toggle=container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    expect(toggle.querySelector('button,[tabindex]')).toBeNull();
+    expect(toggle.getAttribute('aria-keyshortcuts')).toBe('ArrowDown');
+    expect(toggle.getAttribute('aria-description')).toContain('taskPair.card_preview_hint');
+    act(()=>toggle.focus());fireEvent.keyDown(toggle,{key:'ArrowDown'});
+    const preview=document.body.querySelector<HTMLElement>('.task-pair-card-hover-preview')!;
+    expect(document.activeElement).toBe(preview);
+    fireEvent.keyDown(preview,{key:'Escape'});act(()=>vi.advanceTimersByTime(500));
+    expect(document.activeElement).toBe(toggle);
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(toggle);fireEvent.keyDown(toggle,{key:'ArrowDown'});act(()=>vi.advanceTimersByTime(500));
+    expect(container.querySelector('.task-pair-card-body')).toBeTruthy();
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('cancels pending opens on expansion, event replacement and unmount', () => {
+    const view=render(<TaskPairEventChip eventId="pending-1" payload={payload} />);
+    const enter=()=>fireEvent.pointerEnter(view.container.querySelector('.task-pair-title-preview-trigger')!,{pointerType:'mouse'});
+    enter();fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);enter();
+    view.rerender(<TaskPairEventChip eventId="pending-2" payload={{...payload,taskId:'other'}} />);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    enter();view.unmount();act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps a translated preview hint in all seven locales', () => {
+    const root=process.cwd().endsWith('/web')?process.cwd():join(process.cwd(),'web');
+    for(const locale of ['en','zh-CN','zh-TW','ja','ko','es','ru']) {
+      const d=JSON.parse(readFileSync(join(root,'src/i18n/locales',`${locale}.json`),'utf8'));
+      expect(d.taskPair.card_preview_hint).toBeTruthy();
+    }
+  });
+
+});
+
+describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
+  function fakeWs() {
+    const handlers = new Set<(message: unknown) => void>();
+    const sent: any[] = [];
+    return {
+      sent,
+      ws: {
+        send: (message: object) => { sent.push(message); },
+        onMessage: (handler: (message: unknown) => void) => {
+          handlers.add(handler);
+          return () => { handlers.delete(handler); };
+        },
+      } as any,
+      emit: (message: unknown) => {
+        for (const handler of [...handlers]) handler(message);
+      },
+      latestSubscribe: () => [...sent].reverse().find((frame) => frame.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE),
+    };
+  }
+
+  function snapshotPayload(input: {
+    subscriptionId: string;
+    projectName: string;
+    coordinatorSessionName: string;
+    tasks: Array<{ taskId: string; title: string; status?: string; executor?: string; updatedAt?: number }>;
+    projectionVersion?: number;
+    pairRevision?: number;
+  }) {
+    return {
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: input.subscriptionId,
+      scope: { projectName: input.projectName, coordinatorSessionName: input.coordinatorSessionName },
+      schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+      statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+      projectionVersion: input.projectionVersion ?? 1,
+      lastDurableEventId: 10,
+      projectionEpoch: 'epoch-1',
+      pairRevision: input.pairRevision ?? 0,
+      generatedAt: 1_000,
+      tasks: input.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        status: 'implementing',
+        phase: 'active',
+        validationState: 'pending',
+        updatedAt: task.updatedAt ?? 1_000,
+        lastEventId: 10,
+        pair: {
+          status: task.status ?? 'working',
+          flags: [],
+          round: 0,
+          blocking: ['P0'],
+          executor: task.executor ?? 'deck_sub_exec',
+          auditor: 'deck_sub_aud',
+          createdAt: 500,
+          startedAt: 600,
+          updatedAt: task.updatedAt ?? 1_000,
+        },
+      })),
+      assignments: [],
+      pools: [],
+    };
+  }
+
+  beforeEach(() => {
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  it('recovers warm cached server/tab tasks and sub-session titles immediately on switch without scopeReset flash, then reconciles on SYNCED', async () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+
+      // Unvisited scope emits scopeReset before first live snapshot.
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      const subA = mock.latestSubscribe();
+      expect(subA).toBeTruthy();
+
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          tasks: [{ taskId: 'tsk-a1', title: 'Server A Task', executor: 'deck_sub_a', updatedAt: 1_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+
+      // Switch to uncached Server B: emits scopeReset, hides Server A tasks immediately.
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-b"
+            projectName="proj-b"
+            coordinatorSessionName="deck_b_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-b" />
+          <SubSessionTaskTitle sessionName="deck_sub_b" serverId="srv-b" fallback="Fallback B" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(screen.getByText('Fallback B')).toBeTruthy();
+
+      const subB = mock.latestSubscribe();
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subB.subscriptionId,
+          projectName: 'proj-b',
+          coordinatorSessionName: 'deck_b_brain',
+          tasks: [{ taskId: 'tsk-b1', title: 'Server B Task', executor: 'deck_sub_b', updatedAt: 1_100 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server B Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server B Task');
+
+      // Switch BACK to Server A while live WS hasn't answered yet: instant warm recovery with NO scopeReset!
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.cached === true && entry?.serverId === 'srv-a')).toBe(true);
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+      expect(screen.queryByText('Server B Task')).toBeNull();
+
+      // Background live SYNCED update arrives: updates finished/new rows smoothly.
+      const subA2 = mock.latestSubscribe();
+      expect(subA2.scope.projectName).toBe('proj-a');
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA2.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          projectionVersion: 2,
+          pairRevision: 1,
+          tasks: [{ taskId: 'tsk-a2', title: 'Server A Live Followup', status: 'in_audit', executor: 'deck_sub_a', updatedAt: 2_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Live Followup');
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Live Followup');
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
+
+  it('never leaks rows across servers that share identical projectName and coordinatorSessionName', () => {
+    const mock = fakeWs();
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-1', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server One',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-2', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server Two',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 5_000,
+            lastEventId: 1,
+            pair: { status: 'in_audit', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 5_000 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-1"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-1" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server One')).toBeTruthy();
+
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-2"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-2" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server Two')).toBeTruthy();
+    expect(screen.queryByText('Only On Server One')).toBeNull();
+  });
+
+  it('hydrates persisted cache immediately on cold mount before WS exists and hides cleanly if daemon later reports UNAVAILABLE', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-cold', projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' };
+    writeSupervisionTaskConsoleCache(auth, {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 2,
+      tasks: {
+        cold: {
+          taskId: 'cold',
+          title: 'Persisted Task Across Reload',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_500,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_cold', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_500 },
+        },
+      },
+    });
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Persisted Task Across Reload');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Persisted Task Across Reload');
+
+    // Now WS connects and daemon responds UNAVAILABLE -> hides panel & title and clears cache.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' },
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+        retryable: true,
+      });
+    });
+
+    expect(screen.queryByText('Persisted Task Across Reload')).toBeNull();
+    expect(screen.getByText('Cold Fallback')).toBeTruthy();
+  });
+
+  it('clears previous tab tasks immediately when switching to a cached empty scope without emitting scopeReset', () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 1,
+          tasks: {
+            t1: {
+              taskId: 't1',
+              title: 'Tab One Task',
+              status: 'implementing',
+              phase: 'active',
+              validationState: 'pending',
+              updatedAt: 1_000,
+              lastEventId: 1,
+              pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+            },
+          },
+        },
+      );
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 0,
+          tasks: {},
+        },
+      );
+
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-nonempty"
+            coordinatorSessionName="deck_tab_1"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(screen.getByText('Tab One Task')).toBeTruthy();
+
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-empty"
+            coordinatorSessionName="deck_tab_2"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.authorityUnavailable === true)).toBe(false);
+      expect(screen.queryByText('Tab One Task')).toBeNull();
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
+
+  it('replaces panel rows across different project/coordinator/user scopes on the same server even when taskId matches and target updatedAt is older', async () => {
+    // F1 exact counterexample: same serverId, different project/coordinator, identical taskId `tsk_shared`,
+    // where Project A has newer updatedAt=9_000 and Project B has older updatedAt=1_000.
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 5,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project A Private Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 5,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 100, startedAt: 100, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 2,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project B Target Task',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 1_000,
+            lastEventId: 2,
+            pair: { status: 'in_audit', flags: [], round: 1, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'deck_sub_2', createdAt: 50, startedAt: 50, updatedAt: 1_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-2', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'User 2 Target Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 500,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 500 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-a"
+          coordinatorSessionName="deck_a_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project A Private Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project A Private Task');
+
+    // Switch to Project B (older updatedAt=1_000, same serverId, same taskId): must replace Project A row immediately.
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project B Target Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project B Target Task');
+    expect(screen.queryByText('Project A Private Task')).toBeNull();
+
+    // Switch user on the exact same server/project/coordinator -> must replace with User 2's row (updatedAt=500).
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Target Task');
+    expect(screen.queryByText('Project B Target Task')).toBeNull();
+
+    // Live WS SYNCED on User 2 updates smoothly while keeping same-scope stale packet protection.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 9,
+        lastDurableEventId: 9,
+        projectionEpoch: 'ep-u2',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_shared',
+          title: 'User 2 Live Synced',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 9,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+
+    // Same-scope older timestamp synthetic packet must still be ignored by anti-reorder guard.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-same',
+          authorityScopeKey: 'user-2\u0000srv-same\u0000proj-b\u0000deck_b_brain',
+          authoritative: true,
+          tasks: [{ taskId: 'tsk_shared', title: 'Stale Out-Of-Order Packet', updatedAt: 100, pair: { status: 'working', updatedAt: 100 } }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+    expect(screen.queryByText('Stale Out-Of-Order Packet')).toBeNull();
+  });
+
+  it('drops structurally corrupted persisted cache (e.g. non-array pair.flags) cleanly on cold mount without breaking rendering', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-bad', projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' };
+    const corruptedState = {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 1,
+      lastDurableEventId: 1,
+      projectionEpoch: 'ep-1',
+      tasks: {
+        tsk_shared: {
+          taskId: 'tsk_shared',
+          title: 'Corrupted Pair Flags',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: 17, round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+        },
+      },
+    };
+    window.localStorage.setItem(
+      SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+      JSON.stringify([{ authority: auth, accessedAt: 100, state: corruptedState }]),
+    );
+
+    const mock = fakeWs();
+    render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-bad"
+          projectName="proj-bad"
+          coordinatorSessionName="deck_bad_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-bad" />
+      </div>,
+    );
+    expect(screen.queryByText('Corrupted Pair Flags')).toBeNull();
+
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 2,
+        lastDurableEventId: 2,
+        projectionEpoch: 'ep-1',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_live',
+          title: 'Recovered From Live Sync',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(screen.getByText('Recovered From Live Sync')).toBeTruthy();
+  });
+
+  it('rejects explicit authoritative:false snapshots on initial mount and updates without clobbering last good state', async () => {
+    const validState = {
+      ...createSupervisionTaskConsoleState({ projectName: 'proj-auth', coordinatorSessionName: 'deck_auth_brain' }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+      projectionVersion: 1,
+      tasks: {
+        t_good: {
+          taskId: 't_good',
+          title: 'Authoritative Cached Task',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_auth', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        },
+      },
+    };
+    const baseSnapshot = { ...taskConsoleStateToPairSnapshot(validState), serverId: 'srv-auth', cached: true };
+    const rejectedInitial = {
+      ...baseSnapshot,
+      authoritative: false,
+      tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_bad', title: 'Non-authoritative task' }],
+      taskTitles: { t_bad: 'Non-authoritative task' },
+    };
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = rejectedInitial;
+
+    render(
+      <div>
+        <TaskPairStatusPanelHost events={[]} serverId="srv-auth" />
+        <SubSessionTaskTitle sessionName="deck_sub_auth" serverId="srv-auth" fallback="Fallback Title" />
+      </div>,
+    );
+    expect(screen.queryByText('Non-authoritative task')).toBeNull();
+    expect(screen.getByText('Fallback Title')).toBeTruthy();
+
+    // Positive control: cached:true + authoritative:true renders immediately.
+    act(() => {
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = baseSnapshot;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: baseSnapshot }));
+    });
+    await waitFor(() => expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task'));
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Authoritative Cached Task');
+
+    // Subsequent authoritative:false event or wrong-server event must not overwrite or hide last good rows.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-auth',
+          authoritative: false,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_spoof', title: 'Spoofed Non-Authoritative' }],
+          taskTitles: { t_spoof: 'Spoofed Non-Authoritative' },
+          assignments: [],
+        },
+      }));
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-other',
+          authoritative: true,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_other', title: 'Other Server Task' }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task');
+    expect(screen.queryByText('Spoofed Non-Authoritative')).toBeNull();
+    expect(screen.queryByText('Other Server Task')).toBeNull();
+  });
+
+  it('keeps the newest 20 recently completed tasks across both DESC snapshot and ASC timeline order, collapsed by default', async () => {
+    localStorage.setItem(collapsedStorageKey({ serverId: 'recent-20', mobile: false }), 'false');
+    try {
+      // Snapshot arrives newest-first (25 down to 1)
+      const descSnapshot = {
+        authoritative: true,
+        serverId: 'recent-20',
+        tasks: Array.from({ length: 25 }, (_, i) => {
+          const n = 25 - i;
+          return {
+            taskId: `recent-desc-${n}`,
+            title: `Finished task ${n}`,
+            status: 'final',
+            updatedAt: n * 1_000,
+            pair: {
+              status: n % 3 === 0 ? 'cancelled' : 'done',
+              startedAt: n * 1_000 - 500,
+              updatedAt: n * 1_000,
+              endedAt: n * 1_000,
+              executor: 'deck_exec_r',
+              auditor: 'none',
+            },
+          };
+        }),
+        assignments: [],
+      };
+      const snapshotOrdered = resolveOrderedTaskPairRows({ snapshot: descSnapshot, events: [], serverId: 'recent-20' });
+      expect(snapshotOrdered).toHaveLength(20);
+      expect(snapshotOrdered.map((r) => r.payload.taskId)).toEqual(
+        Array.from({ length: 20 }, (_, i) => `recent-desc-${25 - i}`),
+      );
+
+      // Timeline events arrive oldest-first (1 up to 25) -> still keeps newest 20 (25 down to 6)
+      const ascEvents = Array.from({ length: 25 }, (_, i) => {
+        const n = i + 1;
+        return {
+          eventId: `ev-recent-${n}`,
+          type: TASK_PAIR_TIMELINE_EVENT,
+          ts: n * 1_000,
+          payload: {
+            taskId: `recent-desc-${n}`,
+            title: `Finished task ${n}`,
+            toStatus: n % 3 === 0 ? 'cancelled' : 'done',
+            executor: 'deck_exec_r',
+            auditor: 'none',
+          },
+        };
+      }) as unknown as TimelineEvent[];
+      const timelineOrdered = resolveOrderedTaskPairRows({ snapshot: null, events: ascEvents, serverId: 'recent-20' });
+      expect(timelineOrdered.map((r) => r.payload.taskId)).toEqual(
+        snapshotOrdered.map((r) => r.payload.taskId),
+      );
+
+      // Fewer than 20 completed tasks -> retains all newest-first
+      const fewSnapshot = {
+        authoritative: true,
+        serverId: 'recent-20',
+        tasks: descSnapshot.tasks.slice(-5), // tasks 5..1
+        assignments: [],
+      };
+      expect(resolveOrderedTaskPairRows({ snapshot: fewSnapshot, events: [], serverId: 'recent-20' }).map((r) => r.payload.taskId)).toEqual([
+        'recent-desc-5', 'recent-desc-4', 'recent-desc-3', 'recent-desc-2', 'recent-desc-1',
+      ]);
+
+      // 0 active tasks + 25 completed tasks -> panel mounts with <details> recent group collapsed by default and count (20)
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = descSnapshot;
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="recent-20" />);
+      const recentGroup = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentGroup).toBeTruthy();
+      expect(recentGroup!.open).toBe(false);
+      expect(recentGroup!.querySelector('summary h4')?.textContent).toContain('(20)');
+
+      const rows = [...recentGroup!.querySelectorAll('.task-pair-status-row-title')].map((el) => el.textContent);
+      expect(rows).toHaveLength(20);
+      expect(rows[0]).toBe('Finished task 25');
+      expect(rows[19]).toBe('Finished task 6');
+
+      // Re-rendering/receiving updated snapshot preserves collapsed state by default
+      act(() => {
+        window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+          detail: {
+            ...descSnapshot,
+            tasks: [
+              {
+                taskId: 'recent-desc-26',
+                title: 'Finished task 26',
+                status: 'final',
+                updatedAt: 26_000,
+                pair: { status: 'done', startedAt: 25_500, updatedAt: 26_000, endedAt: 26_000, executor: 'deck_exec_r', auditor: 'none' },
+              },
+              ...descSnapshot.tasks,
+            ],
+          },
+        }));
+      });
+      await waitFor(() => {
+        expect(recentGroup!.querySelector('.task-pair-status-row-title')?.textContent).toBe('Finished task 26');
+      });
+      expect(recentGroup!.open).toBe(false);
+
+      // User can manually expand the <details> group
+      recentGroup!.open = true;
+      expect(recentGroup!.open).toBe(true);
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      localStorage.clear();
+    }
+  });
+
+  it('supports right-click context menu on status panel rows with confirmation to cancel active tasks and enforces terminal/viewer guards', async () => {
+    configureApi('http://localhost:3000');
+    configureApiKey('test-key');
+    const closeCalls: Array<{ url: string; body: unknown }> = [];
+    let failForbidden = false;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/task-pairs/') && url.endsWith('/close')) {
+        closeCalls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
+        if (failForbidden) {
+          return new Response(JSON.stringify({ ok: false, error: 'forbidden' }), {
+            status: 403,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          taskId: 'row-active',
+          status: 'cancelled',
+          updatedAt: 20_000,
+          endedAt: 20_000,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const events = [
+      {
+        eventId: 'ev-active',
+        type: TASK_PAIR_TIMELINE_EVENT,
+        ts: 10_000,
+        payload: {
+          taskId: 'row-active',
+          title: 'Active task row',
+          toStatus: 'working',
+          executor: 'deck_exec_1',
+          auditor: 'deck_aud_1',
+        },
+      },
+      {
+        eventId: 'ev-done',
+        type: TASK_PAIR_TIMELINE_EVENT,
+        ts: 9_000,
+        payload: {
+          taskId: 'row-done',
+          title: 'Done task row',
+          toStatus: 'done',
+          executor: 'deck_exec_2',
+          auditor: 'none',
+        },
+      },
+    ] as unknown as TimelineEvent[];
+
+    try {
+      const { container, rerender } = render(<TaskPairStatusPanel events={events} serverId="srv-panel" />);
+      const activeRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]') as HTMLElement;
+      expect(activeRow).toBeTruthy();
+
+      // Right-click active row -> open context menu -> Keep dismisses without API call
+      fireEvent.contextMenu(activeRow, { clientX: 120, clientY: 160 });
+      const cancelMenuBtn = screen.getByTestId('task-pair-panel-ctx-cancel-row-active');
+      expect((cancelMenuBtn as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.click(cancelMenuBtn);
+      expect(screen.getByTestId('task-pair-close-confirm-dialog')).toBeTruthy();
+      fireEvent.click(screen.getByTestId('task-pair-close-keep-btn'));
+      expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull();
+      expect(closeCalls).toHaveLength(0);
+
+      // Failed API error stays in confirmation dialog; retry succeeds and moves row to recent cancelled
+      failForbidden = true;
+      fireEvent.contextMenu(activeRow, { clientX: 120, clientY: 160 });
+      fireEvent.click(screen.getByTestId('task-pair-panel-ctx-cancel-row-active'));
+      fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+      await waitFor(() => expect(screen.getByTestId('task-pair-close-confirm-error').textContent).toContain('taskMode.close_error_forbidden'));
+      expect(closeCalls).toHaveLength(1);
+
+      failForbidden = false;
+      fireEvent.click(screen.getByTestId('task-pair-close-confirm-btn'));
+      await waitFor(() => expect(screen.queryByTestId('task-pair-close-confirm-dialog')).toBeNull());
+      expect(closeCalls).toHaveLength(2);
+      expect(closeCalls[1]).toEqual({
+        url: 'http://localhost:3000/api/server/srv-panel/task-pairs/row-active/close',
+        body: { action: 'cancel' },
+      });
+      await waitFor(() => {
+        const updatedRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]');
+        expect(updatedRow?.getAttribute('data-status')).toBe('cancelled');
+      });
+
+      // Terminal row in recent group disables Cancel task
+      const recentDetails = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement;
+      recentDetails.open = true;
+      const doneRow = container.querySelector('.task-pair-status-row[data-task-id="row-done"]') as HTMLElement;
+      fireEvent.contextMenu(doneRow, { clientX: 120, clientY: 200 });
+      expect((screen.getByTestId('task-pair-panel-ctx-cancel-row-done') as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      // Non-owner / shared viewer (canCloseTasks=false) hides Cancel task
+      rerender(<TaskPairStatusPanel events={events} serverId="srv-panel" canCloseTasks={false} />);
+      const viewerRow = container.querySelector('.task-pair-status-row[data-task-id="row-active"]') as HTMLElement;
+      fireEvent.contextMenu(viewerRow, { clientX: 120, clientY: 160 });
+      expect(screen.queryByTestId('task-pair-panel-ctx-cancel-row-active')).toBeNull();
+    } finally {
+      clearApiKey();
+      vi.unstubAllGlobals();
+      localStorage.clear();
+    }
+  });
+});

@@ -1,0 +1,13 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+(node:96960) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+ ✓ |server| server/test/session-identities-routes.test.ts (6 tests) 52ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  00:32:22
+   Duration  2.19s (transform 1.15s, setup 0ms, collect 1.79s, tests 52ms, environment 0ms, prepare 55ms)
+
+EXIT=0

@@ -9,11 +9,13 @@
  *   Subscribers are wrapped in Readable streams by tmux.ts for terminal streaming.
  */
 
-import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 
 import logger from '../util/logger.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
 // ── node-pty type shim (package installed at runtime, not in devDependencies) ───
 
@@ -70,6 +72,8 @@ interface ConptySession {
   cols: number;                      // cached from spawn/resize
   rows: number;                      // cached from spawn/resize
   cwd: string;                       // cached from spawn (no runtime CWD query available)
+  sessionInstanceId?: string;        // resource owner tuple injected at spawn
+  runtimeEpoch?: string;
 }
 
 const sessions = new Map<string, ConptySession>();
@@ -181,9 +185,12 @@ export async function conptyNewSession(
     cols,
     rows,
     cwd,
+    sessionInstanceId: opts?.env?.[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID],
+    runtimeEpoch: opts?.env?.[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH],
   };
 
   pty.onData((data: string) => {
+    terminalStageTrace('conpty_read', name);
     feedRingBuffer(session, data);
     // Keep recent raw output for snapshot (capturePaneVisible)
     session.screenBuffer += data;
@@ -209,14 +216,18 @@ export async function conptyNewSession(
  * Kill a ConPTY session, terminating the entire process tree on Windows.
  * No-op if the session does not exist.
  */
-export function conptyKillSession(name: string): void {
+export async function conptyKillSession(name: string): Promise<void> {
   const session = sessions.get(name);
   if (!session) return;
 
-  // Kill entire process tree on Windows before pty.kill()
+  // Kill the entire process tree without blocking the daemon event loop. The
+  // old execSync taskkill could stall heartbeats/control for several seconds.
   if (process.platform === 'win32') {
     try {
-      execSync(`taskkill /F /T /PID ${session.pty.pid}`, { stdio: 'ignore' });
+      await execFile('taskkill.exe', ['/F', '/T', '/PID', String(session.pty.pid)], {
+        windowsHide: true,
+        timeout: 2_000,
+      });
     } catch {
       // Process may already be dead — ignore
     }
@@ -359,6 +370,22 @@ export function conptyGetPid(name: string): number {
   return session.pty.pid;
 }
 
+/** Return the owner tuple injected into a live ConPTY pane, if present. */
+export function conptyGetSessionResourceIdentity(name: string): {
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+} | null | undefined {
+  const session = sessions.get(name);
+  if (!session || session.exited) return undefined;
+  if (!session.sessionInstanceId || !session.runtimeEpoch) return null;
+  return {
+    paneId: String(session.pty.pid),
+    sessionInstanceId: session.sessionInstanceId,
+    runtimeEpoch: session.runtimeEpoch,
+  };
+}
+
 /**
  * Check if a ConPTY session's PTY process is still alive.
  * Returns false if the session does not exist.
@@ -402,7 +429,7 @@ export async function conptyRespawnPane(name: string, cmd: string, opts?: { env?
   const oldCwd = session?.cwd;
 
   // Kill existing (also removes from map)
-  conptyKillSession(name);
+  await conptyKillSession(name);
 
   // Spawn new session with same name, preserved CWD, and injected env vars
   await conptyNewSession(name, cmd, { cwd: oldCwd, env: opts?.env });

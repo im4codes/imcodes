@@ -2,18 +2,29 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**에이전트를 위한 IM. 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독된 실행, 사람 간 협업, 그리고 AI 제공자 전반의 교차 감사.**
+**에이전트를 위한 IM. AI 원격 데스크톱, 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독 실행, 교차 모델 감사.**
 
 <!-- TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」 -->
 > 백지장도 맞들면 낫다.<br>
 > 허나 세 명의 제갈량, 담소 속에 천하를 정한다.<br>
 > — IM.codes
 
-IM.codes는 coding agent를 위한, provider를 가로지르는 공유 메모리 레이어이자 관리형 MCP tool surface입니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, 적절한 기록을 이후 session에 주입하거나 recall합니다. Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등을 지원하며, 터미널, 파일 브라우징, Git 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, transport 기반 agent의 네이티브 스트리밍 출력도 함께 제공합니다. OpenSpec Auto Deliver는 변경을 proposal/spec 감사부터 구현, 검증 힌트, Team 감사/재작업, 자동 모듈 채점, 최종 quality gate까지 진행할 수 있습니다. 세션 공유도 live agent session 중심의 pair 또는 multi-person 협업 코딩을 지원합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.
+IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되는 컴퓨터에도 연결합니다. 지원되는 머신을 제한된 **제어 노드(Controlled Nodes)** 로 등록하면 권한 있는 agent가 범위 지정 명령, 파일 전송, 타입 지정 Computer Use로 한 대 또는 여러 대의 컴퓨터를 직접 조작할 수 있습니다. 사람이 화면을 보거나 인계받아야 할 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격 데스크톱으로 열 수 있습니다.
+
+머신 제어와 함께 IM.codes는 provider를 가로지르는 공유 메모리 레이어와 관리형 MCP tool surface를 coding agent에 제공합니다. 완료된 작업을 Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등에서 재사용 가능한 컨텍스트로 활용합니다. 터미널, 파일과 Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, OpenSpec Auto Deliver, Auto supervision, Team 감사가 사람과 agent의 작업을 계속 보이고 연결된 상태로 유지합니다.
 
 > 이 문서는 번역본입니다. **기준 문서는 영어 README(`../README.md`)입니다.** 차이가 있으면 영어판을 우선합니다.
 
 여러 에이전트가 CLI와 SDK 두 방식 모두로 연결될 수 있습니다.
+
+## 제어 노드: AI 원격 데스크톱
+
+각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 제어 노드로 등록합니다.
+
+- **하나의 AI로 여러 컴퓨터.** 여러 머신을 등록하고 한 agent 또는 agent 팀이 해당 컴퓨터를 직접 조작해 작업을 수행할 수 있습니다.
+- **실제 컴퓨터 작업.** 범위 지정 명령 실행, 개별 파일 전송, 타입 지정 Computer Use를 통한 데스크톱 앱 조작을 지원합니다.
+- **필요할 때 사람이 원격 인계.** 지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 화면을 보거나 직접 제어할 수 있습니다.
+- **제한되고 철회 가능한 권한.** 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리되며, 소유자가 실행 권한을 끄거나 노드를 철회할 수 있습니다.
 
 ## 스크린샷
 
@@ -122,6 +133,26 @@ IM.codes는 직접 작성한 supervisor 지시문으로 지원되는 agent sessi
 - **실제 IM.codes workflow를 이해.** Auto supervision은 OpenSpec 작업, Team 토론/리뷰 흐름, `imcodes send` 기반 에이전트 간 조정을 사람에게 즉시 넘겨야 하는 이유가 아니라, 에이전트가 계속 수행할 수 있는 정상적인 다음 단계로 해석합니다。
 
 ## 주요 기능
+
+### 비공개 별칭
+
+사용자 소유의 재사용 가능한 텍스트 조각을 저장하고 composer에서 `;`를 입력해 검색하거나 `;;(name)` 마커를 직접 삽입할 수 있습니다. 메시지에는 마커가 그대로 보이고 IM.codes가 값을 대역 외로 해석해 agent에 전달합니다. Agent도 managed MCP tools로 별칭을 생성·검색·편집·해석할 수 있습니다. 일괄 목록은 메타데이터만 공개하므로 한 번의 호출로 모든 값이 모델 컨텍스트에 들어가지 않습니다.
+
+### 제어 노드
+
+한 대 또는 여러 컴퓨터를 등록하고 `^`로 대상을 선택하거나 `^^(name)`을 직접 삽입하면, 권한 있는 agent가 선택한 머신에서 작업할 수 있습니다. 범위 지정 명령, 개별 파일 전송, 타입 지정 Computer Use를 같은 대화에서 사용해 컴퓨터 플릿을 조작하고 조율할 수 있습니다. 실행 권한은 소유자가 관리하고 철회할 수 있으며, 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리됩니다. 다운로드 링크는 만료되지만 설치 패키지는 보관해 재사용할 수 있습니다.
+
+### 원격 데스크톱 제어
+
+지원되는 Windows 제어 노드는 권한 있는 Owner와 Participant에게 브라우저 원격 데스크톱을 제공합니다. 제어/보기 모드, 디스플레이와 화질 전환, 여러 권한 사용자의 공동 보기와 제어를 지원합니다. 모바일에서는 터치 탐색과 가상 마우스로 휴대폰이나 태블릿에서 데스크톱을 조작할 수 있습니다.
+
+원격 데스크톱은 사용 가능한 연결을 자동으로 선택하며 권한은 언제든 철회할 수 있습니다. **현재 Windows를 지원합니다. macOS와 Linux 노드는 다른 기능을 계속 사용할 수 있고, 원격 데스크톱 지원은 계획 중입니다.**
+
+### Computer Use 및 브라우저 자동화
+
+지원되는 SDK agent는 타입이 지정된 Computer Use tool로 데스크톱 앱을 제어할 수 있습니다. 크로스플랫폼 데스크톱 앱 제어에는 Leo([iFurySt](https://github.com/iFurySt))가 개발하고 MIT 라이선스로 배포한 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)를 통합했으며, 이 통합 기능에 대해 해당 프로젝트에 명확히 크레딧을 표합니다.
+
+브라우저 자동화는 별도로 IM.codes가 구현한 Chrome DevTools Protocol(CDP) 기반 기능입니다. 페이지 열기, 검사, 이동, 클릭, 입력 및 스크립트 평가를 지원하고 기본적으로 구조화된 텍스트를 반환하며 요청할 때만 스크린샷을 첨부합니다. 관리 브라우저는 로컬 루프백 전용 CDP endpoint도 노출하므로 로컬 Python 또는 Node script가 같은 실행 중인 browser instance를 재사용할 수 있습니다.
 
 ### 원격 터미널
 SSH, VPN, 포트 포워딩 없이 브라우저에서 agent session의 터미널에 접근할 수 있습니다.
@@ -242,7 +273,8 @@ daemon은 개발 머신에서 실행되며 tmux 기반 process-backed sessions�
 ## 설치
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash
+# fallback: npm install -g imcodes
 ```
 
 ## 빠른 시작
@@ -288,7 +320,7 @@ imcodes connect openclaw --url wss://gateway.example.com
 ### 원커맨드 설정
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
@@ -305,8 +337,9 @@ docker compose up -d
 
 ## Windows (실험적)
 
-```cmd
-npm install -g imcodes
+```powershell
+irm https://im.codes/install.ps1 | iex
+# fallback: npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
@@ -344,10 +377,15 @@ setx PATH "<npm-prefix-path>;%PATH%"
 
 ## 고지 사항
 
-IM.codes는 독립적인 오픈소스 프로젝트이며 Anthropic, OpenAI, Google, Alibaba, OpenClaw 등과 제휴, 보증, 후원 관계가 없습니다.
+IM.codes는 독립적인 소스 공개(source-available) 프로젝트이며 Anthropic, OpenAI, Google, Alibaba, OpenClaw 등과 제휴, 보증, 후원 관계가 없습니다.
 
 ## 라이선스
 
-[MIT](../LICENSE)
+[Business Source License 1.1 (BSL 1.1)](../LICENSE) — [상용 라이선스 안내](../COMMERCIAL-LICENSE.md) | [서드파티 고지](../THIRD_PARTY_NOTICES.md)
+
+- **비프로덕션 및 개인 프로덕션 사용:** 저작권·라이선스 고지와 상표 제한을 준수하는 범위의 비프로덕션 평가·테스트·복제·수정·재배포는 조직 규모와 무관하게 무료입니다. 개인이 본인 기기/서버에서 개인 개발·학습·연구·개인 셀프호스팅 목적으로 사용하는 경우 소속 회사 규모와 관계없이 영구 무료입니다(조직의 중앙 배포/사내 공유 및 제3자 호스팅/SaaS/화이트라벨 상용 서비스 제외).
+- **소규모 팀 내부 프로덕션 사용:** 법인·관계사 및 모든 배포 인스턴스를 **합산**하여 활성 사용자/시트 **<= 5명** **및** 전체 조직 인원 **<= 50명**을 모두 충족하는 경우에만 추가 사용 허가 무료 범위에 포함됩니다.
+- **추가 사용 허가 제외(상용 라이선스 필요):** 전환일 이전에는 합산 기준 초과 내부 프로덕션 사용(예: `6/50` 또는 `5/51`)이나 인원 규모와 무관한(1인 포함) 호스팅·멀티테넌트 SaaS·화이트라벨 상용 서비스 프로덕션 사용은 추가 사용 허가 대상에서 제외되며 `support@im.codes`로 상용 라이선스가 필요합니다.
+- **전환일:** 각 버전 공개 후 4년 뒤(본 릴리스는 `2030-11-26`) [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)으로 전환됩니다.
 
 © 2026 [IM.codes](https://im.codes)

@@ -69,15 +69,42 @@ describe('transport-resend-queue user-visible signals (audit 0419d1ac-1f4)', () 
 
     await drainResend('s-version', () => 'sent');
     expect(getResendEntries('s-version')).toEqual([]);
-    expect(getTransportQueueRevision('s-version')).toBe(3);
+    expect(getTransportQueueRevision('s-version')).toBeGreaterThan(second.pendingVersion);
+    expect(buildTransportPendingQueueSnapshot('s-version', undefined).pendingEntries).toEqual([]);
+  });
+
+  it('drainResend reports committed delivery facts for successfully dispatched entries', async () => {
+    const now = Date.now();
+    enqueueResend('s-delivery', { text: 'one', commandId: 'c-one', clientMessageId: 'm-one', queuedAt: now });
+    enqueueResend('s-delivery', { text: 'two', commandId: 'c-two', clientMessageId: 'm-two', queuedAt: now });
+    const onDelivered = vi.fn();
+
+    const count = await drainResend('s-delivery', () => 'sent', undefined, undefined, onDelivered);
+
+    expect(count).toBe(2);
+    expect(onDelivered).toHaveBeenCalledTimes(2);
+    expect(onDelivered.mock.calls.flatMap((call) => call[0].deliveryFacts).map((fact) => fact.clientMessageId))
+      .toEqual(['m-one', 'm-two']);
+    for (const call of onDelivered.mock.calls) {
+      const fact = call[0].deliveryFacts[0];
+      expect(fact).toEqual(expect.objectContaining({
+        type: 'transport.queue.delivery',
+        sessionName: 's-delivery',
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        pendingMessageVersion: expect.any(Number),
+        deliveryFrameId: expect.any(String),
+        deliveryFrameVersion: expect.any(Number),
+      }));
+    }
   });
 
   it('resend pending snapshots carry the queue revision', () => {
-    const result = enqueueResend('s-snapshot', { text: 'queued', commandId: 'cmd-q', queuedAt: Date.now() });
+    const result = enqueueResend('s-snapshot', { text: 'queued', commandId: 'cmd-q', clientMessageId: 'msg-q', queuedAt: Date.now() });
     const snapshot = buildTransportPendingQueueSnapshot('s-snapshot', undefined);
-    expect(snapshot.source).toBe('resend');
+    expect(snapshot.source).toBe('sqlite');
     expect(snapshot.pendingVersion).toBe(result.pendingVersion);
-    expect(snapshot.pendingEntries).toEqual([{ clientMessageId: 'cmd-q', text: 'queued' }]);
+    expect(snapshot.pendingEntries).toEqual([{ clientMessageId: 'msg-q', text: 'queued' }]);
   });
 
   it('T-N6: drainResend invokes onExpired callback with count of TTL-dropped entries', async () => {

@@ -1,4 +1,7 @@
 export const OPENAI_CONTEXT_WINDOWS = {
+  // GPT-5.6 Sol has a 1,050,000-token total context window and 128,000 max
+  // output tokens. As with GPT-5.5, this fallback is its prompt/input budget.
+  GPT_56: 922_000,
   // OpenAI's API model table lists gpt-5.5 with a 1,050,000-token
   // total context window and 128,000 max output tokens. The generic UI meter
   // tracks prompt/input occupancy, so the API-style fallback input budget is
@@ -17,6 +20,11 @@ export const CLAUDE_CONTEXT_WINDOWS = {
   OPUS_1M_ALIAS: 1_000_000,
   OPUS_4_FAMILY: 1_000_000,
   SONNET_4_FAMILY: 1_000_000,
+  // The `haiku` alias resolves to Haiku 5.5 from Claude Code / Agent SDK 0.3.293
+  // (it was claude-haiku-4-5-20251001 up to 0.3.291). Measured on the bundled
+  // binary: modelUsage['claude-haiku-5-5'] = { contextWindow: 1_000_000,
+  // maxOutputTokens: 128_000 }; 0.3.291 reported 200_000 for Haiku 4.5.
+  HAIKU_5_FAMILY: 1_000_000,
   HAIKU_4_FAMILY: 200_000,
   CLAUDE_3_FAMILY: 200_000,
 } as const;
@@ -33,8 +41,18 @@ export const QWEN_CONTEXT_WINDOWS = {
   KIMI_K25: 262_144,
 } as const;
 
+export const GEMINI_CONTEXT_WINDOWS = {
+  PRO_FAMILY: 2_000_000,
+  FLASH_FAMILY: 1_000_000,
+  GPT_OSS_120B: 131_072,
+} as const;
+
 function isGpt55Model(model: string): boolean {
   return /^gpt[-_ ]?5\.5(?:$|[-_.\s(])/.test(model);
+}
+
+function isGpt56Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.6(?:$|[-_.\s(])/.test(model);
 }
 
 function isGpt54Model(model: string): boolean {
@@ -46,6 +64,7 @@ export function inferContextWindow(model?: string | null): number | undefined {
   const m = model?.toLowerCase().trim();
   if (!m) return undefined;
 
+  if (isGpt56Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_56;
   if (isGpt55Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
   if (isGpt54Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
 
@@ -64,12 +83,32 @@ export function inferContextWindow(model?: string | null): number | undefined {
   if (/^claude-fable-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
   if (/^claude-mythos-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
   if (m == 'opus[1m]') return CLAUDE_CONTEXT_WINDOWS.OPUS_1M_ALIAS;
-  if (/^claude-opus-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
+  if (/^claude-opus-[45](?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
   if (m == 'sonnet') return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
-  if (/^claude-sonnet-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
-  if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
+  if (/^claude-sonnet-[45](?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
+  if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
+  if (/^claude-haiku-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
   if (/^claude-haiku-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
   if (/^claude-3(?:[.-]|$)/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_3_FAMILY;
+
+  // Google Gemini / Antigravity models
+  if (
+    /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)?[-_ ]?pro(?:$|[-_.\s(])/.test(m)
+    || m === 'pro'
+    || m === 'gemini-pro'
+  ) {
+    return GEMINI_CONTEXT_WINDOWS.PRO_FAMILY;
+  }
+  if (
+    /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)?[-_ ]?flash(?:$|[-_.\s(])/.test(m)
+    || /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)(?:$|[-_.\s(])/.test(m)
+    || /^gemini[-_ ]4[-_ ]argon(?:$|[-_.\s(])/.test(m)
+    || m === 'flash'
+    || m === 'gemini-flash'
+  ) {
+    return GEMINI_CONTEXT_WINDOWS.FLASH_FAMILY;
+  }
+  if (/^gpt-oss-120b(?:$|[-_.\s(])/.test(m)) return GEMINI_CONTEXT_WINDOWS.GPT_OSS_120B;
 
   if (/^coder-model$/.test(m)) return QWEN_CONTEXT_WINDOWS.CODER_MODEL;
   if (/^qwen3\.5-plus(?:$|[-_.])/.test(m)) return QWEN_CONTEXT_WINDOWS.QWEN35_PLUS;

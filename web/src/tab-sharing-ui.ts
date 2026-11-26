@@ -17,6 +17,8 @@ export interface SharedUserSummary {
 }
 
 export interface SharedStateSummary {
+  /** Provenance of an incoming grant; never infer this from participant role. */
+  targetKind?: ShareTarget['kind'];
   scopeLabel?: string | null;
   effectiveRole?: ShareRole | null;
   status?: ShareStatus | null;
@@ -24,6 +26,35 @@ export interface SharedStateSummary {
   outgoing?: boolean;
   activeDispatchId?: string | null;
   unavailableReason?: string | null;
+}
+
+/**
+ * A tab whose access is scoped by someone else's grant. An OUTGOING share is
+ * the local user's own tab being shared out, so it is never scoped.
+ */
+export function isShareScopedState(shared: SharedStateSummary | null | undefined): boolean {
+  return !!shared && shared.outgoing !== true;
+}
+
+/**
+ * Write authority on a shared tab.
+ *
+ * A participant drives the session exactly as its owner does — it already
+ * sends, restarts and edits settings — so it also controls session-level
+ * switches such as automatic supervision. A viewer never does. Capability
+ * rules that are about the SESSION rather than the actor (Brain-only
+ * supervision ownership, for one) are separate and still apply on top.
+ */
+export function canSharedActorControlSession(shared: SharedStateSummary | null | undefined): boolean {
+  if (!isShareScopedState(shared)) return true;
+  return shared?.status === 'active' && shared.effectiveRole === 'participant';
+}
+
+export function canSharedActorManageServer(shared: SharedStateSummary | null | undefined): boolean {
+  if (!isShareScopedState(shared)) return true;
+  return shared?.status === 'active'
+    && shared.effectiveRole === 'participant'
+    && shared.targetKind === 'server';
 }
 
 export type SharedActorDisplaySummary = Pick<SharedActorEnvelope, 'actorDisplayName' | 'effectiveActorRole'>;

@@ -1,0 +1,484 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { getSessionMock } = vi.hoisted(() => ({ getSessionMock: vi.fn() }));
+
+vi.mock('../../src/store/session-store.js', () => ({ getSession: getSessionMock }));
+
+import { buildLegacyTransportPendingQueueSnapshot, buildTransportQueueSnapshot } from '../../src/daemon/transport-queue-projection.js';
+import { buildTransportPendingQueueSnapshot } from '../../src/daemon/transport-pending-snapshot.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+
+let dir: string;
+let dbPath: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'imcodes-transport-queue-projection-'));
+  dbPath = join(dir, 'queue.sqlite');
+  vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH', dbPath);
+  resetTransportQueueStoreForTests();
+  getSessionMock.mockReset();
+  getSessionMock.mockReturnValue(undefined);
+});
+
+afterEach(() => {
+  resetTransportQueueStoreForTests();
+  vi.unstubAllEnvs();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+describe('transport queue projection builder', () => {
+  it('builds SQLite-backed queue snapshots and legacy wrappers from one source', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'msg-1',
+      text: 'queued\nwith newline',
+      now: 100,
+    });
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'msg-2',
+      text: 'failed',
+      now: 200,
+    });
+    getTransportQueueStore().markFailed('deck', 'msg-2', 'dispatch_failed', 300);
+
+    const snapshot = buildTransportQueueSnapshot('deck', 'test');
+    expect(snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-1']);
+    expect(snapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-2']);
+    expect(snapshot.pendingMessageEntries[0]?.text).toBe('queued\nwith newline');
+
+    const legacy = buildLegacyTransportPendingQueueSnapshot('deck', 'test');
+    expect(legacy.pendingMessages).toEqual(['queued\nwith newline']);
+    expect(legacy.failedEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-2']);
+    expect(legacy.queueEpoch).toBe(snapshot.queueEpoch);
+    expect(legacy.queueAuthorityId).toBe(snapshot.queueAuthorityId);
+  });
+
+  it('returns an empty committed SQLite baseline instead of synthesizing runtime fallback', () => {
+    const legacy = buildLegacyTransportPendingQueueSnapshot('deck-empty', 'test');
+    expect(legacy.pendingMessages).toEqual([]);
+    expect(legacy.pendingEntries).toEqual([]);
+    expect(legacy.pendingVersion).toBe(0);
+    expect(legacy.queueEpoch).toEqual(expect.any(String));
+    expect(legacy.queueAuthorityId).toEqual(expect.any(String));
+  });
+
+  it('does not project legacy rows to a newer identified session that reused the same name', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-reused',
+      clientMessageId: 'old-private-message',
+      text: 'must not be exposed to replacement UI',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must not be exposed to replacement UI' }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-reused',
+      sessionInstanceId: 'replacement-instance',
+      runtimeEpoch: 'replacement-epoch',
+      runtimeType: 'transport',
+      createdAt: 20,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-reused', 'test');
+    expect(snapshot.pendingMessageEntries).toEqual([]);
+    expect(snapshot.failedMessageEntries).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain('must not be exposed');
+  });
+
+  it('projects a live queue whose rows are bound to an earlier epoch of the SAME instance', async () => {
+    // The daemon holds two authorities for one queue: rows are stamped at
+    // enqueue with the runtime's `queueRecipient`, while the public projection
+    // gates on the persisted SessionRecord. A same-instance epoch rotation that
+    // the runtime has not adopted splits them, and the row-level gate then
+    // matches nothing -- the browser shows no queue at all while the runtime
+    // still holds and delivers the message. Instance isolation is the real
+    // ownership boundary; an epoch of the SAME instance is the same session.
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-split-epoch',
+      recipient: { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-bound' },
+      clientMessageId: 'queued-1',
+      text: 'still queued, still deliverable',
+      now: 10,
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-split-epoch',
+      sessionInstanceId: 'instance-1',
+      runtimeEpoch: 'epoch-rotated',
+      runtimeType: 'transport',
+      createdAt: 5,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-split-epoch', 'test');
+    expect(snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['queued-1']);
+  });
+
+  it('still refuses to project across a different session instance that reused the name', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-split-instance',
+      recipient: { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-bound' },
+      clientMessageId: 'predecessor-1',
+      text: 'must not be exposed to replacement UI',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must not be exposed to replacement UI' }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-split-instance',
+      sessionInstanceId: 'instance-2',
+      runtimeEpoch: 'epoch-bound',
+      runtimeType: 'transport',
+      createdAt: 20,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-split-instance', 'test');
+    expect(snapshot.pendingMessageEntries).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain('must not be exposed');
+  });
+
+  it('does not use runtime, JSON, or JSONL replay pending arrays as queue authority', () => {
+    const snapshot = buildTransportPendingQueueSnapshot('deck-runtime-only', {
+      pendingMessages: ['runtime stale\ntext'],
+      pendingEntries: [{ clientMessageId: 'runtime-stale', text: 'runtime stale\ntext' } as any],
+      pendingVersion: 99,
+    });
+
+    expect(snapshot.source).toBe('sqlite');
+    expect(snapshot.pendingMessages).toEqual([]);
+    expect(snapshot.pendingEntries).toEqual([]);
+    expect(snapshot.pendingVersion).toBe(0);
+    expect(JSON.stringify(snapshot)).not.toContain('runtime stale');
+  });
+
+  it('projects SQLite rows, failed entries, and diagnostics through privacy allowlists', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-private',
+      clientMessageId: 'msg-private',
+      text: 'safe text',
+      privateMaterialJson: JSON.stringify({
+        messagePreamble: 'SECRET_PREAMBLE',
+        attachmentRefs: [{ daemonPath: '/tmp/raw-local-attachment' }],
+        sharedActorEnvelope: { token: 'SECRET_ACTOR_TOKEN' },
+        sharedMachineAuthority: 'SECRET_MACHINE_AUTHORITY',
+        timelineCommitted: true,
+        historyCommitted: true,
+      }),
+      now: 100,
+    });
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-private',
+      clientMessageId: 'msg-failed',
+      text: 'failed safe text',
+      privateMaterialJson: JSON.stringify({
+        rawProviderPayload: 'SECRET_PROVIDER_PAYLOAD',
+        toolInput: 'SECRET_TOOL_INPUT',
+        toolOutput: 'SECRET_TOOL_OUTPUT',
+        env: { API_KEY: 'SECRET_ENV' },
+      }),
+      now: 101,
+    });
+    getTransportQueueStore().markFailed('deck-private', 'msg-failed', 'dispatch_failed', 200);
+
+    const snapshot = buildTransportQueueSnapshot('deck-private', 'test');
+    expect(snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-private']);
+    expect(snapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-failed']);
+    const serialized = JSON.stringify(snapshot);
+    for (const sentinel of [
+      'SECRET_PREAMBLE',
+      '/tmp/raw-local-attachment',
+      'SECRET_ACTOR_TOKEN',
+      'SECRET_MACHINE_AUTHORITY',
+      'SECRET_PROVIDER_PAYLOAD',
+      'SECRET_TOOL_INPUT',
+      'SECRET_TOOL_OUTPUT',
+      'SECRET_ENV',
+      'timelineCommitted',
+      'historyCommitted',
+    ]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+  });
+
+  it('emits degraded non-authoritative projection instead of speculative snapshots when SQLite reads fail', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().close();
+
+    const snapshot = buildTransportQueueSnapshot('deck-degraded', 'test');
+
+    expect(snapshot).toMatchObject({
+      sessionName: 'deck-degraded',
+      queueEpoch: 'unavailable',
+      queueAuthorityId: 'unavailable',
+      pendingMessageVersion: 0,
+      pendingMessageEntries: [],
+      failedMessageEntries: [],
+      degraded: true,
+    });
+    expect(JSON.stringify(snapshot)).not.toContain('queued text');
+  });
+
+  it('dismisses stale failed task-pair nudges for already-terminated pairs on snapshot projection while preserving Brain done notices and active pairs', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_proj_brain',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+      };
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_cancelled_1', status: 'cancelled' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_done_1', status: 'done' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_active_1', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-proj', runtimeEpoch: 'epoch-proj' };
+      const addFailed = (sessionName: string, id: string) => {
+        qStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      // Worker session has expired failed nudges from terminated + active pairs + user failure
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_cancelled_1:dispatch-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:ready-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_active_1:work-nudge:1`);
+      addFailed('deck_sub_exec', 'user-failed-1');
+
+      const workerSnapshot = buildTransportQueueSnapshot('deck_sub_exec', 'test');
+      expect(workerSnapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_active_1:work-nudge:1`,
+        'user-failed-1',
+      ]);
+
+      // Brain session keeps done completion notices + workspace notices, drops cancelled non-notice nudges
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_cancelled_1:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${reason}:1`);
+      }
+
+      const brainSnapshot = buildTransportQueueSnapshot('deck_proj_brain', 'test');
+      expect(brainSnapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${reason}:1`),
+      ]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('handles colon-containing legacy & wake-v1 task IDs cleanly (keeps active colon sibling, drops cold-start cancelled colon ID, preserves all 4 Brain notices, fails closed on ambiguity)', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_proj_brain',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+      };
+      // Short 'legacy' is ACTIVE, colon 'legacy:child' is CANCELLED, colon 'legacy:done' is DONE.
+      // Ambiguous multi-project 'ambig:1' appears in two projects for the same worker with different states.
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy', status: 'working' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy:child', status: 'cancelled' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy:done', status: 'done' });
+      pairStore.savePair('projA', { ...basePair, taskId: 'ambig:1', status: 'cancelled' });
+      pairStore.savePair('projB', { ...basePair, taskId: 'ambig:1', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-colon', runtimeEpoch: 'epoch-colon' };
+      const addFailed = (sessionName: string, id: string) => {
+        qStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      const wakeCancelledChild = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:nudge-executor::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'proj', taskId: 'legacy:child', epoch: 0 }],
+        reason: 'nudge-executor',
+      }))}:u1`;
+
+      // Worker failed rows:
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:dispatch-nudge:1`);
+      addFailed('deck_sub_exec', wakeCancelledChild);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:work-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}ambig:1:work-nudge:1`);
+
+      const workerSnapshot = buildTransportQueueSnapshot('deck_sub_exec', 'test');
+      expect(workerSnapshot.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}ambig:1:work-nudge:1`,
+      ]);
+
+      // Brain failed rows: legacy:done preserves all 4 Brain notices + brain-line-done-no-auditor, drops worker/wait nudges
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${reason}:1`);
+      }
+
+      const brainSnapshot = buildTransportQueueSnapshot('deck_proj_brain', 'test');
+      expect(brainSnapshot.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${reason}:1`),
+      ]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('keeps production-shaped snapshot reconciliation bounded across 500 historical pairs', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { TASK_PAIR_NUDGE_ID_PREFIX } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_perf_brain',
+        executor: 'deck_sub_perf_exec',
+        auditor: 'deck_sub_perf_aud',
+      };
+      for (let i = 0; i < 500; i += 1) {
+        pairStore.savePair('perfproj', { ...basePair, taskId: `tsk_hist_${i}`, status: i % 2 === 0 ? 'done' : 'cancelled' });
+      }
+      for (let i = 0; i < 20; i += 1) {
+        pairStore.savePair('perfproj', { ...basePair, taskId: `tsk_act_${i}`, status: 'working' });
+      }
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-perf', runtimeEpoch: 'epoch-perf' };
+      qStore.enqueue({ sessionName: 'deck_sub_perf_exec', clientMessageId: 'human-1', text: 'hello', recipient, now: 100 });
+      qStore.markFailed('deck_sub_perf_exec', 'human-1', 'dispatch_failed', 101);
+
+      const t0NoNudge = performance.now();
+      for (let i = 0; i < 50; i += 1) {
+        buildTransportQueueSnapshot('deck_sub_perf_exec', 'test');
+      }
+      const noNudgePerCallMs = (performance.now() - t0NoNudge) / 50;
+
+      // Seed 5 failed nudges for historical terminal pairs + measure single snapshot reconciliation pass
+      for (let i = 0; i < 5; i += 1) {
+        const id = `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_hist_${i}:work-nudge:1`;
+        qStore.enqueue({ sessionName: 'deck_sub_perf_exec', clientMessageId: id, text: 'stale', recipient, now: 102 });
+        qStore.markFailed('deck_sub_perf_exec', id, 'expired', 103);
+      }
+      const t0Reconcile = performance.now();
+      const snap = buildTransportQueueSnapshot('deck_sub_perf_exec', 'test');
+      const reconcileMs = performance.now() - t0Reconcile;
+      expect(snap.failedMessageEntries.map((e) => e.clientMessageId)).toEqual(['human-1']);
+      expect(noNudgePerCallMs).toBeLessThan(10);
+      expect(reconcileMs).toBeLessThan(100);
+      console.info(`[perf] snapshot noNudgePerCallMs=${noNudgePerCallMs.toFixed(3)}ms reconcile5Of520Ms=${reconcileMs.toFixed(3)}ms`);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('does not let SessionRecord.projectName tie-break an ambiguous unbound legacy failure when multiple projects share taskId and participant', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { TASK_PAIR_NUDGE_ID_PREFIX } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    const recipient = { sessionInstanceId: 'inst-ambig', runtimeEpoch: 'epoch-ambig' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_ambig',
+      projectName: 'projA',
+      sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch,
+    });
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_projA_brain',
+        executor: 'deck_sub_ambig',
+        auditor: 'deck_sub_aud',
+      };
+      pairStore.savePair('projA', { ...basePair, taskId: 'legacy:shared', status: 'cancelled' });
+      pairStore.savePair('projB', { ...basePair, brain: 'deck_projB_brain', taskId: 'legacy:shared', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const unboundLegacy = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge:1`;
+      const wakeProjA = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'projA', taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wa`;
+      const wakeProjB = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'projB', taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wb`;
+
+      for (const id of [unboundLegacy, wakeProjA, wakeProjB]) {
+        qStore.enqueue({ sessionName: 'deck_sub_ambig', clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed('deck_sub_ambig', id, 'expired', 200);
+      }
+
+      const snap = buildTransportQueueSnapshot('deck_sub_ambig', 'test');
+      expect(snap.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([unboundLegacy, wakeProjB]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
+});

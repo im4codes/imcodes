@@ -25,9 +25,12 @@ function makeMemDb(state: { servers: Map<string, ServerRow> }): Database {
       if (s.includes('from servers where id = $1')) {
         const row = state.servers.get(params[0] as string);
         if (!row) return null;
-        return { team_id: row.team_id, user_id: row.user_id, token_hash: 'x' } as unknown as T;
+        return { team_id: row.team_id, user_id: row.user_id, token_hash: 'x', owner_status: 'active', actor_status: 'active' } as unknown as T;
       }
       if (s.includes('select role from team_members')) return null;
+      if (s.includes('from users where id = $1')) {
+        return { status: 'active', sessions_valid_after: 0 } as unknown as T;
+      }
       return null;
     },
     query: async () => [],
@@ -103,5 +106,50 @@ describe('V-ws-role: preview WS upgrade enforces resolveServerRole', () => {
     const result = await connectStatus(preview.id, accessToken);
     expect(result.closed).toBe(true);
     expect(result.statusCode).toBe(403);
+  });
+
+  it('rejects doc_collaborator session cookies on preview WS upgrade while allowing normal account session cookies', async () => {
+    const { signJwt } = await import('../src/security/crypto.js');
+    const { COOKIE_SESSION } = await import('../../shared/cookie-names.js');
+    const { ACCOUNT_SESSION_JWT_TYPE } = await import('../../shared/auth-token-types.js');
+    const registry = LocalWebPreviewRegistry.get(serverId);
+    const { preview } = registry.create('owner-user', 3000, '/');
+    const key = 'test-signing-key-32chars-padding!!';
+
+    const connectWithCookie = (cookieVal: string): Promise<{ closed: boolean; statusCode?: number }> =>
+      new Promise((resolve) => {
+        const url = `ws://127.0.0.1:${port}/api/server/${serverId}/local-web/${preview.id}/`;
+        const ws = new WebSocket(url, { headers: { Cookie: `${COOKIE_SESSION}=${cookieVal}` } });
+        let settled = false;
+        const done = (r: { closed: boolean; statusCode?: number }) => {
+          if (settled) return;
+          settled = true;
+          try { ws.close(); } catch { /* ignore */ }
+          resolve(r);
+        };
+        ws.on('unexpected-response', (_req, res) => done({ closed: true, statusCode: res.statusCode }));
+        ws.on('error', () => done({ closed: true }));
+        ws.on('open', () => done({ closed: false }));
+        setTimeout(() => done({ closed: true }), 2000);
+      });
+
+    const docCollabToken = signJwt({
+      sub: 'owner-user',
+      type: ACCOUNT_SESSION_JWT_TYPE,
+      scope: 'doc_collaborator',
+      iat: Math.floor(Date.now() / 1000),
+    }, key);
+    const rejected = await connectWithCookie(docCollabToken);
+    expect(rejected.closed).toBe(true);
+    expect(rejected.statusCode).toBe(401);
+
+    const normalToken = signJwt({
+      sub: 'owner-user',
+      type: ACCOUNT_SESSION_JWT_TYPE,
+      iat: Math.floor(Date.now() / 1000),
+    }, key);
+    const allowed = await connectWithCookie(normalToken);
+    expect(allowed.statusCode).not.toBe(401);
+    expect(allowed.statusCode).not.toBe(403);
   });
 });

@@ -1,5 +1,5 @@
 /**
- * Auth lockout: 5 failed attempts → 15 min lockout per IP/identity.
+ * Auth lockout: 5 failed attempts → 15 min lockout per account identity.
  * DB-backed (PostgreSQL) for multi-instance deployments.
  *
  * rateLimiter singleton is kept for WS JTI single-use tracking only.
@@ -17,13 +17,14 @@ export interface LockoutResult {
 export const rateLimiter = new MemoryRateLimiter();
 
 /**
- * Record an auth failure for an identity (IP or user_id).
+ * Record an auth failure for an account identity (username or user_id).
  * Returns whether the identity is now locked out.
  * Requires DB — uses auth_lockout table (migration 004).
  */
 export async function recordAuthFailure(
   db: Database,
   identity: string,
+  reason = 'authentication_failure',
 ): Promise<LockoutResult> {
   const row = await db.queryOne<{ fail_count: number; locked_until: Date | null }>(`
     INSERT INTO auth_lockout (identity, fail_count, first_fail_at)
@@ -52,7 +53,7 @@ export async function recordAuthFailure(
   const lockedUntil = row?.locked_until ? new Date(row.locked_until).getTime() : undefined;
 
   if (isLocked) {
-    logger.warn({ identity }, 'Auth identity locked out');
+    logger.warn({ identity, reason, dimension: identity.split(':', 1)[0] }, 'Auth identity locked out');
   }
 
   return { locked: isLocked, lockedUntil };

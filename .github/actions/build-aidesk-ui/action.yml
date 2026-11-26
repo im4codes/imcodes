@@ -1,0 +1,51 @@
+name: Build, sign and describe the aiDesk panel window host
+description: >
+  Builds the Windows panel window host (aidesk-local-ui.exe, a WebView2 window: native/aidesk-panel-host-windows/build.ps1), signs it
+  with the release certificate, THEN describes it by a manifest the controlled node verifies before it ever launches it (see
+  scripts/aidesk-ui-artifact.mjs and src/node/aidesk-local-ui-artifact.ts). Output: dist-node-exe/aidesk-local-ui/win32-x64/. NOT wired
+  into the release workflows yet -- shipping it to installed nodes is the distribution round (see
+  test/spec/aidesk-local-ui-release-wiring.test.ts). Build time only: nothing is downloaded when the product runs.
+inputs:
+  version:
+    description: The controlled-node build version recorded in the manifest.
+    required: true
+  windows-signing-cert-thumbprint:
+    description: Thumbprint of the imported Windows release-signing certificate (Windows only).
+    required: false
+    default: ''
+  windows-signing-cert-sha256:
+    description: sha256 of the release-signing certificate; recorded as the manifest's signer (Windows only).
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Build, sign and describe the panel window host (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      env:
+        AIDESK_VERSION: ${{ inputs.version }}
+        AIDESK_THUMBPRINT: ${{ inputs.windows-signing-cert-thumbprint }}
+        AIDESK_SIGNER_SHA256: ${{ inputs.windows-signing-cert-sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ([string]::IsNullOrWhiteSpace($env:AIDESK_THUMBPRINT) -or [string]::IsNullOrWhiteSpace($env:AIDESK_SIGNER_SHA256)) {
+          throw 'The Windows release-signing certificate must be imported before the panel window host is signed.'
+        }
+        $art = 'dist-node-exe\aidesk-local-ui\win32-x64'
+        & .\native\aidesk-panel-host-windows\build.ps1 -ArtifactRoot $art
+        if ($LASTEXITCODE -ne 0) { throw 'building the panel window host failed' }
+        $exe = Join-Path $art 'aidesk-local-ui.exe'
+        if (-not (Test-Path $exe)) { throw "The panel window host was not built at $exe." }
+        if (-not (Test-Path (Join-Path $art 'THIRD-PARTY-NOTICES.txt'))) { throw 'The panel window host third-party notices are missing.' }
+        & .\scripts\windows-sign-release-artifact.ps1 -Mode Sign -ArtifactPath $exe `
+          -CodeSigningCertificateThumbprint $env:AIDESK_THUMBPRINT -ExpectedSignerSha256 $env:AIDESK_SIGNER_SHA256 -TimestampUrl 'http://timestamp.digicert.com'
+        if ($LASTEXITCODE -ne 0) { throw 'signing the panel window host failed' }
+        & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath $exe -ExpectedSignerSha256 $env:AIDESK_SIGNER_SHA256
+        if ($LASTEXITCODE -ne 0) { throw 'the panel window host does not verify against the release signer' }
+        # The manifest records the executable AS SIGNED.
+        node scripts/aidesk-ui-artifact.mjs write $art win32 x64 $env:AIDESK_VERSION $env:AIDESK_SIGNER_SHA256
+        if ($LASTEXITCODE -ne 0) { throw 'writing the panel window host manifest failed' }
+        node scripts/aidesk-ui-artifact.mjs verify $art win32 x64 $env:AIDESK_VERSION
+        if ($LASTEXITCODE -ne 0) { throw 'verifying the panel window host manifest failed' }
+        "aiDesk panel window host (win32-x64): $((Get-Item $exe).Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

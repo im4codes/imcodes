@@ -1,3 +1,7 @@
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { getSession } from '../store/session-store.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Transport session JSONL history — local cache for transport-backed agent messages.
  * Each session gets a JSONL file at ~/.imcodes/transport/{sessionKey}.jsonl
@@ -6,11 +10,16 @@
 
 import { appendFile, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import {
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  isSdkTurnLostRecoveryPhase,
+  sanitizeSdkTurnLostRecoveryMetadata,
+} from '../agent/transport-provider.js';
+import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 import logger from '../util/logger.js';
 
-const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
+function transportDir(): string { return join(resolveImcodesHome(), 'transport'); }
 const MAX_REPLAY_LINES = 200;
 export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 /**
@@ -43,24 +52,31 @@ export const TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES = 1024;
 const TRANSPORT_HISTORY_TRUNCATED_MARKER = '\n[transport result truncated]';
 const RENDERABLE_TRANSPORT_HISTORY_TYPES = new Set(['user.message', 'assistant.text', 'tool.call', 'tool.result']);
 
-let dirEnsured = false;
+let ensuredTransportDir: string | null = null;
+const pendingAppends = new Set<Promise<void>>();
 
 async function ensureDir(): Promise<void> {
-  if (dirEnsured) return;
-  await mkdir(TRANSPORT_DIR, { recursive: true });
-  dirEnsured = true;
+  const dir = transportDir();
+  if (ensuredTransportDir === dir) return;
+  await mkdir(dir, { recursive: true });
+  ensuredTransportDir = dir;
 }
 
 function sessionFile(sessionId: string): string {
   // Sanitize session ID for filesystem (replace non-alphanumeric except dash/underscore)
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return join(TRANSPORT_DIR, `${safe}.jsonl`);
+  return join(transportDir(), `${safe}.jsonl`);
 }
 
 function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolean {
   if (event.hidden === true) return false;
+  if (isClaudeSyntheticSeedAssistantTextEvent(event)) return false;
   const type = typeof event.type === 'string' ? event.type : '';
   if (type === 'tool.call') return readToolCallId(event) !== null;
+  if (type === 'agent.status') {
+    return event.status === SDK_TURN_LOST_RECOVERY_STATUS
+      && sanitizeSdkTurnLostRecoveryMetadata(event.recovery) !== null;
+  }
   return RENDERABLE_TRANSPORT_HISTORY_TYPES.has(type);
 }
 
@@ -140,6 +156,21 @@ function preserveTruncationMetadata(source: Record<string, unknown>, out: Record
 }
 
 export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): Record<string, unknown> {
+  if (event.type === 'agent.status') {
+    const recovery = sanitizeSdkTurnLostRecoveryMetadata(event.recovery);
+    const out: Record<string, unknown> = { type: 'agent.status' };
+    if (event.sessionId !== undefined) out.sessionId = event.sessionId;
+    if (event._ts !== undefined) out._ts = event._ts;
+    if (!recovery) return out;
+    const phase = recovery.phase ?? (isSdkTurnLostRecoveryPhase(event.phase) ? event.phase : undefined);
+    out.status = SDK_TURN_LOST_RECOVERY_STATUS;
+    out.reason = recovery.reason;
+    out.correlationId = recovery.correlationId;
+    if (phase !== undefined) out.phase = phase;
+    out.recovery = recovery;
+    return out;
+  }
+
   if (event.type === 'tool.call') {
     const out: Record<string, unknown> = { type: 'tool.call' };
     for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', '_ts']) {
@@ -154,7 +185,7 @@ export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): R
   const truncatedFields: string[] = [];
   const out: Record<string, unknown> = { type: 'tool.result' };
 
-  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', '_ts']) {
+  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', 'synthetic', 'source', 'decisionReason', 'idempotencyKey', 'turnId', 'itemKind', '_ts']) {
     if (event[key] !== undefined) out[key] = event[key];
   }
   previewField(out, 'output', pickToolResultOutput(event), truncatedFields);
@@ -182,15 +213,46 @@ export function trimTransportHistoryEventsToReplayBudget(sessionId: string, even
   return kept;
 }
 
+function isPrivateTransportSession(sessionId: string, event?: Record<string, unknown>): boolean {
+  if (inIncognitoContext() || isIncognitoSessionName(sessionId)) return true;
+  if (isIncognitoSession(getSession(sessionId))) return true;
+  if (event && (isIncognitoSession(event) || isIncognitoSession(event.payload as { incognito?: boolean } | null | undefined))) {
+    return true;
+  }
+  const eventSessionId = typeof event?.sessionId === 'string' ? event.sessionId : undefined;
+  if (eventSessionId && (isIncognitoSessionName(eventSessionId) || isIncognitoSession(getSession(eventSessionId)))) {
+    return true;
+  }
+  return false;
+}
+
 /** Append a transport event to the session's JSONL file. */
 export async function appendTransportEvent(sessionId: string, event: Record<string, unknown>): Promise<void> {
+  const op = (async () => {
+    try {
+      if (isPrivateTransportSession(sessionId, event)) return;
+      if (!shouldKeepTransportHistoryEvent(event)) return;
+      await ensureDir();
+      const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
+      await appendFile(sessionFile(sessionId), line, 'utf8');
+    } catch (err) {
+      ensuredTransportDir = null;
+      if (isPrivateTransportSession(sessionId, event)) return;
+      logger.debug({ sessionId, err }, 'transport-history: append failed');
+    }
+  })();
+  pendingAppends.add(op);
   try {
-    if (!shouldKeepTransportHistoryEvent(event)) return;
-    await ensureDir();
-    const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
-    await appendFile(sessionFile(sessionId), line, 'utf8');
-  } catch (err) {
-    logger.debug({ sessionId, err }, 'transport-history: append failed');
+    await op;
+  } finally {
+    pendingAppends.delete(op);
+  }
+}
+
+/** Wait for all in-flight transport history appends to settle on disk. */
+export async function flushTransportHistory(): Promise<void> {
+  while (pendingAppends.size > 0) {
+    await Promise.allSettled([...pendingAppends]);
   }
 }
 
@@ -208,6 +270,7 @@ export async function appendTransportEvent(sessionId: string, event: Record<stri
  * multi-hundred-MB JSONLs no longer force a ~340MB V8 string allocation.
  */
 export async function replayTransportHistory(sessionId: string): Promise<Record<string, unknown>[]> {
+  if (isPrivateTransportSession(sessionId)) return [];
   let fh;
   try {
     fh = await open(sessionFile(sessionId), 'r');

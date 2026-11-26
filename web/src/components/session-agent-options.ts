@@ -1,4 +1,7 @@
-import type { SessionAgentType } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from '@shared/agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -10,6 +13,17 @@ export interface SessionAgentChoice {
   labelKey?: string;
   group: SessionAgentGroupId;
   surfaces: SessionAgentSurface[];
+  /**
+   * True to hide this choice's card from the picker grid without removing
+   * it from the data model — the data stays intact (existing
+   * `agentType === 'qwen'` sessions, presets, and their tests keep working
+   * unmodified) while a new session/sub-session can no longer pick it.
+   * Consumers must render hidden choices with `display: none` (not simply
+   * omit them from the mapped array), so the card is invisible and
+   * unreachable to real users/assistive tech while remaining a real DOM
+   * node for any test still querying it directly by `data-agent-type`.
+   */
+  hidden?: boolean;
 }
 
 export const SESSION_AGENT_GROUP_LABEL_KEYS: Record<SessionAgentGroupId, string> = {
@@ -19,10 +33,10 @@ export const SESSION_AGENT_GROUP_LABEL_KEYS: Record<SessionAgentGroupId, string>
 
 const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
   {
-    id: 'claude-code-sdk',
-    icon: '⚡',
-    fallbackLabel: 'Claude Code SDK',
-    labelKey: 'session.agentType.claude_code_sdk',
+    id: AGY_SDK_PROVIDER_ID,
+    icon: '◈',
+    fallbackLabel: 'Antigravity',
+    labelKey: 'session.agentType.agy_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -31,6 +45,31 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '📦',
     fallbackLabel: 'Codex SDK',
     labelKey: 'session.agentType.codex_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: 'claude-code-sdk',
+    icon: '⚡',
+    fallbackLabel: 'Claude Code SDK',
+    labelKey: 'session.agentType.claude_code_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+    icon: '⚡',
+    fallbackLabel: 'CC CLI SDK',
+    labelKey: 'session.agentType.cc_cli_sdk',
+    hidden: true,
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: 'qoder-sdk',
+    icon: 'Q',
+    fallbackLabel: 'Qoder SDK',
+    labelKey: 'session.agentType.qoder_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -51,10 +90,18 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
-    id: 'gemini-sdk',
-    icon: '♊',
-    fallbackLabel: 'Gemini SDK',
-    labelKey: 'session.agentType.gemini_sdk',
+    id: 'opencode-sdk',
+    icon: '🔆',
+    fallbackLabel: 'OpenCode SDK',
+    labelKey: 'session.agentType.opencode_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: 'grok-sdk',
+    icon: '𝕏',
+    fallbackLabel: 'Grok Build',
+    labelKey: 'session.agentType.grok_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -67,12 +114,61 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'muse-code-sdk',
+    icon: 'M',
+    fallbackLabel: 'Muse Code',
+    labelKey: 'session.agentType.muse_code_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: HERMES_AGENT_PROVIDER_ID,
+    icon: 'H',
+    fallbackLabel: 'Hermes Agent',
+    labelKey: 'session.agentType.hermes_agent',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: 'deepseek-harness',
+    icon: '🐳',
+    fallbackLabel: 'DeepSeek Harness',
+    labelKey: 'session.agentType.deepseek_harness',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: 'pi',
+    icon: 'π',
+    fallbackLabel: 'Pi',
+    labelKey: 'session.agentType.pi',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CODEBUDDY_PROVIDER_IDS.CHINA,
+    icon: '云',
+    fallbackLabel: 'CodeBuddy 中国版',
+    labelKey: 'session.agentType.codebuddy_china',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+    icon: 'CB',
+    fallbackLabel: 'CodeBuddy International',
+    labelKey: 'session.agentType.codebuddy_international',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',
     labelKey: 'session.agentType.qwen',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
+    hidden: true,
   },
   {
     id: 'openclaw',
@@ -102,13 +198,6 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     id: 'opencode',
     icon: '🔆',
     fallbackLabel: 'OpenCode',
-    group: 'process',
-    surfaces: ['new-session', 'sub-session'],
-  },
-  {
-    id: 'gemini',
-    icon: '♊',
-    fallbackLabel: 'Gemini CLI',
     group: 'process',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -147,3 +236,24 @@ export function getSessionAgentLabel(
 ): string {
   return choice.labelKey ? t(choice.labelKey) : choice.fallbackLabel;
 }
+
+/** Frontend selection policy only; historical types and backend parsing stay intact. */
+export function isSessionAgentTypeSelectable(agentType: string): boolean {
+  return agentType !== CLAUDE_CODE_CLI_SDK_AGENT_TYPE && agentType !== 'gemini' && agentType !== 'gemini-sdk';
+}
+
+/**
+ * Agent types offered for a project's default coder/auditor role (AddProject,
+ * ProjectSettings) — a narrower, differently-curated list than
+ * `SESSION_AGENT_CHOICES` above (no openclaw/shell/script: those aren't
+ * meaningful "which agent fills this project role" choices). Single source
+ * so AddProject.tsx and ProjectSettings.tsx can't drift out of sync with
+ * each other, the way their previous hand-duplicated copies of this exact
+ * array could.
+ */
+export const PROJECT_ROLE_AGENT_TYPES: string[] = [
+  AGY_SDK_PROVIDER_ID, 'claude-code', 'claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
+  'cursor-headless', 'opencode-sdk', 'opencode', 'grok-sdk',
+  'kimi-sdk', 'muse-code-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+].filter(isSessionAgentTypeSelectable);

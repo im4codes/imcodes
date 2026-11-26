@@ -6,21 +6,16 @@
  * In the future this can be extended to pull from external memory systems.
  */
 
-import { readFile, writeFile, readdir } from 'fs/promises';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
-import { randomUUID } from 'node:crypto';
-import { timelineEmitter } from './timeline-emitter.js';
-import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import { AGENT_SEND_DOCS } from './imcodes-workflow-docs.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
 import { selectStartupMemoryForBootstrap } from '../context/memory-recall-client.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import logger from '../util/logger.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
-
-const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 
 const CONTEXT_CANDIDATES = ['CLAUDE.md', 'AGENTS.md', 'agent.md', 'README.md'];
 
@@ -44,85 +39,6 @@ export async function readProjectMemory(cwd: string): Promise<string | null> {
   return null;
 }
 
-// ── Gemini session injection ───────────────────────────────────────────────────
-
-async function findGeminiSessionFile(sessionId: string): Promise<string | null> {
-  const prefix = sessionId.slice(0, 8);
-  let slugs: string[];
-  try { slugs = await readdir(GEMINI_TMP_DIR); } catch { return null; }
-  for (const slug of slugs) {
-    const chatsDir = join(GEMINI_TMP_DIR, slug, 'chats');
-    let entries: string[];
-    try { entries = await readdir(chatsDir); } catch { continue; }
-    for (const entry of entries) {
-      if (entry.startsWith('session-') && entry.endsWith(`-${prefix}.json`)) return join(chatsDir, entry);
-    }
-  }
-  return null;
-}
-
-/**
- * Inject project memory directly into the Gemini session JSON file.
- * Replaces the initial 'hi' probe message with the project context so it
- * never appears as a sent message in the UI but is part of the history.
- * Retries for up to 3s to handle Gemini's async file write timing.
- */
-export async function injectGeminiMemory(sessionId: string, cwd: string, projectName?: string): Promise<void> {
-  const memory = await buildSessionBootstrapContext(cwd, projectName ?? '');
-  // memory is always non-null now since appendAgentSendDocs guarantees content
-
-  // Retry: Gemini writes the session file slightly after emitting 'init'
-  let filePath: string | null = null;
-  for (let i = 0; i < 15 && !filePath; i++) {
-    filePath = await findGeminiSessionFile(sessionId).catch(() => null);
-    if (!filePath) await new Promise((r) => setTimeout(r, 200));
-  }
-  if (!filePath) {
-    logger.warn({ sessionId }, 'memory-inject: Gemini session file not found, skipping injection');
-    return;
-  }
-
-  let session: any;
-  try {
-    session = JSON.parse(await readFile(filePath, 'utf8'));
-  } catch {
-    logger.warn({ filePath }, 'memory-inject: failed to parse Gemini session file');
-    return;
-  }
-
-  if (!Array.isArray(session.messages)) return;
-
-  const first = session.messages[0];
-  if (first?.type === 'user' && first?.content?.[0]?.text === 'hi') {
-    // Replace the 'hi' probe message with project context
-    first.content[0].text = memory;
-  } else {
-    // Prepend project context as a new historical user message
-    session.messages.unshift({
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      type: 'user',
-      content: [{ text: memory }],
-    });
-  }
-  session.lastUpdated = new Date().toISOString();
-  await writeFile(filePath, JSON.stringify(session, null, 2), 'utf8');
-  logger.info({ sessionId, filePath }, 'memory-inject: injected project memory into Gemini session');
-}
-
-export async function injectGeminiMemoryWithTimeline(
-  sessionName: string,
-  sessionId: string,
-  cwd: string,
-  projectName?: string,
-): Promise<void> {
-  await injectGeminiMemory(sessionId, cwd, projectName);
-  const items = await readProcessedMemoryItems(projectName ?? '');
-  const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
-  if (!payload) return;
-  timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
-}
-
 /**
  * Read processed memory summaries relevant to this project from local context store.
  * Returns a formatted string with recent problem→solution pairs, or null if none.
@@ -130,7 +46,7 @@ export async function injectGeminiMemoryWithTimeline(
 export async function readProcessedMemory(projectName: string): Promise<string | null> {
   const items = await readProcessedMemoryItems(projectName);
   if (items.length === 0) return null;
-  return buildStartupProjectMemoryText(items);
+  return buildStartupProjectMemoryText(attachMemoryShortRefs(items));
 }
 
 export async function readProcessedMemoryItems(projectName: string): Promise<MemorySearchResultItem[]> {
@@ -149,25 +65,29 @@ export async function readProcessedMemoryItems(projectName: string): Promise<Mem
  * Build full session bootstrap context: project files + processed memory + send docs.
  */
 export async function buildSessionBootstrapContext(cwd: string, projectName: string): Promise<string> {
+  return (await buildSessionBootstrapContextWithItems(cwd, projectName)).text;
+}
+
+/** Build bootstrap text and return the exact processed-memory snapshot used in
+ * that text. Startup callers must persist fingerprints from this same snapshot
+ * rather than reading the store a second time and creating ghost tombstones. */
+export async function buildSessionBootstrapContextWithItems(
+  cwd: string,
+  projectName: string,
+): Promise<{ text: string; items: MemorySearchResultItem[] }> {
   const projectContext = await readProjectMemory(cwd);
-  const processedMemory = await readProcessedMemory(projectName);
+  const items = await readProcessedMemoryItems(projectName);
+  const processedMemory = items.length > 0 ? buildStartupProjectMemoryText(attachMemoryShortRefs(items)) : null;
   const parts: string[] = [];
   if (projectContext) parts.push(projectContext);
   if (processedMemory) parts.push(processedMemory);
   parts.push(AGENT_SEND_DOCS);
-  return parts.join('\n\n');
+  return { text: parts.join('\n\n'), items };
 }
 
-/**
- * Append inter-agent communication docs to a memory string.
- * Returns the combined memory with send docs appended.
- */
-export function appendAgentSendDocs(memory: string | null): string {
-  if (memory?.trim()) {
-    return `${memory.trim()}\n\n${AGENT_SEND_DOCS}`;
-  }
-  return AGENT_SEND_DOCS;
-}
+// Pure string helper; it lives beside the docs so callers and tests do not
+// have to load this module's memory/timeline/recall graph to use it.
+export { appendAgentSendDocs } from './imcodes-workflow-docs.js';
 
 // ── Codex rollout helpers ──────────────────────────────────────────────────────
 

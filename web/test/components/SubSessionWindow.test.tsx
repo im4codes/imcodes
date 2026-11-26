@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -35,8 +35,11 @@ const sessionControlsSpy = vi.fn((props: any) => (
     data-model={props.activeSession?.modelDisplay ?? ''}
     data-effort={props.activeSession?.effort ?? ''}
     data-quota={props.activeSession?.quotaLabel ?? ''}
+    data-state={props.activeSession?.state ?? ''}
     data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
-  />
+  >
+    <div ref={props.inputRef} data-testid="session-composer" role="textbox" />
+  </div>
 ));
 const usageFooterSpy = vi.fn((props: any) => (
   <div
@@ -44,6 +47,7 @@ const usageFooterSpy = vi.fn((props: any) => (
     data-quota={props.quotaLabel ?? ''}
     data-state={props.sessionState ?? ''}
     data-model={props.modelOverride ?? ''}
+    data-pending-user-send={String(!!props.pendingUserSend)}
   />
 ));
 let timelineEventsMock: any[] = [];
@@ -61,6 +65,14 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => activeToolCallMock,
+  getTailSessionStateInfo: (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') {
+        return { state: String(events[i].payload?.state ?? ''), ts: events[i].ts ?? null };
+      }
+    }
+    return { state: null, ts: null };
+  },
   getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
@@ -72,18 +84,28 @@ vi.mock('../../src/thinking-utils.js', () => ({
 const addOptimisticUserMessageSpy = vi.fn();
 const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
+const loadOlderEventsSpy = vi.fn();
+const useTimelineSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({
-    events: timelineEventsMock,
-    refreshing: false,
-    // Provide the optimistic helpers so the onSend / retry handlers don't
-    // blow up when a test triggers user interaction. Real behavior is
-    // covered by the useTimeline unit tests.
-    addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    markOptimisticFailed: markOptimisticFailedSpy,
-    retryOptimisticMessage: retryOptimisticMessageSpy,
-  }),
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
+  useTimeline: (...args: any[]) => {
+    useTimelineSpy(...args);
+    return {
+      events: timelineEventsMock,
+      refreshing: false,
+      // Provide the optimistic helpers so the onSend / retry handlers don't
+      // blow up when a test triggers user interaction. Real behavior is
+      // covered by the useTimeline unit tests.
+      addOptimisticUserMessage: addOptimisticUserMessageSpy,
+      markOptimisticFailed: markOptimisticFailedSpy,
+      retryOptimisticMessage: retryOptimisticMessageSpy,
+      // Older-history pagination — must be forwarded to ChatView so scroll-to-top loads history.
+      loadingOlder: false,
+      hasOlderHistory: true,
+      loadOlderEvents: loadOlderEventsSpy,
+    };
+  },
 }));
 
 vi.mock('../../src/hooks/useSwipeBack.js', () => ({
@@ -111,11 +133,14 @@ vi.mock('../../src/git-status-store.js', async (importOriginal) => {
   return {
     ...actual,
     useSharedGitChanges: () => [],
+    useSharedGitChangesCount: () => 0,
   };
 });
 
 import { SubSessionWindow } from '../../src/components/SubSessionWindow.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_INSTALL_MSG } from '@shared/remote-desktop-install.js';
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -168,12 +193,22 @@ function setElementRect(el: HTMLElement, top: number, height: number): void {
 }
 
 
+
+// Unmount after every test, so no window keeps a pending frame or timer past
+// the file and fires into a torn-down jsdom.
+afterEach(() => cleanup());
+
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    // The real client always exposes the daemon capability snapshot;
+    // SubSessionWindow's own DaemonRemoteDesktopControl reads it on mount.
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -181,6 +216,145 @@ describe('SubSessionWindow metadata wiring', () => {
     vi.clearAllMocks();
     timelineEventsMock = [];
     activeToolCallMock = false;
+  });
+
+  it('cancels its pending resize frame and chat-scroll timer when the window unmounts', () => {
+    const frames: number[] = [];
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => {
+      frames.push(frames.length + 9_000);
+      return frames[frames.length - 1]!;
+    });
+    const cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+    const clearSpy = vi.spyOn(window, 'clearTimeout');
+    try {
+      const view = render(
+        <SubSessionWindow
+          sub={makeSubSession({ type: 'codex-sdk', sessionInstanceId: 'window-instance-raf', runtimeEpoch: 'window-runtime-raf' })}
+          ws={ws}
+          connected={true}
+          active={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          zIndex={1}
+          onFocus={vi.fn()}
+        />,
+      );
+      const scheduled = [...frames];
+      clearSpy.mockClear();
+      view.unmount();
+      // Every frame this window scheduled is cancelled, and the chat-scroll timer is cleared.
+      for (const frame of scheduled) expect(cafSpy).toHaveBeenCalledWith(frame);
+      expect(clearSpy).toHaveBeenCalled();
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+
+  it('always scopes task pairs to its canonical session and forwards a separate split visit key', () => {
+    const baseProps = {
+      sub: makeSubSession({ type: 'codex-sdk' }),
+      ws,
+      connected: true,
+      active: true,
+      onDiff: vi.fn(),
+      onHistory: vi.fn(),
+      onMinimize: vi.fn(),
+      onClose: vi.fn(),
+      onRestart: vi.fn(),
+      onRename: vi.fn(),
+      zIndex: 1,
+      onFocus: vi.fn(),
+    };
+    const view = render(<SubSessionWindow {...baseProps} />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(true);
+    view.rerender(<SubSessionWindow {...baseProps} taskPairPanelVisitKey="split-task" />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
+  });
+
+  it('shows the pair task title as the main heading and keeps the session subtitle and role visible', () => {
+    const view = render(
+      <SubSessionWindow
+        sub={makeSubSession({ label: 'Executor window' })}
+        ws={ws}
+        connected={true}
+        active={true}
+        pairTaskTitle="Investigate the long-running handoff"
+        pairRole="executor"
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-title')?.textContent).toBe('Investigate the long-running handoff');
+    expect(view.container.querySelector('.subsession-subtitle')?.textContent).toContain('Executor window');
+    expect(view.container.querySelector('.subsession-pair-role')?.textContent).toBe('taskPair.panel_executor');
+    view.rerender(
+      <SubSessionWindow
+        sub={makeSubSession({ label: 'Executor window' })}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-subtitle')).toBeNull();
+    expect(view.container.querySelector('.subsession-pair-role')).toBeNull();
+  });
+
+  it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          sessionInstanceId: 'window-instance-1',
+          runtimeEpoch: 'window-runtime-1',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+        })}
+        sharedState={{ effectiveRole: 'participant', status: 'active', activeDispatchId: 'dispatch-window-1' }}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession).toMatchObject({
+      name: 'deck_sub_sub-1',
+      sessionInstanceId: 'window-instance-1',
+      runtimeEpoch: 'window-runtime-1',
+      activeModel: 'gpt-5.6',
+      providerId: 'openai',
+      sharedState: expect.objectContaining({
+        effectiveRole: 'participant',
+        activeDispatchId: 'dispatch-window-1',
+      }),
+    });
   });
 
   it('exposes the accent color as a CSS variable on the window root', () => {
@@ -204,6 +378,41 @@ describe('SubSessionWindow metadata wiring', () => {
 
     const root = container.querySelector('.subsession-window') as HTMLElement;
     expect(root.style.getPropertyValue('--subsession-accent-color')).toBe('#34d399');
+  });
+
+  it('renders and highlights all eight desktop resize handles, including the bottom corners', () => {
+    const { container } = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      const handle = container.querySelector(`.resize-${dir}`) as HTMLElement | null;
+      expect(handle).not.toBeNull();
+      expect(handle?.className).toContain('resize-handle');
+      expect(handle?.className).toContain('resize-hover-surface');
+    }
+    const layer = container.querySelector('.resize-handle-layer') as HTMLElement | null;
+    expect(layer).not.toBeNull();
+    expect(layer?.parentElement?.lastElementChild).toBe(layer);
+
+    const southEast = container.querySelector('.resize-se') as HTMLElement;
+    fireEvent.mouseEnter(southEast);
+    expect(southEast.className).toContain('is-pointer-hovered');
+    fireEvent.mouseLeave(southEast);
+    expect(southEast.className).not.toContain('is-pointer-hovered');
   });
 
   it('focuses an inactive desktop window before allowing hide/minimize actions', () => {
@@ -269,7 +478,10 @@ describe('SubSessionWindow metadata wiring', () => {
       effort: 'high' as any,
       modelDisplay: 'gpt-5.4',
       quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
       planLabel: 'Pro',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
     } as any);
 
     render(
@@ -296,6 +508,21 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
+      expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+        quotaLabel: expect.stringContaining('5h 11%'),
+        quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
+        supervisionMode: 'supervised_audit',
+        supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+      });
+      expect(usageFooterSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+        quotaLabel: expect.stringContaining('5h 11%'),
+        quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
+        planLabel: 'Pro',
+      });
+      const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+      expect(chatViewProps).not.toHaveProperty('quotaLabel');
+      expect(chatViewProps).not.toHaveProperty('quotaMeta');
+      expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
     });
   });
 
@@ -332,6 +559,72 @@ describe('SubSessionWindow metadata wiring', () => {
       const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
       expect(props.events).toEqual(timelineEventsMock);
       expect(props.events[0].payload).toMatchObject({ text: 'window partial stream', streaming: true });
+    });
+  });
+
+  it('forwards a pending optimistic send for immediate sub-session status feedback', async () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_sub_sub-1', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'pending', sessionId: 'deck_sub_sub-1', ts: 2, type: 'user.message', payload: { text: 'just sent', pending: true, commandId: 'cmd-now' } },
+    ];
+
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          state: 'idle',
+        } as any)}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.pendingUserSend).toBe('true');
+    });
+  });
+
+  it('forwards older-history pagination (onLoadOlder / hasOlderHistory / loadingOlder) to the ChatView', async () => {
+    // Regression: the sub-session window never forwarded these, so ChatView's
+    // scroll-to-top loader no-op'd and older history could not be loaded in a
+    // sub-session (it worked in the main SessionPane, which does forward them).
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          state: 'running',
+        } as any)}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+      expect(props.onLoadOlder).toBe(loadOlderEventsSpy);
+      expect(props.hasOlderHistory).toBe(true);
+      expect(props.loadingOlder).toBe(false);
     });
   });
 
@@ -527,10 +820,11 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
   });
 
-  it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
+  it('uses authoritative outer idle when stale timeline running has no active work', async () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },
-      { type: 'tool.result', payload: { ok: true } },
+      { type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { type: 'usage.update', payload: { inputTokens: 1, outputTokens: 1 } },
     ];
 
     const sub = makeSubSession({
@@ -558,7 +852,56 @@ describe('SubSessionWindow metadata wiring', () => {
 
     await waitFor(() => {
       const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
-      expect(footer?.dataset.state).toBe('running');
+      expect(footer?.dataset.state).toBe('idle');
+    });
+  });
+
+  it('clears the sub-session controls sweep when authoritative timeline idle beats stale running metadata', async () => {
+    timelineEventsMock = [
+      { type: 'session.state', ts: 10, payload: { state: 'running' } },
+      { type: 'assistant.text', ts: 20, payload: { text: 'done', streaming: false } },
+      {
+        type: 'session.state',
+        ts: 21,
+        payload: {
+          state: 'idle',
+          authoritative: true,
+          blockingWorkCount: 0,
+          activeWorkCount: 0,
+          activeToolCount: 0,
+          busyReasons: [],
+        },
+      },
+    ];
+
+    const sub = makeSubSession({
+      type: 'opencode-sdk',
+      runtimeType: 'transport' as any,
+      state: 'running',
+    } as any);
+
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = container.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      const controls = container.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(footer?.dataset.state).toBe('idle');
+      expect(controls?.dataset.state).toBe('idle');
     });
   });
 
@@ -595,11 +938,16 @@ describe('SubSessionWindow metadata wiring', () => {
 });
 
 describe('SubSessionWindow terminal subscription raw mode', () => {
+  const releaseHold = vi.fn();
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
+    holdTerminalRaw: vi.fn(() => releaseHold),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -665,6 +1013,57 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     controls.remove();
     subCardBar.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+  });
+
+  it('on mobile keeps the main session tabs above the sub-session window', () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
+    const tabBottom = 94;
+
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(tabBottom);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+
+    const subCardBar = document.createElement('div');
+    subCardBar.className = 'subcard-bar';
+    Object.defineProperty(subCardBar, 'offsetHeight', { configurable: true, value: 88 });
+    setElementRect(subCardBar, viewportHeight - 88, 88);
+    document.body.appendChild(subCardBar);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    try {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.top).toBe('94px');
+      expect(panel?.style.bottom).toBe('88px');
+      expect(panel?.style.height).toBe(`calc(${viewportHeight - 94 - 88}px)`);
+    } finally {
+      unmount();
+      subCardBar.remove();
+      tabBar.remove();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   });
 
   it('on mobile ignores both main and sub-window composer controls when reserving bottom space', async () => {
@@ -944,7 +1343,10 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
-  it('keeps shell windows unsubscribed while inactive and raw-subscribes only while active', async () => {
+  it('holds the shell window raw stream for its whole lifetime, regardless of focus', async () => {
+    // Regression: an open shell window that lost focus used to unsubscribe and
+    // freeze. It must now keep the raw PTY stream HELD the whole time it is open
+    // (users pin one to the side to observe), via the ref-counted holdTerminalRaw.
     const sub = makeSubSession();
 
     const view = render(
@@ -964,8 +1366,16 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
+    // Held immediately even though inactive; shell no longer uses the focus-gated
+    // base subscribe, and the hold is not released while mounted.
+    await waitFor(() => {
+      expect(ws.holdTerminalRaw).toHaveBeenCalledWith(sub.sessionName);
+    });
+    expect(ws.holdTerminalRaw).toHaveBeenCalledTimes(1);
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
+    expect(releaseHold).not.toHaveBeenCalled();
 
+    // Toggling focus must NOT re-hold or release — the hold is focus-independent.
     view.rerender(
       <SubSessionWindow
         sub={sub}
@@ -982,11 +1392,6 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
         onFocus={vi.fn()}
       />,
     );
-
-    await waitFor(() => {
-      expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, true);
-    });
-
     view.rerender(
       <SubSessionWindow
         sub={sub}
@@ -1003,10 +1408,46 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
         onFocus={vi.fn()}
       />,
     );
+    expect(ws.holdTerminalRaw).toHaveBeenCalledTimes(1);
+    expect(releaseHold).not.toHaveBeenCalled();
 
+    // Closing the window releases the hold (server stops streaming when the last
+    // holder unmounts).
+    view.unmount();
     await waitFor(() => {
-      expect(ws.unsubscribeTerminal).toHaveBeenCalledWith(sub.sessionName);
+      expect(releaseHold).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('retains hidden chat state while pausing timeline and terminal subscriptions', async () => {
+    const sub = makeSubSession();
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        visible={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith(
+      sub.sessionName,
+      ws,
+      undefined,
+      { isActiveSession: false, isVisible: false, subscriptionMode: 'summary', bootstrapWhenVisible: false },
+    );
+    expect(ws.holdTerminalRaw).not.toHaveBeenCalled();
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
   });
 
   it('keeps non-shell windows passively subscribed when inactive', async () => {
@@ -1032,6 +1473,12 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, false);
     });
+    expect(useTimelineSpy).toHaveBeenLastCalledWith(
+      sub.sessionName,
+      ws,
+      undefined,
+      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true },
+    );
   });
 
   it('does not replay an existing idle flash token when the window remounts', async () => {
@@ -1219,6 +1666,36 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
+  it('passes active timeline turn state into sub-session controls', async () => {
+    timelineEventsMock = [{
+      eventId: 'sub-running-state',
+      type: 'session.state',
+      ts: 10,
+      payload: { state: 'running' },
+    }];
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any, state: 'idle' } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const controlsProps = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(controlsProps?.activeTransportTurn).toBe(true);
+  });
+
   it('keeps a new optimistic bubble visible when retrying a failed transport window send', async () => {
     // Also a regression: the failed optimistic bubble in a sub-session had no
     // retry button because onResendFailed was never threaded through to
@@ -1278,10 +1755,15 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
 
 describe('SubSessionWindow desktop file-browser stack integration', () => {
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    // The real client always exposes the daemon capability snapshot;
+    // SubSessionWindow's own DaemonRemoteDesktopControl reads it on mount.
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -1289,6 +1771,47 @@ describe('SubSessionWindow desktop file-browser stack integration', () => {
     vi.clearAllMocks();
     timelineEventsMock = [];
     activeToolCallMock = false;
+  });
+
+  it('portals the mobile file browser outside the lower sub-session stacking context', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    try {
+      const subWindow = container.querySelector('.subsession-window') as HTMLElement | null;
+      const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+      expect(subWindow).toBeTruthy();
+      expect(toggle).toBeTruthy();
+      toggle!.click();
+
+      await waitFor(() => {
+        const overlay = document.body.querySelector('.mobile-fb-overlay') as HTMLElement | null;
+        expect(overlay).toBeTruthy();
+        expect(overlay?.parentElement).toBe(document.body);
+        expect(subWindow?.contains(overlay)).toBe(false);
+        expect(overlay?.style.zIndex).toBe('');
+      });
+    } finally {
+      unmount();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   });
 
   it('uses desktopFileBrowserZIndex for the floating child file-browser when supplied', async () => {
@@ -1382,5 +1905,640 @@ describe('SubSessionWindow desktop file-browser stack integration', () => {
     await waitFor(() => {
       expect(onClose).toHaveBeenCalled();
     });
+  });
+});
+
+describe('SubSessionWindow remote-desktop quick-open', () => {
+  let confirmSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    confirmSpy.mockRestore();
+  });
+
+  function wsWithCapabilities(capabilities: string[]) {
+    const sent: unknown[] = [];
+    return {
+      onMessage: vi.fn(() => () => undefined),
+      subscribeTerminal: vi.fn(),
+      unsubscribeTerminal: vi.fn(),
+      sendSnapshotRequest: vi.fn(),
+      sendResize: vi.fn(),
+      getDaemonCapabilitySnapshot: vi.fn(() => ({ capabilities })),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+      send: vi.fn((message: unknown) => { sent.push(message); }),
+      sent,
+    } as any;
+  }
+
+  it("renders the remote-desktop button to the LEFT of the file-browser toggle, opening THIS sub-session's own machine directly", () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_CAPABILITY]);
+    const sub = makeSubSession();
+    const onOpenRemoteDesktop = vi.fn();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={onOpenRemoteDesktop}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const header = container.querySelector('.subsession-header') as HTMLElement;
+    const buttons = Array.from(header.querySelectorAll('button'));
+    const rdIndex = buttons.findIndex((b) => b.classList.contains('daemon-remote-desktop-btn'));
+    const filesIndex = buttons.findIndex((b) => b.getAttribute('title') === 'picker.files');
+    expect(rdIndex, 'remote-desktop button must be present').toBeGreaterThanOrEqual(0);
+    expect(filesIndex, 'file-browser toggle must still be present').toBeGreaterThanOrEqual(0);
+    expect(rdIndex, 'remote-desktop button must render to the LEFT of the file-browser toggle').toBeLessThan(filesIndex);
+
+    buttons[rdIndex].click();
+    expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
+    // "This sub-session's own machine" — the same serverId its own FileBrowser is rooted on.
+    expect(onOpenRemoteDesktop.mock.calls[0][0]).toMatchObject({ serverId: 'srv-1' });
+  });
+
+  function renderWithoutDaemonRemoteDesktop(remoteDesktopCanSetUp: boolean) {
+    // A Linux/macOS daemon: it advertises no remote-desktop capability of its
+    // own, because the controlled node on that computer serves it.
+    const ws = wsWithCapabilities([]);
+    const sub = makeSubSession();
+    return render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        remoteDesktopCanSetUp={remoteDesktopCanSetUp}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+  }
+
+  it('still offers remote desktop on a daemon without its own (Linux/macOS), left of the file-browser toggle', () => {
+    const { container } = renderWithoutDaemonRemoteDesktop(true);
+    const buttons = [...container.querySelectorAll('button')];
+    const rd = container.querySelector('.daemon-remote-desktop-btn');
+    const files = container.querySelector('button[title="picker.files"]');
+    expect(rd?.getAttribute('title')).toBe('remote_desktop.setup_button_hint');
+    expect(files).toBeTruthy();
+    expect(buttons.indexOf(rd as HTMLButtonElement)).toBeLessThan(buttons.indexOf(files as HTMLButtonElement));
+  });
+
+  it('renders no setup button on a daemon shared with this user, but keeps the file-browser toggle', () => {
+    const { container } = renderWithoutDaemonRemoteDesktop(false);
+    expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+    expect(container.querySelector('button[title="picker.files"]')).toBeTruthy();
+  });
+
+  it('asks for confirmation and triggers the real install flow when the machine is not yet activated', async () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const rdButton = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+    expect(rdButton).toBeTruthy();
+    rdButton.click();
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(ws.sent).toEqual([{ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }]);
+    });
+  });
+
+  it('does nothing when the user declines the install confirmation', () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+    confirmSpy.mockReturnValue(false);
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const rdButton = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+    rdButton.click();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(ws.sent).toEqual([]);
+  });
+});
+
+describe('SDK window startup budget', () => {
+  const ws = {
+    onMessage: vi.fn(() => () => undefined), subscribeTerminal: vi.fn(), unsubscribeTerminal: vi.fn(),
+    sendSnapshotRequest: vi.fn(), sendResize: vi.fn(), getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+  } as any;
+  it('mounts visible SDK composers while deferring controls for hidden windows', () => {
+    const windows = Array.from({ length: 19 }, (_, index) => makeSubSession({
+      id: `sdk-${index}`, sessionName: `deck_sub_sdk-${index}`, type: index % 2 ? 'claude-code-sdk' : 'codex-sdk',
+      runtimeType: 'transport', providerId: index % 2 ? 'claude-code-sdk' : 'codex-sdk', providerSessionId: `provider-${index}`,
+      requestedModel: 'gpt-5', activeModel: 'gpt-5', cwd: '/workspace/project', state: 'idle',
+    }));
+    const beforeTimeline = useTimelineSpy.mock.calls.length;
+    const beforeControls = sessionControlsSpy.mock.calls.length;
+    render(<>{windows.map((sub, index) => <SubSessionWindow key={sub.id} sub={sub} ws={ws} connected active={index === 0} visible={index < 9} onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000 + index} onFocus={vi.fn()} serverId="srv-1" />)}</>);
+    const timelineCalls = useTimelineSpy.mock.calls.slice(beforeTimeline);
+    expect(timelineCalls.length).toBeLessThanOrEqual(38);
+    const rendersBySession = new Map<string, number>();
+    for (const [sessionName] of timelineCalls) rendersBySession.set(sessionName, (rendersBySession.get(sessionName) ?? 0) + 1);
+    expect(rendersBySession.size).toBe(19);
+    expect(Math.max(...rendersBySession.values())).toBeLessThanOrEqual(2);
+    expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'full').length).toBeGreaterThanOrEqual(9);
+    expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'summary').length).toBeGreaterThanOrEqual(10);
+    const controlCalls = sessionControlsSpy.mock.calls.slice(beforeControls);
+    expect(controlCalls.length).toBeGreaterThanOrEqual(9);
+    expect(controlCalls.some(([props]) => props.activeSession?.name === 'deck_sub_sdk-9')).toBe(false);
+    expect(controlCalls.some(([props]) => props.activeSession?.name === 'deck_sub_sdk-18')).toBe(false);
+  });
+  it('does not throw for incomplete transport metadata', () => {
+    expect(() => render(<SubSessionWindow sub={makeSubSession({ id: 'sdk-missing', sessionName: 'deck_sub_sdk-missing', type: 'codex-sdk', runtimeType: null, providerId: null, providerSessionId: null, state: 'unknown' })} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />)).not.toThrow();
+  });
+  it('enables history bootstrap when an on-screen window receives focus', () => {
+    const sub = makeSubSession({ id: 'sdk-focus', sessionName: 'deck_sub_sdk-focus', type: 'codex-sdk', runtimeType: 'transport' });
+    const view = render(<SubSessionWindow sub={sub} ws={ws} connected active={false} visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
+    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
+    view.rerender(<SubSessionWindow sub={sub} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
+    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: true, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
+  });
+
+  it('keeps the composer visible for an on-screen inactive desktop window', () => {
+    render(<SubSessionWindow
+      sub={makeSubSession({ id: 'inactive-composer', sessionName: 'deck_sub_inactive-composer', type: 'codex-sdk', runtimeType: 'transport' })}
+      ws={ws}
+      connected={true}
+      active={false}
+      visible={true}
+      onDiff={vi.fn()}
+      onHistory={vi.fn()}
+      onMinimize={vi.fn()}
+      onClose={vi.fn()}
+      onRestart={vi.fn()}
+      onRename={vi.fn()}
+      zIndex={5000}
+      onFocus={vi.fn()}
+      serverId="srv-1"
+    />);
+
+    expect(screen.getByTestId('session-composer')).toBeTruthy();
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      keyboardActive: false,
+      activeSession: { name: 'deck_sub_inactive-composer' },
+    });
+  });
+
+  it('keeps onInputRef registered across visible chat/terminal mode toggles and clears it only when hidden', async () => {
+    const onInputRef = vi.fn();
+    const sub = makeSubSession({
+      id: 'mode-reg-1',
+      sessionName: 'deck_sub_mode-reg-1',
+      type: 'codex',
+      runtimeType: 'process',
+    });
+
+    const view = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        onInputRef={onInputRef}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl).not.toBeNull();
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('chat');
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-subsession-id')).toBe('mode-reg-1');
+    });
+
+    onInputRef.mockClear();
+
+    // Switch to terminal mode -> element stays registered so parent retains terminal mode ownership
+    const modeBtn = document.querySelector('.subsession-mode-btn') as HTMLButtonElement;
+    expect(modeBtn).toBeTruthy();
+    fireEvent.click(modeBtn);
+
+    await waitFor(() => {
+      expect(onInputRef).toHaveBeenCalled();
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl).not.toBeNull();
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('terminal');
+    });
+    expect(onInputRef.mock.calls.some(([el]) => el === null)).toBe(false);
+
+    // Switch back to chat mode -> still registered and reflects data-view-mode="chat"
+    onInputRef.mockClear();
+    fireEvent.click(modeBtn);
+    await waitFor(() => {
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('chat');
+    });
+
+    // Hide window -> clears registration cleanly so hidden windows do not leave stale refs
+    onInputRef.mockClear();
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        visible={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        onInputRef={onInputRef}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onInputRef).toHaveBeenCalledWith(null);
+    });
+  });
+
+  it('adds .incognito class and badge on SubSessionWindow when sub.incognito is true', () => {
+    const sub: any = {
+      id: 'sub-win-priv',
+      sessionName: 'deck_sub_sub-win-priv',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      label: 'Priv Win',
+      state: 'idle',
+      cwd: '/tmp',
+      parentSession: 'deck_main_brain',
+      incognito: true,
+    };
+    const ws: any = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+      subscribeTerminal: vi.fn(),
+      unsubscribeTerminal: vi.fn(),
+      sendSnapshotRequest: vi.fn(),
+      sendResize: vi.fn(),
+      getDaemonCapabilitySnapshot: vi.fn(() => null),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+    };
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+    const win = document.querySelector('.subsession-window[data-subsession-id="sub-win-priv"]');
+    expect(win?.classList.contains('incognito')).toBe(true);
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.activeSession?.incognito).toBe(true);
+  });
+
+  it('passes hideWorkflowControls and subSessionId to SessionControls for sub-session windows', () => {
+    const sub = makeSubSession({
+      id: 'sub-workflow-hidden',
+      sessionName: 'deck_sub_workflow_hidden',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      cwd: '/repo',
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      subSessionId: 'sub-workflow-hidden',
+      hideWorkflowControls: true,
+    });
+  });
+
+  it('forwards onChatScrollFn and triggers chat scroll-to-bottom on visible/active transitions without affecting shell sub-sessions', async () => {
+    const scrollBottomSpy = vi.fn();
+    let registeredScrollFn: (() => void) | null = null;
+    const onChatScrollFn = vi.fn((fn: () => void) => { registeredScrollFn = fn; });
+    const sub = makeSubSession({
+      id: 'sub-scroll-focus',
+      sessionName: 'deck_sub_scroll_focus',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      cwd: '/repo',
+    } as any);
+
+    chatViewPropsSpy.mockImplementation((props: any) => {
+      props.onScrollBottomFn?.(scrollBottomSpy);
+    });
+
+    try {
+      const view = render(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={false}
+          visible={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      // Minimized/hidden startup keeps ChatView unmounted until visible=true
+      expect(onChatScrollFn).not.toHaveBeenCalled();
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Transition visible=true, active=false -> ChatView mounts and registers onChatScrollFn (not active yet)
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={false}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      expect(onChatScrollFn).toHaveBeenCalled();
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Calling registered parent callback invokes underlying ChatView scroll fn
+      registeredScrollFn?.();
+      expect(scrollBottomSpy).toHaveBeenCalledTimes(1);
+      scrollBottomSpy.mockClear();
+
+      // Transition active=true -> scrolls chat to bottom
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      await waitFor(() => expect(scrollBottomSpy).toHaveBeenCalled());
+
+      // Unrelated re-render while remaining visible & active must NOT re-trigger auto scroll
+      scrollBottomSpy.mockClear();
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5010}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Shell sub-session (terminal mode) handles visible/active cleanly without throwing
+      const shellSub = makeSubSession({
+        id: 'sub-shell-only',
+        sessionName: 'deck_sub_shell_only',
+        type: 'shell',
+        viewMode: 'terminal',
+        state: 'idle',
+      } as any);
+      render(
+        <SubSessionWindow
+          sub={shellSub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+    } finally {
+      chatViewPropsSpy.mockReset();
+    }
+  });
+
+  it('keeps manual message quotes intact when pendingTaskQuote attaches and replaces across task jumps', () => {
+    chatViewPropsSpy.mockClear();
+    const onConsumed = vi.fn();
+    const sub = makeSubSession({
+      id: 'sub-task-quote',
+      sessionName: 'deck_sub_task_quote',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+    });
+
+    const { rerender } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+        pendingTaskQuote={{ quote: '[Regarding task "Task A"]', nonce: 10 }}
+        onPendingTaskQuoteConsumed={onConsumed}
+      />,
+    );
+    expect(onConsumed).not.toHaveBeenCalled();
+
+    rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+        pendingTaskQuote={{ quote: '[Regarding task "Task A"]', nonce: 10 }}
+        onPendingTaskQuoteConsumed={onConsumed}
+      />,
+    );
+    expect(onConsumed).toHaveBeenCalledWith(10);
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.taskQuote).toBe('[Regarding task "Task A"]');
+
+    const chatProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    chatProps?.onQuote?.('[Regarding task "Task A"]');
+    rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+        pendingTaskQuote={{ quote: '[Regarding task "Task B"]', nonce: 11 }}
+        onPendingTaskQuoteConsumed={onConsumed}
+      />,
+    );
+    expect(onConsumed).toHaveBeenCalledWith(11);
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.taskQuote).toBe('[Regarding task "Task B"]');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.quotes).toEqual(['[Regarding task "Task A"]']);
   });
 });

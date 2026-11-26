@@ -1,25 +1,46 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
-import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
+import {
+  TIMELINE_METADATA_EVENT_TYPES,
+  isAuthoritativeCleanIdlePayload,
+  isCancelIdlePayload,
+  isUserCancelStoppingPayload,
+  isWorkingSessionState,
+  reduceTimelineActivity,
+} from '../../shared/session-activity-types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
   'assistant.thinking',
   'tool.call',
 ]);
 
-const NEUTRAL_TAIL_EVENT_TYPES = new Set<TimelineEvent['type']>([
+const NEUTRAL_TAIL_EVENT_TYPES = new Set<string>([
   'agent.status',
   'usage.update',
   'tool.result',
   'mode.state',
   'terminal.snapshot',
   'command.ack',
+  // Pure metadata/telemetry (memory.context, file.change, queue snapshots, …).
+  // These must never terminate the tail scan: `memory.context` is the tail for
+  // the whole pre-first-tool thinking window of every context-injecting send,
+  // and stopping there reported "no active turn" while the agent was working.
+  ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
 
 type TimelineTailEvent = Pick<TimelineEvent, 'type'> & {
   payload?: TimelineEvent['payload'] | null;
 };
 
+export function isSdkSubagentTimelineEvent(event: TimelineTailEvent): boolean {
+  if (event.type !== 'tool.call' && event.type !== 'tool.result') return false;
+  const detail = event.payload?.detail;
+  return Boolean(detail && typeof detail === 'object' && !Array.isArray(detail)
+    && (detail as { kind?: unknown }).kind === SDK_SUBAGENT_DETAIL_KIND);
+}
+
 export function isRunningTimelineEvent(event: TimelineTailEvent): boolean {
+  if (isSdkSubagentTimelineEvent(event)) return false;
   if (event.type === 'assistant.text') {
     return event.payload?.streaming === true;
   }
@@ -37,8 +58,18 @@ function isAuthoritativeCleanIdle(event: TimelineTailEvent): boolean {
     && isAuthoritativeCleanIdlePayload(event.payload ?? undefined);
 }
 
+function isDiagnosticAssistantNote(event: TimelineTailEvent): boolean {
+  return event.type === 'assistant.text'
+    && event.payload?.automation === true && event.payload?.memoryExcluded === true;
+}
+
 function hasActiveWorkThrough(events: TimelineTailEvent[], endIndex: number): boolean {
-  return reduceTimelineActivity(events.slice(0, endIndex + 1) as any).active;
+  // SDK sub-agent rows have their own lifecycle aggregator. Treating hidden
+  // wrapper tool.call events as generic open tools makes old Codex
+  // collaboration rows keep the parent chat's global "working" indicator
+  // alive forever, even after the dedicated SDK row has terminalized.
+  const activityEvents = events.slice(0, endIndex + 1).filter((event) => !isSdkSubagentTimelineEvent(event) && !isDiagnosticAssistantNote(event));
+  return reduceTimelineActivity(activityEvents as any).active;
 }
 
 export function isPendingUserMessageTimelineEvent(
@@ -47,19 +78,49 @@ export function isPendingUserMessageTimelineEvent(
   return event.type === 'user.message' && event.payload?.pending === true;
 }
 
+/**
+ * Client-owned dispatch evidence used for immediate send feedback. Unlike a
+ * stale thinking/tool tail, an unresolved optimistic user message represents
+ * work the current browser has actually submitted and is still tracking.
+ */
+export function hasPendingUserSend(events: TimelineTailEvent[]): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === 'session.state') {
+      const payload = event.payload ?? undefined;
+      if (
+        isUserCancelStoppingPayload(payload)
+        || (isIdleSessionStateTimelineEvent(event) && (
+          isCancelIdlePayload(payload)
+          || isAuthoritativeCleanIdlePayload(payload)
+        ))
+      ) {
+        return false;
+      }
+    }
+    if (isPendingUserMessageTimelineEvent(event) && event.payload?.failed !== true) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function hasActiveTimelineTurn(
   events: TimelineTailEvent[],
 ): boolean {
   let userMessageTailRequiresSessionState = false;
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
+    // Control receipts (including a pending model choice) are not native turn
+    // completions. Keep the existing run visible until its real terminal.
+    if (isDiagnosticAssistantNote(event)) continue;
     if (isIdleSessionStateTimelineEvent(event)) {
       if (isAuthoritativeCleanIdle(event)) return hasActiveWorkThrough(events, i);
       return hasActiveWorkThrough(events, i);
     }
     if (event.type === 'session.state') {
       const state = String(event.payload?.state ?? '');
-      return state === 'running' || state === 'queued';
+      return isWorkingSessionState(state);
     }
     if (isPendingUserMessageTimelineEvent(event)) continue;
     if (event.type === 'user.message') {
@@ -72,5 +133,31 @@ export function hasActiveTimelineTurn(
     if (NEUTRAL_TAIL_EVENT_TYPES.has(event.type)) continue;
     return false;
   }
+  return false;
+}
+
+/** Events that say nothing about whether a turn ran; they must not re-arm an idle edge. */
+const IDLE_EDGE_NEUTRAL_EVENT_TYPES = new Set<string>(['agent.status', 'usage.update', 'mode.state', 'terminal.snapshot', 'memory.context']);
+
+/**
+ * Track live idle edges per session.
+ *
+ * Returns true when `event` is an idle `session.state` for a session whose last
+ * signal was already idle -- a repeat of the same idle edge, which must not
+ * flash the tab / raise an alert / re-render the app again. Anything that
+ * shows real activity (a non-idle state, a message, a tool call, streaming
+ * text) re-arms the edge, so the next genuine idle still fires.
+ */
+export function noteLiveIdleSignal(idleSessions: Set<string>, event: { sessionId: string } & TimelineTailEvent): boolean {
+  if (event.type === 'session.state') {
+    if (!isIdleSessionStateTimelineEvent(event)) {
+      idleSessions.delete(event.sessionId);
+      return false;
+    }
+    const repeated = idleSessions.has(event.sessionId);
+    idleSessions.add(event.sessionId);
+    return repeated;
+  }
+  if (!IDLE_EDGE_NEUTRAL_EVENT_TYPES.has(event.type)) idleSessions.delete(event.sessionId);
   return false;
 }

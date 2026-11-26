@@ -67,6 +67,8 @@ function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' 
   return {
     agentType: 'codex',
     projectDir: `/work/${overrides.projectName}`,
+    sessionInstanceId: `instance_${overrides.name}`,
+    runtimeEpoch: `epoch_${overrides.name}`,
     state: 'idle',
     restarts: 0,
     restartTimestamps: [],
@@ -144,6 +146,10 @@ function cloneSession(name = CLONE, parentRunId = 'run-1'): SessionRecord {
   });
 }
 
+function sessionAfterCloneCreation(name: string): SessionRecord | undefined {
+  return baseSessions([cloneSession()]).find((record) => record.name === name);
+}
+
 beforeEach(() => {
   clearSendIdempotencyCacheForTests();
   cloneMocks.createExecutionClone.mockReset();
@@ -161,7 +167,11 @@ describe('send_message strict clone schema', () => {
     const dispatchMessage = vi.fn(async () => {});
     cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
     const handlers = createMemoryMcpToolHandlers(mcpCaller(), {
-      sendDeps: { listSessions: () => baseSessions(), dispatchMessage },
+      sendDeps: {
+        listSessions: () => baseSessions(),
+        getSession: sessionAfterCloneCreation,
+        dispatchMessage,
+      },
       isMemoryFeatureEnabled: () => true,
     });
 
@@ -219,7 +229,7 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
-      getSession: (name) => baseSessions().find((s) => s.name === name),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -232,6 +242,25 @@ describe('execution-clone send dispatch', () => {
     expect(dispatchMessage.mock.calls[0][0].name).not.toBe(TEMPLATE);
   });
 
+  it('preserves a queued clone dispatch in the accepted delivery status', async () => {
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
+    const result = await dispatchSendMessage(brainCaller, {
+      target: TEMPLATE,
+      message: 'queue the work',
+      clone: { ...canonicalClone },
+    }, {
+      listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [{ target: CLONE, status: 'queued' }],
+    });
+  });
+
   it('forces reply:true so the worker message carries a reply instruction', async () => {
     const dispatchMessage = vi.fn(async () => {});
     cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
@@ -241,12 +270,16 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
     const sentMessage = dispatchMessage.mock.calls[0][1] as string;
-    expect(sentMessage).toContain('imcodes send');
-    expect(sentMessage).toContain(BRAIN);
+    expect(sentMessage).toContain('<imcodes-agent-delegation-reply-instruction-v2>');
+    expect(sentMessage).toContain('"contractRefs":["supervision_messaging_v1"]');
+    expect(sentMessage).toContain('"tool":"delegation_reply"');
+    expect(sentMessage).toContain(`"target":"${BRAIN}"`);
+    expect(sentMessage).not.toContain('imcodes send');
   });
 
   it('rolls back (destroys) the clone when dispatch fails after creation — no orphan', async () => {
@@ -260,6 +293,7 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -284,6 +318,7 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -301,6 +336,7 @@ describe('execution-clone send dispatch', () => {
       message: 'ordinary send',
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -320,6 +356,7 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -381,6 +418,7 @@ describe('execution-clone send dispatch', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -813,6 +851,7 @@ describe('clone + reply:false rejection', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -830,6 +869,7 @@ describe('clone + reply:false rejection', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 
@@ -877,6 +917,7 @@ describe('execution-clone capability advertisement wiring (item 16)', () => {
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
       isExecutionCloneCapabilityEnabled: () => isDaemonCapabilityAdvertised(EXECUTION_CLONE_CAPABILITY_V1),
     });
@@ -900,6 +941,7 @@ describe('resolved clone limits are consumed on the create path (item 14 / TE-C)
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
       resolveExecutionCloneLimits: (parentRunId) => {
         expect(parentRunId).toBe('run-1');
@@ -927,6 +969,7 @@ describe('resolved clone limits are consumed on the create path (item 14 / TE-C)
       clone: { ...canonicalClone },
     }, {
       listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
       dispatchMessage,
     });
 

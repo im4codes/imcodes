@@ -3,17 +3,28 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**El IM para agentes. Memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada, colaboración humana y auditoría cruzada entre proveedores de IA.**
+**El IM para agentes. Escritorio remoto con IA, memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes conecta a los agentes de IA no solo con sesiones de código, sino también con los ordenadores donde se realiza el trabajo. Registra máquinas compatibles como **nodos controlados** restringidos y permite que un agente autorizado opere directamente uno o varios equipos mediante comandos con alcance, transferencia de archivos y Computer Use tipado. Cuando una persona necesita ver o tomar el control, los nodos Windows compatibles también ofrecen escritorio remoto desde el navegador o el móvil.
+
+Además del control de máquinas, IM.codes ofrece a los coding agents una memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable para [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent) y más. Terminal, archivos y Git, localhost preview, notificaciones, flujos multiagente, OpenSpec Auto Deliver, Auto supervision y auditoría Team mantienen visible y conectado el trabajo de personas y agentes.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
 Varios agentes admiten dos modos de integración: CLI y SDK.
+
+## Nodos controlados: escritorio remoto con IA
+
+Convierte ordenadores compatibles en nodos operados por IA sin configurar cada máquina como un source server completo de IM.codes.
+
+- **Una IA, varios ordenadores.** Registra varias máquinas y deja que un agente —o un equipo de agentes— las opere directamente para realizar el trabajo.
+- **Acciones reales en el ordenador.** Ejecuta comandos con alcance, mueve archivos individuales y controla aplicaciones mediante herramientas Computer Use tipadas.
+- **Escritorio remoto para intervención humana.** Abre un nodo Windows compatible desde el navegador o el móvil para ver la pantalla o tomar el control.
+- **Acceso limitado y revocable.** Cada nodo usa credenciales independientes, queda fuera de las listas normales de server/session y su propietario puede desactivar o revocar la ejecución.
 
 ## Capturas
 
@@ -123,6 +134,26 @@ IM.codes puede conducir sesiones de agent compatibles turno a turno — un super
 - **Pensado para flujos reales de IM.codes.** Auto supervision entiende flujos de OpenSpec, revisiones Team y coordinación entre agentes con `imcodes send` como pasos válidos del agente, no como una razón inmediata para parar y pedir a un humano.
 
 ## Funciones
+
+### Alias privados
+
+Guarda fragmentos de texto reutilizables vinculados al propietario y búscalos escribiendo `;` en el composer, o inserta directamente un marcador `;;(name)`. El mensaje mantiene visible el marcador mientras IM.codes resuelve y entrega el valor fuera de banda. Los agentes también pueden crear, buscar, editar y resolver alias mediante herramientas MCP gestionadas; los listados masivos solo exponen metadatos, evitando que una sola llamada vuelque todos los valores al contexto del modelo.
+
+### Nodos controlados
+
+Registra uno o varios ordenadores, escribe `^` para elegir un destino (o inserta `^^(name)`) y permite que los agentes autorizados trabajen en la máquina seleccionada. Pueden ejecutar comandos con alcance, transferir archivos individuales y usar herramientas Computer Use tipadas, lo que permite operar y coordinar una flota desde la misma conversación. La ejecución sigue bajo control del propietario y puede revocarse; cada nodo usa credenciales independientes y queda fuera de las listas normales de server/session. Los enlaces de descarga caducan, pero el instalador descargado puede conservarse y reutilizarse.
+
+### Control de escritorio remoto
+
+Los nodos Windows compatibles ofrecen escritorio remoto en el navegador a Owners y Participants autorizados. Permite alternar entre control y solo vista, cambiar pantalla y resolución, y colaborar con varios espectadores o controladores autorizados. En móvil, la navegación táctil y el ratón virtual permiten manejar el escritorio desde un teléfono o una tableta.
+
+El escritorio remoto selecciona automáticamente la conexión disponible y el acceso puede revocarse en cualquier momento. **Actualmente está disponible en Windows; los nodos macOS y Linux conservan las demás capacidades, con soporte de escritorio remoto previsto.**
+
+### Computer Use y automatización del navegador
+
+Los agentes SDK compatibles pueden controlar aplicaciones de escritorio mediante herramientas Computer Use tipadas. La ruta multiplataforma para aplicaciones de escritorio integra [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use), de Leo ([iFurySt](https://github.com/iFurySt)), publicado con licencia MIT; se acredita expresamente a ese proyecto por esta capacidad integrada.
+
+La automatización del navegador es una función independiente implementada por IM.codes directamente sobre Chrome DevTools Protocol (CDP). Permite abrir, inspeccionar, navegar, hacer clic, rellenar y evaluar páginas; devuelve texto estructurado por defecto y una captura opcional solo cuando se solicita. El navegador gestionado también expone un endpoint CDP limitado al loopback para que scripts locales de Python o Node reutilicen la misma instancia activa.
 
 ### Terminal remota
 Acceso completo al terminal de tus sesiones de agente desde cualquier navegador, sin SSH, VPN ni port forwarding. Puedes alternar entre modo terminal bruto y una vista de chat estructurada con tool calls, bloques de thinking y salida en streaming.
@@ -246,7 +277,8 @@ El daemon se ejecuta en tu máquina y gestiona sesiones process-backed mediante 
 ## Instalación
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash
+# fallback: npm install -g imcodes
 ```
 
 ## Inicio rápido
@@ -292,7 +324,7 @@ Notas:
 ### Configuración en un solo comando
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
@@ -311,8 +343,9 @@ El `docker-compose.yml` generado ya usa `pgvector/pgvector:pg18` para PostgreSQL
 
 Windows está soportado de forma nativa mediante ConPTY.
 
-```cmd
-npm install -g imcodes
+```powershell
+irm https://im.codes/install.ps1 | iex
+# fallback: npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
@@ -350,10 +383,15 @@ Este es un proyecto personal. Yo prácticamente no escribí código: fue constru
 
 ## Descargo de responsabilidad
 
-IM.codes es un proyecto independiente de código abierto y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada.
+IM.codes es un proyecto independiente de código disponible (source-available) y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada.
 
 ## Licencia
 
-[MIT](../LICENSE)
+[Business Source License 1.1 (BSL 1.1)](../LICENSE) — [Guía de licencia comercial](../COMMERCIAL-LICENSE.md) | [Avisos de terceros](../THIRD_PARTY_NOTICES.md)
+
+- **Uso no productivo y uso personal en producción:** El uso no productivo (evaluación, pruebas, desarrollo), la copia, modificación y redistribución conforme manteniendo avisos de derechos y marcas son gratuitos para cualquier tamaño de organización bajo BSL 1.1; el uso personal por personas físicas para desarrollo personal, aprendizaje, investigación o autoalojamiento personal en sus propios dispositivos o servidores (no desplegado centralmente ni compartido en una organización, ni para servicios comerciales alojados/SaaS/marca blanca a terceros) es gratuito permanentemente, sin importar el tamaño del empleador.
+- **Equipos pequeños en producción interna:** Cubierto gratis bajo la Concesión de Uso Adicional solo si se cumplen **ambas** condiciones **agregadas entre entidad legal, filiales y todas las instancias**: **<= 5** usuarios activos/asientos **y** **<= 50** personas en toda la organización.
+- **Fuera de la Concesión Adicional (licencia comercial):** Antes de la fecha de cambio, el uso en producción que supere cualquier límite agregado (`6/50` o `5/51`), así como el uso en producción para servicios alojados/gestionados, SaaS multi-tenant o reventa de marca blanca (incluso para 1 persona), queda fuera de la Concesión de Uso Adicional y requiere licencia comercial vía `support@im.codes`.
+- **Fecha de cambio:** Se convierte a [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) 4 años después de la publicación de cada versión (`2030-11-26` para esta versión).
 
 © 2026 [IM.codes](https://im.codes)

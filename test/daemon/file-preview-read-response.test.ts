@@ -122,6 +122,36 @@ describe('file-preview read public response assembly', () => {
     expect(response).not.toHaveProperty('encoding');
   });
 
+  it('returns audio stream mode without inline content', () => {
+    const response = assembleSnapshotTerminal({
+      requestId: 'r-audio',
+      rawPath: '/alias/voice.mp3',
+      snapshot: baseSnapshot({
+        realPath: '/tmp/imcodes-test-preview-response/project/voice.mp3',
+        fileName: 'voice.mp3',
+        size: 2048,
+        classification: {
+          previewKind: 'audio',
+          mimeType: 'audio/mpeg',
+          extension: 'mp3',
+          sizeLimitBytes: 100 * 1024 * 1024,
+          previewMode: 'stream',
+        },
+        payload: { mode: 'stream', previewMode: 'stream', mimeType: 'audio/mpeg', size: 2048 },
+      }),
+    });
+
+    expect(response).toMatchObject({
+      status: 'ok',
+      previewMode: 'stream',
+      mimeType: 'audio/mpeg',
+      size: 2048,
+      downloadId: expect.any(String),
+    });
+    expect(response).not.toHaveProperty('content');
+    expect(response).not.toHaveProperty('encoding');
+  });
+
   it('keeps binary and too-large responses downloadable with shared public codes', () => {
     const binary = assembleSnapshotTerminal({
       requestId: 'r-binary',

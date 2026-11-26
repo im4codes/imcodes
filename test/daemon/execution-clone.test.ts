@@ -141,6 +141,7 @@ function templateWithAllIdentity(overrides: Partial<SessionRecord> = {}): Sessio
     restartTimestamps: [1, 2, 3],
     startupMemoryInjected: true,
     recentInjectionHistory: [['a'], ['b']],
+    summarySyncFingerprints: ['summary-a'],
     qwenFreshOnResume: true,
     label: 'OC:main',
     quotaLabel: '1000/day',

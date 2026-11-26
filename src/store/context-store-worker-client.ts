@@ -1,12 +1,12 @@
 /**
- * Context-store worker client — the async facade the daemon main thread uses to
+ * Context-store process client — the async facade the daemon broker uses to
  * reach the memory/context store. Daemon production code MUST go through this
  * client (typed wrappers), never by importing the synchronous `context-store.ts`
  * directly (enforced by the exact-path import guard, task 4.5).
  *
  * Reliability contract (spec "Async client reliability" / "Failure policy
  * matrix" / "Transport liveness"):
- *  - eager worker spawn + `whenReady()` warmup (ensureDb runs in the worker,
+ *  - eager process spawn + `whenReady()` warmup (ensureDb runs in the child,
  *    never blocking the daemon listen path);
  *  - per-RPC client-side timeout (R1 front-of-turn ≤ min(transport budget, 2000),
  *    R3/R5 management+mutation 5000, R4 background 30000);
@@ -15,17 +15,26 @@
  *    drops telemetry / rejects mutations with `context_store_overloaded`);
  *  - self-heal: respawn the worker after N consecutive timeouts, on a cooldown.
  */
-import { Worker } from 'node:worker_threads';
+import { spawnChildProcessWorker } from '../util/child-process-worker.js';
 import {
+  boundedExponentialBackoffMs,
+  CONTEXT_STORE_OP_RETRY_CLASS,
   CONTEXT_STORE_RPC_BACKPRESSURE,
   CONTEXT_STORE_RPC_ERROR,
   CONTEXT_STORE_RPC_SELF_HEAL,
   CONTEXT_STORE_RPC_TIMEOUT_MS,
+  CONTEXT_STORE_SLOW_OP_LOG_MS,
+  CONTEXT_STORE_STUCK_WORKER_GRACE_MS,
+  CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE,
   CONTEXT_STORE_WORKER_DOWN_REASON,
+  CONTEXT_STORE_WORKER_HEALTH,
+  contextStoreOpRetryClass,
   defaultPriorityForOp,
+  isContextStoreRpcOp,
   isFireAndForgetOp,
   type ContextStoreFireAndForgetOp,
   type ContextStoreWorkerDownReason,
+  type ContextStoreWorkerHealth,
   type ContextStoreRpcOp,
   type ContextStoreRpcPriority,
   type ContextStoreRpcRequest,
@@ -48,15 +57,57 @@ interface PendingEntry {
   reject: (err: Error) => void;
   timer: NodeJS.Timeout | null;
   fireAndForget: boolean;
+  /** the op this entry is for - needed to pick the right failure code when the
+   *  generation dies with the request still in flight (retry-class policy). */
+  op: ContextStoreRpcOp;
+  /** true once `postMessage` returned without throwing, i.e. the worker MAY have
+   *  observed (and applied) the request. A never-dispatched entry is always
+   *  cleanly retryable; a dispatched unsafe-retry op is INDETERMINATE. */
+  dispatched: boolean;
+  started: boolean;
+  timeoutMs: number;
+  queueAware: boolean;
+  startedAtMs: number | null;
+}
+
+/** Point-in-time health of the context-store worker, for logs/diagnostics. */
+export interface ContextStoreHealthSnapshot {
+  state: ContextStoreWorkerHealth;
+  /** monotonic generation counter; increments on every (re)spawn */
+  generation: number;
+  ready: boolean;
+  /** consecutive awaited-RPC timeouts on the CURRENT generation */
+  consecutiveTimeouts: number;
+  /** consecutive timeout-driven respawns not yet cleared by a served op */
+  consecutiveTimeoutRespawns: number;
+  /** consecutive generations that died without serving a successful op */
+  consecutiveWorkerFailures: number;
+  /** why the last generation went down (null before the first failure) */
+  lastDownReason: ContextStoreWorkerDownReason | null;
+  /** generation awaiting confirmed exit, or null when nothing is retiring */
+  retiringGeneration: number | null;
+  /** true once the retiring generation was escalated to SIGKILL */
+  retirementForced: boolean;
+  /** ms until the next automatic rebuild attempt; 0 when a rebuild is due/live */
+  retryInMs: number;
+  pendingAwaited: number;
+  pendingFireAndForget: number;
+  /** Most recent worker operation that exceeded the diagnostic slow-op budget. */
+  lastSlowOperation: { op: ContextStoreRpcOp; durationMs: number } | null;
 }
 
 interface ContextStoreWorkerHandle {
+  /** Optional so an injected test double may omit them; production has them. */
+  readonly pid?: number;
+  readonly exitSignal?: string | null;
   unref(): void;
   on(event: 'message', listener: (msg: unknown) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
   on(event: 'exit', listener: (code: number) => void): this;
   postMessage(message: ContextStoreRpcRequest): void;
   terminate(): Promise<number>;
+  /** Optional so an injected test double may omit it; production always has it. */
+  forceKill?(): void;
 }
 
 type ContextStoreWorkerFactory = (url: URL) => ContextStoreWorkerHandle;
@@ -67,8 +118,19 @@ export interface CallOptions {
   timeoutMs?: number;
 }
 
+const SLOW_LOG_WINDOW_MS = 60_000;
+const SLOW_LOG_MAX_PER_WINDOW = 20;
+const LOSS_LOG_MAX_OPS = 5;
 const { maxAwaitedPending, maxFireAndForgetPending } = CONTEXT_STORE_RPC_BACKPRESSURE;
-const { consecutiveTimeoutsBeforeRespawn, respawnCooldownMs, warmupBackoffBaseMs, warmupBackoffMaxMs } = CONTEXT_STORE_RPC_SELF_HEAL;
+const {
+  consecutiveTimeoutsBeforeRespawn,
+  respawnCooldownMs,
+  timeoutBackoffBaseMs,
+  warmupBackoffBaseMs,
+  warmupBackoffMaxMs,
+  terminateConfirmMs,
+  forceKillConfirmMs,
+} = CONTEXT_STORE_RPC_SELF_HEAL;
 
 export class ContextStoreWorkerClient {
   private worker: ContextStoreWorkerHandle | null = null;
@@ -76,11 +138,50 @@ export class ContextStoreWorkerClient {
   private readonly pending = new Map<number, PendingEntry>();
   private awaitedCount = 0;
   private fireAndForgetCount = 0;
+  private lastSlowOperation: { op: ContextStoreRpcOp; durationMs: number } | null = null;
+  private lastWorkerProgressAt = Date.now();
+  /** Most recent worker-reported RSS (from `slow_op` diagnostics). */
+  private lastWorkerRssBytes: number | null = null;
+  /** Exit facts of the current generation, captured for the loss diagnostic. */
+  private lastExit: { code: number | null; signal: string | null } = { code: null, signal: null };
+  private slowLogWindowStart = 0;
+  private slowLogCount = 0;
+  private stuckWorkerCheckTimer: NodeJS.Timeout | null = null;
   private warmReady = false;
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private consecutiveTimeouts = 0;
   private lastRespawnAt = 0;
+  /** consecutive timeout-driven respawns with no successful op in between -
+   *  drives the timeout-domain EXPONENTIAL backoff (base 1s, cap 60s). Reset by
+   *  any ok response, exactly like `consecutiveTimeouts`. */
+  private consecutiveTimeoutRespawns = 0;
+  /** armed whenever there is no live generation and `started` - this is what
+   *  makes recovery AUTOMATIC instead of "whenever the next request happens to
+   *  arrive". Always unref'd so it never holds the daemon open. */
+  private rebuildTimer: NodeJS.Timeout | null = null;
+  private lastDownReason: ContextStoreWorkerDownReason | null = null;
+  /**
+   * A generation that has been retired but has NOT confirmed exit.
+   *
+   * SINGLE-OWNER INVARIANT. `terminate()` sends SIGTERM and only resolves on
+   * the child's `exit`, so a child wedged inside a blocking SQLite call never
+   * settles it. Retirement used to be fire-and-forget while the rebuild timer
+   * armed independently, so once the backoff elapsed a NEW generation spawned
+   * while the old OS process was still alive and still able to write the
+   * database. Generation fencing only discards the old generation's IPC
+   * replies - it cannot undo that process's side effects.
+   *
+   * While this is non-null and unconfirmed, NO new generation may be created.
+   */
+  private retirement: {
+    generation: number;
+    confirmed: boolean;
+    forced: boolean;
+    timer: NodeJS.Timeout | null;
+  } | null = null;
+  private lastHealthState: ContextStoreWorkerHealth | null = null;
+  private healthObserver: ((snapshot: ContextStoreHealthSnapshot) => void) | null = null;
   // ── Warmup/crash fault domain — INDEPENDENT from the timeout-respawn cooldown.
   //  timeout(alive-but-slow): 3 consec awaited timeouts → lastRespawnAt 60s cooldown;
   //    reset = any ok response (consecutiveTimeouts=0).
@@ -112,6 +213,56 @@ export class ContextStoreWorkerClient {
     this.budgetProvider = fn;
   }
 
+  /** Observe health-state TRANSITIONS (not every event) - the daemon wires a
+   *  logger here so unhealthy -> backoff -> ready is visible in daemon.log. */
+  setHealthObserver(fn: ((snapshot: ContextStoreHealthSnapshot) => void) | null): void {
+    this.healthObserver = fn;
+  }
+
+  getHealthSnapshot(now = Date.now()): ContextStoreHealthSnapshot {
+    return {
+      state: this.healthState(now),
+      generation: this.workerGeneration,
+      ready: this.warmReady,
+      consecutiveTimeouts: this.consecutiveTimeouts,
+      consecutiveTimeoutRespawns: this.consecutiveTimeoutRespawns,
+      consecutiveWorkerFailures: this.consecutiveWorkerFailures,
+      lastDownReason: this.lastDownReason,
+      retiringGeneration: this.retirementBlocksSpawn() ? this.retirement?.generation ?? null : null,
+      retirementForced: this.retirement?.forced ?? false,
+      retryInMs: this.retryDelayRemainingMs(now),
+      pendingAwaited: this.awaitedCount,
+      pendingFireAndForget: this.fireAndForgetCount,
+      lastSlowOperation: this.lastSlowOperation,
+    };
+  }
+
+  private healthState(now = Date.now()): ContextStoreWorkerHealth {
+    if (this.disposed) return CONTEXT_STORE_WORKER_HEALTH.disposed;
+    if (this.retirementBlocksSpawn()) return CONTEXT_STORE_WORKER_HEALTH.retiring;
+    if (!this.started && !this.worker) return CONTEXT_STORE_WORKER_HEALTH.idle;
+    if (this.worker) {
+      return this.warmReady ? CONTEXT_STORE_WORKER_HEALTH.ready : CONTEXT_STORE_WORKER_HEALTH.starting;
+    }
+    return this.isRespawnThrottled(now)
+      ? CONTEXT_STORE_WORKER_HEALTH.backoff
+      : CONTEXT_STORE_WORKER_HEALTH.unhealthy;
+  }
+
+  /** Emit only on a state CHANGE so a hot loop cannot spam the log. */
+  private notifyHealth(): void {
+    const observer = this.healthObserver;
+    const snapshot = this.getHealthSnapshot();
+    if (snapshot.state === this.lastHealthState) return;
+    this.lastHealthState = snapshot.state;
+    if (!observer) return;
+    try {
+      observer(snapshot);
+    } catch {
+      /* an observer must never break the store path */
+    }
+  }
+
   /** True once `start()` has been called — i.e. the daemon has declared the
    *  worker the production DB owner. Lifecycle calls `start()` in production
    *  only (skipped under VITEST/test and by the short-lived CLI), so this is the
@@ -121,8 +272,14 @@ export class ContextStoreWorkerClient {
    *  `call`/`fireAndForget` lazily `ensureWorker()`, so a test can spawn a worker
    *  without entering production owner mode. */
   private started = false;
+  /** Set when the child proves its Node runtime lacks node:sqlite. Retrying
+   * forever cannot repair an unsupported executable and only creates noisy
+   * respawn churn; callers receive the normal bounded unavailable error. */
+  private runtimeUnsupported = false;
 
-  constructor(private readonly createWorker: ContextStoreWorkerFactory = (url) => new Worker(url) as ContextStoreWorkerHandle) {}
+  constructor(
+    private readonly createWorker: ContextStoreWorkerFactory = (url) => spawnChildProcessWorker(url),
+  ) {}
 
   /** Eagerly spawn the worker (call once at daemon startup). Enters production
    *  single-owner mode: store access now goes through the worker, and on
@@ -152,22 +309,104 @@ export class ContextStoreWorkerClient {
   whenReady(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (!this.worker && this.isRespawnThrottled()) return Promise.resolve();
+    if (this.retirementBlocksSpawn()) return Promise.resolve();
     this.ensureWorker();
     return this.readyPromise ?? Promise.resolve();
   }
 
+  /** True while a retired generation has not confirmed exit. Spawning here
+   *  would create a second DB owner, so every spawn path must consult this. */
+  private retirementBlocksSpawn(): boolean {
+    return this.retirement !== null && !this.retirement.confirmed;
+  }
+
+  /** Open the retirement gate for `generation` and drive bounded termination.
+   *
+   *  Graceful SIGTERM first; if exit is not confirmed within
+   *  `terminateConfirmMs` escalate to SIGKILL; if even `forceKillConfirmMs`
+   *  after that brings no confirmation, stay closed (fail-closed) rather than
+   *  risk two owners. */
+  private beginRetirement(generation: number, dead: ContextStoreWorkerHandle): void {
+    const entry: { generation: number; confirmed: boolean; forced: boolean; timer: NodeJS.Timeout | null } = {
+      generation,
+      confirmed: false,
+      forced: false,
+      timer: null,
+    };
+    this.retirement = entry;
+
+    const armTimer = (ms: number, onFire: () => void): void => {
+      const timer = setTimeout(onFire, ms);
+      if (typeof timer.unref === 'function') timer.unref();
+      entry.timer = timer;
+    };
+
+    // `terminate()` resolving is one confirmation source; the handle's `exit`
+    // event (wired in `ensureWorker`) is the other. Whichever arrives first.
+    void dead.terminate().then(
+      () => this.confirmRetirement(generation),
+      () => {
+        // A rejected terminate tells us nothing about the process, so it is NOT
+        // a confirmation. The timers below remain the only escalation.
+      },
+    );
+
+    armTimer(terminateConfirmMs, () => {
+      if (entry.confirmed) return;
+      entry.forced = true;
+      try {
+        dead.forceKill?.();
+      } catch {
+        /* nothing else to try */
+      }
+      this.notifyHealth();
+      armTimer(forceKillConfirmMs, () => {
+        if (entry.confirmed) return;
+        // Deliberately NOT confirmed: the old process may still hold the DB, so
+        // the client stays unavailable instead of creating a second owner.
+        this.notifyHealth();
+      });
+    });
+  }
+
+  /** Called by the handle's `exit` event and by a settled `terminate()`. */
+  private confirmRetirement(generation: number): void {
+    const entry = this.retirement;
+    if (!entry || entry.generation !== generation || entry.confirmed) return;
+    entry.confirmed = true;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = null;
+    this.retirement = null;
+    this.notifyHealth();
+    // Only now may the next generation be created. `maybeRespawn` spawns at
+    // once when no throttle applies, and otherwise re-arms the bounded rebuild.
+    this.maybeRespawn();
+  }
+
   // ── Worker lifecycle ───────────────────────────────────────────────────────
-  private ensureWorker(): ContextStoreWorkerHandle {
+  /** Returns null when a spawn is not permitted right now (retirement gate). */
+  private ensureWorker(): ContextStoreWorkerHandle | null {
     if (this.worker) return this.worker;
+    if (this.runtimeUnsupported) return null;
+    if (this.retirementBlocksSpawn()) return null;
+    this.clearRebuildTimer();
     this.warmReady = false;
     this.generationServedOk = false; // new generation: must re-prove health via a served op
+    // A FRESH generation starts with a clean timeout strike count. Without this
+    // the >=3 strikes that killed the previous generation carried over, so the
+    // very FIRST slow RPC on the new worker tripped `respawn()` again - a
+    // permanent tear-down loop that never reached a served op (the field
+    // "no reliable bounded generation recovery"). The escalating
+    // `consecutiveTimeoutRespawns` counter (NOT this one) is what remembers that
+    // the previous generations were sick.
+    this.consecutiveTimeouts = 0;
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
     });
     const generation = ++this.workerGeneration;
     const workerUrl = new URL('./context-store-worker-bootstrap.mjs', import.meta.url);
     const worker = this.createWorker(workerUrl);
-    // Don't keep the daemon process alive solely for this worker.
+    // Don't keep the daemon process alive solely for this child process.
     worker.unref();
     worker.on('message', (msg: unknown) => this.onMessage(msg, generation));
     worker.on('error', (err) =>
@@ -177,7 +416,14 @@ export class ContextStoreWorkerClient {
         { reason: CONTEXT_STORE_WORKER_DOWN_REASON.workerError },
       ),
     );
+    worker.on('exit', () => {
+      // Authoritative confirmation that this generation's process is gone. Must
+      // run even when the generation is no longer current, because that is
+      // exactly the retiring case the gate is waiting on.
+      this.confirmRetirement(generation);
+    });
     worker.on('exit', (code) => {
+      this.lastExit = { code: typeof code === 'number' ? code : null, signal: worker.exitSignal ?? null };
       // Any exit from the current generation makes the worker unavailable, even
       // code 0 with no pending requests: otherwise a pre-ready clean exit leaves
       // whenReady() unresolved forever.
@@ -188,7 +434,54 @@ export class ContextStoreWorkerClient {
       );
     });
     this.worker = worker;
+    this.notifyHealth();
     return worker;
+  }
+
+  // ── Automatic bounded rebuild ──────────────────────────────────────────────
+  private clearRebuildTimer(): void {
+    if (!this.rebuildTimer) return;
+    clearTimeout(this.rebuildTimer);
+    this.rebuildTimer = null;
+  }
+
+  /** ms remaining before a rebuild is allowed - the max of both independent
+   *  throttles, so the timer fires exactly when the last one clears. */
+  private retryDelayRemainingMs(now = Date.now()): number {
+    if (this.disposed || this.worker) return 0;
+    let remaining = 0;
+    if (this.lastRespawnAt > 0) {
+      remaining = Math.max(remaining, this.timeoutBackoffMs() - (now - this.lastRespawnAt));
+    }
+    if (this.consecutiveWorkerFailures > 1) {
+      remaining = Math.max(remaining, this.warmupBackoffMs() - (now - this.lastWorkerFailureAt));
+    }
+    return Math.max(0, remaining);
+  }
+
+  /** Arm the automatic rebuild. This is the core of "the memory worker must
+   *  recover by itself": previously a respawn only happened if some caller
+   *  happened to issue another request after the throttle expired, so a quiet
+   *  period left the store down indefinitely. */
+  private scheduleRebuild(): void {
+    if (this.disposed || !this.started || this.worker) return;
+    // A retirement in flight must not be raced by a rebuild; `confirmRetirement`
+    // re-arms this once the old process is provably gone.
+    if (this.retirementBlocksSpawn()) return;
+    if (this.rebuildTimer) return;
+    const delay = this.retryDelayRemainingMs();
+    const timer = setTimeout(() => {
+      this.rebuildTimer = null;
+      if (this.disposed || !this.started || this.worker) return;
+      if (this.retirementBlocksSpawn()) return; // re-armed by confirmRetirement
+      if (this.isRespawnThrottled()) {
+        this.scheduleRebuild(); // clock moved / another throttle armed meanwhile
+        return;
+      }
+      this.ensureWorker();
+    }, delay);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.rebuildTimer = timer;
   }
 
   private isCurrentGeneration(generation: number): boolean {
@@ -203,7 +496,33 @@ export class ContextStoreWorkerClient {
 
   private onMessage(msg: unknown, generation: number): void {
     if (!this.isCurrentGeneration(generation)) return;
+    // A RETIRING generation stays "current" by number until its successor is
+    // created (the successor is gated on confirmed exit), so the generation
+    // check alone is not enough: a late `ready` from the process being killed
+    // would otherwise flip `warmReady` back on with no live handle behind it.
+    // Late signals from a retired generation are inert by contract.
+    if (this.retirement?.generation === generation) return;
+    if (!this.worker) return;
     if (!msg || typeof msg !== 'object') return;
+    if ((msg as { type?: unknown }).type === 'worker_runtime_error') {
+      const runtimeError = msg as { code?: unknown; message?: unknown };
+      if (runtimeError.code === 'node_sqlite_unavailable') {
+        this.runtimeUnsupported = true;
+        const detail = typeof runtimeError.message === 'string'
+          ? runtimeError.message
+          : 'context-store worker Node runtime does not support node:sqlite';
+        this.markWorkerUnavailable(
+          generation,
+          new ContextStoreError(CONTEXT_STORE_RPC_ERROR.workerError, detail),
+          { reason: CONTEXT_STORE_WORKER_DOWN_REASON.workerError },
+        );
+      }
+      return;
+    }
+    if ((msg as { type?: unknown }).type === CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE.slowOp) {
+      this.onWorkerSlowOp(msg as { kind?: unknown; op?: unknown; durationMs?: unknown; rssBytes?: unknown; queued?: unknown });
+      return;
+    }
     if ((msg as { type?: unknown }).type === 'ready') {
       const warmupError = (msg as { warmupError?: unknown }).warmupError;
       if (typeof warmupError === 'string' && warmupError) {
@@ -218,19 +537,60 @@ export class ContextStoreWorkerClient {
       }
       this.warmReady = true;
       this.settleReady();
+      // The starting -> ready handshake is the recovery signal operators look
+      // for in daemon.log; without this the observer only ever saw the failure
+      // half of the cycle.
+      this.notifyHealth();
+      return;
+    }
+    if ((msg as { type?: unknown }).type === 'started') {
+      const started = msg as { id?: unknown; op?: unknown; startedAtMs?: unknown };
+      if (typeof started.id !== 'number') return;
+      const entry = this.pending.get(started.id);
+      if (!entry || entry.started) return;
+      entry.started = true;
+      this.lastWorkerProgressAt = Date.now();
+      entry.startedAtMs = typeof started.startedAtMs === 'number' ? started.startedAtMs : Date.now();
+      if (entry.timer) clearTimeout(entry.timer);
+      const timeoutMs = entry.timeoutMs;
+      entry.timer = timeoutMs > 0 ? setTimeout(() => this.onTimeout(started.id as number), timeoutMs) : null;
+      if (entry.timer && typeof entry.timer.unref === 'function') entry.timer.unref();
       return;
     }
     const res = msg as ContextStoreRpcResponse;
     if (typeof res.id !== 'number') return;
+    if ('type' in res) return;
+    // A late response is still proof that the worker made progress after the
+    // client-side timeout.  Refresh the liveness clock before discarding it.
+    this.lastWorkerProgressAt = Date.now();
+    this.consecutiveTimeouts = 0;
+    this.clearStuckWorkerCheck();
     const entry = this.pending.get(res.id);
     if (!entry) return; // late-response discard (already timed out / settled)
+    if (entry.started && entry.startedAtMs !== null) {
+      const durationMs = Math.max(0, Date.now() - entry.startedAtMs);
+      if (durationMs >= CONTEXT_STORE_SLOW_OP_LOG_MS) {
+        this.lastSlowOperation = { op: entry.op, durationMs };
+        // The operation's timing starts at the worker's `started` ack, so a
+        // slow record is execution time rather than queue wait. Keep this
+        // structured and op-only: it is safe to correlate with RPC timeout
+        // events without leaking request arguments or memory contents.
+        // eslint-disable-next-line no-console
+        console.warn(`[context-store] slow operation op=${entry.op} durationMs=${durationMs}`);
+      }
+    }
     this.finish(res.id, entry);
     if (res.ok) {
       this.consecutiveTimeouts = 0;
+      // A served op also clears the timeout-respawn ESCALATION and its cooldown
+      // anchor, so a worker that recovered is not still treated as sick.
+      this.consecutiveTimeoutRespawns = 0;
+      this.lastRespawnAt = 0;
       // Served ≥1 successful op → worker is genuinely healthy: clear the
       // warmup/crash backoff (reaching `ready` alone is NOT enough).
       this.consecutiveWorkerFailures = 0;
       this.generationServedOk = true;
+      this.notifyHealth();
       entry.resolve(res.result);
     } else {
       entry.reject(new ContextStoreError(res.error?.code ?? CONTEXT_STORE_RPC_ERROR.opFailed, res.error?.message ?? 'context store error'));
@@ -259,22 +619,114 @@ export class ContextStoreWorkerClient {
       this.lastWorkerFailureAt = Date.now();
       this.workerFailureRecordedGeneration = generation;
     }
+    if (reason !== CONTEXT_STORE_WORKER_DOWN_REASON.dispose) this.lastDownReason = reason;
     const dead = this.worker;
+    if (dead && reason !== CONTEXT_STORE_WORKER_DOWN_REASON.dispose) this.logWorkerLoss(reason, dead);
     this.worker = null;
     this.warmReady = false;
     this.settleReady();
-    if (dead && options.terminate !== false) void dead.terminate().catch(() => {});
+    if (dead && options.terminate !== false) {
+      // Gate the next generation on confirmed exit instead of firing and
+      // forgetting - see `retirement`.
+      this.beginRetirement(generation ?? this.workerGeneration, dead);
+    }
     for (const [id, entry] of this.pending) {
       this.pending.delete(id);
       if (entry.timer) clearTimeout(entry.timer);
-      entry.reject(err);
+      entry.reject(this.pendingFailureFor(entry, err));
     }
     this.awaitedCount = 0;
     this.fireAndForgetCount = 0;
+    this.scheduleRebuild();
+    this.notifyHealth();
+  }
+
+  /** Bounded `slow_op` log from the worker's own per-op timing. Op/step names
+   *  and numbers only - never arguments or row contents. Rate-limited so a
+   *  pathological loop cannot flood daemon.log. */
+  private onWorkerSlowOp(msg: { kind?: unknown; op?: unknown; durationMs?: unknown; rssBytes?: unknown; queued?: unknown }): void {
+    const op = typeof msg.op === 'string' ? msg.op.slice(0, 80) : 'unknown';
+    const durationMs = typeof msg.durationMs === 'number' ? msg.durationMs : 0;
+    if (typeof msg.rssBytes === 'number') this.lastWorkerRssBytes = msg.rssBytes;
+    this.lastWorkerProgressAt = Date.now();
+    if (isContextStoreRpcOp(op)) this.lastSlowOperation = { op, durationMs };
+    const now = Date.now();
+    if (now - this.slowLogWindowStart > SLOW_LOG_WINDOW_MS) {
+      this.slowLogWindowStart = now;
+      this.slowLogCount = 0;
+    }
+    if (this.slowLogCount >= SLOW_LOG_MAX_PER_WINDOW) return;
+    this.slowLogCount += 1;
+    const kind = msg.kind === 'maintenance' ? 'maintenance' : 'op';
+    const queued = typeof msg.queued === 'number' ? msg.queued : 0;
+    const rss = this.lastWorkerRssBytes ?? 0;
+    // eslint-disable-next-line no-console
+    console.warn(`[context-store] worker slow ${kind}=${op} durationMs=${durationMs} queuedAfter=${queued} rssBytes=${rss}`);
+  }
+
+  /** One structured line when a generation is lost (timeout respawn, crash,
+   *  exit, warmup failure): what was running, what was waiting, how it died.
+   *  This is the missing half of "worker respawned after repeated timeouts",
+   *  which previously said nothing about the op that wedged it. */
+  private logWorkerLoss(reason: ContextStoreWorkerDownReason, dead: ContextStoreWorkerHandle): void {
+    const now = Date.now();
+    const inFlight: string[] = [];
+    let queued = 0;
+    let indeterminate = 0;
+    for (const entry of this.pending.values()) {
+      if (entry.started) {
+        if (inFlight.length < LOSS_LOG_MAX_OPS) inFlight.push(`${entry.op}@${entry.startedAtMs === null ? 0 : Math.max(0, now - entry.startedAtMs)}ms`);
+      } else {
+        queued += 1;
+      }
+      if (entry.dispatched && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry) indeterminate += 1;
+    }
+    const slow = this.lastSlowOperation;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[context-store] worker lost reason=${reason} generation=${this.workerGeneration} pid=${dead.pid ?? 'unknown'}`
+      + ` exitCode=${this.lastExit.code ?? 'none'} exitSignal=${dead.exitSignal ?? this.lastExit.signal ?? 'none'}`
+      + ` inFlight=[${inFlight.join(',')}] notStarted=${queued} indeterminateMutations=${indeterminate}`
+      + ` lastSlowOp=${slow ? `${slow.op}@${slow.durationMs}ms` : 'none'}`
+      + ` lastProgressAgeMs=${Math.max(0, now - this.lastWorkerProgressAt)} rssBytes=${this.lastWorkerRssBytes ?? 'unknown'}`,
+    );
+  }
+
+  /** Failure handed to a pending RPC when its generation dies.
+   *
+   *  A request that was never dispatched is cleanly retryable, and so is a
+   *  dispatched read/idempotent write. A DISPATCHED `unsafeRetry` op (append,
+   *  lease/claim, commit bundle) has an UNKNOWN outcome - the worker may have
+   *  committed it before dying - so it gets the distinct `indeterminate` code.
+   *  Background callers requeue on `unavailable`/`timeout` but MUST NOT requeue
+   *  `indeterminate`, which is what stops a worker crash from duplicating
+   *  appends or double-consuming a usage-sync lease. */
+  private pendingFailureFor(entry: PendingEntry, err: Error): Error {
+    if (!entry.dispatched) return err;
+    if (contextStoreOpRetryClass(entry.op) !== CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry) return err;
+    return new ContextStoreError(
+      CONTEXT_STORE_RPC_ERROR.indeterminate,
+      `context-store op outcome unknown after worker loss: ${entry.op} (${err.message})`,
+    );
+  }
+
+  /** Exponential backoff for the TIMEOUT fault domain: 1st respawn waits
+   *  `timeoutBackoffBaseMs`, each further consecutive respawn doubles it, capped
+   *  at `respawnCooldownMs`. Reset by any ok response.
+   *
+   *  Uses `boundedExponentialBackoffMs` rather than a shift: at respawn 23 the
+   *  old `1000 << 22` wrapped to -100663296, which disabled the throttle instead
+   *  of capping it. */
+  private timeoutBackoffMs(): number {
+    return boundedExponentialBackoffMs(
+      timeoutBackoffBaseMs,
+      this.consecutiveTimeoutRespawns,
+      respawnCooldownMs,
+    );
   }
 
   private isRespawnCoolingDown(now = Date.now()): boolean {
-    return this.lastRespawnAt > 0 && now - this.lastRespawnAt < respawnCooldownMs;
+    return this.lastRespawnAt > 0 && now - this.lastRespawnAt < this.timeoutBackoffMs();
   }
 
   /** Exponential backoff for the warmup/crash fault domain. First failure → 0
@@ -282,7 +734,13 @@ export class ContextStoreWorkerClient {
    *  capped at `warmupBackoffMaxMs`. */
   private warmupBackoffMs(): number {
     if (this.consecutiveWorkerFailures <= 1) return 0;
-    return Math.min(warmupBackoffBaseMs << (this.consecutiveWorkerFailures - 2), warmupBackoffMaxMs);
+    // Same overflow hazard as the timeout domain: `500 << 23` wrapped negative
+    // at failure 25.
+    return boundedExponentialBackoffMs(
+      warmupBackoffBaseMs,
+      this.consecutiveWorkerFailures - 1,
+      warmupBackoffMaxMs,
+    );
   }
 
   /** True when ANY respawn throttle is active — the timeout-respawn cooldown OR
@@ -296,15 +754,26 @@ export class ContextStoreWorkerClient {
 
   private maybeRespawn(): void {
     if (this.disposed || this.worker || !this.started) return;
-    if (this.isRespawnThrottled()) return;
+    if (this.retirementBlocksSpawn()) return;
+    if (this.isRespawnThrottled()) {
+      // Still throttled: make sure the AUTOMATIC rebuild is armed so recovery
+      // does not depend on another caller showing up later.
+      this.scheduleRebuild();
+      return;
+    }
     this.ensureWorker();
   }
 
   private respawn(): void {
     const now = Date.now();
-    if (now - this.lastRespawnAt < respawnCooldownMs) return;
+    if (this.isRespawnCoolingDown(now)) return;
+    this.clearStuckWorkerCheck();
     this.lastRespawnAt = now;
-    this.consecutiveTimeouts = 0;
+    this.consecutiveTimeoutRespawns += 1;
+    // NOTE: `consecutiveTimeouts` is deliberately NOT reset here. It is owned by
+    // the generation lifecycle and cleared in `ensureWorker()`; resetting it in
+    // both places left the generation reset unreachable and hid the original
+    // defect (strikes carrying into a fresh worker).
     this.markWorkerUnavailable(
       null,
       new ContextStoreError(CONTEXT_STORE_RPC_ERROR.timeout, 'context-store worker respawned after repeated timeouts'),
@@ -327,6 +796,7 @@ export class ContextStoreWorkerClient {
   ): void {
     try {
       worker.postMessage(request);
+      entry.dispatched = true;
     } catch (err) {
       this.finish(request.id, entry);
       const message = err instanceof Error ? err.message : String(err);
@@ -341,12 +811,68 @@ export class ContextStoreWorkerClient {
   private onTimeout(id: number): void {
     const entry = this.pending.get(id);
     if (!entry) return;
-    this.finish(id, entry);
-    entry.reject(new ContextStoreError(CONTEXT_STORE_RPC_ERROR.timeout, `context-store RPC timed out: id ${id}`));
-    if (!entry.fireAndForget) {
-      this.consecutiveTimeouts += 1;
-      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) this.respawn();
+    // `postMessage` flips dispatched before the worker emits its started ack.
+    // The request is still queue-starved for timeout/respawn accounting, but an
+    // unsafe mutation may already have been accepted by the worker. Keep safe
+    // reads retryable as unavailable; classify only dispatched unsafe mutations
+    // as indeterminate so callers cannot replay a possible append/lease.
+    const queued = entry.queueAware && !entry.started;
+    if (!queued) {
+      const durationMs = entry.startedAtMs === null ? entry.timeoutMs : Math.max(0, Date.now() - entry.startedAtMs);
+      this.lastSlowOperation = { op: entry.op, durationMs };
+      // eslint-disable-next-line no-console
+      console.error(`[context-store] RPC timeout op=${entry.op} durationMs=${durationMs} queued=${!entry.started}`);
     }
+    this.finish(id, entry);
+    // A timeout is NOT proof the op did not run - the worker may still be
+    // executing it. Reads/idempotent writes keep the plain timeout code; a
+    // dispatched unsafe-retry op becomes `indeterminate` so nobody replays it.
+    const timeoutError = new ContextStoreError(
+      queued ? CONTEXT_STORE_RPC_ERROR.unavailable : CONTEXT_STORE_RPC_ERROR.timeout,
+      queued ? `context-store request remained queued: id ${id}` : `context-store RPC timed out: id ${id}`,
+    );
+    const dispatchedUnsafe = entry.dispatched
+      && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
+    entry.reject(dispatchedUnsafe ? this.pendingFailureFor(entry, timeoutError) : timeoutError);
+    // Queue starvation is backpressure, not a sick worker.  In particular do
+    // not increment the generation timeout strike or respawn while a request
+    // has not received the started acknowledgement.
+    if (!entry.fireAndForget && !queued) {
+      this.consecutiveTimeouts += 1;
+      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) {
+        // A started operation can still be progressing even though its caller
+        // budget elapsed.  Defer any destructive respawn until a generous
+        // liveness grace period has passed with no worker-side progress.
+        // Explicit timeout probes (queueAware=false) retain the historical
+        // immediate escalation for a dispatched request with no started ack.
+        // Queue-aware calls are backpressure and never enter this strike path;
+        // started operations receive the liveness grace period.
+        if (entry.started || (entry.dispatched && entry.queueAware)) this.scheduleStuckWorkerCheck();
+        else this.respawn();
+      }
+    }
+  }
+
+  private clearStuckWorkerCheck(): void {
+    if (!this.stuckWorkerCheckTimer) return;
+    clearTimeout(this.stuckWorkerCheckTimer);
+    this.stuckWorkerCheckTimer = null;
+  }
+
+  private scheduleStuckWorkerCheck(): void {
+    if (this.stuckWorkerCheckTimer) return;
+    const generation = this.workerGeneration;
+    const timer = setTimeout(() => {
+      this.stuckWorkerCheckTimer = null;
+      if (this.disposed || generation !== this.workerGeneration || !this.worker) return;
+      if (Date.now() - this.lastWorkerProgressAt < CONTEXT_STORE_STUCK_WORKER_GRACE_MS) {
+        this.scheduleStuckWorkerCheck();
+        return;
+      }
+      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) this.respawn();
+    }, CONTEXT_STORE_STUCK_WORKER_GRACE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.stuckWorkerCheckTimer = timer;
   }
 
   // ── Dispatch ───────────────────────────────────────────────────────────────
@@ -369,13 +895,43 @@ export class ContextStoreWorkerClient {
       return Promise.reject(new ContextStoreError(CONTEXT_STORE_RPC_ERROR.unavailable, `context-store worker throttled for op: ${op}`));
     }
     const worker = this.ensureWorker();
+    if (!worker) {
+      // Retiring: the previous generation has not confirmed exit, so there is
+      // deliberately no owner to dispatch to.
+      return Promise.reject(new ContextStoreError(
+        CONTEXT_STORE_RPC_ERROR.unavailable,
+        `context-store worker retiring for op: ${op}`,
+      ));
+    }
     const id = this.nextId++;
     const priority = opts.priority ?? defaultPriorityForOp(op);
     const timeoutMs = opts.timeoutMs ?? CONTEXT_STORE_RPC_TIMEOUT_MS.r3r5Management;
     return new Promise<T>((resolve, reject) => {
-      const timer = timeoutMs > 0 ? setTimeout(() => this.onTimeout(id), timeoutMs) : null;
+      // The initial timer is only a generous queue guard. Once the worker
+      // acknowledges execution, it is replaced with the normal operation
+      // budget. Queue expiry never contributes a timeout strike/respawn.
+      // Explicit timeout-only calls (used by callers/tests that deliberately
+      // probe execution latency) retain their exact budget. Production calls
+      // either use the default budget or identify a priority lane and receive
+      // the separate queue guard.
+      const queueAware = opts.timeoutMs === undefined || opts.priority !== undefined;
+      const queueTimeoutMs = timeoutMs > 0
+        ? (queueAware ? Math.max(timeoutMs * 4, 30_000) : timeoutMs)
+        : 0;
+      const timer = queueTimeoutMs > 0 ? setTimeout(() => this.onTimeout(id), queueTimeoutMs) : null;
       if (timer && typeof timer.unref === 'function') timer.unref();
-      const entry: PendingEntry = { resolve: resolve as (v: unknown) => void, reject, timer, fireAndForget: false };
+      const entry: PendingEntry = {
+        resolve: resolve as (v: unknown) => void,
+        reject,
+        timer,
+        fireAndForget: false,
+        op,
+        dispatched: false,
+        started: false,
+        startedAtMs: null,
+        timeoutMs,
+        queueAware,
+      };
       this.pending.set(id, entry);
       this.awaitedCount += 1;
       this.tryPostMessage(worker, { id, priority, op, args } satisfies ContextStoreRpcRequest, entry);
@@ -398,12 +954,24 @@ export class ContextStoreWorkerClient {
     // maybeRespawn(). Dropping is spec-compliant ("fire-and-forget MAY be dropped").
     if (!this.worker && this.isRespawnThrottled()) return; // drop / coalesce
     const worker = this.ensureWorker();
+    if (!worker) return; // retiring: drop / coalesce
     const id = this.nextId++;
     const priority = defaultPriorityForOp(op);
     // Time the entry out so a lost response cannot leak a pending slot forever.
     const timer = setTimeout(() => this.onTimeout(id), CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background);
     if (typeof timer.unref === 'function') timer.unref();
-    const entry: PendingEntry = { resolve: () => {}, reject: () => {}, timer, fireAndForget: true };
+    const entry: PendingEntry = {
+      resolve: () => {},
+      reject: () => {},
+      timer,
+      fireAndForget: true,
+      op,
+      dispatched: false,
+      started: false,
+      startedAtMs: null,
+      timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background,
+      queueAware: true,
+    };
     this.pending.set(id, entry);
     this.fireAndForgetCount += 1;
     this.tryPostMessage(worker, { id, priority, op, args } satisfies ContextStoreRpcRequest, entry);
@@ -507,6 +1075,11 @@ export class ContextStoreWorkerClient {
 
   dispose(): void {
     this.disposed = true;
+    this.clearStuckWorkerCheck();
+    this.clearRebuildTimer();
+    // The retirement escalation is deliberately LEFT RUNNING: the child must
+    // still be terminated/killed. Nothing can spawn because `disposed` gates
+    // every spawn path, and the escalation timers are unref'd.
     this.markWorkerUnavailable(null, new ContextStoreError(CONTEXT_STORE_RPC_ERROR.disposed, 'context-store client disposed'), { reason: CONTEXT_STORE_WORKER_DOWN_REASON.dispose });
   }
 }

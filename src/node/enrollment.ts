@@ -1,0 +1,1068 @@
+import {
+  CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_RUNTIME_ABI_PROFILE,
+  normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile,
+} from '../../shared/controlled-node-abi.js';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { constants as fsConstants, type Stats } from 'node:fs';
+import { chmod, chown, lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
+import os from 'node:os';
+import { basename, dirname, join } from 'node:path';
+import {
+  NODE_ROLE,
+  ENROLLMENT_REDEEM_VERSION_V2,
+  ENROLLMENT_MAX_TRAILER_BYTES,
+  ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN,
+  encodeEnrollmentTrailer,
+  decodeEnrollmentTrailer,
+  decodeEnrollmentTrailerWithRange,
+  enrollmentOsFromNodePlatform,
+  isEnrollmentNodeTokenHash,
+  type EnrollRedeemV2Request,
+  type EnrollRedeemV2Response,
+  ENROLL_DIRECT_V2_PATH,
+  type EnrollDirectV2Request,
+  type EnrollmentBlob,
+  type EnrollmentTrailerRange,
+} from '../../shared/remote-exec.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { isControlledNodeArch } from '../../shared/controlled-node-artifacts.js';
+import { normalizeControlledNodeEndpointOrigin } from '../../shared/controlled-node-endpoints.js';
+import {
+  inspectWindowsAuthenticodeEnrollmentContainer,
+  WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
+  type WindowsAuthenticodeEnrollmentRestore,
+} from '../../shared/windows-authenticode-enrollment.js';
+import {
+  applyWindowsAclCommands,
+  windowsCredentialDir,
+  windowsExecutableFileAclCommands,
+  windowsSecretFileAclCommands,
+} from './installer.js';
+
+export interface ControlledNodeCredential {
+  abiProfile?: ControlledNodeAbiProfile;
+  serverId: string;
+  /** Server-minted public identity. Optional only for pre-migration credentials. */
+  nodeId?: string;
+  token: string;
+  serverUrl: string;
+  nodeRole: typeof NODE_ROLE.CONTROLLED;
+  refName?: string;
+  displayName?: string;
+}
+
+export interface InstallIdentity {
+  installId: string;
+  nodeToken: string;
+  nodeTokenHash: string;
+}
+
+export interface PendingInstallIdentity extends InstallIdentity {
+  sourceExePath: string;
+}
+
+export interface EnrollmentRuntimeIdentity {
+  abiProfile?: ControlledNodeAbiProfile;
+  platform: string;
+  arch: string;
+  hostname: string;
+}
+
+export interface FileIdentity {
+  dev?: number;
+  ino?: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
+export interface StagedExecutableReceipt {
+  path: string;
+  size: number;
+  sha256: string;
+  sourceIdentity: FileIdentity;
+  stagedIdentity: FileIdentity;
+}
+
+export interface VerifiedEnrollmentSource {
+  readonly sourcePath: string;
+  readonly identity: FileIdentity;
+  statSize(): Promise<number>;
+  readExactly(position: number, length: number): Promise<Buffer>;
+  readEnrollmentBlobWithRange(): Promise<EnrollmentTrailerRange | null>;
+  stageTrailerFreeExecutable(
+    destPath: string,
+    trailerStart: number,
+    windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore,
+  ): Promise<StagedExecutableReceipt>;
+  cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus>;
+  close(): Promise<void>;
+}
+
+export type SourceCleanupStatus = 'pending' | 'cleaned' | 'skipped' | 'failed';
+
+function isNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+}
+
+async function fsyncParentDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await open(dirname(path), 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+type NodeFileHandle = Awaited<ReturnType<typeof open>>;
+type StagingFileHandle = Pick<NodeFileHandle, 'write' | 'sync' | 'close'>;
+
+export interface EnrollmentStagingFs {
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
+  chmod(path: string, mode: number): Promise<void>;
+  openDestination(path: string, flags: string, mode: number): Promise<StagingFileHandle>;
+  rename(from: string, to: string): Promise<void>;
+  unlink(path: string): Promise<void>;
+  readdir(path: string): Promise<string[]>;
+  lstat(path: string): Promise<Stats>;
+  fsyncParentDirectory(path: string): Promise<void>;
+  openSourceWritable(path: string): Promise<NodeFileHandle>;
+}
+
+const DEFAULT_ENROLLMENT_STAGING_FS: EnrollmentStagingFs = {
+  mkdir,
+  chmod,
+  openDestination: (path, flags, mode) => open(path, flags, mode),
+  rename,
+  unlink,
+  readdir,
+  lstat,
+  fsyncParentDirectory,
+  openSourceWritable: (path) => openNoFollow(path, true),
+};
+
+export function createEnrollmentStagingFs(
+  overrides: Partial<EnrollmentStagingFs> = {},
+): EnrollmentStagingFs {
+  return { ...DEFAULT_ENROLLMENT_STAGING_FS, ...overrides };
+}
+
+function fileIdentityFromStat(stat: {
+  dev?: number;
+  ino?: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}): FileIdentity {
+  return {
+    ...(typeof stat.dev === 'number' ? { dev: stat.dev } : {}),
+    ...(typeof stat.ino === 'number' ? { ino: stat.ino } : {}),
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+}
+
+function sameFileIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  const stableMetadata = a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+  if (a.dev !== undefined && b.dev !== undefined && a.ino !== undefined && b.ino !== undefined) {
+    return a.dev === b.dev && a.ino === b.ino && stableMetadata;
+  }
+  return stableMetadata;
+}
+
+function sourceOpenFlags(readWrite = false): number | string {
+  const base = readWrite ? fsConstants.O_RDWR : fsConstants.O_RDONLY;
+  const nofollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  return base | nofollow;
+}
+
+async function openNoFollow(path: string, readWrite = false): Promise<Awaited<ReturnType<typeof open>>> {
+  return open(path, sourceOpenFlags(readWrite));
+}
+
+export async function readExactly(
+  handle: Pick<NodeFileHandle, 'read'>,
+  position: number,
+  length: number,
+): Promise<Buffer> {
+  if (!Number.isSafeInteger(position) || position < 0) throw new Error('read_exactly_invalid_position');
+  if (!Number.isSafeInteger(length) || length < 0) throw new Error('read_exactly_invalid_length');
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await handle.read(buffer, offset, length - offset, position + offset);
+    if (bytesRead <= 0) throw new Error('read_exactly_eof');
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
+export async function writeExactly(
+  handle: Pick<NodeFileHandle, 'write'>,
+  buffer: Buffer,
+  position: number,
+): Promise<void> {
+  if (!Number.isSafeInteger(position) || position < 0) throw new Error('write_exactly_invalid_position');
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset, position + offset);
+    if (bytesWritten <= 0) throw new Error('write_exactly_no_progress');
+    offset += bytesWritten;
+  }
+}
+
+class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
+  readonly sourcePath: string;
+  readonly identity: FileIdentity;
+  private closed = false;
+
+  constructor(
+    sourcePath: string,
+    private readonly handle: NodeFileHandle,
+    identity: FileIdentity,
+    private readonly stagingFs: EnrollmentStagingFs,
+  ) {
+    this.sourcePath = sourcePath;
+    this.identity = identity;
+  }
+
+  async statSize(): Promise<number> {
+    const stat = await this.handle.stat();
+    return stat.size;
+  }
+
+  async readExactly(position: number, length: number): Promise<Buffer> {
+    const stat = await this.handle.stat();
+    if (position + length > stat.size) throw new Error('read_exactly_range_exceeds_source');
+    return readExactly(this.handle, position, length);
+  }
+
+  async readEnrollmentBlobWithRange(): Promise<EnrollmentTrailerRange | null> {
+    const size = await this.statSize();
+    const tailFileOffset = Math.max(
+      0,
+      size - ENROLLMENT_MAX_TRAILER_BYTES - WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
+    );
+    const length = size - tailFileOffset;
+    if (length <= 0) return null;
+    const buf = await this.readExactly(tailFileOffset, length);
+    const decoded = decodeEnrollmentTrailerWithRange(buf, tailFileOffset);
+    if (!decoded || process.platform !== 'win32') return decoded;
+    const header = await this.readExactly(0, Math.min(size, 4096));
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      header,
+      size,
+      buf,
+      tailFileOffset,
+      decoded.trailerStart,
+      decoded.trailerLength,
+    );
+    if (!restore) throw new Error('windows enrollment package is not Authenticode-preserving');
+    return { ...decoded, windowsAuthenticode: restore };
+  }
+
+  async stageTrailerFreeExecutable(
+    destPath: string,
+    trailerStart: number,
+    windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore,
+  ): Promise<StagedExecutableReceipt> {
+    if (trailerStart <= 0) throw new Error('invalid_trailer_start');
+    const currentSize = await this.statSize();
+    if (trailerStart > currentSize) throw new Error('trailer_start_exceeds_source_size');
+    const stableSize = windowsAuthenticode?.signedArtifactSize ?? trailerStart;
+    if (stableSize <= 0 || stableSize > trailerStart) throw new Error('invalid_stable_executable_size');
+    if (windowsAuthenticode
+      && (windowsAuthenticode.sizeFieldOffset < 0
+        || windowsAuthenticode.sizeFieldOffset + 4 > stableSize)) {
+      throw new Error('invalid_windows_authenticode_restore_offset');
+    }
+    await this.stagingFs.mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') await this.stagingFs.chmod(dirname(destPath), 0o700);
+    const temp = `${destPath}.${process.pid}.${randomUUID()}.tmp`;
+    let dst: StagingFileHandle | null = null;
+    let renamed = false;
+    const hash = createHash('sha256');
+    let written = 0;
+    try {
+      dst = await this.stagingFs.openDestination(temp, 'wx', 0o700);
+      const chunkSize = 64 * 1024;
+      while (written < stableSize) {
+        const toRead = Math.min(chunkSize, stableSize - written);
+        const buf = await this.readExactly(written, toRead);
+        if (windowsAuthenticode) {
+          const patchOffset = windowsAuthenticode.sizeFieldOffset;
+          const patch = Buffer.alloc(4);
+          patch.writeUInt32LE(windowsAuthenticode.originalCertificateTableSize, 0);
+          const overlapStart = Math.max(written, patchOffset);
+          const overlapEnd = Math.min(written + buf.length, patchOffset + patch.length);
+          if (overlapStart < overlapEnd) {
+            patch.copy(buf, overlapStart - written, overlapStart - patchOffset, overlapEnd - patchOffset);
+          }
+        }
+        await writeExactly(dst, buf, written);
+        hash.update(buf);
+        written += buf.length;
+      }
+      await dst.sync();
+      await dst.close();
+      dst = null;
+      if (process.platform !== 'win32') await this.stagingFs.chmod(temp, 0o755);
+      await this.replaceDestination(temp, destPath);
+      renamed = true;
+      if (process.platform === 'win32') {
+        applyWindowsAclCommands(windowsExecutableFileAclCommands(destPath));
+      }
+      await this.stagingFs.fsyncParentDirectory(destPath);
+    } catch (error) {
+      await dst?.close().catch(() => {});
+      if (!renamed) await this.stagingFs.unlink(temp).catch(() => {});
+      throw error;
+    } finally {
+      if (dst) await dst.close().catch(() => {});
+    }
+    const stagedStat = await this.stagingFs.lstat(destPath);
+    if (!stagedStat.isFile() || stagedStat.isSymbolicLink()) throw new Error('staged_executable_not_regular');
+    return {
+      path: destPath,
+      size: stableSize,
+      sha256: hash.digest('hex'),
+      sourceIdentity: this.identity,
+      stagedIdentity: fileIdentityFromStat(stagedStat),
+    };
+  }
+
+  /**
+   * Publish the freshly written copy over the stable service path.
+   *
+   * Windows keeps a running image locked, so renaming *onto* the executing
+   * service copy fails with EACCES/EPERM even for SYSTEM. It does allow the
+   * running image to be renamed *away*, so displace the incumbent and take its
+   * name. The running process keeps its open handle and its own bytes; only the
+   * next launch sees the new copy. A failed second rename puts the incumbent
+   * back, so an interrupted re-stage can never leave the stable path missing.
+   */
+  private async replaceDestination(temp: string, destPath: string): Promise<void> {
+    try {
+      await this.stagingFs.rename(temp, destPath);
+      return;
+    } catch (error) {
+      if (process.platform !== 'win32' || !isLockedDestinationError(error)) throw error;
+    }
+    // Sweep what earlier runs had to leave behind. The image displaced by THIS
+    // run is still executing, so Windows will refuse to delete it below; by the
+    // next install the service has restarted onto the new copy and the old one
+    // finally goes. Without this each re-install strands another ~80MB copy in
+    // the protected directory forever.
+    await this.removeDisplacedPredecessors(destPath);
+    const displaced = `${destPath}.replaced-${randomUUID()}`;
+    await this.stagingFs.rename(destPath, displaced);
+    try {
+      await this.stagingFs.rename(temp, destPath);
+    } catch (error) {
+      await this.stagingFs.rename(displaced, destPath).catch(() => {});
+      throw error;
+    }
+    await this.stagingFs.unlink(displaced).catch(() => {});
+  }
+
+  /** Delete displaced copies from earlier installs; a running one simply stays. */
+  private async removeDisplacedPredecessors(destPath: string): Promise<void> {
+    const directory = dirname(destPath);
+    const prefix = `${basename(destPath)}.replaced-`;
+    const entries = await this.stagingFs.readdir(directory).catch(() => [] as string[]);
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue;
+      await this.stagingFs.unlink(join(directory, entry)).catch(() => {});
+    }
+  }
+
+  async cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus> {
+    if (trailerLength <= 0 || trailerStart < 0) return 'skipped';
+    let cleanupHandle: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      const before = await lstat(this.sourcePath);
+      if (before.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(before))) return 'skipped';
+      cleanupHandle = await this.stagingFs.openSourceWritable(this.sourcePath);
+      const after = await cleanupHandle.stat();
+      if (!sameFileIdentity(this.identity, fileIdentityFromStat(after))) return 'skipped';
+      // EXACT WRITE LOOP: a single `write()` may return short. Use the shared
+      // `writeExactly` helper so partial writes or no-progress writes are
+      // converted into a `failed` status (not a false `cleaned`).
+      try {
+        await writeExactly(cleanupHandle, Buffer.alloc(trailerLength), trailerStart);
+        await cleanupHandle.sync();
+        return 'cleaned';
+      } catch (error) {
+        if (process.platform === 'linux' && isTextFileBusyError(error)) {
+          await cleanupHandle.close().catch(() => {});
+          cleanupHandle = null;
+          return this.replaceRunningLinuxSource(trailerStart);
+        }
+        return 'failed';
+      }
+    } catch (error) {
+      if (isNotFoundError(error)) return 'skipped';
+      if (process.platform === 'linux' && isTextFileBusyError(error)) {
+        return this.replaceRunningLinuxSource(trailerStart);
+      }
+      return 'failed';
+    } finally {
+      if (cleanupHandle) await cleanupHandle.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Linux refuses O_RDWR on the currently executing image with ETXTBSY. Build
+   * a trailer-free sibling and atomically replace the pathname instead. The
+   * running process keeps its original inode, while future launches use the
+   * sanitized executable.
+   */
+  private async replaceRunningLinuxSource(trailerStart: number): Promise<SourceCleanupStatus> {
+    const replacementPath = `${this.sourcePath}.${process.pid}.${randomUUID()}.cleanup`;
+    try {
+      const before = await this.stagingFs.lstat(this.sourcePath);
+      if (before.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(before))) return 'skipped';
+
+      await this.stageTrailerFreeExecutable(replacementPath, trailerStart);
+      await chown(replacementPath, before.uid, before.gid);
+      await this.stagingFs.chmod(replacementPath, before.mode & 0o777);
+      const replacementHandle = await openNoFollow(replacementPath);
+      try {
+        await replacementHandle.sync();
+      } finally {
+        await replacementHandle.close();
+      }
+
+      const current = await this.stagingFs.lstat(this.sourcePath);
+      if (current.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(current))) return 'skipped';
+      await this.stagingFs.rename(replacementPath, this.sourcePath);
+      await this.stagingFs.fsyncParentDirectory(this.sourcePath);
+      return 'cleaned';
+    } catch (error) {
+      if (isNotFoundError(error)) return 'skipped';
+      return 'failed';
+    } finally {
+      await this.stagingFs.unlink(replacementPath).catch(() => {});
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.handle.close();
+  }
+}
+
+function isTextFileBusyError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ETXTBSY';
+}
+
+/** Windows refuses to overwrite an executable that is currently running. */
+function isLockedDestinationError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EACCES' || code === 'EPERM' || code === 'EBUSY';
+}
+
+export async function openVerifiedEnrollmentSource(
+  sourcePath = process.execPath,
+  stagingFs: EnrollmentStagingFs = createEnrollmentStagingFs(),
+): Promise<VerifiedEnrollmentSource> {
+  const before = await lstat(sourcePath);
+  if (before.isSymbolicLink()) throw new Error('enrollment_source_is_symlink');
+  if (!before.isFile()) throw new Error('enrollment_source_not_regular');
+  const handle = await openNoFollow(sourcePath);
+  try {
+    const after = await handle.stat();
+    if (!after.isFile() || !sameFileIdentity(fileIdentityFromStat(before), fileIdentityFromStat(after))) {
+      throw new Error('enrollment_source_identity_changed');
+    }
+    return new VerifiedEnrollmentSourceImpl(sourcePath, handle, fileIdentityFromStat(after), stagingFs);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function assertWritablePathIsNotSymlink(path: string, errorCode: string): Promise<void> {
+  try {
+    const st = await lstat(path);
+    if (st.isSymbolicLink()) throw new Error(errorCode);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+}
+
+async function writeProtectedJson(path: string, value: unknown): Promise<void> {
+  const dir = dirname(path);
+  const dirMode = process.platform === 'linux' && dir === '/var/lib/imcodes-node' ? 0o755 : 0o700;
+  await mkdir(dir, { recursive: true, mode: dirMode });
+  if (process.platform !== 'win32') await chmod(dir, dirMode);
+  const temp = `${path}.${process.pid}.tmp`;
+  const handle = await open(temp, 'w', 0o600);
+  try {
+    await handle.writeFile(JSON.stringify(value));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  if (process.platform !== 'win32') await chmod(temp, 0o600);
+  await rename(temp, path);
+  if (process.platform === 'win32') {
+    applyWindowsAclCommands(windowsSecretFileAclCommands(path));
+  }
+  await fsyncParentDirectory(path);
+}
+
+// Framing lives in shared/ (10.4): the server download route and the node use
+// one implementation. The node keeps only the IO layer. These thin wrappers
+// preserve the historical names used by callers/tests.
+export function encodeEnrollmentBlob(blob: EnrollmentBlob): Buffer {
+  return encodeEnrollmentTrailer(blob);
+}
+
+export function parseEnrollmentBlob(data: Buffer): EnrollmentBlob | null {
+  return decodeEnrollmentTrailer(data);
+}
+
+export function hashNodeToken(nodeToken: string): string {
+  return createHash('sha256').update(nodeToken, 'utf8').digest('hex');
+}
+
+export function defaultCredentialPath(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') return join(windowsCredentialDir(), 'credential.json');
+  return platform === 'darwin'
+    ? '/Library/Application Support/imcodes-node/credential.json'
+    : '/var/lib/imcodes-node/credential.json';
+}
+
+export function defaultInstallIdentityPath(credentialPath = defaultCredentialPath()): string {
+  return join(dirname(credentialPath), 'install-identity.json');
+}
+
+export function defaultPendingDaemonBindPath(credentialPath = defaultCredentialPath()): string {
+  return join(dirname(credentialPath), 'pending-daemon-bind.json');
+}
+
+export interface PendingDaemonBindPrepared {
+  workerUrl: string;
+  serverId: string;
+  token: string;
+  serverName: string;
+  activeUserKey?: string;
+}
+
+export interface PendingDaemonBindRecord {
+  version: 1;
+  relayOrigin: string;
+  installId: string;
+  nodeTokenHash: string;
+  activeUserKey?: string;
+  prepared: PendingDaemonBindPrepared;
+  createdAt: number;
+}
+
+/** Stable trailer-free executable path used by boot autostart (distinct from download path). */
+export function defaultStagedExecutablePath(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') return join(windowsCredentialDir(), 'imcodes-node.exe');
+  if (platform === 'darwin') return '/Library/Application Support/imcodes-node/imcodes-node-macos';
+  return '/var/lib/imcodes-node/imcodes-node-linux';
+}
+
+/** Read only the executable's tail (random access, no full-file load). */
+export async function readEnrollmentBlob(executablePath = process.execPath): Promise<EnrollmentBlob | null> {
+  const withRange = await readEnrollmentBlobWithRange(executablePath);
+  return withRange?.blob ?? null;
+}
+
+/** Read enrollment blob and its exact trailer byte range from the executable tail. */
+export async function readEnrollmentBlobWithRange(executablePath = process.execPath): Promise<EnrollmentTrailerRange | null> {
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await openVerifiedEnrollmentSource(executablePath);
+    // `await` before returning, or `finally` closes the handle while the read
+    // is still in flight and the call dies with EBADF "file closed".
+    return await source.readEnrollmentBlobWithRange();
+  } catch {
+    return null;
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+}
+
+export function generateInstallIdentity(): InstallIdentity {
+  const nodeToken = randomBytes(32).toString('hex');
+  const nodeTokenHash = hashNodeToken(nodeToken);
+  if (!isEnrollmentNodeTokenHash(nodeTokenHash)) {
+    throw new Error('generated nodeTokenHash is invalid');
+  }
+  return { installId: randomUUID(), nodeToken, nodeTokenHash };
+}
+
+export interface ProtectedSecretLoadOptions {
+  platform?: NodeJS.Platform;
+  assertCredentialDirSecured?: (dir: string) => void | Promise<void>;
+}
+
+async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity' | 'pending_bind', options: ProtectedSecretLoadOptions): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (platform === 'win32') {
+    const st = await lstat(path);
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error(`${label}_path_not_regular`);
+    const assert = options.assertCredentialDirSecured ?? assertCredentialDirSecuredDefault;
+    await assert(dirname(path));
+    await assert(path);
+    return;
+  }
+  const st = await lstat(path);
+  if (st.isSymbolicLink()) throw new Error(`${label}_path_is_symlink`);
+  if ((st.mode & 0o077) !== 0) throw new Error(`${label}_permissions_insecure`);
+}
+
+function isValidPendingDaemonBindRecord(value: unknown): value is PendingDaemonBindRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Partial<PendingDaemonBindRecord>;
+  if (r.version !== 1) return false;
+  if (typeof r.relayOrigin !== 'string' || !r.relayOrigin) return false;
+  if (typeof r.installId !== 'string' || !r.installId) return false;
+  if (typeof r.nodeTokenHash !== 'string' || !isEnrollmentNodeTokenHash(r.nodeTokenHash)) return false;
+  if (r.activeUserKey !== undefined && (typeof r.activeUserKey !== 'string' || !r.activeUserKey)) return false;
+  if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt) || r.createdAt < 0) return false;
+  if (!r.prepared || typeof r.prepared !== 'object' || Array.isArray(r.prepared)) return false;
+  const p = r.prepared as Partial<PendingDaemonBindPrepared>;
+  if (typeof p.workerUrl !== 'string' || !p.workerUrl) return false;
+  if (typeof p.serverId !== 'string' || !p.serverId) return false;
+  if (typeof p.token !== 'string' || !p.token) return false;
+  if (typeof p.serverName !== 'string') return false;
+  if (p.activeUserKey !== undefined && (typeof p.activeUserKey !== 'string' || !p.activeUserKey)) return false;
+  return true;
+}
+
+export async function loadPendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<PendingDaemonBindRecord | null> {
+  try {
+    await assertSecretPathProtected(path, 'pending_bind', options);
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!isValidPendingDaemonBindRecord(parsed)) {
+      throw new Error('pending_bind_invalid');
+    }
+    return parsed;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+export async function persistPendingDaemonBind(
+  record: PendingDaemonBindRecord,
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  if (!isValidPendingDaemonBindRecord(record)) {
+    throw new Error('pending_bind_invalid');
+  }
+  await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+  await writeProtectedJson(path, record);
+}
+
+export async function removePendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  try {
+    await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+    await unlink(path);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+}
+
+export async function loadInstallIdentity(
+  path = defaultInstallIdentityPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<PendingInstallIdentity | null> {
+  try {
+    await assertSecretPathProtected(path, 'install_identity', options);
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as Partial<PendingInstallIdentity>;
+    if (!parsed.installId || !parsed.nodeToken || !parsed.nodeTokenHash || !parsed.sourceExePath) {
+      throw new Error('install_identity_invalid');
+    }
+    if (hashNodeToken(parsed.nodeToken) !== parsed.nodeTokenHash) throw new Error('install_identity_hash_mismatch');
+    if (!isEnrollmentNodeTokenHash(parsed.nodeTokenHash)) throw new Error('install_identity_hash_invalid');
+    return parsed as PendingInstallIdentity;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+/** Persist install identity BEFORE any network redeem (D-A). */
+export async function persistInstallIdentity(
+  identity: PendingInstallIdentity,
+  path = defaultInstallIdentityPath(),
+): Promise<void> {
+  await assertWritablePathIsNotSymlink(path, 'install_identity_path_is_symlink');
+  await writeProtectedJson(path, identity);
+}
+
+export async function loadCredential(
+  path: string = defaultCredentialPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<ControlledNodeCredential | null> {
+  try {
+    // Validate the live descriptor/ACL BEFORE parsing either reusable secret.
+    // On Windows tool absence or malformed ACL output rejects the load.
+    await assertSecretPathProtected(path, 'credential', options);
+    const value = JSON.parse(await readFile(path, 'utf8')) as Partial<ControlledNodeCredential>;
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !value.token || !value.serverUrl
+    || (value.nodeId !== undefined && !isControlledNodeId(value.nodeId))) {
+      throw new Error('credential_invalid');
+    }
+    if (normalizeControlledNodeAbiProfile(value.abiProfile) !== CONTROLLED_NODE_RUNTIME_ABI_PROFILE) {
+      throw new Error('credential_abi_profile_mismatch');
+    }
+    return value as ControlledNodeCredential;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+// Lazy-resolved at first call so the test seam (which mutates the module
+// export) can take effect without breaking import order. Implementation is
+// `windows-security.assertCredentialDirSecured`.
+let _assertCredentialDirSecuredImpl: ((dir: string) => void | Promise<void>) | null = null;
+async function assertCredentialDirSecuredDefault(dir: string): Promise<void> {
+  if (!_assertCredentialDirSecuredImpl) {
+    const mod = await import('./windows-security.js');
+    _assertCredentialDirSecuredImpl = mod.assertCredentialDirSecured;
+  }
+  await _assertCredentialDirSecuredImpl!(dir);
+}
+
+export async function persistCredential(credential: ControlledNodeCredential, path = defaultCredentialPath()): Promise<void> {
+  await assertWritablePathIsNotSymlink(path, 'credential_path_is_symlink');
+  await writeProtectedJson(path, credential);
+}
+
+export function buildEnrollRedeemV2Request(
+  blob: EnrollmentBlob,
+  identity: InstallIdentity,
+  runtime: EnrollmentRuntimeIdentity = {
+    platform: process.platform,
+    arch: process.arch,
+    hostname: os.hostname(),
+  },
+): EnrollRedeemV2Request {
+  const abiProfile = runtime.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  if (normalizeControlledNodeAbiProfile(blob.abiProfile) !== abiProfile) {
+    throw new Error('enrollment_abi_profile_mismatch');
+  }
+  return {
+    version: ENROLLMENT_REDEEM_VERSION_V2,
+    enrollToken: blob.enrollToken,
+    installId: identity.installId,
+    nodeTokenHash: identity.nodeTokenHash,
+    hostname: runtime.hostname,
+    os: enrollmentOsFromNodePlatform(runtime.platform),
+    arch: runtime.arch,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+  };
+}
+
+/** D-A v2 redeem — sends installId + nodeTokenHash; response MUST NOT carry a raw token. */
+export async function redeemEnrollmentV2(
+  blob: EnrollmentBlob,
+  identity: InstallIdentity,
+  fetchFn: typeof fetch = fetch,
+): Promise<ControlledNodeCredential> {
+  const expectedOrigin = allowedEnrollmentServerOrigin(blob.serverUrl);
+  const body = buildEnrollRedeemV2Request(blob, identity);
+  const redeemUrl = new URL('/api/enroll/v2/redeem', expectedOrigin).toString();
+  const response = await fetchFn(redeemUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    redirect: 'error',
+  });
+  if (response.redirected) throw new Error('enrollment_redeem_redirect_rejected');
+  let responseOrigin: string;
+  try {
+    responseOrigin = new URL(response.url).origin;
+  } catch {
+    throw new Error('enrollment_redeem_response_url_invalid');
+  }
+  if (responseOrigin !== expectedOrigin) throw new Error('enrollment_redeem_origin_mismatch');
+  if (!response.ok) throw new Error(`enrollment_redeem_failed:${response.status}`);
+  const value = await response.json() as EnrollRedeemV2Response & { token?: string };
+  if (normalizeControlledNodeAbiProfile(value.abiProfile) !== normalizeControlledNodeAbiProfile(body.abiProfile)) {
+    throw new Error('enrollment_redeem_abi_profile_mismatch');
+  }
+  if ('token' in value && value.token) throw new Error('enrollment_redeem_v2_returned_raw_token');
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !isControlledNodeId(value.nodeId)) {
+    throw new Error('enrollment_redeem_invalid_response');
+  }
+  return {
+    ...(body.abiProfile ? { abiProfile: body.abiProfile } : {}),
+    serverId: value.serverId,
+    nodeId: value.nodeId,
+    token: identity.nodeToken,
+    serverUrl: expectedOrigin,
+    nodeRole: NODE_ROLE.CONTROLLED,
+    refName: value.refName,
+    displayName: value.displayName,
+  };
+}
+
+/** Copy the trailer-free executable prefix to a stable protected path. */
+export async function copyCleanExecutable(
+  sourcePath: string,
+  trailerStart: number,
+  destPath: string,
+): Promise<StagedExecutableReceipt> {
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await openVerifiedEnrollmentSource(sourcePath);
+    return await source.stageTrailerFreeExecutable(destPath, trailerStart);
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+}
+
+/**
+ * Legacy/manual best-effort privacy cleanup of a source executable's trailer.
+ * The current product bootstrap deliberately does not call this because a
+ * downloaded installer is permanent and reusable. Failure (e.g. a locked
+ * running image on Windows) is surfaced, not swallowed.
+ */
+export async function cleanupEnrollmentSource(
+  sourcePath: string,
+  trailerStart: number,
+  trailerLength: number,
+): Promise<SourceCleanupStatus> {
+  if (trailerLength <= 0 || trailerStart < 0) return 'skipped';
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await openVerifiedEnrollmentSource(sourcePath);
+    return await source.cleanupEnrollmentSource(trailerStart, trailerLength);
+  } catch (error) {
+    if (isNotFoundError(error)) return 'skipped';
+    return 'failed';
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+}
+
+/**
+ * Legacy/manual token burn, NOT a security boundary. Current reusable
+ * installers are preserved by the product bootstrap.
+ * Prefer {@link cleanupEnrollmentSource} when the exact trailer range is known.
+ */
+export async function burnEnrollmentBlob(executablePath = process.execPath): Promise<void> {
+  const range = await readEnrollmentBlobWithRange(executablePath);
+  if (!range) return;
+  const status = await cleanupEnrollmentSource(executablePath, range.trailerStart, range.trailerLength);
+  if (status === 'failed') throw new Error('enrollment_burn_failed');
+}
+
+export interface EnrollDirectV2Options {
+  relayUrl: string;
+  apiKey: string;
+  identity: InstallIdentity;
+  hostServerId?: string;
+  abiProfile?: ControlledNodeAbiProfile;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  hostname?: string;
+  fetchFn?: typeof fetch;
+}
+
+export class EnrollDirectUnsupportedError extends Error {
+  readonly status: number;
+  constructor(status: number, code?: string) {
+    super(`enroll_direct_unsupported:${status}${code ? `:${code}` : ''}`);
+    this.name = 'EnrollDirectUnsupportedError';
+    this.status = status;
+  }
+}
+
+export async function enrollDirectV2(options: EnrollDirectV2Options): Promise<ControlledNodeCredential> {
+  const expectedOrigin = allowedEnrollmentServerOrigin(options.relayUrl);
+  const fetchImpl = options.fetchFn ?? fetch;
+  const platform = options.platform ?? process.platform;
+  const targetOs = enrollmentOsFromNodePlatform(platform);
+  if (!targetOs) throw new Error(`direct_enroll_unsupported_platform:${platform}`);
+  const arch = options.arch ?? process.arch;
+  if (!isControlledNodeArch(arch)) throw new Error(`direct_enroll_unsupported_arch:${arch}`);
+  const abiProfile = options.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  const hostname = options.hostname ?? os.hostname();
+
+  const body: EnrollDirectV2Request = {
+    installId: options.identity.installId,
+    nodeTokenHash: options.identity.nodeTokenHash,
+    hostname,
+    os: targetOs,
+    arch,
+    abiProfile,
+    ...(options.hostServerId ? { hostServerId: options.hostServerId } : {}),
+  };
+
+  const targetUrl = `${expectedOrigin}${ENROLL_DIRECT_V2_PATH}`;
+  const response = await fetchImpl(targetUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    redirect: 'error',
+  });
+
+  if (response.redirected) {
+    throw new Error('direct_enroll_redirect_rejected');
+  }
+  if (!response.url) {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  let responseOrigin: string;
+  try {
+    responseOrigin = new URL(response.url).origin;
+  } catch {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  if (responseOrigin !== expectedOrigin) {
+    throw new Error(`direct_enroll_origin_mismatch:${responseOrigin}`);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => null) as { error?: unknown } | null;
+    const errCode = typeof errBody?.error === 'string' ? errBody.error : undefined;
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw new EnrollDirectUnsupportedError(response.status, errCode);
+    }
+    throw new Error(`direct_enroll_failed:${response.status}${errCode ? `:${errCode}` : ''}`);
+  }
+
+  const parsed = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('direct_enroll_invalid_response');
+  }
+  if ('token' in parsed && parsed.token !== undefined) {
+    throw new Error('direct_enroll_raw_token_rejected');
+  }
+  if (
+    parsed.ok !== true
+    || typeof parsed.serverId !== 'string'
+    || parsed.serverId.length === 0
+    || !isControlledNodeId(parsed.nodeId)
+    || parsed.nodeRole !== NODE_ROLE.CONTROLLED
+  ) {
+    throw new Error('direct_enroll_invalid_response');
+  }
+
+  return {
+    nodeRole: NODE_ROLE.CONTROLLED,
+    serverId: parsed.serverId,
+    nodeId: parsed.nodeId,
+    token: options.identity.nodeToken,
+    serverUrl: expectedOrigin,
+    abiProfile,
+    ...(typeof parsed.displayName === 'string' && parsed.displayName ? { displayName: parsed.displayName } : {}),
+  };
+}
+
+export function assertProductionServerUrl(serverUrl: string): void {
+  allowedEnrollmentServerOrigin(serverUrl);
+}
+
+/**
+ * Validate and canonicalize the enrollment server URL to a single trusted
+ * origin. Plain HTTP is available only for explicitly-enabled loopback dev
+ * servers; credentials, paths, queries, and fragments are never accepted.
+ * The rules themselves live in shared/controlled-node-endpoints.ts (the same
+ * ones the node's alternate-address list and the server's advertised list use).
+ */
+export function allowedEnrollmentServerOrigin(serverUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(serverUrl);
+  } catch {
+    throw new Error('enrollment_server_url_invalid');
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('enrollment_server_url_must_be_origin');
+  }
+  const origin = normalizeControlledNodeEndpointOrigin(serverUrl, {
+    allowLoopbackHttp: process.env.IMCODES_NODE_ALLOW_HTTP_ENROLL === '1',
+  });
+  if (!origin) throw new Error('enrollment_server_url_must_be_https');
+  return origin;
+}
+
+export function isValidNodeTokenHash(value: string): boolean {
+  return isEnrollmentNodeTokenHash(value) && value.length === ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN;
+}
+
+/**
+ * Inspect an already-staged regular non-symlink executable and compute a real
+ * `StagedExecutableReceipt` (size, streaming SHA-256, and POSIX identity).
+ */
+export async function inspectExecutableReceipt(
+  executablePath: string,
+  sourceExecutablePath?: string,
+): Promise<StagedExecutableReceipt> {
+  const before = await lstat(executablePath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error('staged_executable_not_regular');
+  }
+  const beforeIdentity = fileIdentityFromStat(before);
+  const handle = await openNoFollow(executablePath, false);
+  try {
+    const after = await handle.stat();
+    if (!after.isFile()) {
+      throw new Error('staged_executable_not_regular');
+    }
+    const stagedIdentity = fileIdentityFromStat(after);
+    if (!sameFileIdentity(beforeIdentity, stagedIdentity)) {
+      throw new Error('staged_executable_identity_changed');
+    }
+
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < after.size) {
+      const toRead = Math.min(buffer.length, after.size - position);
+      const { bytesRead } = await handle.read(buffer, 0, toRead, position);
+      if (bytesRead <= 0) {
+        throw new Error('staged_executable_read_ended_early');
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+
+    let sourceIdentity = stagedIdentity;
+    if (sourceExecutablePath && sourceExecutablePath !== executablePath) {
+      try {
+        const srcStat = await lstat(sourceExecutablePath);
+        if (!srcStat.isSymbolicLink() && srcStat.isFile()) {
+          sourceIdentity = fileIdentityFromStat(srcStat);
+        }
+      } catch {
+        // Fall back to stagedIdentity when optional source path is unavailable.
+      }
+    }
+
+    return {
+      path: executablePath,
+      size: after.size,
+      sha256: hash.digest('hex'),
+      sourceIdentity,
+      stagedIdentity,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}

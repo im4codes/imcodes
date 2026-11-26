@@ -90,3 +90,13 @@ export const ACK_OUTBOX_MAX_ATTEMPTS = 10;
 
 /** Upper bound on entries kept in the inflight map before forced GC. */
 export const INFLIGHT_GC_TTL_MS = 60_000;
+
+/**
+ * TTL for `CommandAckOriginRouter`'s commandId -> originating-socket route,
+ * so a command.ack still reaches the browser that sent it even when that
+ * browser is not subscribed to the session (owner report, 199: identity
+ * save/apply from an unsubscribed page timed out at 20s). Comfortably above
+ * every existing client-side ack wait (SESSION_IDENTITY_REFRESH_TIMEOUT_MS
+ * is the longest, at 20s) so a slow-but-real ack is never dropped.
+ */
+export const COMMAND_ACK_ORIGIN_TTL_MS = 30_000;

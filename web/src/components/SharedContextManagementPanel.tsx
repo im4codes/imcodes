@@ -1,9 +1,15 @@
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
-import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
-import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
+import type {
+  ContextMemoryProjectView,
+  ContextMemoryView,
+  SharedContextModelSelectionMode,
+  SharedContextRuntimeBackend,
+} from '@shared/context-types.js';
+import { AGY_FALLBACK_MODEL_IDS } from '@shared/agy-agent.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import {
   MEMORY_MCP_DEGRADED_REASON,
   MEMORY_MCP_PROVIDER_IDS,
@@ -18,7 +24,7 @@ import {
   type MemoryMcpToolFamilyGateView,
 } from '@shared/memory-ws.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
-import { CC_PRESET_MSG, getCcPresetEffectiveModel, type CcPresetModelInfo } from '@shared/cc-presets.js';
+import { CC_PRESET_MSG, CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import {
   MEMORY_MANAGEMENT_ERROR_CODES,
   type MemoryFeatureAdminRecord,
@@ -38,7 +44,12 @@ import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-obser
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
+  DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
+  OPENCODE_FALLBACK_MODEL_IDS,
   doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
@@ -50,6 +61,8 @@ import {
   MEMORY_SCORING_WEIGHT_MIN,
   normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
+  normalizeSharedContextRuntimeConfig,
+  resolveIncomingSharedContextModelSelectionMode,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   type SharedContextRuntimeConfigSnapshot,
 } from '@shared/shared-context-runtime-config.js';
@@ -76,6 +89,7 @@ import {
   listSharedWorkspaces,
   listTeams,
   markSharedProjectPendingRemoval,
+  patchSharedContextMemorySettings,
   removeSharedProject,
   removeTeamMember,
   fetchSharedContextRuntimeConfig,
@@ -91,9 +105,25 @@ import {
   updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
 } from '../api.js';
+import {
+  RuntimeModelPresetSelector,
+  type RuntimeModelPresetEntry,
+} from './RuntimeModelPresetSelector.js';
+import { AgentSkillsPanel } from './AgentSkillsPanel.js';
+import { AgentMcpPanel } from './AgentMcpPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import {
+  PANEL_LOAD_SECTIONS,
+  PANEL_LOAD_SECTION_TABS,
+  classifyPanelLoadError,
+  panelLoadErrorKey,
+  panelLoadSectionKey,
+  PANEL_LOAD_ERROR_KINDS,
+  type PanelLoadSection,
+} from '../shared-context-load-errors.js';
+import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
 
 // ── Mobile detection ────────────────────────────────────────────────────────
@@ -637,106 +667,6 @@ function processingChipStyle(active: boolean) {
       };
 }
 
-function modelChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#0f766e',
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1e293b',
-        lineHeight: 1.35,
-      };
-}
-
-/** Preset chip: visually distinct from built-in model chips so users can see at
- *  a glance that a preset pulls in env/endpoint config, not just a model name. */
-function presetChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#7c3aed',
-        border: '1px solid #a78bfa',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 3,
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1e1b3a',
-        border: '1px solid #4c1d95',
-        color: '#c4b5fd',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 3,
-        lineHeight: 1.35,
-      };
-}
-
-/** Shared row for preset + built-in chips. Wraps on narrow widths but never
- *  grows vertically beyond what the content needs — no decorative container. */
-const compactChipRowStyle = {
-  display: 'flex',
-  gap: 4,
-  flexWrap: 'wrap',
-  alignItems: 'center',
-} as const;
-
-/** Tiny inline "Preset:" / "Model:" label that sits on the same row as the
- *  chips. Smaller than the uppercase field label to keep the dimension
- *  separation visually obvious without adding another stacked heading. */
-const inlineDimensionLabelStyle = {
-  fontSize: 10,
-  fontWeight: 700,
-  letterSpacing: '0.1em',
-  textTransform: 'uppercase',
-  color: DT.text.muted,
-  marginRight: 6,
-  minWidth: 44,
-  flex: '0 0 auto',
-} as const;
-
-/** "(none)" / neutral chip used to clear the preset selection explicitly —
- *  visually distinct from both preset chips (purple) and model chips (teal)
- *  so users can see at a glance that it's the "no bundle" state. */
-function neutralChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#374151',
-        border: '1px solid #6b7280',
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1f2937',
-        border: '1px solid #374151',
-        color: '#9ca3af',
-        lineHeight: 1.35,
-      };
-}
-
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -747,8 +677,9 @@ const defaultPolicyState: SharedProjectPolicy = {
 
 const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, readonly string[]> = {
   'claude-code-sdk': CLAUDE_CODE_MODEL_IDS,
-  'codex-sdk': CODEX_MODEL_IDS,
-  qwen: QWEN_MODEL_IDS,
+  'codex-sdk': Array.from(new Set([DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL, ...CODEX_MODEL_IDS])),
+  'agy-sdk': AGY_FALLBACK_MODEL_IDS,
+  'opencode-sdk': OPENCODE_FALLBACK_MODEL_IDS,
   openclaw: [],
 };
 
@@ -756,13 +687,14 @@ function resolveProcessingModelForBackend(
   nextBackend: SharedContextRuntimeBackend,
   currentModel: string,
   previousBackend?: SharedContextRuntimeBackend,
+  preset?: string,
 ): string {
   const trimmed = currentModel.trim();
   if (!trimmed) return getDefaultSharedContextModelForBackend(nextBackend);
   if (previousBackend && trimmed === getDefaultSharedContextModelForBackend(previousBackend)) {
     return getDefaultSharedContextModelForBackend(nextBackend);
   }
-  if (!isKnownSharedContextModelForBackend(nextBackend, trimmed)) {
+  if (!isKnownSharedContextModelForBackend(nextBackend, trimmed, preset)) {
     return getDefaultSharedContextModelForBackend(nextBackend);
   }
   return trimmed;
@@ -830,7 +762,7 @@ const deleteButtonStyle = {
 } as const;
 
 type KindOption = SharedDocument['kind'];
-type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp';
+type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp' | 'skills';
 type MemoryTopTab = 'personal' | 'enterprise-memory';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
 type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
@@ -1161,175 +1093,6 @@ const adminFormRowStyle = {
   padding: SC_IS_MOBILE ? 0 : `${DT.space.xs}px 0`,
 } as const;
 
-interface ProcessingPresetEntry {
-  name: string;
-  env: Record<string, string>;
-  contextWindow?: number;
-  initMessage?: string;
-  availableModels?: CcPresetModelInfo[];
-  defaultModel?: string;
-  modelDiscoveryError?: string;
-}
-
-/**
- * Unified model + preset selector.
- *
- * Replaces the older two-control design (a `<select>` for presets PLUS a chip
- * row for models) with a single flat set of chips grouped by kind. This
- * removes the dual-control confusion where selecting a preset left the model
- * chip stale (or vice versa), and where the `<select>` silently failed to
- * reflect saved state when the saved preset wasn't in the loaded list yet.
- *
- * Interaction:
- *   - Clicking a PRESET chip: selects that preset and, if the preset's env
- *     carries ANTHROPIC_MODEL, mirrors that model so downstream consumers
- *     don't need to resolve the preset separately.
- *   - Clicking a MODEL chip: selects the model and clears any active preset
- *     (presets carry additional env like base URL / API key — clearing keeps
- *     the two concepts from drifting).
- *   - Clicking the active chip again: deselects (clears both for safety).
- *
- * Active-state highlighting is decoupled per-chip so users can see both the
- * active preset AND the active model when a preset-derived model matches a
- * built-in. That's the read path of the state the save will persist.
- */
-function ModelPresetChipSelector({
-  backend,
-  model,
-  preset,
-  presets,
-  onChange,
-  idPrefix,
-}: {
-  backend: SharedContextRuntimeBackend;
-  model: string;
-  preset: string;
-  presets: ReadonlyArray<ProcessingPresetEntry>;
-  onChange: (next: { model: string; preset: string }) => void;
-  idPrefix: string;
-}) {
-  const { t } = useTranslation();
-  const modelOptions = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
-  const supportsPresets = doesSharedContextBackendSupportPresets(backend);
-  const trimmedModel = model.trim();
-  const trimmedPreset = preset.trim();
-  if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
-
-  // Preset vs model are two DIFFERENT dimensions, not peers.
-  //
-  //   - A preset is an env bundle (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY +
-  //     ANTHROPIC_MODEL). Picking a preset routes traffic to the endpoint
-  //     that preset points at, and pins the model that endpoint serves.
-  //   - A model is the identifier the endpoint resolves. Built-in qwen
-  //     models run on the default qwen endpoint (OAuth / coding plan).
-  //
-  // Rendering them as one flat chip list invited users to read the preset
-  // as a "model" alongside the others. Split them into two labeled rows so
-  // the semantic distinction is visible in a glance, still compact:
-  //
-  //   Preset:  [ (none) ] [⚙ minimax] [⚙ team-b]
-  //   Model:   [coder-model] [qwen3-coder-plus] …   (when no preset)
-  //            [MiniMax-M2.5]                         (when preset pins one)
-  const activePreset = supportsPresets
-    ? presets.find((p) => p.name === trimmedPreset)
-    : undefined;
-  const presetPinnedModel = activePreset ? (getCcPresetEffectiveModel(activePreset) ?? '') : '';
-  // When a preset is active, model selection collapses to what the preset
-  // endpoint exposes — show ONLY the pinned model as a single read-ish chip.
-  // User can still switch away by clicking a built-in chip, which clears
-  // the preset (the `onChange({ model, preset: '' })` path handles that).
-  return (
-    <div style={chipGroupStyle}>
-      {supportsPresets && presets.length > 0 ? (
-        <div style={compactChipRowStyle}>
-          <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingPresetLabel')}</span>
-          <button
-            key={`${idPrefix}:preset:__none__`}
-            type="button"
-            aria-label={`${idPrefix}:preset:none`}
-            aria-pressed={!trimmedPreset}
-            title={t('sharedContext.management.processingPresetNoneTitle')}
-            style={neutralChipStyle(!trimmedPreset)}
-            onClick={() => onChange({ model: trimmedModel, preset: '' })}
-          >
-            {t('sharedContext.management.processingPresetNone')}
-          </button>
-          {presets.map((p) => {
-            const active = trimmedPreset === p.name;
-            const pinned = getCcPresetEffectiveModel(p);
-            return (
-              <button
-                key={`${idPrefix}:preset:${p.name}`}
-                type="button"
-                aria-label={`${idPrefix}:preset:${p.name}`}
-                aria-pressed={active}
-                title={pinned
-                  ? t('sharedContext.management.processingPresetBundleModelTitle', { model: pinned })
-                  : t('sharedContext.management.processingPresetBundleTitle', { preset: p.name })}
-                style={presetChipStyle(active)}
-                onClick={() => {
-                  // Picking a preset pins its embedded model. User has to
-                  // explicitly pick a built-in model chip below (or "(none)"
-                  // + another chip) to override, which clears the preset
-                  // so the two dimensions can't drift.
-                  onChange({ model: pinned || trimmedModel, preset: p.name });
-                }}
-              >
-                <span aria-hidden="true">⚙</span>
-                <span>{p.name}</span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-      <div style={compactChipRowStyle}>
-        <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingModelLabel')}</span>
-        {activePreset ? (
-          // Preset active — this row is read-only: the endpoint dictates
-          // the model. Rendered with the teal "active" style so the user
-          // sees WHICH model the preset pins without a misleading
-          // "click to pick" affordance.
-          <button
-            key={`${backend}:preset-pinned`}
-            type="button"
-            aria-label={`model:${backend}:${presetPinnedModel || '(preset)'}`}
-            aria-pressed={true}
-            disabled
-            title={t('sharedContext.management.processingModelPresetTitle')}
-            style={{ ...modelChipStyle(true), cursor: 'default', opacity: 0.95 }}
-          >
-            {presetPinnedModel || t('sharedContext.management.processingModelDefinedByPreset')}
-          </button>
-        ) : (
-          modelOptions.map((modelId) => {
-            const active = trimmedModel === modelId;
-            return (
-              <button
-                key={`${backend}:${modelId}`}
-                type="button"
-                aria-label={`model:${backend}:${modelId}`}
-                aria-pressed={active}
-                style={modelChipStyle(active)}
-                onClick={() => onChange({ model: modelId, preset: '' })}
-              >
-                {modelId}
-              </button>
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Vertical stack for the two-row (Preset / Model) selector. Tighter than
- *  `fieldLabelStyle`'s flex-column so the rows sit close together. */
-const chipGroupStyle = {
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 4,
-} as const;
-
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
   if (displayName) return displayName;
@@ -1365,6 +1128,7 @@ function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
       stagedEventCount: view.stats.stagedEventCount ?? 0,
       dirtyTargetCount: view.stats.dirtyTargetCount ?? 0,
       pendingJobCount: view.stats.pendingJobCount ?? 0,
+      ...(view.stats.localUnavailable ? { localUnavailable: true } : {}),
     },
     records: view.records ?? [],
     pendingRecords: view.pendingRecords ?? [],
@@ -1387,12 +1151,20 @@ function getMemoryRecordClassLabel(
 
 const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'claude-code-sdk': 'sharedContext.management.mcpProviderClaudeSdk',
-  'gemini-sdk': 'sharedContext.management.mcpProviderGeminiAcp',
+  'grok-sdk': 'sharedContext.management.mcpProviderGrokAcp',
   'kimi-sdk': 'sharedContext.management.mcpProviderKimiAcp',
+  'muse-code-sdk': 'session.agentType.muse_code_sdk',
+  [HERMES_AGENT_PROVIDER_ID]: 'sharedContext.management.mcpProviderHermesAcp',
   'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
   'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',
+  'qoder-sdk': 'sharedContext.management.mcpProviderQoderSdk',
   'cursor-headless': 'sharedContext.management.mcpProviderCursorHeadless',
+  'opencode-sdk': 'sharedContext.management.mcpProviderOpenCodeSdk',
   qwen: 'sharedContext.management.mcpProviderQwen',
+  'deepseek-harness': 'sharedContext.management.mcpProviderDeepseekHarness',
+  pi: 'sharedContext.management.mcpProviderPi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'session.agentType.codebuddy_china',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'session.agentType.codebuddy_international',
 };
 
 function isManagedMcpProviderId(providerId: string): providerId is MemoryMcpProviderId {
@@ -1450,6 +1222,16 @@ function memoryProjectOptionId(input: Pick<MemoryProjectOption, 'canonicalRepoId
     || input.displayName.trim();
 }
 
+function memoryProjectOptionMergeKeys(input: Pick<MemoryProjectOption, 'canonicalRepoId' | 'projectDir' | 'displayName'>): string[] {
+  const keys = [
+    memoryProjectOptionId(input),
+    input.canonicalRepoId?.trim(),
+    input.projectDir?.trim(),
+    input.displayName.trim(),
+  ].filter((key): key is string => Boolean(key));
+  return Array.from(new Set(keys));
+}
+
 function projectDirDisplayName(projectDir: string): string {
   const trimmed = projectDir.trim().replace(/\/+$/, '');
   const parts = trimmed.split('/');
@@ -1493,22 +1275,40 @@ function mergeMemoryProjectOption(
   target: Map<string, MemoryProjectOption>,
   option: MemoryProjectOption,
 ): void {
-  const id = memoryProjectOptionId(option);
-  const existing = target.get(id);
+  const keys = memoryProjectOptionMergeKeys(option);
+  const existingEntries = keys
+    .map((key) => [key, target.get(key)] as const)
+    .filter((entry): entry is readonly [string, MemoryProjectOption] => Boolean(entry[1]));
+  const existing = existingEntries.reduce<MemoryProjectOption | undefined>((merged, [, current]) => {
+    if (!merged) return current;
+    return {
+      ...merged,
+      ...current,
+      displayName: current.displayName || merged.displayName,
+      canonicalRepoId: current.canonicalRepoId || merged.canonicalRepoId,
+      projectDir: current.projectDir || merged.projectDir,
+      status: current.status === 'resolved' || merged.status !== 'resolved' ? current.status : merged.status,
+      lastSeenAt: Math.max(merged.lastSeenAt ?? 0, current.lastSeenAt ?? 0) || undefined,
+    };
+  }, undefined);
   if (!existing) {
+    const id = memoryProjectOptionId(option);
     target.set(id, { ...option, id });
     return;
   }
-  target.set(id, {
+
+  for (const [key] of existingEntries) target.delete(key);
+  const merged = {
     ...existing,
     ...option,
-    id,
     displayName: option.displayName || existing.displayName,
     canonicalRepoId: option.canonicalRepoId || existing.canonicalRepoId,
     projectDir: option.projectDir || existing.projectDir,
     status: option.status === 'resolved' || existing.status !== 'resolved' ? option.status : existing.status,
     lastSeenAt: Math.max(existing.lastSeenAt ?? 0, option.lastSeenAt ?? 0) || undefined,
-  });
+  };
+  const id = memoryProjectOptionId(merged);
+  target.set(id, { ...merged, id });
 }
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange, memoryProjectCandidates = [], activeProjectDir }: Props) {
@@ -1553,6 +1353,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [loading, setLoading] = useState(false);
   const [policyLoading, setPolicyLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** One failed load per section, so an unrelated request neither hides nor shows another's failure. */
+  const [loadErrors, setLoadErrors] = useState<Partial<Record<PanelLoadSection, unknown>>>({});
+  /** Ids of the enterprises the account belongs to; null until the list has loaded (a ref: reading it must not re-run the memory load). */
+  const knownTeamIdsRef = useRef<ReadonlySet<string> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ManagementTab>('enterprise');
 
@@ -1578,17 +1382,49 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingLoading, setProcessingLoading] = useState(false);
   const [processingSaving, setProcessingSaving] = useState(false);
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
+  const [processingModelSelectionMode, setProcessingModelSelectionMode] = useState<SharedContextModelSelectionMode>('auto');
   const [processingPrimaryBackend, setProcessingPrimaryBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-  const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
   const [processingPrimaryPreset, setProcessingPrimaryPreset] = useState('');
-  const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-  const [processingBackupModel, setProcessingBackupModel] = useState('');
+  const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+  const [processingBackupModel, setProcessingBackupModel] = useState(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
   const [processingBackupPreset, setProcessingBackupPreset] = useState('');
   const [processingMemoryRecallMinScore, setProcessingMemoryRecallMinScore] = useState(DEFAULT_MEMORY_RECALL_MIN_SCORE);
   const [processingMemoryScoringWeights, setProcessingMemoryScoringWeights] = useState<MemoryScoringWeights>({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
   const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
-  const [processingPresets, setProcessingPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
+  const [processingPresets, setProcessingPresets] = useState<RuntimeModelPresetEntry[]>([]);
+  const [processingPresetsLoaded, setProcessingPresetsLoaded] = useState(false);
+  const processingPrimaryDynamicModels = useTransportModels(
+    ws ?? null,
+    supportsDynamicTransportModels(processingPrimaryBackend) ? processingPrimaryBackend : null,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(processingPrimaryBackend) ? (processingPrimaryPreset || undefined) : undefined,
+  );
+  const processingBackupDynamicModels = useTransportModels(
+    ws ?? null,
+    supportsDynamicTransportModels(processingBackupBackend) ? processingBackupBackend : null,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(processingBackupBackend) ? (processingBackupPreset || undefined) : undefined,
+  );
+  const hasActivePrimaryPreset = Boolean(
+    processingPrimaryPreset.trim()
+    && processingPresets.some((entry) => entry.name === processingPrimaryPreset.trim()),
+  );
+  const hasActiveBackupPreset = Boolean(
+    processingBackupPreset.trim()
+    && processingPresets.some((entry) => entry.name === processingBackupPreset.trim()),
+  );
+  const processingPrimaryModelOptions = useMemo(() => (
+    mergeModelSuggestions(
+      hasActivePrimaryPreset ? [] : (PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingPrimaryBackend] ?? []),
+      processingPrimaryDynamicModels.models.map((entry) => entry.id),
+    )
+  ), [hasActivePrimaryPreset, processingPrimaryBackend, processingPrimaryDynamicModels.models]);
+  const processingBackupModelOptions = useMemo(() => (
+    mergeModelSuggestions(
+      hasActiveBackupPreset ? [] : (PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingBackupBackend] ?? []),
+      processingBackupDynamicModels.models.map((entry) => entry.id),
+    )
+  ), [hasActiveBackupPreset, processingBackupBackend, processingBackupDynamicModels.models]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
@@ -1744,8 +1580,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     };
   }, [memoryFeatureDisabledBehavior, memoryFeatureLabel, memoryFeatureRecordByFlag, memoryFeaturesStatus, t, ws]);
   const memoryAdminErrorMessage = useCallback((errorCode?: MemoryManagementErrorCode, fallback?: string): string => {
-    if (errorCode) return t(`sharedContext.management.error.${errorCode}`);
-    return fallback ?? t('sharedContext.management.memoryAdminActionFailed');
+    const generic = fallback ?? t('sharedContext.management.memoryAdminActionFailed');
+    // Never surface a raw i18n key: an error code without a translation falls
+    // back to the generic management failure message.
+    if (errorCode) return t(`sharedContext.management.error.${errorCode}`, { defaultValue: generic });
+    return generic;
   }, [t]);
   const markMemoryAdminRequest = useCallback((surface: MemoryAdminRequestSurface): string => {
     const requestId = crypto.randomUUID();
@@ -1768,15 +1607,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   }, []);
 
   useEffect(() => {
-    if (!ws) return;
+    setProcessingPresetsLoaded(false);
+    if (!ws) {
+      setProcessingPresets([]);
+      return;
+    }
     const unsub = ws.onMessage((msg) => {
       if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
-        setProcessingPresets((msg as { presets?: ProcessingPresetEntry[] }).presets ?? []);
+        setProcessingPresets((msg as { presets?: RuntimeModelPresetEntry[] }).presets ?? []);
+        setProcessingPresetsLoaded(true);
       }
     });
     try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch {}
     return unsub;
-  }, [ws]);
+  }, [serverId, ws]);
 
   const renderProcessedMemoryRecords = useCallback((
     view: ContextMemoryView,
@@ -2020,6 +1864,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   }), [t]);
   const currentScopePresentation = scopePresentation[scope];
 
+  const panelLoadErrorLines = useMemo(() => (
+    (Object.entries(loadErrors) as Array<[PanelLoadSection, unknown]>)
+      .filter(([section]) => PANEL_LOAD_SECTION_TABS[section].includes(activeTab))
+      .map(([section, err]) => {
+        const info = classifyPanelLoadError(err);
+        const fallbackToDetail = info.kind === PANEL_LOAD_ERROR_KINDS.OTHER;
+        return {
+          section,
+          text: t(panelLoadErrorKey(info.kind), {
+            section: t(panelLoadSectionKey(section)),
+            status: info.status ?? '',
+            detail: fallbackToDetail ? info.detail : '',
+          }),
+        };
+      })
+  ), [activeTab, loadErrors, t]);
+
   const tabs = useMemo<TabDef[]>(() => [
     { id: 'enterprise', label: t('sharedContext.management.tabs.enterprise') },
     { id: 'members', label: t('sharedContext.management.tabs.members') },
@@ -2028,17 +1889,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
     { id: 'mcp', label: t('sharedContext.management.tabs.mcp') },
+    { id: 'skills', label: t('sharedContext.management.tabs.skills') },
   ], [t]);
 
   const memoryTopTabs = useMemo(() => [
-    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) + cloudPersonalMemory.stats.totalRecords },
+    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemoryStatus === 'ready' || cloudPersonalMemory.stats.totalRecords > 0
+      ? (localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) : 0) + cloudPersonalMemory.stats.totalRecords
+      : undefined },
     { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.stats.totalRecords },
-  ], [t, localPersonalMemory, cloudPersonalMemory, sharedMemory]);
+  ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory, sharedMemory]);
   const memoryPersonalSubTabs = useMemo(() => [
-    { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabLocalPending'), count: localPersonalMemory.pendingRecords?.length ?? 0 },
-    { id: 'processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed'), count: localPersonalMemory.stats.totalRecords },
+    { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabLocalPending'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.pendingRecords?.length ?? 0 : undefined },
+    { id: 'processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords : undefined },
     { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.stats.totalRecords },
-  ], [t, localPersonalMemory, cloudPersonalMemory]);
+  ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory]);
   const memoryEnterpriseSubTabs = useMemo(() => [
     { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.stats.totalRecords },
     { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
@@ -2206,6 +2070,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     });
   }, [markMemoryAdminRequest, resolvingMemoryProjectIds, ws]);
 
+  const reportLoadError = useCallback((section: PanelLoadSection, err: unknown) => {
+    setLoadErrors((current) => ({ ...current, [section]: err }));
+  }, []);
+  const clearLoadError = useCallback((section: PanelLoadSection) => {
+    setLoadErrors((current) => {
+      if (!(section in current)) return current;
+      const next = { ...current };
+      delete next[section];
+      return next;
+    });
+  }, []);
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
     if (!nextEnterpriseId) {
       setTeam(null);
@@ -2221,7 +2096,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE);
     try {
       const [teamDetail, nextWorkspaces, nextProjects, nextDocuments, nextBindings] = await Promise.all([
         getTeam(nextEnterpriseId),
@@ -2251,21 +2126,27 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           : (nextDocuments[0]?.id ?? '')
       ));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE, err);
     } finally {
       setLoading(false);
     }
-  }, [enterpriseId]);
+  }, [clearLoadError, enterpriseId, reportLoadError]);
 
   useEffect(() => {
     void listTeams()
       .then((nextTeams) => {
         setTeams(nextTeams);
-        if (!enterpriseId && nextTeams[0]) {
+        knownTeamIdsRef.current = new Set(nextTeams.map((candidate) => candidate.id));
+        clearLoadError(PANEL_LOAD_SECTIONS.TEAMS);
+        // A remembered enterprise (pinned panel props) the account has since left or that
+        // was deleted only answers 404: fall back to one the account really belongs to.
+        if ((!enterpriseId || !nextTeams.some((candidate) => candidate.id === enterpriseId)) && nextTeams[0]) {
           setEnterpriseId(nextTeams[0].id);
+        } else if (enterpriseId && !nextTeams.some((candidate) => candidate.id === enterpriseId)) {
+          setEnterpriseId('');
         }
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+      .catch((err) => reportLoadError(PANEL_LOAD_SECTIONS.TEAMS, err));
   }, []);
 
   useEffect(() => {
@@ -2293,12 +2174,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setPolicyLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.POLICY);
     void getSharedProjectPolicy(selectedEnrollmentId)
       .then((nextPolicy) => setPolicy(nextPolicy))
       .catch((err) => {
         setPolicy(defaultPolicyState);
-        setError(err instanceof Error ? err.message : String(err));
+        reportLoadError(PANEL_LOAD_SECTIONS.POLICY, err);
       })
       .finally(() => setPolicyLoading(false));
   }, [selectedEnrollmentId]);
@@ -2320,39 +2201,105 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const applyProcessingSnapshot = useCallback((view: SharedContextRuntimeConfigView) => {
     setProcessingSnapshot(view.snapshot);
+    setProcessingModelSelectionMode(resolveIncomingSharedContextModelSelectionMode(view.snapshot.persisted));
     setProcessingPrimaryBackend(view.snapshot.persisted.primaryContextBackend);
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
     setProcessingPrimaryPreset(view.snapshot.persisted.primaryContextPreset ?? '');
-    setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
-    setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+    setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
     setProcessingBackupPreset(view.snapshot.persisted.backupContextPreset ?? '');
     setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
     setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
 
-  /** Defensive sync: if the persisted preset disappears from the loaded preset
-   *  list (e.g. user deleted it elsewhere, or ws reload raced), clear the
-   *  local preset bit so the UI never stays stuck on a non-existent preset.
-   *  The model stays — it's independently valid. */
+  /** Defensive sync: once the current server has returned an authoritative preset
+   *  list, clear a persisted preset that no longer exists so the UI never stays
+   *  stuck on a removed preset. While loading or offline, keep saved values intact. */
   useEffect(() => {
+    if (!processingPresetsLoaded) return;
     const names = new Set(processingPresets.map((p) => p.name));
     if (processingPrimaryPreset && !names.has(processingPrimaryPreset)) {
       setProcessingPrimaryPreset('');
+      if (
+        processingPrimaryBackend === 'codex-sdk'
+        && (processingModelSelectionMode !== 'manual' || !(CODEX_MODEL_IDS as readonly string[]).includes(processingPrimaryModel.trim()))
+      ) {
+        setProcessingPrimaryModel(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
+      }
     }
     if (processingBackupPreset && !names.has(processingBackupPreset)) {
       setProcessingBackupPreset('');
+      if (
+        processingBackupBackend === 'codex-sdk'
+        && (processingModelSelectionMode !== 'manual' || !(CODEX_MODEL_IDS as readonly string[]).includes(processingBackupModel.trim()))
+      ) {
+        setProcessingBackupModel(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
+      }
     }
-  }, [processingPresets, processingPrimaryPreset, processingBackupPreset]);
+  }, [
+    processingBackupBackend,
+    processingBackupModel,
+    processingBackupPreset,
+    processingModelSelectionMode,
+    processingPresets,
+    processingPresetsLoaded,
+    processingPrimaryBackend,
+    processingPrimaryModel,
+    processingPrimaryPreset,
+  ]);
 
-  const reloadProcessingConfig = useCallback(async () => {
+  const isProcessingModelDraftDirty = useMemo(() => {
+    if (!processingSnapshot) return false;
+    const persisted = normalizeSharedContextRuntimeConfig({
+      ...processingSnapshot.persisted,
+      modelSelectionMode: resolveIncomingSharedContextModelSelectionMode(processingSnapshot.persisted),
+    });
+    return processingModelSelectionMode !== persisted.modelSelectionMode
+      || processingPrimaryBackend !== persisted.primaryContextBackend
+      || processingPrimaryModel.trim() !== persisted.primaryContextModel
+      || (processingPrimaryPreset.trim() || undefined) !== (persisted.primaryContextPreset ?? undefined)
+      || processingBackupBackend !== (persisted.backupContextBackend ?? DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND)
+      || (processingBackupModel.trim() || undefined) !== (persisted.backupContextModel ?? DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL)
+      || (processingBackupPreset.trim() || undefined) !== (persisted.backupContextPreset ?? undefined);
+  }, [
+    processingBackupBackend,
+    processingBackupModel,
+    processingBackupPreset,
+    processingModelSelectionMode,
+    processingPrimaryBackend,
+    processingPrimaryModel,
+    processingPrimaryPreset,
+    processingSnapshot,
+  ]);
+  const isProcessingModelDraftDirtyRef = useRef(false);
+  isProcessingModelDraftDirtyRef.current = isProcessingModelDraftDirty;
+  const loadedProcessingServerIdRef = useRef<string | undefined>(undefined);
+
+  /** Preserve uncommitted Processing Model draft state when saving Memory-tab settings;
+   *  when no local model draft is dirty, also sync model fields from the merged server snapshot. */
+  const applyMemorySettingsSnapshot = useCallback((view: SharedContextRuntimeConfigView) => {
+    if (!isProcessingModelDraftDirtyRef.current) {
+      applyProcessingSnapshot(view);
+      return;
+    }
+    setProcessingSnapshot(view.snapshot);
+    setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
+    setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
+    setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
+  }, [applyProcessingSnapshot]);
+
+  const reloadProcessingConfig = useCallback(async (options?: { preserveDirtyModelDraft?: boolean }) => {
     if (!serverId) {
+      loadedProcessingServerIdRef.current = undefined;
+      clearLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG);
       setProcessingSnapshot(null);
+      setProcessingModelSelectionMode('auto');
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-      setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
       setProcessingPrimaryPreset('');
-      setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-      setProcessingBackupModel('');
+      setProcessingBackupBackend(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+      setProcessingBackupModel(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
       setProcessingBackupPreset('');
       setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
       setProcessingMemoryScoringWeights({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
@@ -2360,20 +2307,34 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setProcessingLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG);
+    if (loadedProcessingServerIdRef.current !== serverId) {
+      loadedProcessingServerIdRef.current = undefined;
+      setProcessingSnapshot(null);
+    }
     try {
       const view = await fetchSharedContextRuntimeConfig(serverId);
-      applyProcessingSnapshot(view);
+      const shouldPreserveDraft = options?.preserveDirtyModelDraft === true
+        && loadedProcessingServerIdRef.current === serverId
+        && isProcessingModelDraftDirtyRef.current;
+      loadedProcessingServerIdRef.current = serverId;
+      if (shouldPreserveDraft) {
+        applyMemorySettingsSnapshot(view);
+      } else {
+        applyProcessingSnapshot(view);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // 404 here is the server not being the account's own (or being unknown): the
+      // processing defaults stay on screen and the line below says why.
+      reportLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG, err);
     } finally {
       setProcessingLoading(false);
     }
-  }, [applyProcessingSnapshot, serverId]);
+  }, [applyMemorySettingsSnapshot, applyProcessingSnapshot, clearLoadError, reportLoadError, serverId]);
 
   useEffect(() => {
     if (activeTab !== 'processing' && activeTab !== 'memory') return;
-    void reloadProcessingConfig();
+    void reloadProcessingConfig({ preserveDirtyModelDraft: true });
   }, [activeTab, reloadProcessingConfig]);
 
   useEffect(() => {
@@ -2389,7 +2350,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         pendingRecords: msg.pendingRecords ?? [],
         projects: msg.projects ?? [],
       }));
-      setLocalPersonalMemoryStatus(msg.errorCode ? 'error' : 'ready');
+      setLocalPersonalMemoryStatus(
+        msg.stats?.localUnavailable || msg.errorCode === MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE
+          ? 'unavailable'
+          : msg.errorCode ? 'error' : 'ready',
+      );
     });
   }, [rememberMemoryProjectIndex, ws]);
 
@@ -2429,31 +2394,50 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         setLocalPersonalMemoryStatus('unavailable');
       }
 
-      const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
-      if (memoryViewGenerationRef.current !== generation) return;
-      rememberMemoryProjectIndex(cloudView.projects ?? []);
-      setCloudPersonalMemory(cloudView);
-
-      if (enterpriseId) {
-        const enterpriseView = normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
-          ...(browseCanonicalRepoId ? { canonicalRepoId: browseCanonicalRepoId } : {}),
-          projectionClass: memoryProjectionClass || undefined,
-          query: memoryQuery.trim() || undefined,
-          limit: 25,
-        }));
+      // The cloud and enterprise views are independent requests: one answering 404 (a server
+      // older than this page, or an enterprise the account is no longer in) must not blank
+      // the other, nor the local memory above, nor surface as a bare "API 404: not_found".
+      clearLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY);
+      clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY);
+      try {
+        const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
         if (memoryViewGenerationRef.current !== generation) return;
-        rememberMemoryProjectIndex(enterpriseView.projects ?? []);
-        setSharedMemory(enterpriseView);
+        rememberMemoryProjectIndex(cloudView.projects ?? []);
+        setCloudPersonalMemory(cloudView);
+      } catch (err) {
+        if (memoryViewGenerationRef.current !== generation) return;
+        reportLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY, err);
+      }
+
+      // Skip an enterprise the account's own team list says it does not belong to: that request
+      // can only answer 404 (same-shape not-found, by design).
+      const enterpriseKnown = !knownTeamIdsRef.current || knownTeamIdsRef.current.has(enterpriseId);
+      if (enterpriseId && enterpriseKnown) {
+        try {
+          const enterpriseView = normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
+            ...(browseCanonicalRepoId ? { canonicalRepoId: browseCanonicalRepoId } : {}),
+            projectionClass: memoryProjectionClass || undefined,
+            query: memoryQuery.trim() || undefined,
+            limit: 25,
+          }));
+          if (memoryViewGenerationRef.current !== generation) return;
+          rememberMemoryProjectIndex(enterpriseView.projects ?? []);
+          setSharedMemory(enterpriseView);
+        } catch (err) {
+          if (memoryViewGenerationRef.current !== generation) return;
+          reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY, err);
+        }
       } else {
         if (memoryViewGenerationRef.current !== generation) return;
         setSharedMemory(EMPTY_MEMORY_VIEW);
       }
     } catch (err) {
+      // Only the local query setup can throw out here (sending on a dead socket).
       if (memoryViewGenerationRef.current === generation) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (memoryViewGenerationRef.current === generation) setMemoryLoading(false);
     }
-  }, [browseCanonicalRepoId, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, ws, showArchived]);
+  }, [browseCanonicalRepoId, clearLoadError, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, reportLoadError, showArchived, ws]);
 
   const loadMemoryAdminViews = useCallback(() => {
     if (!ws) {
@@ -2614,6 +2598,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (!isCurrentMemoryAdminResponse('preferences', msg.requestId)) return;
         setPreferenceRecords(msg.records ?? []);
         if (msg.featureEnabled !== undefined) setPreferenceFeatureEnabled(msg.featureEnabled);
+        if (msg.errorCode) setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
         return;
       }
       if (msg.type === MEMORY_WS.CREATE_RESPONSE) {
@@ -2656,6 +2641,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (!isCurrentMemoryAdminResponse('observations', msg.requestId)) return;
         setObservationRecords(msg.records ?? []);
         if (msg.featureEnabled !== undefined) setObservationStoreFeatureEnabled(msg.featureEnabled);
+        if (msg.errorCode) setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
         return;
       }
       if (msg.type === MEMORY_WS.PREF_CREATE_RESPONSE) {
@@ -2925,50 +2911,96 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       : undefined
   ), []);
 
-  const buildProcessingConfigPayload = useCallback(() => ({
-    primaryContextBackend: processingPrimaryBackend,
-    primaryContextModel: processingPrimaryModel.trim(),
-    primaryContextPreset: getProcessingPresetValue(
+  const buildProcessingConfigPayload = useCallback(() => {
+    const primaryPreset = getProcessingPresetValue(
       processingPrimaryBackend,
       processingPrimaryModel,
       processingPrimaryPreset,
-    ),
-    backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-    backupContextModel: processingBackupModel.trim() || undefined,
-    backupContextPreset: processingBackupModel.trim()
+    );
+    const primaryModel = processingPrimaryBackend === 'codex-sdk' && !primaryPreset && processingModelSelectionMode === 'auto'
+      ? DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL
+      : processingPrimaryModel.trim();
+    const backupHasModel = Boolean(processingBackupModel.trim());
+    const backupPreset = backupHasModel
       ? getProcessingPresetValue(processingBackupBackend, processingBackupModel, processingBackupPreset)
-      : undefined,
-    memoryRecallMinScore: processingMemoryRecallMinScore,
-    memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
-    enablePersonalMemorySync: processingPersonalSyncEnabled,
-  }), [
+      : undefined;
+    const backupModel = backupHasModel
+      ? (processingBackupBackend === 'codex-sdk' && !backupPreset && processingModelSelectionMode === 'auto'
+          ? DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL
+          : processingBackupModel.trim())
+      : undefined;
+    const persisted = processingSnapshot?.persisted;
+    return {
+      modelSelectionMode: processingModelSelectionMode,
+      primaryContextBackend: processingPrimaryBackend,
+      primaryContextModel: primaryModel,
+      primaryContextPreset: primaryPreset,
+      backupContextBackend: backupModel ? processingBackupBackend : undefined,
+      backupContextModel: backupModel,
+      backupContextPreset: backupModel ? backupPreset : undefined,
+      memoryRecallMinScore: persisted?.memoryRecallMinScore ?? processingMemoryRecallMinScore,
+      memoryScoringWeights: normalizeMemoryScoringWeights(persisted?.memoryScoringWeights ?? processingMemoryScoringWeights),
+      enablePersonalMemorySync: persisted ? persisted.enablePersonalMemorySync === true : processingPersonalSyncEnabled,
+    };
+  }, [
     getProcessingPresetValue,
     processingBackupBackend,
     processingBackupModel,
     processingBackupPreset,
     processingMemoryRecallMinScore,
     processingMemoryScoringWeights,
+    processingModelSelectionMode,
     processingPersonalSyncEnabled,
     processingPrimaryBackend,
     processingPrimaryModel,
     processingPrimaryPreset,
+    processingSnapshot,
   ]);
 
+  const buildMemorySettingsConfigPayload = useCallback((overrides: {
+    enablePersonalMemorySync?: boolean;
+    memoryRecallMinScore?: number;
+    memoryScoringWeights?: MemoryScoringWeights;
+  }) => {
+    const rawPersisted = processingSnapshot?.persisted;
+    if (!rawPersisted) return null;
+    const baseline = normalizeSharedContextRuntimeConfig({
+      ...rawPersisted,
+      modelSelectionMode: resolveIncomingSharedContextModelSelectionMode(rawPersisted),
+    });
+    return {
+      modelSelectionMode: baseline.modelSelectionMode,
+      primaryContextBackend: baseline.primaryContextBackend,
+      primaryContextModel: baseline.primaryContextModel,
+      primaryContextPreset: baseline.primaryContextPreset,
+      backupContextBackend: baseline.backupContextBackend,
+      backupContextModel: baseline.backupContextModel,
+      backupContextPreset: baseline.backupContextPreset,
+      memoryRecallMinScore: overrides.memoryRecallMinScore ?? baseline.memoryRecallMinScore,
+      memoryScoringWeights: normalizeMemoryScoringWeights(overrides.memoryScoringWeights ?? baseline.memoryScoringWeights),
+      enablePersonalMemorySync: overrides.enablePersonalMemorySync ?? (rawPersisted.enablePersonalMemorySync === true),
+    };
+  }, [processingSnapshot]);
+
   const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
+    setProcessingModelSelectionMode('manual');
+    const nextPreset = doesSharedContextBackendSupportPresets(nextBackend) ? processingPrimaryPreset : '';
     setProcessingPrimaryBackend((prevBackend) => {
-      setProcessingPrimaryModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      setProcessingPrimaryModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend, nextPreset));
       if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingPrimaryPreset('');
       return nextBackend;
     });
-  }, []);
+  }, [processingPrimaryPreset]);
 
   const handleProcessingBackupBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
+    setProcessingModelSelectionMode('manual');
+    const nextPreset = doesSharedContextBackendSupportPresets(nextBackend) ? processingBackupPreset : '';
     setProcessingBackupBackend((prevBackend) => {
-      setProcessingBackupModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      setProcessingBackupModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend, nextPreset));
       if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingBackupPreset('');
       return nextBackend;
     });
-  }, []);
+  }, [processingBackupPreset]);
 
   const localToolDisabledReason = useCallback((featureEnabled: boolean | null, flag: MemoryFeatureFlag): string | null => {
     if (!ws) return t('sharedContext.management.memoryToolDisabledNoDaemon');
@@ -3320,6 +3352,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       </div>
       {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
       {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
+      {panelLoadErrorLines.map((line) => <div key={line.section} data-load-error={line.section} style={{ color: '#fca5a5' }}>{line.text}</div>)}
       {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
 
       {activeTab === 'enterprise' && (
@@ -3828,6 +3861,30 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <InfoCard title={t('sharedContext.management.processingModelTitle')}>
             {serverId ? (
               <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs }}>
+                  <span style={{ color: DT.text.muted, fontSize: 12 }}>{t('sharedContext.management.processingModeLabel')}</span>
+                  <div style={backendChipRowStyle}>
+                    <button
+                      type="button"
+                      aria-label={t('sharedContext.management.processingModeAuto')}
+                      aria-pressed={processingModelSelectionMode === 'auto'}
+                      style={processingChipStyle(processingModelSelectionMode === 'auto')}
+                      onClick={() => setProcessingModelSelectionMode('auto')}
+                    >
+                      {t('sharedContext.management.processingModeAuto')}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={t('sharedContext.management.processingModeManual')}
+                      aria-pressed={processingModelSelectionMode === 'manual'}
+                      style={processingChipStyle(processingModelSelectionMode === 'manual')}
+                      onClick={() => setProcessingModelSelectionMode('manual')}
+                    >
+                      {t('sharedContext.management.processingModeManual')}
+                    </button>
+                  </div>
+                  <div style={helperTextStyle}>{t('sharedContext.management.processingModeAutoHint')}</div>
+                </div>
                 <div style={processingGridStyle}>
                   <div style={processingCardStyle}>
                     <strong>{t('sharedContext.management.processingPrimaryCardTitle')}</strong>
@@ -3843,22 +3900,25 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             style={processingChipStyle(processingPrimaryBackend === backend)}
                             onClick={() => handleProcessingPrimaryBackendChange(backend)}
                           >
-                            {backend}
+                            {backend === 'agy-sdk' ? 'antigravity (agy-sdk)' : backend}
                           </button>
                         ))}
                       </div>
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                      <ModelPresetChipSelector
+                      <RuntimeModelPresetSelector
                         backend={processingPrimaryBackend}
                         model={processingPrimaryModel}
                         preset={processingPrimaryPreset}
                         presets={processingPresets}
+                        modelOptions={processingPrimaryModelOptions}
+                        isFallbackModelList={processingPrimaryDynamicModels.models.length === 0}
                         idPrefix="primary"
                         onChange={({ model, preset }) => {
-                          setProcessingPrimaryModel(model);
+                          setProcessingModelSelectionMode('manual');
                           setProcessingPrimaryPreset(preset);
+                          setProcessingPrimaryModel(model.trim() || getDefaultSharedContextModelForBackend(processingPrimaryBackend));
                         }}
                       />
                     </label>
@@ -3877,22 +3937,25 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             style={processingChipStyle(processingBackupBackend === backend)}
                             onClick={() => handleProcessingBackupBackendChange(backend)}
                           >
-                            {backend}
+                            {backend === 'agy-sdk' ? 'antigravity (agy-sdk)' : backend}
                           </button>
                         ))}
                       </div>
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingBackupModel')}</span>
-                      <ModelPresetChipSelector
+                      <RuntimeModelPresetSelector
                         backend={processingBackupBackend}
                         model={processingBackupModel}
                         preset={processingBackupPreset}
                         presets={processingPresets}
+                        modelOptions={processingBackupModelOptions}
+                        isFallbackModelList={processingBackupDynamicModels.models.length === 0}
                         idPrefix="backup"
                         onChange={({ model, preset }) => {
-                          setProcessingBackupModel(model);
+                          setProcessingModelSelectionMode('manual');
                           setProcessingBackupPreset(preset);
+                          setProcessingBackupModel(model.trim() || getDefaultSharedContextModelForBackend(processingBackupBackend));
                         }}
                       />
                     </label>
@@ -3923,12 +3986,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   </button>
                 </div>
                 <LabeledValue
+                  label={t('sharedContext.management.processingSavedMode')}
+                  value={(processingSnapshot ? resolveIncomingSharedContextModelSelectionMode(processingSnapshot.persisted) : 'auto') === 'manual'
+                    ? t('sharedContext.management.processingModeManual')
+                    : t('sharedContext.management.processingModeAuto')}
+                />
+                <LabeledValue
                   label={t('sharedContext.management.processingSavedPrimaryBackend')}
                   value={processingSnapshot?.persisted.primaryContextBackend ?? DEFAULT_PRIMARY_CONTEXT_BACKEND}
                 />
                 <LabeledValue
                   label={t('sharedContext.management.processingSavedPrimary')}
-                  value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_MODEL}
+                  value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL}
                 />
                 <LabeledValue
                   label={t('sharedContext.management.processingSavedBackupBackend')}
@@ -3958,6 +4027,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       {activeTab === 'mcp' && (
         <>
+          <AgentMcpPanel serverId={serverId} />
+
           <InfoCard title={t('sharedContext.management.mcpTitle')}>
             <div>{t('sharedContext.management.mcpSummaryLine1')}</div>
             <div>{t('sharedContext.management.mcpSummaryLine2')}</div>
@@ -4088,6 +4159,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         </>
       )}
 
+      {activeTab === 'skills' && (
+        <AgentSkillsPanel serverId={serverId} />
+      )}
+
       {activeTab === 'memory' && (
         <>
           <InfoCard title={t('sharedContext.management.memorySummaryTitle')}>
@@ -4117,25 +4192,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   transition: 'border-color 0.15s',
                 }}
                 onClick={() => {
-                  if (processingSaving || !processingSnapshot) return;
+                  if (processingSaving || processingLoading || !processingSnapshot?.persisted) return;
                   const next = !processingPersonalSyncEnabled;
+                  const payload = buildMemorySettingsConfigPayload({ enablePersonalMemorySync: next });
+                  if (!payload) return;
                   if (!next && !window.confirm(t('sharedContext.management.personalSyncDisableConfirm'))) return;
                   setProcessingPersonalSyncEnabled(next);
                   void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                     setProcessingSaving(true);
                     try {
-                      const view = await updateSharedContextRuntimeConfig(serverId, {
-                        primaryContextBackend: processingPrimaryBackend,
-                        primaryContextModel: processingPrimaryModel.trim(),
-                        backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-                        backupContextModel: processingBackupModel.trim() || undefined,
-                        memoryRecallMinScore: processingMemoryRecallMinScore,
-                        memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
-                        enablePersonalMemorySync: next,
-                      });
-                      applyProcessingSnapshot(view);
-                    } catch {
+                      const view = await patchSharedContextMemorySettings(serverId, { enablePersonalMemorySync: next }, payload);
+                      applyMemorySettingsSnapshot(view);
+                    } catch (err) {
                       setProcessingPersonalSyncEnabled(!next);
+                      throw err;
                     } finally {
                       setProcessingSaving(false);
                     }
@@ -4146,7 +4216,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <span style={{ fontWeight: 600, fontSize: SC_IS_MOBILE ? 13 : 14, color: DT.text.primary }}>{t('sharedContext.management.personalSyncToggle')}</span>
                   <span style={{ ...helperTextStyle, fontSize: SC_IS_MOBILE ? 11 : 12 }}>{t('sharedContext.management.personalSyncHelp')}</span>
                 </div>
-                <IOSToggle checked={processingPersonalSyncEnabled} disabled={processingSaving} />
+                <IOSToggle checked={processingPersonalSyncEnabled} disabled={processingSaving || processingLoading || !processingSnapshot?.persisted} />
               </div>
             ) : (
               <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
@@ -4180,16 +4250,27 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <div style={rowStyle}>
                   <button
                     style={buttonStyle}
-                    disabled={processingSaving}
-                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
-                      setProcessingSaving(true);
-                      try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
-                        applyProcessingSnapshot(view);
-                      } finally {
-                        setProcessingSaving(false);
-                      }
-                    })}
+                    disabled={processingSaving || processingLoading || !processingSnapshot?.persisted}
+                    onClick={() => {
+                      const nextRecallMinScore = processingMemoryRecallMinScore;
+                      const payload = buildMemorySettingsConfigPayload({
+                        memoryRecallMinScore: nextRecallMinScore,
+                      });
+                      if (!serverId || !processingSnapshot?.persisted || !payload) return;
+                      void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                        setProcessingSaving(true);
+                        try {
+                          const view = await patchSharedContextMemorySettings(
+                            serverId,
+                            { memoryRecallMinScore: nextRecallMinScore },
+                            payload,
+                          );
+                          applyMemorySettingsSnapshot(view);
+                        } finally {
+                          setProcessingSaving(false);
+                        }
+                      });
+                    }}
                   >
                     {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
                   </button>
@@ -4313,17 +4394,27 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <div style={rowStyle}>
                   <button
                     style={buttonStyle}
-                    disabled={processingSaving || !serverId}
-                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
-                      if (!serverId) return;
-                      setProcessingSaving(true);
-                      try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
-                        applyProcessingSnapshot(view);
-                      } finally {
-                        setProcessingSaving(false);
-                      }
-                    })}
+                    disabled={processingSaving || processingLoading || !processingSnapshot?.persisted || !serverId}
+                    onClick={() => {
+                      const nextWeights = normalizeMemoryScoringWeights(processingMemoryScoringWeights);
+                      const payload = buildMemorySettingsConfigPayload({
+                        memoryScoringWeights: nextWeights,
+                      });
+                      if (!serverId || !processingSnapshot?.persisted || !payload) return;
+                      void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                        setProcessingSaving(true);
+                        try {
+                          const view = await patchSharedContextMemorySettings(
+                            serverId,
+                            { memoryScoringWeights: nextWeights },
+                            payload,
+                          );
+                          applyMemorySettingsSnapshot(view);
+                        } finally {
+                          setProcessingSaving(false);
+                        }
+                      });
+                    }}
                   >
                     {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
                   </button>
@@ -5037,7 +5128,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <SectionHeading
                   title={t('sharedContext.management.memoryLocalTitle')}
                   description={t('sharedContext.management.memoryProcessedDescription')}
-                  action={<span style={pillStyle}>{localPersonalMemory.records.length}</span>}
+                  action={localPersonalMemoryStatus === 'ready' ? <span style={pillStyle}>{localPersonalMemory.records.length}</span> : null}
                 />
                 {localMemoryStatusNotice ? <div style={memoryProcessedNoteStyle}>{localMemoryStatusNotice}</div> : null}
                 {!localMemoryUnavailable ? (
@@ -5136,7 +5227,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <SectionHeading
                   title={t('sharedContext.management.memoryPendingTitle')}
                   description={t('sharedContext.management.memoryPendingDescription')}
-                  action={<span style={pillStyle}>{localPersonalMemory.pendingRecords?.length ?? 0}</span>}
+                  action={localPersonalMemoryStatus === 'ready' ? <span style={pillStyle}>{localPersonalMemory.pendingRecords?.length ?? 0}</span> : null}
                 />
                 {localMemoryStatusNotice ? <div style={memoryProcessedNoteStyle}>{localMemoryStatusNotice}</div> : null}
                 {!localMemoryUnavailable ? (

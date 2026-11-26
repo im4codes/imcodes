@@ -1,15 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   cronMcpCreate,
+  cronMcpCreateSelf,
   cronMcpDelete,
   cronMcpList,
+  cronMcpPause,
+  cronMcpResume,
   cronMcpUpdate,
+  cronMcpUpdateSelf,
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
+import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 
 const endpoint = {
   serverId: 'srv-bound',
   workerUrl: 'https://worker.test/',
+  token: 'tok-bound',
 };
 
 const boundIdentity = {
@@ -40,7 +47,7 @@ describe('cron MCP client', () => {
     vi.clearAllMocks();
   });
 
-  it('uses pod-sticky /api/server/:serverId/cron without auth headers and strips forged identity fields', async () => {
+  it('uses pod-sticky /api/server/:serverId/cron with the daemon credential and strips forged identity fields', async () => {
     const fetchImpl = vi.fn(async () => okJson({ id: 'job-1' }));
 
     const result = await cronMcpCreate(makeCreateInput({
@@ -48,20 +55,23 @@ describe('cron MCP client', () => {
       serverId: 'srv-forged',
       token: 'tok-forged',
       actorId: 'actor-forged',
-    }), { ...boundIdentity, fetchImpl });
+    }), { ...boundIdentity, fetchImpl, deviceTimezone: 'America/Denver' });
 
     expect(result.status).toBe('ok');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
     expect(url).not.toContain('/api/cron');
-    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-bound' });
-    expect(init.headers).not.toHaveProperty('Authorization');
+    // The cron API acts as the owner of the server it names, so it needs the daemon's own credential (never a forged one).
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer tok-bound', 'X-Server-Id': 'srv-bound' });
+    expect(JSON.stringify(init.headers)).not.toContain('tok-forged');
+    expect(init.headers).toMatchObject({ [DEVICE_TIMEZONE_HEADER]: 'America/Denver' });
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.serverId).toBe('srv-bound');
     expect(body.userId).toBeUndefined();
     expect(body.token).toBeUndefined();
     expect(body.actorId).toBeUndefined();
+    expect(body.timezone).toBeUndefined();
   });
 
   it('attaches runtime-derived source provenance to structured send actions', async () => {
@@ -93,6 +103,86 @@ describe('cron MCP client', () => {
     });
     expect(JSON.stringify(body.action)).not.toContain('deck_sub_forged');
     expect(JSON.stringify(body.action)).not.toContain('srv-forged');
+  });
+
+  it('preserves the structured send onlyWhenIdle option in the MCP request', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-idle-only' }));
+
+    await cronMcpCreate(makeCreateInput({
+      action: { type: 'send', target: 'w1', message: 'please review', onlyWhenIdle: true },
+    }), { ...boundIdentity, fetchImpl });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      action: { type: 'send', target: 'w1', message: 'please review', onlyWhenIdle: true },
+    });
+  });
+
+  it('creates a direct command job for the runtime-resolved current session', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-self' }));
+
+    const result = await cronMcpCreateSelf({
+      name: 'Review status',
+      cronExpr: '*/10 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_scheduler',
+      message: 'Review the latest status',
+      timezone: 'Asia/Shanghai',
+    }, { ...boundIdentity, fetchImpl });
+
+    expect(result.status).toBe('ok');
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      name: 'Review status',
+      cronExpr: '*/10 * * * *',
+      serverId: 'srv-bound',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_scheduler',
+      action: { type: 'command', command: 'Review the latest status', selfManaged: true },
+      timezone: 'Asia/Shanghai',
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+    });
+  });
+
+  it('rejects an empty current-session message before HTTP', async () => {
+    const fetchImpl = vi.fn();
+    await expect(cronMcpCreateSelf({
+      name: 'Empty',
+      cronExpr: '*/10 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: '   ',
+    }, { ...boundIdentity, fetchImpl })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('updates a self-managed job without caller-supplied session identity', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdateSelf({
+      id: 'job-self',
+      projectName: 'proj',
+      cronExpr: '*/20 * * * *',
+      message: 'Check progress again',
+      name: 'Progress check',
+      timezone: 'Asia/Shanghai',
+    }, { ...boundIdentity, fetchImpl });
+
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://worker.test/api/server/srv-bound/cron/job-self');
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: 'Progress check',
+      cronExpr: '*/20 * * * *',
+      projectName: 'proj',
+      action: { type: 'command', command: 'Check progress again', selfManaged: true },
+      timezone: 'Asia/Shanghai',
+    });
   });
 
   it('rejects non-send create actions before HTTP', async () => {
@@ -165,6 +255,62 @@ describe('cron MCP client', () => {
     expect(updateBody.actorId).toBeUndefined();
   });
 
+  it('uses the status route for pause and resume without changing the job payload', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-1', status: 'paused' }));
+    const paused = await cronMcpPause('job-1', { ...boundIdentity, fetchImpl });
+    const resumed = await cronMcpResume('job-1', { ...boundIdentity, fetchImpl });
+    expect(paused.status).toBe('ok');
+    expect(resumed.status).toBe('ok');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const calls = fetchImpl.mock.calls as Array<[string, RequestInit]>;
+    expect(calls[0]![0]).toBe('https://worker.test/api/server/srv-bound/cron/job-1/status');
+    expect(calls[1]![0]).toBe('https://worker.test/api/server/srv-bound/cron/job-1/status');
+    expect(JSON.parse(String(calls[0]![1].body))).toEqual({ status: 'paused' });
+    expect(JSON.parse(String(calls[1]![1].body))).toEqual({ status: 'active' });
+  });
+
+  it('preserves the structured send onlyWhenIdle option on updates', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdate({
+      id: 'job-idle-update',
+      projectName: 'proj',
+      action: { type: 'send', target: 'w2', message: 'updated', onlyWhenIdle: true },
+    }, { ...boundIdentity, fetchImpl });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      action: { type: 'send', target: 'w2', message: 'updated', onlyWhenIdle: true },
+    });
+  });
+
+  it('propagates lifecycle updates and force only on explicit deletion', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdateSelf({
+      id: 'job-self',
+      projectName: 'proj',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      force: true,
+    }, { ...boundIdentity, fetchImpl });
+    await cronMcpDelete('job-self', { ...boundIdentity, fetchImpl });
+    await cronMcpDelete('job-self', { ...boundIdentity, fetchImpl }, true);
+
+    expect(JSON.parse(String((fetchImpl.mock.calls[0] as [string, RequestInit])[1].body))).toEqual({
+      projectName: 'proj',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    });
+    expect((fetchImpl.mock.calls[0] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self?force=true',
+    );
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self',
+    );
+    expect((fetchImpl.mock.calls[2] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self?force=true',
+    );
+  });
+
   it('attaches runtime-derived source provenance to update actions', async () => {
     const fetchImpl = vi.fn(async () => okJson({ ok: true }));
 
@@ -227,21 +373,55 @@ describe('cron MCP client', () => {
 
     expect((fetchImpl.mock.calls[0] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-bound/cron?limit=100');
     expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-runtime/cron?limit=100');
-    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).toMatchObject({ 'X-Server-Id': 'srv-runtime' });
-    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).not.toHaveProperty('Authorization');
+    // The credential always names the BOUND server (the token belongs to it); only the route names the runtime server.
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).toMatchObject({ Authorization: 'Bearer tok-bound', 'X-Server-Id': 'srv-bound' });
   });
 
-  it('does not require or forward a token from the local endpoint config', async () => {
-    const fetchImpl = vi.fn(async () => okJson({ jobs: [] }));
+  it('refuses to call the cron API without the daemon server credential, and never sends the request', async () => {
+    const fetchImpl = vi.fn();
 
-    await expect(cronMcpList({}, {
-      endpoint: { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138' },
-      fetchImpl,
-    })).resolves.toMatchObject({ status: 'ok' });
+    for (const unbound of [
+      { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138' },
+      { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138', token: '' },
+    ]) {
+      const result = await cronMcpList({}, { endpoint: unbound as never, fetchImpl });
+      expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 
-    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-local' });
-    expect(init.headers).not.toHaveProperty('Authorization');
+  it('says plainly that the server rejected the daemon credential (HTTP 401), without leaking the token', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await cronMcpList({}, { ...boundIdentity, fetchImpl });
+
+    expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
+    expect(JSON.stringify(result)).toContain('401');
+    expect(JSON.stringify(result)).not.toContain('tok-bound');
+  });
+
+  it('keeps the reason of a 403 scope denial instead of reporting it as a bad credential', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'forbidden', reason: 'share-direct-surface-denied' }), { status: 403, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await cronMcpList({}, { ...boundIdentity, fetchImpl });
+
+    expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: 'forbidden (share-direct-surface-denied)' });
+    expect(JSON.stringify(result)).not.toContain('re-bind');
+  });
+
+  it('maps HTTP 403 shared_host_daemon_authority_required on cron delete to scope_forbidden with server reason', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      error: 'forbidden',
+      reason: 'shared_host_daemon_authority_required',
+    }), { status: 403, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await cronMcpDelete('job-1', { ...boundIdentity, fetchImpl });
+
+    expect(result).toEqual({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+      message: 'forbidden (shared_host_daemon_authority_required)',
+    });
   });
 
   it('sanitizes HTTP and thrown errors', async () => {
@@ -261,5 +441,138 @@ describe('cron MCP client', () => {
     expect(JSON.stringify(thrownError)).not.toContain('tok-bound');
     expect(JSON.stringify(thrownError)).not.toContain('worker.test');
     expect(JSON.stringify(thrownError)).not.toContain('at stack');
+  });
+
+  it('retries transient pre-connect network errors for cron_create_self without duplicating side effects', async () => {
+    const connectTimeout = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(
+        new Error('Connect Timeout Error (attempted address: worker.test:443, timeout: 10000ms)'),
+        { name: 'ConnectTimeoutError', code: 'UND_ERR_CONNECT_TIMEOUT' },
+      ),
+    });
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(connectTimeout)
+      .mockResolvedValueOnce(okJson({ id: 'job-retried' }));
+
+    const result = await cronMcpCreateSelf({
+      name: 'Hourly check',
+      cronExpr: '0 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+
+    expect(result).toMatchObject({ status: 'ok', body: { id: 'job-retried' } });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry POST cron_create_self on post-connect ECONNRESET and preserves error cause', async () => {
+    const postConnectReset = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    const fetchImpl = vi.fn().mockRejectedValue(postConnectReset);
+
+    const result = await cronMcpCreateSelf({
+      name: 'Hourly check',
+      cronExpr: '0 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+      message: 'fetch failed: read ECONNRESET',
+    });
+  });
+
+  it('retries idempotent GET cron_list on transient socket reset and 503 gateway errors, surfacing cause if exhausted', async () => {
+    const closedSocket = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    });
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(closedSocket)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'bad gateway' }), { status: 503 }))
+      .mockResolvedValueOnce(okJson({ jobs: [{ id: 'job-1' }] }));
+
+    const okResult = await cronMcpList({}, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+    expect(okResult).toMatchObject({ status: 'ok', body: { jobs: [{ id: 'job-1' }] } });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+
+    const failingFetch = vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('Connect Timeout Error (attempted address: https://worker.test:443, timeout: 10000ms)'), {
+        name: 'ConnectTimeoutError',
+        code: 'UND_ERR_CONNECT_TIMEOUT',
+      }),
+    }));
+    const failed = await cronMcpList({}, {
+      ...boundIdentity,
+      fetchImpl: failingFetch,
+      preConnectRetry: { maxAttempts: 2, sleep: async () => {} },
+    });
+    expect(failingFetch).toHaveBeenCalledTimes(2);
+    expect(failed.status).toBe('error');
+    if (failed.status === 'error') {
+      expect(failed.message).toContain('fetch failed: Connect Timeout Error');
+      expect(failed.message).toContain('UND_ERR_CONNECT_TIMEOUT');
+      expect(failed.message).not.toContain('worker.test');
+    }
+  });
+
+  it('forwards shortIntervalReason and surfaces server cron_short_interval_reason_required error cleanly', async () => {
+    const serverErrMsg = 'Intervals under 20 minutes require shortIntervalReason explaining why a shorter interval is genuinely needed instead of reactive wakeups or >=20m (>=30m recommended).';
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: 'cron_short_interval_reason_required',
+        thresholdMinutes: 20,
+        message: serverErrMsg,
+      }), { status: 400, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(okJson({ id: 'job-short-ok' }));
+
+    const rejected = await cronMcpCreateSelf({
+      name: 'Too short without reason',
+      cronExpr: '*/5 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    }, { ...boundIdentity, fetchImpl });
+
+    expect(rejected).toEqual({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+      message: serverErrMsg,
+    });
+
+    const accepted = await cronMcpCreateSelf({
+      name: 'Short with reason',
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: 'User requested 5m canary deployment polling window',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    }, { ...boundIdentity, fetchImpl });
+
+    expect(accepted).toMatchObject({ status: 'ok' });
+    const [, init] = fetchImpl.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: 'User requested 5m canary deployment polling window',
+    });
   });
 });

@@ -49,6 +49,7 @@ import {
   type ContextNamespaceRow,
   type ContextObservationRow,
 } from '../store/context-store.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
 
@@ -105,6 +106,8 @@ export interface MemorySearchResultItem {
   userId?: string;
   eventType?: string;
   projectionClass?: ProcessedContextClass;
+  /** Session whose timeline produced this projection, when provenance is known. */
+  sourceSessionName?: string;
   summary: string;
   content?: string;
   createdAt: number;
@@ -136,6 +139,7 @@ export interface AuthorizedMemorySearchQuery extends Omit<MemorySearchQuery, 'na
 // ── Authorized management read (worker-safe R5 path) ─────────────────────────
 
 export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery): MemorySearchResult {
+  if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
   const allItems: MemorySearchResultItem[] = [];
   const seenProjectionIds = new Set<string>();
   const seenObservationIds = new Set<string>();
@@ -343,6 +347,7 @@ export async function rerankCandidatesBySemantic(
 // ── Substring search implementation ────────────────────────────────────────────
 
 export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult {
+  if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
   const allItems: MemorySearchResultItem[] = [];
 
   // Collect processed projections from local SQLite
@@ -525,6 +530,9 @@ export function projectionToItem(projection: ProcessedContextProjection): Memory
     workspaceId: projection.namespace.workspaceId,
     userId: projection.namespace.userId,
     projectionClass: projection.class,
+    ...(typeof contentRecord?.sessionName === 'string' && contentRecord.sessionName.trim()
+      ? { sourceSessionName: contentRecord.sessionName.trim() }
+      : {}),
     summary: projection.summary,
     content: contentRecord ? JSON.stringify(contentRecord) : undefined,
     createdAt: projection.createdAt,

@@ -1,3 +1,5 @@
+import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+
 export const SHARE_ROLES = ['viewer', 'participant'] as const;
 export type ShareRole = (typeof SHARE_ROLES)[number];
 
@@ -31,9 +33,39 @@ export type ShareTargetInput =
       subSessionDisplayName?: string;
     };
 
+export type SharedPresenceState = 'online' | 'offline' | 'unknown';
+
+export interface SharedPresencePayload {
+  status?: string | null;
+  lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
+  source?: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
+}
+
+/**
+ * Authoritative presence classifier for shared and inventory servers.
+ * - Explicit 'offline' status -> 'offline'
+ * - Missing or invalid heartbeat -> 'unknown'
+ * - Heartbeat within 60s freshness window -> 'online'
+ * - Heartbeat older than 60s -> 'offline'
+ */
+export function classifyServerPresence(
+  server: { status?: string | null; lastHeartbeatAt?: number | null; heartbeatSource?: string | null } | null | undefined,
+  now = Date.now(),
+): SharedPresenceState {
+  if (!server) return 'unknown';
+  if (server.status === 'offline') return 'offline';
+  if (typeof server.lastHeartbeatAt !== 'number' || !Number.isFinite(server.lastHeartbeatAt) || server.lastHeartbeatAt <= 0) {
+    return 'unknown';
+  }
+  return (now - server.lastHeartbeatAt < 60_000) ? 'online' : 'offline';
+}
+
 export interface ShareAuthorizationSnapshot {
   target: ShareTarget;
   effectiveRole: ShareRole;
+  /** True only when a participant grant on the whole server covers target. */
+  serverParticipantAuthority?: boolean;
   /**
    * Back-compat field retained in tickets, audit snapshots, and UI payloads.
    * Collaborative sharing exposes full target history by scope, so newly
@@ -83,11 +115,29 @@ export const SHARE_DENIAL_REASONS = [
   'share-role-changed',
   'share-ticket-invalid',
   'share-cancel-unsupported',
+  /** A cancel named a turn other than the one the server knows is running. */
+  'share-dispatch-changed',
   'share-audit-duplicate',
   'share-comment-invalid',
 ] as const;
 
 export type ShareDenialReason = (typeof SHARE_DENIAL_REASONS)[number];
+
+/**
+ * A shared participant's cancel names the turn they saw (`observedDispatchId`)
+ * so it cannot stop a different, newer one. It is refused only when the server
+ * positively knows a running turn that is not the one named. When the server
+ * knows none (the turn was started by a queue drain, a pair/agent send or cron,
+ * none of which pass through the bridge) there is nothing to disagree with, so
+ * the stop goes through instead of failing for a turn nobody could observe.
+ */
+export function shareCancelDispatchDenial(
+  observedDispatchId: string | null | undefined,
+  activeDispatchId: string | null | undefined,
+): 'share-dispatch-changed' | null {
+  if (!activeDispatchId) return null;
+  return (observedDispatchId ?? '').trim() === activeDispatchId ? null : 'share-dispatch-changed';
+}
 
 export const SHARE_ROLE_ORDER: Record<ShareRole, number> = {
   viewer: 1,
@@ -134,6 +184,8 @@ export const SHARE_BROWSER_COMMANDS = {
   TERMINAL_RESIZE: 'terminal.resize',
   DISCUSSION_COMMENT: 'discussion.comment',
   DISCUSSION_START: 'discussion.start',
+  OPENSPEC_VIEW: 'openspec.view',
+  OPENSPEC_CONTROL: 'openspec.control',
   P2P_STATUS: 'p2p.status',
   P2P_LIST_DISCUSSIONS: 'p2p.list_discussions',
   P2P_READ_DISCUSSION: 'p2p.read_discussion',
@@ -141,6 +193,13 @@ export const SHARE_BROWSER_COMMANDS = {
   P2P_CANCEL: 'p2p.cancel',
   P2P_CONFIG_SAVE: 'p2p.config.save',
   SESSION_SEND: 'session.send',
+  SESSION_MODEL_SWITCH: 'session.model_switch',
+  SESSION_MODEL_LIST: 'session.model_list',
+  SESSION_PRESET_LIST: 'session.preset_list',
+  SESSION_SUPERVISION: 'session.supervision',
+  SESSION_IDENTITY_REFRESH: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
+  /** Read-only live task projection for one shared MAIN coordinator tab. */
+  SUPERVISION_TASK_CONSOLE_READ: 'supervision.task_console.read',
   SESSION_CANCEL: 'session.cancel',
   SESSION_STOP: 'session.stop',
   SESSION_START: 'session.start',
@@ -151,6 +210,7 @@ export const SHARE_BROWSER_COMMANDS = {
   SUBSESSION_RESTART: 'subsession.restart',
   QUEUE_EDIT: 'queue.edit',
   QUEUE_UNDO: 'queue.undo',
+  QUEUE_APPEND: 'queue.append',
   QUEUE_CANCEL: 'queue.cancel',
   QUEUE_REMOVE: 'queue.remove',
   QUEUE_REORDER: 'queue.reorder',
@@ -203,52 +263,65 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.P2P_READ_DISCUSSION]: allow('server'),
   [SHARE_BROWSER_COMMANDS.CHAT_HISTORY]: allow('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.DISCUSSION_START]: allowParticipant('server'),
+  [SHARE_BROWSER_COMMANDS.OPENSPEC_VIEW]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.P2P_RUN_START]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.P2P_CANCEL]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.SESSION_SEND]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ]: allow('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_CANCEL]: {
     ...allowParticipant('concrete-tab'),
     requiresObservedDispatchId: true,
     transportOnly: true,
   },
-  [SHARE_BROWSER_COMMANDS.TERMINAL_INPUT]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.TERMINAL_INPUT]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_STOP]: deny('global', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.SESSION_START]: deny('global', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.SESSION_RESTART]: deny('global', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.SUBSESSION_LIST]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.SUBSESSION_START]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.SESSION_START]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_RESTART]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SUBSESSION_LIST]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SUBSESSION_START]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SUBSESSION_STOP]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.QUEUE_EDIT]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.QUEUE_UNDO]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.QUEUE_EDIT]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.QUEUE_UNDO]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.QUEUE_APPEND]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.QUEUE_CANCEL]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_REMOVE]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_REORDER]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.PROVIDER_STATUS]: deny('global', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.PROVIDER_LIST]: deny('global', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_READ]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_WRITE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_EDIT]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_DELETE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_PATCH]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_BROWSE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.FILE_SEARCH]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.REPO_STATUS]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.REPO_DIFF]: deny('direct-surface', 'share-direct-surface-denied'),
+  // Shared file access is always tied to one covered session. Viewers may
+  // inspect that session's project tree; filesystem mutations require the
+  // participant role. The daemon independently confines every scoped request
+  // to the selected session's canonical project root.
+  [SHARE_BROWSER_COMMANDS.FILE_READ]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_WRITE]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_EDIT]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_DELETE]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_PATCH]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_BROWSE]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.FILE_SEARCH]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.REPO_STATUS]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.REPO_DIFF]: allow('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.REPO_COMMIT]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.REPO_PUSH]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.REPO_PULL]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.REPO_BRANCH]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.REPO_SEARCH]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.MEMORY_QUERY]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.REPO_BRANCH]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.REPO_SEARCH]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.MEMORY_QUERY]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.MEMORY_MUTATE]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.CRON_LIST]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.CRON_MUTATE]: deny('direct-surface', 'share-direct-surface-denied'),
+  [SHARE_BROWSER_COMMANDS.CRON_LIST]: allow('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.CRON_MUTATE]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.CREDENTIALS]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.BILLING]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.MEMBERSHIP]: deny('direct-surface', 'share-direct-surface-denied'),
@@ -257,7 +330,7 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
 
 export const UNKNOWN_SHARE_COMMAND_POLICY: ShareCommandPolicyEntry = deny('global', 'share-direct-surface-denied');
 
-export type ShareHttpRouteDisposition = 'share-aware' | 'share-denied' | 'not-applicable';
+export type ShareHttpRouteDisposition = 'share-aware' | 'server-share-aware' | 'share-denied' | 'not-applicable';
 
 export interface ShareHttpRoutePolicyEntry {
   id: string;
@@ -272,7 +345,7 @@ export const SHARE_HTTP_ROUTE_POLICY_INVENTORY = [
   { id: 'recipient-share-list', method: 'GET', pattern: '/api/shares', command: SHARE_BROWSER_COMMANDS.LIST_SHARED_ENTRIES, disposition: 'share-aware' },
   { id: 'recipient-share-open', method: 'POST', pattern: '/api/shares/open', command: SHARE_BROWSER_COMMANDS.OPEN_SHARED_ENTRY, disposition: 'share-aware' },
   { id: 'recipient-share-ws-ticket', method: 'POST', pattern: '/api/shares/ws-ticket', command: SHARE_BROWSER_COMMANDS.ISSUE_WS_TICKET, disposition: 'share-aware' },
-  { id: 'watch-session-list', method: 'GET', pattern: '/api/watch/sessions', command: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
+  { id: 'watch-session-list', method: 'GET', pattern: '/api/watch/sessions', command: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, disposition: 'server-share-aware' },
   { id: 'timeline-history', method: 'GET', pattern: '/api/server/:id/timeline/history', command: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, disposition: 'share-aware' },
   { id: 'timeline-history-full', method: 'GET', pattern: '/api/server/:id/timeline/history/full', command: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, disposition: 'share-aware' },
   { id: 'timeline-text-tail', method: 'GET', pattern: '/api/server/:id/timeline/text-tail', command: SHARE_BROWSER_COMMANDS.TERMINAL_HISTORY, disposition: 'share-aware' },
@@ -284,30 +357,50 @@ export const SHARE_HTTP_ROUTE_POLICY_INVENTORY = [
   { id: 'p2p-run-detail', method: 'GET', pattern: '/api/server/:id/p2p/runs/:runId', command: SHARE_BROWSER_COMMANDS.P2P_READ_DISCUSSION, disposition: 'share-aware' },
   { id: 'session-send', method: 'POST', pattern: '/api/server/:id/session/send', command: SHARE_BROWSER_COMMANDS.SESSION_SEND, disposition: 'share-aware' },
   { id: 'session-cancel', method: 'POST', pattern: '/api/server/:id/session/cancel', command: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, disposition: 'share-aware' },
-  { id: 'session-start', method: 'POST', pattern: '/api/server/:id/session/start', command: SHARE_BROWSER_COMMANDS.SESSION_START, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-stop', method: 'POST', pattern: '/api/server/:id/session/stop', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-settings', method: 'PATCH', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-relabel', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/label', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-rename', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/rename', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'session-group-clone', method: 'POST', pattern: '/api/server/:id/sessions/:rootSession/group-clone', command: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'subsession-list', method: 'GET', pattern: '/api/server/:id/sub-sessions', command: SHARE_BROWSER_COMMANDS.SUBSESSION_LIST, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'subsession-create', method: 'POST', pattern: '/api/server/:id/sub-sessions', command: SHARE_BROWSER_COMMANDS.SUBSESSION_START, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'subsession-reorder', method: 'PATCH', pattern: '/api/server/:id/sub-sessions/reorder', command: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'subsession-update', method: 'PATCH', pattern: '/api/server/:id/sub-sessions/:subId', command: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'subsession-close', method: 'DELETE', pattern: '/api/server/:id/sub-sessions/:subId', command: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'local-web-preview-create', method: 'POST', pattern: '/api/server/:id/local-web-preview', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'local-web-preview-close', method: 'DELETE', pattern: '/api/server/:id/local-web-preview/:previewId', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'file-upload', method: 'POST', pattern: '/api/server/:id/upload', command: SHARE_BROWSER_COMMANDS.FILE_WRITE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'file-download-token', method: 'POST', pattern: '/api/server/:id/uploads/:attachmentId/download-token', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'file-download', method: 'GET', pattern: '/api/server/:id/uploads/:attachmentId/download', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'memory-sources', method: 'GET', pattern: '/api/memory/sources', command: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-list', method: 'GET', pattern: '/api/server/:serverId/cron', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-create', method: 'POST', pattern: '/api/server/:serverId/cron', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-update', method: 'PUT', pattern: '/api/server/:serverId/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-status', method: 'PATCH', pattern: '/api/server/:serverId/cron/:id/status', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-delete', method: 'DELETE', pattern: '/api/server/:serverId/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
-  { id: 'cron-trigger', method: 'POST', pattern: '/api/server/:serverId/cron/:id/trigger', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
+  { id: 'session-start', method: 'POST', pattern: '/api/server/:id/session/start', command: SHARE_BROWSER_COMMANDS.SESSION_START, disposition: 'server-share-aware' },
+  { id: 'session-stop', method: 'POST', pattern: '/api/server/:id/session/stop', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'server-share-aware' },
+  { id: 'session-settings', method: 'PATCH', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
+  { id: 'session-supervision', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/supervision', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-supervision-defaults-read', method: 'GET', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-supervision-defaults-write', method: 'PUT', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-identity-read', method: 'GET', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
+  { id: 'session-identity-write', method: 'PUT', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
+  { id: 'session-identity-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
+  { id: 'session-relabel', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/label', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
+  { id: 'session-rename', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/rename', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
+  { id: 'session-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'server-share-aware' },
+  { id: 'session-group-clone', method: 'POST', pattern: '/api/server/:id/sessions/:rootSession/group-clone', command: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, disposition: 'server-share-aware' },
+  { id: 'subsession-list', method: 'GET', pattern: '/api/server/:id/sub-sessions', command: SHARE_BROWSER_COMMANDS.SUBSESSION_LIST, disposition: 'share-aware' },
+  { id: 'subsession-create', method: 'POST', pattern: '/api/server/:id/sub-sessions', command: SHARE_BROWSER_COMMANDS.SUBSESSION_START, disposition: 'share-aware' },
+  { id: 'subsession-reorder', method: 'PATCH', pattern: '/api/server/:id/sub-sessions/reorder', command: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, disposition: 'server-share-aware' },
+  { id: 'subsession-update', method: 'PATCH', pattern: '/api/server/:id/sub-sessions/:subId', command: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, disposition: 'share-aware' },
+  { id: 'subsession-close', method: 'DELETE', pattern: '/api/server/:id/sub-sessions/:subId', command: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, disposition: 'server-share-aware' },
+  { id: 'local-web-preview-create', method: 'POST', pattern: '/api/server/:id/local-web-preview', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'server-share-aware' },
+  { id: 'local-web-preview-close', method: 'DELETE', pattern: '/api/server/:id/local-web-preview/:previewId', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'server-share-aware' },
+  { id: 'file-upload', method: 'POST', pattern: '/api/server/:id/upload', command: SHARE_BROWSER_COMMANDS.FILE_WRITE, disposition: 'share-aware' },
+  { id: 'file-upload-delete', method: 'DELETE', pattern: '/api/server/:id/uploads/:attachmentId', command: SHARE_BROWSER_COMMANDS.FILE_DELETE, disposition: 'share-aware' },
+  { id: 'file-download-token', method: 'POST', pattern: '/api/server/:id/uploads/:attachmentId/download-token', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-aware' },
+  { id: 'file-download', method: 'GET', pattern: '/api/server/:id/uploads/:attachmentId/download', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-aware' },
+  { id: 'memory-sources', method: 'GET', pattern: '/api/memory/sources', command: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, disposition: 'server-share-aware' },
+  { id: 'cron-list', method: 'GET', pattern: '/api/server/:serverId/cron', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-executions', method: 'GET', pattern: '/api/server/:serverId/cron/executions', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-job-executions', method: 'GET', pattern: '/api/server/:serverId/cron/:id/executions', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-create', method: 'POST', pattern: '/api/server/:serverId/cron', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-update', method: 'PUT', pattern: '/api/server/:serverId/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-status', method: 'PATCH', pattern: '/api/server/:serverId/cron/:id/status', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-delete', method: 'DELETE', pattern: '/api/server/:serverId/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-trigger', method: 'POST', pattern: '/api/server/:serverId/cron/:id/trigger', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-list-global-route', method: 'GET', pattern: '/api/cron', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-executions-global-route', method: 'GET', pattern: '/api/cron/executions', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-job-executions-global-route', method: 'GET', pattern: '/api/cron/:id/executions', command: SHARE_BROWSER_COMMANDS.CRON_LIST, disposition: 'share-aware' },
+  { id: 'cron-create-global-route', method: 'POST', pattern: '/api/cron', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-update-global-route', method: 'PUT', pattern: '/api/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-status-global-route', method: 'PATCH', pattern: '/api/cron/:id/status', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-delete-global-route', method: 'DELETE', pattern: '/api/cron/:id', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'cron-trigger-global-route', method: 'POST', pattern: '/api/cron/:id/trigger', command: SHARE_BROWSER_COMMANDS.CRON_MUTATE, disposition: 'share-aware' },
+  { id: 'server-rename', method: 'PATCH', pattern: '/api/server/:id/name', command: SHARE_BROWSER_COMMANDS.ADMIN_SETTINGS, disposition: 'server-share-aware' },
+  { id: 'server-delete', method: 'DELETE', pattern: '/api/server/:id', command: SHARE_BROWSER_COMMANDS.ADMIN_SETTINGS, disposition: 'server-share-aware' },
+  { id: 'server-upgrade', method: 'POST', pattern: '/api/server/:id/upgrade', command: SHARE_BROWSER_COMMANDS.ADMIN_SETTINGS, disposition: 'server-share-aware' },
   { id: 'share-management-list', method: 'GET', pattern: '/api/server/:serverId/shares', command: SHARE_BROWSER_COMMANDS.MEMBERSHIP, disposition: 'not-applicable' },
   { id: 'share-management-create', method: 'POST', pattern: '/api/server/:serverId/shares', command: SHARE_BROWSER_COMMANDS.MEMBERSHIP, disposition: 'not-applicable' },
   { id: 'share-audit', method: 'GET', pattern: '/api/server/:serverId/share-audit', command: SHARE_BROWSER_COMMANDS.ADMIN_SETTINGS, disposition: 'not-applicable' },
@@ -326,6 +419,7 @@ export interface ShareDaemonMessagePolicyEntry {
 }
 
 export const SHARE_DAEMON_MESSAGE_TYPES = {
+  DAEMON_STATS: 'daemon.stats',
   SESSION_LIST: 'session_list',
   SESSION_EVENT: 'session.event',
   SESSION_IDLE: 'session.idle',
@@ -352,11 +446,18 @@ export const SHARE_DAEMON_MESSAGE_TYPES = {
   P2P_RUN_ERROR: 'p2p.run_error',
   P2P_CANCEL_RESPONSE: 'p2p.cancel_response',
   QUEUE_STATE: 'queue.state',
+  SUPERVISION_TASK_CONSOLE_SNAPSHOT: 'supervision.task_console.snapshot',
+  SUPERVISION_TASK_CONSOLE_DELTA: 'supervision.task_console.delta',
+  SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED: 'supervision.task_console.resync_required',
+  SUPERVISION_TASK_CONSOLE_UNAVAILABLE: 'supervision.task_console.unavailable',
+  SUPERVISION_TASK_CONSOLE_PAIR_DELTA: 'supervision.task_console.pair_delta',
+  SUPERVISION_TASK_CONSOLE_BRIEF_RESPONSE: 'supervision.task_console.brief_response',
 } as const;
 
 export type ShareDaemonMessageType = (typeof SHARE_DAEMON_MESSAGE_TYPES)[keyof typeof SHARE_DAEMON_MESSAGE_TYPES];
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = {
+  [SHARE_DAEMON_MESSAGE_TYPES.DAEMON_STATS]: daemonAllow('server', false, true),
   [SHARE_DAEMON_MESSAGE_TYPES.SESSION_LIST]: daemonAllow('server', false, true),
   [SHARE_DAEMON_MESSAGE_TYPES.SESSION_EVENT]: daemonAllow('main', true),
   [SHARE_DAEMON_MESSAGE_TYPES.SESSION_IDLE]: daemonAllow('main', true),
@@ -383,6 +484,12 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = {
   [SHARE_DAEMON_MESSAGE_TYPES.P2P_RUN_ERROR]: daemonAllow('server', true),
   [SHARE_DAEMON_MESSAGE_TYPES.P2P_CANCEL_RESPONSE]: daemonAllow('server', true),
   [SHARE_DAEMON_MESSAGE_TYPES.QUEUE_STATE]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_SNAPSHOT]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_DELTA]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_UNAVAILABLE]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_PAIR_DELTA]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_BRIEF_RESPONSE]: daemonAllow('main', true),
 } as const satisfies Record<ShareDaemonMessageType, ShareDaemonMessagePolicyEntry>;
 
 export const SHARE_DAEMON_RELAY_INVENTORY = Object.values(SHARE_DAEMON_MESSAGE_TYPES);
@@ -491,6 +598,9 @@ export function resolveEffectiveCoverageForTarget(
   return {
     target: requestedTarget,
     effectiveRole,
+    serverParticipantAuthority: covering.some((grant) => (
+      grant.target.kind === 'server' && grant.role === 'participant'
+    )),
     historyCutoffAt: 0,
     nextCoverageRecheckAt,
     coveringShareIds: covering.map((grant) => grant.id),
@@ -530,6 +640,22 @@ export function isShareCommandAllowed(command: string, role: ShareRole): boolean
   const policy = getShareScopedCommandPolicy(command);
   if (policy.disposition === 'deny') return false;
   return policy.minRole == null || SHARE_ROLE_ORDER[role] >= SHARE_ROLE_ORDER[policy.minRole];
+}
+
+/**
+ * A participant reached through a whole-server share is the owner's delegated
+ * operator for that server. This is deliberately provenance-sensitive: a
+ * main/sub-session participant keeps the narrower tab policy, and grant
+ * management stays outside this authority entirely.
+ */
+export function isSharedServerParticipant(
+  target: ShareTarget | null | undefined,
+  role: ShareRole | null | undefined,
+  serverParticipantAuthority?: boolean,
+): boolean {
+  return role === 'participant'
+    && (serverParticipantAuthority === true
+      || (serverParticipantAuthority === undefined && target?.kind === 'server'));
 }
 
 export function getShareScopedDaemonMessagePolicy(type: string): ShareDaemonMessagePolicyEntry {

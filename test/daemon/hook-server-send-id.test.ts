@@ -1,6 +1,8 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const upsertSessionMock = vi.hoisted(() => vi.fn());
@@ -68,6 +70,27 @@ function postSend(port: number, body: Record<string, unknown>): Promise<{ status
   });
 }
 
+function postList(port: number, from: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ from });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/list',
+      method: 'POST',
+      agent: false,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)), Connection: 'close' },
+    }, (res) => {
+      let response = '';
+      res.on('data', (chunk) => { response += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(response) as Record<string, unknown> }));
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 describe('hook-server /send ids', () => {
   let server: http.Server;
   let port: number;
@@ -96,13 +119,36 @@ describe('hook-server /send ids', () => {
     expect(res.body).toMatchObject({ ok: true, delivered: true, target: 'deck_alpha_w1' });
     expect(isSendDispatchId(res.body.dispatchId)).toBe(true);
     expect(isSendMessageId(res.body.messageId)).toBe(true);
-    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_alpha_w1', 'hello');
+    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+      'deck_alpha_w1',
+      `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\nhello`,
+      { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+    );
+  });
+
+  it('does not list raw frontend-hidden project workers as send targets', async () => {
+    const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
+    const hiddenWorker = makeSession({ name: 'deck_alpha_w1', role: 'w1' });
+    const visibleSub = makeSession({
+      name: 'deck_sub_cc1',
+      role: 'w1',
+      label: 'CC1',
+      parentSession: 'deck_alpha_brain',
+      userCreated: true,
+    });
+    getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : null);
+    listSessionsMock.mockReturnValue([brain, hiddenWorker, visibleSub]);
+
+    const res = await postList(port, brain.name);
+
+    expect(res.status).toBe(200);
+    expect((res.body.sessions as Array<{ name: string }>).map((session) => session.name)).toEqual(['deck_sub_cc1']);
   });
 
   it('returns per-target message ids for broadcast while preserving delivered array', async () => {
     const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
-    const w1 = makeSession({ name: 'deck_alpha_w1', role: 'w1' });
-    const w2 = makeSession({ name: 'deck_alpha_w2', role: 'w2' });
+    const w1 = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder1' });
+    const w2 = makeSession({ name: 'deck_alpha_w2', role: 'w2', label: 'Coder2' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : null);
     listSessionsMock.mockReturnValue([brain, w1, w2]);
 

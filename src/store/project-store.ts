@@ -1,9 +1,10 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
+import logger from '../util/logger.js';
 
-const STORE_DIR = join(homedir(), '.imcodes');
-const STORE_PATH = join(STORE_DIR, 'projects.json');
+function storeDir(): string { return resolveImcodesHome(); }
+function storePath(): string { return join(storeDir(), 'projects.json'); }
 const DEBOUNCE_MS = 500;
 
 export interface ProjectTrackerConfig {
@@ -40,9 +41,10 @@ let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let store: ProjectStore = { projects: {} };
 
 export async function loadProjectStore(): Promise<ProjectStore> {
-  await mkdir(STORE_DIR, { recursive: true });
+  const path = storePath();
+  await mkdir(storeDir(), { recursive: true });
   try {
-    const raw = await readFile(STORE_PATH, 'utf8');
+    const raw = await readFile(path, 'utf8');
     store = JSON.parse(raw) as ProjectStore;
   } catch {
     store = { projects: {} };
@@ -50,11 +52,41 @@ export async function loadProjectStore(): Promise<ProjectStore> {
   return store;
 }
 
+// All store writes are serialized through this chain so a debounced write and
+// a flush can never interleave partial writes on the same file.
+let writeChain: Promise<void> = Promise.resolve();
+
+async function writeStoreOnce(): Promise<void> {
+  const dir = storeDir();
+  const path = storePath();
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function chainWrite(propagateErrors: boolean): Promise<void> {
+  const run = writeChain.then(writeStoreOnce);
+  // Keep the chain alive regardless of this write's outcome.
+  writeChain = run.catch(() => {});
+  if (propagateErrors) return run;
+  // The debounced background write MUST be exception-safe: a rejected write
+  // (store dir missing/removed, disk error) would otherwise surface as an
+  // unhandled rejection — it failed CI's coverage run when a test's temp home
+  // was cleaned up while a debounced write was still in flight, and in
+  // production it would crash the daemon. Warn and move on; the next mutation
+  // reschedules, and flushProjectStore() remains the error-propagating path.
+  return run.catch((err) => {
+    logger.warn({ err, path: storePath() }, 'project-store debounced write failed');
+  });
+}
+
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
+  // The timer callback is async and never rejects (chainWrite(false) catches
+  // internally), so vitest's runOnlyPendingTimersAsync can await the write to
+  // completion deterministically and node's real timers never see a rejection.
   writeTimer = setTimeout(async () => {
-    await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
     writeTimer = null;
+    await chainWrite(false);
   }, DEBOUNCE_MS);
 }
 
@@ -93,5 +125,7 @@ export async function flushProjectStore(): Promise<void> {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  // Serialized behind any in-flight debounced write; propagates errors to the
+  // caller (the awaited path keeps its original error semantics).
+  await chainWrite(true);
 }

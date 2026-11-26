@@ -1,6 +1,7 @@
 import { capturePane } from './tmux.js';
 import { detectStatusMulti } from './detect.js';
 import { getDriver } from './session-manager.js';
+import { isProcessSessionAgentType } from '../../shared/agent-types.js';
 import type { AgentStatus, AgentType } from './detect.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
@@ -52,6 +53,9 @@ export class StatusPoller {
 
   private async pollSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
+      if (!isProcessSessionAgentType(session.agentType)) {
+        continue;
+      }
       try {
         const driver = getDriver(session.agentType as AgentType);
         const lines = await capturePane(session.name);

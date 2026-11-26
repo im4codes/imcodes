@@ -1,16 +1,79 @@
+import { AGY_NATIVE_SESSION_STATE as AG } from '../../shared/agy-agent.js';
+import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
+import { DEFAULT_CODEX_AUTOMATION_MODEL, DEFAULT_CODEX_SESSION_MODEL } from '../../src/shared/models/options.js';
+import { canonicalizeTransportCwd, normalizeTransportCwd } from '../../src/agent/transport-paths.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const claudeRuns: Array<{ options: Record<string, unknown>; prompt: string }> = [];
   const codexRuns: Array<{ mode: 'start' | 'resume'; id: string | null; options: Record<string, unknown>; input: string }> = [];
   const claudeFailures = new Map<string, number>();
-  return { store, claudeRuns, codexRuns, claudeFailures };
+  // Whether the mock app-server reports the IM delegation MCP server as
+  // connected. Default true so ordinary Brain turns may start; a control test
+  // flips it to prove the production gate actually blocks the turn.
+  return { store, realStore: undefined as any, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
 });
 
+const reassignSessionFileMock = vi.hoisted(() => vi.fn());
+
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
+const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadCompletedTextTailMock = vi.hoisted(() => vi.fn(async () => []));
+const writePrivateInputMock = vi.hoisted(() => vi.fn());
+const preparePrivateInputWriterMock = vi.hoisted(() => vi.fn(async () => writePrivateInputMock));
+const getDshPresetTransportConfigMock = vi.hoisted(() => vi.fn(async () => ({
+  env: { ANTHROPIC_MODEL: 'MiniMax-M3' },
+  llm: {
+    provider: 'minimax',
+    model: 'MiniMax-M3',
+    baseUrl: 'https://api.minimax.io/anthropic',
+    apiKey: 'test-dsh-key',
+    contextWindow: 1_000_000,
+  },
+  model: 'MiniMax-M3',
+  availableModels: ['MiniMax-M3'],
+  systemPrompt: 'Runtime facts: MiniMax-M3 through minimax.',
+  contextWindow: 1_000_000,
+})));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: vi.fn(() => ({})),
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+}));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+// These restore scenarios exercise the legacy stream-json contract. Keep the
+// CLI-version probe explicit instead of relying on an incomplete execFile mock
+// (Node's real promisified execFile returns { stdout, stderr }, not a string).
+vi.mock('../../src/util/exec-helper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/util/exec-helper.js')>();
+  return {
+    ...actual,
+    execFileOffMain: vi.fn((...args: Parameters<typeof actual.execFileOffMain>) => {
+      if (args[1]?.includes('--version')) return Promise.resolve({ stdout: '1.4.12\n', stderr: '' });
+      return actual.execFileOffMain(...args);
+    }),
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -43,6 +106,22 @@ vi.mock('node:child_process', async (importOriginal) => {
             stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-restore', status: 'inProgress', items: [], error: null } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turnId: 'turn-restore', item: { id: 'msg-restore', type: 'agentMessage', text: 'MANGO' } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turn: { id: 'turn-restore', status: 'completed', error: null } } }) + '\n');
+          }
+          // A Brain turn is gated on IM delegation being authoritatively usable
+          // (codex-sdk asserts this before every turn/start). The fixture models
+          // the app-server answering that inventory; `mcpDelegationConnected`
+          // lets a test flip it off to prove the gate is load-bearing.
+          if (msg.method === 'mcpServerStatus/list' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({
+              id: msg.id,
+              result: {
+                data: [{
+                  name: 'imcodes-memory',
+                  runtimeStatus: mocks.mcpDelegationConnected ? 'connected' : 'disconnected',
+                  tools: { send_list_targets: {}, send_message: {} },
+                }],
+              },
+            }) + '\n');
           }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             stdout.write(JSON.stringify({ id: msg.id, result: { status: 'unsubscribed' } }) + '\n');
@@ -77,7 +156,13 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+  query: vi.fn(({ prompt: rawPrompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+    // The provider drives the SDK in streaming-input mode, so `prompt` is an
+    // AsyncIterable<SDKUserMessage> rather than a string. This mock stands in for
+    // the SDK, so it reads the user text the SDK would consume.
+    const prompt = typeof rawPrompt === 'string'
+      ? rawPrompt
+      : (((rawPrompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0]?.message?.content) as string ?? '');
     mocks.claudeRuns.push({ prompt, options });
     async function* gen() {
       if (prompt.includes('[transport-always-fail]')) {
@@ -90,8 +175,9 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
           throw new Error('simulated transport failure');
         }
       }
-      yield { type: 'system', subtype: 'init', session_id: String(options.resume ?? options.sessionId), model: 'claude-sonnet-4-6' };
-      yield { type: 'result', subtype: 'success', is_error: false, session_id: String(options.resume ?? options.sessionId), result: prompt.includes('token') ? 'BANANA' : 'ACK', usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 0 } };
+      const sessionId = mocks.claudeSessionIdOverride ?? String(options.resume ?? options.sessionId);
+      yield { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-4-6' };
+      yield { type: 'result', subtype: 'success', is_error: false, session_id: sessionId, result: prompt.includes('token') ? 'BANANA' : 'ACK', usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 0 } };
     }
     const q = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
     q.close = () => {};
@@ -101,11 +187,13 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
-  listSessions: vi.fn(() => [...mocks.store.values()]),
-  getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
-  upsertSession: vi.fn((record: Record<string, any>) => { if (record.name) mocks.store.set(record.name, record); }),
-  removeSession: vi.fn((name: string) => { mocks.store.delete(name); }),
+  flushStore: vi.fn(async (options?: any) => { if (mocks.realStore) await mocks.realStore.flushStore(options); }),
+  listSessions: vi.fn(() => mocks.realStore ? mocks.realStore.listSessions() : [...mocks.store.values()]),
+  getSession: vi.fn((name: string) => mocks.realStore ? mocks.realStore.getSession(name) : mocks.store.get(name) ?? null),
+  upsertSession: vi.fn((record: Record<string, any>) => { if (mocks.realStore) mocks.realStore.upsertSession(record); else if (record.name) mocks.store.set(record.name, record); }),
+  removeSession: vi.fn((name: string) => { if (mocks.realStore) mocks.realStore.removeSession(name); else mocks.store.delete(name); }),
   updateSessionState: vi.fn((name: string, state: string) => {
+    if (mocks.realStore) { mocks.realStore.updateSessionState(name, state); return; }
     const existing = mocks.store.get(name);
     if (existing) mocks.store.set(name, { ...existing, state });
   }),
@@ -123,15 +211,23 @@ vi.mock('../../src/util/logger.js', () => ({
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
+vi.mock('../../src/daemon/timeline-store.js', () => ({
+  timelineStore: {
+    readByTypesPreferred: timelineReadByTypesPreferredMock,
+    readPreferred: timelineReadPreferredMock,
+    readCompletedTextTail: timelineReadCompletedTextTailMock,
+  },
+}));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
   newSession: vi.fn().mockResolvedValue(undefined), killSession: vi.fn().mockResolvedValue(undefined), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
-  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
+  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(),
+  preparePrivateInputWriter: preparePrivateInputWriterMock,
+  BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), reserveSessionFile: vi.fn(), reassignSessionFile: reassignSessionFileMock, stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined), startWatchingById: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingLatest: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({ getQwenRuntimeConfig: vi.fn(async () => null) }));
@@ -143,6 +239,10 @@ vi.mock('../../src/agent/sdk-runtime-config.js', async (importOriginal) => ({
   getClaudeSdkRuntimeConfig: vi.fn(async () => ({})),
 }));
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
+vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/daemon/cc-presets.js')>()),
+  getDshPresetTransportConfig: getDshPresetTransportConfigMock,
+}));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
 vi.mock('../../src/agent/agent-version.js', () => ({ getAgentVersion: vi.fn(async () => 'test') }));
@@ -151,17 +251,158 @@ vi.mock('../../src/agent/notify-setup.js', () => ({ setupCodexNotify: vi.fn(asyn
 vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
+import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
+import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
+import {
+  ensureTransportRuntimeAvailable,
+  getTransportRuntime,
+  launchTransportSession,
+  relaunchSessionWithSettings,
+  restoreTransportSessions,
+  stopTransportRuntimeSession,
+  setSessionEventCallback,
+  setSessionPersistCallback,
+} from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { releaseSessionChildResources } from '../../src/daemon/session-resource-service.js';
+import { markNonDaemonProcess, markDaemonProcess, resetProcessRoleForTests } from '../../src/daemon/process-role.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import {
+  DEFAULT_SUPERVISION_BACKEND,
+  SUPERVISION_MODE,
+  SUPERVISION_TRANSPORT_CONFIG_KEY,
+  extractSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
+  normalizeSessionSupervisionSnapshot,
+} from '../../shared/supervision-config.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
+
+const originalOpenCodeStart = openCodeSdkRuntimeHooks.start;
+
+function createOpenCodeRestoreHarness() {
+  const remoteSessions = new Map<string, Record<string, any>>();
+  let signal: AbortSignal | undefined;
+  const stream = {
+    async *[Symbol.asyncIterator]() {
+      if (signal?.aborted) return;
+      await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+    },
+  };
+  const client = {
+    session: {
+      create: vi.fn(async (options: any) => {
+        const session = {
+          id: 'unexpected-new-session',
+          title: options.body?.title ?? 'unexpected',
+          directory: options.query?.directory,
+        };
+        remoteSessions.set(session.id, session);
+        return { data: session };
+      }),
+      get: vi.fn(async (options: any) => {
+        const session = remoteSessions.get(String(options.path?.id));
+        if (!session) throw new Error('404 session not found');
+        return { data: session };
+      }),
+      list: vi.fn(async (options: any) => ({
+        data: [...remoteSessions.values()].filter((session) => (
+          !options.query?.directory || session.directory === options.query.directory
+        )),
+      })),
+      abort: vi.fn(async () => ({ data: true })),
+      message: vi.fn(async () => {
+        throw new Error('404 message not found', { cause: { status: 404 } });
+      }),
+      prompt: vi.fn(),
+      promptAsync: vi.fn(async () => ({ data: undefined, response: { status: 204 } })),
+    },
+    provider: {
+      list: vi.fn(async () => ({
+        data: {
+          connected: ['opencode'],
+          default: { opencode: 'deepseek-v4-flash-free' },
+          all: [{
+            id: 'opencode',
+            name: 'OpenCode',
+            models: {
+              'deepseek-v4-flash-free': {
+                id: 'deepseek-v4-flash-free',
+                name: 'DeepSeek V4 Flash Free',
+                limit: { context: 128_000 },
+              },
+            },
+          }],
+        },
+      })),
+    },
+    event: {
+      subscribe: vi.fn(async () => ({ stream })),
+    },
+    permission: {
+      reply: vi.fn(async () => ({ data: true })),
+    },
+    postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+  };
+  const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
+  openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+    signal = options.signal;
+    return { client: client as any, server };
+  });
+  return { client, remoteSessions };
+}
+
+/**
+ * A Brain turn now carries the work-delegation contract as a leading
+ * `Context instructions:` block -- the full contract body on the first turn of a
+ * thread, and a short reference on later turns. That prefix is production
+ * behaviour, so these fixtures assert on the USER payload that follows it.
+ *
+ * Exactly one leading context block is stripped and the remainder is compared
+ * EXACTLY. Substring matching is deliberately avoided: it would let a
+ * regression that corrupts, truncates or reorders the payload keep passing.
+ */
+const PROMPT_CONTEXT_PREFIX = 'Context instructions:\n';
+
+function userPayloadOfPrompt(prompt: string): string {
+  if (!prompt.startsWith(PROMPT_CONTEXT_PREFIX)) return prompt;
+  const separator = prompt.indexOf('\n\n');
+  return separator === -1 ? '' : prompt.slice(separator + 2);
+}
+
+/** Text the real Claude Agent SDK serializes as appendSystemPrompt at initialize. */
+function claudePresetAppend(options: Record<string, unknown>): string {
+  const systemPrompt = options.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return '';
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : '';
+}
+
+/** True when the provider's native system channel carried the Brain contract. */
+function systemCarriesDelegationContract(run: { options: Record<string, unknown> }): boolean {
+  return claudePresetAppend(run.options).includes('supervision_brain_work_delegation_v1');
+}
 
 function claudeRunForSession(sessionName: string, prompt?: string) {
   return mocks.claudeRuns.find((run) => {
@@ -169,7 +410,7 @@ function claudeRunForSession(sessionName: string, prompt?: string) {
     return !!env
       && typeof env === 'object'
       && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
-      && (!prompt || run.prompt === prompt);
+      && (!prompt || userPayloadOfPrompt(run.prompt) === prompt);
   });
 }
 
@@ -198,10 +439,29 @@ function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
  *  Preserves the original initial flush, then keeps flushing ONLY if the async
  *  send→provider→run-registration chain hasn't completed yet — uncontended runs
  *  are unchanged (the run is present after the first flush, the loop exits at once). */
-async function settleCodexRun(sessionName: string, mode: 'start' | 'resume') {
+async function settleCodexRun(
+  sessionName: string,
+  mode: 'start' | 'resume',
+  /**
+   * The turn input this run is expected to carry, when the caller goes on to
+   * assert it.
+   *
+   * `thread/start` registers the run with an empty input and `turn/start` fills
+   * it in afterwards, so waiting only for registration returns in the window
+   * between the two -- where the input is still ''. Uncontended that window is
+   * invisible; under coverage instrumentation it is wide enough to land in, and
+   * the assertion then reads the run it was waiting for but not the turn.
+   */
+  expectedInput?: string,
+) {
   await flush();
   const deadline = Date.now() + 5_000;
-  while (!codexRunForSession(sessionName, mode) && Date.now() < deadline) {
+  const settled = (): boolean => {
+    const run = codexRunForSession(sessionName, mode);
+    if (!run) return false;
+    return expectedInput === undefined || run.input === expectedInput;
+  };
+  while (!settled() && Date.now() < deadline) {
     await flush();
   }
 }
@@ -218,6 +478,28 @@ function forceRuntimeProviderError(
   internal.setStatus('error');
 }
 
+function makeRestoreSdkSubagentDetail(overrides: Partial<SdkSubagentDetail['meta']> = {}): SdkSubagentDetail {
+  return {
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: 'Child agent is running',
+    input: { action: 'start', receiverCount: 1 },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: 'codex:restore:collab:child-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      receiverCount: 1,
+      runningChildCount: 1,
+      ...overrides,
+    },
+  };
+}
+
 describe('sdk transport session restore', () => {
   let tempDir: string;
 
@@ -226,19 +508,78 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    mocks.claudeSessionIdOverride = undefined;
+    reassignSessionFileMock.mockClear();
+    mocks.mcpDelegationConnected = true;
+    getDshPresetTransportConfigMock.mockClear();
     clearAllResend();
     timelineEmitterEmitMock.mockClear();
+    timelineReadByTypesPreferredMock.mockReset();
+    timelineReadByTypesPreferredMock.mockResolvedValue([]);
+    timelineReadPreferredMock.mockReset();
+    timelineReadPreferredMock.mockResolvedValue([]);
+    timelineReadCompletedTextTailMock.mockReset();
+    timelineReadCompletedTextTailMock.mockResolvedValue([]);
+    writePrivateInputMock.mockClear();
+    preparePrivateInputWriterMock.mockClear();
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
 
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('sdk-transport-restore');
+    // The app-server is mocked; an explicitly scoped CODEX_HOME must not turn
+    // this fixture into a dependency on the developer's real login.
+    const codexHome = path.join(tempDir, 'codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'fixture-only-not-a-real-key' }));
+    vi.stubEnv('CODEX_HOME', codexHome);
   });
 
   afterEach(async () => {
     await disconnectAll();
+    openCodeSdkRuntimeHooks.start = originalOpenCodeStart;
     await cleanupIsolatedSharedContextDb(tempDir);
+    vi.unstubAllEnvs();
+  });
+
+  it('preserves an explicit effort when a restore launch omits the optional field', async () => {
+    const name = 'deck_sdk_effort_sticky_brain';
+    mocks.store.set(name, {
+      name,
+      projectName: 'effort-sticky',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/effort-sticky',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-effort-sticky',
+      ccSessionId: 'cc-effort-sticky',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      effort: 'medium',
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    // This models a fresh-conversation caller that has the durable record but
+    // omitted optional launch metadata. The persisted explicit choice must not
+    // be replaced by the provider/default high level.
+    await launchTransportSession({
+      name,
+      projectName: 'effort-sticky',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/effort-sticky',
+      ccSessionId: 'cc-effort-sticky',
+      fresh: true,
+    });
+
+    expect(mocks.store.get(name)?.effort).toBe('medium');
   });
 
   it('restores claude-code-sdk sessions with persisted resume id and sends via resumed continuity', async () => {
@@ -281,13 +622,943 @@ describe('sdk transport session restore', () => {
       IMCODES_SESSION: 'deck_sdk_cc_brain',
       IMCODES_SESSION_LABEL: 'deck_sdk_cc_brain',
     });
-    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
+    expect(claudePresetAppend(run?.options ?? {})).toContain('Exact session name: deck_sdk_cc_brain');
     expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('a non-daemon process (MCP/CLI) never restores or binds the daemon\'s transport runtimes', async () => {
+    const now = Date.now();
+    mocks.store.set('deck_sdk_nondaemon_brain', {
+      name: 'deck_sdk_nondaemon_brain',
+      projectName: 'sdknondaemon',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/deck_sdk_nondaemon_brain',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-nondaemon',
+      ccSessionId: 'cc-nondaemon',
+    });
+    await connectProvider('claude-code-sdk', {});
+
+    markNonDaemonProcess();
+    try {
+      await expect(ensureTransportRuntimeAvailable('deck_sdk_nondaemon_brain')).resolves.toBeUndefined();
+      await restoreTransportSessions('claude-code-sdk');
+      expect(getTransportRuntime('deck_sdk_nondaemon_brain')).toBeUndefined();
+
+      // The daemon itself (startup marks it) restores normally.
+      markDaemonProcess();
+      const runtime = await ensureTransportRuntimeAvailable('deck_sdk_nondaemon_brain');
+      expect(runtime?.providerSessionId).toBe('route-nondaemon');
+    } finally {
+      resetProcessRoleForTests();
+    }
+  });
+
+  it('restores a newly launched unused AG route after daemon state is lost', async () => {
+    const name = 'deck_sdk_ag_unused_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-unused', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const record = { ...mocks.store.get(name)! };
+    expect(record.providerResumeId).toBeUndefined();
+    // No send: the adapter has not spawned the native conversation at all.
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, record);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+  });
+
+  it.each([undefined, AG.STARTED])('keeps an AG record with %s creation evidence and no id unbound', async state => {
+    const name = 'deck_sdk_ag_unknown_brain';
+    mocks.store.set(name, { name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk',
+      providerId: 'agy-sdk', providerSessionId: 'legacy-route', projectDir: tempDir, state: 'idle',
+      createdAt: 1, updatedAt: 1, restarts: 0, restartTimestamps: [], runtimeType: 'transport',
+      ...(state ? { agyNativeSessionState: state } : {}) });
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(mocks.store.get(name)?.providerSessionId).toBe('legacy-route');
+    await expect(launchTransportSession({ name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir }))
+      .rejects.toThrow('refusing an implicit fresh launch');
+  });
+
+  it.each(['brain', 'w1'])('persists AG late init for a %s and resumes only its native id', async role => {
+    const name = `deck_sdk_ag_info_${role}`;
+    let config: any;
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { config = c; return c.sessionKey; });
+    await launchTransportSession({ name, projectName: 'sdk-ag-info', role, agentType: 'agy-sdk', projectDir: tempDir });
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.UNSTARTED);
+    await config.beforeNativeSessionStart();
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('agy-sdk')!;
+    (provider as any).emitSessionInfo(getTransportRuntime(name)!.providerSessionId, { resumeId: 'native-'+role });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('native-'+role);
+    const saved = { ...mocks.store.get(name)! };
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, saved);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(config.resumeId).toBe('native-'+role);
+    expect(config.sessionKey).not.toBe(config.resumeId);
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+    createSpy.mockRestore();
+  });
+
+  it('restores two unused same-cwd AG owners, drains each queue once and never replays accepted ids', async () => {
+    const configs = new Map<string, any>(); const sent: Array<{ owner: string; text: string }> = [];
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { configs.set(c.sessionKey,c); return c.sessionKey; });
+    const sendSpy = vi.spyOn(AgySdkProvider.prototype, 'send').mockImplementation(async function(this: AgySdkProvider, sid, payload) {
+      await configs.get(sid).beforeNativeSessionStart();
+      const record = [...mocks.store.values()].find(r=>r.providerSessionId===sid)!;
+      expect(record.agyNativeSessionState).toBe(AG.STARTED);
+      const text = typeof payload==='string'?payload:payload.userMessage;
+      sent.push({owner:record.name,text});
+      (this as any).emitSessionInfo(sid,{resumeId:'native-'+record.name});
+      setTimeout(()=>{ for(const cb of (this as any).completeCallbacks) cb(sid,{id:'done-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()}); },0);
+    });
+    try {
+      const names=['deck_sdk_ag_queue_brain','deck_sdk_ag_queue_w1'];
+      const ids: Record<string,string[]> = {};
+      for(const [i,name] of names.entries()) {
+        await launchTransportSession({name,projectName:'sdk-ag-queue',role:i?'w1':'brain',agentType:'agy-sdk',projectDir:tempDir});
+        if(i)mocks.store.set(name,{...mocks.store.get(name),parentSession:names[0]});
+        await stopTransportRuntimeSession(name);
+        const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+        const recipient={sessionInstanceId,runtimeEpoch};
+        expect(enqueueResend(name,{recipient,text:name+'-one',commandId:name+'-one',queuedAt:Date.now()}).accepted).toBe(true);
+        expect(enqueueResend(name,{recipient,text:name+'-two',commandId:name+'-two',queuedAt:Date.now()}).accepted).toBe(true);
+        ids[name]=getResendEntries(name).map(e=>e.clientMessageId!);
+      }
+      await disconnectAll();await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{concurrency:2,interSessionDelayMs:0});
+      await vi.waitFor(()=>expect(sent).toHaveLength(4));
+      for(const name of names) {
+        expect(sent.filter(s=>s.owner===name).map(s=>s.text)).toEqual([name+'-one',name+'-two']);
+        await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+        for(const id of ids[name])expect(getTransportQueueStore().hasDeliveryTombstone(name,id)).toBe(true);
+      }
+      await restoreTransportSessions('agy-sdk');expect(sent).toHaveLength(4);
+      expect(mocks.store.get(names[1])?.parentSession).toBe(names[0]);
+    } finally { sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it('keeps both unaccepted AG queue entries when the start commit fails without auto-relaunch', async () => {
+    let config: any; let effects=0;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async()=>{await config.beforeNativeSessionStart();effects++;});
+    const storeModule=await import('../../src/store/session-store.js');
+    const flush=vi.mocked(storeModule.flushStore);
+    const originalFlush=flush.getMockImplementation()!;
+    try {
+      const name='deck_sdk_ag_writefail_brain';
+      await launchTransportSession({name,projectName:'sdk-ag-writefail',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+      const recipient={sessionInstanceId,runtimeEpoch};
+      expect(enqueueResend(name,{recipient,text:'one',commandId:'ag-fail-one',queuedAt:Date.now()}).accepted).toBe(true);
+      expect(enqueueResend(name,{recipient,text:'two',commandId:'ag-fail-two',queuedAt:Date.now()}).accepted).toBe(true);
+      flush.mockRejectedValue(new Error('fixture disk full'));
+      await connectProvider('agy-sdk',{});await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(getTransportRuntime(name)?.getStatus()).toBe('error'));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toHaveLength(2));
+      expect(effects).toBe(0);expect(createSpy).toHaveBeenCalledTimes(2);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally { flush.mockImplementation(originalFlush);sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG launch after %s', async action => {
+    const name='deck_sdk_ag_init_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);
+    const saved={...mocks.store.get(name)!};
+    const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const launch=launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      const rejected=expect(launch).rejects.toMatchObject({code:PROVIDER_ERROR_CODES.CANCELLED});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner',providerResumeId:'good-native'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'good-native'});
+      const after=mocks.store.get(name);
+      gate.resolve(config.sessionKey);await rejected;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG restore after %s', async action => {
+    const name='deck_sdk_ag_restorelate_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-restorelate',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);await disconnectAll();await connectProvider('agy-sdk',{});
+    const saved={...mocks.store.get(name)!};const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const restore=restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'new-native'});
+      const after=mocks.store.get(name);gate.resolve(config.sessionKey);await restore;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('coalesces concurrent AG launches instead of creating two native owners', async () => {
+    const name='deck_sdk_ag_concurrent_brain';const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const opts={name,projectName:'sdk-ag-concurrent',role:'brain',agentType:'agy-sdk' as const,projectDir:tempDir};
+      const first=launchTransportSession(opts);const second=launchTransportSession(opts);
+      await vi.waitFor(()=>expect(config).toBeDefined());gate.resolve(config.sessionKey);await Promise.all([first,second]);
+      expect(createSpy).toHaveBeenCalledTimes(1);expect(getTransportRuntime(name)?.providerSessionId).toBe(config.sessionKey);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['brain','w1'])('keeps a trusted AG native binding through a skipStore %s relaunch', async role => {
+    const name=`deck_sdk_ag_skip_${role}`;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>c.sessionKey);
+    try {
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir});
+      const saved={...mocks.store.get(name)!,providerResumeId:'trusted-native'};
+      mocks.store.set(name,saved);await stopTransportRuntimeSession(name);
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir,skipStore:true});
+      expect(mocks.store.get(name)?.providerResumeId).toBe('trusted-native');
+      expect(mocks.store.get(name)?.providerSessionId).toBe(getTransportRuntime(name)?.providerSessionId);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('runs AG manager restore, native-id capture and queue ownership across a real SQLite reload', async () => {
+    const actual = await vi.importActual<typeof import('../../src/store/session-store.js')>('../../src/store/session-store.js');
+    const { persistedSessions } = await import('../helpers/session-store-db.js');
+    const home=path.join(tempDir,'real-home');await mkdir(home);
+    vi.stubEnv('HOME',home);vi.stubEnv('USERPROFILE',home);vi.stubEnv('IMCODES_HOME',path.join(home,'.imcodes'));
+    mocks.realStore=actual;actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});
+    const name='deck_realproj_ag_sqlite_w1';const configs=new Map<string,any>();const sent:string[]=[];
+    const native='11111111-2222-4333-8444-555555555555';
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{configs.set(c.sessionKey,c);return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async function(this:AgySdkProvider,sid,payload){
+      await configs.get(sid).beforeNativeSessionStart();
+      const record=actual.getSession(name)!;
+      expect(persistedSessions(home)[name].agyNativeSessionState).toBe(AG.STARTED);
+      expect(record.runtimeEpoch).toBe(configs.get(sid).runtimeEpoch);
+      sent.push(typeof payload==='string'?payload:payload.userMessage);
+      (this as any).emitSessionInfo(sid,{resumeId:native});
+      setTimeout(()=>{for(const cb of (this as any).completeCallbacks)cb(sid,{id:'sqlite-result-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()});},0);
+    });
+    try {
+      await launchTransportSession({name,projectName:'realproj',role:'w1',agentType:'agy-sdk',projectDir:tempDir});
+      actual.upsertSession({...actual.getSession(name)!,parentSession:'deck_realproj_brain'});await actual.flushStore();
+      const before={...actual.getSession(name)!};
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const recipient={sessionInstanceId:before.sessionInstanceId!,runtimeEpoch:before.runtimeEpoch!};
+      for(const text of ['one','two'])expect(enqueueResend(name,{recipient,text,commandId:'real-ag-'+text,queuedAt:Date.now()}).accepted).toBe(true);
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(sent).toEqual(['one','two']));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+      await actual.flushStore();
+      expect(persistedSessions(home)[name]).toMatchObject({providerResumeId:native,agyNativeSessionState:AG.STARTED,parentSession:'deck_realproj_brain'});
+      expect(actual.getSession(name)?.runtimeEpoch).not.toBe(before.runtimeEpoch);
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      const current=getTransportRuntime(name)!;
+      expect(configs.get(current.providerSessionId!).resumeId).toBe(native);expect(sent).toHaveLength(2);
+    } finally {
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      await actual.flushStore();await actual.waitForSessionStoreSnapshotForTests();actual.resetSessionStoreAuthorityForTests();
+      mocks.realStore=undefined;sendSpy.mockRestore();createSpy.mockRestore();
+    }
+  });
+
+  it('rejects an old AG runtime info callback after owner replacement', async () => {
+    const name = 'deck_sdk_ag_late_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-late', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const old = getTransportRuntime(name)!;
+    const callback = (old as any)._onSessionInfoChange;
+    const saved = { ...mocks.store.get(name)! };
+    mocks.store.set(name, { ...saved, runtimeEpoch: 'replacement', providerSessionId: 'other-route', providerResumeId: 'good-native' });
+    callback({ resumeId: 'late-old-id' });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('good-native');
+  });
+
+  it('does not restore a stale Muse record while restoring a different provider', async () => {
+    const name = 'deck_ag_fresh_ignores_muse';
+    mocks.store.set(name, {
+      name,
+      projectName: 'ag-fresh',
+      role: 'brain',
+      agentType: 'muse-code-sdk',
+      projectDir: '/tmp/ag-fresh',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'muse-code-sdk',
+      providerSessionId: 'stale-muse-route',
+      providerResumeId: 'stale-muse-session',
+    });
+
+    // AG restoration must filter by providerId before attempting any runtime
+    // initialization, so a stale Muse record cannot emit its error on AG.
+    await restoreTransportSessions('agy-sdk');
+
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(mocks.claudeRuns).toHaveLength(0);
+  });
+
+  it('restores only the requested persisted transport session on demand', async () => {
+    const now = Date.now();
+    const makeStoredSession = (name: string, providerSessionId: string, ccSessionId: string) => ({
+      name,
+      projectName: 'sdkexactrestore',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: `/tmp/${name}`,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId,
+      ccSessionId,
+    });
+    mocks.store.set(
+      'deck_sdk_exact_target_brain',
+      makeStoredSession('deck_sdk_exact_target_brain', 'route-exact-target', 'cc-exact-target'),
+    );
+    mocks.store.set(
+      'deck_sdk_exact_other_brain',
+      makeStoredSession('deck_sdk_exact_other_brain', 'route-exact-other', 'cc-exact-other'),
+    );
+
+    await connectProvider('claude-code-sdk', {});
+    const [runtime, concurrentRuntime] = await Promise.all([
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+    ]);
+
+    expect(runtime).toBeDefined();
+    expect(concurrentRuntime).toBe(runtime);
+    expect(runtime?.providerSessionId).toBe('route-exact-target');
+    expect(getTransportRuntime('deck_sdk_exact_target_brain')).toBe(runtime);
+    expect(getTransportRuntime('deck_sdk_exact_other_brain')).toBeUndefined();
+  });
+
+  it('recovers a legacy OpenCode conversation by one unique remote title instead of creating a new one', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor/../service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'remote-monitor-session' },
+      query: { directory: '/tmp/service-monitor' },
+    }));
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: '/tmp/service-monitor' },
+      throwOnError: true,
+    });
+    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBe('remote-monitor-session');
+  });
+
+  it('queries canonical and symlink directory spellings and resumes with the provider spelling', async () => {
+    const realDirectory = path.join(tempDir, 'service-monitor-real');
+    const aliasDirectory = path.join(tempDir, 'service-monitor-alias');
+    await mkdir(realDirectory);
+    await symlink(
+      realDirectory,
+      aliasDirectory,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const canonicalDirectory = canonicalizeTransportCwd(realDirectory)!;
+    const normalizedAlias = normalizeTransportCwd(aliasDirectory)!;
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-symlink-monitor', {
+      id: 'remote-symlink-monitor',
+      title: '监控',
+      directory: normalizedAlias,
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_symlink_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: normalizedAlias,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-symlink-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-symlink-route');
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: canonicalDirectory },
+      throwOnError: true,
+    });
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: normalizedAlias },
+      throwOnError: true,
+    });
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'remote-symlink-monitor' },
+      query: { directory: normalizedAlias },
+    }));
+    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBe('remote-symlink-monitor');
+  });
+
+  it('refuses legacy provider discovery when a directory-scoped record has no project directory', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_missing_directory_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '   ',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await expect(ensureTransportRuntimeAvailable(name)).resolves.toBeUndefined();
+
+    expect(harness.client.session.list).not.toHaveBeenCalled();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+  });
+
+  it('does not attach an old recovery to a same-name session recreated while listing is pending', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const listingStarted = deferred<void>();
+    const listingResult = deferred<{ data: Array<Record<string, any>> }>();
+    harness.client.session.list.mockImplementationOnce(async () => {
+      listingStarted.resolve();
+      return listingResult.promise;
+    });
+    const name = 'deck_service_recreated_monitor';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-old',
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-old-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await listingStarted.promise;
+
+    mocks.store.delete(name);
+    mocks.store.set(name, {
+      ...oldRecord,
+      sessionInstanceId: 'instance-new',
+      providerSessionId: 'new-route',
+      createdAt: oldRecord.createdAt + 1,
+      updatedAt: Date.now(),
+    });
+    listingResult.resolve({
+      data: [{
+        id: 'remote-monitor-session',
+        title: '监控',
+        directory: '/tmp/service-monitor',
+        time: { updated: Date.now() },
+      }],
+    });
+    await restore;
+
+    expect(mocks.store.get(name)?.sessionInstanceId).toBe('instance-new');
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('does not let SessionInfo from an initializing restore pollute a same-name replacement', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const getStarted = deferred<void>();
+    const getResult = deferred<{ data: Record<string, any> }>();
+    harness.client.session.get.mockImplementationOnce(async () => {
+      getStarted.resolve();
+      return getResult.promise;
+    });
+    const name = 'deck_service_recreated_during_initialize';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-old',
+      runtimeEpoch: 'epoch-old',
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-old-route',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+    enqueueResend(name, {
+      text: 'must remain queued until restore authority commits',
+      commandId: 'cmd-stale-initialize',
+      queuedAt: Date.now(),
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await getStarted.promise;
+
+    mocks.store.delete(name);
+    mocks.store.set(name, {
+      ...oldRecord,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      providerSessionId: 'new-route',
+      providerResumeId: undefined,
+      createdAt: oldRecord.createdAt + 1,
+      updatedAt: Date.now(),
+    });
+    getResult.resolve({
+      data: {
+        id: 'remote-monitor-session',
+        title: '监控',
+        directory: '/tmp/service-monitor',
+      },
+    });
+    await restore;
+
+    expect(mocks.store.get(name)).toMatchObject({
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      providerSessionId: 'new-route',
+    });
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+    expect(mocks.store.get(name)?.activeModel).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(getResendCount(name)).toBe(1);
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+  });
+
+  it('abandons an initializing restore when the same session changes runtime authority', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const getStarted = deferred<void>();
+    const getResult = deferred<{ data: Record<string, any> }>();
+    harness.client.session.get.mockImplementationOnce(async () => {
+      getStarted.resolve();
+      return getResult.promise;
+    });
+    const name = 'deck_service_reconfigured_during_initialize';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-stable',
+      runtimeEpoch: 'epoch-old',
+      label: '旧监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-route',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await getStarted.promise;
+
+    mocks.store.set(name, {
+      ...oldRecord,
+      runtimeEpoch: 'epoch-new',
+      label: '新监控',
+      requestedModel: 'opencode/new-model',
+      transportConfig: { provider: { mode: 'changed' } },
+      updatedAt: Date.now(),
+    });
+    getResult.resolve({
+      data: {
+        id: 'remote-monitor-session',
+        title: '旧监控',
+        directory: '/tmp/service-monitor',
+      },
+    });
+    await restore;
+
+    expect(mocks.store.get(name)).toMatchObject({
+      sessionInstanceId: 'instance-stable',
+      runtimeEpoch: 'epoch-new',
+      label: '新监控',
+      requestedModel: 'opencode/new-model',
+      transportConfig: { provider: { mode: 'changed' } },
+      providerResumeId: 'remote-monitor-session',
+    });
+    expect(mocks.store.get(name)?.activeModel).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+  });
+
+  it('refuses to let two same-name legacy records claim one provider conversation', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_monitor_a', {
+      ...baseRecord,
+      name: 'deck_service_monitor_a',
+      providerSessionId: 'legacy-route-a',
+    });
+    mocks.store.set('deck_service_monitor_b', {
+      ...baseRecord,
+      name: 'deck_service_monitor_b',
+      providerSessionId: 'legacy-route-b',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_monitor_a')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_monitor_b')).toBeUndefined();
+    expect(mocks.store.get('deck_service_monitor_a')?.providerResumeId).toBeUndefined();
+    expect(mocks.store.get('deck_service_monitor_b')?.providerResumeId).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('refuses a legacy claim when another local record already owns the provider conversation', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_owned_monitor', {
+      ...baseRecord,
+      name: 'deck_service_owned_monitor',
+      providerSessionId: 'owned-route',
+      providerResumeId: 'remote-monitor-session',
+    });
+    mocks.store.set('deck_service_legacy_monitor', {
+      ...baseRecord,
+      name: 'deck_service_legacy_monitor',
+      providerSessionId: 'legacy-route',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_owned_monitor')?.providerSessionId).toBe('owned-route');
+    expect(getTransportRuntime('deck_service_legacy_monitor')).toBeUndefined();
+    expect(mocks.store.get('deck_service_legacy_monitor')?.providerResumeId).toBeUndefined();
+  });
+
+  it('fails all restores when one provider resume id is already persisted on multiple records', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_duplicate_a', {
+      ...baseRecord,
+      name: 'deck_service_duplicate_a',
+      providerSessionId: 'duplicate-route-a',
+    });
+    mocks.store.set('deck_service_duplicate_b', {
+      ...baseRecord,
+      name: 'deck_service_duplicate_b',
+      providerSessionId: 'duplicate-route-b',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_duplicate_a')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_duplicate_b')).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('scopes legacy OpenCode title recovery to the stored project directory', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('other-project-monitor', {
+      id: 'other-project-monitor',
+      title: '监控',
+      directory: '/tmp/other-project',
+      time: { updated: Date.now() + 1 },
+    });
+    harness.remoteSessions.set('service-project-monitor', {
+      id: 'service-project-monitor',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_scoped_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route-scoped',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route-scoped');
+    expect(mocks.store.get(name)?.providerResumeId).toBe('service-project-monitor');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'service-project-monitor' },
+      query: { directory: '/tmp/service-monitor' },
+    }));
+    expect(harness.client.session.get).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'other-project-monitor' },
+    }));
+  });
+
+  it('retries one transient directory-list failure and reuses the recovered listing', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('second-monitor', {
+      id: 'second-monitor',
+      title: 'Second monitor',
+      directory: '/tmp/shared-monitor',
+      time: { updated: Date.now() },
+    });
+    harness.client.session.list.mockRejectedValueOnce(new Error('temporary list failure'));
+    const baseRecord = {
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/shared-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_first_monitor', {
+      ...baseRecord,
+      name: 'deck_service_first_monitor',
+      label: 'First monitor',
+      providerSessionId: 'legacy-first-route',
+    });
+    mocks.store.set('deck_service_second_monitor', {
+      ...baseRecord,
+      name: 'deck_service_second_monitor',
+      label: 'Second monitor',
+      providerSessionId: 'legacy-second-route',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+
+    expect(harness.client.session.list).toHaveBeenCalledTimes(2);
+    expect(getTransportRuntime('deck_service_first_monitor')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_second_monitor')?.providerSessionId)
+      .toBe('legacy-second-route');
+    expect(mocks.store.get('deck_service_second_monitor')?.providerResumeId)
+      .toBe('second-monitor');
+  });
+
+  it('persists the provider-native OpenCode resume id on the first launch', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    await connectProvider('opencode-sdk', {});
+
+    await launchTransportSession({
+      name: 'deck_opencode_new_brain',
+      projectName: 'opencodenew',
+      role: 'brain',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/opencode-new',
+      label: 'New OpenCode session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    expect(harness.client.session.create).toHaveBeenCalledOnce();
+    expect(mocks.store.get('deck_opencode_new_brain')).toMatchObject({
+      providerSessionId: expect.any(String),
+      providerResumeId: 'unexpected-new-session',
+    });
   });
 
   it('persists transport runtime running status so session snapshots do not stay idle while tools run', async () => {
@@ -330,6 +1601,154 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({ state: 'running' }),
       { source: 'daemon', confidence: 'high' },
     );
+  });
+
+  it('restoreTransportSessions rehydrates a SQLite-queued message and dispatches it after restart', async () => {
+    // The "restart doesn't resync the queue" bug: a message queued behind an
+    // in-flight turn is persisted to transport-queue.sqlite, but a fresh daemon
+    // rebuilds the runtime with an EMPTY in-memory queue and never reads the row
+    // back — so it lingers `queued` forever. This exercises the real restore
+    // wiring end to end: seed a `queued` row, restore, assert it drains.
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_rehydrate_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkrehydrate',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-rehydrate',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-rehydrate',
+      codexSessionId: 'codex-thread-rehydrate',
+    });
+
+    // A message that was queued behind an in-flight turn before the crash —
+    // it survives ONLY in SQLite (both in-memory holders are gone on restart).
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-restart-recover',
+      commandId: 'msg-restart-recover',
+      text: 'recovered after restart',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-restart-recover', text: 'recovered after restart' }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    // The restored+idle runtime rehydrates the row and drains it to the provider.
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('recovered after restart') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('recovered after restart');
+
+    // And the persisted row no longer lingers as live `queued` (it dispatched).
+    const stillQueued = getTransportQueueStore()
+      .readSnapshot(sessionName)
+      .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-restart-recover' && entry.status === 'queued');
+    expect(stillQueued).toBe(false);
+  });
+
+  it('restoreTransportSessions adopts an identified original session legacy queue and dispatches it once', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_legacy_identity_brain';
+    const createdAt = Date.now() - 10_000;
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      sessionInstanceId: 'legacy-persisted-instance',
+      runtimeEpoch: 'legacy-current-epoch',
+      projectName: 'sdklegacyidentity',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-identity',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt,
+      updatedAt: createdAt,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-legacy-identity',
+      codexSessionId: 'codex-thread-legacy-identity',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-legacy-identity',
+      commandId: 'msg-legacy-identity',
+      text: 'legacy identified restart recovery',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-legacy-identity',
+        text: 'legacy identified restart recovery',
+      }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('legacy identified restart recovery')
+      && Date.now() < deadline) await flush();
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('legacy identified restart recovery');
+    expect(getTransportQueueStore().queueBelongsTo(sessionName, {
+      sessionInstanceId: 'legacy-persisted-instance',
+      runtimeEpoch: 'legacy-current-epoch',
+    })).toBe(true);
+    expect(mocks.codexRuns.filter((run) => run.input.includes('legacy identified restart recovery'))).toHaveLength(1);
+  });
+
+  it('does not replay a dead-daemon unexpired handoff before its lease expires', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_unexpired_handoff_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkunexpiredhandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-unexpired-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-unexpired-handoff',
+      codexSessionId: 'codex-thread-unexpired-handoff',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-unexpired-handoff',
+      commandId: 'msg-unexpired-handoff',
+      text: 'recover lease owned by dead daemon',
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-unexpired-handoff',
+        text: 'recover lease owned by dead daemon',
+      }),
+    });
+    expect(getTransportQueueStore().markHandoffInFlight(
+      sessionName,
+      ['msg-unexpired-handoff'],
+      60_000,
+    )).toHaveLength(1);
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    await flush();
+    expect(mocks.codexRuns.filter((run) => run.input.includes('recover lease owned by dead daemon'))).toHaveLength(0);
+    expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'msg-unexpired-handoff', status: 'handoff_inflight' }),
+    ]);
   });
 
   it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
@@ -386,6 +1805,18 @@ describe('sdk transport session restore', () => {
     });
     expect(idleCall?.[2]).not.toHaveProperty('error');
     expect(idleCall?.[2]).not.toHaveProperty('reason');
+    // Regression (deck_sub_3l6z4l39 stuck "working" in the web): the emitted
+    // daemon idle MUST satisfy the exact shared validator the web uses to
+    // accept an authoritative clean idle. The payload previously carried only
+    // `pendingMessageVersion` (no numeric `pendingCount`/`pendingVersion`), so
+    // isAuthoritativeIdlePayloadShape failed, every daemon idle was demoted to
+    // a WEAK idle, and any unmatched tool.call kept the session rendered
+    // "working" even after the reconciler proved clean idle.
+    expect(idleCall?.[2]).toMatchObject({
+      pendingCount: expect.any(Number),
+      pendingVersion: expect.any(Number),
+    });
+    expect(isAuthoritativeCleanIdlePayload(idleCall?.[2] as Record<string, unknown>)).toBe(true);
   });
 
   it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
@@ -395,6 +1826,7 @@ describe('sdk transport session restore', () => {
       sessionId: sessionName,
       toolCallId: 'restore-tool-1',
       tool: 'Bash',
+      activityGeneration: { scope: 'session', sessionName, generation: 7 },
       input: { command: 'SECRET_RESTORE_COMMAND' },
     });
     mocks.store.set(sessionName, {
@@ -441,9 +1873,179 @@ describe('sdk transport session restore', () => {
         toolCallId: 'restore-tool-1',
         terminalStatus: 'stale',
         terminalReason: 'daemon_restart_orphan',
+        activityGeneration: { scope: 'session', sessionName, generation: 7 },
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'restore_reconnect_orphan_reconcile',
+        idempotencyKey: expect.stringContaining('restore-tool-1:stale:daemon_restart_orphan'),
       }),
     ]));
     expect(JSON.stringify(replayed)).not.toContain('SECRET_RESTORE_COMMAND');
+  });
+
+  it('reconciles hidden SDK sub-agent timeline rows as daemon restart orphans before restore idle observation', async () => {
+    const sessionName = `deck_sdk_hidden_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const activityGeneration = { scope: 'session', sessionName, generation: 11 };
+    const detail = makeRestoreSdkSubagentDetail();
+    timelineReadByTypesPreferredMock.mockResolvedValue([
+      {
+        eventId: 'hidden-sdk-call',
+        sessionId: sessionName,
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        hidden: true,
+        payload: {
+          toolCallId: 'sdk-hidden-1',
+          tool: 'Task',
+          activityGeneration,
+          turnId: 'turn-hidden-1',
+          input: { action: 'SECRET_CHILD_PROMPT' },
+          detail,
+        },
+      },
+    ]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhidden',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-orphan',
+      codexSessionId: 'codex-thread-hidden-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
+    const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'tool.result'
+      && call[2]?.toolCallId === 'sdk-hidden-1'
+      && call[2]?.terminalStatus === 'stale'
+      && call[2]?.terminalReason === 'daemon_restart_orphan'
+    );
+    const restoreStateIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'session.state'
+      && call[2]?.decisionReason === 'restore_reconnect_observed'
+    );
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(restoreStateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(restoreStateIndex);
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2]).toMatchObject({
+      activityGeneration,
+      turnId: 'turn-hidden-1',
+      itemKind: 'codex_collaboration',
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        meta: {
+          canonicalKey: 'codex:restore:collab:child-1',
+          normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+          active: false,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+          runningChildCount: 0,
+        },
+      },
+    });
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[3]).toMatchObject({
+      hidden: true,
+      eventId: `transport-tool:${sessionName}:sdk-hidden-1:restore-orphan-result`,
+    });
+    expect(JSON.stringify(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2])).not.toContain('SECRET_CHILD_PROMPT');
+    expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
+  });
+
+  it('scans a broad timeline tail so daemon restart closes older SDK sub-agent rows after noisy restores', async () => {
+    const sessionName = `deck_sdk_hidden_old_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const detail = makeRestoreSdkSubagentDetail({
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey: 'codex:restore:runtime:agent-old',
+    });
+    const oldRunning = {
+      eventId: 'hidden-sdk-old-call',
+      sessionId: sessionName,
+      ts: Date.now() - 120_000,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      hidden: true,
+      payload: {
+        toolCallId: 'sdk-hidden-old',
+        tool: 'Codex Sub-agent',
+        detail,
+      },
+    } as const;
+    const noisyTools = Array.from({ length: 350 }, (_, index) => ({
+      eventId: `noise-${index}`,
+      sessionId: sessionName,
+      ts: Date.now() - 60_000 + index,
+      seq: 2 + index,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: index % 2 === 0 ? 'tool.call' : 'tool.result',
+      payload: { toolCallId: `noise-${index}`, tool: 'Bash' },
+    } as const));
+    timelineReadByTypesPreferredMock.mockResolvedValue([oldRunning, ...noisyTools]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhiddenold',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden-old',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-old-orphan',
+      codexSessionId: 'codex-thread-hidden-old-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
+    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        sessionName,
+        'tool.result',
+        expect.objectContaining({
+          toolCallId: 'sdk-hidden-old',
+          terminalStatus: 'stale',
+          terminalReason: 'daemon_restart_orphan',
+          detail: expect.objectContaining({
+            kind: SDK_SUBAGENT_DETAIL_KIND,
+            meta: expect.objectContaining({
+              canonicalKey: 'codex:restore:runtime:agent-old',
+              normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+              active: false,
+              terminal: true,
+            }),
+          }),
+        }),
+      ]),
+    ]));
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
@@ -536,9 +2138,15 @@ describe('sdk transport session restore', () => {
     // Pre-populate the resend queue with messages that arrived while
     // the runtime was offline.
     const queuedAt = Date.now();
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-1', commandId: 'cmd-q1', queuedAt });
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-2', commandId: 'cmd-q2', queuedAt });
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-3', commandId: 'cmd-q3', queuedAt });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-1', commandId: 'cmd-q1', clientMessageId: 'offline-id-1', queuedAt,
+    });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-2', commandId: 'cmd-q2', clientMessageId: 'offline-id-2', queuedAt,
+    });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-3', commandId: 'cmd-q3', clientMessageId: 'offline-id-3', queuedAt,
+    });
 
     expect(getResendCount('deck_sdk_drain_brain')).toBe(3);
 
@@ -569,8 +2177,108 @@ describe('sdk transport session restore', () => {
     //   - claudeRuns[1]: merged msg-2 + msg-3 (after first turn
     //     completed, _drainPending fired a new merged turn)
     expect(mocks.claudeRuns).toHaveLength(2);
-    expect(mocks.claudeRuns[0].prompt).toBe('offline-msg-1');
-    expect(mocks.claudeRuns[1].prompt).toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    // The user payload and its order are asserted exactly; the Brain delegation
+    // contract rides in front of it and is asserted separately below so a
+    // regression cannot drop the contract OR mangle the payload unnoticed.
+    expect(userPayloadOfPrompt(mocks.claudeRuns[0].prompt)).toBe('offline-msg-1');
+    expect(userPayloadOfPrompt(mocks.claudeRuns[1].prompt))
+      .toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    // This Brain's record carries no supervision binding, so the project is
+    // inert: no legacy or delegation supervision contract is injected.
+    expect(mocks.claudeRuns.every((run) => !systemCarriesDelegationContract(run))).toBe(true);
+    expect(claudePresetAppend(mocks.claudeRuns[0].options)).not.toContain('supervision_brain_work_delegation_v1');
+    expect(claudePresetAppend(mocks.claudeRuns[1].options)).not.toContain('supervision_brain_work_delegation_v1');
+    expect(mocks.claudeRuns.some((run) => claudePresetAppend(run.options).includes('task_assignment'))).toBe(false);
+    const queueDeadline = Date.now() + 5_000;
+    while (getTransportQueueStore().readSnapshot('deck_sdk_drain_brain').pendingMessageEntries.length > 0
+      && Date.now() < queueDeadline) await flush();
+    for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
+      const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
+        call[0] === 'deck_sdk_drain_brain'
+        && call[1] === 'user.message'
+        && (call[2] as { text?: unknown } | undefined)?.text === text
+      ));
+      expect(matchingUserEvents, `${text} should have exactly one timeline owner after restore drain`).toHaveLength(1);
+    }
+    // Each durable queue identity has one owner throughout resend -> runtime
+    // transfer. A second SQLite rehydrate would duplicate the payload above;
+    // retaining the original handoff until runtime finalization instead leaves
+    // one tombstone per id and no live row.
+    const queueSnapshot = getTransportQueueStore().readSnapshot('deck_sdk_drain_brain');
+    expect(queueSnapshot.pendingMessageEntries).toEqual([]);
+    for (const clientMessageId of ['offline-id-1', 'offline-id-2', 'offline-id-3']) {
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_sdk_drain_brain', clientMessageId))
+        .toBe(true);
+    }
+  });
+
+  it('restored Brain reads its supervision mode from the LIVE session record on every turn', async () => {
+    // The wiring under test is session-manager's, not the runtime's: if the
+    // runtime were never handed a resolver it would fail closed to "off", and a
+    // Brain whose owner DID enable supervision would silently lose its contract.
+    // Built from the shared defaults, so a later model-list change cannot turn
+    // this into an unparseable (and therefore silently "off") fixture.
+    const supervised = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: DEFAULT_SUPERVISION_BACKEND,
+      model: DEFAULT_CODEX_AUTOMATION_MODEL,
+    });
+    const transportConfig: Record<string, unknown> = {
+      provider: { mode: 'safe' },
+      sharedContextNamespace: { scope: 'personal', projectId: 'sdk-mode-live' },
+      [SUPERVISION_TRANSPORT_CONFIG_KEY]: supervised,
+    };
+    // Non-vacuous precondition: the fixture really is an ENABLED snapshot.
+    expect(isAutomaticSupervisionEnabled(extractSessionSupervisionSnapshot(transportConfig))).toBe(true);
+
+    mocks.store.set('deck_sdk_mode_brain', {
+      name: 'deck_sdk_mode_brain',
+      projectName: 'sdkmode',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-mode',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-mode-restore',
+      ccSessionId: 'cc-session-mode',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      transportConfig,
+    });
+    enqueueResend('deck_sdk_mode_brain', { text: 'while-supervised', commandId: 'cmd-mode-1', queuedAt: Date.now() });
+
+    await connectProvider('claude-code-sdk', {});
+    await restoreTransportSessions('claude-code-sdk');
+    const runsFor = () => mocks.claudeRuns.filter((run: { options: { env?: unknown } }) => (
+      (run.options.env as Record<string, unknown> | undefined)?.IMCODES_SESSION === 'deck_sdk_mode_brain'
+    ));
+    await vi.waitFor(() => expect(runsFor()).toHaveLength(1), { timeout: 5_000 });
+    expect(claudePresetAppend(runsFor()[0].options)).toContain('"automaticSupervision":true');
+    expect(claudePresetAppend(runsFor()[0].options)).toContain('IMCODES_TASK');
+    expect(claudePresetAppend(runsFor()[0].options)).not.toContain('task_assignment');
+    expect(runsFor()[0].prompt).toBe('while-supervised');
+
+    // The owner turns supervision OFF after restore. Nothing restarts; the very
+    // next turn must already see it.
+    const runtime = getTransportRuntime('deck_sdk_mode_brain');
+    expect(runtime).toBeDefined();
+    await vi.waitFor(() => expect(runtime!.getStatus()).toBe('idle'), { timeout: 5_000 });
+    const record = mocks.store.get('deck_sdk_mode_brain');
+    mocks.store.set('deck_sdk_mode_brain', {
+      ...record,
+      transportConfig: { ...transportConfig, [SUPERVISION_TRANSPORT_CONFIG_KEY]: { ...supervised, mode: SUPERVISION_MODE.OFF } },
+    });
+    runtime!.send('after-supervision-off', 'cmd-mode-2');
+    await vi.waitFor(() => expect(runsFor()).toHaveLength(2), { timeout: 5_000 });
+    const afterOff = claudePresetAppend(runsFor()[1].options);
+    expect(afterOff).not.toContain('"contractId":"supervision_brain_work_delegation_v1"');
+    expect(afterOff).not.toContain('task_assignment');
+    expect(runsFor()[1].prompt).toBe('after-supervision-off');
   });
 
   it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {
@@ -621,6 +2329,143 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns[1].prompt).toBe('relaunch-msg-2');
   });
 
+  // Re-audit P1 (Transport closed fix): only a relaunch that resumes the SAME
+  // provider thread may keep that thread's provider-hosted MCP child; a fresh
+  // reset or an agent switch abandons the thread and must reap it.
+  for (const [label, previousAgent, fresh, continues] of [
+    ['a non-fresh codex-sdk relaunch resumes the same thread', 'codex-sdk', false, true],
+    ['a fresh (reset) codex-sdk relaunch abandons the old thread', 'codex-sdk', true, false],
+    ['switching agent to codex-sdk abandons the old provider thread', 'claude-code-sdk', false, false],
+  ] as const) {
+    it(`relaunch child cleanup: ${label}`, async () => {
+      const sessionName = `deck_sdk_hosted_${fresh ? 'fresh' : 'keep'}_${previousAgent.replace(/\W/g, '')}_w1`;
+      const createdAt = Date.now() - 10_000;
+      const existing = {
+        name: sessionName,
+        sessionInstanceId: 'hosted-instance',
+        runtimeEpoch: 'hosted-epoch-1',
+        projectName: 'sdkhosted',
+        role: 'w1',
+        agentType: previousAgent,
+        projectDir: '/tmp/sdk-hosted',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt,
+        updatedAt: createdAt,
+        runtimeType: 'transport',
+        ...(previousAgent === 'codex-sdk' ? { codexSessionId: 'codex-thread-hosted' } : {}),
+      };
+      mocks.store.set(sessionName, existing);
+      vi.mocked(releaseSessionChildResources).mockClear();
+
+      await connectProvider('codex-sdk', {});
+      await launchTransportSession({
+        name: sessionName,
+        projectName: 'sdkhosted',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/sdk-hosted',
+        ...(fresh ? { fresh: true } : { codexSessionId: 'codex-thread-hosted' }),
+      });
+
+      expect(releaseSessionChildResources).toHaveBeenCalledWith(
+        expect.objectContaining({ name: sessionName, runtimeEpoch: 'hosted-epoch-1' }),
+        { providerThreadContinues: continues },
+      );
+    });
+  }
+
+  it('launchTransportSession resumes and drains a legacy queue only for the original persisted identity', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_legacy_launch_w1';
+    const createdAt = Date.now() - 10_000;
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      sessionInstanceId: 'legacy-launch-instance',
+      runtimeEpoch: 'legacy-launch-epoch',
+      projectName: 'sdklegacylaunch',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-launch',
+      state: 'error',
+      restarts: 1,
+      restartTimestamps: [],
+      createdAt,
+      updatedAt: createdAt,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-legacy-launch',
+      codexSessionId: 'codex-thread-legacy-launch',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-legacy-launch',
+      commandId: 'msg-legacy-launch',
+      text: 'legacy relaunch recovery',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-legacy-launch',
+        text: 'legacy relaunch recovery',
+      }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await launchTransportSession({
+      name: sessionName,
+      projectName: 'sdklegacylaunch',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-launch',
+      codexSessionId: 'codex-thread-legacy-launch',
+    });
+
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('legacy relaunch recovery')
+      && Date.now() < deadline) await flush();
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('legacy relaunch recovery');
+    expect(mocks.codexRuns.filter((run) => run.input.includes('legacy relaunch recovery'))).toHaveLength(1);
+  });
+
+  it('refuses to start a Brain codex turn when IM delegation is not authoritatively connected (control)', async () => {
+    // Guards the fixture change above: the mock now reports the delegation MCP
+    // server so ordinary Brain turns may start. If that gate were ever removed
+    // from production, this control fails -- the fixture cannot silently become
+    // the reason turns start.
+    mocks.mcpDelegationConnected = false;
+    mocks.store.set('deck_sdk_cx_gate_brain', {
+      name: 'deck_sdk_cx_gate_brain',
+      label: 'deck_sdk_cx_gate_brain',
+      projectName: 'sdk-cx-gate',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-gate',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-gate',
+      codexSessionId: 'codex-thread-gate',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+    const runtime = getTransportRuntime('deck_sdk_cx_gate_brain');
+    expect(runtime).toBeDefined();
+
+    const before = mocks.codexRuns.filter((run) => run.input).length;
+    runtime!.send('should not start a turn');
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) await flush();
+
+    // No turn input was ever delivered: the gate blocked turn/start.
+    expect(mocks.codexRuns.filter((run) => run.input).length).toBe(before);
+    expect(mocks.codexRuns.some((run) => run.input.includes('should not start a turn'))).toBe(false);
+  });
+
   it('restores codex-sdk sessions with persisted thread id and sends via resumeThread()', async () => {
     mocks.store.set('deck_sdk_cx_brain', {
       name: 'deck_sdk_cx_brain',
@@ -652,6 +2497,12 @@ describe('sdk transport session restore', () => {
 
     runtime!.send('What token did I ask you to remember?');
     await settleCodexRun('deck_sdk_cx_brain', 'resume');
+    {
+      const deadline = Date.now() + 5_000;
+      while (mocks.store.get('deck_sdk_cx_brain')?.state !== 'idle' && Date.now() < deadline) {
+        await flush();
+      }
+    }
 
     expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
@@ -661,7 +2512,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
-  it('uses gpt-5.5 instead of Claude-family models when launching codex-sdk', async () => {
+  it('uses the ChatGPT-compatible Codex default instead of Claude-family models when launching codex-sdk', async () => {
     await connectProvider('codex-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_cx_launch_opus_brain',
@@ -673,8 +2524,8 @@ describe('sdk transport session restore', () => {
       fresh: true,
     });
 
-    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe('gpt-5.5');
-    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe('gpt-5.5');
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_SESSION_MODEL);
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_SESSION_MODEL);
 
     const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
     expect(runtime).toBeDefined();
@@ -683,11 +2534,11 @@ describe('sdk transport session restore', () => {
 
     expect(codexRunForSession('deck_sdk_cx_launch_opus_brain', 'start')).toMatchObject({
       mode: 'start',
-      options: expect.objectContaining({ model: 'gpt-5.5' }),
+      options: expect.objectContaining({ model: DEFAULT_CODEX_SESSION_MODEL }),
     });
   });
 
-  it('uses gpt-5.5 instead of stored Claude-family models when restoring codex-sdk', async () => {
+  it('uses the ChatGPT-compatible Codex default instead of stored Claude-family models when restoring codex-sdk', async () => {
     mocks.store.set('deck_sdk_cx_opus_brain', {
       name: 'deck_sdk_cx_opus_brain',
       projectName: 'sdkcxopus',
@@ -710,8 +2561,8 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe('gpt-5.5');
-    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe('gpt-5.5');
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_SESSION_MODEL);
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_SESSION_MODEL);
 
     const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
     expect(runtime).toBeDefined();
@@ -721,11 +2572,19 @@ describe('sdk transport session restore', () => {
     expect(codexRunForSession('deck_sdk_cx_opus_brain', 'resume')).toMatchObject({
       mode: 'resume',
       id: 'codex-thread-opus-restore',
-      options: expect.objectContaining({ model: 'gpt-5.5' }),
+      options: expect.objectContaining({ model: DEFAULT_CODEX_SESSION_MODEL }),
     });
   });
 
-  it('publishes idle after restoring a transport session from stale persisted running state', async () => {
+  // A daemon restart while a codex session is mid-turn must not cost the
+  // conversation. This used to start a fresh thread whenever the persisted state
+  // was 'running' -- i.e. on every restart during activity -- and a live Brain
+  // lost a multi-megabyte working thread that resumed perfectly when pointed back
+  // at it by hand. What the restore must still guarantee is the part that fixed
+  // the original 211 deadlock: the restored runtime settles idle, never stuck
+  // 'running'. A thread that genuinely cannot continue is handled at the provider
+  // (active-writer conflict, unreadable or never-materialized history).
+  it('resumes the same codex thread, settled idle, after restoring a transport session from persisted running state', async () => {
     const persistedRecords: Array<Record<string, any> | null> = [];
     setSessionPersistCallback(async (record) => {
       persistedRecords.push(record);
@@ -746,6 +2605,9 @@ describe('sdk transport session restore', () => {
       providerId: 'codex-sdk',
       providerSessionId: 'route-cx-stale-running',
       codexSessionId: 'codex-thread-stale-running',
+      startupMemoryInjected: true,
+      recentInjectionHistory: [['memory-old']],
+      summarySyncFingerprints: ['summary-old'],
       requestedModel: 'gpt-5.5',
       activeModel: 'gpt-5.5',
     });
@@ -753,11 +2615,21 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(getTransportRuntime('deck_sub_sdk_stale_running')?.getStatus()).toBe('idle');
+    const runtime = getTransportRuntime('deck_sub_sdk_stale_running');
+    expect(runtime?.getStatus()).toBe('idle');
+    // Resumed like any other restore: it rebinds the persisted route.
+    expect(runtime?.providerSessionId).toBe('route-cx-stale-running');
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.state).toBe('idle');
+    // The conversation survives the restart: same thread, and the memory that
+    // thread already carries is not re-injected as if it were new.
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('codex-thread-stale-running');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBe(true);
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toEqual([['memory-old']]);
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',
+      codexSessionId: 'codex-thread-stale-running',
+      startupMemoryInjected: true,
     });
     expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_sub_sdk_stale_running',
@@ -765,12 +2637,36 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({
         state: 'idle',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: 0,
-        pendingMessages: [],
         pendingMessageEntries: [],
+        failedMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          source: 'restore_reconnect_observed',
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        }),
       }),
       { source: 'daemon', confidence: 'high' },
     );
+
+    mocks.store.set('deck_sub_sdk_stale_running', {
+      ...mocks.store.get('deck_sub_sdk_stale_running'),
+      label: 'Renamed while restored runtime stays attached',
+    });
+    runtime!.send('continue after daemon restart');
+    await settleCodexRun('deck_sub_sdk_stale_running', 'resume', 'continue after daemon restart');
+
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'start'), 'the interrupted thread must not be abandoned').toBeUndefined();
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toMatchObject({
+      mode: 'resume',
+      id: 'codex-thread-stale-running',
+      input: 'continue after daemon restart',
+    });
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('codex-thread-stale-running');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.label).toBe('Renamed while restored runtime stays attached');
   });
 
   it('emits started idle when launching a new transport session', async () => {
@@ -808,7 +2704,43 @@ describe('sdk transport session restore', () => {
       IMCODES_SESSION: 'deck_sdk_new_brain',
       IMCODES_SESSION_LABEL: 'CC1',
     });
-    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
+    expect(claudePresetAppend(run?.options ?? {})).toContain('Display label: CC1');
+  });
+
+  it('passes a ccPreset route into a newly launched dsh session', async () => {
+    const createSessionSpy = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    try {
+      await connectProvider('deepseek-harness', {});
+      await launchTransportSession({
+        name: 'deck_dsh_preset_brain',
+        projectName: 'dshpreset',
+        role: 'brain',
+        agentType: 'deepseek-harness',
+        projectDir: '/tmp/dsh-preset',
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+      });
+
+      expect(getDshPresetTransportConfigMock).toHaveBeenCalledWith('minimax', 'MiniMax-M3');
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({ ANTHROPIC_MODEL: 'MiniMax-M3' }),
+        llm: {
+          provider: 'minimax',
+          model: 'MiniMax-M3',
+          baseUrl: 'https://api.minimax.io/anthropic',
+          apiKey: 'test-dsh-key',
+          contextWindow: 1_000_000,
+        },
+      }));
+      expect(mocks.store.get('deck_dsh_preset_brain')).toMatchObject({
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+        presetContextWindow: 1_000_000,
+      });
+    } finally {
+      createSessionSpy.mockRestore();
+    }
   });
 
   it('does not auto-restart ordinary provider errors', async () => {
@@ -871,7 +2803,7 @@ describe('sdk transport session restore', () => {
       recoverable: false,
     });
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
       const relaunched = getTransportRuntime('deck_sdk_retry_pending_brain') !== firstRuntime;
       const prompts = mocks.claudeRuns.map((run) => run.prompt);
@@ -910,15 +2842,24 @@ describe('sdk transport session restore', () => {
     expect(firstRuntime!.send('limited follow up one', 'cmd-retry-limit-pending-1')).toBe('queued');
     expect(firstRuntime!.send('limited follow up two', 'cmd-retry-limit-pending-2')).toBe('queued');
 
+    // The failed turn's own message is not retried, but the session-level
+    // queue is not bound to it: both ordinary follow-ups queued behind it
+    // (neither carries the always-fail marker) must still get a chance to
+    // run instead of being stuck forever, and they succeed normally.
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      if (firstRuntime!.getStatus() === 'error') break;
+      if (firstRuntime!.getStatus() === 'idle' && firstRuntime!.pendingCount === 0) break;
       await flush();
     }
 
-    expect(firstRuntime!.getStatus()).toBe('error');
+    expect(firstRuntime!.getStatus()).toBe('idle');
+    expect(firstRuntime!.pendingCount).toBe(0);
     await flush();
-    expect(mocks.claudeRuns).toHaveLength(1);
+    // claudeRuns[0]: the failed 'cmd-retry-limit-active' turn. claudeRuns[1]:
+    // the drained, merged follow-up turn -- a normal new turn on the SAME
+    // still-connected provider, not a process relaunch (see the "auto-restart"
+    // assertions below, which are the actual invariant this test title names).
+    expect(mocks.claudeRuns).toHaveLength(2);
     expect(getTransportRuntime('deck_sdk_retry_limited_brain')).toBe(firstRuntime);
     expect(getResendEntries('deck_sdk_retry_limited_brain')).toEqual([]);
     expect(timelineEmitterEmitMock.mock.calls.some((call) => (
@@ -1088,6 +3029,47 @@ describe('sdk transport session restore', () => {
     expect(run?.options.sessionId).toBeUndefined();
   });
 
+  it('migrates transcript ownership when a live Claude SDK stream reports a new session id', async () => {
+    const name = 'deck_resume_claim_change_brain';
+    mocks.store.set(name, {
+      name,
+      projectName: 'resume-claim-change',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/resume-claim-change',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-resume-claim-change',
+      ccSessionId: 'cc-session-old',
+      requestedModel: 'sonnet',
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name,
+      projectName: 'resume-claim-change',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/resume-claim-change',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-old',
+    });
+
+    mocks.claudeSessionIdOverride = 'cc-session-new';
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('rotate transcript');
+    await settleClaudeRun(name, 'rotate transcript');
+
+    expect(reassignSessionFileMock).toHaveBeenCalledWith(name, 'cc-session-old', 'cc-session-new');
+    expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-new');
+  });
+
   it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {
     const name = 'deck_restart_ccsdk_brain';
     const record = {
@@ -1227,5 +3209,805 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.agentType).toBe('codex');
     expect(mocks.store.get(name)?.codexSessionId).toBe('codex-thread-switch');
     expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).toContain('codex-thread-switch');
+  });
+
+  it('resets codex-sdk fresh with handoff pack on { fresh: true, handoff: true } and injects it into the next turn', async () => {
+    const name = 'deck_handoff_cxsdk_brain';
+    const record = {
+      name,
+      projectName: 'handoffcxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-cxsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-handoff',
+      codexSessionId: 'codex-thread-before-handoff',
+    };
+    mocks.store.set(name, record);
+    const prevUserEvent = {
+      eventId: 'ev-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'HANDOFF_GOAL_ALPHA' },
+    };
+    const prevAssistantEvent = {
+      eventId: 'ev-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'HANDOFF_STATE_BETA', streaming: false },
+    };
+    const handoffCmdEvent = {
+      eventId: 'ev-3',
+      sessionId: name,
+      ts: 300,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    };
+    timelineReadPreferredMock.mockResolvedValue([handoffCmdEvent as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([prevUserEvent, prevAssistantEvent, handoffCmdEvent] as any);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    const updated = mocks.store.get(name);
+    expect(updated?.codexSessionId).not.toBe('codex-thread-before-handoff');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_GOAL_ALPHA');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_STATE_BETA');
+    expect(updated?.crossVendorHandoff?.pending?.text).not.toContain('/handoff');
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('continue task');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('continue task') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toContain('HANDOFF_GOAL_ALPHA');
+    expect(run?.input).toContain('HANDOFF_STATE_BETA');
+    expect(run?.input).toContain('continue task');
+    expect(run?.input).not.toContain('/handoff');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+  });
+
+  it('clears stale pending handoff pack when relaunched fresh without handoff (/clear)', async () => {
+    const name = 'deck_clear_strips_pending_brain';
+    const record = {
+      name,
+      projectName: 'clearpending',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-pending',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-clear-pending',
+      codexSessionId: 'codex-thread-pending',
+      crossVendorHandoff: {
+        pending: {
+          text: 'STALE_HANDOFF_SHOULD_VANISH',
+          sourceAgentType: 'codex-sdk',
+          sourceRuntimeType: 'transport',
+          cutoff: { epoch: 1, seq: 1, ts: 10 },
+          createdAt: 10,
+          tokenCount: 10,
+        },
+      },
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('brand new start');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('brand new start') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('brand new start');
+  });
+
+  it('degrades cleanly with no handoff pack when timeline is empty or control-only on /handoff', async () => {
+    const name = 'deck_handoff_empty_brain';
+    const record = {
+      name,
+      projectName: 'handoffempty',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-empty',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-handoff-empty',
+      codexSessionId: 'codex-thread-empty',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('first real question');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('first real question') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toBe('first real question');
+  });
+
+  it('delivers handoff pack via process private writer when relaunching claude-code with { fresh: true, handoff: true }', async () => {
+    const name = 'deck_handoff_cccli_brain';
+    const record = {
+      name,
+      projectName: 'handoffcccli',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      projectDir: '/tmp/handoff-cccli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccSessionId: 'cc-old-handoff',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-proc-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([
+      {
+        eventId: 'ev-proc-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'PROCESS_HANDOFF_TASK' },
+      },
+      {
+        eventId: 'ev-proc-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+      },
+    ] as any);
+
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    await vi.waitFor(() => {
+      expect(writePrivateInputMock).toHaveBeenCalled();
+    }, { timeout: 15_000, interval: 10 });
+
+    expect(mocks.store.get(name)?.ccSessionId).not.toBe('cc-old-handoff');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('cc-old-handoff');
+    expect(preparePrivateInputWriterMock).toHaveBeenCalledWith(name);
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_TASK'));
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_FACT'));
+  });
+
+  it('invalidates an in-flight /handoff pack on clearTransportConversation and never resurrects it on later restore', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_inflight_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearinflighthandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-inflight-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-inflight',
+      codexSessionId: 'codex-thread-inflight',
+    };
+    mocks.store.set(name, record);
+
+    const rowsReady = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-inflight-cutoff',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockImplementation(() => rowsReady.promise);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    // User immediately runs /clear before the async handoff pack finishes building.
+    await clearTransportConversation(mocks.store.get(name) as any);
+
+    rowsReady.resolve([{
+      eventId: 'ev-inflight-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    }]);
+    await flush();
+    await flush();
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    // Stop runtime and run ordinary recovery/restore: cleared session must remain blank.
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('NEW_QUESTION_AFTER_CLEAR');
+    await settleCodexRun(name, 'start', 'NEW_QUESTION_AFTER_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('NEW_QUESTION_AFTER_CLEAR');
+    expect(run?.input).not.toContain('PRIVATE_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('clears a ready-pending /handoff pack on clearTransportConversation and keeps subsequent restore clean', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_ready_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearreadyhandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-ready-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-ready',
+      codexSessionId: 'codex-thread-ready',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('READY_CONTEXT_CLEARED_BY_USER');
+
+    await clearTransportConversation(mocks.store.get(name) as any);
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    runtime!.send('AFTER_READY_CLEAR');
+    await settleCodexRun(name, 'start', 'AFTER_READY_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('AFTER_READY_CLEAR');
+    expect(run?.input).not.toContain('READY_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('delivers only the newest pack once across consecutive /handoff calls', async () => {
+    const name = 'deck_consecutive_handoff_brain';
+    const record = {
+      name,
+      projectName: 'consecutivehandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/consecutive-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-consecutive',
+      codexSessionId: 'codex-thread-consec',
+    };
+    mocks.store.set(name, record);
+
+    const firstSlow = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    } as any]);
+    timelineReadCompletedTextTailMock
+      .mockImplementationOnce(() => firstSlow.promise)
+      .mockResolvedValueOnce([{
+        eventId: 'ev-consec-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'LATEST_SECOND_HANDOFF' },
+      } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    await relaunchSessionWithSettings(mocks.store.get(name) as any, { fresh: true, handoff: true });
+
+    firstSlow.resolve([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    }]);
+    const deadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_HANDOFF');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_HANDOFF');
+
+    mocks.codexRuns.length = 0;
+    const runtime = getTransportRuntime(name);
+    runtime!.send('turn one');
+    await settleCodexRun(name, 'start');
+    const firstTurnDeadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_HANDOFF');
+    expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_HANDOFF');
+
+    // Consumed: second turn after /handoff must not repeat the handoff pack.
+    runtime!.send('turn two');
+    await settleCodexRun(name, 'start', 'turn two');
+    expect(codexRunForSession(name, 'start')?.input).toBe('turn two');
+  });
+
+  it('preserves codex-sdk ccPreset and resolves getCodexPresetTransportConfig on /handoff with one-time pack delivery', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      model: 'custom-codex-model',
+      availableModels: ['custom-codex-model', 'custom-codex-mini'],
+      contextWindow: 128_000,
+      codexModelProvider: {
+        id: 'custom_codex_preset',
+        name: 'custom-codex-preset',
+        baseUrl: 'https://custom-codex.example/v1',
+        envKey: 'CUSTOM_API_KEY',
+      },
+    });
+    try {
+      const name = 'deck_handoff_codex_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/handoff-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-preset',
+        codexSessionId: 'codex-thread-preset-old',
+        ccPreset: 'custom-codex-preset',
+        requestedModel: 'custom-codex-model',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('custom-codex-preset', 'custom-codex-model');
+      const updated = mocks.store.get(name);
+      expect(updated?.ccPreset).toBe('custom-codex-preset');
+      expect(updated?.requestedModel).toBe('custom-codex-model');
+      expect(updated?.codexSessionId).not.toBe('codex-thread-preset-old');
+
+      const pendingDeadline = Date.now() + 5_000;
+      while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+        await flush();
+      }
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('next step');
+      await settleCodexRun(name, 'start');
+      const runDeadline = Date.now() + 5_000;
+      while (!codexRunForSession(name, 'start')?.input.includes('next step') && Date.now() < runDeadline) {
+        await flush();
+      }
+      expect(codexRunForSession(name, 'start')?.input).toContain('CODEX_PRESET_HANDOFF_GOAL');
+      expect(codexRunForSession(name, 'start')?.options.model).toBe('custom-codex-model');
+
+      // One-time delivery check
+      runtime!.send('follow up');
+      await settleCodexRun(name, 'start', 'follow up');
+      expect(codexRunForSession(name, 'start')?.input).toBe('follow up');
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('preserves codex process ccPreset and available models while rotating thread and delivering handoff pack', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const resolveEnvSpy = vi.spyOn(ccPresets, 'resolvePresetEnv').mockResolvedValue({});
+    const getPresetSpy = vi.spyOn(ccPresets, 'getPreset').mockResolvedValue({
+      name: 'custom-codex-cli-preset',
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      contextWindow: 128_000,
+      availableModels: [{ id: 'custom-codex-model' }],
+    } as any);
+    try {
+      const name = 'deck_handoff_codex_cli_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexclipreset',
+        role: 'brain',
+        agentType: 'codex',
+        runtimeType: 'process',
+        projectDir: '/tmp/handoff-codex-cli-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        codexSessionId: 'codex-cli-thread-old',
+        ccPreset: 'custom-codex-cli-preset',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+      const deadline = Date.now() + 5_000;
+      while (writePrivateInputMock.mock.calls.length === 0 && Date.now() < deadline) {
+        await flush();
+      }
+
+      const updated = mocks.store.get(name);
+      expect(resolveEnvSpy).toHaveBeenCalledWith('custom-codex-cli-preset', undefined);
+      expect(getPresetSpy).toHaveBeenCalledWith('custom-codex-cli-preset');
+      expect(updated?.ccPreset).toBe('custom-codex-cli-preset');
+      expect(updated?.codexAvailableModels).toEqual(['custom-codex-model']);
+      expect(updated?.codexSessionId).not.toBe('codex-cli-thread-old');
+      expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('CODEX_CLI_PRESET_GOAL'));
+    } finally {
+      resolveEnvSpy.mockRestore();
+      getPresetSpy.mockRestore();
+    }
+  });
+
+  it('does not carry an incompatible ccPreset across families when switching from claude-code to codex-sdk without an override', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig');
+    try {
+      const name = 'deck_cross_family_preset_drop_brain';
+      const record = {
+        name,
+        projectName: 'crossfamilypreset',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        projectDir: '/tmp/cross-family-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        providerId: 'claude-code-sdk',
+        providerSessionId: 'route-cc-cross',
+        ccSessionId: 'cc-cross-old',
+        ccPreset: 'claude-only-preset',
+      };
+      mocks.store.set(name, record);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { agentType: 'codex-sdk' });
+
+      expect(codexPresetSpy).not.toHaveBeenCalled();
+      expect(mocks.store.get(name)?.agentType).toBe('codex-sdk');
+      expect(mocks.store.get(name)?.ccPreset).toBeUndefined();
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('restores codex-sdk ccPreset session with codexModelProvider, switched requestedModel, env, systemPrompt, and availableModels', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const switchedModel = 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored';
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: {
+        OPENAI_BASE_URL: 'https://preset-qwen.example/v1',
+        CODEX_BASE_URL: 'https://preset-qwen.example/v1',
+        OPENAI_API_KEY: 'sk-preset',
+        CODEX_API_KEY: 'sk-preset',
+        CODEX_MODEL: switchedModel,
+        IMCODES_CC_PRESET: 'qwen3.8-27b',
+      },
+      model: switchedModel,
+      availableModels: ['qwen3.8-27b', switchedModel],
+      systemPrompt: 'Authoritative runtime fact: qwen3.8-27b preset.',
+      contextWindow: 262_144,
+      codexModelProvider: {
+        providerId: 'qwen3_8-27b',
+        baseUrl: 'https://preset-qwen.example/v1',
+        apiKey: 'sk-preset',
+        wireApi: 'responses',
+      },
+    });
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize');
+    try {
+      const name = 'deck_restore_codex_preset_brain';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/restore-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-codex-preset-restore',
+        codexSessionId: 'codex-thread-preset-restore',
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: switchedModel,
+        activeModel: switchedModel,
+        modelDisplay: switchedModel,
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk');
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('qwen3.8-27b', switchedModel);
+      expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({
+        sessionName: name,
+        providerId: 'codex-sdk',
+        agentId: switchedModel,
+        systemPrompt: 'Authoritative runtime fact: qwen3.8-27b preset.',
+        settings: {
+          codexModelProvider: {
+            providerId: 'qwen3_8-27b',
+            baseUrl: 'https://preset-qwen.example/v1',
+            apiKey: 'sk-preset',
+            wireApi: 'responses',
+          },
+        },
+        env: expect.objectContaining({
+          CODEX_MODEL: switchedModel,
+          OPENAI_BASE_URL: 'https://preset-qwen.example/v1',
+          IMCODES_CC_PRESET: 'qwen3.8-27b',
+        }),
+      }));
+
+      const persisted = mocks.store.get(name);
+      expect(persisted?.requestedModel).toBe(switchedModel);
+      expect(persisted?.activeModel).toBe(switchedModel);
+      expect(persisted?.modelDisplay).toBe(switchedModel);
+      expect(persisted?.codexAvailableModels).toEqual(['qwen3.8-27b', switchedModel]);
+      expect(persisted?.presetContextWindow).toBe(262_144);
+
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('continue with switched preset model');
+      await settleCodexRun(name, 'resume', 'continue with switched preset model');
+      const resumed = codexRunForSession(name, 'resume');
+      expect(resumed?.id).toBe('codex-thread-preset-restore');
+      expect(resumed?.options.model).toBe(switchedModel);
+      expect(resumed?.options.modelProvider).toBe('qwen3_8-27b');
+    } finally {
+      initSpy.mockRestore();
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('handles missing or deleted ccPreset safely when restoring a codex-sdk session', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({ env: {} });
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize');
+    try {
+      const name = 'deck_restore_codex_missing_preset_brain';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexmissingpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/restore-codex-missing-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-codex-missing-preset',
+        codexSessionId: 'codex-thread-missing-preset',
+        ccPreset: 'deleted-preset',
+        requestedModel: 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored',
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk');
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('deleted-preset', 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored');
+      expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({
+        sessionName: name,
+        providerId: 'codex-sdk',
+        agentId: 'sc117-qwen3.8-flash-next-iq3_xxs-uncensored',
+      }));
+      const initCall = initSpy.mock.calls.find(([cfg]) => cfg.sessionName === name)?.[0];
+      expect(initCall?.settings).toBeUndefined();
+      expect(mocks.store.get(name)?.requestedModel).toBe('sc117-qwen3.8-flash-next-iq3_xxs-uncensored');
+    } finally {
+      initSpy.mockRestore();
+      codexPresetSpy.mockRestore();
+    }
   });
 });

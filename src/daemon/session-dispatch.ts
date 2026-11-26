@@ -1,0 +1,932 @@
+import { queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
+import { TASK_PAIR_NUDGE_ID_PREFIX } from '../../shared/task-pair.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import {
+  SESSION_MODEL_COMMAND,
+  classifySessionControlCommand,
+  isSessionControlCommandText,
+  isSessionModelSwitchCommandText,
+} from '../../shared/session-control-commands.js';
+import { createHash } from 'node:crypto';
+import { sendCommandText } from '../../shared/send-command-mode.js';
+import { readSenderOwnerMachineAuthority, readSenderParticipantTurn } from './sender-participant-turn.js';
+import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
+import { SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
+import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import {
+  PEER_AUDIT_CONTRACT_VERSION,
+  PEER_AUDIT_PREFLIGHT_ERRORS,
+  type PeerAuditDispatchReceipt,
+} from '../../shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_CONTEXT_HEADER,
+  AGENT_DELEGATION_CONTEXT_OMITTED_MARKER,
+  AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
+  AGENT_DELEGATION_ERROR_CODES,
+  buildAgentDelegationReplyInstruction,
+  buildAgentDelegationSenderLine,
+  isAgentDelegationForwardedPayloadText,
+  isDelegationReplyCapableAgentType,
+  neutralizeAgentDelegationEnvelopeMarkers,
+  stripAgentDelegationControlInstructions,
+  type AgentDelegationReplyAuthority,
+  type AgentDelegationErrorCode,
+  type DelegationContextStatus,
+} from '../../shared/agent-delegation.js';
+import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
+import { redactSensitiveText } from '../../shared/redact-secrets.js';
+import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
+import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { clearResend, enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { retireRestartContinuation } from './restart-continuation.js';
+import logger from '../util/logger.js';
+import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
+import { timelineEmitter } from './timeline-emitter.js';
+import { isPairsEngineSession } from './task-pairs/engine.js';
+import {
+  createDelegationReplyAuthority,
+  expireDelegationReplyAuthority,
+} from './delegation-reply-authority.js';
+import type { TimelineEvent } from './timeline-event.js';
+import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
+
+export interface SessionDispatchRuntimeCaller {
+  userId: string;
+  sessionName: string | null;
+  projectName?: string | null;
+  projectRoot?: string | null;
+}
+
+export interface SessionDispatchMessageOptions {
+  dispatchId: SendDispatchId;
+  messageId: SendMessageId;
+  sharedActor?: SharedActorEnvelope;
+  /**
+   * Server-minted participant authority carried with a participant-stamped message (sender's turn was started by a share participant):
+   * the receiving turn is bound to that participant, so machine tools there follow the participant's own access, not the owner's.
+   */
+  sharedMachineAuthority?: string;
+  /** Server-minted owner-turn authority carried across sibling sends during an owner turn or owner cron send. */
+  ownerMachineAuthority?: string;
+  /** Node MCP send_message: prefer provider-native append before FIFO. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /**
+   * Internal daemon transport binding. The live /send boundary validates this
+   * against the registry and creates/verifies the exact assignment worktree
+   * before acknowledging delivery.
+   */
+  supervision?: { taskId: string; assignmentId: string };
+  /** Durable lifecycle authority; never inferred from the message body. */
+  queueSupervisionReference?: QueueSupervisionReference;
+  /** Persist before delivery. Used by daemon-owned exactly-once control traffic. */
+  durableQueue?: boolean;
+  /** Deliver daemon-owned control traffic to the agent without a duplicate user timeline card. */
+  suppressTimeline?: boolean;
+  /**
+   * Author of a non-human message (shared/chat-message-origin.ts). Stamped on
+   * the timeline row and carried on every queued copy, so the row projected
+   * after a drain is not rendered as the human's input. Absent for human input
+   * (external chat bridges route here too).
+   */
+  messageOrigin?: ChatMessageOrigin;
+  /**
+   * Command mode (shared/send-command-mode.ts): `message` is already the exact
+   * text to deliver. The target runtime delivers it without per-turn
+   * memory/identity enrichment and never merges it with other queued text; a
+   * process target skips memory recall and sandbox path rewriting.
+   */
+  command?: true;
+  /** Emergency steering: auto-stops busy targets that cannot append before delivering this message. */
+  emergency?: boolean;
+  /** Injected cancel hook for testability / explicit cancel delegation. */
+  cancelSession?: (target: SessionRecord) => Promise<boolean> | boolean;
+}
+
+export type SessionDispatchOptions = SessionDispatchMessageOptions;
+export type SessionDispatchMessageResult = 'sent' | 'queued' | void;
+
+type BuildSessionDispatchMessageInput = {
+  message?: string;
+  files?: string[];
+  /** Sender's exact IM.codes session name — carried regardless of whether a reply is requested, so the recipient always knows who sent this. */
+  from?: string | null;
+  /** Sender's display label, shown alongside `from` when available. */
+  fromLabel?: string | null;
+  replyTo?: string | null;
+  replyAuthority?: AgentDelegationReplyAuthority;
+  contextTail?: string | null;
+  contextOmitted?: boolean;
+  contextStatus?: DelegationContextStatus;
+  /** Command mode: deliver `message.trim()` and nothing else (shared/send-command-mode.ts). */
+  command?: boolean;
+};
+
+/**
+ * Text that must be delivered verbatim so the receiving daemon runs it as a
+ * command. `/stop` is excluded: stopping has its own priority path (send_stop)
+ * and must not ride the ordinary send queue.
+ */
+function isSessionControlDispatchText(message: string): boolean {
+  const control = classifySessionControlCommand(message);
+  return (control !== null && control.id !== 'stop') || isSessionModelSwitchCommandText(message);
+}
+
+export function buildSessionDispatchMessage(message: string, options: Omit<BuildSessionDispatchMessageInput, 'message'>): string;
+export function buildSessionDispatchMessage(input: BuildSessionDispatchMessageInput): string;
+export function buildSessionDispatchMessage(
+  messageOrInput: string | BuildSessionDispatchMessageInput,
+  maybeOptions: Omit<BuildSessionDispatchMessageInput, 'message'> = {},
+): string {
+  const message = typeof messageOrInput === 'string' ? messageOrInput : messageOrInput.message ?? '';
+  const options = typeof messageOrInput === 'string' ? maybeOptions : messageOrInput;
+  // A session control command (/clear, /compact, /stop, /model X) must arrive
+  // as exactly that text. The sender line, context tail or reply instruction
+  // turned it into prose: the command never ran and the model read it instead.
+  if (options.command === true || isSessionControlDispatchText(message)) return sendCommandText(message);
+  const contextStatus: DelegationContextStatus = options.contextStatus ?? (options.contextOmitted ? 'omitted' : 'ok');
+  // The body is the sender's content; only the line built below is the daemon's own envelope.
+  let result = neutralizeAgentDelegationEnvelopeMarkers(message);
+  if (options.from) {
+    const senderLine = buildAgentDelegationSenderLine(options.from, options.fromLabel);
+    if (senderLine) result = `${senderLine}\n\n${result}`;
+  }
+  if (options.contextTail?.trim()) {
+    result += `\n\n${AGENT_DELEGATION_CONTEXT_HEADER}\n${options.contextTail.trim()}`;
+    if (contextStatus === 'truncated') {
+      result += `\n${AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER} Recent context was truncated to fit delegation limits.`;
+    }
+  } else if (contextStatus === 'truncated') {
+    result += `\n\n${AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER} Recent context was truncated and omitted; forwarded clean task only.`;
+  } else if (contextStatus === 'omitted') {
+    result += `\n\n${AGENT_DELEGATION_CONTEXT_OMITTED_MARKER} Recent context unavailable; forwarded clean task only.`;
+  }
+  const files = options.files ?? [];
+  if (files.length > 0) {
+    result += `\n\nReferenced files:\n${files.map((file) => `- ${file}`).join('\n')}`;
+  }
+  if (options.replyTo && isValidImcodesSessionName(options.replyTo)) {
+    result += `\n\n${buildAgentDelegationReplyInstruction(options.replyTo, options.replyAuthority, {
+      taskPairEngine: isPairsEngineSession(options.replyTo),
+    })}`;
+  }
+  return result;
+}
+
+
+function isSubSessionRecord(sessionName: string | null | undefined, record?: SessionRecord): boolean {
+  return Boolean(
+    record?.parentSession
+    || record?.userCreated === true && (record.name.startsWith('deck_sub_') || sessionName?.startsWith('deck_sub_'))
+    || sessionName?.startsWith('deck_sub_'),
+  );
+}
+
+function shouldAttachServerMemberActor(callerName: string | null, callerRecord: SessionRecord | undefined, target: SessionRecord): boolean {
+  return isSubSessionRecord(callerName, callerRecord) || isSubSessionRecord(target.name, target);
+}
+
+function formatServerMemberActorName(callerName: string, callerRecord?: SessionRecord): string {
+  const label = callerRecord?.label?.trim();
+  if (label) return label;
+  return callerRecord?.name || callerName;
+}
+
+export interface SessionDispatchActorOption {
+  sharedActor?: SharedActorEnvelope;
+  sharedMachineAuthority?: string;
+  ownerMachineAuthority?: string;
+  /** A participant-stamped message waits for its own turn: it must never be appended into a turn that is already running. */
+  deliveryMode?: typeof MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE;
+}
+
+/**
+ * The actor stamp of an agent-to-agent message -- the one place every send path (send_message, clones, command mode, `imcodes send`,
+ * reply delivery) takes it from. When the SENDER's current turn was started by a share participant, the message carries that participant
+ * (role `participant`, their server-minted authority) so the receiving turn runs under the same restriction; otherwise an owner-level
+ * turn on the receiving side would let a participant launder a request through any sibling session.
+ */
+export function buildServerMemberSharedActorOption(
+  caller: SessionDispatchRuntimeCaller,
+  callerRecord: SessionRecord | undefined,
+  target: SessionRecord,
+  actionId: string,
+  now: number,
+): SessionDispatchActorOption {
+  if (!caller.sessionName || !isValidImcodesSessionName(caller.sessionName)) return {};
+  const senderTurn = readSenderParticipantTurn(caller.sessionName);
+  if (senderTurn) {
+    const stamped = buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, senderTurn.actorUserId, 'participant');
+    return {
+      sharedActor: stamped,
+      ...(senderTurn.authority ? { sharedMachineAuthority: senderTurn.authority } : {}),
+    };
+  }
+  const ownerAuthority = readSenderOwnerMachineAuthority(caller.sessionName);
+  const attachActor = shouldAttachServerMemberActor(caller.sessionName, callerRecord, target);
+  if (!attachActor && !ownerAuthority) return {};
+  return {
+    ...(attachActor ? { sharedActor: buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, caller.userId || caller.sessionName, 'server-member') } : {}),
+    ...(ownerAuthority ? { ownerMachineAuthority: ownerAuthority } : {}),
+  };
+}
+
+function buildServerMemberActorEnvelope(
+  caller: SessionDispatchRuntimeCaller,
+  callerRecord: SessionRecord | undefined,
+  target: SessionRecord,
+  actionId: string,
+  now: number,
+  actorUserId: string,
+  effectiveActorRole: 'participant' | 'server-member',
+): SharedActorEnvelope {
+  const actorDisplayName = formatServerMemberActorName(caller.sessionName!, callerRecord);
+  const targetSnapshot = target.name.startsWith('deck_sub_')
+    ? {
+        kind: 'subsession' as const,
+        serverId: 'local',
+        subSessionId: target.name,
+        ...(target.label ? { subSessionDisplayName: target.label } : {}),
+      }
+    : {
+        kind: 'main' as const,
+        serverId: 'local',
+        sessionName: target.name,
+      };
+  return {
+    actorUserId,
+    actorDisplayName,
+    snapshot: {
+      target: targetSnapshot,
+      effectiveRole: 'participant',
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: [],
+      primaryShareId: null,
+      authorizedAt: now,
+    },
+    primaryShareId: null,
+    effectiveActorRole,
+    actionId,
+    origin: 'server-member',
+    authorizedAt: now,
+    queuedAt: now,
+  };
+}
+
+async function cancelTargetSession(target: SessionRecord, options: SessionDispatchMessageOptions): Promise<void> {
+  if (options.cancelSession) {
+    await options.cancelSession(target);
+    return;
+  }
+  try {
+    const commandHandler = await import('./command-handler.js');
+    const stopFn = (commandHandler as Record<string, unknown>).stopSessionNow;
+    if (typeof stopFn === 'function') {
+      (stopFn as (name: string) => boolean)(target.name);
+    }
+  } catch {
+    // If command-handler or stopSessionNow is unavailable (e.g. partial test mocks), ignore safely.
+  }
+}
+
+async function clearTransportResendQueue(targetName: string, reason: string): Promise<void> {
+  try {
+    const queueMod = await import('./transport-resend-queue.js');
+    const clearFn = (queueMod as Record<string, unknown>).clearResend;
+    if (typeof clearFn === 'function') {
+      (clearFn as (name: string, reason: string) => unknown)(targetName, reason);
+    }
+  } catch {
+    // If transport-resend-queue or clearResend is unavailable (e.g. partial test mocks), ignore safely.
+  }
+}
+
+export async function dispatchSessionMessage(
+  target: SessionRecord,
+  message: string,
+  options: SessionDispatchMessageOptions,
+): Promise<SessionDispatchMessageResult> {
+  // Urgent control: /stop stops the target immediately and never rides any send queue.
+  if (isSessionControlCommandText(message.trim(), 'stop')) {
+    const { stopSessionNow } = await import('./command-handler.js');
+    stopSessionNow(target.name);
+    return 'sent';
+  }
+  if (!retireRestartContinuation(target.name)) {
+    logger.warn({ sessionName: target.name }, 'Failed to persist restart-continuation retirement on session dispatch');
+  }
+  // Inter-session traffic is append-by-default. Callers that explicitly need
+  // ordinary FIFO waiting must opt into `deliveryMode=queue`; keeping the
+  // normalization at this runtime-neutral boundary prevents task-pair,
+  // cron, relay, and named-send paths from silently reverting to FIFO.
+  // Appending into a running turn records the sender's origin (via _appendedTurnOrigins),
+  // so participant restrictions and machine authority taints are preserved safely without
+  // blocking in-flight steer/append.
+  const deliveryMode = options.emergency
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    : (options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND);
+  if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
+    // `/clear` and `/handoff` are daemon-managed: a fresh provider conversation,
+    // exactly as from the browser. Handing them to runtime.send made them ordinary
+    // model text and left the whole context in place.
+    const isTransportClear = isSessionControlCommandText(message.trim(), 'clear');
+    const isTransportHandoff = isSessionControlCommandText(message.trim(), 'handoff');
+    if (isTransportClear || isTransportHandoff) {
+      const { clearTransportConversation, handoffSessionConversation, supportsTransportClear } = await import('./command-handler.js');
+      if (supportsTransportClear(target.agentType)) {
+        if (!options.suppressTimeline) {
+          emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
+        }
+        if (isTransportHandoff) {
+          await handoffSessionConversation(target);
+        } else {
+          await clearTransportConversation(target);
+        }
+        return 'sent';
+      }
+    }
+    // `/model X` from another session: the same switch the browser and the
+    // session_model MCP tool use (it posts its own switched/refused notice).
+    if (isSessionModelSwitchCommandText(message)) {
+      const { switchSessionModelNow } = await import('./command-handler.js');
+      const requested = message.trim().slice(SESSION_MODEL_COMMAND.length).trim().split(/\s+/)[0] ?? '';
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
+      }
+      await switchSessionModelNow(target.name, requested);
+      return 'sent';
+    }
+    const runtime = getTransportRuntime(target.name);
+    if (options.durableQueue) {
+      const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.command ? { commandMode: true as const } : {}),
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+        // Daemon-owned supervision traffic is persisted before delivery. Keep
+        // its append policy on that durable row: otherwise the immediate drain
+        // silently converts an automatic Brain wake into an ordinary FIFO item,
+        // which cannot resume a turn currently parked in wait_agent. The resend
+        // handoff owns exactly-once provider admission and falls back to FIFO
+        // only when native append is unavailable.
+        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_durable'),
+      }, { source: 'daemon', confidence: 'high' });
+      if (runtime?.providerSessionId) {
+        await drainTransportResendQueueForDispatch(target.name);
+      } else {
+        void ensureTransportRuntimeForPendingResend(target.name, { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
+      }
+      return 'queued';
+    }
+    if (!runtime?.providerSessionId) {
+      if (options.emergency) {
+        clearResend(target.name, 'user_stopped');
+      }
+      const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.command ? { commandMode: true as const } : {}),
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_missing_runtime'),
+      }, { source: 'daemon', confidence: 'high' });
+      // Do not await provider startup on the inbound webhook path. The durable
+      // resend entry is now authoritative; launch/restore drains it and owns
+      // the eventual single user.message projection.
+      void ensureTransportRuntimeForPendingResend(target.name, { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
+      return 'queued';
+    }
+    if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+      const appendExternal = runtime.appendExternalMessageToActiveTurn;
+      const privateMetadata = {
+        timelineCommitted: options.suppressTimeline === true,
+        ...originMetadata(options),
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+      };
+      const commandPrivateMetadata = Object.keys(privateMetadata).length > 0 ? privateMetadata : undefined;
+      const result = typeof appendExternal === 'function'
+        ? commandPrivateMetadata
+          ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference, undefined, commandPrivateMetadata)
+          : options.queueSupervisionReference
+            ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference)
+            : await appendExternal.call(runtime, message, options.messageId)
+        : 'unsupported';
+      if (result === 'retry') {
+        throw new Error('transport supervision authority temporarily unavailable');
+      }
+      if (result !== 'sent' && result !== 'appended' && result !== 'queued') {
+        // Unsupported providers and active-turn races retain the old durable
+        // delivery guarantee. Prefer append, but never drop a peer message.
+        const shouldStop = options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
+        if (shouldStop) {
+          if (typeof (runtime as { clearPendingMessages?: (reason: string) => unknown }).clearPendingMessages === 'function') {
+            (runtime as { clearPendingMessages: (reason: string) => unknown }).clearPendingMessages('user_stopped');
+          } else {
+            await clearTransportResendQueue(target.name, 'user_stopped');
+          }
+          await cancelTargetSession(target, options);
+        }
+        const fallback = runtime.send(message, options.messageId, undefined, undefined, {
+          deliveryMode,
+          ...(shouldStop ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+          ...(options.queueSupervisionReference
+            ? { supervisionReference: options.queueSupervisionReference }
+            : {}),
+          ...originMetadata(options),
+        });
+        if (fallback === 'sent' && !options.suppressTimeline) {
+          emitStructuredTransportUserMessage(
+            target.name,
+            message,
+            options.messageId,
+            options.sharedActor,
+            options.messageOrigin,
+          );
+        } else {
+          timelineEmitter.emit(target.name, 'session.state', {
+            state: 'queued',
+            ...buildTransportQueueSnapshotPayload(target.name, 'send_tool_append_fallback'),
+          }, { source: 'daemon', confidence: 'high' });
+        }
+        return fallback;
+      }
+      if (result !== 'queued' && !options.suppressTimeline) {
+        emitStructuredTransportUserMessage(
+          target.name,
+          message,
+          options.messageId,
+          options.sharedActor,
+          options.messageOrigin,
+        );
+      }
+      if (result === 'queued') {
+        timelineEmitter.emit(target.name, 'session.state', {
+          state: 'queued',
+          ...buildTransportQueueSnapshotPayload(target.name, 'send_tool'),
+        }, { source: 'daemon', confidence: 'high' });
+      }
+      return result === 'queued' ? 'queued' : 'sent';
+    }
+    const result = options.suppressTimeline
+      ? runtime.send(message, options.messageId, undefined, undefined, {
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          timelineCommitted: true,
+          ...originMetadata(options),
+        })
+      : options.sharedActor || options.ownerMachineAuthority
+      ? runtime.send(message, options.messageId, undefined, undefined, {
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...originMetadata(options),
+        })
+      : options.messageOrigin || options.command
+      ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
+      : runtime.send(message, options.messageId);
+    if (result === 'sent' && !options.suppressTimeline) {
+      emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
+    } else if (result === 'queued') {
+      const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+    }
+    return result;
+  }
+
+  if (isSessionControlCommandText(message.trim(), 'handoff')) {
+    const { handoffSessionConversation, supportsProcessClear } = await import('./command-handler.js');
+    if (supportsProcessClear(target.agentType)) {
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
+      }
+      await handoffSessionConversation(target);
+      return 'sent';
+    }
+  }
+
+  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  if (!queuedPairWakeAllowed(target.name, options.messageId)) throw new Error('pair wake is no longer current');
+  const shouldAutoStopProcess = (options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND)
+    && target.state === 'running';
+  if (shouldAutoStopProcess) {
+    await cancelTargetSession(target, options);
+  }
+  // A participant-stamped message makes this process session's next turn a participant turn;
+  // an authenticated owner-turn message carries ownerMachineAuthority when no participant is involved.
+  const processAuthorityBinding = target.sessionInstanceId && target.runtimeEpoch
+    ? options.sharedActor?.effectiveActorRole === 'participant'
+      ? bindProcessSharedMachineActivity(
+          target.name,
+          { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
+          { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: options.sharedActor.actorUserId, authority: options.sharedMachineAuthority },
+          { sessionRunning: target.state === 'running' },
+        )
+      : options.ownerMachineAuthority
+        ? bindProcessSharedMachineActivity(
+            target.name,
+            { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
+            { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: options.ownerMachineAuthority },
+            { sessionRunning: target.state === 'running' },
+          )
+        : null
+    : null;
+  const processDeliveryMode = deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE
+    ? { deliveryMode }
+    : {};
+  const userMessageMetadata = options.messageOrigin
+    ? { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: options.messageOrigin } }
+    : {};
+  // Command mode: the process sender delivers the text with no memory recall,
+  // sandbox path rewriting or preamble.
+  const processCommandMode = options.command ? { verbatim: true as const } : {};
+  const processOptions = {
+    ...(options.messageId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX) ? { beforeTyping: () => queuedPairWakeAllowed(target.name, options.messageId) } : {}),
+    ...(options.suppressTimeline ? { suppressTimeline: true as const } : {}),
+    ...processDeliveryMode,
+    ...userMessageMetadata,
+    ...processCommandMode,
+    ...(processAuthorityBinding ? { onTyped: () => processAuthorityBinding.typed() } : {}),
+  };
+  try {
+    const result = Object.keys(processOptions).length > 0
+      ? await sendProcessSessionMessageForAutomation(target.name, message, processOptions)
+      : await sendProcessSessionMessageForAutomation(target.name, message);
+    if (result === 'queued') return 'queued';
+  } finally {
+    // Delivery is over whatever happened: an input that never reached the terminal is not a turn that will run.
+    processAuthorityBinding?.settle();
+  }
+}
+
+/** Resolve a named session and deliver through the runtime-neutral boundary.
+ * The selected runtime owns the single user.timeline projection: transport
+ * dispatch emits its structured event, while the process sender emits before
+ * entering its serialized terminal delivery path. */
+export async function dispatchSessionMessageByName(
+  sessionName: string,
+  message: string,
+  deps: {
+    getSession?: (name: string) => SessionRecord | undefined;
+    dispatchMessage?: typeof dispatchSessionMessage;
+  } = {},
+): Promise<SessionDispatchMessageResult> {
+  const target = (deps.getSession ?? getStoredSession)(sessionName);
+  if (!target) throw new Error(`session not found: ${sessionName}`);
+  return (deps.dispatchMessage ?? dispatchSessionMessage)(target, message, {
+    dispatchId: createSendDispatchId(),
+    messageId: createSendMessageId(),
+  });
+}
+
+export type PeerAuditDispatchResult =
+  | { ok: true; receipt: PeerAuditDispatchReceipt }
+  | { ok: false; error: PeerAuditProcessInjectError };
+
+/**
+ * Peer-audit-only dispatch. This deliberately does not share the manual
+ * delegation wrapper, visible user timeline event, or process terminal-key
+ * fallback. The receipt is captured before any wrapper can discard the
+ * transport sent/queued disposition.
+ */
+export async function dispatchPeerAuditMessage(input: {
+  target: SessionRecord;
+  brief: string;
+  attemptId: string;
+  /**
+   * Effect-revision barrier for the unrevocable process path, evaluated at the
+   * final boundary under the send lock. Omitted means "no revision to check".
+   */
+  isEffectCurrent?: () => boolean;
+}): Promise<PeerAuditDispatchResult> {
+  const { target } = input;
+  if (!target.sessionInstanceId || !target.runtimeEpoch) {
+    return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
+  }
+  const dispatchId = createSendDispatchId();
+  const messageId = createSendMessageId();
+
+  if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
+    const runtime = getTransportRuntime(target.name);
+    if (!runtime) return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
+    const privateMetadata = {
+      // If the durable fallback queues, the drain projects it as a daemon
+      // audit brief, not the human's input.
+      peerAudit: {
+        contractVersion: PEER_AUDIT_CONTRACT_VERSION,
+        attemptHash: createHash('sha256').update(input.attemptId).digest('base64url'),
+      },
+    };
+    const metadata = {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      ...privateMetadata,
+    };
+    const appendExternal = runtime.appendExternalMessageToActiveTurn;
+    const appendResult = typeof appendExternal === 'function'
+      ? await appendExternal.call(runtime, input.brief, messageId, undefined, undefined, privateMetadata)
+      : 'unsupported';
+    // If it queues, the drain projects it: a daemon audit brief, not the
+    // human's input. Unsupported providers retain the durable fallback.
+    const disposition = appendResult === 'queued'
+      ? 'queued'
+      : appendResult === 'sent' || appendResult === 'appended'
+      ? 'sent'
+      : runtime.send(input.brief, messageId, undefined, undefined, metadata);
+    const queueEpoch = disposition === 'queued'
+      ? buildTransportQueueSnapshotPayload(target.name, 'peer_audit').queueEpoch
+      : undefined;
+    return {
+      ok: true,
+      receipt: {
+        disposition,
+        dispatchId,
+        messageId,
+        targetSessionInstanceId: target.sessionInstanceId,
+        targetRuntimeEpoch: target.runtimeEpoch,
+        ...(queueEpoch ? { queueEpoch } : {}),
+      },
+    };
+  }
+
+  // A process runtime cannot revoke a terminal injection after acceptance, so
+  // the idle/identity/effect check and the write must be one atomic critical
+  // section against authoritative state — never this pre-lock snapshot. The
+  // injector also keeps the capability-bearing brief out of the timeline,
+  // history, and memory, and never falls back to an ordinary send.
+  const injected = await injectPeerAuditBriefIntoProcessSession({
+    targetSessionName: target.name,
+    expectedSessionInstanceId: target.sessionInstanceId,
+    expectedRuntimeEpoch: target.runtimeEpoch,
+    brief: input.brief,
+    ...(input.isEffectCurrent ? { isEffectCurrent: input.isEffectCurrent } : {}),
+  });
+  if (!injected.ok) return injected;
+  return {
+    ok: true,
+    receipt: {
+      disposition: 'sent_unrevocable',
+      dispatchId,
+      messageId,
+      targetSessionInstanceId: target.sessionInstanceId,
+      targetRuntimeEpoch: target.runtimeEpoch,
+    },
+  };
+}
+
+/** Exact queued-message cancellation for a revocable transport peer audit. */
+export function cancelQueuedPeerAuditMessage(targetSessionName: string, messageId: string): boolean {
+  return Boolean(getTransportRuntime(targetSessionName)?.removePendingMessage(messageId));
+}
+
+/** Per-message runtime metadata: the author of a non-human message and command mode. */
+function originMetadata(options: SessionDispatchMessageOptions): { messageOrigin?: ChatMessageOrigin; commandMode?: true } {
+  return {
+    ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
+    ...(options.command ? { commandMode: true as const } : {}),
+  };
+}
+
+function emitStructuredTransportUserMessage(
+  sessionName: string,
+  message: string,
+  messageId: SendMessageId,
+  sharedActor?: SharedActorEnvelope,
+  messageOrigin?: ChatMessageOrigin,
+): void {
+  timelineEmitter.emit(
+    sessionName,
+    'user.message',
+    {
+      text: message,
+      allowDuplicate: true,
+      commandId: messageId,
+      clientMessageId: messageId,
+      ...(messageOrigin ? { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: messageOrigin } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
+    },
+    { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+  );
+}
+
+export interface DelegatedSessionDispatchDeps {
+  listSessions: () => SessionRecord[];
+  getSession?: (name: string) => SessionRecord | undefined;
+  dispatchMessage?: (target: SessionRecord, message: string, options: SessionDispatchMessageOptions) => Promise<SessionDispatchMessageResult>;
+  readTimeline?: (sessionName: string, limit: number) => TimelineEvent[] | Promise<TimelineEvent[]>;
+  now?: () => number;
+}
+
+export type DelegatedSessionDispatchResult =
+  | { status: 'accepted'; dispatchId: SendDispatchId; messageId: SendMessageId; delegationId: string; target: string; contextStatus: DelegationContextStatus; contextOmitted?: boolean }
+  | { status: 'error'; error: AgentDelegationErrorCode; detail?: string };
+
+export interface DelegationContextTailResult {
+  text: string;
+  status: DelegationContextStatus;
+}
+
+export const DELEGATION_CONTEXT_TURN_CAP = 12;
+export const DELEGATION_CONTEXT_BYTE_CAP = 16 * 1024;
+const DELEGATION_CONTEXT_READ_LIMIT = 96;
+
+export function resolveExactDelegationTarget(input: { caller: SessionDispatchRuntimeCaller; targetSession: string; allSessions: SessionRecord[] }):
+  | { ok: true; target: SessionRecord }
+  | { ok: false; error: AgentDelegationErrorCode; detail?: string } {
+  const { caller, targetSession, allSessions } = input;
+  if (!caller.sessionName) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_FORBIDDEN, detail: 'missing caller session' };
+  if (targetSession === caller.sessionName) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_SELF_TARGET };
+  const target = allSessions.find((session) => session.name === targetSession);
+  if (!target) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_UNAVAILABLE, detail: 'target not found' };
+  const callerProject = resolveRuntimeScope({ ...caller, projectName: caller.projectName ?? null, projectRoot: caller.projectRoot ?? null }, allSessions).projectName;
+  const targetProject = resolveEffectiveProjectName(target, allSessions);
+  if (!callerProject || targetProject !== callerProject) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_FORBIDDEN, detail: 'target outside caller project' };
+  if (target.state === 'stopped' || target.state === 'error') return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_UNAVAILABLE, detail: `target state ${target.state}` };
+  if (target.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_FORBIDDEN, detail: 'execution clone target' };
+  if (!isDelegationReplyCapableAgentType(target.agentType)) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_NOT_REPLY_CAPABLE, detail: `agent type ${target.agentType}` };
+  return { ok: true, target };
+}
+
+export async function buildDelegationContextTail(input: { sessionName: string; readTimeline: (sessionName: string, limit: number) => TimelineEvent[] | Promise<TimelineEvent[]>; turnCap?: number; byteCap?: number }): Promise<DelegationContextTailResult> {
+  const turnCap = input.turnCap ?? DELEGATION_CONTEXT_TURN_CAP;
+  const byteCap = input.byteCap ?? DELEGATION_CONTEXT_BYTE_CAP;
+  let events: TimelineEvent[];
+  try {
+    events = await input.readTimeline(input.sessionName, DELEGATION_CONTEXT_READ_LIMIT);
+  } catch {
+    return { text: '', status: 'omitted' };
+  }
+  const safe: string[] = [];
+  for (const event of events) {
+    if (event.sessionId !== input.sessionName) continue;
+    if (event.type !== 'user.message' && event.type !== 'assistant.text') continue;
+    if (event.type === 'assistant.text' && event.payload.streaming === true) continue;
+    if ((event.payload as { memoryExcluded?: unknown }).memoryExcluded === true) continue;
+    const raw = event.payload.text;
+    if (typeof raw !== 'string' || raw.trim().length === 0) continue;
+    if (isAgentDelegationForwardedPayloadText(raw)) continue;
+    const cleaned = redactSensitiveText(stripAgentDelegationControlInstructions(raw));
+    if (!cleaned) continue;
+    safe.push(`${event.type === 'user.message' ? 'User' : 'Assistant'}: ${cleaned}`);
+  }
+  const turnWindow = safe.slice(-turnCap);
+  let truncated = safe.length > turnWindow.length;
+  const kept: string[] = [];
+  let bytes = 0;
+  for (let i = turnWindow.length - 1; i >= 0; i -= 1) {
+    const item = turnWindow[i];
+    const separatorBytes = kept.length > 0 ? Buffer.byteLength('\n\n', 'utf8') : 0;
+    const itemBytes = Buffer.byteLength(item, 'utf8');
+    if (bytes + separatorBytes + itemBytes > byteCap) {
+      truncated = true;
+      const remaining = byteCap - bytes - separatorBytes;
+      if (remaining > 32 && kept.length === 0) {
+        const truncatedItem = truncateUtf8(item, remaining);
+        if (truncatedItem) kept.unshift(truncatedItem);
+      }
+      break;
+    }
+    kept.unshift(item);
+    bytes += separatorBytes + itemBytes;
+  }
+  if (kept.length === 0) return { text: '', status: 'ok' };
+  return { text: kept.join('\n\n'), status: truncated ? 'truncated' : 'ok' };
+}
+
+function truncateUtf8(value: string, byteCap: number): string {
+  if (byteCap <= 0) return '';
+  const marker = '…';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  const limit = Math.max(0, byteCap - markerBytes);
+  let bytes = 0;
+  let result = '';
+  for (const char of value) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > limit) break;
+    result += char;
+    bytes += charBytes;
+  }
+  return result ? `${result}${marker}` : '';
+}
+
+
+export async function dispatchDelegatedSessionSend(input: {
+  caller: SessionDispatchRuntimeCaller;
+  targetSession: string;
+  message: string;
+}, deps: DelegatedSessionDispatchDeps): Promise<DelegatedSessionDispatchResult> {
+  if (input.message.trim().length === 0) return { status: 'error', error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_EMPTY_TASK };
+  const allSessions = deps.listSessions();
+  const resolved = resolveExactDelegationTarget({ caller: input.caller, targetSession: input.targetSession, allSessions });
+  if (!resolved.ok) return { status: 'error', error: resolved.error, ...(resolved.detail ? { detail: resolved.detail } : {}) };
+  const context = deps.readTimeline && input.caller.sessionName
+    ? await buildDelegationContextTail({ sessionName: input.caller.sessionName, readTimeline: deps.readTimeline })
+    : { text: '', status: 'omitted' as const };
+  const dispatchId = createSendDispatchId();
+  const messageId = createSendMessageId();
+  const callerRecord = input.caller.sessionName
+    ? deps.getSession?.(input.caller.sessionName) ?? getStoredSession(input.caller.sessionName)
+    : undefined;
+  const replyAuthority = createDelegationReplyAuthority({
+    origin: callerRecord,
+    target: resolved.target,
+    dispatchId,
+    messageId,
+    now: deps.now?.() ?? Date.now(),
+  });
+  if (!replyAuthority) {
+    return {
+      status: 'error',
+      error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_NOT_REPLY_CAPABLE,
+      detail: 'reply-capable session identity is unavailable',
+    };
+  }
+  const message = buildSessionDispatchMessage({
+    message: input.message.trim(),
+    from: input.caller.sessionName,
+    fromLabel: callerRecord?.label,
+    replyTo: input.caller.sessionName,
+    replyAuthority: replyAuthority.authority,
+    contextTail: context.text,
+    contextStatus: context.status,
+  });
+  try {
+    await (deps.dispatchMessage ?? dispatchSessionMessage)(resolved.target, message, {
+      dispatchId,
+      messageId,
+      ...buildServerMemberSharedActorOption(input.caller, callerRecord, resolved.target, messageId, deps.now?.() ?? Date.now()),
+    });
+    if (context.status === 'omitted' && input.caller.sessionName) {
+      timelineEmitter.emit(input.caller.sessionName, 'assistant.text', {
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.DELEGATION_CONTEXT_OMITTED,
+          `${AGENT_DELEGATION_CONTEXT_OMITTED_MARKER} Delegation context was unavailable; forwarded clean task only.`,
+        ),
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'medium' });
+    }
+    return {
+      status: 'accepted',
+      dispatchId,
+      messageId,
+      delegationId: replyAuthority.record.delegationId,
+      target: resolved.target.name,
+      contextStatus: context.status,
+      ...(context.status === 'omitted' ? { contextOmitted: true } : {}),
+    };
+  } catch (err) {
+    expireDelegationReplyAuthority(replyAuthority.record.delegationId);
+    return { status: 'error', error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_UNAVAILABLE, detail: sanitizeMcpErrorMessage(err) };
+  }
+}

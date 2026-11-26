@@ -49,7 +49,7 @@ index 2eb8aec..d14ee21 100644
          @Override
          public void onBufferReceived(byte[] buffer) {}
 diff --git a/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift b/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
-index 51823fa..19eb934 100644
+index 51823fa..6cd0f4e 100644
 --- a/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
 +++ b/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
 @@ -32,6 +32,14 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -125,7 +125,7 @@ index 51823fa..19eb934 100644
          }
          hasInstalledTap = true
  
-@@ -207,6 +223,38 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+@@ -207,11 +223,47 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
          }
      }
  
@@ -163,4 +163,14 @@ index 51823fa..19eb934 100644
 +
      private func configureAudioSession() throws {
          let session = AVAudioSession.sharedInstance()
-         try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .duckOthers])
+-        try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .duckOthers])
++        try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .duckOthers, .allowBluetoothA2DP])
+         try session.setMode(.measurement)
+         try session.setActive(true, options: .notifyOthersOnDeactivation)
++        if let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }),
++           session.preferredInput?.uid != builtInMic.uid {
++            try? session.setPreferredInput(builtInMic)
++        }
+     }
+ 
+     private func cleanupRecognition(notifyStop: Bool) {

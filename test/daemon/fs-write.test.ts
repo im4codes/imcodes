@@ -19,6 +19,7 @@ const mockServerLink = {
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
   lstat: vi.fn(),
+  mkdir: vi.fn(),
   readdir: vi.fn(),
   realpath: vi.fn(),
   readFile: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock('node:fs/promises', () => ({
 }));
 
 const mockLstat = vi.mocked(fsp.lstat);
+const mockMkdir = vi.mocked(fsp.mkdir);
 const mockRealpath = vi.mocked(fsp.realpath);
 const mockRename = vi.mocked(fsp.rename);
 const mockRm = vi.mocked(fsp.rm);
@@ -39,6 +41,7 @@ const mockWriteFile = vi.mocked(fsp.writeFile);
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 import * as sessionStore from '../../src/store/session-store.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
 
@@ -51,6 +54,7 @@ describe('fs.write handler', () => {
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockMkdir.mockResolvedValue(undefined);
     mockRename.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
     __resetFsGitCachesForTests();
@@ -96,9 +100,85 @@ describe('fs.write handler', () => {
     });
   });
 
-  it('returns file_too_large when content exceeds 1MB', async () => {
+  it('refuses to write an existing file outside the owning session project directory', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsidePath = path.join(homedir(), 'other', 'outside.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockStat.mockResolvedValue({ mtimeMs: 1 } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.write',
+      path: outsidePath,
+      content: 'must-not-write',
+      requestId: 'write-session-outside',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'write-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('refuses a scoped mkdir when the created path resolves outside the project root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const requestedPath = path.join(projectDir, 'linked-dir');
+    const escapedPath = path.join(homedir(), 'other');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => {
+      const value = String(target);
+      return value === requestedPath ? escapedPath : value;
+    });
+
+    handleWebCommand({
+      type: 'fs.mkdir',
+      path: requestedPath,
+      requestId: 'mkdir-session-symlink',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockMkdir).toHaveBeenCalledWith(requestedPath, { recursive: true });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.mkdir_response',
+      requestId: 'mkdir-session-symlink',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('writes content above 1MB when it is within the 5MB save limit', async () => {
+    const allowedPath = path.join(homedir(), 'medium-file.txt');
+    const mediumContent = 'x'.repeat(1_048_577);
+
+    mockStat
+      .mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
+      .mockResolvedValueOnce({ mtimeMs: 2000 } as fsp.Stats);
+    mockRealpath
+      .mockResolvedValueOnce(homedir() as unknown as string)
+      .mockResolvedValueOnce(allowedPath as unknown as string);
+    mockLstat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockWriteFile.mockResolvedValueOnce(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: allowedPath, content: mediumContent, requestId: 'req-medium' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledWith(allowedPath, mediumContent, { encoding: 'utf-8', flag: 'wx' });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-medium',
+      status: 'ok',
+    });
+  });
+
+  it('returns file_too_large when content exceeds 5MB', async () => {
     const allowedPath = path.join(homedir(), 'big-file.txt');
-    const largeContent = 'x'.repeat(1_048_577); // > 1MB
+    const largeContent = 'x'.repeat(FS_WRITE_MAX_BYTES + 1);
 
     handleWebCommand({ type: 'fs.write', path: allowedPath, content: largeContent, requestId: 'req-toolarge' }, mockServerLink as any);
     await flushAsync();
@@ -113,10 +193,11 @@ describe('fs.write handler', () => {
 
   it('uses Buffer.byteLength for size check (not string.length)', async () => {
     // A string of CJK characters: each is 3 bytes in UTF-8
-    // 349526 chars × 3 bytes = 1048578 bytes > 1MB
+    // This is under 5MB by character count but over 5MB by UTF-8 bytes.
     const allowedPath = path.join(homedir(), 'cjk-file.txt');
-    const cjkContent = '中'.repeat(349526);
-    expect(Buffer.byteLength(cjkContent, 'utf-8')).toBeGreaterThan(1_048_576);
+    const cjkContent = '中'.repeat(Math.floor(FS_WRITE_MAX_BYTES / 3) + 1);
+    expect(cjkContent.length).toBeLessThanOrEqual(FS_WRITE_MAX_BYTES);
+    expect(Buffer.byteLength(cjkContent, 'utf-8')).toBeGreaterThan(FS_WRITE_MAX_BYTES);
 
     handleWebCommand({ type: 'fs.write', path: allowedPath, content: cjkContent, requestId: 'req-cjk-toolarge' }, mockServerLink as any);
     await flushAsync();
@@ -306,6 +387,62 @@ describe('fs.write handler', () => {
     });
   });
 
+  it.each([false, true])('writes base64 as binary bytes (existing=%s)', async (existing) => {
+    const filePath = path.join(homedir(), 'binary-write.bin');
+    const bytes = Buffer.from([0, 255, 128, 65]);
+    const mtime = 2000;
+    if (existing) {
+      mockStat.mockResolvedValueOnce({ mtimeMs: 1000 } as fsp.Stats);
+      mockRealpath.mockResolvedValueOnce(filePath as unknown as string);
+    } else {
+      mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockRealpath.mockResolvedValueOnce(path.dirname(filePath) as unknown as string);
+    }
+    mockStat.mockResolvedValueOnce({ mtimeMs: mtime } as fsp.Stats);
+    if (!existing) mockRealpath.mockResolvedValueOnce(filePath as unknown as string);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: bytes.toString('base64'), encoding: 'base64', requestId: 'req-binary' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    if (existing) {
+      expect(mockWriteFile).toHaveBeenCalledWith(filePath, bytes);
+    } else {
+      expect(mockWriteFile).toHaveBeenCalledWith(filePath, bytes, { flag: 'wx' });
+    }
+    expect(sent[0]).toMatchObject({ status: 'ok', mtime });
+  });
+
+  it('writes an existing symlink only through its allowed real target', async () => {
+    const linkPath = path.join(homedir(), 'allowed-link.txt');
+    const realPath = path.join(homedir(), 'allowed-target.txt');
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
+    mockRealpath.mockResolvedValue(realPath as unknown as string);
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => true } as fsp.Stats);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: linkPath, content: 'updated', requestId: 'req-allowed-link' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockStat).toHaveBeenCalledWith(linkPath);
+    expect(mockWriteFile).toHaveBeenCalledWith(realPath, 'updated', 'utf-8');
+    expect(sent[0]).toMatchObject({ status: 'ok', resolvedPath: realPath });
+  });
+
+  it('rejects a dangling symlink even when stat reports its target missing', async () => {
+    const linkPath = path.join(homedir(), 'dangling-link.txt');
+    mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRealpath.mockResolvedValueOnce(path.dirname(linkPath) as unknown as string);
+    mockLstat.mockResolvedValueOnce({ isSymbolicLink: () => true } as fsp.Stats);
+
+    handleWebCommand({ type: 'fs.write', path: linkPath, content: 'blocked', requestId: 'req-dangling-link' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({ status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+  });
+
   it('fails closed when a new target appears as a symlink after the initial existence check', async () => {
     const filePath = path.join(homedir(), 'new-link-to-secret.txt');
     const parentPath = path.dirname(filePath);
@@ -333,6 +470,7 @@ describe('fs.rename and fs.delete handlers', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
     mockRename.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
     __resetFsGitCachesForTests();
@@ -647,5 +785,53 @@ describe('fs.read handler — mtime field', () => {
 
     expect(mockReadFile).toHaveBeenCalledTimes(2);
     expect((sent.find((msg: any) => msg.requestId === 'req-post-write') as any)?.content).toBe('after write');
+  });
+
+  it('blocks tab-share fs.write outside projectDir even when only sessionId is provided, while permitting writes inside projectDir', async () => {
+    const projectDir = path.join(homedir(), 'tab-write-proj');
+    const outsidePath = path.join(homedir(), 'outside-secret.txt');
+    const insidePath = path.join(projectDir, 'notes.txt');
+    const getSessionSpy = vi.spyOn(sessionStore, 'getSession').mockImplementation((name: string) => (
+      name === 'deck_tab_write'
+        ? { name: 'deck_tab_write', projectName: 'proj', role: 'brain', agentType: 'codex', state: 'idle', projectDir, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1 }
+        : undefined
+    ));
+    try {
+      const tabActor = {
+        actorUserId: 'part-1',
+        origin: 'shared-tab',
+        snapshot: { target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_tab_write' }, effectiveRole: 'participant' },
+      };
+
+      mockRealpath.mockImplementation(async (target) => String(target) as unknown as string);
+      handleWebCommand({
+        type: 'fs.write',
+        sessionId: 'deck_tab_write',
+        path: outsidePath,
+        content: 'pwned',
+        requestId: 'req-write-escape',
+        sharedActor: tabActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[0]).toMatchObject({ requestId: 'req-write-escape', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+      expect(mockWriteFile).not.toHaveBeenCalled();
+
+      mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockWriteFile.mockResolvedValue(undefined);
+      mockStat.mockResolvedValue({ mtimeMs: 4000 } as fsp.Stats);
+      handleWebCommand({
+        type: 'fs.write',
+        sessionId: 'deck_tab_write',
+        path: insidePath,
+        content: 'allowed edit',
+        requestId: 'req-write-inside',
+        sharedActor: tabActor,
+      }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[1]).toMatchObject({ requestId: 'req-write-inside', status: 'ok', resolvedPath: insidePath });
+      expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    } finally {
+      getSessionSpy.mockRestore();
+    }
   });
 });

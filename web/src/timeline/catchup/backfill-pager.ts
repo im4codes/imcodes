@@ -26,9 +26,12 @@
  *    exhausted. (The server body `hasMore` is wired to the daemon's
  *    `droppedEvents > 0`, i.e. PAYLOAD truncation — it is an INCOMPLETE-page
  *    signal, not a count signal, and MUST NOT drive continuation.)
- *  - PAYLOAD truncation (`payloadTruncated` / `droppedEvents` / `truncatedEvents`
- *    / `cursorReset` / `recoverable`) means the page itself is incomplete; the
- *    round ends `truncated` and MUST NOT cool down.
+ *  - PAYLOAD / PAGE incompleteness (`droppedEvents > 0`, `cursorReset`, `recoverable`,
+ *    or legacy `payloadTruncated` when counts are absent) means events in this
+ *    window slice are missing; the round ends `truncated` and MUST NOT cool down.
+ *    Per-event detail trimming (`truncatedEvents > 0` with `droppedEvents === 0`)
+ *    delivers every event in the slice (details hydrate lazily via `detailRefs`),
+ *    so it MUST NOT mark the page incomplete.
  *
  * It ALSO separates "responded" from "caught up": only a `caught_up` terminal
  * (window exhausted with no truncation/drop/reset) should advance the backfill
@@ -48,6 +51,8 @@
  * unit-testable with no React, no real network, and no real timers.
  */
 
+import { isRecoverableTimelineRequestErrorReason } from '../../../../shared/timeline-history-errors.js';
+
 /** Bounded number of window pages a single catch-up round may fetch. */
 export const CATCHUP_TAIL_MAX_PAGES = 5;
 
@@ -60,6 +65,8 @@ export interface BackfillPage {
    * use it to drive window continuation (that is `events.length >= limit`).
    */
   hasMore: boolean;
+  status?: string;
+  errorReason?: string;
   payloadTruncated?: boolean;
   droppedEvents?: number;
   truncatedEvents?: number;
@@ -98,7 +105,9 @@ export interface NewestWindowBackfillDeps {
    * the min/max `ts` across them (`minTs` drives the next window's upper bound).
    * `minTs: null` signals "no usable cursor" (empty / all-malformed page).
    */
-  mergePage: (events: unknown[]) => { candidateCount: number; minTs: number | null; maxTs: number | null };
+  mergePage: (events: unknown[]) =>
+    | { candidateCount: number; minTs: number | null; maxTs: number | null }
+    | Promise<{ candidateCount: number; minTs: number | null; maxTs: number | null }>;
   /**
    * The page size requested per fetch. A page with `events.length >= limit` is a
    * full window slice (there may be more below → continue); `< limit` proves the
@@ -107,20 +116,42 @@ export interface NewestWindowBackfillDeps {
   limit: number;
   /** Max window pages (default `CATCHUP_TAIL_MAX_PAGES`). */
   maxPages?: number;
+  /**
+   * Resume a round's upper bound from a PRIOR round's `resumeBeforeTs`
+   * (see `NewestWindowBackfillOutcome`), instead of starting at the newest
+   * event. `afterTs` (the lower bound) must be the SAME value the prior
+   * round used -- this only moves where descent starts, never the window's
+   * floor. Omit / `undefined` to start at the newest event, as before.
+   */
+  initialBeforeTs?: number;
 }
 
 export interface NewestWindowBackfillOutcome {
   terminal: BackfillTerminal;
   pageCount: number;
   totalNew: number;
+  /**
+   * Present ONLY when `terminal === 'cap_hit'` because the page BUDGET ran
+   * out while pages were still making real downward progress (full pages,
+   * `minTs` strictly descending): the exact `beforeTs` the NEXT page would
+   * have used. A caller MAY resume with a fresh round
+   * (`initialBeforeTs: resumeBeforeTs`, same `afterTs`) to continue exactly
+   * where this one stopped, rather than re-walking from the newest event.
+   *
+   * Absent for the OTHER `cap_hit` cause (no usable cursor, or a same-`ts`
+   * cluster at least `limit` wide) -- that window is genuinely stuck, and a
+   * resume would just reproduce the identical stall forever.
+   */
+  resumeBeforeTs?: number;
 }
 
-function pageIsIncomplete(page: BackfillPage): boolean {
-  return page.payloadTruncated === true
-    || (page.droppedEvents ?? 0) > 0
-    || (page.truncatedEvents ?? 0) > 0
+export function pageIsIncomplete(page: BackfillPage): boolean {
+  const hasCounts = page.droppedEvents !== undefined || page.truncatedEvents !== undefined;
+  return (page.droppedEvents ?? 0) > 0
+    || (!hasCounts && page.payloadTruncated === true)
     || page.cursorReset === true
-    || page.recoverable === true;
+    || page.recoverable === true
+    || (page.recoverable === undefined && isRecoverableTimelineRequestErrorReason(page.errorReason));
 }
 
 /**
@@ -137,7 +168,9 @@ export async function runNewestWindowBackfill(
 ): Promise<NewestWindowBackfillOutcome> {
   const maxPages = deps.maxPages ?? CATCHUP_TAIL_MAX_PAGES;
   const afterTs = lowerAfterTs; // fixed lower bound for the whole round
-  let beforeTs: number | undefined; // moving upper bound (undefined = newest)
+  // Moving upper bound (undefined = newest). A caller-supplied resume point
+  // continues a PRIOR round's descent instead of re-walking from the top.
+  let beforeTs: number | undefined = deps.initialBeforeTs;
   let prevMinTs = Number.POSITIVE_INFINITY;
   let pageCount = 0;
   let totalNew = 0;
@@ -147,7 +180,9 @@ export async function runNewestWindowBackfill(
     if (page === null) {
       return { terminal: 'transient_null', pageCount, totalNew };
     }
-    const { candidateCount, minTs } = deps.mergePage(page.events);
+    // A page can contain hundreds of events.  Allow consumers to yield while
+    // applying it so a reconnect/backfill never monopolizes the renderer.
+    const { candidateCount, minTs } = await deps.mergePage(page.events);
     pageCount += 1;
     totalNew += candidateCount;
 
@@ -168,5 +203,8 @@ export async function runNewestWindowBackfill(
     prevMinTs = minTs;
     beforeTs = minTs + 1; // +1 re-includes the boundary ms; merge dedups it.
   }
-  return { terminal: 'cap_hit', pageCount, totalNew };
+  // Budget exhausted while still making real progress (every page so far was
+  // full and strictly descending) -- `beforeTs` is exactly where the next
+  // page would have started, so a resumed round can continue from here.
+  return { terminal: 'cap_hit', pageCount, totalNew, resumeBeforeTs: beforeTs };
 }

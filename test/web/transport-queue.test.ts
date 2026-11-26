@@ -67,7 +67,7 @@ describe('transport queue reconciliation', () => {
     expect(entries).toEqual([]);
   });
 
-  it('falls back to legacy messages only when entries are absent', () => {
+  it('rejects legacy messages when entries are absent', () => {
     const entries = normalizeTransportPendingEntries(
       undefined,
       ['legacy-A'],
@@ -75,12 +75,12 @@ describe('transport queue reconciliation', () => {
       { hasEntriesField: false, hasMessagesField: true },
     );
 
-    expect(entries).toEqual([{ clientMessageId: 'session-a:legacy:0:legacy-A', text: 'legacy-A' }]);
+    expect(entries).toEqual([]);
   });
 
-  it('detects explicit snapshots from entries-only payloads', () => {
+  it('detects explicit snapshots from structured queue fields only', () => {
     expect(hasExplicitTransportPendingSnapshot({ pendingMessageEntries: [] })).toBe(true);
-    expect(hasExplicitTransportPendingSnapshot({ transportPendingMessageEntries: [] })).toBe(true);
+    expect(hasExplicitTransportPendingSnapshot({ transportPendingMessageEntries: [] })).toBe(false);
     expect(hasExplicitTransportPendingSnapshot({ state: 'running' })).toBe(false);
   });
 
@@ -111,7 +111,7 @@ describe('transport queue reconciliation', () => {
     expect(result.entries.map((entry) => entry.clientMessageId)).toEqual(['queued-a']);
   });
 
-  it('allows a real delivered id to clear a single matching legacy queued entry by text', () => {
+  it('does not clear legacy-shaped queued entries by text with a different delivered id', () => {
     const result = removeTransportPendingEntryForUserMessage(
       [{ clientMessageId: 'session-a:legacy:0:same text', text: 'same text' }],
       ['same text'],
@@ -119,8 +119,8 @@ describe('transport queue reconciliation', () => {
       'session-a',
     );
 
-    expect(result.changed).toBe(true);
-    expect(result.entries).toEqual([]);
-    expect(result.messages).toEqual([]);
+    expect(result.changed).toBe(false);
+    expect(result.entries).toEqual([{ clientMessageId: 'session-a:legacy:0:same text', text: 'same text' }]);
+    expect(result.messages).toEqual(['same text']);
   });
 });

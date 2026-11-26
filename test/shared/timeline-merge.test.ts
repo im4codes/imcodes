@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { mergeTimelineEvents, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import {
+  mergeTimelineEvents,
+  mergeTimelineEventsWithTextPriority,
+  preferTimelineEvent,
+} from '../../src/shared/timeline/merge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { eventId: string }): TimelineEvent {
@@ -16,6 +20,56 @@ function makeEvent(overrides: Partial<TimelineEvent> & { eventId: string }): Tim
     ...overrides,
   };
 }
+
+describe('stable user send identity across projections', () => {
+  const user = (eventId: string, commandId?: string, payload: Record<string, unknown> = {}) => makeEvent({
+    eventId, type: 'user.message', payload: { text: 'Intentional repeated content', allowDuplicate: true, ...(commandId ? { commandId } : {}), ...payload },
+  });
+
+  it.each([false, true])('folds live/history/cache replay independently of arrival order (reverse=%s)', (reverse) => {
+    const primary = { ...user('primary', 'send-1', { sharedActor: { actorUserId: 'participant-1' } }), epoch: 2 };
+    const fallback = { ...user('fallback', undefined, { clientMessageId: 'send-1' }), epoch: 0 };
+    const incoming = reverse ? [fallback, primary] : [primary, fallback];
+    const once = mergeTimelineEvents([], incoming);
+    const replayed = mergeTimelineEvents(once, [...incoming, ...incoming]);
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].eventId).toBe('primary');
+    expect(replayed[0].payload.sharedActor).toEqual({ actorUserId: 'participant-1' });
+    expect(replayed[0].payload.clientMessageId).toBe('send-1');
+  });
+
+  it('heals duplicate old cached rows even without a newly arriving event', () => {
+    expect(mergeTimelineEvents([user('cache-a', 'send-1'), user('cache-b', 'send-1')], [])).toHaveLength(1);
+  });
+
+  it('preserves intentional identical sends, distinct participants and identity-free legacy rows', () => {
+    const rows = [user('a', 'first', { sharedActor: { actorUserId: 'participant-1' } }),
+      user('b', 'second', { sharedActor: { actorUserId: 'participant-1' } }),
+      user('c', 'third', { sharedActor: { actorUserId: 'participant-2' } }), user('legacy-a'), user('legacy-b')];
+    expect(mergeTimelineEvents([], rows)).toHaveLength(5);
+  });
+
+  it('scopes identity to the exact session and supports attachment-only/empty text', () => {
+    const a = user('a', 'send-1', { text: '', attachments: [{ name: 'test.png' }] });
+    expect(mergeTimelineEvents([a], [user('b', 'send-1', { text: '' })])).toHaveLength(1);
+    expect(mergeTimelineEvents([a], [{ ...a, eventId: 'other', sessionId: 'session-b' }])).toHaveLength(2);
+  });
+
+  it('keeps deletion sticky across alternate ids without restoring transient preview/failed state', () => {
+    const preview = user('preview', 'send-1', { historyPayloadTruncated: true, failed: true });
+    const full = user('full', 'send-1');
+    const merged = mergeTimelineEvents([preview], [full]);
+    expect(merged[0].payload.historyPayloadTruncated).toBeUndefined();
+    expect(merged[0].payload.failed).toBeUndefined();
+    const deleted = { ...full, hidden: true, payload: { ...full.payload, userDeleted: true } };
+    expect(mergeTimelineEvents(merged, [deleted, preview])[0].payload.userDeleted).toBe(true);
+  });
+
+  it('does not consume a local optimistic send while folding authoritative projections', () => {
+    const local = user('optimistic:session-a:send-1', 'send-1', { pending: true });
+    expect(mergeTimelineEvents([local], [user('remote-a', 'send-1'), user('remote-b', 'send-1')])).toHaveLength(2);
+  });
+});
 
 describe('preferTimelineEvent', () => {
   it('prefers non-streaming terminal event over streaming event with same id', () => {
@@ -74,11 +128,134 @@ describe('preferTimelineEvent', () => {
     expect(preferTimelineEvent(hydrated, preview)).toBe(hydrated);
   });
 
+  it('lets a newer streaming delta past an older hydrated snapshot of the same message', () => {
+    // Detail hydration rebuilds the event as `{ ...existing, payload }`, so the
+    // hydrated copy carries the seq of the snapshot it hydrated. Ranking
+    // completeness first made that stale snapshot outrank every delta still
+    // arriving: the merge reported no change and the message stopped updating
+    // until the terminal event replaced it, so the whole reply appeared at once.
+    const hydratedMidStream = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      ts: 500,
+      payload: { text: 'hello wo', streaming: true, completeness: 'hydrated' },
+    });
+    const nextDelta = makeEvent({
+      eventId: 'evt-1',
+      seq: 9,
+      ts: 900,
+      payload: { text: 'hello world, and then some', streaming: true },
+    });
+
+    expect(preferTimelineEvent(hydratedMidStream, nextDelta)).toBe(nextDelta);
+    // Order must not matter: the same pair seen the other way round agrees.
+    expect(preferTimelineEvent(nextDelta, hydratedMidStream)).toBe(nextDelta);
+  });
+
+  it('still lets the terminal event replace a hydrated streaming snapshot', () => {
+    const hydratedMidStream = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: { text: 'partial', streaming: true, completeness: 'hydrated' },
+    });
+    const terminal = makeEvent({
+      eventId: 'evt-1',
+      seq: 9,
+      payload: { text: 'final text' },
+    });
+
+    expect(preferTimelineEvent(hydratedMidStream, terminal)).toBe(terminal);
+  });
+
+  it('still prefers the more complete payload when two streaming versions share a seq', () => {
+    // Same generation, so there is no freshness signal to go on — completeness
+    // remains the tie-breaker and a truncated copy must not win.
+    const truncated = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: {
+        text: 'trunc', streaming: true, completeness: 'preview',
+        detailRefs: [{ detailId: 'td_1', fieldPath: 'payload.text' }],
+      },
+    });
+    const hydrated = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: { text: 'full text', streaming: true, completeness: 'hydrated' },
+    });
+
+    expect(preferTimelineEvent(truncated, hydrated)).toBe(hydrated);
+    expect(preferTimelineEvent(hydrated, truncated)).toBe(hydrated);
+  });
+
   it('honors explicit top-level completeness metadata', () => {
     const full = makeEvent({ eventId: 'evt-1', seq: 1, ts: 100, payload: { text: 'full payload' }, completeness: 'full' });
     const preview = makeEvent({ eventId: 'evt-1', seq: 2, ts: 200, payload: { text: 'preview payload' }, completeness: 'preview' });
 
     expect(preferTimelineEvent(full, preview)).toBe(full);
+  });
+
+  it('keeps provider-authoritative usage context when inferred terminal metadata updates the same event id', () => {
+    const tokens = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 8,
+      payload: {
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+        streaming: false,
+      },
+    });
+    const terminalMetadata = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 14,
+      payload: {
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 1_000_000,
+      },
+    });
+
+    const merged = preferTimelineEvent(tokens, terminalMetadata);
+
+    expect(merged.seq).toBe(14);
+    expect(merged.payload).toMatchObject({
+      inputTokens: 22,
+      cacheTokens: 36_608,
+      outputTokens: 10,
+      model: 'opencode/deepseek-v4-flash-free',
+      contextWindow: 200_000,
+      contextWindowSource: 'provider',
+    });
+    expect(preferTimelineEvent(terminalMetadata, tokens).payload).toEqual(merged.payload);
+  });
+
+  it('does not carry authoritative context across different models sharing a malformed event id', () => {
+    const providerUsage = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 8,
+      payload: {
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+      },
+    });
+    const newerModel = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 14,
+      payload: {
+        model: 'opencode/deepseek-v4-pro',
+        contextWindow: 1_000_000,
+      },
+    });
+
+    expect(preferTimelineEvent(providerUsage, newerModel).payload).toEqual(newerModel.payload);
   });
 });
 
@@ -126,5 +303,182 @@ describe('mergeTimelineEvents', () => {
     const merged = mergeTimelineEvents(existing, incoming);
     expect(merged).toHaveLength(1);
     expect(merged[0]?.payload.text).toBe('full output');
+  });
+
+  it('heals a cached late-cancel event that was appended after a newer user message', () => {
+    const existing = [
+      makeEvent({
+        eventId: 'new-user',
+        seq: 14,
+        ts: 200,
+        type: 'user.message',
+        payload: { text: 'new message after stop' },
+      }),
+      makeEvent({
+        eventId: 'old-assistant',
+        seq: 1,
+        ts: 100,
+        payload: { text: 'old partial', streaming: true },
+      }),
+    ];
+    const incoming = [
+      makeEvent({
+        eventId: 'old-assistant',
+        seq: 15,
+        ts: 100,
+        payload: { text: 'old partial\n\n⚠️ Turn cancelled', streaming: false },
+      }),
+    ];
+
+    const merged = mergeTimelineEvents(existing, incoming);
+
+    expect(merged.map((event) => event.eventId)).toEqual(['old-assistant', 'new-user']);
+    expect(merged[0]?.payload.text).toContain('Turn cancelled');
+  });
+});
+
+describe('mergeTimelineEventsWithTextPriority', () => {
+  it('retains text when a large tool burst fills the detail window', () => {
+    const text = makeEvent({
+      eventId: 'assistant-before-tools',
+      type: 'assistant.text',
+      ts: 1,
+      seq: 1,
+      payload: { text: 'visible reply' },
+    });
+    const tools = Array.from({ length: 288 }, (_, index) => makeEvent({
+      eventId: `tool-${index}`,
+      type: index === 287 ? 'tool.call' : 'tool.result',
+      ts: 10 + index,
+      seq: 10 + index,
+      payload: { toolCallId: `call-${index}`, output: 'x'.repeat(1024) },
+    }));
+
+    const merged = mergeTimelineEventsWithTextPriority(tools, [text], 300, 300);
+
+    expect(merged.find((event) => event.eventId === text.eventId)?.payload.text).toBe('visible reply');
+    expect(merged.filter((event) => event.type === 'tool.result')).toHaveLength(287);
+    expect(merged.filter((event) => event.type === 'tool.call')).toHaveLength(1);
+    expect(merged.at(-1)?.eventId).toBe('tool-287');
+  });
+
+  it('preserves at least 24 recent text events on interleaved sessions even under a 300+ tool burst', () => {
+    const interleaved = Array.from({ length: 30 }, (_, index) => makeEvent({
+      eventId: `interleaved-${index}`,
+      type: index % 2 === 0 ? 'assistant.text' : 'tool.result',
+      ts: 10 + index,
+      seq: 10 + index,
+      payload: { text: `msg-${index}` },
+    }));
+    const moreTexts = Array.from({ length: 24 }, (_, index) => makeEvent({
+      eventId: `text-${index}`,
+      type: index % 2 === 0 ? 'user.message' : 'assistant.text',
+      ts: 100 + index,
+      seq: 100 + index,
+      payload: { text: `recent-${index}` },
+    }));
+    const toolBurst = Array.from({ length: 310 }, (_, index) => makeEvent({
+      eventId: `burst-tool-${index}`,
+      type: 'tool.result',
+      ts: 1000 + index,
+      seq: 1000 + index,
+      payload: { output: `out-${index}` },
+    }));
+
+    const merged = mergeTimelineEventsWithTextPriority(
+      [...interleaved, ...moreTexts],
+      toolBurst,
+      300,
+      300,
+      300,
+    );
+
+    expect(merged).toHaveLength(300);
+    const retainedTexts = merged.filter((e) => e.type === 'user.message' || e.type === 'assistant.text');
+    expect(retainedTexts.length).toBeGreaterThanOrEqual(24);
+    expect(retainedTexts.map((e) => e.eventId)).toContain('text-23');
+    expect(retainedTexts.map((e) => e.eventId)).toContain('text-0');
+    expect(merged.at(-1)?.eventId).toBe('burst-tool-309');
+  });
+});
+
+describe('user-deleted tombstones are sticky in the merge', () => {
+  const tombstone = (overrides: Partial<TimelineEvent> = {}): TimelineEvent => makeEvent({
+    eventId: 'evt-del', seq: 10, ts: 100, hidden: true, payload: { text: 'gone', streaming: false, userDeleted: true }, ...overrides,
+  });
+
+  it('beats a HYDRATED (fuller) copy of the same event, in either merge order', () => {
+    const hydrated = makeEvent({ eventId: 'evt-del', seq: 50, ts: 100, payload: { text: 'gone', completeness: 'hydrated' } });
+    expect(preferTimelineEvent(hydrated, tombstone())).toEqual(expect.objectContaining({ hidden: true }));
+    expect(preferTimelineEvent(tombstone(), hydrated)).toEqual(expect.objectContaining({ hidden: true }));
+  });
+
+  it('beats a later streaming delta and a later terminal update (higher seq)', () => {
+    const delta = makeEvent({ eventId: 'evt-del', seq: 99, payload: { text: 'more', streaming: true } });
+    const terminal = makeEvent({ eventId: 'evt-del', seq: 100, payload: { text: 'done', streaming: false } });
+    expect(preferTimelineEvent(tombstone(), delta).hidden).toBe(true);
+    expect(preferTimelineEvent(tombstone(), terminal).hidden).toBe(true);
+    expect(mergeTimelineEvents([terminal], [tombstone()])[0]?.hidden).toBe(true);
+    expect(mergeTimelineEvents([tombstone()], [terminal])[0]?.hidden).toBe(true);
+  });
+
+  it('an event that is merely hidden (daemon-internal) is NOT sticky', () => {
+    const internalHidden = makeEvent({ eventId: 'evt-x', seq: 1, hidden: true, payload: { text: 'internal' } });
+    const visibleUpdate = makeEvent({ eventId: 'evt-x', seq: 2, payload: { text: 'revised' } });
+    expect(preferTimelineEvent(internalHidden, visibleUpdate)).toBe(visibleUpdate);
+  });
+
+  it('between two tombstones the newer one wins as usual', () => {
+    const older = tombstone({ seq: 10 });
+    const newer = tombstone({ seq: 11 });
+    expect(preferTimelineEvent(older, newer)).toBe(newer);
+  });
+});
+
+describe('summary vs full completeness ranking', () => {
+  it('ranks summary: true / detailAvailable: true below full events regardless of arrival order or seq', () => {
+    const summaryIdle = makeEvent({
+      eventId: 'state-idle-1',
+      type: 'session.state',
+      seq: 10,
+      ts: 2000,
+      summary: true,
+      completeness: 'full',
+      payload: { state: 'idle', completeness: 'full' },
+    } as any);
+    const fullIdle = makeEvent({
+      eventId: 'state-idle-1',
+      type: 'session.state',
+      seq: 9,
+      ts: 1000,
+      payload: {
+        state: 'idle',
+        authoritative: true,
+        clearInputs: [{ source: 'runtime', reason: 'clear', count: 0 }],
+      },
+    });
+    const detailAvailTool = makeEvent({
+      eventId: 'tool-1',
+      type: 'tool.result',
+      seq: 20,
+      ts: 3000,
+      payload: { name: 'Bash', preview: { output: 'short' } },
+      detailAvailable: true,
+    } as any);
+    const fullTool = makeEvent({
+      eventId: 'tool-1',
+      type: 'tool.result',
+      seq: 20,
+      ts: 3000,
+      payload: { toolCallId: 'c1', output: 'full output' },
+    });
+
+    expect(preferTimelineEvent(fullIdle, summaryIdle)).toBe(fullIdle);
+    expect(preferTimelineEvent(summaryIdle, fullIdle)).toBe(fullIdle);
+    expect(mergeTimelineEvents([summaryIdle], [fullIdle])[0]?.summary).toBeUndefined();
+    expect(mergeTimelineEvents([fullIdle], [summaryIdle])[0]?.payload.authoritative).toBe(true);
+
+    expect(preferTimelineEvent(fullTool, detailAvailTool)).toBe(fullTool);
+    expect(preferTimelineEvent(detailAvailTool, fullTool)).toBe(fullTool);
   });
 });

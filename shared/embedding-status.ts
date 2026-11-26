@@ -30,5 +30,22 @@ export interface EmbeddingStatus {
   reason: string | null;
 }
 
+const EMBEDDING_STATES: ReadonlySet<string> = new Set<EmbeddingState>([
+  'idle',
+  'loading',
+  'ready',
+  'fallback',
+  'unavailable',
+]);
+
+/** Validate an untrusted daemon.stats value before forwarding it to browsers. */
+export function isEmbeddingStatus(value: unknown): value is EmbeddingStatus {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.state === 'string'
+    && EMBEDDING_STATES.has(record.state)
+    && (record.reason === null || typeof record.reason === 'string');
+}
+
 /** Stable default returned when status data is unavailable (older daemon, missing field). */
 export const EMBEDDING_STATUS_UNKNOWN: EmbeddingStatus = { state: 'idle', reason: null };

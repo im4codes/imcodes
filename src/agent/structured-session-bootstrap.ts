@@ -1,10 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { basename } from 'node:path';
 import type { AgentType } from './detect.js';
 import { findRolloutPathByUuid, ensureSessionFile as ensureCodexSessionFile } from '../daemon/codex-watcher.js';
-import { injectGeminiMemoryWithTimeline } from '../daemon/memory-inject.js';
-import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
-import { GeminiDriver } from './drivers/gemini.js';
 import logger from '../util/logger.js';
 
 export interface StructuredSessionBootstrapInput {
@@ -14,13 +10,11 @@ export interface StructuredSessionBootstrapInput {
   isNewSession: boolean;
   ccSessionId?: string | null;
   codexSessionId?: string | null;
-  geminiSessionId?: string | null;
 }
 
 export interface StructuredSessionBootstrapResult {
   ccSessionId?: string;
   codexSessionId?: string;
-  geminiSessionId?: string;
 }
 
 /**
@@ -34,11 +28,9 @@ export async function resolveStructuredSessionBootstrap({
   isNewSession,
   ccSessionId,
   codexSessionId,
-  geminiSessionId,
 }: StructuredSessionBootstrapInput): Promise<StructuredSessionBootstrapResult> {
   let resolvedCcSessionId = ccSessionId ?? undefined;
   let resolvedCodexSessionId = codexSessionId ?? undefined;
-  let resolvedGeminiSessionId = geminiSessionId ?? undefined;
 
   if (agentType === 'claude-code' && !resolvedCcSessionId && isNewSession) {
     resolvedCcSessionId = randomUUID();
@@ -61,23 +53,8 @@ export async function resolveStructuredSessionBootstrap({
     }
   }
 
-  if (agentType === 'gemini' && !resolvedGeminiSessionId && isNewSession) {
-    try {
-      resolvedGeminiSessionId = await new GeminiDriver().resolveSessionId(projectDir);
-      logger.info({ projectDir, geminiSessionId: resolvedGeminiSessionId }, 'Resolved Gemini session ID');
-      if (resolvedGeminiSessionId && !legacyInjectionDisabled()) {
-        injectGeminiMemoryWithTimeline(sessionName, resolvedGeminiSessionId, projectDir, basename(projectDir)).catch((e) =>
-          logger.warn({ err: e, projectDir, geminiSessionId: resolvedGeminiSessionId }, 'Gemini memory injection failed (non-fatal)'),
-        );
-      }
-    } catch (e) {
-      logger.warn({ err: e, projectDir }, 'Failed to resolve Gemini session ID — launching without --resume');
-    }
-  }
-
   return {
     ...(resolvedCcSessionId ? { ccSessionId: resolvedCcSessionId } : {}),
     ...(resolvedCodexSessionId ? { codexSessionId: resolvedCodexSessionId } : {}),
-    ...(resolvedGeminiSessionId ? { geminiSessionId: resolvedGeminiSessionId } : {}),
   };
 }

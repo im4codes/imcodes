@@ -199,6 +199,21 @@ describe('timeline history worker', () => {
     ]);
   });
 
+  it('filters a same-epoch cursor by seq when timestamps are identical', async () => {
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_hist');
+      insertEvent(db, 1, makeEvent('deck_hist', 1, 'user.message', { text: 'already shown' }, 100));
+      insertEvent(db, 2, makeEvent('deck_hist', 2, 'user.message', { text: 'cursor boundary' }, 100));
+      insertEvent(db, 3, makeEvent('deck_hist', 3, 'assistant.text', { text: 'new event', streaming: false }, 100));
+    });
+
+    const result = await handleTimelineHistoryWorkerRequest(request({ epoch: 1, afterSeq: 2, afterTs: 100 }));
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') throw new Error(result.reason);
+    expect(result.events.map((event) => event.payload.text)).toEqual(['new event']);
+  });
+
   it('does not send multi-MB raw detail candidates back to the main thread', async () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
@@ -247,5 +262,159 @@ describe('timeline history worker', () => {
       reason: TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE,
       sanitized: true,
     });
+  });
+
+  it('guarantees up to 24 newest readable text events independently of 250+ tool events and keeps beforeTs strict', async () => {
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_tool_flood');
+      let ordinal = 1;
+      for (let i = 1; i <= 25; i += 1) {
+        const type = i % 2 === 1 ? 'user.message' : 'assistant.text';
+        insertEvent(db, ordinal, makeEvent('deck_tool_flood', ordinal, type, { text: `msg-${i}` }, 100 + i));
+        ordinal += 1;
+      }
+      for (let i = 1; i <= 250; i += 1) {
+        const type = i % 2 === 1 ? 'tool.call' : 'tool.result';
+        insertEvent(db, ordinal, makeEvent('deck_tool_flood', ordinal, type, { tool: 'Read', output: `tool-${i}` }, 1000 + i));
+        ordinal += 1;
+      }
+    });
+
+    const tail = await handleTimelineHistoryWorkerRequest(request({
+      sessionName: 'deck_tool_flood',
+      limit: 200,
+      contentTypes: ['user.message', 'assistant.text', 'tool.call', 'tool.result'],
+      stateTypes: ['session.state'],
+    }));
+
+    expect(tail.kind).toBe('success');
+    if (tail.kind !== 'success') throw new Error(tail.reason);
+    const texts = tail.events.filter((e) => e.type === 'user.message' || e.type === 'assistant.text');
+    const tools = tail.events.filter((e) => e.type === 'tool.call' || e.type === 'tool.result');
+    expect(texts).toHaveLength(24);
+    expect(texts[0]!.payload.text).toBe('msg-2');
+    expect(texts[23]!.payload.text).toBe('msg-25');
+    expect(tools).toHaveLength(176);
+    expect(tools[0]!.ts).toBe(1075);
+    expect(tail.events).toHaveLength(200);
+    expect(tail.hasMore).toBe(true);
+    expect(tail.cursorFloorTs).toBe(1075);
+
+    // Paging older with beforeTs must NOT re-pull newer/spliced events >= beforeTs.
+    const olderPage = await handleTimelineHistoryWorkerRequest(request({
+      sessionName: 'deck_tool_flood',
+      limit: 50,
+      beforeTs: tail.cursorFloorTs,
+      contentTypes: ['user.message', 'assistant.text', 'tool.call', 'tool.result'],
+      stateTypes: ['session.state'],
+    }));
+    expect(olderPage.kind).toBe('success');
+    if (olderPage.kind !== 'success') throw new Error(olderPage.reason);
+    expect(olderPage.events.every((e) => e.ts < tail.cursorFloorTs!)).toBe(true);
+    expect(olderPage.events.map((e) => e.ts)).toContain(1074);
+  });
+});
+
+describe('timeline history worker: transient readiness failure is not absence', () => {
+  const originalHome = process.env.HOME;
+  let tempDir: string | null = null;
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock('node:worker_threads');
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+    tempDir = null;
+  });
+
+  /**
+   * Load the worker against a projection DB whose readiness probe THROWS rather
+   * than returning a "not ready" row. Under peak load the real throw is
+   * SQLITE_BUSY: the reader exhausts busy_timeout while a writer checkpoints the
+   * WAL. Dropping the sessions table reproduces the same control flow -- the
+   * probe raises instead of answering -- deterministically and in milliseconds,
+   * without racing a real writer.
+   */
+  async function loadWorkerWithThrowingReadiness() {
+    tempDir = mkdtempSync(join(tmpdir(), 'imcodes-timeline-history-busy-'));
+    const dbPath = join(tempDir, 'timeline.sqlite');
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE timeline_projection_events (
+          session_id TEXT NOT NULL, append_ordinal INTEGER NOT NULL, event_id TEXT NOT NULL,
+          ts INTEGER NOT NULL, seq INTEGER NOT NULL, epoch INTEGER NOT NULL, type TEXT NOT NULL,
+          source TEXT NOT NULL, confidence TEXT NOT NULL, payload_json TEXT NOT NULL
+        );
+      `);
+      // No timeline_projection_sessions table: the readiness SELECT raises.
+    } finally {
+      db.close();
+    }
+    vi.doMock('node:worker_threads', () => ({
+      workerData: { dbPath },
+      parentPort: { on: vi.fn(), postMessage: vi.fn() },
+    }));
+    return await import('../../src/daemon/timeline-history-worker.js');
+  }
+
+  it('reports a raising readiness probe as transient, never as projection_unavailable', async () => {
+    // This is the exact fail-open behind the incident. sessionProjectionReady()
+    // swallows ANY throw and returns false, so a transient saturation error is
+    // reported with the one reason the command layer treats as "the projection
+    // genuinely does not exist" -- and its response to that is to run heavy
+    // SQLite/synthesize/sanitize on the main event loop, precisely when the
+    // process is already saturated.
+    //
+    // Absence and busy must therefore be different signals. Only absence may
+    // license the main-thread path.
+    const worker = await loadWorkerWithThrowingReadiness();
+    const result = await worker.handleTimelineHistoryWorkerRequest({
+      workerRequestId: 1,
+      workerSlotId: 1,
+      workerGeneration: 1,
+      sessionName: 'deck_saturated_brain',
+      limit: 100,
+      maxResponseBytes: 512_000,
+      contentTypes: ['assistant.text'],
+      stateTypes: ['session.state'],
+    } as TimelineHistoryWorkerRequest);
+
+    expect(result.kind).toBe('error');
+    const reason = (result as { reason: string }).reason;
+    expect(reason, 'a throwing readiness probe must not be reported as absence')
+      .not.toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    expect(reason).toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_BUSY);
+  });
+
+  it('still reports genuine absence as projection_unavailable', async () => {
+    // The by-design case must survive: a session with no projection row is
+    // legitimately unavailable, and that is the only case allowed to reach the
+    // main thread.
+    tempDir = mkdtempSync(join(tmpdir(), 'imcodes-timeline-history-absent-'));
+    const dbPath = join(tempDir, 'timeline.sqlite');
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    try { createProjectionSchema(db); } finally { db.close(); }
+    vi.doMock('node:worker_threads', () => ({
+      workerData: { dbPath },
+      parentPort: { on: vi.fn(), postMessage: vi.fn() },
+    }));
+    const worker = await import('../../src/daemon/timeline-history-worker.js');
+    const result = await worker.handleTimelineHistoryWorkerRequest({
+      workerRequestId: 1,
+      workerSlotId: 1,
+      workerGeneration: 1,
+      sessionName: 'deck_never_projected_brain',
+      limit: 100,
+      maxResponseBytes: 512_000,
+      contentTypes: ['assistant.text'],
+      stateTypes: ['session.state'],
+    } as TimelineHistoryWorkerRequest);
+    expect(result.kind).toBe('error');
+    expect((result as { reason: string }).reason)
+      .toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
   });
 });

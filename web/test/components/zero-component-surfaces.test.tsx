@@ -255,7 +255,9 @@ describe('previously uncovered component surfaces', () => {
     fireEvent.click(screen.getByText('api_key.generate'));
     await waitFor(() => expect(onKeyCreated).toHaveBeenCalled());
     fireEvent.click(await screen.findByText('api_key.copy'));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('curl -fsSL https://im.codes/install.sh | bash && imcodes bind'));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('key-1'));
+    expect(document.body.textContent).toContain('npm install -g imcodes');
     cleanup();
 
     const fetchMock = vi.fn(async () => ({
@@ -379,10 +381,13 @@ describe('previously uncovered component surfaces', () => {
     const onUpgradeAll = vi.fn();
     const onDelete = vi.fn();
     const onClose = vi.fn();
+    const onTogglePin = vi.fn();
     render(
       <ServerContextMenu
         x={180}
         y={110}
+        pinned={false}
+        onTogglePin={onTogglePin}
         onRename={onRename}
         onUpgrade={onUpgrade}
         onUpgradeAll={onUpgradeAll}
@@ -391,6 +396,8 @@ describe('previously uncovered component surfaces', () => {
       />,
     );
     expect((document.querySelector('.server-ctx-menu') as HTMLElement).style.left).toBe('36px');
+    fireEvent.click(screen.getByText('server.pin'));
+    expect(onTogglePin).toHaveBeenCalled();
     fireEvent.click(screen.getByText('session.rename'));
     expect(onClose).toHaveBeenCalled();
     expect(onRename).toHaveBeenCalled();
@@ -402,7 +409,7 @@ describe('previously uncovered component surfaces', () => {
     expect(onDelete).toHaveBeenCalled();
     fireEvent.mouseDown(document.body);
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledTimes(6);
+    expect(onClose).toHaveBeenCalledTimes(7);
     cleanup();
 
     const onConfirm = vi.fn();
@@ -431,6 +438,7 @@ describe('previously uncovered component surfaces', () => {
           { id: 'srv-2', name: '', status: 'offline', lastHeartbeatAt: null, createdAt: Date.now() },
         ]}
         activeServerId="srv-1"
+        returnHintServerId="srv-1"
         onSelectServer={onSelectServer}
         onServerContextMenu={onServerContextMenu}
         sidebarCollapsed
@@ -443,6 +451,7 @@ describe('previously uncovered component surfaces', () => {
     );
     fireEvent.click(screen.getByTitle('sidebar.expand'));
     fireEvent.click(screen.getByLabelText('Prod'));
+    expect(screen.getByLabelText('Prod').classList.contains('server-icon-return-hint')).toBe(true);
     fireEvent.contextMenu(screen.getByLabelText('Prod'), { clientX: 12, clientY: 34 });
     fireEvent.click(screen.getByTitle('Admin'));
     fireEvent.click(screen.getByTitle('Settings'));

@@ -4,9 +4,58 @@
  * Native mode: reads/writes @capacitor/preferences, defaults to app.im.codes.
  */
 
+import { resolveLocaleDefaultServers, type LocaleDefaultServerRule } from '@shared/locale-default-servers.js';
+import { detectUiLanguage } from './i18n/detect-language.js';
+
 export const DEFAULT_SERVER_URL = 'https://app.im.codes';
 const PREFS_SERVER_URL_KEY = 'deck_server_url';
 const PREFS_SERVER_LIST_KEY = 'deck_server_list';
+
+function readCompiledLocaleDefaultServers(): readonly LocaleDefaultServerRule[] {
+  return typeof __LOCALE_DEFAULT_SERVERS__ !== 'undefined' && Array.isArray(__LOCALE_DEFAULT_SERVERS__)
+    ? __LOCALE_DEFAULT_SERVERS__
+    : [];
+}
+
+function resolveActiveDefaultServerLocale(explicitLocale?: string): string {
+  const trimmedExplicit = explicitLocale?.trim();
+  if (trimmedExplicit) return trimmedExplicit;
+  const savedLang = readLocalStorageValue('imcodes_lang')?.trim();
+  if (savedLang) return savedLang;
+  try {
+    const docLang = typeof document !== 'undefined' ? document.documentElement?.lang?.trim() : '';
+    if (docLang) return docLang;
+  } catch { /* ignore */ }
+  return detectUiLanguage();
+}
+
+export function getLocaleDefaultServers(
+  locale?: string,
+  rulesOverride?: readonly LocaleDefaultServerRule[],
+): LocaleDefaultServerRule[] {
+  const rules = rulesOverride ?? readCompiledLocaleDefaultServers();
+  return resolveLocaleDefaultServers(rules, resolveActiveDefaultServerLocale(locale));
+}
+
+export function getDefaultServerUrls(
+  locale?: string,
+  rulesOverride?: readonly LocaleDefaultServerRule[],
+): string[] {
+  return mergeServerUrlList([
+    DEFAULT_SERVER_URL,
+    ...getLocaleDefaultServers(locale, rulesOverride).map((rule) => rule.url),
+  ]);
+}
+
+export function isDefaultServerUrl(
+  url: string,
+  locale?: string,
+  rulesOverride?: readonly LocaleDefaultServerRule[],
+): boolean {
+  const normalized = normalizeServerUrl(url);
+  if (!normalized) return false;
+  return getDefaultServerUrls(locale, rulesOverride).includes(normalized);
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const isNative = (): boolean =>
@@ -25,8 +74,7 @@ export async function getServerUrl(): Promise<string | null> {
   }
 }
 
-/** Returns the saved list of server URLs. Always includes DEFAULT_SERVER_URL first. */
-export async function getServerList(): Promise<string[]> {
+async function readPersistedServerList(): Promise<string[]> {
   const localList = readLocalStorageValue(PREFS_SERVER_LIST_KEY);
   const localCurrent = readLocalStorageValue(PREFS_SERVER_URL_KEY);
   if (!isNative()) {
@@ -44,33 +92,40 @@ export async function getServerList(): Promise<string[]> {
     // never become empty just because the native Preferences bridge is late.
   }
 
-  const merged = mergeServerUrlList([
+  return mergeServerUrlList([
     DEFAULT_SERVER_URL,
     persistedCurrent,
     ...parseServerListValue(persistedList),
     localCurrent,
     ...parseServerListValue(localList),
   ]);
-  persistServerListMirror(merged);
-  return merged;
+}
+
+/** Returns the saved list of server URLs plus active locale defaults without persisting unvisited locale defaults. */
+export async function getServerList(locale?: string): Promise<string[]> {
+  const persisted = await readPersistedServerList();
+  if (isNative()) {
+    persistServerListMirror(persisted);
+  }
+  return mergeServerUrlList([...getDefaultServerUrls(locale), ...persisted]);
 }
 
 /** Add a URL to the saved server list (no-op if already present). */
 export async function addServerToList(url: string): Promise<void> {
   const normalized = normalizeServerUrl(url);
   if (!normalized) return;
-  const list = mergeServerUrlList([...(await getServerList()), normalized]);
+  const list = mergeServerUrlList([...(await readPersistedServerList()), normalized]);
   persistServerListMirror(list);
   if (!isNative()) return;
   const { Preferences } = await import('@capacitor/preferences');
   await Preferences.set({ key: PREFS_SERVER_LIST_KEY, value: JSON.stringify(list) });
 }
 
-/** Remove a URL from the saved server list. Cannot remove the default server. */
-export async function removeServerFromList(url: string): Promise<void> {
+/** Remove a URL from the saved server list. Cannot remove any active default server. */
+export async function removeServerFromList(url: string, locale?: string): Promise<void> {
   const normalized = normalizeServerUrl(url);
-  if (!normalized || normalized === DEFAULT_SERVER_URL) return;
-  const updated = (await getServerList()).filter((u) => u !== normalized);
+  if (!normalized || isDefaultServerUrl(normalized, locale)) return;
+  const updated = (await readPersistedServerList()).filter((u) => u !== normalized);
   persistServerListMirror(updated);
   if (!isNative()) return;
   const { Preferences } = await import('@capacitor/preferences');

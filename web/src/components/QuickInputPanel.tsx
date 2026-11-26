@@ -1,11 +1,34 @@
+import { MachineGroupTabs } from './MachineGroupTabs.js';
+import { machineGroupsOf, machinesInGroup, resolveMachineGroup, useRememberedMachineGroup } from '../machine-grouping.js';
 import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
 import { createSharedResource, type SharedResource } from '../stores/shared-resource.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { useAliases } from '../hooks/useAliases.js';
+import { AliasApiError } from '../api/aliases.js';
+import {
+  ALIAS_DESCRIPTION_MAX,
+  validateAliasName,
+  validateAliasValue,
+  validateAliasDescription,
+  validateAliasTags,
+  isAliasId,
+  type AliasReason,
+} from '@shared/alias-types.js';
 import type { WsClient } from '../ws-client.js';
+import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
+import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import {
+  VERIFICATION_MACHINE_KINDS,
+  VERIFICATION_MACHINE_SCOPES,
+  type VerificationMachineProfile,
+  type VerificationMachineScope,
+} from '@shared/verification-machine.js';
+import { listVerificationMachines, setVerificationMachine } from '../api/verification-machines.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -17,20 +40,6 @@ export interface QuickData {
 export const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
 
 // ── Built-in defaults (not stored in D1, cannot be deleted) ───────────────
-
-const DEFAULT_COMMANDS: Record<string, string[]> = {
-  'claude-code': ['/compact', '/clear', '/usage', '/cost', '/status', '/help'],
-  'claude-code-sdk': ['/compact', '/clear', '/model', '/thinking'],
-  'copilot-sdk': ['/compact', '/clear', '/model', '/thinking'],
-  'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
-  'codex-sdk':   ['/compact', '/clear', '/model', '/thinking'],
-  'cursor-headless': ['/compact', '/clear', '/model'],
-  'opencode':    ['/compact', '/clear', '/model', '/help'],
-  'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
-  'kimi-sdk':    ['/compact', '/clear', '/model'],
-  'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
-};
-const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
 const GLOBAL_HISTORY_MAX = 50;
@@ -309,60 +318,65 @@ export interface UseQuickDataResult {
   clearSessionHistory: (sessionName: string) => void;
 }
 
+// The mutators only touch module-level state, so they are module constants: the
+// object useQuickData() returns must keep its identity between renders, or
+// every memoized consumer (panes, windows, cards, composers) re-renders with it.
+const recordHistory = (text: string, sessionName?: string) => {
+  updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
+};
+
+const addCommand = (cmd: string) => {
+  const trimmed = cmd.trim();
+  if (!trimmed) return;
+  // Mark pending BEFORE the optimistic mutation so a racing fetcher
+  // (a no-op `set` doesn't trigger one, but defensive ordering keeps
+  // the invariant simple) sees the addition.
+  _pendingCommandAdds.add(trimmed);
+  updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
+};
+
+const addPhrase = (phrase: string) => {
+  const trimmed = phrase.trim();
+  if (!trimmed) return;
+  _pendingPhraseAdds.add(trimmed);
+  updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
+};
+
+const removeCommand = (cmd: string) => {
+  // If the user adds-then-removes inside the debounce window, drop the
+  // pending entry — there is nothing to preserve across a refresh.
+  _pendingCommandAdds.delete(cmd);
+  updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
+};
+const removePhrase = (phrase: string) => {
+  _pendingPhraseAdds.delete(phrase);
+  updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
+};
+const removeHistory = (text: string) => {
+  updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
+};
+const removeSessionHistory = (sessionName: string, text: string) => {
+  updateQuickData((prev) => {
+    const sh = prev.sessionHistory[sessionName] ?? [];
+    if (!sh.includes(text)) return prev;
+    return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
+  });
+};
+const clearHistory = () => {
+  updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
+};
+const clearSessionHistory = (sessionName: string) => {
+  updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
+};
+
+
+const QUICK_DATA_ACTIONS = { recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+
 export function useQuickData(): UseQuickDataResult {
   installQuickDataVisibilityListener();
   const snapshot = quickDataResource.use();
-  const data = normalizeQuickData(snapshot.value ?? EMPTY_QUICK_DATA);
-
-  const recordHistory = (text: string, sessionName?: string) => {
-    updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
-  };
-
-  const addCommand = (cmd: string) => {
-    const trimmed = cmd.trim();
-    if (!trimmed) return;
-    // Mark pending BEFORE the optimistic mutation so a racing fetcher
-    // (a no-op `set` doesn't trigger one, but defensive ordering keeps
-    // the invariant simple) sees the addition.
-    _pendingCommandAdds.add(trimmed);
-    updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
-  };
-
-  const addPhrase = (phrase: string) => {
-    const trimmed = phrase.trim();
-    if (!trimmed) return;
-    _pendingPhraseAdds.add(trimmed);
-    updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
-  };
-
-  const removeCommand = (cmd: string) => {
-    // If the user adds-then-removes inside the debounce window, drop the
-    // pending entry — there is nothing to preserve across a refresh.
-    _pendingCommandAdds.delete(cmd);
-    updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
-  };
-  const removePhrase = (phrase: string) => {
-    _pendingPhraseAdds.delete(phrase);
-    updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
-  };
-  const removeHistory = (text: string) => {
-    updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
-  };
-  const removeSessionHistory = (sessionName: string, text: string) => {
-    updateQuickData((prev) => {
-      const sh = prev.sessionHistory[sessionName] ?? [];
-      if (!sh.includes(text)) return prev;
-      return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
-    });
-  };
-  const clearHistory = () => {
-    updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
-  };
-  const clearSessionHistory = (sessionName: string) => {
-    updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
-  };
-
-  return { data, loaded: snapshot.loaded, recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+  const data = useMemo(() => normalizeQuickData(snapshot.value ?? EMPTY_QUICK_DATA), [snapshot.value]);
+  return useMemo(() => ({ data, loaded: snapshot.loaded, ...QUICK_DATA_ACTIONS }), [data, snapshot.loaded]);
 }
 
 export function __resetQuickDataForTests(): void {
@@ -407,14 +421,35 @@ interface Props {
   ws?: WsClient | null;
   sessionCwd?: string;
   onAppendPaths?: (paths: string[]) => void;
+  /** Insert a `;;(name)` alias marker into the composer (never the value). */
+  onInsertAlias?: (name: string) => void;
+  /** Controlled nodes shown in the optional machine tab. */
+  machines?: readonly MachineListItem[];
+  /** Insert a canonical nodeId marker plus its human-readable display note. */
+  onInsertMachine?: (nodeId: string, displayName: string) => void;
+  /** Stable project identity used to include project-scoped verification machines. */
+  projectKey?: string;
+  /** Insert one long-lived verification-machine reference into the composer. */
+  onInsertVerificationMachine?: (machine: VerificationMachineProfile) => void;
   anchorRef?: RefObject<HTMLElement>;
+  /** Restrict the shared picker to text/history surfaces for non-chat inputs. */
+  quickOnly?: boolean;
+  /** Optional portal layer for callers rendered inside higher desktop windows. */
+  portalZIndex?: number;
+  /**
+   * Optional host for the portal. Fullscreen callers must supply the active
+   * fullscreen element because document.body is outside the rendered
+   * fullscreen subtree.
+   */
+  portalContainer?: Element | null;
 }
 
 const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
-type QpTab = 'quick' | 'files';
+type QpTab = 'quick' | 'files' | 'alias' | 'machines' | 'verification';
+type VerificationSourceTab = 'alias' | 'controlled_node';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -423,12 +458,18 @@ function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
+function formatPreviewText(text: string, max = TRUNCATE_THRESHOLD): string {
+  return truncateMiddle(text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ '), max);
+}
+
 export function QuickInputPanel({
   open, onClose, onSelect, onSend, agentType, sessionName,
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths, anchorRef,
+  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine,
+  projectKey, onInsertVerificationMachine, anchorRef, quickOnly = false, portalZIndex,
+  portalContainer,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -441,11 +482,111 @@ export function QuickInputPanel({
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup(open && activeTab === 'machines');
+  const machineGroup = resolveMachineGroup(rememberedMachineGroup, machines);
+  // Legacy peers without groups still show every machine, just as before.
+  const machineGroups = machineGroupsOf(machines);
+  const visibleMachines = machineGroups.length ? machinesInGroup(machines, machineGroup) : machines;
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
+  const [verificationMachines, setVerificationMachines] = useState<VerificationMachineProfile[]>([]);
+  const [verificationLoading, setVerificationLoading] = useState(false);
+  const [verificationError, setVerificationError] = useState(false);
+  const [verificationBusyTarget, setVerificationBusyTarget] = useState<string | null>(null);
+  const [verificationPickerOpen, setVerificationPickerOpen] = useState(false);
+  const [verificationSourceTab, setVerificationSourceTab] = useState<VerificationSourceTab>('alias');
+  const [verificationScope, setVerificationScope] = useState<VerificationMachineScope>(
+    projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
+  );
+  const enabledVerificationMachines = useMemo(
+    () => verificationMachines.filter((profile) => profile.enabled),
+    [verificationMachines],
+  );
+
+  // ── Alias tab state ──
+  // Server-authoritative alias data (create/remove invalidate the shared
+  // resource so every alias surface updates without a reload). We do NOT reuse
+  // the quick-data debounced storage path here — aliases persist immediately.
+  const [aliasSearch, setAliasSearch] = useState('');
+  const { aliases: allAliases, filtered: filteredAliases, create: createAlias, remove: removeAlias, refetch: refetchAliases } = useAliases(aliasSearch);
+  // Alias editor: `null` = closed; `{ original: null }` = creating a new one;
+  // `{ original: name }` = editing that alias by its original name.
+  // `tags` is carried through the form (not yet user-editable) so that editing
+  // an existing alias PRESERVES its tags instead of the upsert clearing them,
+  // and so any tags we send are validated with the shared validator (Cx1-6).
+  const [aliasForm, setAliasForm] = useState<{ original: string | null; name: string; value: string; description: string; tags: string } | null>(null);
+  const [aliasError, setAliasError] = useState<AliasReason | 'generic' | null>(null);
+  const [aliasSaving, setAliasSaving] = useState(false);
+  const aliasNameInputRef = useRef<HTMLInputElement>(null);
 
   // Reset page when scope or session changes
   useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName]);
+
+  // Refetch server aliases whenever the alias tab becomes visible (or the panel
+  // opens on it), so aliases created elsewhere — e.g. by an agent via the
+  // save_alias MCP tool, or on another device — show up without a manual reload.
+  useEffect(() => {
+    if (open && (activeTab === 'alias' || activeTab === 'verification')) refetchAliases();
+  }, [open, activeTab, refetchAliases]);
+
+  useEffect(() => {
+    setVerificationScope(projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER);
+  }, [projectKey]);
+
+  useEffect(() => {
+    if (!open || activeTab !== 'verification') return;
+    let live = true;
+    setVerificationLoading(true);
+    setVerificationError(false);
+    void listVerificationMachines(projectKey).then((profiles) => {
+      if (live) setVerificationMachines(profiles);
+    }).catch(() => {
+      if (live) setVerificationError(true);
+    }).finally(() => {
+      if (live) setVerificationLoading(false);
+    });
+    return () => { live = false; };
+  }, [activeTab, open, projectKey]);
+
+  const authorizeVerificationTarget = async (input: {
+    alias: string;
+    kind: VerificationMachineProfile['kind'];
+    target: string;
+  }) => {
+    const existing = verificationMachines.find((profile) => (
+      profile.scope === verificationScope
+      && profile.kind === input.kind
+      && profile.target === input.target
+    ));
+    setVerificationBusyTarget(`${input.kind}:${input.target}`);
+    setVerificationError(false);
+    try {
+      await setVerificationMachine({
+        ...(existing ? { id: existing.id, expectedRevision: existing.revision } : {}),
+        scope: verificationScope,
+        scopeKey: verificationScope === VERIFICATION_MACHINE_SCOPES.PROJECT ? projectKey ?? '' : '',
+        alias: input.alias,
+        kind: input.kind,
+        target: input.target,
+        enabled: true,
+      });
+      setVerificationMachines(await listVerificationMachines(projectKey));
+      setVerificationPickerOpen(false);
+    } catch {
+      setVerificationError(true);
+    } finally {
+      setVerificationBusyTarget(null);
+    }
+  };
+
+  // A removed/revoked last machine must not strand the panel on a hidden tab.
+  useEffect(() => {
+    if (activeTab === 'machines' && machines.length === 0) setActiveTab('quick');
+  }, [activeTab, machines.length]);
+
+  useEffect(() => {
+    if (quickOnly && activeTab !== 'quick') setActiveTab('quick');
+  }, [activeTab, quickOnly]);
 
   useEffect(() => {
     if (!open || typeof window === 'undefined') return;
@@ -475,6 +616,33 @@ export function QuickInputPanel({
     return () => document.removeEventListener('mousedown', handler);
   }, [open, onClose, anchorRef]);
 
+  // Keep keyboard navigation inside the open picker. In particular, the
+  // trigger remains focused when the portal opens, so the first Tab must enter
+  // the dialog rather than continue through the remote-desktop toolbar.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !panelRef.current) return;
+      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (focusable.length === 0) return;
+      const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      event.preventDefault();
+      focusable[nextIndex]?.focus({ preventScroll: true });
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
   // Focus add/edit input when shown
   useEffect(() => {
     if (addTarget) setTimeout(() => addInputRef.current?.focus(), 50);
@@ -482,6 +650,17 @@ export function QuickInputPanel({
   useEffect(() => {
     if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
   }, [editingItem]);
+  // Focus the name input only when a form is (re)opened — NOT on every keystroke.
+  // `aliasForm` is a fresh object on each field edit, so depending on it re-ran
+  // this effect and stole focus back to `name` while typing value/desc/tags.
+  // Key on the form IDENTITY instead (`original`; `undefined` = no form open),
+  // which is stable across edits within the same form.
+  const aliasFormId = aliasForm ? aliasForm.original : undefined;
+  useEffect(() => {
+    if (aliasFormId === undefined) return;
+    const t = setTimeout(() => aliasNameInputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, [aliasFormId]);
 
   const panelStyle = useMemo(() => {
     if (!open) return undefined; // skip computation when closed
@@ -525,7 +704,7 @@ export function QuickInputPanel({
 
   if (!open) return null;
 
-  const defaultCmds = DEFAULT_COMMANDS[agentType] ?? DEFAULT_COMMANDS['claude-code'];
+  const defaultCmds = getDefaultQuickCommands(agentType);
   const activeHistory = historyScope === 'session'
     ? (data.sessionHistory[sessionName] ?? [])
     : getAccountHistory(data);
@@ -582,19 +761,280 @@ export function QuickInputPanel({
     if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
   };
 
+  // ── Alias tab handlers ──
+  const openAliasCreate = () => {
+    setAliasError(null);
+    setAliasForm({ original: null, name: '', value: '', description: '', tags: '' });
+  };
+  const openAliasEdit = (name: string) => {
+    const entry = allAliases.find((a) => a.name === name);
+    if (!entry) return;
+    setAliasError(null);
+    setAliasForm({ original: entry.name, name: entry.name, value: entry.value, description: entry.description ?? '', tags: (entry.tags ?? []).join(' ') });
+  };
+  const closeAliasForm = () => {
+    setAliasForm(null);
+    setAliasError(null);
+    setAliasSaving(false);
+  };
+
+  const commitAlias = async () => {
+    if (!aliasForm || aliasSaving) return;
+    const name = aliasForm.name.trim();
+    const value = aliasForm.value;
+    const description = aliasForm.description.trim();
+    // Tags are entered as a free-text, space-separated string; split into the
+    // wire array (whitespace-collapsed, empties dropped). The server + shared
+    // validateAliasTags remain authoritative on count/length/control chars.
+    const tags = aliasForm.tags.trim().split(/\s+/).filter(Boolean);
+    // Client-side validation with the shared validators gives instant, localized
+    // feedback via the same reason codes the server enforces (server remains
+    // authoritative — its AliasApiError reason overrides on any mismatch).
+    const nameErr = validateAliasName(name);
+    if (nameErr) { setAliasError(nameErr); return; }
+    const valueErr = validateAliasValue(value);
+    if (valueErr) { setAliasError(valueErr); return; }
+    const descErr = validateAliasDescription(description || undefined);
+    if (descErr) { setAliasError(descErr); return; }
+    // Validate the space-separated tags before sending (Cx1-6); the server is
+    // authoritative and also rejects invalid ones — surface `alias_tags_invalid`.
+    const tagsErr = validateAliasTags(tags.length > 0 ? tags : undefined);
+    if (tagsErr) { setAliasError(tagsErr); return; }
+
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      const existing = aliasForm.original
+        ? allAliases.find((entry) => entry.name === aliasForm.original)
+        : undefined;
+      // Preserve the server row id on rename so durable verification-machine
+      // associations follow the alias automatically.
+      await createAlias({
+        ...(existing?.id ? { id: existing.id } : {}),
+        name,
+        value,
+        ...(description ? { description } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+      });
+      closeAliasForm();
+    } catch (err) {
+      setAliasSaving(false);
+      const reason = err instanceof AliasApiError ? err.reason : null;
+      setAliasError(reason ?? 'generic');
+    }
+  };
+
+  const deleteAliasEntry = async (name: string) => {
+    if (!confirm(t('alias.delete_confirm'))) return;
+    try {
+      await removeAlias(name);
+    } catch {
+      // Removal failures are non-fatal for the UI; surface a generic notice.
+      setAliasError('generic');
+    }
+  };
+
+  const aliasErrorText = aliasError
+    // The limits are passed in rather than restated in each locale string, so a
+    // change to the shared constant cannot leave seven translations claiming a
+    // number the server no longer enforces.
+    ? (aliasError === 'generic'
+      ? t('alias.error.generic')
+      : t(`alias.error.${aliasError}`, { max: ALIAS_DESCRIPTION_MAX }))
+    : null;
+
   const panel = (
     <>
-      <div class="qp-backdrop" onClick={onClose} />
-      <div class="qp" ref={panelRef} style={panelStyle}>
-        {/* Tab bar — shown when Files feature is available */}
-        {ws && (
-          <div class="qp-tabs">
-            <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
-              ⚡ {t('quick_input.tab_quick')}
-            </button>
+      <div
+        class="qp-backdrop"
+        style={portalZIndex === undefined ? undefined : { zIndex: portalZIndex - 1 }}
+        onClick={onClose}
+      />
+      <div
+        class="qp"
+        ref={panelRef}
+        style={portalZIndex === undefined ? panelStyle : { ...panelStyle, zIndex: portalZIndex }}
+        role="dialog"
+        aria-label={t('quick_input.title')}
+      >
+        {/* Machine tab is present only when the account has controlled nodes. */}
+        {!quickOnly && <div class="qp-tabs">
+          <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
+            ⚡ {t('quick_input.tab_quick')}
+          </button>
+          {ws && (
             <button class={`qp-tab${activeTab === 'files' ? ' active' : ''}`} onClick={() => setActiveTab('files')}>
               📁 {t('quick_input.tab_files')}
             </button>
+          )}
+          <button class={`qp-tab${activeTab === 'alias' ? ' active' : ''}`} onClick={() => setActiveTab('alias')}>
+            🔖 {t('alias.tab')}
+          </button>
+          {machines.length > 0 && (
+            <button class={`qp-tab${activeTab === 'machines' ? ' active' : ''}`} onClick={() => setActiveTab('machines')}>
+              🖥 {t('quick_input.tab_machines')}
+            </button>
+          )}
+          <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
+            🧪 {t('quick_input.tab_verification')}
+          </button>
+        </div>}
+
+        {/* Controlled-node tab — display names are mutable, canonical node IDs
+            are stable. Connectivity is informational: an offline node can still
+            be referenced in a task and resolve once it reconnects. */}
+        {activeTab === 'machines' && machines.length > 0 && (
+          <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
+            <div class="qp-alias-hint">{t('machine.usage_hint')}</div>
+            {machineGroups.length > 0 && (
+              <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+                <MachineGroupTabs machines={machines} group={machineGroup} onSelect={setMachineGroup} testIdPrefix="qp-machine-group" />
+              </div>
+            )}
+            {visibleMachines.length === 0 && <div class="qp-history-empty">{t('controlled_nodes.empty')}</div>}
+            {visibleMachines.map((machine) => (
+              <button
+                key={machine.serverId}
+                type="button"
+                class={`qp-machine-item${machine.online ? '' : ' is-offline'}`}
+                disabled={!onInsertMachine || !machine.nodeId}
+                title={machine.online ? machine.displayName : t('machine.offline_hint')}
+                onClick={() => {
+                  if (machine.nodeId) onInsertMachine?.(machine.nodeId, machine.displayName);
+                  onClose();
+                }}
+              >
+                <span class="qp-machine-item-main">
+                  <strong>{machine.displayName}</strong>
+                  <code>^^({machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE})</code>
+                </span>
+                <span class={`qp-machine-status ${machine.online ? 'is-online' : 'is-offline'}`}>
+                  {machine.online ? t('machine.online') : t('machine.offline')}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {activeTab === 'verification' && (
+          <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_verification')}>
+            <div class="qp-alias-hint">{t('quick_input.verification_hint')}</div>
+            {verificationLoading && <div class="qp-history-empty">{t('quick_input.loading')}</div>}
+            {verificationError && <div class="qp-alias-error" role="alert">{t('quick_input.verification_error')}</div>}
+            {!verificationLoading && !verificationError && enabledVerificationMachines.length === 0 && (
+              <div class="qp-history-empty">{t('quick_input.verification_empty')}</div>
+            )}
+            {!verificationLoading && enabledVerificationMachines.map((machine) => (
+              <button
+                key={machine.id}
+                type="button"
+                class="qp-machine-item"
+                title={machine.target}
+                disabled={!onInsertVerificationMachine}
+                onClick={() => {
+                  if (!onInsertVerificationMachine) return;
+                  onInsertVerificationMachine(machine);
+                  onClose();
+                }}
+              >
+                <span class="qp-machine-item-main">
+                  <strong>{machine.alias}</strong>
+                  <code>{machine.target}</code>
+                </span>
+                <span class={`qp-machine-status is-${machine.lastVerificationStatus}`}>
+                  {t(`controlled_nodes.verification.status_${machine.lastVerificationStatus}`)}
+                </span>
+              </button>
+            ))}
+            <button
+              type="button"
+              class="qp-toolbar-btn"
+              aria-expanded={verificationPickerOpen}
+              onClick={() => setVerificationPickerOpen((current) => !current)}
+            >
+              ＋ {t('quick_input.verification_add')}
+            </button>
+            {verificationPickerOpen && <div class="qp-verification-authorize">
+              <div class="qp-verification-authorize-header">
+                <strong>{t('quick_input.verification_add')}</strong>
+                <select
+                  aria-label={t('controlled_nodes.verification.scope')}
+                  value={verificationScope}
+                  onChange={(event) => setVerificationScope(
+                    (event.target as HTMLSelectElement).value as VerificationMachineScope,
+                  )}
+                >
+                  {projectKey && (
+                    <option value={VERIFICATION_MACHINE_SCOPES.PROJECT}>
+                      {t('controlled_nodes.verification.project_scope')}
+                    </option>
+                  )}
+                  <option value={VERIFICATION_MACHINE_SCOPES.USER}>
+                    {t('controlled_nodes.verification.user_scope')}
+                  </option>
+                </select>
+              </div>
+              <div class="qp-verification-source-tabs" role="tablist" aria-label={t('quick_input.verification_source')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'alias'}
+                  class={verificationSourceTab === 'alias' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('alias')}
+                >
+                  🔖 {t('alias.tab')}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'controlled_node'}
+                  class={verificationSourceTab === 'controlled_node' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('controlled_node')}
+                >
+                  🖥 {t('quick_input.tab_machines')}
+                </button>
+              </div>
+              <div class="qp-verification-source-list">
+                {verificationSourceTab === 'alias' && allAliases.map((entry) => {
+                  if (!isAliasId(entry.id)) return null;
+                  const aliasId = entry.id;
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${aliasId}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`alias:${aliasId}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: entry.name,
+                        kind: VERIFICATION_MACHINE_KINDS.SSH,
+                        target: aliasId,
+                      }); }}
+                    >
+                      🔖 {t('quick_input.verification_authorize_alias', { name: entry.name })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+                {verificationSourceTab === 'controlled_node' && machines.filter((machine) => machine.nodeId).map((machine) => {
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE}:${machine.nodeId}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`node:${machine.nodeId}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: machine.displayName,
+                        kind: VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE,
+                        target: machine.nodeId!,
+                      }); }}
+                    >
+                      🖥 {t('quick_input.verification_authorize_node', { name: machine.displayName })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>}
           </div>
         )}
 
@@ -618,6 +1058,87 @@ export function QuickInputPanel({
             }}
           />
         )}
+
+        {/* Alias tab — browse + create/edit/delete user aliases. Selecting one
+            inserts its `;;(name)` marker (never the value). */}
+        {activeTab === 'alias' && <>
+          <div class="qp-add-row">
+            <input
+              class="qp-add-input"
+              value={aliasSearch}
+              onInput={(e) => setAliasSearch((e.target as HTMLInputElement).value)}
+              placeholder={t('alias.search_placeholder')}
+            />
+            <button class="qp-add-confirm" title={t('alias.add')} onClick={openAliasCreate}>＋</button>
+          </div>
+
+          <div class="qp-alias-hint">{t('alias.usage_hint')}</div>
+
+          {aliasForm && (
+            <div class="qp-alias-form">
+              <input
+                ref={aliasNameInputRef}
+                class="qp-add-input"
+                value={aliasForm.name}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, name: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.name_placeholder')}
+              />
+              <textarea
+                class="qp-add-input qp-alias-value"
+                value={aliasForm.value}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, value: (e.target as HTMLTextAreaElement).value } : f)}
+                placeholder={t('alias.value_placeholder')}
+                rows={3}
+              />
+              <input
+                class="qp-add-input"
+                value={aliasForm.description}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, description: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.description_placeholder')}
+              />
+              <input
+                class="qp-add-input"
+                value={aliasForm.tags}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, tags: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.tags_placeholder')}
+              />
+              {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
+              <div class="qp-alias-form-actions">
+                <button class="qp-toolbar-btn" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
+                <button class="qp-toolbar-btn" onClick={closeAliasForm}>{t('alias.cancel')}</button>
+              </div>
+            </div>
+          )}
+
+          <div class="qp-list">
+            {filteredAliases.length === 0 ? (
+              <div class="qp-history-empty">
+                {aliasSearch ? t('alias.no_results') : t('alias.empty')}
+              </div>
+            ) : (
+              <div class="qp-alias-items">
+                {filteredAliases.map((a) => (
+                  <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={a.description || a.name}>
+                    <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
+                    {/* Desktop list view: truncated value + description + tags.
+                        Hidden on mobile (CSS), where the row collapses to a pill. */}
+                    <span class="qp-alias-item-meta">
+                      <span class="qp-alias-item-value">{a.value}</span>
+                      {a.description ? <span class="qp-alias-item-desc">{a.description}</span> : null}
+                      {a.tags && a.tags.length > 0 ? (
+                        <span class="qp-alias-item-tags">
+                          {a.tags.map((tg) => <span key={tg} class="qp-alias-tag">{tg}</span>)}
+                        </span>
+                      ) : null}
+                    </span>
+                    <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
+                    <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </>}
 
         {/* Quick tab content */}
         {activeTab === 'quick' && <>
@@ -671,7 +1192,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{truncateMiddle(cmd)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
                     </span>
@@ -686,7 +1207,7 @@ export function QuickInputPanel({
             <>
               <div class="qp-section-header">{t('quick_input.phrases')}</div>
               <div class="qp-pills">
-                {DEFAULT_PHRASES.map((phrase) => (
+                {DEFAULT_QUICK_PHRASES.map((phrase) => (
                   <button key={phrase} class="qp-pill qp-pill-default" onClick={() => handleSend(phrase)}>{phrase}</button>
                 ))}
                 {data.phrases.map((phrase) => (
@@ -703,7 +1224,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{truncateMiddle(phrase)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
                     </span>
@@ -731,7 +1252,7 @@ export function QuickInputPanel({
               </div>
               {historySlice.length > 0 ? historySlice.map((text, i) => (
                 <div key={historyPage * HISTORY_PAGE_SIZE + i} class="qp-item qp-item-history" onClick={() => handleSelect(text)} title={text.length > 60 ? text : undefined}>
-                  <span class="qp-item-text">{truncateMiddle(text, 60)}</span>
+                  <span class="qp-item-text">{formatPreviewText(text, 60)}</span>
                   <button class="qp-item-del" onClick={(e) => { e.stopPropagation(); handleRemoveItem(text); }}>✕</button>
                 </div>
               )) : (
@@ -757,5 +1278,5 @@ export function QuickInputPanel({
   );
 
   if (typeof document === 'undefined') return panel;
-  return createPortal(panel, document.body);
+  return createPortal(panel, portalContainer ?? document.body);
 }

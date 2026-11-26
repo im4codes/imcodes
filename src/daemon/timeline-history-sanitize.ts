@@ -1,7 +1,9 @@
 import type { TimelineEvent } from './timeline-event.js';
+import { TIMELINE_HISTORY_MIN_TEXT_FLOOR } from '../../shared/timeline-history-limits.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
   type TimelineDetailFieldPath,
   type TimelineDetailRef,
 } from '../../shared/timeline-protocol.js';
@@ -11,6 +13,10 @@ import {
   buildSdkSubagentTimelinePayload,
   parseSdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
+import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
+import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
+import { PEER_AUDIT_FINDINGS_BYTES, isPeerAuditVerdict } from '../../shared/peer-audit.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -41,6 +47,8 @@ export interface TimelineHistorySanitizeOptions {
   maxResponseBytes?: number;
   detailSink?: TimelineHistoryDetailSink;
   collectDetailRefs?: boolean;
+  /** Reserve byte budget for at least N newest readable text events before packing tools/state. */
+  minTextFloor?: number;
 }
 
 export interface TimelineHistoryDetailSink {
@@ -73,6 +81,8 @@ export interface TimelineHistorySanitizeResult {
   droppedEvents: number;
   truncatedEvents: number;
   detailRefs: TimelineDetailRef[];
+  /** Oldest timestamp of the unbroken newest window when byte trimming occurred after reserved text. */
+  contiguousFloorTs?: number;
 }
 
 const NORMAL_POLICY: ValuePolicy = {
@@ -288,6 +298,16 @@ function sanitizeTextPayload(
 
 function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, policy = NORMAL_POLICY): Record<string, unknown> {
   const payload = event.payload ?? {};
+  if (event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+    && isPeerAuditVerdict(payload.verdict)
+    && typeof payload.result === 'string') {
+    const sanitized = sanitizeValue(payload, policy, stats) as Record<string, unknown>;
+    // peer_audit_reply already enforces PEER_AUDIT_FINDINGS_BYTES. Preserve
+    // that bounded markdown whole so history replay never injects the generic
+    // "[history truncated]" marker into an authoritative audit card.
+    sanitized.result = truncateStringByUtf8Bytes(payload.result, PEER_AUDIT_FINDINGS_BYTES);
+    return sanitized;
+  }
   if (event.type === 'tool.call' || event.type === 'tool.result') {
     const sdkDetail = parseSdkSubagentDetail(payload.detail);
     if (sdkDetail.kind === 'ok') {
@@ -357,10 +377,6 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
 
 function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): number {
   return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
-}
-
-function isNewerTimelineEvent(candidate: TimelineEvent, current: TimelineEvent): boolean {
-  return compareTimelineEventsForReplay(candidate, current) >= 0;
 }
 
 function detailStringAtPath(event: TimelineEvent, fieldPath: string): string | undefined {
@@ -478,32 +494,67 @@ export function sanitizeTimelineHistoryEventsForTransport(
   options: TimelineHistorySanitizeOptions = {},
 ): TimelineHistorySanitizeResult {
   const maxResponseBytes = Math.max(64 * 1024, Math.trunc(options.maxResponseBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES));
+  const minTextFloor = Math.max(0, Math.trunc(options.minTextFloor ?? TIMELINE_HISTORY_MIN_TEXT_FLOOR));
   const dedupedByEventId = new Map<string, TimelineEvent>();
   for (const event of events) {
+    if (isClaudeSyntheticSeedAssistantTextEvent(event as unknown as Record<string, unknown>)) continue;
     const current = dedupedByEventId.get(event.eventId);
-    if (!current || isNewerTimelineEvent(event, current)) dedupedByEventId.set(event.eventId, event);
+    dedupedByEventId.set(event.eventId, current ? preferTimelineEvent(current, event) : event);
   }
   const inputEvents = Array.from(dedupedByEventId.values()).sort(compareTimelineEventsForReplay);
-  const selectedEntries: Array<ReturnType<typeof sanitizeTimelineHistoryEventForTransport> & { originalEvent: TimelineEvent }> = [];
+  const selectedByIndex = new Map<number, ReturnType<typeof sanitizeTimelineHistoryEventForTransport> & { originalEvent: TimelineEvent }>();
   let payloadBytes = 2;
-  let droppedEvents = 0;
   let truncatedEvents = 0;
+  let pass1StoppedByBudget = false;
+  let pass2OldestKeptIndex: number | undefined;
+  let pass2StoppedByBudget = false;
 
-  for (let index = inputEvents.length - 1; index >= 0; index -= 1) {
-    const entry = sanitizeTimelineHistoryEventForTransport(inputEvents[index]!, {
-      ...options,
-      collectDetailRefs: false,
-    });
-    const nextBytes = payloadBytes + entry.bytes + (selectedEntries.length > 0 ? 1 : 0);
-    if (nextBytes > maxResponseBytes && selectedEntries.length > 0) {
-      droppedEvents += index + 1;
-      break;
+  // Pass 1: reserve up to `minTextFloor` newest readable conversation text events
+  // so huge tool payloads cannot exhaust the response budget and evict all text.
+  if (minTextFloor > 0) {
+    for (let index = inputEvents.length - 1; index >= 0 && selectedByIndex.size < minTextFloor; index -= 1) {
+      const candidate = inputEvents[index]!;
+      if (!(TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[]).includes(candidate.type)) continue;
+      const entry = sanitizeTimelineHistoryEventForTransport(candidate, {
+        ...options,
+        collectDetailRefs: false,
+      });
+      const nextBytes = payloadBytes + entry.bytes + (selectedByIndex.size > 0 ? 1 : 0);
+      if (nextBytes > maxResponseBytes && selectedByIndex.size > 0) {
+        pass1StoppedByBudget = true;
+        break;
+      }
+      selectedByIndex.set(index, { ...entry, originalEvent: candidate });
+      payloadBytes = nextBytes;
+      if (entry.truncated) truncatedEvents += 1;
     }
-    selectedEntries.push({ ...entry, originalEvent: inputEvents[index]! });
-    payloadBytes = nextBytes;
-    if (entry.truncated) truncatedEvents += 1;
   }
-  selectedEntries.reverse();
+
+  // Pass 2: pack the newest remaining contiguous tail into the leftover byte budget.
+  if (!pass1StoppedByBudget) {
+    for (let index = inputEvents.length - 1; index >= 0; index -= 1) {
+      if (selectedByIndex.has(index)) continue;
+      const candidate = inputEvents[index]!;
+      const entry = sanitizeTimelineHistoryEventForTransport(candidate, {
+        ...options,
+        collectDetailRefs: false,
+      });
+      const nextBytes = payloadBytes + entry.bytes + (selectedByIndex.size > 0 ? 1 : 0);
+      if (nextBytes > maxResponseBytes && selectedByIndex.size > 0) {
+        pass2StoppedByBudget = true;
+        break;
+      }
+      selectedByIndex.set(index, { ...entry, originalEvent: candidate });
+      payloadBytes = nextBytes;
+      pass2OldestKeptIndex = index;
+      if (entry.truncated) truncatedEvents += 1;
+    }
+  }
+
+  const selectedEntries = Array.from(selectedByIndex.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, entry]) => entry);
+  const droppedEvents = inputEvents.length - selectedEntries.length;
   const selected = selectedEntries.map((entry) => entry.event);
   const detailRefs = options.detailSink
     ? selectedEntries.flatMap((entry) => collectDetailRefs(
@@ -513,11 +564,15 @@ export function sanitizeTimelineHistoryEventsForTransport(
     : [];
 
   if (droppedEvents > 0) truncatedEvents += droppedEvents;
+  const contiguousFloorTs = pass2StoppedByBudget && pass2OldestKeptIndex !== undefined
+    ? inputEvents[pass2OldestKeptIndex]?.ts
+    : selected[0]?.ts;
   return {
     events: selected,
     payloadBytes,
     droppedEvents,
     truncatedEvents,
     detailRefs,
+    ...(contiguousFloorTs !== undefined ? { contiguousFloorTs } : {}),
   };
 }

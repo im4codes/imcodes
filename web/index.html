@@ -22,7 +22,9 @@
       #splash {
         position: fixed; inset: 0; z-index: 9999;
         display: flex; align-items: center; justify-content: center; flex-direction: column;
-        background: var(--splash-bg);
+        background:
+          radial-gradient(circle at 50% 44%, rgba(34, 211, 238, 0.1), rgba(0, 255, 180, 0.025) 34%, transparent 64%),
+          var(--splash-bg);
         font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
         overflow: hidden;
         transition: opacity 0.12s ease, visibility 0.12s ease;
@@ -200,6 +202,7 @@
       <div class="splash-beam"></div>
     </div>
     <div id="app"></div>
+    <script type="module" src="/src/remote-desktop-invite-bootstrap-entry.ts"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

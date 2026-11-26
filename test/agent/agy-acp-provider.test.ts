@@ -1,0 +1,6778 @@
+import logger from '../../src/util/logger.js';
+import { agyNativeStartNotAttemptedError } from '../../src/agent/agy-session-persistence.js';
+import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
+} from '../../shared/sdk-subagent-status.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
+import {
+  readPersistedAgySystemPrompt,
+  reconcilePersistedAgyWorkspace,
+  resolveAgyResumeSystemPromptMeta,
+  sanitizeAgyTrajectoryWorkspaceBlob,
+  stripAgentIdentityBlock,
+} from '../../src/agent/agy-persisted-system-prompt.js';
+import { pathToFileURL } from 'node:url';
+import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import path from 'node:path';
+import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
+import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-sdk.js';
+import { KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
+import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
+import { AGY_NATIVE_START_RECOVERY_HINT, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
+import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
+import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { SessionInfoUpdate, ToolCallEvent } from '../../src/agent/transport-provider.js';
+
+const resources: Array<{ provider: AgyAcpProvider; root: string }> = [];
+afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } vi.unstubAllEnvs(); });
+async function setup(scenario = '', extraEnv: Record<string, string> = {}) {
+  const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-acp-'));
+  const binary = path.join(root, 'agy');
+  const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+  await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${fixture}' "$@"\n`, { mode: 0o700 });
+  const provider = new AgyAcpProvider(); resources.push({ provider, root });
+  const log = path.join(root, 'rpc.jsonl');
+  await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log, AGY_ACP_FIXTURE_SCENARIO: scenario, ...extraEnv } });
+  const requests = async () => (await readFile(log, 'utf8').catch(e => e?.code === 'ENOENT' ? '' : Promise.reject(e))).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  return { provider, root, binary, requests };
+}
+const notification = (id: string, text = id) => ({ notificationId: id, text });
+async function route(provider: AgyAcpProvider, name = 'deck_test_agy_acp', extra = {}) {
+  await provider.createSession({ sessionKey: name, sessionName: name, cwd: process.cwd(), agentId: 'model-a', ...extra }); return name;
+}
+describe('AG native ACP', () => {
+  it.each(['normal', 'reordered'])('keeps A/B/C in one active native run and emits one terminal (%s)', async scenario => {
+    const { provider, requests } = await setup(scenario);
+    const id = await route(provider); const complete = vi.fn(), errors = vi.fn();
+    provider.onComplete(complete); provider.onError(errors);
+    await provider.send(id, 'A');
+    await Promise.all([provider.notifyActiveDelegation(id, notification('B')), provider.notifyActiveDelegation(id, notification('C'))]);
+    await new Promise(resolve => setTimeout(resolve, 35));
+    expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1].content).toBe('A B C'); expect(errors).not.toHaveBeenCalled();
+    const prompts = (await requests()).filter(x => x.method === 'session/prompt');
+    expect(prompts.map(x => x.params.sessionId)).toEqual(['native-1', 'native-1', 'native-1']);
+    expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
+    expect(complete.mock.calls[0]?.[1].metadata.usage).toMatchObject({ inputTokens: scenario === 'reordered' ? 30 : 10, outputTokens: scenario === 'reordered' ? 15 : 5 });
+  });
+  it('deduplicates durable ids, including retries after the superseded A response', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    await provider.send(id, 'A');
+    await Promise.all([provider.notifyActiveDelegation(id, notification('B')), provider.notifyActiveDelegation(id, notification('B'))]);
+    await provider.notifyActiveDelegation(id, notification('B'));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+  });
+  it('does not clear an active A/tool when only B RPC is rejected', async () => {
+    const { provider } = await setup('reject-b'); const id = await route(provider), complete = vi.fn(), errors = vi.fn(); provider.onComplete(complete); provider.onError(errors);
+    await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(complete).not.toHaveBeenCalled(); expect(errors).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+  });
+  it('Stop cancels the aggregate once without allowing delayed updates to revive it', async () => {
+    const { provider } = await setup('reordered'); const id = await route(provider); const complete = vi.fn(), errors = vi.fn(); provider.onComplete(complete); provider.onError(errors);
+    await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B')); await provider.cancelAndWait(id);
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete).not.toHaveBeenCalled();
+    expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+  it('keeps one stable ACP prefix and normalizes native usage for relay', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    const complete = vi.fn(); provider.onComplete(complete);
+    const text = 'UNCOMPRESSED Brain role; user/project/pair/session identity; MCP policy 完整 😀';
+    for (const message of ['ordinary one', 'after silent compaction']) {
+      const payload = normalizeProviderPayload(message);
+      payload.sessionSystemText = text;
+      await provider.send(id, payload);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(message === 'ordinary one' ? 1 : 2), { timeout: 5000 });
+    }
+    const prompts = (await requests()).filter(x => x.method === 'session/prompt');
+    expect(prompts[0].params.prompt[0].text).toContain(text);
+    expect(prompts[1].params.prompt[0].text).not.toContain(text);
+    expect(complete.mock.calls[1][1].metadata.usage).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+  });
+  it('reasserts byte-identical ACP contracts once after summary/model/compact/clear/initialize', async () => {
+    const {provider,requests,root}=await setup('usage-missing'); let id=await route(provider);
+    const done=vi.fn(); provider.onComplete(done); let count=0;
+    const contract='UNCOMPRESSED Brain-only delegation; USER/PROJECT/PAIR/SESSION identity; MCP guidance 完整 😀';
+    const send=async(label:string, injected:boolean) => {
+      const payload=normalizeProviderPayload(label); payload.sessionSystemText=contract;
+      await provider.send(id,payload); count++;
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(count), { timeout: 5000 });
+      const prompt=(await requests()).filter(x=>x.method==='session/prompt').at(-1).params.prompt[0].text;
+      expect(prompt.split(contract).length-1).toBe(injected?1:0);
+      if(label!=='/compact') expect(Number(done.mock.calls.at(-1)![1].metadata.usage.input_tokens)).toBeGreaterThan(0);
+      return prompt;
+    };
+    const first=await send('ordinary one',true);
+    await send('ordinary two',false); await send('ordinary three',false); await send('ordinary four',false);
+    const native=(await requests()).find(x=>x.method==='session/prompt').params.sessionId;
+    const logs=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs'); await mkdir(logs,{recursive:true});
+    await writeFile(path.join(logs,'transcript.jsonl'),JSON.stringify({step_index:10,source:'USER_EXPLICIT',type:'USER_INPUT',status:'DONE',created_at:'2026-11-12T00:00:00Z',content:'<CONTEXT_SUMMARY>summary</CONTEXT_SUMMARY>'})+'\n');
+    const restored=await send('after summary',true);
+    expect(restored.slice(0,restored.indexOf('after summary'))).toBe(first.slice(0,first.indexOf('ordinary one')));
+    await send('post summary ordinary',false);
+    provider.setSessionAgentId(id,'model-b'); await send('after set model',true); await send('post set ordinary',false);
+    await provider.applySessionModel(id,'model-a'); await send('after apply model',true); await send('post apply ordinary',false);
+    await send('/compact',false); await send('after compact',true); await send('post compact ordinary',false);
+    provider.refreshSessionSystemText(id); await send('after clear',true); await send('post clear ordinary',false);
+    id=await route(provider,id,{fresh:true}); await send('after initialize',true); await send('post initialize ordinary',false);
+  });
+  it('keeps registered originals through real runtime fresh initialization, injects once and withdraws without resurrection',async()=>{
+    const {provider,requests,root}=await setup();const key='deck_test_agy_reset_contract';
+    vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH',path.join(root,'contracts-queue.sqlite'));resetTransportQueueStoreForTests();
+    let runtime=new TransportSessionRuntime(provider,key);const config={sessionKey:key,sessionInstanceId:'logical-owner',cwd:root,agentId:'model-a',systemPrompt:'Original system'};
+    let n=0;
+    const send=async(body?:string)=>{
+      const before=(await requests()).filter(r=>r.method==='session/prompt').length;
+      runtime.send('ordinary-'+(++n),'id-'+n,undefined,undefined,body===undefined?undefined:{registeredSystemContract:{contractId:'dynamic',signature:body,body}});
+      await vi.waitFor(async()=>expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(before+1), { timeout: 5000 });
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      return (await requests()).filter(r=>r.method==='session/prompt').at(-1).params.prompt.map((b:any)=>b.text??'').join('');
+    };
+    try {
+      await runtime.initialize(config);
+      expect(await send('COMPLETE ORIGINAL REGISTERED BODY')).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      for(const extra of [{fresh:true},{startupMemoryAlreadyInjected:true},{runtimeEpoch:'next-runtime'}]) {
+        await runtime.initialize({...config,...extra});
+        expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+        expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      }
+      // Real /clear creates a new Runtime object; closing/reopening the
+      // private store also models daemon restore, not module-global retention.
+      await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'restored-epoch'});
+      expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      await send('');await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'after-withdrawal'});
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+    } finally {await runtime.kill();resetTransportQueueStoreForTests();}
+  });
+  it.each(['usage-missing','usage-zero','usage-used'])('reports positive current ACP occupancy (%s)', async scenario => {
+    const {provider}=await setup(scenario); const id=await route(provider); const done=vi.fn(),usage=vi.fn(); provider.onComplete(done);provider.onUsage(usage);
+    const p=normalizeProviderPayload('hello');p.sessionSystemText='full system contract '.repeat(100);
+    await provider.send(id,p); await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const value=done.mock.calls[0][1].metadata.usage;
+    if(scenario==='usage-used') expect(value).toMatchObject({input_tokens:45000,model_context_window:1000000});
+    else { expect(value.input_tokens).toBeGreaterThan(100);expect(value.context_usage_estimated).toBe(true); }
+    expect(usage.mock.calls.some(([,u])=>u.usage.input_tokens>0)).toBe(true);
+  });
+  it('synchronizes real ACP tool calls and native snapshots into canonical Agent lifecycles', async () => {
+    const {provider}=await setup('subagents');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'children');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const child=events.filter(t=>t.name==='Agent');expect(child.length).toBeGreaterThan(8);
+    for(const normalizedStatus of ['running','complete','error','interrupted']) expect(child.some(t=>t.detail?.meta?.normalizedStatus===normalizedStatus)).toBe(true);
+    const a=child.filter(t=>t.detail?.meta?.agentPath==='child-a'); expect(new Set(a.map(t=>t.id)).size).toBe(1);
+    expect(a.at(-1)?.detail?.meta?.terminal).toBe(true);
+    expect(child.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=child.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=child.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe('complete');
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe('error');
+    expect(child.some(t => t.detail?.meta?.model === 'model-a')).toBe(true);
+
+    // Active child transcript PLANNER_RESPONSE model overrides inherited model cleanly.
+    const state = (provider as any).sessions.get(id);
+    (provider as any).handleSessionUpdate({
+      sessionId: state.acpSessionId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'launch-transcript-model',
+        title: 'Run invoke_subagent',
+        status: 'completed',
+        rawInput: { Role: 'TranscriptChild', Prompt: 'inspect' },
+        rawOutput: JSON.stringify({ conversationId: 'child-transcript-active', status: 'running' }),
+      },
+    });
+    expect(events.at(-1)?.detail?.meta).toMatchObject({
+      agentPath: 'child-transcript-active',
+      model: 'model-a',
+      active: true,
+    });
+    (provider as any).handleAgyTranscriptRow(id, state, 'child-transcript-active', {
+      step_index: 10,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      model: 'gemini-4-hydrogen-high',
+      tool_calls: [{ name: 'read_file', args: {} }],
+    });
+    expect(events.at(-1)?.detail?.meta).toMatchObject({
+      agentPath: 'child-transcript-active',
+      model: 'gemini-4-hydrogen-high',
+      active: true,
+    });
+
+  });
+  it.each(['acp-child-json','acp-child-text','acp-child-inline','acp-child-update-only'])('tracks ACP-only launch results through real child and parent transcript callbacks (%s)',async scenario=>{
+    const {provider,requests}=await setup(scenario),id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,tool)=>events.push(tool));
+    await provider.send(id,'launch directly');
+    const state=(provider as any).sessions.get(id),childId='12345678-1234-1234-1234-123456789abc';
+    await vi.waitFor(()=>expect(state.agyBridges?.has(childId)).toBe(true),{timeout:3000});
+    await vi.waitFor(()=>expect(events.some(e=>e.detail?.meta?.agentPath===childId && e.detail?.meta?.terminal===true)).toBe(true),{timeout:5000});
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:5000});
+    expect(done.mock.calls.map(([,message])=>message.content)).toEqual(['PARENT-STARTED','PARENT-CONTINUED CHILD-RESULT']);
+    expect(events.every(e=>e.detail?.kind===SDK_SUBAGENT_DETAIL_KIND)).toBe(true);
+    expect(new Set(events.map(e=>e.id)).size).toBe(1);
+    if(scenario==='acp-child-inline') expect(events[0].detail?.input?.description).toBe('return child result');
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    await new Promise(r=>setTimeout(r,120));expect(done).toHaveBeenCalledTimes(2);
+  });
+  it.each(['stop','rebind'])('does not deliver ACP-only child or parent callback after %s',async action=>{
+    const {provider,root,requests}=await setup('acp-child-json'),id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,tool)=>events.push(tool));
+    await provider.send(id,'launch directly');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1),{timeout:5000});
+    const old=(provider as any).sessions.get(id);
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    const before=events.length;
+    await new Promise(r=>setTimeout(r,450));
+    expect(old.agyBridges.size).toBe(0);expect(done).toHaveBeenCalledTimes(1);expect(events).toHaveLength(before);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    const file=path.join(root,'.gemini/antigravity-cli/brain/native-1/.system_generated/logs/transcript_full.jsonl');
+    if (action === 'stop') {
+      expect(await readFile(file,'utf8')).toContain('PARENT-CONTINUED CHILD-RESULT');
+    } else {
+      expect(old.isolatedTransport).toBeUndefined();
+    }
+  });
+  it('never observes an input-only peer or a request UUID in unrelated launch output',async()=>{
+    const {provider,requests}=await setup('acp-child-json'),id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch directly');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:5000});
+    const state=(provider as any).sessions.get(id);
+    const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:state.acpSessionId,update});
+    update({sessionUpdate:'tool_call',toolCallId:'peer',title:'Run send_message',status:'in_progress',rawInput:{Recipient:'unrelated-peer',Prompt:'note'}});
+    update({sessionUpdate:'tool_call',toolCallId:'unresolved',title:'Run invoke_subagent',status:'in_progress',rawInput:{Prompt:'work'}});
+    update({sessionUpdate:'tool_call_update',toolCallId:'unresolved',status:'completed',rawOutput:'Request ID: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'});
+    expect([...state.agyBridges.keys()].sort()).toEqual(['12345678-1234-1234-1234-123456789abc','native-1']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it.each(['native-child-log','native-child-both','native-child-rpc-late','native-child-late','native-child-late-chunks'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:6000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    const children=events.filter(t=>t.name==='Agent');
+    expect(children.some(t=>t.detail?.meta?.agentPath==='native-child-fixture')).toBe(true);
+    await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true), { timeout: 5000 });
+    expect(new Set(children.filter(t=>t.detail?.meta?.agentPath==='native-child-fixture').map(t=>t.id)).size).toBe(1);
+    await new Promise(r=>setTimeout(r,500));expect(done).toHaveBeenCalledTimes(2);
+    const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
+  });
+  it('pairs native-first duplicate streams once per native step, not permanently by response text',async()=>{
+    const {provider,requests}=await setup('native-child-same-twice');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3),{timeout:5000});
+    await new Promise(r=>setTimeout(r,500));
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('does not mistake a previous late ACP reply for a new foreground successor child wake',async()=>{
+    const {provider,root,requests}=await setup('native-child-late');const id=await route(provider),messages:string[]=[],nativeSteps:number[]=[];
+    provider.onComplete((_,m)=>{
+      messages.push(m.content??'');
+      if(m.content==='PARENT-WOKE CHILD-PONG') {
+        const file=path.join(root,'.gemini/antigravity-cli/brain/native-1/.system_generated/logs/transcript_full.jsonl');
+        nativeSteps.push(Math.max(...readFileSync(file,'utf8').trim().split('\n').map(line=>JSON.parse(line).step_index)));
+      }
+    });
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(messages).toHaveLength(2), { timeout: 5000 });
+    await provider.send(id,'immediate successor');await vi.waitFor(()=>expect(messages).toHaveLength(4), { timeout: 5000 });
+    await new Promise(r=>setTimeout(r,500));
+    expect(nativeSteps).toEqual([5,11]);
+    expect(messages).toHaveLength(4);expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('uses independent native steps after async, ignoring unowned ACP even with repeated bodies',async()=>{
+    const {provider,root}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    const state=(provider as any).sessions.get(id),native=state.acpSessionId;
+    const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:native,update});
+    const before=deltas.mock.calls.length;
+    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Different response'}});
+    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(2);expect(deltas).toHaveBeenCalledTimes(before);
+    update({sessionUpdate:'tool_call_update',toolCallId:'launch-1',status:'completed'});
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    for(const [i,body] of ['Different response','PARENT-WOKE CHILD-PONG'].entries()) {
+      await appendFile(file,JSON.stringify({step_index:6+i*2,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=child content=result'})+'\n'+JSON.stringify({step_index:7+i*2,type:'PLANNER_RESPONSE',status:'DONE',content:body})+'\n');
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3+i), { timeout: 5000 });
+      expect(done.mock.calls.at(-1)![1].content).toBe(body);
+    }
+  });
+  it.each(['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'])('keeps an actively running successor foreground isolated from late prior chunks, usage and terminals (%s)',async scenario=>{
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    const start=deltas.mock.calls.length;
+    await provider.send(id,'successor foreground');
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    const successorDeltas = deltas.mock.calls.slice(start).filter(([,d])=>d.type==='text');
+    expect(successorDeltas.some(([,d])=>d.delta==='PARENT-WOKE '||d.delta==='CHILD-PONG')).toBe(false);
+    expect(successorDeltas.every(([,d])=>/:step:(9|11)$/.test(d.messageId))).toBe(true);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4),{timeout:5000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG',scenario==='native-child-same-foreground'?'PARENT-WOKE CHILD-PONG':'PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect(done.mock.calls[2][1].metadata.usage).toMatchObject({input_tokens:700,output_tokens:71});
+    expect(done.mock.calls[3][1].metadata.usage).toMatchObject({input_tokens:120,output_tokens:3});
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(4);
+  });
+  it('keeps async active steering correlated to the latest explicit native input without waiting for superseded output',async()=>{
+    const {provider,requests}=await setup('native-steering');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });expect(done.mock.calls[0][1].content).toBe('STEERED OWNED RESULT');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('attributes G1 output when active steering/ask_question answer writes no new USER_EXPLICIT row (G1 resolves first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g1-first');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G1-FIRST');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('defers absorbed G2 settlement until G1 finishes when G2 RPC resolves first',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g2-first');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await new Promise(r=>setTimeout(r,15));
+    expect(done).not.toHaveBeenCalled();
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G2-FIRST');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:200,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('fails boundedly without publishing unattributed ACP text when absorbed steering produces no terminal native output',async()=>{
+    const {provider}=await setup('absorbed-steering-no-native');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();
+    provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    await provider.send(id,'initial task');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    state.agyForeground.deadlineMs=30;
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(errors.mock.calls[0][1].message).toContain('could not be attributed');
+    expect(done).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+  });
+  it('keeps genuine G2 input logged after G2 RPC ACK attributable instead of dropping it as foreign (F1)',async()=>{
+    const {provider,requests}=await setup('native-steering-delayed-input');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','genuine steered prompt'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('STEERED DELAYED RESULT');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('does not promote pre-answer ask_question when G1 RPC settles before delayed continuation lands (F2: G1 first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g1-first-delayed');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G1-FIRST DELAYED');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('waits past pre-answer ask_question even when both G1 and G2 RPCs settle before delayed native continuation lands (F2: both RPCs first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-both-before-native');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const state=(provider as any).sessions.get(id);
+    // Flush bridge after fixture appends delayed row at 55ms so host EMFILE inotify limits cannot mask bridge delivery.
+    setTimeout(()=>{ void state.agyBridges?.get(state.acpSessionId)?.flush(); }, 80);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL BOTH-BEFORE-NATIVE');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
+    const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it.each(['stop','rebind'])('releases an unresolved native foreground wait on %s',async action=>{
+    const {provider,requests}=await setup('native-child-wait');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');const old=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(old.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(old); // Actual RPC has ended; native PLANNER has not.
+    expect(done).not.toHaveBeenCalled();
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await vi.waitFor(()=>expect(old.agyBridges.size).toBe(0), { timeout: 5000 });
+    await new Promise(r=>setTimeout(r,700));expect(done).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('fails boundedly without publishing unattributed async ACP text when the native output is absent',async()=>{
+    const {provider}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    // Shorten only the failure deadline on this captured owner, not file ordering/coalescing.
+    const {AgyForegroundOwnership}=await import('../../src/agent/agy-foreground-ownership.js');
+    (provider as any).sessions.get(id).agyForeground=new AgyForegroundOwnership(30);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(errors.mock.calls[0][1].message).toContain('could not be attributed');expect(done).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect((provider as any).sessions.get(id).agyBridges.size).toBe(0);
+  });
+  it('attributes foreground output once when a peer SYSTEM_MESSAGE arrives during active tool calls',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({step_index:3,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=peer content=mid-turn note'})+'\n'+
+      JSON.stringify({step_index:4,type:'PLANNER_RESPONSE',status:'DONE',content:'',tool_calls:[{name:'read_file',args:{Path:'/tmp/x'}}]})+'\n'+
+      JSON.stringify({step_index:5,type:'PLANNER_RESPONSE',status:'DONE',content:'FOREGROUND-AFTER-MID-TURN-MESSAGE'})+'\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('FOREGROUND-AFTER-MID-TURN-MESSAGE');
+    expect(errors).not.toHaveBeenCalled();
+    await new Promise(r=>setTimeout(r,200));
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+  it('attributes foreground output when native turn ends with tool_calls (e.g. ask_question)',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Please confirm before proceeding',
+        tool_calls: [{ name: 'ask_question', args: { question: 'Confirm?' } }],
+      }) + '\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('Please confirm before proceeding');
+    expect(errors).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.some(([,d])=>d.delta==='Please confirm before proceeding')).toBe(true);
+    await new Promise(r=>setTimeout(r,200));
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+  it('does not time out on a final ask_question tool response with empty content',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'ask_question', args: { question: 'Confirm?' } }],
+      }) + '\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    await new Promise(r=>setTimeout(r,200));
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+  it('settles a bound non-subagent tool-only turn cleanly without failing on native attribution deadline',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }],
+      }) + '\n' +
+      JSON.stringify({
+        step_index: 4,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Command exited with code 0.',
+      }) + '\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+  });
+  it('does not replace delayed native final text with nonempty intermediate tool commentary',async()=>{
+    const {provider,requests}=await setup('native-child-commentary');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(errors).not.toHaveBeenCalled();
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('keeps ordinary no-async ACP chunk streaming before the prompt RPC terminates',async()=>{
+    const {provider}=await setup('stream-before-ack');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true), { timeout: 5000 });
+    expect(done).not.toHaveBeenCalled();await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });expect(done.mock.calls[0][1].content).toBe('direct stream');
+  });
+  it.each(['stop','rebind'])('discards native-first late ACP receipts across %s',async action=>{
+    const {provider}=await setup('native-child-late');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
+  });
+  it('reuses a completed native child cursor after send_message without replaying its old terminal',async()=>{
+    const {provider,requests}=await setup('native-child-reuse');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    const terminals=()=>events.filter(t=>t.name==='Agent'&&t.detail?.meta?.agentPath==='native-child-fixture'&&t.detail?.meta?.terminal);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });await vi.waitFor(()=>expect(terminals()).toHaveLength(1), { timeout: 5000 });
+    const key=terminals()[0].id;
+    await provider.send(id,'send child another assignment');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4), { timeout: 5000 });await vi.waitFor(()=>expect(terminals()).toHaveLength(2), { timeout: 5000 });
+    expect(terminals().every(t=>t.id===key)).toBe(true);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    expect(terminals()[1].output).toBe('REUSE-PONG');
+  });
+  it('closes native log observers on Stop and never revives the stopped parent',async()=>{
+    const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const state=(provider as any).sessions.get(id);await provider.cancel(id);
+    expect(state.agyBridges.size).toBe(0);await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(1);
+  });
+  it.each(['reordered', 'reject-b'])('Stop waits for all RPCs even after the last one settled (%s)', async scenario => {
+    const { provider } = await setup(scenario), id = await route(provider), errors = vi.fn();
+    provider.onError(errors);
+    await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
+    const state = (provider as any).sessions.get(id);
+    // The last RPC has ended/rejected but the original native A is still live.
+    await (provider as any).promptTerminals.get(state).catch(() => {});
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    const stopping = provider.cancelAndWait(id), confirmed = vi.fn();
+    const off = onConfirmedProviderStop(stopping, confirmed);
+    try {
+      await expect(Promise.race([stopping.then(() => 'stopped'), new Promise(resolve => setTimeout(() => resolve('timeout'), 300))])).resolves.toBe('stopped');
+      expect(confirmed).toHaveBeenCalledTimes(1);
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      await expect(provider.send(id, 'AFTER_STOP')).resolves.toBeUndefined();
+    } finally { off(); }
+  });
+  it('confirms an aggregate Stop on captured child death, not a single RPC rejection', async () => {
+    const { provider } = await setup('crash-on-cancel'), id = await route(provider), errors = vi.fn();
+    provider.onError(errors); await provider.send(id, 'A');
+    await provider.notifyActiveDelegation(id, notification('B'));
+    await expect(provider.cancelAndWait(id)).resolves.toBeUndefined();
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).toHaveBeenCalledTimes(1);
+  });
+  it('never cancels or confirms a replacement owner through a captured old Stop', async () => {
+    const { provider, requests } = await setup(), id = await route(provider), complete = vi.fn();
+    provider.onComplete(complete); await provider.send(id, 'A');
+    const stopping = provider.cancelAndWait(id), confirmed = vi.fn();
+    const rejected = expect(stopping).rejects.toThrow('changed');
+    const off = onConfirmedProviderStop(stopping, confirmed);
+    try {
+      await route(provider, id, { fresh: true });
+      await provider.send(id, 'NEW_OWNER'); await rejected;
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(complete.mock.calls[0]?.[1].content).toBe('NEW_OWNER');
+      expect(confirmed).not.toHaveBeenCalled();
+      expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
+    } finally { off(); }
+  });
+  it.each([
+    [PROVIDER_ERROR_CODES.CONFIG_ERROR, 'AG conversation has no trusted resume id or unused proof'],
+    [PROVIDER_ERROR_CODES.CONFIG_ERROR, 'Cannot persist AG native start; no process was started'],
+    [PROVIDER_ERROR_CODES.CANCELLED, 'AG start owner changed'],
+  ])('preserves structured durable barrier error %s: %s', async (code, message) => {
+    const error = agyNativeStartNotAttemptedError(message, code);
+    const { provider, requests } = await setup();
+    const id = await route(provider, undefined, { beforeNativeSessionStart: async () => { throw error; } });
+    await expect(provider.send(id, 'A')).rejects.toBe(error);
+    expect((await requests()).some(x => x.method === 'session/new')).toBe(false);
+  });
+
+  it.each([
+    [ACP_ERROR_PHASE.NEW_SESSION, 'newSession'],
+    [ACP_ERROR_PHASE.RESUME_SESSION, 'resumeSession'],
+    [ACP_ERROR_PHASE.LOAD_SESSION, 'loadSession'],
+    [ACP_ERROR_PHASE.CONFIRM_MODEL, 'unstable_setSessionModel'],
+    [ACP_ERROR_PHASE.PROMPT, 'prompt'],
+  ])('logs only safe structured ACP diagnostics during %s', async (phase, method) => {
+    const { provider } = await setup();
+    // Exercise the shared ACP engine's load option as well as AG's resume option.
+    if (phase === ACP_ERROR_PHASE.LOAD_SESSION) {
+      Object.defineProperty(provider, 'profile', { value: { ...(provider as any).profile, resumeWithoutReplay: false } });
+    }
+    const raw = 'PRIVATE_PROMPT /Users/private/path secret-token-value';
+    const error = Object.assign(new Error(raw), { code: -32602, data: { prompt: raw, path: raw } });
+    const warnings = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const errors = vi.fn(); provider.onError(errors);
+    try {
+      const id = await route(provider, undefined, phase === ACP_ERROR_PHASE.RESUME_SESSION || phase === ACP_ERROR_PHASE.LOAD_SESSION
+        ? { resumeId: 'native-existing' } : phase === ACP_ERROR_PHASE.CONFIRM_MODEL ? { agentId: 'model-b' } : {});
+      await (provider as any).startPerSessionAcpServer(id, (provider as any).sessions.get(id));
+      vi.spyOn((provider as any).sessions.get(id).isolatedTransport.connection, method).mockRejectedValue(error);
+      await provider.send(id, 'user prompt').catch(() => {});
+      await vi.waitFor(() => expect(errors).toHaveBeenCalled(), { timeout: 5000 });
+      expect(warnings.mock.calls.some(([fields]) => (fields as any)?.acpPhase === phase
+        && (fields as any)?.rpcCode === -32602 && (fields as any)?.errorCode === '-32602')).toBe(true);
+      const exposed = JSON.stringify({ warnings: warnings.mock.calls, errors: errors.mock.calls });
+      for (const secret of ['PRIVATE_PROMPT', '/Users/private/path', 'secret-token-value']) expect(exposed).not.toContain(secret);
+      if (phase === ACP_ERROR_PHASE.NEW_SESSION) expect(errors.mock.calls[0][1].message).toContain('session_restart reset=true');
+    } finally { warnings.mockRestore(); }
+  });
+
+  it('does not log arbitrary upstream error codes as safe identifiers', async () => {
+    const { provider } = await setup();
+    const warnings = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const id = await route(provider);
+      await (provider as any).startPerSessionAcpServer(id, (provider as any).sessions.get(id));
+      vi.spyOn((provider as any).sessions.get(id).isolatedTransport.connection, 'newSession').mockRejectedValue(Object.assign(new Error('private text'), { code: 'secret-token-value' }));
+      await expect(provider.send(id, 'A')).rejects.toMatchObject({ details: { acpPhase: ACP_ERROR_PHASE.NEW_SESSION, errorCode: 'unknown' } });
+      expect(warnings.mock.calls.some(([fields]) => (fields as any)?.acpPhase === ACP_ERROR_PHASE.NEW_SESSION
+        && (fields as any)?.errorCode === 'unknown' && !('rpcCode' in (fields as any)))).toBe(true);
+      expect(JSON.stringify(warnings.mock.calls)).not.toContain('secret-token-value');
+    } finally { warnings.mockRestore(); }
+  });
+
+  it('holds session/new behind durable ownership and preserves queued no-start evidence', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider, undefined, { beforeNativeSessionStart: async () => { throw new Error('disk failed'); } });
+    await expect(provider.send(id, 'A')).rejects.toMatchObject({ details: { [AGY_NATIVE_START_NOT_ATTEMPTED]: true } });
+    expect((await requests()).some(x => x.method === 'session/new')).toBe(false);
+  });
+  it('retries a transient initial model rejection without changing the selected model or native conversation', async () => {
+    const { provider, requests } = await setup('model-error-once');
+    const id = await route(provider, undefined, { agentId: 'model-b' });
+    await expect(provider.send(id, 'first')).rejects.toBeTruthy();
+    await expect(provider.send(id, 'retry')).resolves.toBeUndefined();
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(1), { timeout: 5000 });
+    const rows = await requests();
+    expect(rows.filter(x => x.method === 'session/new')).toHaveLength(1);
+    expect(rows.filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-b']);
+  });
+  it('does not prompt or publish a late new-session result after Stop', async () => {
+    const { provider, requests } = await setup('late-new'); const id = await route(provider); const info = vi.fn(); provider.onSessionInfo(info);
+    const sending = provider.send(id, 'A'); const rejected = expect(sending).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    await vi.waitFor(async () => expect((await requests()).some(x => x.method === 'session/new')).toBe(true), { timeout: 5000 });
+    await provider.cancel(id); await rejected;
+    expect((await requests()).some(x => x.method === 'session/prompt')).toBe(false); expect(info).not.toHaveBeenCalled();
+  });
+  it('resumes exact native IDs without fresh fallback or replay, and isolates main/sub routes', async () => {
+    const { provider, requests } = await setup(); const a = await route(provider, 'deck_test_agy_main', { resumeId: 'persisted-main' }); const b = await route(provider, 'deck_test_agy_sub', { resumeId: 'persisted-sub' });
+    await provider.send(a, 'A'); await provider.send(b, 'A');
+    const rows = await requests(); expect(rows.filter(x => x.method === 'session/resume').map(x => x.params.sessionId)).toEqual(['persisted-main', 'persisted-sub']); expect(rows.some(x => x.method === 'session/new' || x.method === 'session/load')).toBe(false);
+    const missing = await route(provider, 'deck_test_agy_missing', { resumeId: 'missing-native' }); await expect(provider.send(missing, 'A')).rejects.toBeTruthy(); expect((await requests()).some(x => x.method === 'session/new')).toBe(false);
+  });
+  it('selects pending B only on the next idle turn and reports confirmed models', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider); const complete = vi.fn(), info: SessionInfoUpdate[] = []; provider.onComplete(complete); provider.onSessionInfo((_id, update) => info.push(update));
+    await provider.send(id, 'A'); provider.setSessionAgentId(id, 'model-b');
+    expect(info.filter(x => x.model === 'model-b')).toHaveLength(0);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete.mock.calls[0]?.[1].metadata.model).toBe('model-a');
+    await provider.send(id, 'A'); expect(info.some(x => x.model === 'model-b')).toBe(true);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    provider.setSessionAgentId(id, 'model-a'); await provider.send(id, 'A');
+    expect((await requests()).filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-a']);
+  });
+  it('ACKs busy selection without changing captured actual or steering, then uses B on the next turn', async () => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider);
+    const hold = path.join(root, 'rpc.jsonl.hold');
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await Promise.all([writeFile(hold, 'hold'), writeFile(modelHold, 'hold')]);
+    const complete = vi.fn(), info = vi.fn(); provider.onComplete(complete); provider.onSessionInfo(info);
+    try {
+      await provider.send(id, 'A');
+      const switching = provider.applySessionModel(id, 'model-b');
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+      expect(complete).not.toHaveBeenCalled();
+      const repeated = provider.applySessionModel(id, 'model-b');
+      await rm(modelHold, { force: true });
+      expect(await switching).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await repeated).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
+      expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+      await provider.notifyActiveDelegation(id, notification('STEER_AFTER_SELECTION'));
+      await vi.waitFor(async () => expect((await requests()).filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']), { timeout: 5000 });
+    } finally { await Promise.all([rm(hold, { force: true }), rm(modelHold, { force: true })]); }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
+    expect(info.mock.calls.at(-1)?.[1].model).toBe('model-b');
+    expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
+    await provider.send(id, 'NEXT_TURN');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1][1].metadata.model).toBe('model-b');
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
+    expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-b');
+  });
+
+  it('converges sessionInfo immediately on settle for rapid A->B->C, A->B->A, and reactive->idle transitions without duplicate set_model', async () => {
+    const { provider, requests, root } = await setup();
+    const id = await route(provider);
+    const complete = vi.fn();
+    const info: SessionInfoUpdate[] = [];
+    provider.onComplete(complete);
+    provider.onSessionInfo((_id, update) => info.push(update));
+
+    const hold = path.join(root, 'rpc.jsonl.hold');
+    await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'TURN_1');
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/prompt')).toBe(true), { timeout: 5000 });
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(info.filter(x => x.model === 'model-c')).toHaveLength(0);
+    } finally {
+      await rm(hold, { force: true });
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
+    expect(info.filter(x => x.model).at(-1)?.model).toBe('model-c');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(r => r.params.modelId)).toEqual(['model-b', 'model-c']);
+
+    // Mid-turn A->B->A returns LIVE immediately when reverting to the running turn model.
+    await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'TURN_2');
+      await vi.waitFor(async () => expect((await requests()).filter(row => row.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE);
+      expect(info.filter(x => x.model).at(-1)?.model).toBe('model-c');
+    } finally {
+      await rm(hold, { force: true });
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1][1].metadata.model).toBe('model-c');
+
+    // Reactive -> foreground-idle boundary reconciles an unconfirmed model once reactive work clears.
+    const state = (provider as any).sessions.get(id);
+    state.agyReactive = true;
+    provider.setSessionAgentId(id, 'model-b');
+    state.agyReactive = false;
+    (provider as any).syncAgyStatusAfterTurn(id, state);
+    await vi.waitFor(() => expect(info.filter(x => x.model).at(-1)?.model).toBe('model-b'), { timeout: 5000 });
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(r => r.params.modelId)).toEqual(['model-b', 'model-c', 'model-b', 'model-c', 'model-b']);
+  });
+
+  it('orders C after a delayed B but never publishes the superseded B ACK', async () => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    provider.onSessionInfo(info);
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'model-c');
+      await rm(modelHold, { force: true });
+      expect(await second).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
+    expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
+  });
+  it.each(['cancel', 'replace', 'disconnect'])('rejects a delayed model ACK after %s without stale actual', async action => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'A'); provider.onSessionInfo(info);
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const switching = provider.applySessionModel(id, 'model-b'); const rejected = expect(switching).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      if (action === 'cancel') await provider.cancel(id);
+      else if (action === 'replace') await route(provider, id, { fresh: true });
+      else await provider.disconnect();
+      await rm(modelHold, { force: true });
+      await rejected;
+    } finally { await rm(modelHold, { force: true }); }
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+  });
+  it.each(['model-error', 'model-unsupported'])('does not report false model success on %s', async scenario => {
+    const { provider } = await setup(scenario); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    provider.onSessionInfo(info);
+    await expect(provider.applySessionModel(id, 'model-b')).rejects.toBeTruthy();
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+    await provider.send(id, 'after-rejection');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+  });
+  it('reapplies A after a delayed superseded B instead of trusting the old A cache', async () => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider);
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'model-a');
+      await rm(modelHold, { force: true });
+      expect(await second).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-a']);
+  });
+  it('returns to the retained selection if C fails after superseding a pending B', async () => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    provider.onSessionInfo(info);
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const old = provider.applySessionModel(id, 'model-b'); const rejected = expect(old).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const failed = provider.applySessionModel(id, 'invalid');
+      await rm(modelHold, { force: true });
+      await expect(failed).rejects.toBeTruthy(); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
+    await provider.send(id, 'after-failed-c');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'invalid', 'model-a']);
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+  });
+
+  it('bounds a model RPC timeout, rejects its late ACK, and recovers on a new confirmed selection', async () => {
+    const { provider } = await setup('model-timeout'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+    provider.onSessionInfo(info);
+    await expect(provider.applySessionModel(id, 'model-b')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR });
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+    expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
+    await provider.send(id, 'after-timeout');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
+  }, 10000);
+
+  it('keeps an unloaded selection next-start without creating native work', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    expect((await requests()).some(row => row.method === 'session/new' || row.method === 'session/set_model')).toBe(false);
+  });
+
+  it.each(['deck_test_agy_main', 'deck_test_agy_sub'])('confirms a pending unloaded choice when restoring %s without native creation', async name => {
+    const { provider, requests } = await setup();
+    const id = await route(provider, name, { resumeId: 'owned-native' }); const info = vi.fn();
+    provider.onSessionInfo(info);
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    expect(await provider.restoreSession(id)).toBe(true);
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
+    expect((await requests()).some(row => row.method === 'session/new')).toBe(false);
+    expect((await requests()).find(row => row.method === 'session/set_model').params).toEqual({ sessionId: 'owned-native', modelId: 'model-b' });
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
+  });
+
+  it('passes combined native base-model/thought IDs unchanged and captures the original executor choice', async () => {
+    const { provider, requests, root } = await setup();
+    const id = await route(provider, undefined, { agentId: 'gemini-3.8-flash-low' }); const done = vi.fn(); provider.onComplete(done);
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(await provider.applySessionModel(id, 'gemini-3.8-flash-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    const hold = path.join(root, 'rpc.jsonl.hold'); await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'A');
+      expect(await provider.applySessionModel(id, 'gemini-4-carbon-medium')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    } finally { await unlink(hold); }
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1][1].metadata.model).toBe('gemini-3.8-flash-high');
+    await provider.send(id, 'next'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2][1].metadata.model).toBe('gemini-4-carbon-medium');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-3.8-flash-low', 'gemini-3.8-flash-high', 'gemini-4-carbon-medium']);
+  });
+
+  it('defaults new sessions without agentId and cached listModels defaultModel to gemini-4-hydrogen-high when supported', async () => {
+    const { provider, requests } = await setup('legacy-flash-default');
+    const id = 'deck_test_agy_acp_default';
+    const done = vi.fn();
+    provider.onComplete(done);
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    await provider.send(id, 'hello');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-4-hydrogen-high']);
+    expect((await provider.listModels()).defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(provider.getCachedModels()?.defaultModel).toBe('gemini-4-hydrogen-high');
+
+    // Resumed native session without explicit agentId ALSO locks to gemini-4-hydrogen-high
+    // rather than adopting upstream's unpersisted default currentModelId.
+    const resumedId = 'deck_test_agy_acp_resumed';
+    await provider.createSession({ sessionKey: resumedId, sessionName: resumedId, cwd: process.cwd(), resumeId: 'owned-native' });
+    await provider.send(resumedId, 'resumed turn');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-4-hydrogen-high', 'gemini-4-hydrogen-high']);
+  });
+
+  it('locks both newSession and resumeSession against upstream gemini-4-carbon-medium while honoring explicit agentId and fallback listModels', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default');
+    // Before any ACP session loads, listModels falls back to static AGY models + gemini-4-hydrogen-high default.
+    expect(provider.getCachedModels()).toBeNull();
+    const preloaded = await provider.listModels();
+    expect(preloaded.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(preloaded.isAuthenticated).toBe(true);
+    expect(preloaded.models.some(m => m.id === 'gemini-4-hydrogen-high')).toBe(true);
+
+    const emittedModels: Array<[string, string]> = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (info.model) emittedModels.push([sid, info.model]);
+    });
+    provider.onComplete(done);
+
+    // 1) Resumed session without explicit agentId: must apply gemini-4-hydrogen-high and never emit carbon-medium.
+    const defaultResume = 'deck_test_agy_carbon_default_resume';
+    await provider.createSession({ sessionKey: defaultResume, sessionName: defaultResume, cwd: process.cwd(), resumeId: 'native-default-1' });
+    expect(await provider.restoreSession(defaultResume)).toBe(true);
+    await provider.send(defaultResume, 'after daemon restart');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // 2) Resumed session WITH explicit user-selected model: must replay gemini-4-argon-high and never emit carbon-medium or hydrogen-high.
+    const customResume = 'deck_test_agy_carbon_custom_resume';
+    await provider.createSession({ sessionKey: customResume, sessionName: customResume, cwd: process.cwd(), resumeId: 'native-custom-1', agentId: 'gemini-4-argon-high' });
+    await provider.send(customResume, 'custom model turn');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    expect(emittedModels.some(([, m]) => m === 'gemini-4-carbon-medium')).toBe(false);
+    expect(emittedModels.filter(([sid]) => sid === defaultResume).every(([, m]) => m === 'gemini-4-hydrogen-high')).toBe(true);
+    expect(emittedModels.filter(([sid]) => sid === customResume).every(([, m]) => m === 'gemini-4-argon-high')).toBe(true);
+
+    const setModelCalls = (await requests()).filter(row => row.method === 'session/set_model').map(row => ({
+      sessionId: row.params.sessionId,
+      modelId: row.params.modelId,
+    }));
+    expect(setModelCalls).toEqual([
+      { sessionId: 'native-default-1', modelId: 'gemini-4-hydrogen-high' },
+      { sessionId: 'native-custom-1', modelId: 'gemini-4-argon-high' },
+    ]);
+
+    // 3) Cached/live listModels retains full upstream dynamic list for manual switching, with defaultModel locked to gemini-4-hydrogen-high.
+    const postLoaded = await provider.listModels();
+    expect(postLoaded.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(postLoaded.models.map(m => m.id)).toEqual([
+      'gemini-4-carbon-medium',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(provider.getCachedModels()?.defaultModel).toBe('gemini-4-hydrogen-high');
+  });
+
+  it('does not submit a prompt if native model selection fails', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider, undefined, { agentId: 'invalid' });
+    await expect(provider.send(id, 'A')).rejects.toBeTruthy(); expect((await requests()).some(x => x.method === 'session/prompt')).toBe(false);
+  });
+  it('keeps a timed-out write pending and deduplicates its retry before native submission', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    await provider.send(id, 'A');
+    const tracker = (provider as any).sessions.get(id).isolatedTransport.connection.connection;
+    let release!: () => void; tracker.writeQueue = new Promise<void>(resolve => { release = resolve; });
+    let admitted = false;
+    const first = provider.notifyActiveDelegation(id, notification('B')).then(x => { admitted = true; return x; });
+    await new Promise(resolve => setTimeout(resolve, 25)); expect(admitted).toBe(false);
+    const retry = provider.notifyActiveDelegation(id, notification('B')); release();
+    expect(await first).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED); expect(await retry).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+  });
+  it('isolates child death to this provider and never replays the admitted B', async () => {
+    const { provider, requests } = await setup('crash'); const id = await route(provider), errors = vi.fn(), complete = vi.fn();
+    provider.onError(errors); provider.onComplete(complete);
+    await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+  it('replaces a pending startup owner even when the canonical route is unchanged', async () => {
+    const { provider, requests } = await setup(); let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const id = await route(provider, 'deck_test_agy_owner', { beforeNativeSessionStart: () => gate });
+    const oldSend = provider.send(id, 'old-owner').then(() => 'sent', error => error.code);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    try {
+      await route(provider, id, { beforeNativeSessionStart: async () => {} });
+      await expect(provider.send(id, 'new-owner')).resolves.toBeUndefined();
+    } finally { release(); }
+    expect(await oldSend).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']), { timeout: 5000 });
+  });
+  it('ignores old native-session updates and terminals after delete/recreate of the route', async () => {
+    const { provider } = await setup(); const id = await route(provider); const complete = vi.fn(), deltas = vi.fn(); provider.onComplete(complete); provider.onDelta(deltas);
+    await provider.send(id, 'A');
+    await provider.createSession({ sessionKey: id, cwd: process.cwd(), fresh: true, agentId: 'model-a' });
+    await provider.send(id, 'new-owner'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await new Promise(resolve => setTimeout(resolve, 650));
+    expect(complete).toHaveBeenCalledTimes(1); expect(complete.mock.calls[0]?.[1].content).toBe('new-owner');
+    expect(deltas.mock.calls.some(x => x[1].delta === 'A')).toBe(false);
+  });
+  it('suppresses all resume replay and keeps the current real error visible', async () => {
+    const { provider } = await setup('resume-history'); const id = await route(provider, undefined, { resumeId: 'saved-id' });
+    const deltas = vi.fn(), complete = vi.fn(); provider.onDelta(deltas); provider.onComplete(complete);
+    await provider.send(id, 'A'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1].content).toBe('A'); expect(deltas.mock.calls.some(x => x[1].delta.includes('OLD_ERROR'))).toBe(false);
+  });
+  it('includes stable system instructions once per native history and reasserts after refresh', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider), complete = vi.fn(); provider.onComplete(complete);
+    const base = normalizeProviderPayload('A');
+    const input = { ...base, sessionSystemText: 'IDENTITY_TEST_334', context: { ...base.context, sessionSystemText: 'IDENTITY_TEST_334' } };
+    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    provider.refreshSessionSystemText(id); await provider.send(id, input);
+    // send resolves at native write, before the peer necessarily logs receipt.
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3), { timeout: 5000 });
+    const text = (await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text);
+    expect(text.map(x => x.includes('IDENTITY_TEST_334'))).toEqual([true, false, true]);
+  });
+  it.each(['env', 'home'])('probes and initializes the same CLI without binaryPath on sparse PATH (%s)', async source => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-path-'));
+    const binary = path.join(root, source === 'home' ? '.local/bin/agy' : 'chosen-agy');
+    await mkdir(path.dirname(binary), { recursive: true });
+    const argvLog = path.join(root, 'argv.log'), rpcLog = path.join(root, 'rpc.jsonl');
+    await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${argvLog}'\nexec '${process.execPath}' '${path.resolve('test/fixtures/agy-acp.mjs')}' "$@"\n`, { mode: 0o700 });
+    vi.stubEnv('HOME', root); vi.stubEnv('PATH', '/usr/bin:/bin');
+    vi.stubEnv(AGY_CLI_PATH_ENV, source === 'env' ? binary : '');
+    const config = { env: { HOME: root, PATH: '/usr/bin:/bin', AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: rpcLog } };
+    const provider = await createAgyProvider(config) as AgyAcpProvider;
+    resources.push({ provider, root });
+    // Resolution is frozen at the version probe, not repeated against changed env.
+    vi.stubEnv(AGY_CLI_PATH_ENV, path.join(root, 'not-the-probed-cli'));
+    await provider.connect(config);
+    expect(provider).toBeInstanceOf(AgyAcpProvider);
+    expect((await readFile(argvLog, 'utf8')).trim().split('\n')).toEqual(['--version']);
+    const id = await route(provider);
+    await provider.send(id, 'warm');
+    expect((await readFile(argvLog, 'utf8')).trim().split('\n')).toEqual(['--version', 'acp --stdio --dangerously-skip-permissions']);
+    const rows = (await readFile(rpcLog, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
+    expect(rows.some(x => x.method === 'initialize')).toBe(true);
+  });
+  it('forwards autonomous wakeup turn stream, maintains provider/runtime busy state, and settles on turn_completed', async () => {
+    const { provider, root } = await setup();
+    const id = 'deck_test_agy_auto_wakeup';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const statuses: string[] = [];
+    runtime.onStatusChange = s => statuses.push(s);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const deltas: string[] = [], tools: ToolCallEvent[] = [], completed: any[] = [];
+    provider.onDelta((sid, d) => { if (sid === id) deltas.push(d.delta); });
+    provider.onToolCall((sid, t) => { if (sid === id) tools.push(t); });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+
+    const startHold = path.join(root, 'rpc.jsonl.auto-start-hold');
+    const thoughtHold = path.join(root, 'rpc.jsonl.auto-thought-hold');
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    await writeFile(startHold, 'hold');
+    await writeFile(thoughtHold, 'hold');
+    await writeFile(autoHold, 'hold');
+    try {
+      runtime.send('SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Release startHold so autonomous wakeup turn begins with agent_thought_chunk while thoughtHold is held.
+      await unlink(startHold);
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('thinking'), { timeout: 5000 });
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        busyReasons: ['provider_wait'],
+      });
+
+      // Release thoughtHold so tool_call (in_progress) is emitted while autoHold is held.
+      await unlink(thoughtHold);
+      await vi.waitFor(() => expect(tools.some(t => t.id === 'edit-1' && t.status === 'running')).toBe(true), { timeout: 5000 });
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 1,
+        busyReasons: ['provider_wait', 'open_tool_call'],
+      });
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        activeToolCount: 1,
+        busyReasons: expect.arrayContaining(['provider_wait', 'open_tool_call']),
+      });
+      expect((runtime as any)._openTools.get('edit-1')).toMatchObject({
+        name: 'edit_file',
+        status: 'running',
+      });
+    } finally {
+      await unlink(startHold).catch(() => {});
+      await unlink(thoughtHold).catch(() => {});
+      await unlink(autoHold).catch(() => {});
+    }
+
+    await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+    expect(runtime.getStatus()).toBe('idle');
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(deltas).toContain('AUTONOMOUS_WAKEUP_DONE');
+    expect(tools.some(t => t.id === 'edit-1' && t.status === 'complete')).toBe(true);
+    expect(completed[1]).toMatchObject({
+      content: 'AUTONOMOUS_WAKEUP_DONE',
+      metadata: {
+        model: 'model-a',
+        usage: { inputTokens: 22, outputTokens: 11 },
+      },
+    });
+    await runtime.kill();
+  });
+  it('converges auto -> external steering to a single terminal and prevents delayed frames after Stop from reviving an autonomous turn', async () => {
+    const { provider, root, requests } = await setup('late-after-cancel');
+    const id = await route(provider);
+    const complete = vi.fn(), errors = vi.fn(), deltas = vi.fn();
+    provider.onComplete(complete); provider.onError(errors); provider.onDelta(deltas);
+
+    // 1. auto -> external steering converges to a single terminal onComplete.
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    const autoCancelHold = path.join(root, 'rpc.jsonl.auto-cancel-hold');
+    await writeFile(autoHold, 'hold');
+    try {
+      await provider.send(id, 'SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
+      expect(await provider.notifyActiveDelegation(id, notification('STEER_IN_AUTO'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      await vi.waitFor(async () => expect((await requests()).some((r) =>
+        r.method === 'session/prompt' && JSON.stringify(r.params?.prompt ?? '').includes('STEER_IN_AUTO')
+      )).toBe(true), { timeout: 5000 });
+    } finally {
+      await unlink(autoHold).catch(() => {});
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1]?.[1].content).toBe('AUTONOMOUS_WAKEUP_DONE STEER_IN_AUTO');
+    expect(errors).not.toHaveBeenCalled();
+
+    // 2. Stop / cancelAndWait during an autonomous turn waits for native turn_completed before confirming, then ignores delayed post-Stop frames.
+    await writeFile(autoHold, 'hold');
+    await writeFile(autoCancelHold, 'hold');
+    try {
+      await provider.send(id, 'SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
+      let proof = false, resolved = false;
+      const stopping = provider.cancelAndWait(id);
+      stopping.then(() => { resolved = true; }, () => {});
+      const off = onConfirmedProviderStop(stopping, () => { proof = true; });
+      try {
+        await vi.waitFor(async () => expect((await requests()).some(r => r.fixture === 'auto-cancel-requested')).toBe(true), { timeout: 5000 });
+        expect(proof).toBe(false);
+        expect(resolved).toBe(false);
+        expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+        await unlink(autoCancelHold);
+        await expect(stopping).resolves.toBeUndefined();
+        expect(proof).toBe(true);
+        expect(resolved).toBe(true);
+      } finally {
+        off();
+      }
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(errors.mock.calls[0]?.[1].code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(complete).toHaveBeenCalledTimes(3);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(deltas.mock.calls.some(c => c[1].delta.includes('LATE_AFTER_STOP'))).toBe(false);
+    } finally {
+      await unlink(autoHold).catch(() => {});
+      await unlink(autoCancelHold).catch(() => {});
+    }
+  });
+  it('requires native terminal proof for Stop of an autonomous turn, retains queued work while cancel is ignored, and recovers once native terminal arrives', async () => {
+    const { provider, root, requests } = await setup('ignore-auto-cancel');
+    const id = 'deck_test_agy_auto_stop_proof';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: any[] = [], errors: any[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+    provider.onError((sid, e) => { if (sid === id) errors.push(e); });
+
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    await writeFile(autoHold, 'hold');
+    let off = () => {};
+    try {
+      runtime.send('SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
+      expect(runtime.send('QUEUED_SUCCESSOR', 'msg-after-auto-stop')).toBe('queued');
+
+      let proof = false, resolved = false;
+      const stop = provider.cancelAndWait(id);
+      stop.then(() => { resolved = true; }, () => {});
+      off = onConfirmedProviderStop(stop, () => { proof = true; });
+      await runtime.cancel();
+
+      await vi.waitFor(async () => expect((await requests()).some(row => row.fixture === 'cancel-ignored')).toBe(true), { timeout: 5000 });
+      const ignored = (await requests()).find(row => row.fixture === 'cancel-ignored');
+      expect(ignored?.inAutoWakeup).toBe(true);
+      expect(proof, 'cancel request is not native terminal proof').toBe(false);
+      expect(resolved).toBe(false);
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+      expect((await requests()).filter(row => row.method === 'session/prompt')).toHaveLength(1);
+
+      await unlink(autoHold);
+      await expect(stop).resolves.toBeUndefined();
+      expect(proof).toBe(true);
+      expect(resolved).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]?.content).toBe('QUEUED_SUCCESSOR');
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    } finally {
+      off();
+      await unlink(autoHold).catch(() => {});
+      await runtime.kill();
+    }
+  });
+  it('keeps the Windows shim entrypoint/prepend args, not just node.exe', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-shim-'));
+    const platform = process.platform;
+    try {
+      const scriptDir = path.join(root, 'node_modules', 'test-agy');
+      await mkdir(scriptDir, { recursive: true });
+      const script = path.join(scriptDir, 'cli.js'), shim = path.join(root, 'agy.cmd');
+      await writeFile(script, '#!/usr/bin/env node\n');
+      await writeFile(shim, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\test-agy\\cli.js" %*\r\n');
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      const config = { binaryPath: shim }, provider = new AgyAcpProvider();
+      const spawned = (provider as any).resolveAcpExecutable(config);
+      expect(spawned).toEqual(resolveAgyBinary(config));
+      expect(spawned.prependArgs).toEqual([script]);
+      expect(spawned.executable).toBe(process.execPath);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: platform });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('uses version-only selection, preserving unsupported CLI stream FIFO without retrying ACP errors', async () => {
+    const { root, binary } = await setup();
+    const old = await createAgyProvider({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_VERSION: '1.4.12' } }); expect(old).toBeInstanceOf(AgySdkProvider);
+    const current = await createAgyProvider({ binaryPath: binary, env: { HOME: root } }); expect(current).toBeInstanceOf(AgyAcpProvider);
+    expect(supportsAgyAcp('unrecognized')).toBe(false); expect(supportsAgyAcp('1.5.0')).toBe(true);
+  });
+  it('tracks AG native background run_command tasks across end_turn and settles cleanly on completion or server restart', async () => {
+    const { provider, root } = await setup('native-child-no-owned-output');
+    const id = 'deck_test_agy_bg_task';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const statuses: string[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+    runtime.onStatusChange = (status) => { statuses.push(status); };
+
+    try {
+      expect(runtime.send('launch', 'msg-bg-1')).toBe('sent');
+      const state = (provider as any).sessions.get(id);
+      await vi.waitFor(() => expect(state?.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+      await (provider as any).promptTerminals.get(state);
+      const native = state.acpSessionId as string;
+      const file = path.join(root, '.gemini/antigravity-cli/brain', native, '.system_generated/logs/transcript_full.jsonl');
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } }],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 4,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/task-11351`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 5,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'Running full unit suite in background...',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]?.content).toBe('Running full unit suite in background...');
+      await vi.waitFor(() => {
+        const snap = provider.getActiveWorkSnapshot(id);
+        expect(snap?.activeWorkCount).toBe(1);
+        expect(snap?.backgroundWorkCount).toBe(1);
+        expect(snap?.activeToolCount).toBe(0);
+        expect(snap?.busyReasons).toContain('background_monitor');
+        expect(snap?.busyReasons).not.toContain('open_tool_call');
+      }, { timeout: 5000 });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Completion SYSTEM_MESSAGE + reactive PLANNER_RESPONSE settles back to idle.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 6,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: `[Message] timestamp=2026-11-12T18:10:10Z sender=${native}/task-11351 priority=MESSAGE_PRIORITY_HIGH content=Task id "${native}/task-11351" finished with result:\nCommand exited with code 0.`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 7,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'BACKGROUND-TASK-DONE',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]?.content).toBe('BACKGROUND-TASK-DONE');
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0);
+
+      // Standing cron schedule does not hold the session busy; another background command + server restart settles to idle without a reactive PLANNER_RESPONSE.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [
+            { name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true, Prompt: 'tick' } },
+            { name: 'run_command', args: { CommandLine: 'sleep 60', WaitMsBeforeAsync: 5000 } },
+          ],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 9,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/cron-standing`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 10,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/task-22222`,
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => {
+        expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+          activeWorkCount: 1,
+          backgroundWorkCount: 1,
+          activeToolCount: 0,
+          busyReasons: ['background_monitor'],
+        });
+      }, { timeout: 5000 });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 11,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: 'All your subagents and background tasks have been stopped due to server restart.',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(0), { timeout: 5000 });
+      expect(runtime.getStatus()).toBe('idle');
+      expect(statuses).toContain('tool_running');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('starts an autonomous turn when wakeup session/update frames arrive in the same stdout chunk right after prompt end_turn', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-same-tick-'));
+    const holdFile = path.join(root, 'auto.hold');
+    const script = path.join(root, 'same-tick-agy.mjs');
+    const binary = path.join(root, 'agy');
+    await writeFile(holdFile, 'hold');
+    await writeFile(script, `
+import { createInterface } from 'node:readline';
+import { existsSync } from 'node:fs';
+const holdFile = ${JSON.stringify(holdFile)};
+const rl = createInterface({ input: process.stdin });
+const send = (lines) => process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\\n') + '\\n');
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '2.0.0' },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/new') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      sessionId: 'native-same-tick',
+      models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/prompt') {
+    send([
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'INITIAL_OK' } } } },
+      { jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } } } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'tool_call', toolCallId: 'edit-same-tick', title: 'Edit', kind: 'edit', status: 'running' } } },
+    ]);
+    const poll = setInterval(() => {
+      if (existsSync(holdFile)) return;
+      clearInterval(poll);
+      send([
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AUTO_SAME_TICK_DONE' } } } },
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'turn_completed' } } },
+      ]);
+    }, 5);
+  }
+});
+`);
+    await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+    const provider = new AgyAcpProvider();
+    resources.push({ provider, root });
+    await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+    const id = await route(provider, 'deck_test_same_tick');
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    try {
+      await provider.send(id, 'hello');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
+      expect(complete.mock.calls[0]?.[1].content).toBe('INITIAL_OK');
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1]?.[1].content).toBe('AUTO_SAME_TICK_DONE');
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('preserves second prompt text and settles idle when response(A), second chunk, and response(B) arrive in the same stdout chunk', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-dual-prompt-'));
+    const script = path.join(root, 'dual-prompt-agy.mjs');
+    const binary = path.join(root, 'agy');
+    await writeFile(script, `
+import { createInterface } from 'node:readline';
+const rl = createInterface({ input: process.stdin });
+const send = (lines) => process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\\n') + '\\n');
+let promptAId = null;
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '2.0.0' },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/new') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      sessionId: 'native-dual-prompt',
+      models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/prompt') {
+    if (promptAId === null) {
+      promptAId = msg.id;
+      send([
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-dual-prompt', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FIRST ' } } } },
+      ]);
+      return;
+    }
+    send([
+      { jsonrpc: '2.0', id: promptAId, result: { stopReason: 'end_turn' } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-dual-prompt', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'SECOND' } } } },
+      { jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } },
+    ]);
+  }
+});
+`);
+    await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+    const provider = new AgyAcpProvider();
+    resources.push({ provider, root });
+    await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+    const id = await route(provider, 'deck_test_dual_prompt');
+    const complete = vi.fn();
+    const deltas: string[] = [];
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onDelta((sid, evt) => {
+      if (sid === id && evt.type === 'text' && evt.delta) deltas.push(evt.delta);
+    });
+    provider.onError(errors);
+
+    await provider.send(id, 'FIRST');
+    await vi.waitFor(() => expect(deltas.join('')).toBe('FIRST '), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id, notification('SECOND'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete.mock.calls[0]?.[1].content).toBe('FIRST SECOND');
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('does not create bogus Agent cards or bleed sibling background/MCP outputs onto parallel subagent tool calls', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = await route(provider, 'deck_test_parallel_bleed');
+    const done = vi.fn();
+    const events: ToolCallEvent[] = [];
+    provider.onComplete(done);
+    provider.onToolCall((_, tool) => events.push(tool));
+
+    await provider.send(id, 'launch');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(
+      () => expect(events.some((e) => e.detail?.meta?.agentPath === 'native-child-fixture' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true),
+      { timeout: 5000 },
+    );
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    const isAgyAgentCard = (e: ToolCallEvent) =>
+      e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND
+      && e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+      && e.detail?.meta?.taskType !== SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
+    const beforeAgentCount = events.filter(isAgyAgentCard).length;
+    const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
+
+    // Case 1: send_message to IM.codes deck_sub_* in parallel with run_command background task & send_list_targets.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'peer-send-1',
+      title: 'Run send_message',
+      status: 'in_progress',
+      rawInput: { Recipient: 'deck_sub_602p4q1r', Message: 'ping' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'peer-send-1',
+      status: 'failed',
+      rawOutput: 'recipient not found',
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'mcp-list-1',
+      title: 'send_list_targets',
+      status: 'completed',
+      rawOutput: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: []',
+    });
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'send_message', args: { Recipient: 'deck_sub_602p4q1r', Message: 'ping' } },
+          { name: 'send_list_targets', args: {} },
+          { name: 'run_command', args: { CommandLine: 'sleep 10', WaitMsBeforeAsync: 5000 } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${nativeId}/task-999`,
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 12,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: []',
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 13,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'checked',
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(provider.getActiveWorkSnapshot(id)?.busyReasons).toContain('background_monitor');
+    }, { timeout: 5000 });
+    expect(events.filter(isAgyAgentCard)).toHaveLength(beforeAgentCount);
+    expect(events.filter((e) => e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT && e.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH)).toMatchObject([{
+      detail: {
+        summary: 'sleep 10',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+          taskId: `${nativeId}/task-999`,
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          backgrounded: true,
+          active: true,
+        },
+      },
+    }]);
+
+    // Case 2: parallel [invoke_subagent, run_command] where run_command's RUNNING row arrives first.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'parallel-launch-1',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'ParallelWorker', Prompt: 'work' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'parallel-launch-1',
+      status: 'completed',
+    });
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 14,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'ParallelWorker', Prompt: 'work' } },
+          { name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 15,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${nativeId}/task-1000`,
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 16,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'parallel-child-1', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      const bound = events.find((e) => e.detail?.meta?.agentPath === 'parallel-child-1');
+      expect(bound).toBeTruthy();
+      expect(bound?.output ?? '').not.toContain('Tool is running as a background task');
+    }, { timeout: 5000 });
+  });
+
+  it('preserves authoritative ACP rawOutput across out-of-order parallel MCP GENERIC rows without duplicating or leaking outputs', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = await route(provider, 'deck_test_f1_rawoutput_race');
+    const done = vi.fn();
+    const events: ToolCallEvent[] = [];
+    provider.onComplete(done);
+    provider.onToolCall((_, tool) => events.push(tool));
+
+    await provider.send(id, 'launch');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(
+      () => expect(events.some((e) => e.detail?.meta?.agentPath === 'native-child-fixture' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true),
+      { timeout: 5000 },
+    );
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
+
+    // Case 1: rawOutput-only subagent completes via ACP BEFORE sibling send_list_targets's
+    // GENERIC arrives and BEFORE send_list_targets's ACP update arrives.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-invoke-1',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'RealWorker', Prompt: 'do work' },
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-list-1',
+      title: 'send_list_targets',
+      status: 'in_progress',
+      rawInput: {},
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-invoke-1',
+      status: 'completed',
+      rawOutput: { conversationId: 'real-child', status: 'running' },
+    });
+
+    const eventsBeforeGeneric = events.filter((e) => e.detail?.meta?.agentPath === 'real-child').length;
+    expect(eventsBeforeGeneric).toBe(1);
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 20,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'RealWorker', Prompt: 'do work' } },
+          { name: 'send_list_targets', args: {} },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 21,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: MCPPARALLEL_RESULT',
+      }) + '\n',
+    );
+
+    // Sibling MCP update arrives AFTER both transcript rows have been consumed;
+    // real-child must NOT receive MCPPARALLEL_RESULT. A fixed sleep is flaky on
+    // loaded macOS runners, so wait on the reader's observable native order.
+    await vi.waitFor(() => {
+      // The GENERIC row consumes send_list_targets immediately; the remaining
+      // invoke_subagent order entry proves both transcript rows were handled.
+      expect(state.agyNativeToolOrder?.map((entry: { name: string }) => entry.name))
+        .toEqual(['invoke_subagent']);
+    }, { timeout: 5000 });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-list-1',
+      status: 'completed',
+      rawOutput: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: MCPPARALLEL_RESULT',
+    });
+
+    // Now the real child's own GENERIC row arrives later.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 22,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'real-child', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(state.agyConsumedNativeTools?.has('f1-invoke-1')).toBe(true);
+    }, { timeout: 5000 });
+
+    const realChildEvents = events.filter((e) => e.detail?.meta?.agentPath === 'real-child');
+    expect(realChildEvents).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain('"agentPath":"real-child","output":"Created At:');
+    expect(realChildEvents.some((e) => (e.output ?? '').includes('MCPPARALLEL_RESULT'))).toBe(false);
+    expect(state.agyNativeToolOrder).toEqual([]);
+
+    // Case 2: two parallel invoke_subagent calls (Alpha completes via ACP, Beta completes via
+    // transcript GENERIC first, Alpha's GENERIC arrives second).
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-alpha',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'Alpha', Prompt: 'alpha work' },
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-beta',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'Beta', Prompt: 'beta work' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-alpha',
+      status: 'completed',
+      rawOutput: { conversationId: 'child-alpha', status: 'running' },
+    });
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 23,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'Alpha', Prompt: 'alpha work' } },
+          { name: 'invoke_subagent', args: { Role: 'Beta', Prompt: 'beta work' } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 24,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'child-beta', status: 'running' }),
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 25,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'child-alpha', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.detail?.meta?.agentPath === 'child-beta')).toBe(true);
+      expect(state.agyConsumedNativeTools?.has('f1-alpha')).toBe(true);
+      expect(state.agyConsumedNativeTools?.has('f1-beta')).toBe(true);
+    }, { timeout: 5000 });
+
+    const alphaEvents = events.filter((e) => e.detail?.meta?.agentPath === 'child-alpha');
+    const betaEvents = events.filter((e) => e.detail?.meta?.agentPath === 'child-beta');
+    expect(alphaEvents).toHaveLength(1);
+    expect(betaEvents).toHaveLength(1);
+    expect(alphaEvents[0].detail?.meta?.agentName).toBe('Alpha');
+    expect(betaEvents[0].detail?.meta?.agentName).toBe('Beta');
+    expect(state.agyNativeToolOrder).toEqual([]);
+  });
+
+  it('cancel() when !promptInFlight clears background tasks, open tool calls, and waiting status without a synthetic error', async () => {
+    const { provider } = await setup();
+    const id = await route(provider);
+    const completed: Array<{ content: string }> = [];
+    const errors: unknown[] = [];
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onComplete((_sid, msg) => completed.push({ content: msg.content }));
+    provider.onError((_sid, err) => errors.push(err));
+    provider.onStatus((_sid, status) => statuses.push({ status: status.status, label: status.label }));
+
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    expect(state.promptInFlight).toBe(false);
+
+    // Simulate active background task + non-in-flight open tool call + waiting status.
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-stale-bg`,
+      toolName: 'run_command',
+    });
+    (provider as any).handleToolCall(id, state, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'orphan-tool-call',
+      title: 'Bash',
+      status: 'in_progress',
+    });
+    expect(state.promptInFlight).toBe(false);
+
+    await vi.waitFor(() => {
+      const snap = provider.getActiveWorkSnapshot(id);
+      expect(snap?.activeWorkCount).toBeGreaterThan(0);
+      expect(snap?.busyReasons).toContain('background_monitor');
+      expect(snap?.busyReasons).toContain('open_tool_call');
+    }, { timeout: 5000 });
+
+    await provider.cancel(id);
+
+    expect(errors).toHaveLength(0);
+    expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+    expect(state.toolCalls.size).toBe(0);
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+
+    await provider.send(id, 'follow up');
+    await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+  });
+
+  it('dispatches plain-text append sends immediately while background tasks run with !promptInFlight', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_append';
+    const completed: Array<{ content: string }> = [];
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+      expect(state.promptInFlight).toBe(false);
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-bg-append`,
+        toolName: 'run_command',
+      });
+
+      const snap = provider.getActiveWorkSnapshot(id);
+      expect(snap).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      expect(runtime.send('plain append while bg runs', 'bg-plain-1', undefined, undefined, {
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      })).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(runtime.pendingEntries).toEqual([]);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('clears provisional ACP tools on useAgyNativeOutput and ignores status-less late tool_call_update when idle', async () => {
+    const { provider } = await setup();
+    const id = await route(provider);
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((_sid, msg) => completed.push({ content: msg.content }));
+
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    (provider as any).handleSessionUpdate({
+      sessionId: nativeId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'provisional-tool',
+        title: 'Bash',
+        status: 'in_progress',
+      },
+    });
+    expect(state.promptInFlight).toBe(true);
+    expect(state.toolCalls.size).toBe(1);
+
+    (provider as any).useAgyNativeOutput(state);
+    expect(state.promptInFlight).toBe(false);
+    expect(state.toolCalls.size).toBe(0);
+
+    (provider as any).handleSessionUpdate({
+      sessionId: nativeId,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'late-statusless-tool',
+        rawOutput: 'late output',
+      },
+    });
+
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      backgroundWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('retires provisional tools from TransportSessionRuntime on useAgyNativeOutput, blocks non-terminal late frames, and drains/dispatches appends immediately', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider, requests, root } = await setup();
+    const id = 'deck_test_agy_provisional_runtime_handoff';
+    const toolEvents: ToolCallEvent[] = [];
+    const completed: Array<{ content: string }> = [];
+    provider.onToolCall((sid, evt) => { if (sid === id) toolEvents.push(evt); });
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-rt-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Prepare native transcript log so post-handoff turns attribute cleanly.
+      const nativeLogFile = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+      await mkdir(path.dirname(nativeLogFile), { recursive: true });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'warm' }) + '\n'
+        + JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'warm ok' }) + '\n',
+      );
+
+      // Provisional ACP tool opens an autonomous generation while idle; a concurrent send queues.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'provisional-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      expect(state.promptInFlight).toBe(true);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
+      expect(runtime.send('queued during provisional', 'handoff-queued-1')).toBe('queued');
+      expect(runtime.pendingEntries).toHaveLength(1);
+
+      // Native output handoff retires the provisional generation, closes Runtime._openTools, and drains queue immediately.
+      (provider as any).useAgyNativeOutput(state);
+
+      const syntheticEnd = toolEvents.find((e) => e.id === 'provisional-tool' && e.status !== 'running');
+      expect(syntheticEnd).toMatchObject({
+        id: 'provisional-tool',
+        status: 'complete',
+        terminalStatus: 'abandoned',
+        terminalReason: 'generation_rollover',
+        terminalSynthetic: true,
+        terminalSource: 'provider_snapshot',
+      });
+
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 2, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'queued during provisional' }) + '\n'
+        + JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'NATIVE DRAINED ON ROLLOVER' }) + '\n',
+      );
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]?.content).toBe('NATIVE DRAINED ON ROLLOVER');
+
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 0,
+        backgroundWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        backgroundWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Late explicit non-terminal frames (tool_call_update in_progress / pending, delayed tool_call re-entry,
+      // and unowned orphan in_progress update) must NOT reopen state.toolCalls or Runtime._openTools.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'provisional-tool',
+          status: 'in_progress',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'provisional-tool',
+          status: 'pending',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'provisional-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'orphan-nonterminal-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+
+      expect(state.promptInFlight).toBe(false);
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Plain-text active append dispatches immediately without sticking in queue.
+      expect(runtime.send('plain append after handoff', 'handoff-plain-1', undefined, undefined, {
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      })).toBe('sent');
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(3), { timeout: 5000 });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 4, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'plain append after handoff' }) + '\n'
+        + JSON.stringify({ step_index: 5, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'NATIVE AFTER HANDOFF' }) + '\n',
+      );
+      await vi.waitFor(() => expect(completed).toHaveLength(3), { timeout: 5000 });
+      expect(completed[2]?.content).toBe('NATIVE AFTER HANDOFF');
+      expect(runtime.pendingEntries).toEqual([]);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('retires open tools on non-turn-completion cancel(!promptInFlight) across provider and runtime while preserving real active-turn & background gates', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider } = await setup();
+    const id = 'deck_test_agy_non_turn_cancel_and_controls';
+    const completed: Array<{ content: string }> = [];
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-rt-2')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Mark foreground authoritative and inject an unowned idle running tool (no promptInFlight).
+      (state.agyForeground ??= {} as any).authoritative = true;
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'idle-open-tool',
+          title: 'Read',
+          status: 'in_progress',
+        },
+      });
+      expect(state.promptInFlight).toBe(false);
+      expect(runtime.getActivitySnapshot().busyReasons).toContain('open_tool_call');
+
+      // Cancelling while !promptInFlight must close Runtime._openTools and suppress late reopening.
+      await provider.cancel(id);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'idle-open-tool',
+          status: 'in_progress',
+        },
+      });
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+      // clearSessionWorkAfterFailure while !promptInFlight also closes Runtime._openTools and retires IDs.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'failure-open-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      expect(runtime.getActivitySnapshot().busyReasons).toContain('open_tool_call');
+      (provider as any).clearSessionWorkAfterFailure(id, state);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'failure-open-tool',
+          status: 'in_progress',
+        },
+      });
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+      // Positive control 1: genuine active turn + open tool preserves blocking telemetry.
+      (state.agyForeground as any).authoritative = false;
+      expect(runtime.send('real turn', 'real-turn-1')).toBe('sent');
+      await vi.waitFor(
+        () =>
+          expect(
+            (state.promptInFlight && !state.replaying && state.loaded && state.promptSubmittedGeneration !== null) ||
+              completed.length >= 2,
+          ).toBe(true),
+        { timeout: 5000 },
+      );
+      if (state.promptInFlight && !state.replaying && state.acpSessionId) {
+        (provider as any).handleSessionUpdate({
+          sessionId: state.acpSessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'real-active-tool',
+            title: 'Edit',
+            status: 'in_progress',
+          },
+        });
+        expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
+        expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBe(1);
+        (provider as any).handleSessionUpdate({
+          sessionId: state.acpSessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'real-active-tool',
+            status: 'completed',
+          },
+        });
+      }
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+
+      // Positive control 2: background_monitor stays non-blocking on provider/runtime while turn is idle.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-bg-ctrl`,
+        toolName: 'run_command',
+      });
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('isolates per-session ACP processes so busy or crashing siblings never block or disconnect other sessions', async () => {
+    const { provider, root, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const holdFile = log + '.hold';
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    const idA = await route(provider, 'deck_test_iso_a');
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(idA, 'A_HELD');
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(idA)?.promptInFlight).toBe(true), { timeout: 5000 });
+      const pidA = (provider as any).sessions.get(idA)?.isolatedTransport?.child?.pid;
+      expect(pidA).toBeTypeOf('number');
+
+      // Busy sibling A does not block starting and running sibling B in its own process.
+      await unlink(holdFile);
+      const idB = await route(provider, 'deck_sub_iso_b');
+      await provider.send(idB, 'B_DONE');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      const pidB = (provider as any).sessions.get(idB)?.isolatedTransport?.child?.pid;
+      expect(pidB).toBeTypeOf('number');
+      expect(pidB).not.toBe(pidA);
+      expect((provider as any).child).toBeNull();
+
+      // Crashing sibling B emits CONNECTION_LOST only for B while keeping A intact and loaded.
+      const childB = (provider as any).sessions.get(idB)?.isolatedTransport?.child;
+      childB.kill('SIGKILL');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(errors.mock.calls.filter(([sid]) => sid === idA)).toHaveLength(0);
+      expect((provider as any).sessions.get(idA)?.loaded).toBe(true);
+      expect((provider as any).sessions.get(idA)?.isolatedTransport?.child?.pid).toBe(pidA);
+      expect((provider as any).sessions.get(idB)?.acpSessionId).toBeTruthy();
+
+      const boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+  });
+
+  it('recovers per-session ACP binary replacements on disk and bounds worker-spawn ENOENT retries without affecting siblings', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-per-upgrade-'));
+    const binary = path.join(root, 'agy');
+    const staging = path.join(root, 'agy.next');
+    const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+    const log = path.join(root, 'rpc.jsonl');
+    const holdFile = log + '.hold';
+    const writeBinary = (target: string, version: string) => writeFile(
+      target,
+      `#!/bin/sh\nAGY_ACP_FIXTURE_VERSION='${version}' exec '${process.execPath}' '${fixture}' "$@"\n`,
+      { mode: 0o700 },
+    );
+
+    await writeBinary(binary, '1.5.8');
+    vi.stubEnv(AGY_CLI_PATH_ENV, binary);
+    const config = {
+      env: {
+        HOME: root,
+        PATH: '/usr/bin:/bin',
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: log,
+      },
+    };
+    const provider = await createAgyProvider(config) as AgyAcpProvider;
+    resources.push({ provider, root });
+    await provider.connect(config);
+
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    const idBusy = await route(provider, 'deck_test_upgrade_busy');
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(idBusy, 'BUSY_1');
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(idBusy)?.promptInFlight).toBe(true), { timeout: 5000 });
+      const busyPid = (provider as any).sessions.get(idBusy)?.isolatedTransport?.child?.pid;
+
+      const idOther = await route(provider, 'deck_sub_upgrade_other');
+      await unlink(holdFile);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await provider.send(idOther, 'OTHER_V1');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+      // Replace binary on disk while idBusy and idOther exist.
+      await writeBinary(staging, '1.5.9');
+      await rename(staging, binary);
+
+      // Next send on idOther detects binary change on its per-session process and resumes on 1.5.9 without touching idBusy.
+      await provider.send(idOther, 'OTHER_V2');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+      expect((provider as any).sessions.get(idBusy)?.isolatedTransport?.child?.pid).toBe(busyPid);
+
+      // Worker-spawn ENOENT retries once per session (and is bounded when persistent), privacy-safe without recovery hint.
+      const beforeNativeSessionStart = vi.fn(async () => {});
+      const idRetry = await route(provider, 'deck_sub_reactive_new', { beforeNativeSessionStart });
+      await writeFile(log + '.worker-enoent', '1');
+      await writeFile(log + '.worker-enoent-clear-on-init', '1');
+      await provider.send(idRetry, 'RETRY_ONCE_OK');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+      expect(beforeNativeSessionStart).toHaveBeenCalledTimes(1);
+
+      const idFail = await route(provider, 'deck_sub_reactive_bounded');
+      await writeFile(log + '.worker-enoent', '1');
+      let thrown: any;
+      try {
+        await provider.send(idFail, 'SHOULD_FAIL_AFTER_ONE_RETRY');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toMatchObject({ code: PROVIDER_ERROR_CODES.CONNECTION_LOST, recoverable: true });
+      expect(thrown.message).not.toContain('/secret/private/path');
+      expect(thrown.message).not.toContain(AGY_NATIVE_START_RECOVERY_HINT);
+      expect(errors).toHaveBeenCalledTimes(1);
+
+      const rows = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.some(r => r.fixture === 'boot' && r.version === '1.5.9')).toBe(true);
+      expect(rows.some(r => r.method === 'session/resume')).toBe(true);
+    } finally {
+      await unlink(holdFile).catch(() => {});
+      await unlink(log + '.worker-enoent').catch(() => {});
+      await unlink(log + '.worker-enoent-clear-on-init').catch(() => {});
+    }
+  });
+
+  it('hibernates idle per-session ACP processes after TTL and resumes seamlessly on next send', async () => {
+    vi.stubEnv('IMCODES_AGY_IDLE_HIBERNATE_MS', '120');
+    const { provider, requests } = await setup();
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    const id = await route(provider, 'deck_sub_idle_hib');
+    await provider.send(id, 'TURN_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const state = (provider as any).sessions.get(id);
+    const pid1 = state.isolatedTransport?.child?.pid;
+    const acpId = state.acpSessionId;
+    expect(pid1).toBeTypeOf('number');
+    expect(acpId).toBeTruthy();
+
+    await vi.waitFor(() => {
+      expect(state.isolatedTransport).toBeUndefined();
+      expect(state.loaded).toBe(false);
+    }, { timeout: 5000 });
+    expect(state.acpSessionId).toBe(acpId);
+    expect(errors).not.toHaveBeenCalled();
+
+    // Waking the hibernated session spawns a fresh process and calls session/resume.
+    await provider.send(id, 'TURN_2');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(state.isolatedTransport?.child?.pid).toBeTypeOf('number');
+    expect(state.isolatedTransport?.child?.pid).not.toBe(pid1);
+    const resumes = (await requests()).filter((r) => r.method === 'session/resume' && r.params?.sessionId === acpId);
+    expect(resumes).toHaveLength(1);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('evicts oldest idle sub-sessions before main sessions when warm cap is reached without blocking busy sessions', async () => {
+    vi.stubEnv('IMCODES_AGY_MAX_WARM_SESSIONS', '2');
+    vi.stubEnv('IMCODES_AGY_IDLE_HIBERNATE_MS', '60000');
+    const { provider, root, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const holdFile = log + '.hold';
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const mainId = await route(provider, 'deck_proj_main');
+    await provider.send(mainId, 'MAIN_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const sub1 = await route(provider, 'deck_sub_lru_1');
+    await provider.send(sub1, 'SUB1_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    // Spawning sub2 hits cap=2 -> evicts idle sub1 BEFORE mainId even though mainId is older.
+    const sub2 = await route(provider, 'deck_sub_lru_2');
+    await provider.send(sub2, 'SUB2_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+    expect((provider as any).sessions.get(mainId)?.isolatedTransport).toBeDefined();
+    expect((provider as any).sessions.get(sub2)?.isolatedTransport).toBeDefined();
+    expect((provider as any).sessions.get(sub1)?.isolatedTransport).toBeUndefined();
+    expect((provider as any).sessions.get(sub1)?.loaded).toBe(false);
+    const sub1AcpId = (provider as any).sessions.get(sub1)?.acpSessionId;
+
+    // Resuming evicted sub1 succeeds transparently.
+    await provider.send(sub1, 'SUB1_RESUMED');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+    expect((await requests()).some((r) => r.method === 'session/resume' && r.params?.sessionId === sub1AcpId)).toBe(true);
+
+    // Even when all warm sessions are busy, spawning another session is never blocked.
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(mainId, 'BUSY_MAIN');
+      await provider.send(sub1, 'BUSY_SUB1');
+      const sub3 = await route(provider, 'deck_sub_busy_3');
+      await provider.send(sub3, 'BUSY_SUB3');
+      await unlink(holdFile);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(7), { timeout: 5000 });
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+  });
+
+  it('keeps incognito sessions non-resumable and excluded from idle hibernation and warm-cap eviction', async () => {
+    vi.stubEnv('IMCODES_AGY_MAX_WARM_SESSIONS', '1');
+    vi.stubEnv('IMCODES_AGY_IDLE_HIBERNATE_MS', '80');
+    const { provider } = await setup();
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const idIncog = await route(provider, 'deck_test_incog_per', { incognito: true });
+    await provider.send(idIncog, 'INCOG_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const incogPid = (provider as any).sessions.get(idIncog)?.isolatedTransport?.child?.pid;
+    expect(incogPid).toBeTypeOf('number');
+
+    // Wait past idle TTL AND spawn a regular session exceeding cap=1: incognito stays alive.
+    await new Promise((resolve) => setTimeout(resolve, 140));
+    const idSub = await route(provider, 'deck_sub_regular');
+    await provider.send(idSub, 'REG_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const incogState = (provider as any).sessions.get(idIncog);
+    expect(incogState?.loaded).toBe(true);
+    expect(incogState?.isolatedTransport?.child?.pid).toBe(incogPid);
+
+    await provider.endSession(idIncog);
+    expect(incogState?.disposed).toBe(true);
+  });
+
+  it('uses 60m default idle TTL for main/Brain sessions while hibernating sub-sessions at 5m and honoring mixed env overrides', async () => {
+    vi.stubEnv('IMCODES_AGY_IDLE_HIBERNATE_MS', '120');
+    vi.stubEnv('IMCODES_AGY_MAIN_IDLE_HIBERNATE_MS', '5000');
+    const { provider } = await setup();
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const mainId = await route(provider, 'deck_cd_brain');
+    const subId = await route(provider, 'deck_sub_worker_ttl');
+    await provider.send(mainId, 'MAIN_TTL_1');
+    await provider.send(subId, 'SUB_TTL_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const mainState = (provider as any).sessions.get(mainId);
+    const subState = (provider as any).sessions.get(subId);
+    expect(mainState?.isolatedTransport).toBeDefined();
+    expect(subState?.isolatedTransport).toBeDefined();
+
+    // Mixed pool: sub-session hits 120ms TTL and hibernates; main/Brain stays warm and timer re-arms for main TTL.
+    await vi.waitFor(() => {
+      expect(subState.isolatedTransport).toBeUndefined();
+      expect(subState.loaded).toBe(false);
+      expect((provider as any).idleHibernateTimer).not.toBeNull();
+    }, { timeout: 5000 });
+    expect(mainState.isolatedTransport).toBeDefined();
+    expect(mainState.loaded).toBe(true);
+
+    // Verify default TTLs with both overrides cleared and reverse main-override case.
+    vi.unstubAllEnvs();
+    expect((provider as any).getIdleHibernateMs(mainId, mainState)).toBe(60 * 60_000);
+    expect((provider as any).getIdleHibernateMs(subId, subState)).toBe(5 * 60_000);
+
+    vi.stubEnv('IMCODES_AGY_IDLE_HIBERNATE_MS', '120');
+    expect((provider as any).getIdleHibernateMs(mainId, mainState)).toBe(120);
+    expect((provider as any).getIdleHibernateMs(subId, subState)).toBe(120);
+
+    vi.unstubAllEnvs();
+    vi.stubEnv('IMCODES_AGY_MAIN_IDLE_HIBERNATE_MS', '150');
+    expect((provider as any).getIdleHibernateMs(mainId, mainState)).toBe(150);
+    expect((provider as any).getIdleHibernateMs(subId, subState)).toBe(5 * 60_000);
+  });
+
+  it('logs intentional hibernation at info and maps post-hibernation server restart notice to idle hibernation instead of Server restarted', async () => {
+    vi.stubEnv('IMCODES_AGY_MAIN_IDLE_HIBERNATE_MS', '120');
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { provider } = await setup();
+      const complete = vi.fn();
+      const events: ToolCallEvent[] = [];
+      provider.onComplete(complete);
+      provider.onToolCall((_sid, evt) => events.push(evt));
+
+      const mainId = await route(provider, 'deck_cd_brain');
+      await provider.send(mainId, 'TURN_1');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      const state = (provider as any).sessions.get(mainId);
+      const nativeId = state.acpSessionId;
+
+      await vi.waitFor(() => {
+        expect(state.isolatedTransport).toBeUndefined();
+        expect(state.loaded).toBe(false);
+      }, { timeout: 5000 });
+
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: mainId,
+          reason: 'idle_ttl',
+          isSubSession: false,
+        }),
+        expect.stringContaining('hibernating idle ACP session'),
+      );
+      expect(state.hibernatedByImcodes).toMatchObject({ reason: 'idle_ttl' });
+
+      // Resuming after intentional hibernation consumes the flag and labels the Antigravity restart notice accurately.
+      await provider.send(mainId, 'TURN_2');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      // Ensure a pending hibernation marker still maps correctly if the resume notice lands right on wake-up,
+      // and verify turn settlement clears stale flags so a later genuine crash reports 'Server restarted'.
+      expect(state.hibernatedByImcodes).toBeUndefined();
+
+      // Re-hibernate via warm_cap_lru / idle_ttl and verify post-hibernation restart notice before turn completion.
+      await vi.waitFor(() => expect(state.isolatedTransport).toBeUndefined(), { timeout: 5000 });
+      expect(state.hibernatedByImcodes).toMatchObject({ reason: 'idle_ttl' });
+      (provider as any).updateAgyBackgroundTasks(mainId, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-hib`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 10' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(mainId, state, {
+        text: 'All your subagents and background tasks have been stopped due to server restart.',
+        isSystemMessage: true,
+      });
+      const hibEvt = events.filter((e) => e.detail?.meta?.taskId === `${nativeId}/bg-hib`).at(-1);
+      expect(hibEvt?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.INTERRUPTED);
+      expect(hibEvt?.output).toBe('Resumed after idle hibernation');
+      expect(state.hibernatedByImcodes).toBeUndefined();
+
+      // Genuine unexpected crash (non-hibernated disposal / SIGKILL) still reports 'Server restarted'.
+      vi.stubEnv('IMCODES_AGY_MAIN_IDLE_HIBERNATE_MS', '60000');
+      await provider.send(mainId, 'TURN_3');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+      const liveChild = state.isolatedTransport?.child;
+      expect(liveChild).toBeTruthy();
+      liveChild.kill('SIGKILL');
+      await vi.waitFor(() => expect(liveChild.exitCode !== null || liveChild.signalCode !== null).toBe(true), { timeout: 5000 });
+      (provider as any).updateAgyBackgroundTasks(mainId, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-crash`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 10' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(mainId, state, {
+        text: 'All your subagents and background tasks have been stopped due to server restart.',
+        isSystemMessage: true,
+      });
+      const crashEvt = events.filter((e) => e.detail?.meta?.taskId === `${nativeId}/bg-crash`).at(-1);
+      expect(crashEvt?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.INTERRUPTED);
+      expect(crashEvt?.output).toBe('Server restarted');
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+});
+
+describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
+  it('delivers sessionSystemText via session/new _meta, omits it from session/prompt and /compact, and never logs identity text', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    const debugSpy = vi.spyOn(logger, 'debug');
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const errorSpy = vi.spyOn(logger, 'error');
+    try {
+      const { provider, requests } = await setup('usage-missing', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const id = await route(provider);
+      const complete = vi.fn();
+      provider.onComplete(complete);
+
+      const identityPayload = '<imcodes-agent-identity>\nSECRET_META_IDENTITY_TOKEN_991\n' + 'padding '.repeat(80) + '</imcodes-agent-identity>';
+      const makePayload = (msg: string) => {
+        const p = normalizeProviderPayload(msg);
+        p.sessionSystemText = identityPayload;
+        p.context = { ...p.context, sessionSystemText: identityPayload };
+        return p;
+      };
+
+      await provider.send(id, makePayload('A'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(complete.mock.calls[0]?.[1]?.metadata?.usage).toMatchObject({ context_usage_estimated: true });
+      expect(Number(complete.mock.calls[0]?.[1]?.metadata?.usage?.input_tokens)).toBeGreaterThan(50);
+
+      await provider.send(id, makePayload('/compact'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+      await provider.send(id, makePayload('after compact'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+      const reqs = await requests();
+      const newReq = reqs.find((x) => x.method === 'session/new');
+      expect(newReq?.params?._meta).toEqual({
+        antigravity: { systemPrompt: { append: identityPayload } },
+      });
+      expect(reqs.filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      expect(prompts).toEqual(['A', '/compact', 'after compact']);
+      for (const promptText of prompts) {
+        expect(promptText).not.toContain('<imcodes-agent-identity>');
+        expect(promptText).not.toContain('SECRET_META_IDENTITY_TOKEN_991');
+      }
+
+      for (const spy of [infoSpy, debugSpy, warnSpy, errorSpy]) {
+        for (const call of spy.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('SECRET_META_IDENTITY_TOKEN_991');
+        }
+      }
+    } finally {
+      infoSpy.mockRestore();
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('delivers sessionSystemText via session/resume _meta on reconnect and keeps session/prompt clean', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_resume', { resumeId: 'saved-meta-1' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const identityPayload = '<imcodes-agent-identity>RESUMED_IDENTITY_77</imcodes-agent-identity>';
+    const p = normalizeProviderPayload('resumed hello');
+    p.sessionSystemText = identityPayload;
+    p.context = { ...p.context, sessionSystemText: identityPayload };
+
+    await provider.send(id, p);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumeReq = reqs.find((x) => x.method === 'session/resume');
+    expect(resumeReq?.params?.sessionId).toBe('saved-meta-1');
+    expect(resumeReq?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: identityPayload } },
+    });
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['resumed hello']);
+  });
+
+  it('refreshes, updates, and clears mid-session identity via session/resume _meta without leaking into session/prompt', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_mid_refresh');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string, sys?: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    const id1 = '<imcodes-agent-identity>IDENTITY_V1</imcodes-agent-identity>';
+    const id2 = '<imcodes-agent-identity>IDENTITY_V2</imcodes-agent-identity>';
+
+    await provider.send(id, makePayload('turn-1', id1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2-refresh', id1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-3-update', id2));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-4-clear', ''));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-5-still-empty', ''));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(5), { timeout: 5000 });
+
+    const reqs = await requests();
+    const newReq = reqs.find((x) => x.method === 'session/new');
+    expect(newReq?.params?._meta).toEqual({ antigravity: { systemPrompt: { append: id1 } } });
+
+    const resumes = reqs.filter((x) => x.method === 'session/resume');
+    expect(resumes.map((r) => r.params?._meta?.antigravity?.systemPrompt?.append)).toEqual([id1, id2, '']);
+
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['turn-1', 'turn-2-refresh', 'turn-3-update', 'turn-4-clear', 'turn-5-still-empty']);
+  });
+
+  it('omits _meta when sessionSystemText is initially empty and guards incognito from session/resume', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_empty');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    await provider.send(id, 'empty-1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, 'empty-2');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const incogId = await route(provider, 'deck_test_meta_incog', { incognito: true });
+    const incogP1 = normalizeProviderPayload('incog-1');
+    incogP1.sessionSystemText = '<imcodes-agent-identity>INCOG_V1</imcodes-agent-identity>';
+    incogP1.context = { ...incogP1.context, sessionSystemText: incogP1.sessionSystemText };
+    await provider.send(incogId, incogP1);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+    const incogP2 = normalizeProviderPayload('incog-2');
+    incogP2.sessionSystemText = '<imcodes-agent-identity>INCOG_V2</imcodes-agent-identity>';
+    incogP2.context = { ...incogP2.context, sessionSystemText: incogP2.sessionSystemText };
+    await provider.send(incogId, incogP2);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+
+    const reqs = await requests();
+    const newReqs = reqs.filter((x) => x.method === 'session/new');
+    expect(newReqs[0]?.params?._meta).toBeUndefined();
+    expect(newReqs[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '<imcodes-agent-identity>INCOG_V1</imcodes-agent-identity>' } },
+    });
+    expect(reqs.filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts[0]).toBe('empty-1');
+    expect(prompts[1]).toBe('empty-2');
+    expect(prompts[2]).toBe('incog-1');
+    expect(prompts[3]).toContain('INCOG_V2');
+  });
+
+  it('matches AgyForegroundOwnership cleanly against promptText without sessionSystemText', async () => {
+    const { provider, requests } = await setup('native-steering', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_foreground');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const p = normalizeProviderPayload('CLEAN_FOREGROUND_A');
+    p.sessionSystemText = '<imcodes-agent-identity>FOREGROUND_IDENTITY</imcodes-agent-identity>';
+    p.context = { ...p.context, sessionSystemText: p.sessionSystemText };
+
+    await provider.send(id, p);
+    await provider.notifyActiveDelegation(id, notification('CLEAN_FOREGROUND_B'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1]?.content).toBe('STEERED OWNED RESULT');
+
+    const prompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['CLEAN_FOREGROUND_A', 'CLEAN_FOREGROUND_B']);
+  });
+
+  it('re-confirms target model across syncMetaOnLoaded session/resume after system-prompt refresh or /model switch without reverting to gemini-4-carbon-medium', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_resume_meta_reconfirm';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    const sys1 = '<imcodes-agent-identity>ID_V1</imcodes-agent-identity>';
+    const sys2 = '<imcodes-agent-identity>ID_V2</imcodes-agent-identity>';
+
+    // Turn 1: initial session/new confirms default gemini-4-hydrogen-high over upstream carbon-medium.
+    await provider.send(id, makePayload('turn-1', sys1));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Turn 2: refreshSessionSystemText / updated system prompt triggers syncMetaOnLoaded session/resume
+    // while state.model and state.modelRevision are unchanged.
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2', sys2));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Turn 3: /model switch (applySessionModel + refreshSessionSystemText, matching TransportSessionRuntime.applyAgentId)
+    // followed by next turn triggering syncMetaOnLoaded session/resume.
+    expect(await provider.applySessionModel(id, 'gemini-4-argon-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-3', sys2));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/resume')).toHaveLength(2);
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+  });
+
+  it('re-issues session/set_model on same-model applySessionModel when confirmedModel drifted to gemini-4-carbon-medium', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_same_model_self_heal';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    await provider.send(id, 'turn-1');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const conn = (provider as any).connectionForState(state);
+    // Simulate upstream session/resume resetting native model and confirmedModel to carbon-medium
+    // while state.model remains gemini-4-hydrogen-high and state.modelRevision is unchanged.
+    await (provider as any).resumeOrLoadAcpSession(id, state, conn, 'RESUMED_META');
+    expect(state.model).toBe('gemini-4-hydrogen-high');
+    expect(state.confirmedModel).toBe('gemini-4-carbon-medium');
+
+    expect(await provider.applySessionModel(id, 'gemini-4-hydrogen-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect(state.confirmedModel).toBe('gemini-4-hydrogen-high');
+
+    await provider.send(id, 'turn-2');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+  });
+
+  it('re-confirms target model after disposeIsolatedSession idle hibernate wakeup and child exit respawn', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_hibernate_reconfirm';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: process.cwd(),
+      agentId: 'gemini-4-argon-high',
+      fresh: true,
+    });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    await provider.send(id, 'before-hibernate');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    const state = (provider as any).sessions.get(id);
+    const savedNativeId = state.acpSessionId;
+    await (provider as any).disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+    expect(state.loaded).toBe(false);
+    expect(state.confirmedModel).toBeUndefined();
+    expect(state.modelApplyRequest).toBeUndefined();
+    expect(state.acpSessionId).toBe(savedNativeId);
+
+    await provider.send(id, 'after-hibernate');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    // Also verify unexpected child process exit clears confirmedModel & modelApplyRequest and re-confirms on next turn.
+    const child = state.isolatedTransport?.child as import('node:child_process').ChildProcess | null;
+    expect(child).toBeTruthy();
+    child!.kill('SIGKILL');
+    await vi.waitFor(() => expect(state.loaded).toBe(false), { timeout: 5000 });
+    expect(state.confirmedModel).toBeUndefined();
+    expect(state.modelApplyRequest).toBeUndefined();
+
+    await provider.send(id, 'after-child-crash');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-argon-high');
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+  });
+
+  it('re-confirms model when LoadSessionResponse omits models ({}), createSession rebinds, or recycleSharedAcpServer recycles, while deduplicating concurrent in-flight confirmStrictSessionModel', async () => {
+    const { provider, requests, root, binary } = await setup('resume-empty-metadata', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_empty_resume_and_inflight';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const done = vi.fn();
+    provider.onComplete(done);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    await provider.send(id, makePayload('turn-1', '<imcodes-agent-identity>META_1</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // session/resume returns {} (missing models.currentModelId): must reset confirmedModel to undefined and re-send session/set_model.
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2', '<imcodes-agent-identity>META_2</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Re-calling createSession without fresh:true creates loaded:false state and must not inherit stale confirmedModel.
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd() });
+    const reboundState = (provider as any).sessions.get(id);
+    expect(reboundState.loaded).toBe(false);
+    expect(reboundState.confirmedModel).toBeUndefined();
+    expect(reboundState.modelApplyRequest).toBeUndefined();
+
+    await provider.send(id, makePayload('turn-3', '<imcodes-agent-identity>META_2</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Concurrent in-flight deduplication: two simultaneous applySessionModel calls while RPC is held share 1 RPC.
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'gemini-4-argon-high');
+      await vi.waitFor(async () => {
+        const argonCalls = (await requests()).filter((r) => r.method === 'session/set_model' && r.params.modelId === 'gemini-4-argon-high');
+        expect(argonCalls).toHaveLength(1);
+      }, { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'gemini-4-argon-high');
+      await rm(modelHold, { force: true });
+      expect(await Promise.all([first, second])).toEqual([SESSION_MODEL_APPLIED.LIVE, SESSION_MODEL_APPLIED.LIVE]);
+    } finally {
+      await rm(modelHold, { force: true });
+    }
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+
+    // Shared ACP server recycle path: clears confirmedModel & modelApplyRequest and re-confirms on next turn.
+    const sharedLog = path.join(root, 'shared-rpc.jsonl');
+    const sharedProvider = new AgyAcpProvider();
+    (sharedProvider as any).profile = { ...(sharedProvider as any).profile, perSessionTransport: false };
+    resources.push({ provider: sharedProvider, root });
+    await sharedProvider.connect({
+      binaryPath: binary,
+      env: {
+        HOME: root,
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: sharedLog,
+        AGY_ACP_FIXTURE_SCENARIO: 'upstream-carbon-default',
+      },
+    });
+    const sharedId = 'deck_test_agy_shared_recycle';
+    const sharedDone = vi.fn();
+    sharedProvider.onComplete(sharedDone);
+    await sharedProvider.createSession({ sessionKey: sharedId, sessionName: sharedId, cwd: process.cwd(), fresh: true });
+    await sharedProvider.send(sharedId, 'shared-1');
+    await vi.waitFor(() => expect(sharedDone).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const sharedState = (sharedProvider as any).sessions.get(sharedId);
+    await (sharedProvider as any).recycleSharedAcpServer('test_recycle');
+    expect(sharedState.loaded).toBe(false);
+    expect(sharedState.confirmedModel).toBeUndefined();
+    expect(sharedState.modelApplyRequest).toBeUndefined();
+
+    await sharedProvider.send(sharedId, 'shared-2');
+    await vi.waitFor(() => expect(sharedDone).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(sharedDone.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    const sharedReqs = (await readFile(sharedLog, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(sharedReqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+  });
+
+  it('keeps AG reactive/native-output long tasks non-idle across multi-step tool calls, protects active long native turns from silent recovery, and returns to idle cleanly', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = 'deck_test_agy_reactive_native_long';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    runtime.setProviderSessionId(id);
+
+    const done = vi.fn();
+    provider.onComplete(done);
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+    expect(runtime.send('launch', 'turn-1')).toBe('sent');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+
+    // 1) Reactive [Message] wakeup sets agyReactive and stays non-idle even across useAgyNativeOutput and native tool steps.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 50,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:00:00Z sender=worker-a content=wake parent',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(true);
+      expect(runtime.getStatus()).not.toBe('idle');
+    }, { timeout: 5000 });
+    expect(runtime.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(true);
+    expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+    (provider as any).useAgyNativeOutput(state);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    const prevActivityAt = state.lastActivityAt;
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 51,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } }],
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyNativeToolOrder?.length).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+    expect(state.lastActivityAt).toBeGreaterThanOrEqual(prevActivityAt);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    // Empty final non-tool-call PLANNER_RESPONSE settles reactive turn cleanly back to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 52,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    }, { timeout: 5000 });
+
+    // 2) cancel() during reactive turn clears agyReactive and settles to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 53,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:01:00Z sender=worker-b content=wake again',
+      }) + '\n',
+    );
+    await vi.waitFor(() => expect(state.agyReactive).toBe(true), { timeout: 5000 });
+    await provider.cancel(id);
+    expect(state.agyReactive).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+
+    // 3) During an in-flight native turn with active native tool calls, getActiveWorkSnapshot reports activeToolCount > 0
+    // and recoverSilentActiveTurn does not falsely settle the active long native turn at the short threshold.
+    state.promptInFlight = true;
+    state.agyReactive = true;
+    state.agyNativeToolOrder = [{ name: 'run_command', interactive: false }];
+    (runtime as any).setStatus('tool_running');
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBeGreaterThan(0);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: Date.now() + 10_000, staleMs: 5_000 })).toBe(false);
+    expect(runtime.getStatus()).toBe('tool_running');
+    state.agyNativeToolOrder = [];
+    state.promptInFlight = false;
+    state.agyReactive = false;
+    (provider as any).syncAgyStatusAfterTurn(id, state);
+    expect(runtime.getStatus()).toBe('idle');
+    await runtime.kill();
+  });
+
+  it('ignores IsDaemon run_command background ids, reconciles empty manage_task(list), and ignores errored manage_task(list)', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_daemon_and_list';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+
+    try {
+      expect(runtime.send('warm', 'warm-daemon')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // IsDaemon: true must NOT enter agyBackgroundTasks or hold runtime running.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/daemon-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm run dev', IsDaemon: true, WaitMsBeforeAsync: 500 },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Non-daemon background task holds runtime tool_running.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/stale-bg-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 30', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Errored manage_task(list) must NOT clear agyBackgroundTasks.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'error',
+      });
+      expect(state.agyBackgroundTasks?.has(`${nativeId}/stale-bg-1`)).toBe(true);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Successful empty manage_task(list) reconciles stale ids and drops cleanly back to idle.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks.',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('handles child transcript RUNNING guard, empty-content terminal, SYSTEM_ERROR, and ACP failure subagent interrupt + idle cleanup', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_child_errors_and_crash';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => { if (sid === id) events.push(evt); });
+
+    try {
+      expect(runtime.send('launch', 'child-check-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      const state = (provider as any).sessions.get(id);
+
+      // Register three native children through handleSessionUpdate (real invoke_subagent ACP batch result):
+      // 1 finishes with empty content after a RUNNING chunk, 1 fails with SYSTEM_ERROR, 1 stays running until ACP crash.
+      (provider as any).handleSessionUpdate({
+        sessionId: state.acpSessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'launch-batch-child-check',
+          title: 'Run invoke_subagent',
+          status: 'completed',
+          rawInput: { Subagents: [{ Role: 'EmptyDone' }, { Role: 'ErrChild' }, { Role: 'CrashChild' }] },
+          rawOutput: JSON.stringify({
+            subagents: [
+              { conversationId: 'child-empty-done', status: 'running' },
+              { conversationId: 'child-err', status: 'running' },
+              { conversationId: 'child-crash', status: 'running' },
+            ],
+          }),
+        },
+      });
+      await vi.waitFor(() => expect(state.agySubagents?.activeCount()).toBe(3), { timeout: 5000 });
+
+      // 1) Child PLANNER_RESPONSE with status RUNNING must NOT close prematurely.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-empty-done', {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        content: 'partial chunk',
+      });
+      expect(state.agySubagents.activeCount()).toBe(3);
+
+      // 2) Child PLANNER_RESPONSE DONE with empty content completes and closes bridge.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-empty-done', {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(events.find((e) => e.detail?.meta?.agentPath === 'child-empty-done' && e.detail?.meta?.terminal)?.detail?.meta?.normalizedStatus).toBe('complete');
+      expect(state.agySubagents.activeCount()).toBe(2);
+
+      // 3) Child SYSTEM_ERROR emits error and closes bridge.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-err', {
+        step_index: 1,
+        type: 'SYSTEM_ERROR',
+        status: 'ERROR',
+        content: 'subagent crashed',
+      });
+      const errEvt = events.find((e) => e.detail?.meta?.agentPath === 'child-err' && e.detail?.meta?.terminal);
+      expect(errEvt?.status).toBe('error');
+      expect(errEvt?.detail?.meta?.normalizedStatus).toBe('error');
+      expect(state.agySubagents.activeCount()).toBe(1);
+
+      // 4) Simulate ACP failure/exit while agyReactive and child-crash are active -> interrupts subagent & resets to idle.
+      state.agyReactive = true;
+      (provider as any).syncAgyStatusAfterTurn(id, state);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      const hadActive = (provider as any).clearSessionWorkAfterFailure(id);
+      expect(hadActive).toBe(true);
+      expect(state.agyReactive).toBe(false);
+      expect(state.agySubagents.activeCount()).toBe(0);
+      expect(events.some((e) => e.detail?.meta?.agentPath === 'child-crash' && e.detail?.meta?.normalizedStatus === 'interrupted')).toBe(true);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('settles runtime cleanly to idle when native ACP end_turn records an ack before delayed reactive transcript arrives, preserves background/prompt work, and avoids duplicate onComplete', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_f1_ack_idle';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+
+    try {
+      expect(runtime.send('warm', 'ack-warm-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+      const beforeReactiveCompleted = completed.length;
+
+      // Case 1: SYSTEM_MESSAGE wakeup makes agyReactive=true; ACP native autonomous end_turn arrives FIRST,
+      // then delayed matching transcript PLANNER_RESPONSE arrives and consumes agyNativeAcks[0].
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 20,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-18T00:00:00Z sender=worker-ack content=wake',
+      });
+      expect(state.agyReactive).toBe(true);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      // Native autonomous ACP end_turn settles while agyReactive=true (status stays running, ack pushed).
+      (provider as any).startAutonomousTurn(id, state);
+      const gen1 = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:acp-1`;
+      state.currentText = 'NATIVE-ACP-FIRST-DONE';
+      (state.activePromptGenerations ??= new Set()).add(gen1);
+      (provider as any).settleTurn(id, state, gen1, 'end_turn');
+      expect(completed).toHaveLength(beforeReactiveCompleted + 1);
+      expect(completed.at(-1)?.content).toBe('NATIVE-ACP-FIRST-DONE');
+      expect(state.agyNativeAcks).toHaveLength(1);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      // Delayed transcript PLANNER_RESPONSE arrives with matching text: consumes ack without duplicate onComplete,
+      // and transitions runtime cleanly to idle (zero remaining work).
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 21,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'NATIVE-ACP-FIRST-DONE',
+      });
+      expect(state.agyReactive).toBe(false);
+      expect(state.agyNativeAcks).toHaveLength(0);
+      expect(completed).toHaveLength(beforeReactiveCompleted + 1);
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 0,
+        backgroundWorkCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Case 2: Same ACP-first + delayed ack sequence while a real non-daemon background task IS still active:
+      // status must remain tool_running until the background task finishes.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-keep-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm test', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 22,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-18T00:01:00Z sender=worker-ack-2 content=wake2',
+      });
+      (provider as any).startAutonomousTurn(id, state);
+      const gen2 = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:acp-2`;
+      state.currentText = 'NATIVE-ACP-WITH-BG';
+      (state.activePromptGenerations ??= new Set()).add(gen2);
+      (provider as any).settleTurn(id, state, gen2, 'end_turn');
+      expect(completed).toHaveLength(beforeReactiveCompleted + 2);
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 23,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'NATIVE-ACP-WITH-BG',
+      });
+      expect(completed).toHaveLength(beforeReactiveCompleted + 2);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Background task completion clears cleanly to idle.
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 24,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] timestamp=2026-11-18T00:02:00Z sender=${nativeId}/bg-keep-1 content=Task id "${nativeId}/bg-keep-1" finished with result:\nCommand exited with code 0.`,
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 25,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Case 3: Successor foreground prompt in flight must not be cleared when delayed ack row arrives,
+      // and foreground claim clearing agyReactive while !promptInFlight must settle cleanly to idle.
+      state.agyReactive = true;
+      state.promptInFlight = true;
+      (provider as any).emitStatus(id, state, { status: 'thinking', label: 'Thinking...' });
+      state.agyNativeAcks = [{ generation: 99, text: 'DELAYED-ACK' }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 26,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'DELAYED-ACK',
+      });
+      expect(state.promptInFlight).toBe(true);
+      expect(state.lastStatusSignature).not.toBe(JSON.stringify({ status: null, label: null }));
+      state.promptInFlight = false;
+      state.agyPendingResponses?.clear();
+      state.agyNativeAcks = [];
+      state.agyReactive = true;
+      (provider as any).syncAgyStatusAfterTurn(id, state);
+      expect(runtime.getStatus()).not.toBe('idle');
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 27,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        content: 'user cleared reactive',
+      });
+      expect(state.agyReactive).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('re-emits Running background task status after onComplete across end_turn and max_tokens, clears to null on task finish, and does not clobber a synchronous next turn', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_status_after_complete';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const timeline: Array<{ kind: 'complete' | 'status'; content?: string; status?: string | null; label?: string | null }> = [];
+    let launchNextTurnOnComplete = false;
+    let launchedNextTurn = false;
+    provider.onComplete((sid, m) => {
+      if (sid !== id) return;
+      timeline.push({ kind: 'complete', content: m.content });
+      if (launchNextTurnOnComplete && !launchedNextTurn) {
+        launchedNextTurn = true;
+        launchNextTurnOnComplete = false;
+        void provider.send(id, 'synchronous follow-up turn');
+        const currentState = (provider as any).sessions.get(id);
+        (provider as any).emitStatus(id, currentState, { status: 'thinking', label: 'Thinking...' });
+      }
+    });
+    provider.onStatus((sid, st) => {
+      if (sid === id) timeline.push({ kind: 'status', status: st.status, label: st.label });
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-up')).toBe('sent');
+      await vi.waitFor(() => expect(timeline.some((e) => e.kind === 'complete')).toBe(true), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Seed an active native background task.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-status-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 10', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+
+      // 1) end_turn settles with onComplete, then re-emits Running background task AFTER onComplete.
+      timeline.length = 0;
+      (provider as any).startAutonomousTurn(id, state);
+      const genEndTurn = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:end-turn`;
+      state.currentText = 'foreground reply while bg running';
+      (state.activePromptGenerations ??= new Set()).add(genEndTurn);
+      (provider as any).settleTurn(id, state, genEndTurn, 'end_turn');
+
+      const completeIdx1 = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'foreground reply while bg running');
+      expect(completeIdx1).toBeGreaterThanOrEqual(0);
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+      expect(timeline.length - 1).toBeGreaterThan(completeIdx1);
+
+      // 2) max_tokens path also emits Running background task AFTER onComplete.
+      timeline.length = 0;
+      (provider as any).startAutonomousTurn(id, state);
+      const genMaxTok = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:max-tokens`;
+      state.currentText = 'truncated reply while bg running';
+      (state.activePromptGenerations ??= new Set()).add(genMaxTok);
+      (provider as any).settleTurn(id, state, genMaxTok, 'max_tokens');
+
+      const completeIdx2 = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'truncated reply while bg running');
+      expect(completeIdx2).toBeGreaterThanOrEqual(0);
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+      expect(timeline.length - 1).toBeGreaterThan(completeIdx2);
+
+      // 3) If onComplete synchronously starts the next turn (promptInFlight === true),
+      //    settleTurn tail must NOT overwrite the new turn's Thinking... with Running background task.
+      timeline.length = 0;
+      launchNextTurnOnComplete = true;
+      (provider as any).startAutonomousTurn(id, state);
+      const genOverlap = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:overlap`;
+      state.currentText = 'reply triggering successor';
+      (state.activePromptGenerations ??= new Set()).add(genOverlap);
+      (provider as any).settleTurn(id, state, genOverlap, 'end_turn');
+
+      expect(launchedNextTurn).toBe(true);
+      const firstCompleteIdx = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'reply triggering successor');
+      expect(firstCompleteIdx).toBeGreaterThanOrEqual(0);
+      // Immediately upon settleTurn returning while the synchronous successor turn is in flight,
+      // settleTurn's tail must NOT overwrite the successor's Thinking... with Running background task.
+      expect(timeline.slice(firstCompleteIdx + 1)).toEqual([
+        { kind: 'status', status: 'thinking', label: 'Thinking...' },
+      ]);
+      await vi.waitFor(() => expect(timeline.some((e) => e.kind === 'complete' && e.content === 'synchronous follow-up turn')).toBe(true), { timeout: 5000 });
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+
+      // 4) Background task completion clears status to null once reactive wakeup finishes.
+      timeline.length = 0;
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 30,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] timestamp=2026-11-18T00:03:00Z sender=${nativeId}/bg-status-1 content=Task id "${nativeId}/bg-status-1" finished with result:\nCommand exited with code 0.`,
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 31,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: null, label: null });
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('does not reconcile active subagents on transcript-first ERROR/RUNNING manage_subagents(list) or mixed ACP/transcript errors, and reconciles cleanly on terminal DONE', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_f2_generic_status';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+    provider.onToolCall((sid, evt) => { if (sid === id) events.push(evt); });
+
+    try {
+      expect(runtime.send('warm', 'f2-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Seed one running native child.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'f2-launch',
+          title: 'Run invoke_subagent',
+          status: 'completed',
+          rawInput: { Subagents: [{ Role: 'WorkerKeep' }] },
+          rawOutput: JSON.stringify({ conversationId: 'child-keep', status: 'running' }),
+        },
+      });
+      await vi.waitFor(() => expect(state.agySubagents?.activeCount()).toBe(1), { timeout: 5000 });
+      const beforeEvents = events.length;
+
+      // 1) Transcript-first GENERIC status:ERROR with content:'[]' (no pending ACP event) MUST NOT complete child-keep.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 10, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 2) Transcript-first GENERIC status:RUNNING with content:'[]' MUST NOT complete child-keep.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 12, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 13,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 3) Mixed order: ACP tool_call complete with empty output, followed by transcript GENERIC status:ERROR content:'[]':
+      // transcript ERROR still wins and MUST NOT complete child-keep.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'f2-list-acp-empty',
+          title: 'Run manage_subagents',
+          status: 'completed',
+          rawInput: { Action: 'list' },
+        },
+      });
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 14, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 15,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 4) Positive control: transcript-first GENERIC status:DONE content:'[]' reconciles child-keep to COMPLETE.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 16, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 17,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(0);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.agentPath === 'child-keep' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('spawns per-session ACP server in state.cwd (never /) under launchd cwd=/, handles nonexistent cwd safely, and recycles on cwd change preserving resumeId', async () => {
+    const { provider, requests, root } = await setup();
+    const wsA = path.join(root, 'workspace-a');
+    const wsB = path.join(root, 'workspace-b');
+    await mkdir(wsA, { recursive: true });
+    await mkdir(wsB, { recursive: true });
+
+    const done = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(done);
+    provider.onError(errors);
+
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/');
+    try {
+      // 1) Explicit valid workspace cwd wins even when daemon process.cwd() === '/'.
+      const sid = 'deck_test_acp_cwd';
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: wsA, agentId: 'model-a' });
+      await provider.send(sid, 'turn in wsA');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      let boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(1);
+      expect(boots[0].cwd).toBe(realpathSync(wsA));
+      expect(boots[0].pwd).toBe(realpathSync(wsA));
+
+      const firstResumeId = (provider as any).sessions.get(sid)?.acpSessionId;
+      expect(firstResumeId).toBe('native-1');
+
+      // 2) Moving an existing idle perSessionTransport session to a different valid cwd recycles child while preserving resumeId.
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: wsB, agentId: 'model-a' });
+      await provider.send(sid, 'turn in wsB');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      const allReqs = await requests();
+      boots = allReqs.filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(2);
+      expect(boots[1].pid).not.toBe(boots[0].pid);
+      expect(boots[1].cwd).toBe(realpathSync(wsB));
+      expect(allReqs.some((r) => r.method === 'session/resume' && r.params?.sessionId === 'native-1' && r.params?.cwd === wsB)).toBe(true);
+
+      // 3) Omitted cwd or non-existent synthetic cwd under process.cwd() === '/' falls back safely to homedir (never '/' or ENOENT).
+      const sidOmitted = 'deck_test_acp_omitted_cwd';
+      await provider.createSession({ sessionKey: sidOmitted, sessionName: sidOmitted, agentId: 'model-a' });
+      expect((provider as any).sessions.get(sidOmitted)?.cwd).toBe(realpathSync(homedir()));
+      await provider.send(sidOmitted, 'turn omitted cwd');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+      const sidMissing = 'deck_test_acp_missing_cwd';
+      await provider.createSession({
+        sessionKey: sidMissing,
+        sessionName: sidMissing,
+        cwd: path.join(root, 'synthetic-missing-dir'),
+        agentId: 'model-a',
+      });
+      await provider.send(sidMissing, 'turn missing cwd');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(4), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(4);
+      expect(boots[2].cwd).toBe(realpathSync(homedir()));
+      expect(boots[3].cwd).toBe(realpathSync(homedir()));
+      // 4) Symlinked workspace canonicalization (macOS /tmp -> /private/tmp, /var -> /private/var):
+      //    boot.cwd and boot.pwd both match realpathSync(realWs), and switching from symlinkWs to realWs does NOT respawn.
+      const realWs = path.join(root, 'workspace-real');
+      const symlinkWs = path.join(root, 'workspace-symlink');
+      await mkdir(realWs, { recursive: true });
+      symlinkSync(realWs, symlinkWs, 'dir');
+
+      const sidSym = 'deck_test_acp_symlink_cwd';
+      await provider.createSession({ sessionKey: sidSym, sessionName: sidSym, cwd: symlinkWs, agentId: 'model-a' });
+      await provider.send(sidSym, 'turn via symlinkWs');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(5), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(5);
+      expect(boots[4].cwd).toBe(realpathSync(realWs));
+      expect(boots[4].pwd).toBe(realpathSync(realWs));
+
+      await provider.createSession({ sessionKey: sidSym, sessionName: sidSym, cwd: realWs, agentId: 'model-a' });
+      await provider.send(sidSym, 'turn via realWs alias');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(6), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(5);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('sets PWD to spawnCwd and hoists Homebrew/user tool dirs ahead of /usr/bin without shadowing leading caller PATH shims', async () => {
+    const fakeHome = await mkdtemp(path.join(tmpdir(), 'imcodes-acp-path-home-'));
+    const ws = path.join(fakeHome, 'project');
+    await mkdir(ws, { recursive: true });
+    try {
+      const launchdPath = [
+        '/tmp/test-shim',
+        `${fakeHome}/.local/bin`,
+        '/usr/local/bin',
+        '/System/Cryptexes/App/usr/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
+        '/opt/homebrew/bin',
+      ].join(':');
+      const { provider, requests } = await setup('', {
+        HOME: fakeHome,
+        PWD: '/',
+        PATH: launchdPath,
+      });
+      const done = vi.fn();
+      const errors = vi.fn();
+      provider.onComplete(done);
+      provider.onError(errors);
+
+      const sid = 'deck_test_acp_env_path';
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: ws, agentId: 'model-a' });
+      await provider.send(sid, 'check env');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      const boot = (await requests()).find((r) => r.fixture === 'boot');
+      expect(boot).toBeTruthy();
+      expect(boot.pwd).toBe(realpathSync(ws));
+      if (process.platform !== 'win32') {
+        const entries = String(boot.path ?? '').split(':');
+        expect(entries[0]).toBe('/tmp/test-shim');
+        const cryptexIdx = entries.indexOf('/System/Cryptexes/App/usr/bin');
+        const usrBinIdx = entries.indexOf('/usr/bin');
+        expect(cryptexIdx).toBeGreaterThan(0);
+        expect(usrBinIdx).toBeGreaterThan(cryptexIdx);
+        for (const expectedDir of [
+          path.join(fakeHome, '.local', 'bin'),
+          path.join(fakeHome, '.gemini', 'antigravity-cli', 'bin'),
+          path.join(fakeHome, '.npm-global', 'bin'),
+          '/opt/homebrew/bin',
+          '/usr/local/bin',
+        ]) {
+          const idx = entries.indexOf(expectedDir);
+          expect(idx).toBeGreaterThan(0);
+          expect(idx).toBeLessThan(cryptexIdx);
+          expect(entries.filter((entry) => entry === expectedDir)).toHaveLength(1);
+        }
+      }
+    } finally {
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  function encodeProtobufVarint(n: number): Buffer {
+    const out: number[] = [];
+    let val = n;
+    while (val >= 0x80) {
+      out.push((val & 0x7f) | 0x80);
+      val = Math.floor(val / 128);
+    }
+    out.push(val);
+    return Buffer.from(out);
+  }
+
+  async function writeAgyMetadataBlobDb(
+    homeDir: string,
+    acpSessionId: string,
+    blobData: Buffer,
+  ): Promise<string> {
+    const dir = path.join(homeDir, '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(dir, { recursive: true });
+    const dbPath = path.join(dir, `${acpSessionId}.db`);
+    suppressSqliteExperimentalWarning();
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec('CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)');
+      db.prepare('INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES (?, ?)').run('main', blobData);
+    } finally {
+      db.close();
+    }
+    return dbPath;
+  }
+
+  function buildPersistedSystemPromptBlob(promptText: string): Buffer {
+    const payload = Buffer.from(promptText, 'utf8');
+    const marker = Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1');
+    const prefix = Buffer.from('08011a086d65746164617461', 'hex');
+    const suffix = Buffer.from('1001', 'hex');
+    return Buffer.concat([prefix, marker, encodeProtobufVarint(payload.length), payload, suffix]);
+  }
+
+  it('omits session/resume _meta when SQLite trajectory_metadata_blob already persisted acp_system_prompt (Scenario A)', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    const debugSpy = vi.spyOn(logger, 'debug');
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const errorSpy = vi.spyOn(logger, 'error');
+    try {
+      const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const identity = '<imcodes-agent-identity>\nSECRET_SLOT_A_IDENTITY_101\n</imcodes-agent-identity>';
+      const persistedPrompt = `${'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2400)}\n${identity}`;
+      await writeAgyMetadataBlobDb(root, 'persisted-slot-a', buildPersistedSystemPromptBlob(persistedPrompt));
+
+      const id = await route(provider, 'deck_test_slot_a_resume', { resumeId: 'persisted-slot-a' });
+      const complete = vi.fn();
+      provider.onComplete(complete);
+
+      // Cold session/resume after hibernation when base contract and identity match (CRLF / blank lines normalized)
+      const matchingSystemPrompt = `${'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2400).trimEnd()}\r\n\r\n${identity}`;
+      const p1 = normalizeProviderPayload('wake from hibernation');
+      p1.sessionSystemText = matchingSystemPrompt;
+      p1.context = { ...p1.context, sessionSystemText: matchingSystemPrompt };
+      await provider.send(id, p1);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+      // Live syncMetaOnLoaded after refreshSessionSystemText while base & identity remain unchanged
+      provider.refreshSessionSystemText(id);
+      const p2 = normalizeProviderPayload('turn after refresh');
+      p2.sessionSystemText = matchingSystemPrompt;
+      p2.context = { ...p2.context, sessionSystemText: matchingSystemPrompt };
+      await provider.send(id, p2);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+      const reqs = await requests();
+      const resumes = reqs.filter((x) => x.method === 'session/resume');
+      expect(resumes).toHaveLength(1);
+      expect(resumes[0]?.params?.sessionId).toBe('persisted-slot-a');
+      expect(resumes[0]?.params?._meta).toBeUndefined();
+
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      expect(prompts).toEqual(['wake from hibernation', 'turn after refresh']);
+      for (const promptText of prompts) {
+        expect(promptText).not.toContain('OUTER_SYSTEM_CONTRACT');
+        expect(promptText).not.toContain('SECRET_SLOT_A_IDENTITY_101');
+      }
+
+      for (const spy of [infoSpy, debugSpy, warnSpy, errorSpy]) {
+        for (const call of spy.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('SECRET_SLOT_A_IDENTITY_101');
+        }
+      }
+    } finally {
+      infoSpy.mockRestore();
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('sends only updated <imcodes-agent-identity> block via _meta when Slot A already persisted outer prompt (Scenario B)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const outerContract = 'OUTER_CONTRACT_55KB_PADDING '.repeat(2200);
+    const idV1 = '<imcodes-agent-identity>\nIDENTITY_V1\n</imcodes-agent-identity>';
+    const idV2 = '<imcodes-agent-identity>\nIDENTITY_V2_UPDATED\n</imcodes-agent-identity>';
+    await writeAgyMetadataBlobDb(root, 'persisted-slot-b', buildPersistedSystemPromptBlob(`${outerContract}\n${idV1}`));
+
+    const id = await route(provider, 'deck_test_slot_b_identity_delta', { resumeId: 'persisted-slot-b' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    // Cold resume with updated <imcodes-agent-identity>: only sends the delta identity block
+    await provider.send(id, makePayload('turn-1-delta', `${outerContract}\n${idV2}`));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    // Mid-session identity cleared while outer contract remains: sends empty identity override only
+    await provider.send(id, makePayload('turn-2-clear-identity', outerContract));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumes = reqs.filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: idV2 } },
+    });
+    expect(resumes[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '<imcodes-agent-identity>\n</imcodes-agent-identity>' } },
+    });
+    for (const resumeReq of resumes) {
+      expect(resumeReq?.params?._meta?.antigravity?.systemPrompt?.append).not.toContain('OUTER_CONTRACT_55KB_PADDING');
+    }
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['turn-1-delta', 'turn-2-clear-identity']);
+  });
+
+  it('delivers full _meta on session/resume when SQLite trajectory_metadata_blob lacks acp_system_prompt (Scenario C)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    // Legacy ~812-byte metadata blob without acp_system_prompt field
+    await writeAgyMetadataBlobDb(root, 'legacy-no-slot-a', Buffer.alloc(812, 0x20));
+
+    const id = await route(provider, 'deck_test_legacy_db_resume', { resumeId: 'legacy-no-slot-a' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const fullSystemText = `${'LEGACY_FULL_SYSTEM_CONTRACT '.repeat(200)}\n<imcodes-agent-identity>LEGACY_V1</imcodes-agent-identity>`;
+    const p = normalizeProviderPayload('legacy resume turn');
+    p.sessionSystemText = fullSystemText;
+    p.context = { ...p.context, sessionSystemText: fullSystemText };
+    await provider.send(id, p);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumeReq = reqs.find((x) => x.method === 'session/resume');
+    expect(resumeReq?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: fullSystemText } },
+    });
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['legacy resume turn']);
+  });
+
+  it('safely returns null from readPersistedAgySystemPrompt on traversal, missing/empty/corrupt DB, and busy lock', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-blob-bounds-'));
+    try {
+      expect(readPersistedAgySystemPrompt('', 'valid-id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '.')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '..')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '../escape')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'nested/id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'win\\id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'null\0id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'does-not-exist')).toBeNull();
+
+      // Valid round-trip (>128 bytes multi-byte varint + UTF-8)
+      const roundTripText = '中文边界测试 '.repeat(40);
+      await writeAgyMetadataBlobDb(root, 'valid-utf8', buildPersistedSystemPromptBlob(roundTripText));
+      expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBe(roundTripText);
+
+      // Empty table (no 'main' row)
+      const dir = path.join(root, '.gemini', 'antigravity-cli', 'conversations');
+      suppressSqliteExperimentalWarning();
+      const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+      const emptyDb = new DatabaseSync(path.join(dir, 'empty-row.db'));
+      emptyDb.exec('CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)');
+      emptyDb.close();
+      expect(readPersistedAgySystemPrompt(root, 'empty-row')).toBeNull();
+
+      // Truncated varint / length exceeding buffer
+      const marker = Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1');
+      await writeAgyMetadataBlobDb(root, 'truncated-varint', Buffer.concat([marker, Buffer.from([0x80])]));
+      expect(readPersistedAgySystemPrompt(root, 'truncated-varint')).toBeNull();
+
+      await writeAgyMetadataBlobDb(root, 'truncated-payload', Buffer.concat([marker, encodeProtobufVarint(50), Buffer.from('short')]));
+      expect(readPersistedAgySystemPrompt(root, 'truncated-payload')).toBeNull();
+
+      // Invalid UTF-8 bytes inside payload
+      await writeAgyMetadataBlobDb(root, 'bad-utf8', Buffer.concat([marker, encodeProtobufVarint(2), Buffer.from([0xff, 0xfe])]));
+      expect(readPersistedAgySystemPrompt(root, 'bad-utf8')).toBeNull();
+
+      // Busy lock (EXCLUSIVE transaction held while busy_timeout=0)
+      const lockDbPath = path.join(dir, 'valid-utf8.db');
+      const lockingDb = new DatabaseSync(lockDbPath);
+      try {
+        lockingDb.exec('BEGIN EXCLUSIVE');
+        expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBeNull();
+        lockingDb.exec('ROLLBACK');
+      } finally {
+        lockingDb.close();
+      }
+      // After lock release, reading succeeds again (no leaked handle / corruption)
+      expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBe(roundTripText);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: 'Slot A with identity: A -> B -> B(outer refresh) -> A -> A(outer refresh) -> rebuild(A)',
+      initialIdentity: '<imcodes-agent-identity>\nIDENTITY_A\n</imcodes-agent-identity>',
+      revertAppend: '<imcodes-agent-identity>\nIDENTITY_A\n</imcodes-agent-identity>',
+      sessionId: 'slot-a-revert-with-id',
+    },
+    {
+      label: 'Slot A without identity: none -> B -> B(outer refresh) -> none -> none(outer refresh) -> rebuild(none)',
+      initialIdentity: undefined,
+      revertAppend: '',
+      sessionId: 'slot-a-revert-no-id',
+    },
+  ])('reverts Slot B override back to Slot A baseline cleanly ($label)', async ({ initialIdentity, revertAppend, sessionId }) => {
+    const outerV1 = 'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2200);
+    const identityB = '<imcodes-agent-identity>\nIDENTITY_B_DYNAMIC\n</imcodes-agent-identity>';
+
+    const buildSystemText = (outer: string, idBlock?: string) => (idBlock ? `${outer}\n${idBlock}` : outer);
+    const persistedText = buildSystemText(outerV1, initialIdentity);
+
+    const { provider, root, binary, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    await writeAgyMetadataBlobDb(root, sessionId, buildPersistedSystemPromptBlob(persistedText));
+
+    const routeName = `deck_test_${sessionId}`;
+    await route(provider, routeName, { resumeId: sessionId });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(routeName, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume at baseline -> omits _meta
+    await sendTurn('turn-1-baseline', persistedText, 1);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta ?? null)).toEqual([null]);
+
+    // 2. Live update to B -> sends B delta
+    await sendTurn('turn-2-apply-b', buildSystemText(outerV1, identityB), 2);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta?.antigravity?.systemPrompt?.append ?? null)).toEqual([
+      null,
+      identityB,
+    ]);
+
+    // 3. refreshSessionSystemText while base & B unchanged -> no extra resume RPC
+    provider.refreshSessionSystemText(routeName);
+    await sendTurn('turn-3-keep-b-outer-refresh', buildSystemText(outerV1, identityB), 3);
+    expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(2);
+
+    // 4. Revert back to Slot A baseline -> MUST send resume override to clear/replace B in Slot B
+    await sendTurn('turn-4-revert-to-a', buildSystemText(outerV1, initialIdentity), 4);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta?.antigravity?.systemPrompt?.append ?? null)).toEqual([
+      null,
+      identityB,
+      revertAppend,
+    ]);
+
+    // 5. refreshSessionSystemText while reverted baseline unchanged -> no extra resume RPC
+    provider.refreshSessionSystemText(routeName);
+    await sendTurn('turn-5-keep-reverted-outer-refresh', buildSystemText(outerV1, initialIdentity), 5);
+    expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(3);
+
+    // 6. Transport rebuild on a fresh provider instance (simulating daemon restart / hibernation wake) ->
+    //    activeSlotBIdentityOverride resets to undefined, cold resume at baseline omits _meta again
+    const logAfterRebuild = path.join(root, 'rpc-rebuild.jsonl');
+    const providerAfterRebuild = new AgyAcpProvider();
+    resources.push({ provider: providerAfterRebuild, root });
+    await providerAfterRebuild.connect({
+      binaryPath: binary,
+      env: {
+        HOME: root,
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: logAfterRebuild,
+        AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1',
+      },
+    });
+    const rebuildComplete = vi.fn();
+    providerAfterRebuild.onComplete(rebuildComplete);
+    await providerAfterRebuild.createSession({
+      sessionKey: routeName,
+      sessionName: routeName,
+      cwd: process.cwd(),
+      agentId: 'model-a',
+      resumeId: sessionId,
+    });
+    const pRebuild = normalizeProviderPayload('turn-6-after-rebuild');
+    pRebuild.sessionSystemText = buildSystemText(outerV1, initialIdentity);
+    pRebuild.context = { ...pRebuild.context, sessionSystemText: pRebuild.sessionSystemText };
+    await providerAfterRebuild.send(routeName, pRebuild);
+    await vi.waitFor(() => expect(rebuildComplete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const rebuildReqs = (await readFile(logAfterRebuild, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const rebuildResumes = rebuildReqs.filter((x) => x.method === 'session/resume');
+    expect(rebuildResumes).toHaveLength(1);
+    expect(rebuildResumes[0]?.params?._meta).toBeUndefined();
+
+    // Prompts stay clean across both transports (never leaking system contract or identity)
+    const initialPrompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    const rebuildPrompts = rebuildReqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(initialPrompts).toEqual([
+      'turn-1-baseline',
+      'turn-2-apply-b',
+      'turn-3-keep-b-outer-refresh',
+      'turn-4-revert-to-a',
+      'turn-5-keep-reverted-outer-refresh',
+    ]);
+    expect(rebuildPrompts).toEqual(['turn-6-after-rebuild']);
+  });
+
+  it('resends full contract when SQLite holds a 643-byte slash-control stub without repeating on subsequent identical turns', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const slashStub = [
+      '<imcodes-cron-control> message is a trusted scheduled task.',
+      '</imcodes-cron-control>',
+      '',
+      'IM.codes session identity:',
+      '- Exact session name: deck_jdzj_brain',
+      '- Display label: Brain',
+      'X'.repeat(420),
+    ].join('\n');
+    expect(Buffer.byteLength(slashStub, 'utf8')).toBeGreaterThan(500);
+    expect(Buffer.byteLength(slashStub, 'utf8')).toBeLessThan(800);
+    await writeAgyMetadataBlobDb(root, 'stub-session', buildPersistedSystemPromptBlob(slashStub));
+
+    const id = await route(provider, 'deck_test_stub_recovery', { resumeId: 'stub-session' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const fullContract = `${'IM.codes autonomous-work policy + task_pair_markers_v1 '.repeat(900)}\n<imcodes-agent-identity>\nPROJECT_RULES\n</imcodes-agent-identity>`;
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume with 643-byte stub -> MUST deliver full contract in Slot B
+    await sendTurn('turn-1-recover-stub', fullContract, 1);
+    // 2. Repeated turn with unchanged contract hash -> MUST NOT re-send _meta / session/resume
+    await sendTurn('turn-2-same-contract', fullContract, 2);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: fullContract } },
+    });
+  });
+
+  it('resends full contract on outdated base upgrade, preserves full contract across identity edits, and neutralizes stale Slot A identity', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const outerV1 = 'OUTER_CONTRACT_V1 '.repeat(1200).trim();
+    const outerV2 = 'OUTER_CONTRACT_V2_UPGRADED '.repeat(1200).trim();
+    const idA = '<imcodes-agent-identity>\nSTALE_SLOT_A_IDENTITY\n</imcodes-agent-identity>';
+    const idB = '<imcodes-agent-identity>\nLIVE_IDENTITY_B\n</imcodes-agent-identity>';
+
+    await writeAgyMetadataBlobDb(root, 'outdated-base', buildPersistedSystemPromptBlob(`${outerV1}\n${idA}`));
+    const id = await route(provider, 'deck_test_outdated_base', { resumeId: 'outdated-base' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Upgraded base WITHOUT identity while Slot A carried STALE_SLOT_A_IDENTITY ->
+    //    must deliver full outerV2 AND append empty identity block to neutralize Slot A's identity.
+    await sendTurn('turn-1-upgraded-no-id', outerV2, 1);
+    // 2. Later add identity B while base stays outerV2 -> must send full outerV2 + idB (not idB alone!)
+    await sendTurn('turn-2-upgraded-with-id-b', `${outerV2}\n${idB}`, 2);
+    // 3. Revert back to original outerV1 + idA (matching Slot A) -> sends '' to clear outerV2 + idB in Slot B
+    await sendTurn('turn-3-revert-to-v1', `${outerV1}\n${idA}`, 3);
+    // 4. Refresh while matching outerV1 + idA -> no extra session/resume
+    provider.refreshSessionSystemText(id);
+    await sendTurn('turn-4-stay-v1', `${outerV1}\n${idA}`, 4);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(3);
+    expect(resumes[0]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>`);
+    expect(resumes[1]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n${idB}`);
+    expect(resumes[2]?.params?._meta?.antigravity?.systemPrompt?.append).toBe('');
+  });
+
+  it('handles stripAgentIdentityBlock and resolveAgyResumeSystemPromptMeta boundary cases', () => {
+    const idBlock = '<imcodes-agent-identity>\nUSER_RULE\n</imcodes-agent-identity>';
+    expect(stripAgentIdentityBlock(`A\r\n\r\n${idBlock}\r\n\r\n\r\nB`)).toBe('A\n\nB');
+    expect(stripAgentIdentityBlock('   \n  ')).toBe('');
+
+    // Whitespace-only persisted prompt triggers full send
+    const onEmpty = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: '   \n  ',
+      trimmedSystemText: `FULL_CONTRACT\n${idBlock}`,
+      hasDeliveredMeta: false,
+    });
+    expect(onEmpty.shouldSendMeta).toBe(true);
+    expect(onEmpty.metaToSend).toBe(`FULL_CONTRACT\n${idBlock}`);
+
+    // Revert from mismatched full override without identity back to matching base without identity clears Slot B once
+    const step1 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V2',
+      hasDeliveredMeta: false,
+    });
+    expect(step1).toMatchObject({ shouldSendMeta: true, metaToSend: 'BASE_V2' });
+    const step2 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V1',
+      hasDeliveredMeta: step1.nextMetaDelivered,
+      activeSlotBOverride: step1.nextSlotBOverride,
+    });
+    expect(step2).toMatchObject({ shouldSendMeta: true, metaToSend: '', nextSlotBOverride: undefined });
+    const step3 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V1',
+      hasDeliveredMeta: step2.nextMetaDelivered,
+      activeSlotBOverride: step2.nextSlotBOverride,
+    });
+    expect(step3.shouldSendMeta).toBe(false);
+  });
+
+  it('preserves full IM.codes contract & identity across /compact on an active AGY session and keeps /compact byte-clean', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_compact_preserve';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({
+      sessionKey: id,
+      sessionName: id,
+      role: 'brain',
+      description: 'AGY Brain description',
+      identityPrompt: '<imcodes-agent-identity>\nKEEP_ME_ACROSS_COMPACT\n</imcodes-agent-identity>',
+      agentId: 'model-a',
+    });
+
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+
+    try {
+      runtime.send('initial task', 't-1');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const newAppend = (await requests()).find((x) => x.method === 'session/new')?.params?._meta?.antigravity?.systemPrompt?.append as string;
+      const acpSessionId = (provider as any).sessions.get(id).acpSessionId as string;
+      await writeAgyMetadataBlobDb(root, acpSessionId, buildPersistedSystemPromptBlob(newAppend));
+
+      runtime.send('/compact', 't-compact');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+      runtime.send('after compact task', 't-3');
+      await vi.waitFor(() => expect(completed).toHaveLength(3), { timeout: 5000 });
+
+      const reqs = await requests();
+      const resumes = reqs.filter((x) => x.method === 'session/resume');
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+
+      expect(newAppend).toContain('KEEP_ME_ACROSS_COMPACT');
+      expect(newAppend).toContain('AGY Brain description');
+      // Never sends EMPTY_AGENT_IDENTITY_BLOCK or overwrites Slot B during /compact or post-compact turn
+      expect(resumes).toHaveLength(0);
+      expect(prompts).toEqual(['initial task', '/compact', 'after compact task']);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('delivers full IM.codes system contract on session/new when first turn on fresh AGY session is commandMode: true', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_cmd_first_turn';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({
+      sessionKey: id,
+      sessionName: id,
+      role: 'brain',
+      description: 'Fresh Brain description',
+      identityPrompt: '<imcodes-agent-identity>\nFRESH_CMD_IDENTITY\n</imcodes-agent-identity>',
+      agentId: 'model-a',
+    });
+
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+
+    try {
+      runtime.send('status probe', 'cmd-first', undefined, undefined, { commandMode: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const reqs = await requests();
+      const newReq = reqs.find((x) => x.method === 'session/new');
+      const promptTexts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      const append = newReq?.params?._meta?.antigravity?.systemPrompt?.append as string | undefined;
+
+      expect(append).toContain('FRESH_CMD_IDENTITY');
+      expect(append).toContain('Fresh Brain description');
+      expect(append).toContain('IM.codes autonomous-work policy');
+      expect(promptTexts).toEqual(['status probe']);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('keeps /compact byte-clean on non-meta ACP turns while delivering full sessionSystemText on the next ordinary turn', async () => {
+    const { provider, requests } = await setup('');
+    const id = await route(provider, 'deck_test_non_meta_compact_clean');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = 'FULL_NON_META_CONTRACT\n<imcodes-agent-identity>NON_META_ID</imcodes-agent-identity>';
+      p.context = { ...p.context, sessionSystemText: p.sessionSystemText };
+      return p;
+    };
+
+    await provider.send(id, makePayload('/compact'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, makePayload('ordinary turn'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const prompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts[0]).toBe('/compact');
+    expect(prompts[1]).toContain('FULL_NON_META_CONTRACT');
+    expect(prompts[1]).toContain('NON_META_ID');
+    expect(prompts[1]).toContain('ordinary turn');
+  });
+
+  it('clears full Slot B override when reverting A+I -> B+I -> A+I without repeating on subsequent A+I (F1 provider fixture flow)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const baseA = 'BASE_CONTRACT_A '.repeat(1200).trim();
+    const baseB = 'BASE_CONTRACT_B '.repeat(1200).trim();
+    const sameIdentity = '<imcodes-agent-identity>\nSAME_IDENTITY_RULE\n</imcodes-agent-identity>';
+
+    await writeAgyMetadataBlobDb(root, 'slot-b-full-revert', buildPersistedSystemPromptBlob(`${baseA}\n${sameIdentity}`));
+    const id = await route(provider, 'deck_test_full_slot_b_revert_same_id', { resumeId: 'slot-b-full-revert' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume A+I -> B+I (base differs, same identity) -> sends full B+I into Slot B
+    await sendTurn('turn-1-b-plus-i', `${baseB}\n${sameIdentity}`, 1);
+    // 2. Revert back to A+I (same base & identity as Slot A) -> MUST send '' to clear full B+I in Slot B
+    await sendTurn('turn-2-revert-a-plus-i', `${baseA}\n${sameIdentity}`, 2);
+    // 3. Repeated A+I (even after refreshSessionSystemText) -> MUST NOT repeat session/resume
+    provider.refreshSessionSystemText(id);
+    await sendTurn('turn-3-repeat-a-plus-i', `${baseA}\n${sameIdentity}`, 3);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: `${baseB}\n${sameIdentity}` } },
+    });
+    expect(resumes[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '' } },
+    });
+  });
+
+  it.each([
+    {
+      label: 'A+I -> B+I -> A+I (same identity)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '',
+    },
+    {
+      label: 'A+I -> B -> A+I (B dropped identity, reverted to A+I)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B',
+      expected1: 'B\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '',
+    },
+    {
+      label: 'A+I -> B -> A (B dropped identity, stayed identity-less on A)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B',
+      expected1: 'B\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '<imcodes-agent-identity>\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A+ID_A -> B+ID_B -> A+ID_B (new identity retained on A)',
+      persisted: 'A\n<imcodes-agent-identity>\nID_A\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected2: '<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A+ID_A -> B+ID_B -> A (identity cleared on revert to A)',
+      persisted: 'A\n<imcodes-agent-identity>\nID_A\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '<imcodes-agent-identity>\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A -> B+I -> A+I (persisted no-id, reverted base with new identity)',
+      persisted: 'A',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A -> B+I -> A (persisted no-id, B had identity, reverted to A)',
+      persisted: 'A',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '',
+    },
+    {
+      label: 'A -> B -> A (no identity anywhere)',
+      persisted: 'A',
+      step1: 'B',
+      expected1: 'B',
+      step2: 'A',
+      expected2: '',
+    },
+  ])('clears/replaces full Slot B override cleanly across full-to-base revert matrix ($label)', ({ persisted, step1, expected1, step2, expected2 }) => {
+    const p1 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step1,
+      hasDeliveredMeta: false,
+    });
+    expect(p1).toMatchObject({ shouldSendMeta: true, metaToSend: expected1 });
+
+    const p2 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step2,
+      hasDeliveredMeta: p1.nextMetaDelivered,
+      activeSlotBOverride: p1.nextSlotBOverride,
+    });
+    expect(p2).toMatchObject({ shouldSendMeta: true, metaToSend: expected2 });
+
+    // Repeating step2 MUST NOT re-send _meta
+    const p3 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step2,
+      hasDeliveredMeta: p2.nextMetaDelivered,
+      activeSlotBOverride: p2.nextSlotBOverride,
+    });
+    expect(p3.shouldSendMeta).toBe(false);
+  });
+
+  function encodeLenDelimitedField(fieldNum: number, payload: Uint8Array): Buffer {
+    return Buffer.concat([
+      encodeProtobufVarint(fieldNum * 8 + 2),
+      encodeProtobufVarint(payload.length),
+      payload,
+    ]);
+  }
+
+  function buildWorkspaceInfoSlice(uri: string, gitMeta?: { repo: string; branch: string }): Buffer {
+    const inner: Buffer[] = [encodeLenDelimitedField(1, Buffer.from(uri, 'utf8'))];
+    if (gitMeta) {
+      inner.push(
+        encodeLenDelimitedField(
+          3,
+          Buffer.concat([
+            encodeLenDelimitedField(1, Buffer.from(gitMeta.repo, 'utf8')),
+            encodeLenDelimitedField(2, Buffer.from(gitMeta.branch, 'utf8')),
+          ]),
+        ),
+      );
+    }
+    return encodeLenDelimitedField(1, Buffer.concat(inner));
+  }
+
+  function readTopLevelWorkspaceEntries(blob: Uint8Array): { f1Slices: Buffer[]; f1Uris: string[]; f7Uris: string[]; otherFieldNums: number[] } {
+    const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+    const readVar = (start: number): { val: number; next: number } => {
+      let off = start;
+      let val = 0;
+      let shift = 0;
+      while (off < buf.length) {
+        const b = buf[off++]!;
+        val += (b & 0x7f) * 2 ** shift;
+        if ((b & 0x80) === 0) return { val, next: off };
+        shift += 7;
+      }
+      throw new Error('truncated varint');
+    };
+    const f1Slices: Buffer[] = [];
+    const f1Uris: string[] = [];
+    const f7Uris: string[] = [];
+    const otherFieldNums: number[] = [];
+    let off = 0;
+    while (off < buf.length) {
+      const start = off;
+      const tag = readVar(off);
+      off = tag.next;
+      const field = Math.floor(tag.val / 8);
+      const wire = tag.val & 7;
+      if (wire === 0) {
+        while ((buf[off++]! & 0x80) !== 0) { /* advance */ }
+      } else if (wire === 1) {
+        off += 8;
+      } else if (wire === 2) {
+        const len = readVar(off);
+        off = len.next;
+        const payload = buf.subarray(off, off + len.val);
+        off += len.val;
+        if (field === 1) {
+          f1Slices.push(Buffer.from(buf.subarray(start, off)));
+          let pOff = 0;
+          while (pOff < payload.length) {
+            let pTagVal = 0;
+            let pShift = 0;
+            while (pOff < payload.length) {
+              const b = payload[pOff++]!;
+              pTagVal += (b & 0x7f) * 2 ** pShift;
+              if ((b & 0x80) === 0) break;
+              pShift += 7;
+            }
+            const pField = Math.floor(pTagVal / 8);
+            const pWire = pTagVal & 7;
+            if (pWire === 2) {
+              let pLen = 0;
+              let lShift = 0;
+              while (pOff < payload.length) {
+                const b = payload[pOff++]!;
+                pLen += (b & 0x7f) * 2 ** lShift;
+                if ((b & 0x80) === 0) break;
+                lShift += 7;
+              }
+              const sub = payload.subarray(pOff, pOff + pLen);
+              pOff += pLen;
+              if (pField === 1) f1Uris.push(sub.toString('utf8'));
+            }
+          }
+        } else if (field === 7) {
+          f7Uris.push(payload.toString('utf8'));
+        } else {
+          otherFieldNums.push(field);
+        }
+      } else if (wire === 5) {
+        off += 4;
+      }
+    }
+    return { f1Slices, f1Uris, f7Uris, otherFieldNums };
+  }
+
+  function readBlobRow(dbPath: string): Buffer {
+    suppressSqliteExperimentalWarning();
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data: Uint8Array };
+      return Buffer.from(row.data);
+    } finally {
+      db.close();
+    }
+  }
+
+  it('strips wrong root file:/// workspace from SQLite trajectory_metadata_blob before session/resume while preserving matching git metadata and Slot A prompt', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const projDir = path.join(root, 'proj');
+    await mkdir(projDir, { recursive: true });
+    const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+
+    const identity = '<imcodes-agent-identity>\nWS_ALIGN_ID_1\n</imcodes-agent-identity>';
+    const persistedPrompt = `${'SLOT_A_55KB_OUTER '.repeat(2300)}\n${identity}`;
+    const f1Wrong = buildWorkspaceInfoSlice('file:///');
+    const f1Proj = buildWorkspaceInfoSlice(targetUri, { repo: 'im4codes/imcodes', branch: 'dev' });
+    const f4 = encodeLenDelimitedField(4, Buffer.from('preserve-f4-bytes', 'utf8'));
+    const f10Payload = Buffer.concat([
+      Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1'),
+      encodeProtobufVarint(Buffer.byteLength(persistedPrompt, 'utf8')),
+      Buffer.from(persistedPrompt, 'utf8'),
+    ]);
+    const f10 = encodeLenDelimitedField(10, f10Payload);
+    const f15Fixed64 = Buffer.concat([encodeProtobufVarint(15 * 8 + 1), Buffer.from('0102030405060708', 'hex')]);
+    const f18Fixed32 = Buffer.concat([encodeProtobufVarint(18 * 8 + 5), Buffer.from('0a0b0c0d', 'hex')]);
+    const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///', 'utf8'));
+    const f7Proj = encodeLenDelimitedField(7, Buffer.from(targetUri, 'utf8'));
+
+    const initialBlob = Buffer.concat([f1Wrong, f1Proj, f4, f7Wrong, f7Proj, f10, f15Fixed64, f18Fixed32]);
+    const dbPath = await writeAgyMetadataBlobDb(root, 'align-root-slash', initialBlob);
+
+    await provider.createSession({
+      sessionKey: 'deck_test_align_slash',
+      sessionName: 'deck_test_align_slash',
+      cwd: projDir,
+      agentId: 'model-a',
+      resumeId: 'align-root-slash',
+    });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const payload = normalizeProviderPayload('align check');
+    payload.sessionSystemText = persistedPrompt;
+    payload.context = { ...payload.context, sessionSystemText: persistedPrompt };
+    await provider.send('deck_test_align_slash', payload);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const updatedBlob = readBlobRow(dbPath);
+    const parsed = readTopLevelWorkspaceEntries(updatedBlob);
+    expect(parsed.f1Uris).toEqual([targetUri]);
+    expect(parsed.f7Uris).toEqual([targetUri]);
+    expect(parsed.f1Slices[0]?.equals(f1Proj)).toBe(true);
+    expect(updatedBlob.includes(f4)).toBe(true);
+    expect(updatedBlob.includes(f10)).toBe(true);
+    expect(updatedBlob.includes(f15Fixed64)).toBe(true);
+    expect(updatedBlob.includes(f18Fixed32)).toBe(true);
+    expect(readPersistedAgySystemPrompt(root, 'align-root-slash')).toBe(persistedPrompt);
+
+    // Slot A prompt preserved -> session/resume also omits duplicate _meta
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]?.params?._meta).toBeUndefined();
+  });
+
+  it('replaces completely mismatched persisted workspace URIs with project cwd on session/resume', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const projDir = path.join(root, 'new-project');
+    await mkdir(projDir, { recursive: true });
+    const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+
+    const initialBlob = Buffer.concat([
+      buildWorkspaceInfoSlice('file:///wrong/old'),
+      encodeLenDelimitedField(4, Buffer.from('f4-meta', 'utf8')),
+      encodeLenDelimitedField(7, Buffer.from('file:///wrong/old', 'utf8')),
+      encodeLenDelimitedField(7, Buffer.from('file:///home/ai', 'utf8')),
+    ]);
+    const dbPath = await writeAgyMetadataBlobDb(root, 'align-old-only', initialBlob);
+
+    await provider.createSession({
+      sessionKey: 'deck_test_align_old',
+      sessionName: 'deck_test_align_old',
+      cwd: projDir,
+      agentId: 'model-a',
+      resumeId: 'align-old-only',
+    });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+    await provider.send('deck_test_align_old', 'hello aligned');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const parsed = readTopLevelWorkspaceEntries(readBlobRow(dbPath));
+    expect(parsed.f1Uris).toEqual([targetUri]);
+    expect(parsed.f7Uris).toEqual([targetUri]);
+    expect(readBlobRow(dbPath).includes(Buffer.from('f4-meta', 'utf8'))).toBe(true);
+    expect((await requests()).some((x) => x.method === 'session/resume')).toBe(true);
+  });
+
+  it('is idempotent on aligned DBs, normalizes symlinks and special-char paths, skips root /, and survives corrupt blobs', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-ws-bounds-'));
+    try {
+      const realProj = path.join(root, 'real', '测试 dir');
+      await mkdir(realProj, { recursive: true });
+      const symlinkProj = path.join(root, 'proj-link');
+      symlinkSync(realProj, symlinkProj);
+      const expectedUri = pathToFileURL(realpathSync(realProj)).href.replace(/\/+$/, '');
+      expect(expectedUri).toContain('%E6%B5%8B%E8%AF%95%20dir');
+
+      const f1Wrong = buildWorkspaceInfoSlice('file:///home/ai');
+      const f4 = encodeLenDelimitedField(4, Buffer.from('keep-f4', 'utf8'));
+      const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///home/ai', 'utf8'));
+      const dbPath = await writeAgyMetadataBlobDb(root, 'symlink-case', Buffer.concat([f1Wrong, f4, f7Wrong]));
+
+      // Root '/' must never rewrite DB
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', '/')).toBe(false);
+      expect(sanitizeAgyTrajectoryWorkspaceBlob(Buffer.concat([f1Wrong, f4, f7Wrong]), 'file:///')).toBeNull();
+      expect(readTopLevelWorkspaceEntries(readBlobRow(dbPath)).f1Uris).toEqual(['file:///home/ai']);
+
+      // Reconcile via symlink path writes canonical realpath + URL-encoded special chars
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', symlinkProj)).toBe(true);
+      const alignedBytes = readBlobRow(dbPath);
+      expect(readTopLevelWorkspaceEntries(alignedBytes).f1Uris).toEqual([expectedUri]);
+      expect(readTopLevelWorkspaceEntries(alignedBytes).f7Uris).toEqual([expectedUri]);
+
+      // Second call is strictly idempotent (zero write needed -> returns false, identical bytes)
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', symlinkProj)).toBe(false);
+      expect(readBlobRow(dbPath).equals(alignedBytes)).toBe(true);
+
+      // Corrupt/truncated blobs return null / false without modifying DB
+      const corruptBytes = Buffer.from([0x0b, 0xff, 0x80]); // wire type 3 unsupported + truncated
+      const corruptPath = await writeAgyMetadataBlobDb(root, 'corrupt-blob', corruptBytes);
+      expect(sanitizeAgyTrajectoryWorkspaceBlob(corruptBytes, expectedUri)).toBeNull();
+      expect(reconcilePersistedAgyWorkspace(root, 'corrupt-blob', realProj)).toBe(false);
+      expect(readBlobRow(corruptPath).equals(corruptBytes)).toBe(true);
+
+      // Still does not block session/resume when DB blob is corrupt
+      const { provider, root: providerHome, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const corruptSessionProj = path.join(providerHome, 'proj-ok');
+      await mkdir(corruptSessionProj, { recursive: true });
+      await writeAgyMetadataBlobDb(providerHome, 'corrupt-resume-id', corruptBytes);
+      await provider.createSession({
+        sessionKey: 'deck_test_corrupt_resume',
+        sessionName: 'deck_test_corrupt_resume',
+        cwd: corruptSessionProj,
+        agentId: 'model-a',
+        resumeId: 'corrupt-resume-id',
+      });
+      const complete = vi.fn();
+      provider.onComplete(complete);
+      await provider.send('deck_test_corrupt_resume', 'resume despite corrupt blob');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect((await requests()).some((x) => x.method === 'session/resume')).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'f1 missing + wrong f7 before opaque [f7(wrong), f4, f10]', order: 'f7wrong-f4-f10' as const, keepGit: false },
+    { name: 'f1 missing + wrong f7 after opaque [f4, f10, f7(wrong)]', order: 'f4-f10-f7wrong' as const, keepGit: false },
+    { name: 'f1 missing + matching f7 [f4, f10, f7(match)]', order: 'f4-f10-f7match' as const, keepGit: false },
+    { name: 'both f1 and f7 missing [f4, f10]', order: 'f4-f10' as const, keepGit: false },
+    { name: 'f1 present with git + f7 missing [f4, f1(git), f10]', order: 'f4-f1git-f10' as const, keepGit: true },
+  ])('preserves opaque fields and Slot A across missing/reordered workspace fields ($name)', async ({ order, keepGit }) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-ws-matrix-'));
+    try {
+      const projDir = path.join(root, 'proj');
+      await mkdir(projDir, { recursive: true });
+      const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+      const persistedPrompt = `${'MATRIX_SLOT_A_55KB_CONTRACT '.repeat(2050)}\n<imcodes-agent-identity>MATRIX_ID</imcodes-agent-identity>`;
+
+      const f4 = encodeLenDelimitedField(4, Buffer.from('opaque-f4-payload', 'utf8'));
+      const f10Payload = Buffer.concat([
+        Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1'),
+        encodeProtobufVarint(Buffer.byteLength(persistedPrompt, 'utf8')),
+        Buffer.from(persistedPrompt, 'utf8'),
+      ]);
+      const f10 = encodeLenDelimitedField(10, f10Payload);
+      const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///wrong/old', 'utf8'));
+      const f7Match = encodeLenDelimitedField(7, Buffer.from(targetUri, 'utf8'));
+      const f1Git = buildWorkspaceInfoSlice(targetUri, { repo: 'im4codes/imcodes', branch: 'dev' });
+
+      const chunksByOrder: Record<typeof order, Buffer[]> = {
+        'f7wrong-f4-f10': [f7Wrong, f4, f10],
+        'f4-f10-f7wrong': [f4, f10, f7Wrong],
+        'f4-f10-f7match': [f4, f10, f7Match],
+        'f4-f10': [f4, f10],
+        'f4-f1git-f10': [f4, f1Git, f10],
+      };
+
+      const sessionId = `matrix-${order}`;
+      const dbPath = await writeAgyMetadataBlobDb(root, sessionId, Buffer.concat(chunksByOrder[order]));
+
+      expect(reconcilePersistedAgyWorkspace(root, sessionId, projDir)).toBe(true);
+      const afterFirst = readBlobRow(dbPath);
+      const parsed = readTopLevelWorkspaceEntries(afterFirst);
+
+      expect(parsed.f1Uris).toEqual([targetUri]);
+      expect(parsed.f7Uris).toEqual([targetUri]);
+      if (keepGit) {
+        expect(parsed.f1Slices[0]?.equals(f1Git)).toBe(true);
+      }
+
+      const f4Offset = afterFirst.indexOf(f4);
+      const f10Offset = afterFirst.indexOf(f10);
+      expect(f4Offset).toBeGreaterThanOrEqual(0);
+      expect(f10Offset).toBeGreaterThan(f4Offset);
+      expect(readPersistedAgySystemPrompt(root, sessionId)).toBe(persistedPrompt);
+
+      // Strictly idempotent on second run (zero write, identical bytes)
+      expect(reconcilePersistedAgyWorkspace(root, sessionId, projDir)).toBe(false);
+      expect(readBlobRow(dbPath).equals(afterFirst)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes agy-sdk, settings display names, and bare family slugs in AgyAcpProvider.createSession and applySessionModel while overriding upstream default', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const emitted: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((_sid, info) => {
+      if (info.model) emitted.push(info.model);
+    });
+    provider.onComplete(done);
+
+    // 1. Bare backend placeholder 'agy-sdk' falls back to AGY_DEFAULT_MODEL_ID ('gemini-4-hydrogen-high')
+    await provider.createSession({
+      sessionKey: 'deck_test_acp_norm_default',
+      sessionName: 'deck_test_acp_norm_default',
+      cwd: process.cwd(),
+      agentId: 'agy-sdk',
+      fresh: true,
+    });
+    await provider.send('deck_test_acp_norm_default', 'turn-1');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // 2. Display name normalizes to canonical slug in applySessionModel
+    expect(await provider.applySessionModel('deck_test_acp_norm_default', 'Gemini 4 Hydrogen (Medium)')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    await provider.send('deck_test_acp_norm_default', 'turn-2');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-medium');
+
+    // 3. Bare family slug in createSession normalizes with '-high' suffix
+    await provider.createSession({
+      sessionKey: 'deck_test_acp_norm_family',
+      sessionName: 'deck_test_acp_norm_family',
+      cwd: process.cwd(),
+      agentId: 'gemini-4-neon',
+      fresh: true,
+    });
+    await provider.send('deck_test_acp_norm_family', 'turn-3');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-neon-high');
+
+    const setModelIds = (await requests())
+      .filter((r) => r.method === 'session/set_model')
+      .map((r) => r.params.modelId);
+    expect(setModelIds).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-medium',
+      'gemini-4-neon-high',
+    ]);
+    expect(emitted).not.toContain('agy-sdk');
+    expect(emitted).not.toContain('gemini-4-carbon-medium');
+  });
+
+  it('surfaces AGY background shell tasks in SDK sub-agent panel lifecycle with secret redaction, idempotent starts, and full cleanup', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_shell_panel';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-bg-shell')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // 1. Start a background run_command with inline secret token -> sanitized running event + backgroundWorkCount=1
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-1\nTask Description: bash ./sync.sh --all`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'GH_TOKEN=ghp_supersecret123 bash ./sync.sh --all', WaitMsBeforeAsync: 500 },
+        toolStatus: 'complete',
+        toolId: 'acp-tool-1',
+      });
+      expect(events).toHaveLength(1);
+      const startEvt = events[0]!;
+      expect(startEvt.status).toBe('running');
+      expect(startEvt.detail?.meta).toMatchObject({
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        taskId: `${nativeId}/task-1`,
+        taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+        backgrounded: true,
+        active: true,
+        terminal: false,
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        parentToolUseId: 'acp-tool-1',
+      });
+      expect(startEvt.detail?.summary).toContain('bash ./sync.sh --all');
+      expect(JSON.stringify(startEvt)).not.toContain('ghp_supersecret123');
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // 2. Duplicate start notification for same taskId is idempotent (keeps startedAtMs, no extra event)
+      const firstStartedAt = startEvt.detail?.meta?.startedAtMs;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'other command' },
+        toolStatus: 'running',
+      });
+      expect(events).toHaveLength(1);
+      expect(state.agyBackgroundTasks.get(`${nativeId}/task-1`)?.startedAtMs).toBe(firstStartedAt);
+
+      // 3. Excluded tools (IsDaemon, recurring schedule, invoke_subagent) do NOT create local_bash background shell rows
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/daemon-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm run dev', IsDaemon: true },
+        toolStatus: 'complete',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/cron-1`,
+        toolName: 'schedule',
+        toolInput: { CronExpression: '*/5 * * * *', Prompt: 'check' },
+        toolStatus: 'complete',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sub-1`,
+        toolName: 'invoke_subagent',
+        toolInput: { Role: 'Researcher', Prompt: 'read' },
+        toolStatus: 'complete',
+      });
+      expect(events).toHaveLength(1);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+
+      // 4. Completion notification emits matching terminal event on same canonicalKey and clears to 0
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/task-1" finished with result:\nCommand exited with code 0.`,
+        isSystemMessage: true,
+      });
+      expect(events).toHaveLength(2);
+      expect(events[1]!.id).toBe(startEvt.id);
+      expect(events[1]!.status).toBe('complete');
+      expect(events[1]!.detail?.meta).toMatchObject({
+        canonicalKey: startEvt.detail?.meta?.canonicalKey,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+
+      // 5. Non-zero exit code emits error terminal event; server restart & cancel emit interrupted terminal events
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-fail`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'false' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/task-fail" finished with result:\nCommand exited with code 1.`,
+        isSystemMessage: true,
+      });
+      expect(events.at(-1)?.status).toBe('error');
+      expect(events.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-restart`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'docker compose logs -f' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'All your subagents and background tasks have been stopped due to server restart.',
+        isSystemMessage: true,
+      });
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/task-restart`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-cancel`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'tail -f app.log' },
+        toolStatus: 'running',
+      });
+      expect(state.agyBackgroundTasks.size).toBe(1);
+      await provider.cancel(id);
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/task-cancel`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+
+      // 6. Empty manage_task(list) reconciles stale task with matching complete event
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-stale`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 20' },
+        toolStatus: 'running',
+      });
+      const staleStart = events.at(-1)!;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks.',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(events.at(-1)?.id).toBe(staleStart.id);
+      expect(events.at(-1)?.status).toBe('complete');
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        canonicalKey: staleStart.detail?.meta?.canonicalKey,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('redacts quoted/escaped env secrets, CLI password flags, and terminal secret outputs without over-redacting normal quoted commands', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_shell_redaction';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-redact')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // 1. Escaped double quotes inside secret env value + trailing command
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'TOKEN="prefix\\"SYNTHETIC_SECRET_TAIL" bash worker.sh' },
+        toolStatus: 'running',
+      });
+      const e1 = events.at(-1)!;
+      expect(JSON.stringify(e1)).not.toContain('SYNTHETIC_SECRET_TAIL');
+      expect(JSON.stringify(e1)).not.toContain('prefix');
+      expect(e1.detail?.summary).toBe('TOKEN=[REDACTED] bash worker.sh');
+
+      // 2. Concatenated quotes + escaped whitespace inside env value + CLI password/token flags
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-2`,
+        toolName: 'run_command',
+        toolInput: {
+          CommandLine:
+            'API_KEY="part1"\'part2\'\\ SYNTHETIC_JOINED docker login --username alice --password SYNTHETIC_PASSWORD --token="tok\\"SYNTHETIC_FLAG" registry.example',
+        },
+        toolStatus: 'running',
+      });
+      const e2 = events.at(-1)!;
+      const e2Json = JSON.stringify(e2);
+      expect(e2Json).not.toContain('SYNTHETIC_JOINED');
+      expect(e2Json).not.toContain('SYNTHETIC_PASSWORD');
+      expect(e2Json).not.toContain('SYNTHETIC_FLAG');
+      expect(e2.detail?.summary).toContain('docker login --username alice --password [REDACTED] --token=[REDACTED] registry.example');
+
+      // 3. Terminal output containing quoted/escaped secret and password flag is also sanitized before truncation
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/sec-2" finished with error: TOKEN="a\\"SYNTHETIC_OUT_ENV" --password SYNTHETIC_OUT_PW`,
+        isSystemMessage: true,
+      });
+      const e2Term = events.at(-1)!;
+      const e2TermJson = JSON.stringify(e2Term);
+      expect(e2TermJson).not.toContain('SYNTHETIC_OUT_ENV');
+      expect(e2TermJson).not.toContain('SYNTHETIC_OUT_PW');
+      expect(e2Term.status).toBe('error');
+
+      // 3b. Whole-quoted env assignments, quoted CLI flags, and bash -lc subshell secrets
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-3`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: "env 'TOKEN=SYNTHETIC_QUOTED_ENV' bash worker.sh" },
+        toolStatus: 'running',
+      });
+      const e3 = events.at(-1)!;
+      expect(JSON.stringify(e3)).not.toContain('SYNTHETIC_QUOTED_ENV');
+      expect(e3.detail?.summary).toBe("env 'TOKEN=[REDACTED]' bash worker.sh");
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-4`,
+        toolName: 'run_command',
+        toolInput: {
+          CommandLine:
+            'env "GH_TOKEN=SYNTHETIC_QUOTED_GH" \'--password=SYNTHETIC_QFLAG\' bash -lc \'SECRET="a\\"SYNTHETIC_SUBSHELL" ./run.sh\'',
+        },
+        toolStatus: 'running',
+      });
+      const e4Json = JSON.stringify(events.at(-1)!);
+      expect(e4Json).not.toContain('SYNTHETIC_QUOTED_GH');
+      expect(e4Json).not.toContain('SYNTHETIC_QFLAG');
+      expect(e4Json).not.toContain('SYNTHETIC_SUBSHELL');
+
+      // 4. Positive control: normal command with spaces and escaped quotes is preserved intact
+      const normalCmd = 'git commit -m "fix \\"quote\\" edge" && ./sync.sh --all';
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/norm-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: normalCmd },
+        toolStatus: 'running',
+      });
+      expect(events.at(-1)?.detail?.summary).toBe(normalCmd);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('parses manage_task multi-task lists and multi-record system notices per record without cross-task status bleeding', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_multitask_isolation';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-multi')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      for (const suffix of ['A', 'B', 'C']) {
+        (provider as any).updateAgyBackgroundTasks(id, state, {
+          text: `Tool is running as a background task with task id: ${nativeId}/${suffix}`,
+          toolName: 'run_command',
+          toolInput: { CommandLine: `echo ${suffix}` },
+          toolStatus: 'running',
+        });
+      }
+      expect(state.agyBackgroundTasks.size).toBe(3);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(3);
+
+      const startEventsBefore = events.length;
+      const keyA = state.agyBackgroundTasks.get(`${nativeId}/A`).canonicalKey;
+      const keyB = state.agyBackgroundTasks.get(`${nativeId}/B`).canonicalKey;
+      const keyC = state.agyBackgroundTasks.get(`${nativeId}/C`).canonicalKey;
+
+      // Case 1: RUNNING block before DONE block + KILLED block -> only B & C close with exact statuses, A stays running!
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task: ${nativeId}/A`,
+          'Status: RUNNING',
+          '',
+          `Task: ${nativeId}/B`,
+          'Status: DONE',
+          '',
+          `Task: ${nativeId}/C`,
+          'Status: KILLED',
+        ].join('\n'),
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+
+      const listEmitted1 = events.slice(startEventsBefore);
+      expect(listEmitted1).toHaveLength(2);
+      expect(listEmitted1.find((e) => e.id === keyB)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/B`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+      expect(listEmitted1.find((e) => e.id === keyC)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/C`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+      expect(listEmitted1.some((e) => e.id === keyA)).toBe(false);
+      expect([...state.agyBackgroundTasks.keys()]).toEqual([`${nativeId}/A`]);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+
+      // Case 2: Swapped order (FAILED first, RUNNING second) + multi-record SYSTEM_MESSAGE isolation
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/D`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'echo D' },
+        toolStatus: 'running',
+      });
+      const keyD = state.agyBackgroundTasks.get(`${nativeId}/D`).canonicalKey;
+      const beforeSwap = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task: ${nativeId}/D`,
+          'Status: FAILED',
+          '',
+          `Task: ${nativeId}/A`,
+          'Status: RUNNING',
+        ].join('\n'),
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      const swapEmitted = events.slice(beforeSwap);
+      expect(swapEmitted).toHaveLength(1);
+      expect(swapEmitted[0]!.id).toBe(keyD);
+      expect(swapEmitted[0]!.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/D`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+        active: false,
+        terminal: true,
+      });
+      expect([...state.agyBackgroundTasks.keys()]).toEqual([`${nativeId}/A`]);
+
+      // Case 3: Multi-record SYSTEM_MESSAGE with distinct exit statuses (E code 0 vs A code 1)
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/E`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'echo E' },
+        toolStatus: 'running',
+      });
+      const keyE = state.agyBackgroundTasks.get(`${nativeId}/E`).canonicalKey;
+      const beforeSys = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task id "${nativeId}/E" finished with result:\nCommand exited with code 0.`,
+          `Task id "${nativeId}/A" finished with result:\nCommand exited with code 1.`,
+        ].join('\n\n'),
+        isSystemMessage: true,
+      });
+      const sysEmitted = events.slice(beforeSys);
+      expect(sysEmitted).toHaveLength(2);
+      expect(sysEmitted.find((e) => e.id === keyE)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(sysEmitted.find((e) => e.id === keyA)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(state.agyBackgroundTasks.size).toBe(0);
+
+      // Case 4: Native [Message] envelope multi-record isolation (exit 0 + exit 1 AND reversed 1 + 0, plus sender-only)
+      for (const suffix of ['F', 'G', 'H', 'I']) {
+        (provider as any).updateAgyBackgroundTasks(id, state, {
+          text: `Tool is running as a background task with task id: ${nativeId}/${suffix}`,
+          toolName: 'run_command',
+          toolInput: { CommandLine: `echo ${suffix}` },
+          toolStatus: 'running',
+        });
+      }
+      const keyF = state.agyBackgroundTasks.get(`${nativeId}/F`).canonicalKey;
+      const keyG = state.agyBackgroundTasks.get(`${nativeId}/G`).canonicalKey;
+      const keyH = state.agyBackgroundTasks.get(`${nativeId}/H`).canonicalKey;
+      const keyI = state.agyBackgroundTasks.get(`${nativeId}/I`).canonicalKey;
+
+      const beforeEnv = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `[Message] timestamp=2026-11-19T00:00:00Z sender=${nativeId}/F priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/F" finished with result:\nCommand exited with code 0.`,
+          `[Message] timestamp=2026-11-19T00:00:01Z sender=${nativeId}/G priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/G" finished with result:\nCommand exited with code 1.`,
+        ].join('\n'),
+        isSystemMessage: true,
+      });
+      const envEmitted1 = events.slice(beforeEnv);
+      expect(envEmitted1).toHaveLength(2);
+      const evtF = envEmitted1.find((e) => e.id === keyF)!;
+      const evtG = envEmitted1.find((e) => e.id === keyG)!;
+      expect(evtF.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(evtF.output).toContain(`${nativeId}/F`);
+      expect(evtF.output).not.toContain(`${nativeId}/G`);
+      expect(evtG.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(evtG.output).toContain(`${nativeId}/G`);
+      expect(evtG.output).not.toContain(`${nativeId}/F`);
+
+      // Reversed order: exit 1 first, sender-only completion second
+      const beforeEnv2 = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `[Message] timestamp=2026-11-19T00:00:02Z sender=${nativeId}/H priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/H" finished with result:\nCommand exited with code 1.`,
+          `[Message] timestamp=2026-11-19T00:00:03Z sender=${nativeId}/I priority=MESSAGE_PRIORITY_HIGH content=done`,
+        ].join('\n'),
+        isSystemMessage: true,
+      });
+      const envEmitted2 = events.slice(beforeEnv2);
+      expect(envEmitted2).toHaveLength(2);
+      expect(envEmitted2.find((e) => e.id === keyH)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(envEmitted2.find((e) => e.id === keyI)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(envEmitted2.find((e) => e.id === keyI)?.output).not.toContain(`${nativeId}/H`);
+
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('prevents stale compaction reset to ~979 on resume, streams real PLANNER_RESPONSE ctx, ignores cumulative PromptResponse.usage, and isolates child transcripts', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_ctx_regression';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    // Seed historical step-2748 compaction (~979 tokens) superseded by step-2835 PLANNER_RESPONSE (212,644 tokens).
+    await writeFile(
+      path.join(logsDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({ step_index: 2748, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-20T14:43:02Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 2835, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-20T14:46:57Z', content: 'restored reply' }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      path.join(logsDir, 'transcript_full.jsonl'),
+      [
+        JSON.stringify({ step_index: 2748, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-20T14:43:02Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }),
+        JSON.stringify({ step_index: 2835, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-20T14:46:57Z', content: 'restored reply', input_tokens: 3324, cache_read_tokens: 209320, output_tokens: 180 }),
+      ].join('\n') + '\n',
+    );
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'continue after reconnect');
+
+    // Immediately after send() (startAgyBridge + checkSessionCompaction + beginPrompt), seeded 212k occupancy MUST NOT reset to ~979.
+    const state = (provider as any).sessions.get(id);
+    const seededAfterSend = state.agyContextUsage.normalize();
+    expect(seededAfterSend.cache_read_input_tokens).toBe(209320);
+    expect(seededAfterSend.input_tokens).toBeGreaterThanOrEqual(3324);
+
+    // Emit live multi-step PLANNER_RESPONSE rows + GENERIC tool row while turn is in flight, plus a child transcript row.
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await appendFile(fullPath, JSON.stringify({ step_index: 2843, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000 && e.usage.input_tokens === 3100)).toBe(true), { timeout: 5000 });
+
+    // Subsequent GENERIC row must preserve 211,000 cacheTokens without wiping it to 0.
+    await appendFile(fullPath, JSON.stringify({ step_index: 2844, type: 'GENERIC', status: 'DONE', content: 'tool done' }) + '\n');
+    const afterStep1Count = usageEvents.length;
+    await vi.waitFor(() => expect(usageEvents.length).toBeGreaterThan(afterStep1Count), { timeout: 5000 });
+    expect(usageEvents.at(-1)!.usage.cache_read_input_tokens).toBe(211000);
+    expect(usageEvents.at(-1)!.usage.input_tokens).toBeGreaterThanOrEqual(3100);
+
+    // Child transcript row must NEVER pollute parent session usage.
+    const childLogs = path.join(root, '.gemini/antigravity-cli/brain/child-isolated/.system_generated/logs');
+    await mkdir(childLogs, { recursive: true });
+    await writeFile(path.join(childLogs, 'transcript_full.jsonl'), JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'child done', input_tokens: 999999, cache_read_tokens: 999999, output_tokens: 999 }) + '\n');
+    await (provider as any).startAgyBridge(id, state, 'child-isolated');
+    expect(usageEvents.some((e) => e.usage.input_tokens === 999999 || e.usage.cache_read_input_tokens === 999999)).toBe(false);
+
+    // Second steering/continuation step raises real occupancy to 324,000.
+    await appendFile(fullPath, JSON.stringify({ step_index: 2926, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'final step', input_tokens: 3324, cache_read_tokens: 320676, output_tokens: 600 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 320676 && e.usage.input_tokens === 3324)).toBe(true), { timeout: 5000 });
+
+    // Release fixture hold: fixture sends cumulative PromptResponse.usage (263,842 + 5,178,828 = 5.44M).
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    const finalUsage = completes[0].metadata.usage;
+    expect(finalUsage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 1000,
+    });
+    expect((finalUsage.input_tokens ?? 0) + (finalUsage.cache_read_input_tokens ?? 0)).toBe(324000);
+    expect(finalUsage.inputTokens).toBeUndefined();
+    expect(finalUsage.cachedReadTokens).toBeUndefined();
+    // Every emitted usage event across the entire turn stayed far above 979 and well below 5.44M.
+    for (const evt of usageEvents) {
+      const total = (evt.usage.input_tokens ?? 0) + (evt.usage.cache_read_input_tokens ?? 0);
+      expect(total).toBeGreaterThanOrEqual(212644);
+      expect(total).toBeLessThan(400000);
+    }
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 1000,
+    });
+  });
+
+  it('falls back to ACP PromptResponse outputTokens when the final PLANNER_RESPONSE omits output_tokens while preserving 324k ctx', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_partial_output';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await writeFile(fullPath, '');
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'partial step output');
+
+    // Step 1 reports output_tokens=400, final Step 2 reports 324k ctx WITHOUT output_tokens.
+    await appendFile(fullPath, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000)).toBe(true), { timeout: 5000 });
+    await appendFile(fullPath, JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'done', input_tokens: 3324, cache_read_tokens: 320676 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 320676 && e.usage.input_tokens === 3324)).toBe(true), { timeout: 5000 });
+
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    expect(completes[0].metadata.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 22308,
+    });
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      input_tokens: 3324,
+      cache_read_input_tokens: 320676,
+      output_tokens: 22308,
+    });
+  });
+
+  it('clears pre-compaction agyLatestStepUsage and resets to summary estimate when mid-turn CHECKPOINT arrives before turn end', async () => {
+    const { provider, root } = await setup('usage-cumulative');
+    const id = 'deck_agy_midturn_compact';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: root,
+      agentId: 'model-a',
+      resumeId: 'native-1',
+    });
+
+    const logsDir = path.join(root, '.gemini/antigravity-cli/brain/native-1/.system_generated/logs');
+    await mkdir(logsDir, { recursive: true });
+    const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+    await writeFile(fullPath, '');
+
+    const logFile = path.join(root, 'rpc.jsonl');
+    const holdFile = `${logFile}.hold`;
+    await writeFile(holdFile, 'hold');
+
+    const usageEvents: Array<{ finalized?: boolean; usage: any }> = [];
+    const completes: any[] = [];
+    provider.onUsage((_sid, evt) => usageEvents.push(evt));
+    provider.onComplete((_sid, msg) => completes.push(msg));
+
+    await provider.send(id, 'compact mid-turn');
+
+    // Step 1 reports 214,100 ctx, then CHECKPOINT compaction (~1000 tokens) occurs with no subsequent PLANNER_RESPONSE.
+    await appendFile(fullPath, JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command', args: {} }], input_tokens: 3100, cache_read_tokens: 211000, output_tokens: 400 }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.some((e) => e.usage.cache_read_input_tokens === 211000)).toBe(true), { timeout: 5000 });
+
+    const beforeCompactCount = usageEvents.length;
+    await appendFile(fullPath, JSON.stringify({ step_index: 2, type: 'CHECKPOINT', source: 'SYSTEM', status: 'DONE', created_at: '2026-11-21T08:00:00Z', content: '# Resuming from a compaction\n' + 'summary '.repeat(500) }) + '\n');
+    await vi.waitFor(() => expect(usageEvents.length).toBeGreaterThan(beforeCompactCount), { timeout: 5000 });
+    const afterCompactLive = usageEvents.at(-1)!.usage;
+    expect(afterCompactLive.context_usage_estimated).toBe(true);
+    expect(afterCompactLive.cache_read_input_tokens).toBe(0);
+    expect(afterCompactLive.input_tokens).toBeLessThan(5000);
+
+    await unlink(holdFile);
+    await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 5000 });
+
+    const finalUsage = completes[0].metadata.usage;
+    expect(finalUsage.context_usage_estimated).toBe(true);
+    expect(finalUsage.cache_read_input_tokens).toBe(0);
+    expect(finalUsage.input_tokens).toBeGreaterThan(500);
+    expect(finalUsage.input_tokens).toBeLessThan(5000);
+    expect(finalUsage.output_tokens).toBe(400);
+    const finalizedEvent = usageEvents.find((e) => e.finalized === true);
+    expect(finalizedEvent?.usage).toMatchObject({
+      context_usage_estimated: true,
+      cache_read_input_tokens: 0,
+      output_tokens: 400,
+    });
+    expect(finalizedEvent?.usage.input_tokens).toBeLessThan(5000);
+  });
+
+  it('clears wedged promptInFlight and transitions TransportSessionRuntime cleanly to idle on STALE_WATCHDOG cancel', async () => {
+    const { provider } = await setup();
+    const id = await route(provider);
+    const runtime = new TransportSessionRuntime(provider, id);
+    const statuses: string[] = [];
+    runtime.onStatusChange = (status) => statuses.push(status);
+    await runtime.initialize({ sessionKey: id, sessionName: id, role: 'brain' });
+
+    const state = (provider as any).sessions.get(id);
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5_000 });
+
+    // Simulate a live in-flight ACP turn whose connection hangs on cancel() / never completes prompt().
+    state.promptInFlight = true;
+    state.activePromptGenerations = new Set([99]);
+    state.turnGeneration = 99;
+    const neverSettles = new Promise<void>(() => {});
+    (provider as any).steeringRunTerminals.set(state, { terminal: neverSettles, complete: () => {} });
+    const fakeConn = (provider as any).connectionForState(state);
+    if (fakeConn) {
+      fakeConn.cancel = () => new Promise<void>(() => {});
+    }
+    (runtime as any)._status = 'thinking';
+    (runtime as any)._sending = false;
+    (runtime as any)._activeDispatchProviderStarted = true;
+    (runtime as any)._activeDispatchEntries = [{ clientMessageId: 'stuck-1', text: 'stuck', attachments: [] }];
+
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 1,
+      busyReasons: ['provider_wait'],
+    });
+
+    expect(runtime.recoverSilentActiveTurn({
+      nowMs: Date.now() + 900_000,
+      staleMs: 720_000,
+      reason: 'health-poll-stale-active-turn',
+    })).toBe(true);
+
+    await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: 6_000 });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 6_000 });
+    expect(statuses).not.toContain('error');
+    await runtime.kill();
+  });
+
+  it('emits CONFIG_ERROR once without idle set_model retry when confirmStrictSessionModel fails during send(), while still reconciling a mid-turn switch to a new modelRevision', async () => {
+    const { provider, requests, root } = await setup('model-late');
+    const id = await route(provider);
+    const errors: Array<{ code: string; message: string }> = [];
+    const complete = vi.fn();
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+    provider.onComplete(complete);
+
+    // Warm the session on model-a so state.loaded is already true.
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    // 1. Switch to 'invalid' via setSessionAgentId and send(): should fail with CONFIG_ERROR once and NOT trigger idle retry for the same modelRevision.
+    provider.setSessionAgentId(id, 'invalid');
+    const beforeSendReqs = (await requests()).filter((r) => r.method === 'session/set_model').length;
+    await expect(provider.send(id, 'fail-model')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe(PROVIDER_ERROR_CODES.CONFIG_ERROR);
+    const setModelAfterFail = (await requests()).filter((r) => r.method === 'session/set_model').slice(beforeSendReqs);
+    expect(setModelAfterFail.map((r) => r.params.modelId)).toEqual(['invalid']);
+
+    // 2. While another turn is in flight, switching to a new valid modelRevision ('model-b') must still reconcile on idle.
+    provider.setSessionAgentId(id, 'model-a');
+    await provider.send(id, 'back-to-a');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const hold = path.join(root, 'rpc.jsonl.hold');
+    await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'inflight-turn');
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(3), { timeout: 5000 });
+      provider.setSessionAgentId(id, 'model-b');
+      await new Promise((r) => setTimeout(r, 30));
+    } finally {
+      await rm(hold, { force: true });
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    await vi.waitFor(async () => {
+      const models = (await requests()).filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId);
+      expect(models.at(-1)).toBe('model-b');
+    }, { timeout: 5000 });
+    expect(errors).toHaveLength(1);
+  });
+
+  it('disposes cold-start per-session ACP child on resumed CONFIG_ERROR (preserving resumeId) and recovers automatically on next send(), while never preserving resumeId for incognito', async () => {
+    const { provider, requests } = await setup('model-error-once');
+    const id = await route(provider, 'deck_test_agy_cold_resume', {
+      agentId: 'model-b',
+      resumeId: 'persisted-cold-resume',
+    });
+    const errors: string[] = [];
+    const complete = vi.fn();
+    provider.onError((_sid, err) => errors.push(err.code));
+    provider.onComplete(complete);
+
+    await expect(provider.send(id, 'cold-first')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Only one error emitted; child was disposed with resumeId preserved.
+    expect(errors).toEqual([PROVIDER_ERROR_CODES.CONFIG_ERROR]);
+    const state = (provider as any).sessions.get(id);
+    expect(state.loaded).toBe(false);
+    expect(state.isolatedTransport).toBeUndefined();
+    expect(state.acpSessionId).toBe('persisted-cold-resume');
+
+    // Next user retry spawns a fresh ACP child (2nd boot pid), resumes the exact native ID, and succeeds without manual restart.
+    await expect(provider.send(id, 'cold-retry')).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const rows = await requests();
+    const bootPids = rows.filter((r) => r.fixture === 'boot').map((r) => r.pid);
+    expect(new Set(bootPids).size).toBe(2);
+    expect(rows.filter((r) => r.method === 'session/resume').map((r) => r.params.sessionId)).toEqual([
+      'persisted-cold-resume',
+      'persisted-cold-resume',
+    ]);
+    expect(rows.filter((r) => r.method === 'session/new')).toHaveLength(0);
+    expect(rows.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual(['model-b', 'model-b']);
+
+    // Boundary check: incognito session must NEVER attempt resume-preserving disposal/relaunch on cold-start CONFIG_ERROR.
+    const { provider: incogProvider, requests: incogRequests } = await setup('model-error');
+    const incogId = 'deck_test_agy_incognito_model_err';
+    await incogProvider.createSession({
+      sessionKey: incogId,
+      sessionName: incogId,
+      cwd: process.cwd(),
+      agentId: 'model-b',
+      incognito: true,
+    });
+    await expect(incogProvider.send(incogId, 'incog-fail')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    const incogRows = await incogRequests();
+    expect(incogRows.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+    expect((incogProvider as any).sessions.get(incogId)?.disposed).not.toBe(true);
+  });
+
+  it('ignores background-task text inside synchronous grep/truncated/non-spawning tool outputs and clears state on user force cancellation', async () => {
+    const { provider, root } = await setup('native-child-no-owned-output');
+    const id = 'deck_test_agy_false_bg_and_force_cancel';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (sid === id && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH) events.push(evt);
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-false-bg')).toBe('sent');
+      const state = (provider as any).sessions.get(id);
+      await vi.waitFor(() => expect(state?.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+      await (provider as any).promptTerminals.get(state);
+      const nativeId = state.acpSessionId as string;
+      const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+
+      // 1. Synchronous grep / truncated / exited run_command stdout containing historical "Tool is running as a background task with task id:" must NOT register.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 10,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [
+            { name: 'run_command', args: { CommandLine: 'grep -n "background task" transcript.jsonl', WaitMsBeforeAsync: 5000 } },
+            { name: 'run_command', args: { CommandLine: 'cat truncated.log', WaitMsBeforeAsync: 5000 } },
+            { name: 'read_file', args: { Path: '/tmp/notes.txt' } },
+            { name: 'manage_task', args: { Action: 'list' } },
+            { name: 'mcp_imcodes-memory_session_history', args: { kind: 'text' } },
+          ],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 11,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Created At: 2026-11-23T01:00:00Z\nCompleted At: 2026-11-23T01:00:01Z\nCommand exited with code 0.\n\nCommand output:\n5258:Tool is running as a background task with task id: ${nativeId}/fake-grep-1\n5261:Tool is running as a background task with task id: ${nativeId}/fake-grep-2`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 12,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `The tool's output was truncated. Output saved to /tmp/out.txt\nTool is running as a background task with task id: ${nativeId}/fake-truncated`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 13,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Tool is running as a background task with task id: ${nativeId}/fake-read-file`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 14,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Tool is running as a background task with task id: ${nativeId}/fake-manage-task`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 15,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Tool is running as a background task with task id: ${nativeId}/fake-mcp`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 16,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'done checking logs',
+        }) + '\n',
+      );
+
+      // Direct errored run_command and unanchored line-start + exited marker must also be ignored.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/fake-err`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'false' },
+        toolStatus: 'error',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/fake-sync-exit\nCommand exited with code 0.`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'echo line' },
+        toolStatus: 'complete',
+      });
+
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]?.content).toBe('done checking logs');
+      expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+      expect(events).toHaveLength(0);
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 0,
+        backgroundWorkCount: 0,
+        busyReasons: [],
+      });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      // 2. Genuine run_command, one-shot schedule, and run_workflow still register, while user force cancellation clears them + agyReactive.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 17,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [
+            { name: 'run_command', args: { CommandLine: 'sleep 30', WaitMsBeforeAsync: 5000 } },
+            { name: 'schedule', args: { DurationSeconds: 60, Prompt: 'check' } },
+            { name: 'run_workflow', args: { Description: 'fan out' } },
+          ],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 18,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${nativeId}/real-cmd\nTask logs are available at: /tmp/real.log\nLog output:\nstarting\nCommand exited with code 0`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 19,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${nativeId}/real-sched`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 20,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${nativeId}/real-wf`,
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(state.agyBackgroundTasks?.size).toBe(3), { timeout: 5000 });
+      expect(runtime.getStatus()).toBe('tool_running');
+      state.agyReactive = true;
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 21,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: 'All your subagents and background tasks have been stopped due to user force cancellation.',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(state.agyBackgroundTasks?.size).toBe(0), { timeout: 5000 });
+      expect(state.agyReactive).toBe(false);
+      expect(events.filter((e) => e.detail?.meta?.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED && e.output === 'Cancelled by user')).toHaveLength(3);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('disposes wedged isolated ACP child strictly before emitting CANCELLED and draining recovery continue on STALE_WATCHDOG', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_stale_dispose_before_emit';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    const emittedErrors: string[] = [];
+    const order: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+    provider.onError((sid, err) => {
+      if (sid === id) {
+        emittedErrors.push(err.code);
+        order.push(`error:${err.code}`);
+      }
+    });
+
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    try {
+      expect(runtime.send('warm', 'cmd-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const firstTransport = state.isolatedTransport;
+      const firstPid = firstTransport?.child?.pid;
+      const firstNativeId = state.acpSessionId as string;
+      expect(firstTransport).toBeTruthy();
+      expect(firstPid).toBeTypeOf('number');
+      expect(firstNativeId).toBeTruthy();
+
+      // Hold the next prompt and ignore session/cancel so cancel({ origin: STALE_WATCHDOG }) must force-fail the wedged child.
+      await writeFile(holdFile, 'hold');
+      expect(runtime.send('stuck-turn', 'cmd-stuck')).toBe('sent');
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+      expect(state.promptInFlight).toBe(true);
+      firstTransport.connection.cancel = () => new Promise<void>(() => {});
+
+      // Queue recovery continue behind the hung turn (same queue path used by recoverAgyStalledSession).
+      expect(runtime.send('continue', 'cmd-continue')).toBe('queued');
+
+      let snapshotAtRecoverySend: { sameTransport: boolean; disposeInFlight: boolean; acpSessionId: string | undefined } | null = null;
+      const origSend = provider.send.bind(provider);
+      vi.spyOn(provider, 'send').mockImplementation(async (sid, payload, ...rest) => {
+        if (sid === id) {
+          order.push('send:recovery');
+          snapshotAtRecoverySend = {
+            sameTransport: state.isolatedTransport === firstTransport,
+            disposeInFlight: Boolean(state.isolatedDisposeInFlight),
+            acpSessionId: state.acpSessionId,
+          };
+          await rm(holdFile, { force: true });
+        }
+        return origSend(sid, payload, ...rest);
+      });
+
+      const origDispose = (provider as any).disposeIsolatedSession.bind(provider);
+      vi.spyOn(provider as any, 'disposeIsolatedSession').mockImplementation(async (targetState: unknown, opts?: unknown) => {
+        order.push('dispose:start');
+        await origDispose(targetState, opts);
+        // Simulate asynchronous child reaper tail; with fire-and-forget disposal, error:CANCELLED and send:recovery fire before dispose:end.
+        await new Promise((r) => setTimeout(r, 40));
+        order.push('dispose:end');
+      });
+
+      await runtime.cancel({ origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG });
+
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(order.indexOf('dispose:start')).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf('dispose:end')).toBeGreaterThan(order.indexOf('dispose:start'));
+      expect(order.indexOf('error:CANCELLED')).toBeGreaterThan(order.indexOf('dispose:end'));
+      expect(order.indexOf('send:recovery')).toBeGreaterThan(order.indexOf('dispose:end'));
+      expect(snapshotAtRecoverySend).toEqual({
+        sameTransport: false,
+        disposeInFlight: false,
+        acpSessionId: firstNativeId,
+      });
+      expect(emittedErrors).toEqual([PROVIDER_ERROR_CODES.CANCELLED]);
+      expect(completed[1]).toContain('continue');
+
+      const rows = await requests();
+      const bootPids = rows.filter((r) => r.fixture === 'boot').map((r) => r.pid);
+      expect(new Set(bootPids).size).toBe(2);
+      expect(state.isolatedTransport?.child?.pid).not.toBe(firstPid);
+      expect(rows.filter((r) => r.method === 'session/resume').map((r) => r.params.sessionId)).toEqual([firstNativeId]);
+    } finally {
+      await rm(holdFile, { force: true });
+      await runtime.kill();
+    }
+  });
+
+  it('handles in-flight disposal, incognito resume suppression, and removed sessions safely during STALE_WATCHDOG recovery', async () => {
+    const { provider } = await setup();
+    const idIncog = 'deck_test_agy_stale_incog';
+    await provider.createSession({
+      sessionKey: idIncog,
+      sessionName: idIncog,
+      cwd: process.cwd(),
+      agentId: 'model-a',
+      incognito: true,
+    });
+    const incogErrors: string[] = [];
+    provider.onError((sid, err) => { if (sid === idIncog) incogErrors.push(err.code); });
+    const incogState = (provider as any).sessions.get(idIncog);
+    incogState.promptInFlight = true;
+    incogState.acpSessionId = 'incog-native-1';
+    let resolveInFlight!: () => void;
+    const inFlightPromise = new Promise<void>((resolve) => { resolveInFlight = resolve; });
+    incogState.isolatedDisposeInFlight = inFlightPromise;
+
+    const cancelPromise = (provider as any).forceFailWedgedTurnOnStaleWatchdog(idIncog, incogState);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(incogErrors).toEqual([]);
+    resolveInFlight();
+    await cancelPromise;
+    expect(incogErrors).toEqual([PROVIDER_ERROR_CODES.CANCELLED]);
+
+    // Real incognito disposal without pre-existing in-flight promise clears acpSessionId and sets disposed.
+    const idIncog2 = 'deck_test_agy_stale_incog_real';
+    await provider.createSession({
+      sessionKey: idIncog2,
+      sessionName: idIncog2,
+      cwd: process.cwd(),
+      agentId: 'model-a',
+      incognito: true,
+    });
+    const incogErrors2: string[] = [];
+    provider.onError((sid, err) => { if (sid === idIncog2) incogErrors2.push(err.code); });
+    const incogState2 = (provider as any).sessions.get(idIncog2);
+    incogState2.promptInFlight = true;
+    incogState2.acpSessionId = 'incog-native-2';
+    incogState2.isolatedTransport = { child: null, connection: null, initPromise: null, sessionListSupported: false, systemPromptMetaAppendSupported: false };
+    await (provider as any).forceFailWedgedTurnOnStaleWatchdog(idIncog2, incogState2);
+    expect(incogState2.acpSessionId).toBeUndefined();
+    expect(incogState2.disposed).toBe(true);
+    expect(incogErrors2).toEqual([PROVIDER_ERROR_CODES.CANCELLED]);
+
+    // Session removed mid-await must not emit a stale error.
+    const idGone = 'deck_test_agy_stale_replaced';
+    await route(provider, idGone);
+    const goneErrors: string[] = [];
+    provider.onError((sid, err) => { if (sid === idGone) goneErrors.push(err.code); });
+    const goneState = (provider as any).sessions.get(idGone);
+    goneState.promptInFlight = true;
+    let resolveGone!: () => void;
+    goneState.isolatedDisposeInFlight = new Promise<void>((resolve) => { resolveGone = resolve; });
+    const goneCancel = (provider as any).forceFailWedgedTurnOnStaleWatchdog(idGone, goneState);
+    (provider as any).sessions.delete(idGone);
+    resolveGone();
+    await goneCancel;
+    expect(goneErrors).toEqual([]);
+  });
+
+  it('clears agyNativeToolOrder on empty terminal GENERIC rows, startTurn/settleTurn, and expires leaked agyReactive on settleTurn and 3m silence', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_p0_2_p0_3';
+    await route(provider, id);
+    const state = (provider as any).sessions.get(id);
+    const statuses: string[] = [];
+    provider.onStatus((sid, upd) => {
+      if (sid === id) statuses.push(upd?.status ?? 'idle');
+    });
+
+    // 1) Empty terminal GENERIC row consumes non-subagent entry in agyNativeToolOrder so activeToolCount returns to 0.
+    state.promptInFlight = true;
+    state.acpSessionId = 'native-empty-generic';
+    (provider as any).handleAgyTranscriptRow(id, state, 'native-empty-generic', {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'RUNNING',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'true' } }],
+    });
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBe(1);
+    (provider as any).handleAgyTranscriptRow(id, state, 'native-empty-generic', {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: '',
+    });
+    expect(state.agyNativeToolOrder).toEqual([]);
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBe(0);
+
+    // 2) startTurn resets leftover agyNativeToolOrder immediately, and settleTurn clears both agyNativeToolOrder and prior leaked agyReactive.
+    state.promptInFlight = false;
+    state.agyNativeToolOrder = [{ name: 'read_file', input: {}, step: 3, index: 0 }];
+    state.agyReactive = true;
+    state.agyReactiveSinceMs = Date.now() - 10_000;
+    state.agyReactiveLastActivityAt = state.agyReactiveSinceMs;
+
+    const gen = ++state.turnGeneration;
+    state.promptInFlight = true;
+    state.agyNativeToolOrder = [];
+    state.agyTurnStartedAtMs = Date.now();
+    // Simulate another mid-turn native tool batch left open before settleTurn runs.
+    state.agyNativeToolOrder = [{ name: 'write_file', input: {}, step: 4, index: 0 }];
+    (state.activePromptGenerations ??= new Set()).add(gen);
+    (provider as any).settleTurn(id, state, gen, 'end_turn');
+    expect(state.agyNativeToolOrder).toEqual([]);
+    expect(state.agyReactive).toBe(false);
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBe(0);
+    expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+
+    // 3) Silent idle agyReactive past 3m expires in getActiveWorkSnapshot and transitions status to idle.
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_700_000_000);
+    (provider as any).handleAgyTranscriptRow(id, state, 'native-empty-generic', {
+      step_index: 5,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '[Message] timestamp=2026-11-24T00:00:00Z sender=peer content=wake',
+    });
+    expect(state.agyReactive).toBe(true);
+    expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+
+    nowSpy.mockReturnValue(1_700_700_000_000 + 3 * 60_000);
+    const snap = provider.getActiveWorkSnapshot(id);
+    expect(state.agyReactive).toBe(false);
+    expect(snap?.backgroundWorkCount).toBe(0);
+    expect(snap?.activeWorkCount).toBe(0);
+    expect(statuses.at(-1)).toBe('idle');
+    nowSpy.mockRestore();
+  });
+
+  it('unwedges ordinary non-watchdog cancel when ACP child ignores session/cancel and recovers on next send (P0-1)', async () => {
+    resetTransportQueueStoreForTests();
+    vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '120');
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_p01_ordinary_stop';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+    provider.onError((sid, err) => { if (sid === id) errors.push(err.code); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    const cancelIgnoreFile = path.join(root, 'rpc.jsonl.cancel-ignore');
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'cmd-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const firstTransport = state.isolatedTransport;
+      expect(firstTransport).toBeTruthy();
+
+      await writeFile(holdFile, 'hold');
+      await writeFile(cancelIgnoreFile, 'ignore');
+      expect(runtime.send('wedged-turn', 'cmd-wedged')).toBe('sent');
+      await vi.waitFor(
+        async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2),
+        { timeout: 5000 },
+      );
+      expect(state.promptInFlight).toBe(true);
+
+      await runtime.cancel();
+
+      await vi.waitFor(() => expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED), { timeout: 5000 });
+      await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5000 });
+      expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount ?? 0).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+      expect(state.isolatedTransport).toBeUndefined();
+      expect((await requests()).some((r) => r.fixture === 'cancel-ignored')).toBe(true);
+
+      await rm(holdFile, { force: true });
+      await rm(cancelIgnoreFile, { force: true });
+
+      expect(runtime.send('follow-up-after-stop', 'cmd-follow')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]).toContain('follow-up-after-stop');
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+      await rm(cancelIgnoreFile, { force: true }).catch(() => {});
+      await runtime.kill();
+    }
+  });
+
+  it('confirms Stop & Send without latching _unconfirmedProviderStop when ACP child ignores session/cancel (P0-1)', async () => {
+    resetTransportQueueStoreForTests();
+    vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '120');
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_p01_stop_and_send';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    const cancelIgnoreFile = path.join(root, 'rpc.jsonl.cancel-ignore');
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'cmd-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      await writeFile(holdFile, 'hold');
+      await writeFile(cancelIgnoreFile, 'ignore');
+      expect(runtime.send('wedged-for-stop-send', 'cmd-wedged')).toBe('sent');
+      await vi.waitFor(
+        async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2),
+        { timeout: 5000 },
+      );
+
+      expect(runtime.send('queued-stop-send', 'cmd-queued')).toBe('queued');
+      const queuedId = runtime.pendingEntries[0]?.clientMessageId;
+      expect(queuedId).toBe('cmd-queued');
+      // Force the non-append Stop & Send path (cancel({ waitForProvider: true })) so
+      // provider-stop confirmation depends on ACP grace teardown when session/cancel is ignored.
+      (provider.capabilities as any).activeDelegationNotification = 'none';
+
+      const op = await runtime.stopAndSendPendingMessages([queuedId!], 'stop-send-notif');
+      expect(op.status).toBe('stopped_and_dispatched');
+      expect((runtime as any)._unconfirmedProviderStop).toBe(false);
+      await rm(holdFile, { force: true });
+      await rm(cancelIgnoreFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]).toContain('queued-stop-send');
+      const state = (provider as any).sessions.get(id);
+      expect(state.promptInFlight).toBe(false);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+      await rm(cancelIgnoreFile, { force: true }).catch(() => {});
+      await runtime.kill();
+    }
+  });
+
+  it('unwedges pre-acpSessionId Stop during hung session/new without sending a ghost prompt (P0-1)', async () => {
+    resetTransportQueueStoreForTests();
+    vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '120');
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_p01_pre_session_stop';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+    provider.onError((sid, err) => { if (sid === id) errors.push(err.code); });
+
+    const newHoldFile = path.join(root, 'rpc.jsonl.new-hold');
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      await writeFile(newHoldFile, 'hold');
+      expect(runtime.send('pre-session-msg', 'cmd-pre-1')).toBe('sent');
+      await vi.waitFor(
+        async () => expect((await requests()).some((r) => r.method === 'session/new')).toBe(true),
+        { timeout: 5000 },
+      );
+
+      const state = (provider as any).sessions.get(id);
+      expect(state.acpSessionId).toBeUndefined();
+      expect(state.promptInFlight).toBe(true);
+
+      await runtime.cancel();
+
+      await vi.waitFor(() => expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED), { timeout: 5000 });
+      await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5000 });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Releasing session/new hold must NOT emit a ghost session/prompt for the cancelled turn.
+      await rm(newHoldFile, { force: true });
+      await new Promise((r) => setTimeout(r, 80));
+      expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(0);
+
+      expect(runtime.send('recovery-after-pre-cancel', 'cmd-pre-2')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]).toContain('recovery-after-pre-cancel');
+    } finally {
+      await rm(newHoldFile, { force: true }).catch(() => {});
+      await runtime.kill();
+    }
+  });
+
+  it('cancels hung session/new on TRANSPORT_TURN_TIMEOUT to prevent ghost prompt and allows recovery (P0-4)', async () => {
+    resetTransportQueueStoreForTests();
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '800');
+    vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '120');
+    vi.stubEnv('IMCODES_ACP_SESSION_RPC_TIMEOUT_MS', '5000');
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_p04_turn_timeout_ghost';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+    provider.onError((sid, err) => { if (sid === id) errors.push(err.code); });
+
+    const newHoldFile = path.join(root, 'rpc.jsonl.new-hold');
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      await writeFile(newHoldFile, 'hold');
+      expect(runtime.send('timeout-turn', 'cmd-timeout-1')).toBe('sent');
+      await vi.waitFor(
+        async () => expect((await requests()).some((r) => r.method === 'session/new')).toBe(true),
+        { timeout: 5000 },
+      );
+
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('error'), { timeout: 5000 });
+      const state = (provider as any).sessions.get(id);
+      await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5000 });
+
+      // Release hold and verify zero ghost session/prompt from the timed-out turn.
+      await rm(newHoldFile, { force: true });
+      await new Promise((r) => setTimeout(r, 80));
+      expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(0);
+
+      expect(runtime.send('after-timeout', 'cmd-timeout-2')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]).toContain('after-timeout');
+      expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(1);
+    } finally {
+      await rm(newHoldFile, { force: true }).catch(() => {});
+      await runtime.kill();
+    }
+  });
+
+  it('bounds pre-prompt ACP RPCs (newSession, resumeSession, setSessionMode, unstable_setSessionModel, wireOrderTail, waitForAcpWrite) with clean disposal (P0-4)', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-rpc-timeouts-'));
+    const binary = path.join(root, 'agy');
+    const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+    await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${fixture}' "$@"\n`, { mode: 0o700 });
+    const provider = new AgyAcpProvider(undefined, {
+      cancelGraceMs: 120,
+      sessionRpcTimeoutMs: 120,
+      modeModelRpcTimeoutMs: 120,
+      acpWriteTimeoutMs: 100,
+    });
+    resources.push({ provider, root });
+    const log = path.join(root, 'rpc.jsonl');
+    await provider.connect({
+      binaryPath: binary,
+      env: {
+        HOME: root,
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: log,
+      },
+    });
+    const newHoldFile = path.join(root, 'rpc.jsonl.new-hold');
+    const resumeHoldFile = path.join(root, 'rpc.jsonl.resume-hold');
+    const modeHoldFile = path.join(root, 'rpc.jsonl.mode-hold');
+    const modelHoldFile = path.join(root, 'rpc.jsonl.model-hold');
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    // 1. newSession timeout
+    const idNew = await route(provider, 'deck_test_agy_rpc_new');
+    await writeFile(newHoldFile, 'hold');
+    await expect(provider.send(idNew, 'hung-new')).rejects.toThrow(/newSession/i);
+    await rm(newHoldFile, { force: true });
+    const stateNew = (provider as any).sessions.get(idNew);
+    expect(stateNew.promptInFlight).toBe(false);
+    expect(stateNew.isolatedTransport).toBeUndefined();
+    expect(stateNew.sharedSessionReadyInFlight).toBeUndefined();
+
+    // 2. resumeSession timeout (preserveResumeId: true for non-incognito)
+    const idResume = await route(provider, 'deck_test_agy_rpc_resume');
+    await provider.send(idResume, 'warm-resume');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+    const stateResume = (provider as any).sessions.get(idResume);
+    const savedId = stateResume.acpSessionId;
+    expect(savedId).toBeTruthy();
+    await (provider as any).disposeIsolatedSession(stateResume, { preserveResumeId: true });
+    await writeFile(resumeHoldFile, 'hold');
+    await expect(provider.send(idResume, 'hung-resume')).rejects.toThrow(/resumeSession/i);
+    await rm(resumeHoldFile, { force: true });
+    expect(stateResume.promptInFlight).toBe(false);
+    expect(stateResume.isolatedTransport).toBeUndefined();
+    expect(stateResume.acpSessionId).toBe(savedId);
+    await provider.send(idResume, 'recover-resume');
+    await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+
+    // 3. setSessionMode & unstable_setSessionModel timeouts dispose isolated transport cleanly
+    const modeProvider = new KimiSdkProvider({
+      id: 'kimi-sdk',
+      displayName: 'Kimi',
+      binary,
+      args: [],
+      defaultMode: 'default',
+      approval: 'auto-allow',
+      loadFailure: 'error',
+      resumeWithoutReplay: true,
+      perSessionTransport: true,
+      strictModelSelection: false,
+      compact: {
+        execution: 'slash-command',
+        providerCommand: '/compact',
+        verified: true,
+        completion: 'command-result',
+        cancellation: 'provider-cancel',
+        reason: 'test',
+      },
+    }, {
+      cancelGraceMs: 120,
+      sessionRpcTimeoutMs: 5000,
+      modeModelRpcTimeoutMs: 120,
+      acpWriteTimeoutMs: 100,
+    });
+    try {
+      await modeProvider.connect({
+        binaryPath: binary,
+        env: {
+          HOME: root,
+          AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+          AGY_ACP_FIXTURE_LOG: log,
+        },
+      });
+      const idMode = 'deck_test_kimi_rpc_mode';
+      await modeProvider.createSession({ sessionKey: idMode, sessionName: idMode, cwd: process.cwd(), agentId: 'model-a' });
+      await writeFile(modeHoldFile, 'hold');
+      await expect(modeProvider.send(idMode, 'hung-mode')).rejects.toThrow(/setSessionMode/i);
+      await rm(modeHoldFile, { force: true });
+      const stateMode = (modeProvider as any).sessions.get(idMode);
+      expect(stateMode.promptInFlight).toBe(false);
+      expect(stateMode.isolatedTransport).toBeUndefined();
+
+      const idModel = 'deck_test_kimi_rpc_model';
+      await modeProvider.createSession({ sessionKey: idModel, sessionName: idModel, cwd: process.cwd(), agentId: 'model-b' });
+      await writeFile(modelHoldFile, 'hold');
+      await expect(modeProvider.send(idModel, 'hung-model')).rejects.toThrow(/unstable_setSessionModel/i);
+      await rm(modelHoldFile, { force: true });
+      const stateModel = (modeProvider as any).sessions.get(idModel);
+      expect(stateModel.promptInFlight).toBe(false);
+      expect(stateModel.isolatedTransport).toBeUndefined();
+    } finally {
+      await rm(modeHoldFile, { force: true }).catch(() => {});
+      await rm(modelHoldFile, { force: true }).catch(() => {});
+      await modeProvider.disconnect();
+    }
+
+    // 4. wireOrderTail timeout (requires unloaded state entering resumeOrLoadAcpSession)
+    const idWire = await route(provider, 'deck_test_agy_rpc_wire');
+    await provider.send(idWire, 'warm-wire');
+    await vi.waitFor(() => expect(completed).toHaveLength(3), { timeout: 5000 });
+    const stateWire = (provider as any).sessions.get(idWire);
+    await (provider as any).disposeIsolatedSession(stateWire, { preserveResumeId: true });
+    stateWire.wireOrderTail = new Promise<void>(() => {});
+    await expect(provider.send(idWire, 'hung-wire')).rejects.toThrow(/wireOrderTail/i);
+    expect(stateWire.promptInFlight).toBe(false);
+    expect(stateWire.isolatedTransport).toBeUndefined();
+
+    // 5. waitForAcpWrite timeout clears writeQueue hang and disposes wedged transport cleanly
+    const idWrite = await route(provider, 'deck_test_agy_rpc_write');
+    await provider.send(idWrite, 'warm-write');
+    await vi.waitFor(() => expect(completed).toHaveLength(4), { timeout: 5000 });
+    const stateWrite = (provider as any).sessions.get(idWrite);
+    stateWrite.isolatedTransport.connection.connection.writeQueue = new Promise<void>(() => {});
+    await expect(provider.send(idWrite, 'hung-write')).rejects.toThrow(/prompt write failed/i);
+    expect(stateWrite.promptInFlight).toBe(false);
+    expect(stateWrite.isolatedTransport).toBeUndefined();
+  });
+
+  it('keeps child alive on fast normal cancel and ignores stale grace timer from an earlier turnGeneration', async () => {
+    resetTransportQueueStoreForTests();
+    vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '1000');
+    const { provider, root, requests } = await setup();
+    const id = 'deck_test_agy_p01_boundary_fast_cancel_and_gen';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push(msg.content); });
+    provider.onError((sid, err) => { if (sid === id) errors.push(err.code); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'cmd-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const pidBefore = state.isolatedTransport?.child?.pid;
+      expect(pidBefore).toBeTypeOf('number');
+
+      // Fast normal cancel: session/cancel resolves immediately in fixture without .cancel-ignore.
+      await writeFile(holdFile, 'hold');
+      expect(runtime.send('cancel-fast', 'cmd-fast')).toBe('sent');
+      await vi.waitFor(
+        async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2),
+        { timeout: 5000 },
+      );
+
+      await runtime.cancel();
+      await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5000 });
+      // Wait past graceMs (1000ms) and confirm child was NOT killed and turnGeneration wasn't torn down.
+      await new Promise((r) => setTimeout(r, 1150));
+      expect(state.isolatedTransport?.child?.pid).toBe(pidBefore);
+
+      // Next turn immediately starts and must NOT be killed by any stale timer from earlier generation.
+      await rm(holdFile, { force: true });
+      const prevGen = state.turnGeneration;
+      expect(runtime.send('next-gen', 'cmd-next-gen')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(state.turnGeneration).toBeGreaterThan(prevGen);
+      expect(state.isolatedTransport?.child?.pid).toBe(pidBefore);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+      await runtime.kill();
+    }
+  });
+
+  it('streams completed PLANNER_RESPONSE steps promptly while authoritative promptInFlight stays open across tools and timers without duplicating on settle', async () => {
+    const { provider, root } = await setup();
+    const id = await route(provider, 'deck_test_agy_long_turn_streaming');
+    const deltas: Array<{ messageId: string; delta: string }> = [];
+    const completed: Array<{ id: string; content: string }> = [];
+    const errors: unknown[] = [];
+    provider.onDelta((sid, d) => { if (sid === id && d.type === 'text') deltas.push({ messageId: d.messageId, delta: d.delta }); });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ id: m.id, content: m.content }); });
+    provider.onError((sid, err) => { if (sid === id) errors.push(err); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    // Warm up session and enable authoritative native foreground output.
+    await provider.send(id, 'warm-long-turn');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '');
+    await (provider as any).startAgyBridge(id, state);
+    (provider as any).useAgyNativeOutput(state);
+
+    deltas.length = 0;
+    completed.length = 0;
+
+    // Hold session/prompt RPC open to simulate a multi-hour run with timers/background work.
+    await writeFile(holdFile, 'hold');
+    try {
+      const promptText = 'long-running task with schedule';
+      await provider.send(id, promptText);
+      expect(state.promptInFlight).toBe(true);
+
+      // Step 10 RUNNING must be ignored; DONE non-subagent tool step emits immediately.
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 9, type: 'USER_INPUT', status: 'DONE', source: 'USER_EXPLICIT', content: promptText }) + '\n'
+        + JSON.stringify({ step_index: 10, type: 'PLANNER_RESPONSE', status: 'RUNNING', content: 'Checking...', tool_calls: [{ name: 'run_command' }] }) + '\n',
+      );
+      await new Promise((r) => setTimeout(r, 100));
+      expect(deltas).toHaveLength(0);
+
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 10, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Checking service status...', tool_calls: [{ name: 'run_command' }] }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(1), { timeout: 5000 });
+      expect(deltas[0]).toEqual({ messageId: `${nativeId}:step:10`, delta: 'Checking service status...' });
+      expect(completed).toHaveLength(0);
+
+      // Step 12 claimed by agyForeground lane while promptInFlight stays true still emits promptly.
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 12, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Cron armed; waiting for timer.' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(2), { timeout: 5000 });
+      expect(deltas[1]).toEqual({ messageId: `${nativeId}:step:12`, delta: 'Cron armed; waiting for timer.' });
+      expect(completed).toHaveLength(0);
+
+      // Step 15 after cron SYSTEM_MESSAGE post-lane while promptInFlight is still true emits too.
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 14, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<imcodes-cron-control>tick</imcodes-cron-control>' }) + '\n'
+        + JSON.stringify({ step_index: 15, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Cron fired, verified healthy.' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(3), { timeout: 5000 });
+      expect(deltas[2]).toEqual({ messageId: `${nativeId}:step:15`, delta: 'Cron fired, verified healthy.' });
+      expect(completed).toHaveLength(0);
+
+      // Release RPC; settleOwnedAcpPrompt must complete step 15 once without regressing or duplicating.
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(errors).toHaveLength(0);
+      expect(completed[0]).toEqual({ id: `${nativeId}:step:15`, content: 'Cron fired, verified healthy.' });
+      expect(deltas).toHaveLength(3);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+    }
+  });
+
+  it('streams mid-turn PLANNER_RESPONSE steps while steering keeps activePromptGenerations > 1', async () => {
+    const { provider, root } = await setup();
+    const id = await route(provider, 'deck_test_agy_steering_midturn_streaming');
+    const deltas: Array<{ messageId: string; delta: string }> = [];
+    const completed: Array<{ id: string; content: string }> = [];
+    provider.onDelta((sid, d) => { if (sid === id && d.type === 'text') deltas.push({ messageId: d.messageId, delta: d.delta }); });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ id: m.id, content: m.content }); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    await provider.send(id, 'warm-steering-stream');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '');
+    await (provider as any).startAgyBridge(id, state);
+    (provider as any).useAgyNativeOutput(state);
+
+    deltas.length = 0;
+    completed.length = 0;
+
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(id, 'primary task');
+      expect(await provider.notifyActiveDelegation(id, notification('steer-1', 'steered instruction'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      expect(state.activePromptGenerations.size).toBe(2);
+
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 20, type: 'USER_INPUT', status: 'DONE', source: 'USER_EXPLICIT', content: 'steered instruction' }) + '\n'
+        + JSON.stringify({ step_index: 21, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Working on steered instruction...', tool_calls: [{ name: 'read_file' }] }) + '\n'
+        + JSON.stringify({ step_index: 22, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Steered task finished.' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(2), { timeout: 5000 });
+      expect(deltas).toEqual([
+        { messageId: `${nativeId}:step:21`, delta: 'Working on steered instruction...' },
+        { messageId: `${nativeId}:step:22`, delta: 'Steered task finished.' },
+      ]);
+      expect(completed).toHaveLength(0);
+
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]).toEqual({ id: `${nativeId}:step:22`, content: 'Steered task finished.' });
+      expect(deltas).toHaveLength(2);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+    }
+  });
+
+  it('enforces bounded step tracking (60k+ steps), suppresses empty/compact/cancelled text, and avoids short-turn duplicates', async () => {
+    const { provider, root } = await setup();
+    const id = await route(provider, 'deck_test_agy_transcript_boundaries');
+    const deltas: Array<{ messageId: string; delta: string }> = [];
+    const completed: Array<{ id: string; content: string; metadata?: Record<string, unknown> }> = [];
+    provider.onDelta((sid, d) => { if (sid === id && d.type === 'text') deltas.push({ messageId: d.messageId, delta: d.delta }); });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ id: m.id, content: m.content, metadata: m.metadata }); });
+
+    await provider.send(id, 'warm-boundaries');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '');
+    await (provider as any).startAgyBridge(id, state);
+    (provider as any).useAgyNativeOutput(state);
+
+    // 1. Normal short turn: single bubble, single delta, matching step messageId, no duplicate.
+    deltas.length = 0;
+    completed.length = 0;
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(id, 'short turn');
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 30, type: 'USER_INPUT', status: 'DONE', source: 'USER_EXPLICIT', content: 'short turn' }) + '\n'
+        + JSON.stringify({ step_index: 31, type: 'PLANNER_RESPONSE', status: 'DONE', content: '' }) + '\n'
+        + JSON.stringify({ step_index: 32, type: 'PLANNER_RESPONSE', status: 'DONE', content: '   \n\t  ' }) + '\n'
+        + JSON.stringify({ step_index: 33, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Short reply' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(1), { timeout: 5000 });
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(deltas).toEqual([{ messageId: `${nativeId}:step:33`, delta: 'Short reply' }]);
+      expect(completed[0]).toMatchObject({ id: `${nativeId}:step:33`, content: 'Short reply' });
+
+      // 2. Trailing empty tool step after streamed prose preserves streamed prose on settle.
+      deltas.length = 0;
+      completed.length = 0;
+      await writeFile(holdFile, 'hold');
+      await provider.send(id, 'prose then empty tool');
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 34, type: 'USER_INPUT', status: 'DONE', source: 'USER_EXPLICIT', content: 'prose then empty tool' }) + '\n'
+        + JSON.stringify({ step_index: 35, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Prose before tool', tool_calls: [{ name: 'run_command' }] }) + '\n'
+        + JSON.stringify({ step_index: 36, type: 'PLANNER_RESPONSE', status: 'DONE', content: '', tool_calls: [{ name: 'run_command' }] }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas).toHaveLength(1), { timeout: 5000 });
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]).toMatchObject({ id: `${nativeId}:step:35`, content: 'Prose before tool' });
+
+      // 3. /compact control turn must NOT emit PLANNER_RESPONSE deltas.
+      deltas.length = 0;
+      completed.length = 0;
+      await writeFile(holdFile, 'hold');
+      await provider.send(id, '/compact');
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 37, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Internal summary text' }) + '\n',
+      );
+      await new Promise((r) => setTimeout(r, 120));
+      expect(deltas).toHaveLength(0);
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(deltas).toHaveLength(0);
+      expect(completed[0].content).toBe('');
+
+      // 4. Cancelled rows / cancelled state must NOT emit PLANNER_RESPONSE deltas.
+      deltas.length = 0;
+      state.promptInFlight = true;
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 38, type: 'PLANNER_RESPONSE', status: 'CANCELLED', content: 'Should not emit',
+      });
+      state.cancelled = true;
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 39, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Cancelled state',
+      });
+      expect(deltas).toHaveLength(0);
+      state.cancelled = false;
+      state.promptInFlight = false;
+
+      // 5. Large transcript (60,500+ steps) keeps agyEmittedTextSteps O(1) bounded.
+      for (let step = 100; step < 60_600; step++) {
+        (provider as any).rememberAgyEmittedTextStep(state, step);
+      }
+      expect(state.agyEmittedTextSteps.size).toBeLessThanOrEqual(512);
+      expect(state.agyEmittedTextSteps.has(60_599)).toBe(true);
+      expect(state.agyEmittedTextSteps.has(100)).toBe(false);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+    }
+  });
+
+  it('finalizes non-authoritative PLANNER_RESPONSE steps across schedule wakeups and steering without concatenating or duplicating', async () => {
+    const { provider, root } = await setup();
+    const id = await route(provider, 'deck_test_agy_non_auth_schedule_finalization');
+    const deltas: Array<{ messageId: string; delta: string; final?: boolean }> = [];
+    const completed: Array<{ id: string; content: string }> = [];
+    provider.onDelta((sid, d) => {
+      if (sid === id && d.type === 'text') {
+        deltas.push({ messageId: d.messageId, delta: d.delta, ...(d.final !== undefined ? { final: d.final } : {}) });
+      }
+    });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ id: m.id, content: m.content }); });
+
+    const holdFile = path.join(root, 'rpc.jsonl.hold');
+    await provider.send(id, 'warm-non-auth');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    expect(state.agyForeground?.authoritative ?? false).toBe(false);
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '');
+    await (provider as any).startAgyBridge(id, state);
+
+    deltas.length = 0;
+    completed.length = 0;
+
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(id, 'run monitor loop with schedule');
+      expect(state.promptInFlight).toBe(true);
+
+      // 1) ACP streams partial chunk for step 10 with random UUID (no incoming messageId),
+      //    then transcript PLANNER_RESPONSE DONE arrives -> final:true reuses the SAME streamed messageId
+      //    and clears currentMessageId/currentText so future turns start a fresh bubble.
+      (provider as any).handleAgentChunk(id, state, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Scheduled timer ' },
+      });
+      const streamedMsgId = state.currentMessageId as string;
+      expect(streamedMsgId).toBeTruthy();
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 10,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'Scheduled timer armed for 10m.',
+          tool_calls: [{ name: 'schedule' }],
+        }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas.some((d) => d.final === true)).toBe(true), { timeout: 5000 });
+      const step10Final = deltas.find((d) => d.final === true)!;
+      expect(step10Final).toEqual({
+        messageId: streamedMsgId,
+        delta: 'Scheduled timer armed for 10m.',
+        final: true,
+      });
+      expect(state.currentMessageId).toBeNull();
+      expect(state.currentText).toBe('');
+      expect(completed).toHaveLength(0);
+
+      // 2) After schedule fires inside the still-open session/prompt RPC, ACP drops chunks:
+      //    transcript PLANNER_RESPONSE DONE still emits final:true immediately under `${nativeId}:step:12`.
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 11, type: 'GENERIC', status: 'DONE', content: 'Timer fired' }) + '\n'
+        + JSON.stringify({ step_index: 12, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Server restarted cleanly at 19:25 UTC.' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas.filter((d) => d.final === true)).toHaveLength(2), { timeout: 5000 });
+      expect(deltas.filter((d) => d.final === true)[1]).toEqual({
+        messageId: `${nativeId}:step:12`,
+        delta: 'Server restarted cleanly at 19:25 UTC.',
+        final: true,
+      });
+      expect(completed).toHaveLength(0);
+
+      // 3) Steering arrives and ACP streams a fresh chunk (no incoming messageId) -> must allocate
+      //    a brand new messageId instead of concatenating onto step 10 or step 12.
+      expect(await provider.notifyActiveDelegation(id, notification('steer-non-auth', 'check logs'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      (provider as any).handleAgentChunk(id, state, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Logs look clean.' },
+      });
+      const steeredMsgId = state.currentMessageId as string;
+      expect(steeredMsgId).toBeTruthy();
+      expect(steeredMsgId).not.toBe(streamedMsgId);
+      expect(steeredMsgId).not.toBe(`${nativeId}:step:12`);
+      expect(state.currentText).toBe('Logs look clean.');
+
+      await appendFile(
+        file,
+        JSON.stringify({ step_index: 13, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Logs look clean.' }) + '\n',
+      );
+      await vi.waitFor(() => expect(deltas.filter((d) => d.final === true)).toHaveLength(3), { timeout: 5000 });
+      expect(deltas.filter((d) => d.final === true)[2]).toEqual({
+        messageId: steeredMsgId,
+        delta: 'Logs look clean.',
+        final: true,
+      });
+
+      // Settle open RPC: fixture echoes its inputs as its own new message without touching finalized steps.
+      await rm(holdFile, { force: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]!.id).not.toBe(streamedMsgId);
+      expect(completed[0]!.id).not.toBe(`${nativeId}:step:12`);
+      expect(completed[0]!.id).not.toBe(steeredMsgId);
+      expect(completed[0]!.content).not.toContain('Scheduled timer');
+      expect(completed[0]!.content).not.toContain('Server restarted');
+      expect(completed[0]!.content).not.toContain('Logs look clean.');
+
+      // Subagent PLANNER_RESPONSE row must NOT emit assistant.text.
+      state.promptInFlight = true;
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 14,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Spawning subagent...',
+        tool_calls: [{ name: 'invoke_subagent' }],
+      });
+      state.promptInFlight = false;
+      expect(deltas.filter((d) => d.final === true)).toHaveLength(3);
+      expect(completed).toHaveLength(1);
+    } finally {
+      await rm(holdFile, { force: true }).catch(() => {});
+    }
+  });
+});

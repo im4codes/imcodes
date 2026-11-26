@@ -13,6 +13,7 @@ import {
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
 import { validateP2pArtifactRelativePath } from '../../shared/p2p-workflow-artifacts.js';
 import type { P2pArtifactContract } from '../../shared/p2p-workflow-types.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 export type P2pArtifactRuntimePhase = 'freeze' | 'create' | 'validate' | 'baseline';
 
@@ -177,11 +178,11 @@ export const P2P_RUN_STATE_DIR_ENV = 'IMCODES_P2P_RUN_STATE_DIR';
  * sensitive, so we keep it dependency-free) and the override is ignored.
  */
 function resolveRunStateDir(): string {
-  const defaultDir = path.join(homedir(), '.imcodes', 'runs');
+  const defaultDir = path.join(imcodesStateDir(), 'runs');
   const override = process.env[P2P_RUN_STATE_DIR_ENV];
   if (!override || override.trim().length === 0) return defaultDir;
   const candidate = path.resolve(override.trim());
-  const safeRoots = [path.resolve(homedir()), path.resolve(tmpdir())];
+  const safeRoots = [path.resolve(homedir()), path.resolve(tmpdir()), path.resolve(imcodesStateDir())];
   const within = safeRoots.some((root) => candidate === root || candidate.startsWith(root + path.sep));
   if (!within) {
     // Use process.stderr to avoid pulling logger into this module (artifact

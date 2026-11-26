@@ -30,6 +30,33 @@ describe('p2p execution marker', () => {
     });
   });
 
+  it('preserves a non-negative integer skippable task count', () => {
+    const content = stringifyP2pExecutionMarker({
+      ...buildP2pExecutionMarker(spec, 'completed'),
+      skippableTaskCount: 2,
+    });
+
+    expect(validateP2pExecutionMarkerContent(content, spec)).toMatchObject({
+      ok: true,
+      marker: { skippableTaskCount: 2 },
+    });
+  });
+
+  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid skippable task count %s',
+    (skippableTaskCount) => {
+      const content = stringifyP2pExecutionMarker({
+        ...buildP2pExecutionMarker(spec, 'completed'),
+        skippableTaskCount,
+      });
+
+      expect(validateP2pExecutionMarkerContent(content, spec)).toMatchObject({
+        ok: false,
+        reason: 'skippable_task_count_invalid',
+      });
+    },
+  );
+
   it('rejects mismatched nonce and does not treat it as agent failure', () => {
     const content = stringifyP2pExecutionMarker(buildP2pExecutionMarker({ ...spec, nonce: 'wrong' }, 'completed'));
 

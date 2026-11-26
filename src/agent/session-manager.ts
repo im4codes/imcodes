@@ -1,71 +1,220 @@
+import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
+import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, normalizeAgyModelId } from '../../shared/agy-agent.js';
+import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
+import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
+import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
+import { RESTORE_PACING_MIN_GAP_MS, RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } from '../../shared/event-loop-backpressure.js';
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
 import { OpenCodeDriver } from './drivers/opencode.js';
 import { ShellDriver } from './drivers/shell.js';
-import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import { isTransportAgent } from './detect.js';
-import { buildTransportResumeLaunchOpts } from './transport-resume-opts.js';
+import {
+  buildTransportResumeLaunchOpts,
+  findLegacyProviderResumeId,
+  usesDirectoryScopedSessionListing,
+  usesProviderResumeId,
+} from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
+import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
-import { PROVIDER_ERROR_CODES, type SessionInfoUpdate } from './transport-provider.js';
+import {
+  claimTransportRestoreNotice,
+  clearTransportRestoreBackoff,
+  isTransportRestoreBackedOff,
+  noteTransportRestoreUnbound,
+  transportRestoreFingerprint,
+  type TransportRestoreUnboundReason,
+} from './transport-restore-backoff.js';
+import {
+  PROVIDER_ERROR_CODES,
+  type RemoteSessionInfo,
+  type SessionInfoUpdate,
+} from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
+import {
+  PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD,
+} from '../../shared/peer-audit.js';
 import {
   getSession,
   upsertSession,
   removeSession,
   listSessions as storeSessions,
+  mergeProviderLimitSignal,
   updateSessionState,
   type SessionRecord,
   type SessionState,
 } from '../store/session-store.js';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { hookCredentialEnv, mintHookCredential } from '../daemon/hook-session-credential.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { timelineStore } from '../daemon/timeline-store.js';
+import {
+  registerTmuxSessionResource,
+  initializeSessionResourceLifecycle,
+  releaseSessionChildResources,
+  releaseSessionResources,
+  resourceOwnerEnv,
+} from '../daemon/session-resource-service.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
+import { isNonDaemonProcess } from '../daemon/process-role.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId, reserveSessionFile, reassignSessionFile } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
-import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWatching, isWatching as isOpenCodeWatching } from '../daemon/opencode-watcher.js';
 import { resolveStructuredSessionBootstrap } from './structured-session-bootstrap.js';
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
-import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
+import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
 import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
+import { peekAgyUsageQuotaCached } from './agy-usage-quota.js';
+import { peekGrokUsageQuotaCached, getGrokUsageQuota } from './grok-usage-quota.js';
+import { peekMuseUsageQuotaCached, getMuseUsageQuota } from './muse-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
-import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import {
+  getSessionRuntimeType,
+  isClaudeCodeFamily,
+  isClaudeCodeSdkAgentType,
+  isCodexFamily,
+  isSessionAgentType,
+  isSubSessionRecord,
+  unsupportedAgentTypeError,
+} from '../../shared/agent-types.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
+import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
-import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
+import {
+  resolveTransportContextBootstrap,
+  type TransportContextNamespaceStage,
+} from './runtime-context-bootstrap.js';
+import { resolveLaunchContextBootstrap } from './launch-context-bootstrap.js';
+import { readBoundedTimeoutMs } from './transport-context-budget.js';
+import { withTimeoutOutcome } from '../util/timeout-outcome.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { attachDaemonUserNotice, createDaemonUserNoticePayload, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC, buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  parseSdkSubagentDetail,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord, RESEND_DISPATCH_CONTROL } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
+import { deliverTransportResendEntry } from './transport-resend-delivery.js';
+import { resolveTransportQueueEntryAdmission } from '../daemon/delegation-reply-task-liveness.js';
+import { isNativeAgentFenceRequiredForLaunch } from '../daemon/native-collaboration-guard.js';
+import { processLaunchFence } from './native-agent-fence.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { getDefaultTimelineDetailStore } from '../daemon/timeline-detail-store.js';
+import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
+import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
+import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
+import { imcodesStateDirEnv } from '../util/imcodes-state-dir.js';
+import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
+import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
+import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
+import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
+import { identityPromptHash } from '../util/identity-prompt-hash.js';
+import {
+  claimProcessRestartContinuationRecovery,
+  clearSessionRestartContinuation,
+  consumeRestartContinuation,
+  dispatchProcessRestartContinuation,
+  dispatchTransportRestartContinuation,
+  emitSystemContinueUserMessage,
+  hasActiveProcessRestartContinuationRecovery,
+  hasPendingRestartContinuation,
+  retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
+} from '../daemon/restart-continuation.js';
 
-const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
+function maybeDispatchProcessRestartContinuation(
+  sessionName: string,
+  preRestoreSession?: SessionRecord,
+): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
+  return dispatchProcessRestartContinuation({
+    sessionName,
+    preRestoreSession,
+    currentSession: getSession(sessionName),
+    sendKeys: (name, keys) => sendKeys(name, keys),
+    emitUserMessage: (name, commandId) =>
+      emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'process'),
+  });
+}
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
     || isTransportAgent(record.agentType as AgentType);
+}
+
+function markLaunchFailure(record: Pick<SessionRecord, 'name' | 'projectDir'>, cause: unknown): Error {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const code = typeof cause === 'object' && cause !== null && 'code' in cause
+    ? String((cause as { code?: unknown }).code)
+    : '';
+  const isWorkingDirectoryFailure = raw.includes(SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND)
+    || code === 'ENOENT'
+    || code === 'ENOTDIR'
+    || code === '267'
+    || /error code:\s*267\b/i.test(raw);
+  const message = isWorkingDirectoryFailure
+    ? `${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${record.projectDir}`
+    : raw;
+  updateSessionState(record.name, 'error', message);
+  emitSessionEvent('error', record.name, message);
+  return isWorkingDirectoryFailure ? new Error(message) : (cause instanceof Error ? cause : new Error(message));
+}
+
+function isPersistedWorkingDirectoryError(error: string | undefined): boolean {
+  return typeof error === 'string'
+    && error.startsWith(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}:`);
+}
+
+function storedProviderResumeIdOwners(providerId: string, resumeId: string): string[] {
+  const normalizedResumeId = resumeId.trim();
+  if (!normalizedResumeId) return [];
+  return storeSessions()
+    .filter((record) => (
+      (record.providerId ?? record.agentType) === providerId
+      && record.providerResumeId?.trim() === normalizedResumeId
+    ))
+    .map((record) => record.name);
 }
 
 function shouldAutoRelaunchTransportRuntimeAfterError(
@@ -101,7 +250,39 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
     || lower.includes('_haiku')
     || lower.includes('claude-')
     || lower.includes('claude_');
-  return isClaudeModel ? DEFAULT_CODEX_SDK_STARTUP_MODEL : trimmed;
+  return isClaudeModel ? DEFAULT_CODEX_SESSION_MODEL : trimmed;
+}
+
+async function applyCodexPresetConfig(input: {
+  ccPreset: string;
+  requestedModel?: string;
+  env?: Record<string, string>;
+  contextWindow?: number;
+  systemPrompt?: string;
+  settings?: string | Record<string, unknown>;
+}): Promise<{
+  env?: Record<string, string>;
+  model?: string;
+  contextWindow?: number;
+  systemPrompt?: string;
+  availableModels?: string[];
+  settings?: string | Record<string, unknown>;
+}> {
+  const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+  const presetConfig = await getCodexPresetTransportConfig(input.ccPreset, input.requestedModel);
+  return {
+    env: { ...(input.env ?? {}), ...presetConfig.env },
+    model: presetConfig.model ?? input.requestedModel,
+    contextWindow: presetConfig.contextWindow ?? input.contextWindow,
+    systemPrompt: presetConfig.systemPrompt ?? input.systemPrompt,
+    availableModels: presetConfig.availableModels?.length ? presetConfig.availableModels : undefined,
+    settings: presetConfig.codexModelProvider
+      ? {
+          ...(typeof input.settings === 'object' && input.settings ? input.settings : {}),
+          codexModelProvider: presetConfig.codexModelProvider,
+        }
+      : input.settings,
+  };
 }
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
@@ -122,10 +303,12 @@ function startStructuredWatcher(
   name: string,
   agentType: AgentType,
   projectDir: string,
-  ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string; opencodeSessionId?: string },
+  ids?: { ccSessionId?: string; codexSessionId?: string; opencodeSessionId?: string },
 ): void {
   if (agentType === 'claude-code') {
-    startCCWatcher(name, projectDir, ids?.ccSessionId);
+    if (!name.startsWith('deck_sub_') || ids?.ccSessionId) {
+      startCCWatcher(name, projectDir, ids?.ccSessionId);
+    }
   } else if (agentType === 'codex') {
     if (ids?.codexSessionId) {
       findRolloutPathByUuid(ids.codexSessionId).then((rolloutPath) => {
@@ -148,26 +331,24 @@ function startStructuredWatcher(
         logger.warn({ err: e, session: name }, 'codex-watcher start failed'),
       );
     }
-  } else if (agentType === 'gemini') {
-    if (ids?.geminiSessionId) {
-      startGeminiWatching(name, ids.geminiSessionId).catch((e) =>
-        logger.warn({ err: e, session: name }, 'gemini-watcher start failed'),
-      );
-    } else {
-      startGeminiWatchingLatest(name).catch((e) =>
-        logger.warn({ err: e, session: name }, 'gemini-watcher start latest failed'),
-      );
-    }
   } else if (agentType === 'opencode') {
     startOpenCodeWatching(name, projectDir, ids?.opencodeSessionId).catch((e) =>
       logger.warn({ err: e, session: name }, 'opencode-watcher start failed'),
     );
+  } else if (isClaudeCodeSdkAgentType(agentType) && ids?.ccSessionId) {
+    // claude-code-sdk sessions get their structured events from the provider
+    // stream, not from tailing a JSONL file — no jsonl-watcher is started for
+    // them. The underlying claude binary still writes a transcript to disk
+    // under this ccSessionId, though, so it must be reserved: otherwise a
+    // DIFFERENT (possibly stopped/misdirected) session's directory-scan or
+    // rotation poll sees an unclaimed file and freely adopts it.
+    reserveSessionFile(name, ids.ccSessionId);
   }
 }
 
 // Restart loop prevention: max 3 restarts within 5 minutes
-const MAX_RESTARTS = 3;
-const RESTART_WINDOW_MS = 5 * 60 * 1000;
+export const MAX_RESTARTS = 3;
+export const RESTART_WINDOW_MS = 5 * 60 * 1000;
 
 type SessionEventCallback = (event: 'started' | 'stopped' | 'error', session: string, state: string) => void;
 let _onSessionEvent: SessionEventCallback | null = null;
@@ -213,6 +394,30 @@ export async function persistSessionRecordAwaited(record: SessionRecord | null, 
   await _onSessionPersist?.(record, name);
 }
 
+type TransportSessionRestoredCallback = (sessionName: string) => void;
+let _onTransportSessionRestored: TransportSessionRestoredCallback | null = null;
+
+/** Wire the authoritative post-upsert transport restore boundary. */
+export function setTransportSessionRestoredCallback(cb: TransportSessionRestoredCallback): void {
+  _onTransportSessionRestored = cb;
+}
+
+type SessionInfoModelSyncCallback = (sessionName: string) => void;
+let _onSessionInfoModelSync: SessionInfoModelSyncCallback | null = null;
+
+/** Push live model updates from provider sessionInfo to connected clients. */
+export function setSessionInfoModelSyncCallback(cb: SessionInfoModelSyncCallback | null): void {
+  _onSessionInfoModelSync = cb;
+}
+
+function emitTransportSessionRestored(sessionName: string): void {
+  try {
+    _onTransportSessionRestored?.(sessionName);
+  } catch (error) {
+    logger.warn({ err: error, sessionName }, 'transport session restored callback failed');
+  }
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
@@ -228,6 +433,8 @@ export interface ProjectConfig {
   ccPreset?: string;
   /** Transport thinking level for supported main sessions. */
   effort?: TransportEffortLevel;
+  /** Session-scoped Agent identity available before the first provider turn. */
+  identityPrompt?: string;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -237,9 +444,8 @@ export function getDriver(type: AgentType): AgentDriver {
     case 'opencode': return new OpenCodeDriver();
     case 'shell': return new ShellDriver();
     case 'script': return new ShellDriver();
-    case 'gemini': return new GeminiDriver();
     default:
-      throw new Error(`getDriver: no tmux driver for transport agent '${type as string}'`);
+      throw new Error(`getDriver: no tmux driver for agent '${type as string}'`);
   }
 }
 
@@ -249,9 +455,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort, identityPrompt } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort, identityPrompt });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -294,12 +500,16 @@ export async function stopProject(
         }
         if (await sessionExists(record.name)) throw new Error('session still exists after kill');
       },
+      cleanupResources: async () => {
+        const result = await releaseSessionResources(record);
+        if (result.failed > 0) throw new Error(`session resource cleanup failed for ${result.failed} resource(s)`);
+      },
       emitSuccess: async () => {
         if (record.name.startsWith('deck_sub_')) {
           timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
           return;
         }
-        if (shouldMaterializeMasterOnSessionStop(record)) {
+        if (!isIncognitoSession(record) && shouldMaterializeMasterOnSessionStop(record)) {
           const registration = registerMasterCompaction(
             () => materializeMasterSummary(record.name, record.contextNamespace),
             {
@@ -323,11 +533,18 @@ export async function stopProject(
           }
         }
         removeSession(record.name);
+        clearTransportRestoreBackoff(record.name);
         // Session is gone — free its in-memory timeline ring buffer + dedup maps
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
-        clearResend(record.name);
+        notifySessionTeardown(record.name);
+        clearResend(record.name, 'session_removed');
+        clearSessionRestartContinuation(record.name);
+        if (isIncognitoSession(record)) {
+          getTransportQueueStore().discardSessionQueueState(record.name);
+          getDefaultTimelineDetailStore().forgetSession(record.name);
+        }
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -358,13 +575,12 @@ export async function stopProject(
   return result;
 }
 
-/** Kill tmux sessions and watchers for a project but keep store records (for restart). */
+/** Kill tmux sessions and watchers for a project's main/worker sessions, keeping store records (for restart) and leaving sub-sessions untouched. */
 export async function teardownProject(projectName: string): Promise<void> {
-  const sessions = storeSessions(projectName);
+  const sessions = storeSessions(projectName).filter((s) => !isSubSessionRecord(s));
   for (const s of sessions) {
     stopWatching(s.name);
     stopCodexWatching(s.name);
-    stopGeminiWatching(s.name);
     stopOpenCodeWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
@@ -396,9 +612,57 @@ export async function initOnStartup(): Promise<void> {
     logger.warn({ err }, 'cleanupOrphanFifos failed — daemon continues');
   }
   try {
+    await reclaimOrphanedAgyIncognitoHomes();
+  } catch (err) {
+    logger.warn({ err }, 'reclaimOrphanedAgyIncognitoHomes failed — daemon continues');
+  }
+  try {
     await cleanupKnownTestTerminalSessions();
   } catch (err) {
     logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
+  }
+  // Test harness sessions can survive a killed daemon even when their terminal
+  // backend is already gone. Remove the persisted records too, otherwise the
+  // restore pass resurrects them on every boot. Keep this predicate shared with
+  // terminal cleanup so Windows-shaped paths (C:\\tmp\\existing-project) and
+  // the legacy deck_existing_brain fixture cannot drift apart.
+  try {
+    const leaked = storeSessions().filter((record) => isKnownTestSessionLike({
+      name: record.name,
+      projectName: record.projectName,
+      projectDir: record.projectDir,
+      parentSession: record.parentSession,
+      cwd: record.projectDir,
+    }));
+    for (const record of leaked) {
+      // The terminal-list sweep above is best-effort (ConPTY/tmux can be
+      // unavailable during boot). Retry the backend kill by persisted name so
+      // a leaked process cannot survive merely because enumeration failed.
+      await killSession(record.name).catch(() => {});
+      removeSession(record.name);
+      emitSessionPersist(null, record.name);
+    }
+    if (leaked.length > 0) {
+      logger.info({ count: leaked.length, sessions: leaked.map((record) => record.name) }, 'Removed leaked test sessions from persistent store');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Persistent test-session cleanup failed — daemon continues');
+  }
+  try {
+    const activeProcessOwners: SessionRecord[] = [];
+    for (const record of storeSessions()) {
+      if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
+      if (await sessionExists(record.name)) activeProcessOwners.push(record);
+    }
+    const swept = await initializeSessionResourceLifecycle(activeProcessOwners, {
+      // initOnStartup runs only after loadStore. Passing this provider is an
+      // explicit daemon-only opt-in; controlled-node callers use the shared
+      // default sweep without any local-store orphan authority.
+      listSessionsForOrphanSweep: () => storeSessions(),
+    });
+    logger.info({ ...swept }, 'Session resource orphan sweep completed');
+  } catch (err) {
+    logger.warn({ err }, 'Session resource orphan sweep failed — daemon continues');
   }
   // Execution clones are ephemeral and their parent runs live in daemon memory
   // (not reattachable after a restart). Sweep ALL execution clones on startup so
@@ -433,8 +697,6 @@ async function extractSessionUuidFromPane(sessionName: string): Promise<string |
 
 /** Extract ccSessionId from tmux pane start command. */
 const extractCcSessionIdFromPane = extractSessionUuidFromPane;
-/** Extract geminiSessionId from tmux pane start command (gemini --resume <uuid>). */
-const extractGeminiSessionIdFromPane = extractSessionUuidFromPane;
 /** Extract OpenCode session ID from tmux pane start command (`opencode -s <id>`). */
 async function extractOpenCodeSessionIdFromPane(sessionName: string): Promise<string | undefined> {
   try {
@@ -472,7 +734,6 @@ async function inferAgentTypeFromPane(sessionName: string): Promise<AgentType> {
     const cmd = await getPaneStartCommand(sessionName);
     if (/\bclaude\b/.test(cmd)) return 'claude-code';
     if (/\bcodex\b/.test(cmd)) return 'codex';
-    if (/\bgemini\b/.test(cmd)) return 'gemini';
     if (/\bopencode\b/.test(cmd)) return 'opencode';
   } catch { /* tmux query failed */ }
   return 'claude-code'; // last-resort default
@@ -486,22 +747,68 @@ export async function restoreFromStore(): Promise<void> {
   const all = storeSessions();
   const live = await tmuxListSessions();
 
+  // Reserve every known Claude session transcript UUID up front, before any
+  // watcher starts polling. This covers claude-code-sdk (transport) sessions,
+  // which never call startWatching/startWatchingFile themselves but still
+  // have a JSONL transcript on disk — without an explicit reservation here,
+  // another session's directory-scan/rotation logic (e.g. a stopped
+  // sub-session whose watcher gets restarted below) can freely adopt it.
+  for (const s of all) {
+    if (isClaudeCodeFamily(s.agentType) && s.ccSessionId) {
+      reserveSessionFile(s.name, s.ccSessionId);
+    }
+  }
+
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
+    if (!isSessionAgentType(s.agentType)) {
+      logger.warn({ session: s.name, agentType: s.agentType }, 'restoreFromStore: skipping unsupported or removed agent type');
+      continue;
+    }
     if (isStoredTransportSession(s)) {
+      healPersistedAgySessionModel(s);
+      // Transport sessions are normally handed to restoreTransportSessions,
+      // but that path intentionally assumes providers validate cwd later.
+      // Mark a missing persisted directory here so an invalid transport cannot
+      // remain apparently healthy or be retried on every boot.
+      if (s.state !== 'error' && s.projectDir && !existsSync(s.projectDir)) {
+        markLaunchFailure(s, new Error(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${s.projectDir}`));
+      }
       // Handled by restoreTransportSessions() after provider connects
       continue;
     }
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
     // but still restore watchers if the tmux session is alive.
     if (s.name.startsWith('deck_sub_')) {
+      // A sub-session already marked stopped must never get its watcher
+      // restarted just because the tmux artifact (e.g. remain-on-exit)
+      // still exists — tmux liveness alone is not the source of truth once
+      // the session has been explicitly retired.
+      if (s.state === 'stopped') {
+        logger.debug({ session: s.name }, 'restoreFromStore: sub-session already stopped, skipping watcher restart');
+        continue;
+      }
       const isLive = live.includes(s.name);
       logger.info({ session: s.name, agentType: s.agentType, isLive, codexSessionId: s.codexSessionId ?? null }, 'Restoring sub-session watcher');
       if (!isLive) {
         // Mark dead sub-sessions as stopped so the health poller doesn't restart them
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
         continue;
+      }
+      if (!(await isPaneAlive(s.name))) {
+        if (shouldAutoRespawnDeadProcessSubSession(s)) {
+          logger.info({ session: s.name, agentType: s.agentType }, 'Sub-session pane dead on restore with pending continuation, respawning');
+          try {
+            await respawnSession(s);
+          } catch (err) {
+            logger.warn({ err, session: s.name }, 'Failed to respawn dead-pane sub-session on restore');
+          }
+        }
+        continue;
+      }
+      if (!hasActiveProcessRestartContinuationRecovery(s.name)) {
+        consumeRestartContinuation(s.name);
       }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
@@ -516,19 +823,6 @@ export async function restoreFromStore(): Promise<void> {
               logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher startById failed'));
           }
         }).catch((e) => logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher findRollout failed'));
-      } else if (s.agentType === 'gemini' && !isGeminiWatching(s.name)) {
-        let gemId = s.geminiSessionId;
-        if (!gemId) {
-          gemId = await extractGeminiSessionIdFromPane(s.name);
-          if (gemId) {
-            upsertSession({ ...s, geminiSessionId: gemId });
-            emitSessionPersist({ ...s, geminiSessionId: gemId }, s.name);
-            logger.info({ session: s.name, geminiSessionId: gemId }, 'Backfilled missing geminiSessionId from tmux');
-          }
-        }
-        if (gemId) {
-          startGeminiWatching(s.name, gemId);
-        }
       } else if (s.agentType === 'opencode' && !s.opencodeSessionId) {
         const opencodeId = await recoverOpenCodeSessionId(s);
         if (opencodeId) {
@@ -581,10 +875,24 @@ export async function restoreFromStore(): Promise<void> {
     const paneAlive = isLiveSession ? await isPaneAlive(s.name) : false;
     logger.debug({ session: s.name, agentType: s.agentType, isLive: isLiveSession, paneAlive, ccSessionId: s.ccSessionId ?? null, watching: isWatching(s.name) }, 'restoreFromStore: processing main session');
 
+    // Durable cwd errors are intentionally not auto-retried. They remain
+    // visible in the session list until the user fixes the path and retries.
+    if (!isLiveSession && s.state === 'error' && isPersistedWorkingDirectoryError(s.error)) {
+      logger.warn({ session: hydrated.name, projectDir: hydrated.projectDir }, 'Skipping restore for session with missing working directory');
+      continue;
+    }
+    // Some transport providers accept a missing cwd and only fail later,
+    // which would otherwise leave the persisted record looking healthy and
+    // retry it on every boot. Detect the path before any provider launch so
+    // every backend gets the same durable, user-actionable error state.
+    if (!isLiveSession && hydrated.projectDir && !existsSync(hydrated.projectDir)) {
+      markLaunchFailure(hydrated, new Error(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${hydrated.projectDir}`));
+      continue;
+    }
     if (!isLiveSession) {
       logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
       try { await restartSession(hydrated); } catch (err) {
-        logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
+        logger.error({ err, session: hydrated.name, backend: BACKEND }, 'Failed to restart session on restore — skipping');
         const message = err instanceof Error ? err.message : String(err);
         updateSessionState(hydrated.name, 'error', message);
         emitSessionEvent('error', hydrated.name, message);
@@ -598,7 +906,12 @@ export async function restoreFromStore(): Promise<void> {
         updateSessionState(hydrated.name, 'error', message);
         emitSessionEvent('error', hydrated.name, message);
       }
-    } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
+    } else {
+      // Live CLI process survived daemon restart intact — discard any captured marker so it is never nudged.
+      if (!hasActiveProcessRestartContinuationRecovery(hydrated.name)) {
+        consumeRestartContinuation(hydrated.name);
+      }
+      if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
       } else {
@@ -629,31 +942,11 @@ export async function restoreFromStore(): Promise<void> {
           logger.warn({ err: e, session: hydrated.name }, 'codex-watcher start failed (restore)'),
         );
       }
-    } else if (hydrated.agentType === 'gemini' && !isGeminiWatching(hydrated.name)) {
-      let gemId = hydrated.geminiSessionId;
-      if (!gemId) {
-        gemId = await extractGeminiSessionIdFromPane(hydrated.name);
-        if (gemId) {
-          hydrated = { ...hydrated, geminiSessionId: gemId };
-          upsertSession(hydrated);
-          emitSessionPersist(hydrated, hydrated.name);
-          logger.info({ session: hydrated.name, geminiSessionId: gemId }, 'Backfilled missing geminiSessionId from tmux');
-        }
-      }
-      if (gemId) {
-        startGeminiWatching(hydrated.name, gemId).catch((e) =>
-          logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start failed (restore)'),
-        );
-      } else {
-        // Fallback: watch latest for orphans/incomplete records
-        startGeminiWatching(hydrated.name, '').catch((e) =>
-          logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start latest failed (restore)'),
-        );
-      }
     } else if (hydrated.agentType === 'opencode' && hydrated.projectDir && hydrated.opencodeSessionId && !isOpenCodeWatching(hydrated.name)) {
       startOpenCodeWatching(hydrated.name, hydrated.projectDir, hydrated.opencodeSessionId).catch((e) =>
         logger.warn({ err: e, session: hydrated.name }, 'opencode-watcher start failed (restore)'),
       );
+    }
     }
   }
 
@@ -724,7 +1017,11 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     logger.info({ session: record.name }, 'Skipping restart for transport session');
     return false;
   }
-
+  if (!isSessionAgentType(record.agentType)) {
+    logger.warn({ session: record.name, agentType: record.agentType }, 'Skipping restart for unsupported or removed agent type');
+    updateSessionState(record.name, 'stopped');
+    return false;
+  }
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -754,18 +1051,32 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
   };
   upsertSession(updated);
 
-  await launchSession({
-    name: effectiveRecord.name,
-    projectName: effectiveRecord.projectName,
-    role: effectiveRecord.role,
-    agentType: effectiveRecord.agentType as AgentType,
-    projectDir: effectiveRecord.projectDir,
-    skipStore: true,
-    ccSessionId: effectiveRecord.ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-  });
+  try {
+    await launchSession({
+      name: effectiveRecord.name,
+      projectName: effectiveRecord.projectName,
+      role: effectiveRecord.role,
+      agentType: effectiveRecord.agentType as AgentType,
+      projectDir: effectiveRecord.projectDir,
+      skipStore: true,
+      ccSessionId: effectiveRecord.ccSessionId,
+      codexSessionId: effectiveRecord.codexSessionId,
+      opencodeSessionId: effectiveRecord.opencodeSessionId,
+      onPostLaunchReady: () => maybeDispatchProcessRestartContinuation(effectiveRecord.name, record),
+    });
+    } catch (error) {
+      throw markLaunchFailure(record, error);
+  }
+
+  // A health-check restart can race a dead tmux server while the browser's
+  // terminal subscription is still alive. Rebind its pipe immediately after
+  // the replacement pane is created so output and input resume in-place.
+  try {
+    const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+    await terminalStreamer.rebindSession(effectiveRecord.name);
+  } catch (error) {
+    logger.warn({ session: effectiveRecord.name, error }, 'Terminal stream rebind after restart failed');
+  }
 
   return true;
 }
@@ -780,7 +1091,11 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     logger.info({ session: record.name }, 'Skipping respawn for transport session');
     return false;
   }
-
+  if (!isSessionAgentType(record.agentType)) {
+    logger.warn({ session: record.name, agentType: record.agentType }, 'Skipping respawn for unsupported or removed agent type');
+    updateSessionState(record.name, 'stopped');
+    return false;
+  }
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -804,82 +1119,143 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const driver = getDriver(effectiveRecord.agentType as AgentType);
   const ccSessionId = effectiveRecord.ccSessionId;
   const projectDir = effectiveRecord.projectDir;
+  // Decided from managed authority on the path that launches the process.
+  const nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({
+    sessionName: record.name,
+    role: record.role,
+    parentSession: record.parentSession,
+  });
   const cmd = driver.buildResumeCommand(record.name, {
     cwd: projectDir,
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
+    nativeAgentsFenced,
   }) ?? driver.buildLaunchCommand(record.name, {
     cwd: projectDir,
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
+    nativeAgentsFenced,
   });
+
+  const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
+  // A process pane respawn: the old CLI process (and anything it hosted) is gone.
+  const oldResources = await releaseSessionChildResources(record, { providerThreadContinues: false });
+  if (oldResources.failed > 0) {
+    throw new Error(`session resource cleanup failed for ${oldResources.failed} resource(s)`);
+  }
 
   // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
-  const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
+  // A respawn always starts a new process, so it gets a new hook credential (the old process's copy stops working).
+  const hookCredential = mintHookCredential();
+  const mergedEnv: Record<string, string> = {
+    ...imcodesStateDirEnv(),
+    IMCODES_SESSION: record.name,
+    ...resourceOwnerEnv({
+      sessionName: record.name,
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+    }),
+    ...hookCredentialEnv(hookCredential),
+  };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
-  if (BACKEND === 'conpty') {
-    await respawnPane(record.name, cmd, { env: mergedEnv });
-  } else {
-    const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-    const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
-    await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+  const releaseRecovery = (record.agentType !== 'shell' && record.agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(record.name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
+  try {
+    try {
+      if (BACKEND === 'conpty') {
+        await respawnPane(record.name, cmd, { env: mergedEnv });
+      } else {
+        const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+        const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+        await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+      }
+    } catch (error) {
+      throw markLaunchFailure(record, error);
+    }
+
+    // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
+    const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+    void terminalStreamer.rebindSession(record.name);
+
+    const updated: SessionRecord = {
+      ...effectiveRecord,
+      restarts: record.restarts + 1,
+      restartTimestamps: [...recentRestarts, now],
+      state: 'idle',
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      hookCredential,
+      // The proof names exactly the instance and epoch this process was launched for.
+      nativeAgentLaunchFence: {
+        fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
+        decidedAt: now,
+      },
+      updatedAt: now,
+    };
+    upsertSession(updated);
+    const persistedRecord = getSession(record.name);
+    if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
+
+    startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
+      ccSessionId,
+      codexSessionId: effectiveRecord.codexSessionId,
+      opencodeSessionId: effectiveRecord.opencodeSessionId,
+    });
+
+    // postLaunch (auto-dismiss startup prompts) + init message injection
+    const injectInit = async () => {
+      try {
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(record.name),
+            (key: string) => sendKey(record.name, key),
+          ).catch(() => {});
+        }
+        const initParts: string[] = [];
+        if (record.description) initParts.push(record.description);
+        const identityPrompt = await resolveEffectiveIdentityPrompt(record);
+        if (identityPrompt) initParts.push(identityPrompt);
+        if (record.ccPreset && record.agentType === 'claude-code') {
+          const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
+          const preset = await getPreset(record.ccPreset);
+          if (preset) initParts.push(getPresetInitMessage(preset));
+        }
+        if (initParts.length > 0) {
+          const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+          try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
+        }
+        try {
+          await maybeDispatchProcessRestartContinuation(record.name, record);
+        } catch (err) {
+          logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
+        }
+      } finally {
+        releaseRecovery?.();
+      }
+    };
+    recoveryHandedOff = true;
+    void injectInit();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
   }
-
-  // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
-  const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
-  void terminalStreamer.rebindSession(record.name);
-
-  const updated: SessionRecord = {
-    ...effectiveRecord,
-    restarts: record.restarts + 1,
-    restartTimestamps: [...recentRestarts, now],
-    state: 'idle',
-    updatedAt: now,
-  };
-  upsertSession(updated);
-
-  startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
-    ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-  });
-
-  // postLaunch (auto-dismiss startup prompts) + init message injection
-  const injectInit = async () => {
-    if (driver.postLaunch) {
-      await driver.postLaunch(
-        () => capturePane(record.name),
-        (key: string) => sendKey(record.name, key),
-      ).catch(() => {});
-    }
-    const initParts: string[] = [];
-    if (record.description) initParts.push(record.description);
-    if (record.ccPreset && record.agentType === 'claude-code') {
-      const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
-      const preset = await getPreset(record.ccPreset);
-      if (preset) initParts.push(getPresetInitMessage(preset));
-    }
-    if (initParts.length > 0) {
-      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
-      try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
-    }
-  };
-  void injectInit();
 
   logger.info({ session: record.name, agentType: record.agentType, ccPreset: record.ccPreset }, 'Respawned session');
   return true;
 }
 
-export interface LaunchOpts {
+export interface LaunchOpts extends SessionIncognitoConfig {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;
@@ -893,8 +1269,6 @@ export interface LaunchOpts {
   ccSessionId?: string;
   /** Codex session UUID for `codex resume <UUID>`. */
   codexSessionId?: string;
-  /** Gemini session UUID for `gemini --resume <UUID>`. */
-  geminiSessionId?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
   /** Provider-side durable resume identifier for shared local-sdk providers. */
@@ -911,6 +1285,8 @@ export interface LaunchOpts {
   transportConfig?: Record<string, unknown>;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
+  /** Effective synchronized user/project/session identity contract. */
+  identityPrompt?: string;
   /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
   ccPreset?: string;
   /** Bind to an existing remote session key instead of creating a new one. */
@@ -921,14 +1297,20 @@ export interface LaunchOpts {
   parentSession?: string;
   /** Mark as user-created (not auto-synced from provider). Protected from sync/health cleanup. */
   userCreated?: boolean;
+  /** Internal: launch generation already allocated by `relaunchSessionWithSettings`. */
+  handoffLaunchGeneration?: number;
+  /** Internal: invoked after `postLaunch` and initial context injection finish. */
+  onPostLaunchReady?: () => Promise<unknown> | unknown;
 }
 
 export interface SessionRelaunchOverrides {
   agentType?: AgentType;
   fresh?: boolean | null;
+  handoff?: boolean;
   projectDir?: string;
   label?: string | null;
   description?: string | null;
+  identityPrompt?: string | null;
   requestedModel?: string | null;
   effort?: TransportEffortLevel | null;
   transportConfig?: Record<string, unknown> | null;
@@ -936,13 +1318,12 @@ export interface SessionRelaunchOverrides {
 }
 
 export function getCompatibleSessionIds(
-  record: Pick<SessionRecord, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'>,
+  record: Pick<SessionRecord, 'ccSessionId' | 'codexSessionId' | 'opencodeSessionId'>,
   agentType: AgentType,
-): Pick<LaunchOpts, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'> {
+): Pick<LaunchOpts, 'ccSessionId' | 'codexSessionId' | 'opencodeSessionId'> {
   return {
     ...(isClaudeCodeFamily(agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(isCodexFamily(agentType) && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...(agentType === 'gemini' && record.geminiSessionId ? { geminiSessionId: record.geminiSessionId } : {}),
     ...(agentType === 'opencode' && record.opencodeSessionId ? { opencodeSessionId: record.opencodeSessionId } : {}),
   };
 }
@@ -950,17 +1331,34 @@ export function getCompatibleSessionIds(
 function stopStructuredWatchers(sessionName: string): void {
   stopWatching(sessionName);
   stopCodexWatching(sessionName);
-  stopGeminiWatching(sessionName);
   stopOpenCodeWatching(sessionName);
 }
 
-export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
+const cancelledTransportStarts = new WeakSet<Promise<void>>();
+
+export async function stopTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
+  // Stop must also fence a launch/restore whose provider id has not bound yet.
+  for (const pending of [transportLaunchInFlight.get(sessionName), transportSessionRestoreInFlight.get(sessionName)]) {
+    if (pending) cancelledTransportStarts.add(pending);
+  }
+  await detachTransportRuntimeSession(sessionName, options);
+}
+
+async function detachTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
+  clearTransportResendAuthorityRetry(sessionName);
+  notifySessionTeardown(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
   transportRuntimes.delete(sessionName);
   if (providerSid) unregisterProviderRoute(providerSid);
-  await transportRuntime.kill();
+  await transportRuntime.kill(options);
 }
 
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
@@ -973,79 +1371,290 @@ async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
   await killSession(record.name).catch(() => {});
 }
 
+const crossVendorHandoffLaunchGenerations = new Map<string, number>();
+
+function advanceCrossVendorHandoffLaunchGeneration(sessionName: string): number {
+  const next = (crossVendorHandoffLaunchGenerations.get(sessionName) ?? 0) + 1;
+  crossVendorHandoffLaunchGenerations.set(sessionName, next);
+  return next;
+}
+
+function stripPendingCrossVendorHandoff(
+  state: SessionRecord['crossVendorHandoff'],
+  fresh: boolean | undefined,
+): SessionRecord['crossVendorHandoff'] {
+  if (!state) return undefined;
+  return fresh && state.pending ? { ...state, pending: undefined } : state;
+}
+
+function invalidateFreshCrossVendorHandoff(sessionName: string): void {
+  advanceCrossVendorHandoffLaunchGeneration(sessionName);
+  const stored = getSession(sessionName);
+  if (stored?.crossVendorHandoff?.pending) {
+    upsertSession({
+      ...stored,
+      crossVendorHandoff: { ...stored.crossVendorHandoff, pending: undefined },
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+function isPresetCompatibleAgentSwitch(sourceAgentType: string, targetAgentType: string): boolean {
+  if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType)) return false;
+  if (sourceAgentType === targetAgentType) return true;
+  if (isClaudeCodeFamily(sourceAgentType) && isClaudeCodeFamily(targetAgentType)) return true;
+  if (isCodexFamily(sourceAgentType) && isCodexFamily(targetAgentType)) return true;
+  return false;
+}
+
 export async function relaunchSessionWithSettings(
   record: SessionRecord,
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
+  const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
+  const existedAtStart = Boolean(getSession(record.name));
+  const isGenerationCurrent = (): boolean => crossVendorHandoffLaunchGenerations.get(record.name) === launchGeneration;
+  const assertSessionOwnership = (): void => {
+    if (!isGenerationCurrent()) {
+      throw new Error(`Session ${record.name} relaunch superseded by a newer launch`);
+    }
+    const latest = getSession(record.name);
+    if (existedAtStart && !latest) {
+      throw new Error(`Session ${record.name} deleted during relaunch`);
+    }
+    if (latest && record.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+      throw new Error(`Session ${record.name} ownership changed during relaunch`);
+    }
+  };
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
+  const isPrivate = isIncognitoSession(record);
+  if (isPrivate && !targetFresh) {
+    throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+  }
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
-  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
+  // A model id is provider-scoped. An AG switch without an explicit choice
+  // must use AG's default, not the previous provider's (possibly invalid) id.
+  const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
+  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
+    : enteringAgy ? null : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
-  const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined
+    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
+    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
+  const targetRuntimeType = getSessionRuntimeType(targetAgentType);
+  const forceHandoff = overrides.handoff === true;
+  const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
+  const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
+  const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
+  const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
+    overrides.identityPrompt !== undefined ? Promise.resolve(overrides.identityPrompt) : resolveEffectiveIdentityPrompt(record),
+    wantsHandoff ? timelineStore.readPreferred(record.name, { limit: 1 }).catch(() => []) : Promise.resolve([]),
+  ]);
+  assertSessionOwnership();
+  const targetIdentityPrompt = resolvedIdentityPrompt ?? null;
+  let handoffPromise: Promise<import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack | undefined> | undefined;
+  let handoffCutoff: CrossVendorHandoffCutoff | undefined;
+  if (wantsHandoff) {
+    const last = cutoffEvents.at(-1);
+    handoffCutoff = last
+      ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
+      : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    const cutoff = handoffCutoff;
+    const providerKey = targetAgentType;
+    const priorCutoff = record.crossVendorHandoff?.cutoffs?.[providerKey];
+    const persistedState = beginCrossVendorHandoffState(
+      record.crossVendorHandoff,
+      handoffConfig,
+      record.agentType,
+      cutoff,
+    );
+    upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
+    const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
+      ...effectiveHandoffConfig,
+      // A previous cutoff means this is a switch-back; the pack builder still
+      // uses the authoritative timeline and the target runtime receives it once.
+      ...(priorCutoff ? { recentTurns: effectiveHandoffConfig.recentTurns } : {}),
+    }, priorCutoff);
+    handoffPromise = resolveCrossVendorHandoffPack(build, effectiveHandoffConfig.timeoutMs);
+  }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    && (!targetFresh || targetAgentType === 'openclaw')
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
-    // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
-    // codexSessionId; Kimi uses providerResumeId, so these providers use a fresh
+    // preserve it (unless fresh conversation requested). Claude/Codex SDKs keep their provider continuity in ccSessionId /
+    // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
-    && targetAgentType !== 'claude-code-sdk'
+    && !isClaudeCodeSdkAgentType(targetAgentType)
     && targetAgentType !== 'codex-sdk'
-    && targetAgentType !== 'copilot-sdk'
-    && targetAgentType !== 'cursor-headless'
-    && targetAgentType !== 'kimi-sdk'
+    && targetAgentType !== 'qoder-sdk'
+    && !usesProviderResumeId(targetAgentType)
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
   await teardownSessionRuntime(record);
+  assertSessionOwnership();
 
-  await launchSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: targetAgentType,
-    projectDir: targetProjectDir,
-    label: targetLabel ?? undefined,
-    description: targetDescription ?? undefined,
-    requestedModel: targetRequestedModel ?? undefined,
-    effort: targetEffort ?? undefined,
-    transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen')
-      ? (targetCcPreset ?? undefined)
-      : undefined,
-    ...(preserveTransportBinding ? {
-      bindExistingKey: record.providerSessionId,
-      skipCreate: true,
-    } : {}),
-    ...((targetAgentType === 'copilot-sdk' || targetAgentType === 'cursor-headless' || targetAgentType === 'kimi-sdk') && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId }
-      : {}),
-    ...compatibleIds,
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-    ...(targetFresh ? { fresh: true } : {}),
-  });
+  try {
+    await launchSession({
+      name: record.name,
+      projectName: record.projectName,
+      role: record.role,
+      agentType: targetAgentType,
+      projectDir: targetProjectDir,
+      label: targetLabel ?? undefined,
+      description: targetDescription ?? undefined,
+      identityPrompt: targetIdentityPrompt ?? undefined,
+      requestedModel: targetRequestedModel ?? undefined,
+      effort: targetEffort ?? undefined,
+      transportConfig: targetTransportConfig ?? undefined,
+      ccPreset: targetCcPreset ?? undefined,
+      ...(preserveTransportBinding ? {
+        bindExistingKey: record.providerSessionId,
+        ...(!targetFresh ? { skipCreate: true } : {}),
+      } : {}),
+      ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
+        ? { providerResumeId: record.providerResumeId }
+        : {}),
+      ...compatibleIds,
+      ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+      ...(record.userCreated ? { userCreated: true } : {}),
+      ...(targetFresh ? { fresh: true } : {}),
+      ...(isPrivate ? { incognito: true } : {}),
+      handoffLaunchGeneration: launchGeneration,
+    });
+  } catch (err) {
+    if (isGenerationCurrent()) advanceCrossVendorHandoffLaunchGeneration(record.name);
+    throw err;
+  }
+  const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
+    ? transportRuntimes.get(record.name)
+    : undefined;
+  const launchedRecord = getSession(record.name);
+  const launchedRuntimeEpoch = launchedRecord?.runtimeEpoch;
+  const launchedSessionInstanceId = launchedRecord?.sessionInstanceId;
+  const isCurrentLaunch = (): boolean => {
+    const current = getSession(record.name);
+    if (!isCrossVendorHandoffLaunchCurrent({
+      expectedGeneration: launchGeneration,
+      currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
+      currentAgentType: current?.agentType,
+      targetAgentType,
+    })) {
+      return false;
+    }
+    if (launchedRuntimeEpoch && (current?.runtimeEpoch !== launchedRuntimeEpoch || current?.sessionInstanceId !== launchedSessionInstanceId)) {
+      return false;
+    }
+    if (launchedTransport && transportRuntimes.get(record.name) !== launchedTransport) {
+      return false;
+    }
+    return true;
+  };
+  if (handoffPromise && isCurrentLaunch()) {
+    const persistPending = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
+      if (!isCurrentLaunch()) return;
+      const current = getSession(record.name);
+      if (!current) return;
+      const state = current.crossVendorHandoff ?? {};
+      upsertSession({ ...current, crossVendorHandoff: { ...state, pending: pack }, updatedAt: Date.now() });
+    };
+    const markConsumed = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
+      if (!isCurrentLaunch()) return;
+      const current = getSession(record.name);
+      if (!current) return;
+      const state = current.crossVendorHandoff ?? {};
+      // Clear only the exact pack that was accepted; a newer restart may have
+      // replaced pending while this callback was in flight.
+      if (state.pending && state.pending.cutoff.epoch === pack.cutoff.epoch
+        && state.pending.cutoff.seq === pack.cutoff.seq) {
+        upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [targetAgentType]: pack.cutoff } }, updatedAt: Date.now() });
+      }
+      incrementCounter('handoff.injected', { runtime: targetRuntimeType });
+    };
+    const guardedPromise = handoffPromise.then((pack) => {
+      if (pack && isCurrentLaunch()) persistPending(pack);
+      return pack && isCurrentLaunch() ? pack : undefined;
+    });
+    if (launchedTransport) {
+      launchedTransport.setPendingHandoffConsumedHandler(() => {
+        // The accepted pack is tracked by the runtime callback below.
+        const current = getSession(record.name);
+        const pending = current?.crossVendorHandoff?.pending;
+        if (pending) markConsumed(pending);
+      });
+      launchedTransport.setPendingHandoffReady(guardedPromise, effectiveHandoffConfig.providerWaitMs);
+    }
+    void guardedPromise.then(async (pack) => {
+      if (!pack || !isCurrentLaunch()) return;
+      if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
+        launchedTransport?.setPendingHandoff(pack);
+        return;
+      }
+      try {
+        const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+        let injected = false;
+        await runWithProcessSessionSendLock(record.name, async () => {
+          if (!isCurrentLaunch()) return;
+          const writePrivate = await prepareProcessSessionPrivateWriter(record.name);
+          writePrivate(pack.text);
+          injected = true;
+        });
+        if (injected) markConsumed(pack);
+      } catch (err) {
+        logger.debug({ err, session: record.name }, 'cross-vendor process handoff injection failed');
+        incrementCounter('handoff.injection_failed', { runtime: targetRuntimeType });
+      }
+    });
+  }
 }
 
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
+const TRANSPORT_RESEND_AUTHORITY_RETRY_BASE_MS = 100;
+const TRANSPORT_RESEND_AUTHORITY_RETRY_MAX_MS = 2_000;
+const TRANSPORT_RESEND_AUTHORITY_RETRY_LIMIT = 6;
+const transportResendAuthorityRetries = new Map<string, {
+  attempts: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  fingerprint: string;
+}>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
+
+function hasDurableTransportQueueEntries(sessionName: string): boolean {
+  return getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === sessionName);
+}
 
 function previewTransportQueueText(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim();
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
 }
 
+function buildTransportQueueSessionStatePayload(
+  sessionName: string,
+  state: SessionState | 'queued',
+  source: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    state,
+    ...(extra ?? {}),
+    ...buildTransportQueueSnapshotPayload(sessionName, source),
+  };
+}
+
 export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
   const resendQueues = listFreshResendQueues(nowMs);
   const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
+  const durableBySession = new Map(getTransportQueueStore().listLiveQueueSessions().map((queue) => [queue.sessionName, queue]));
   const sessionNames = new Set<string>([
     ...transportRuntimes.keys(),
     ...resendQueues.map((queue) => queue.sessionName),
+    ...durableBySession.keys(),
   ]);
   for (const session of storeSessions()) {
     if (isStoredTransportSession(session)) {
@@ -1059,6 +1668,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
     runtime?.drainPendingIfIdle?.('transport-queue-diagnostics');
     const runtimeSnapshot = runtime?.getDiagnosticSnapshot(nowMs);
     const resendEntries = resendBySession.get(sessionName) ?? [];
+    const durable = durableBySession.get(sessionName);
     return {
       sessionName,
       ...(record?.agentType ? { agentType: record.agentType } : {}),
@@ -1072,6 +1682,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
       ...(runtimeSnapshot ? { lastActivityAt: runtimeSnapshot.lastActivityAt } : {}),
       ...(runtimeSnapshot ? { lastActivityAgeMs: runtimeSnapshot.lastActivityAgeMs } : {}),
       resendCount: resendEntries.length,
+      ...(durable ? { oldestQueuedAt: durable.oldestQueuedAt, oldestQueuedAgeMs: Math.max(0, nowMs - durable.oldestQueuedAt) } : {}),
       ...(resendEntries.length
         ? {
             resendEntries: resendEntries.map((entry) => ({
@@ -1112,10 +1723,21 @@ const TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS = (() => {
   const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS);
   return Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 75;
 })();
+const TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT = (() => {
+  const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT);
+  return Number.isFinite(raw) && raw >= 200 ? Math.trunc(raw) : 2_000;
+})();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
-function pauseBetweenTransportRestores(index: number, delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS): Promise<void> {
+async function pauseBetweenTransportRestores(
+  index: number,
+  delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS,
+  paceBudget?: { leftMs: number },
+): Promise<void> {
   if (index <= 0) return new Promise((resolve) => setImmediate(resolve));
+  // A warm restore of dozens of sessions is paced by what the daemon can take (158: 53 restores into a loop blocked
+  // 1.2 s at a time), not by a fixed gap: the gap is a floor, and the next restore waits for the loop to recover.
+  if (paceBudget) return paceByEventLoopHealth(Math.max(delayMs, RESTORE_PACING_MIN_GAP_MS), paceBudget);
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
@@ -1123,12 +1745,31 @@ function buildTransportSessionEnv(
   sessionName: string,
   label: string | null | undefined,
   extraEnv?: Record<string, string>,
+  providerId?: string,
 ): Record<string, string> {
   return {
+    ...(providerId ? localAuthContextEnv(providerId) : {}),
     ...(extraEnv ?? {}),
     [IMCODES_SESSION_ENV]: sessionName,
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
+    ...imcodesStateDirEnv(),
   };
+}
+
+export async function resolveLaunchAuthContext(providerId: string, extraEnv?: Record<string, string>): Promise<LocalAuthContext | undefined> {
+  const env = { ...process.env, ...(extraEnv ?? {}) };
+  const candidate = hasLocalAuthCandidate(providerId, env);
+  // Known providers without a proven adapter still receive an explicit
+  // unsupported context at launch. This keeps status and runtime behavior
+  // aligned without guessing credentials or blocking providers that own
+  // their native login flow (for example Claude with no UDS candidate).
+  if (!candidate && !isExplicitlyUnsupportedLocalAuthProvider(providerId)) return undefined;
+  const context = await detectLocalAuthContext(providerId, env);
+  if (!context.authenticated || !context.reusable) {
+    if (!candidate && isExplicitlyUnsupportedLocalAuthProvider(providerId)) return context;
+    throw new Error(`Local auth unavailable for ${providerId}: ${context.reason ?? 'authentication context could not be verified'}`);
+  }
+  return context;
 }
 
 async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
@@ -1194,44 +1835,48 @@ async function recoverTransportRuntimeAfterError(
     if (recentRecoveries.length >= MAX_RESTARTS) {
       logger.error({ sessionName, ...preservation }, 'Transport error recovery loop detected — refusing auto-restart');
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERY_STOPPED,
+          `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
+          { limit: MAX_RESTARTS, minutes: RESTART_WINDOW_MS / 60_000 },
+        ),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
       if (pendingCount > 0) {
-        const queued = getResendEntries(sessionName);
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'queued',
-          pendingCount,
-          pendingMessages: queued.map((entry) => entry.text),
-          pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-          pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery_loop'),
+          { source: 'daemon', confidence: 'high' },
+        );
       }
       return false;
     }
     transportErrorRecoveryTimestamps.set(sessionName, [...recentRecoveries, now]);
 
     if (pendingCount > 0) {
-      const queued = getResendEntries(sessionName);
       const recoveryReason = providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST
         ? 'Provider connection lost'
         : 'Provider became stuck busy';
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⏳ ${recoveryReason} — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING,
+          `⏳ ${recoveryReason} — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
+          { count: pendingCount, detail: recoveryReason },
+        ),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', {
-        state: 'queued',
-        pendingCount,
-        pendingMessages: queued.map((entry) => entry.text),
-        pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-        pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery'),
+        { source: 'daemon', confidence: 'high' },
+      );
     }
 
-    await stopTransportRuntimeSession(sessionName).catch((err) => {
+    await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
       logger.warn({ err, sessionName }, 'Failed to stop errored transport runtime before auto-restart');
     });
 
@@ -1246,15 +1891,15 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
       // conversation instead of binding the same poisoned qwen session again.
       ...(record.agentType === 'qwen' ? { fresh: true } : {}),
-      ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+      ...(isClaudeCodeSdkAgentType(record.agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
+      ...(usesProviderResumeId(record.agentType) && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -1265,7 +1910,11 @@ async function recoverTransportRuntimeAfterError(
   })().catch((err) => {
     logger.error({ err, sessionName }, 'Transport auto-restart after error failed');
     timelineEmitter.emit(sessionName, 'assistant.text', {
-      text: `⚠️ Auto-restart failed: ${err instanceof Error ? err.message : String(err)}`,
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.TRANSPORT_AUTO_RESTART_FAILED,
+        `⚠️ Auto-restart failed: ${err instanceof Error ? err.message : String(err)}`,
+        { detail: err instanceof Error ? err.message : String(err) },
+      ),
       streaming: false,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high' });
@@ -1302,65 +1951,68 @@ async function recoverTransportRuntimeAfterError(
  * before dispatch, so the overlapping launch + provider-ready drains re-deliver
  * each entry at most once.
  */
+function clearTransportResendAuthorityRetry(sessionName: string): void {
+  const retry = transportResendAuthorityRetries.get(sessionName);
+  if (retry?.timer) clearTimeout(retry.timer);
+  transportResendAuthorityRetries.delete(sessionName);
+}
+
+function scheduleTransportResendAuthorityRetry(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+): void {
+  const fingerprint = getResendEntries(sessionName)
+    .map((entry) => entry.clientMessageId ?? entry.commandId)
+    .join('\n');
+  const existing = transportResendAuthorityRetries.get(sessionName);
+  if (existing && existing.fingerprint !== fingerprint) {
+    if (existing.timer) clearTimeout(existing.timer);
+    transportResendAuthorityRetries.delete(sessionName);
+  }
+  const current = transportResendAuthorityRetries.get(sessionName)
+    ?? { attempts: 0, timer: null, fingerprint };
+  if (current.timer || current.attempts >= TRANSPORT_RESEND_AUTHORITY_RETRY_LIMIT) return;
+  const attempts = current.attempts + 1;
+  const delayMs = Math.min(
+    TRANSPORT_RESEND_AUTHORITY_RETRY_BASE_MS * 2 ** (attempts - 1),
+    TRANSPORT_RESEND_AUTHORITY_RETRY_MAX_MS,
+  );
+  const timer = setTimeout(() => {
+    const state = transportResendAuthorityRetries.get(sessionName);
+    if (!state || state.timer !== timer) return;
+    state.timer = null;
+    void drainTransportResendQueueIntoRuntime(runtime, sessionName, 'authority-retry');
+  }, delayMs);
+  timer.unref?.();
+  transportResendAuthorityRetries.set(sessionName, { attempts, timer, fingerprint });
+}
+
 async function drainTransportResendQueueIntoRuntime(
   runtime: TransportSessionRuntime,
   sessionName: string,
-  context: 'reconnect' | 'launch' | 'provider-ready',
+  context: 'reconnect' | 'launch' | 'provider-ready' | 'explicit-dispatch' | 'authority-retry',
 ): Promise<void> {
   const pendingCount = getResendCount(sessionName);
-  if (pendingCount === 0) return;
+  if (pendingCount === 0) {
+    clearTransportResendAuthorityRetry(sessionName);
+    return;
+  }
   logger.info({ session: sessionName, pendingCount, context }, 'Draining transport resend queue');
   try {
     await drainResend(
       sessionName,
-      (entry) => {
+      async (entry, ownership) => {
+        const admission = resolveTransportQueueEntryAdmission(sessionName, entry);
+        if (admission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
+        if (admission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
         const attachments = entry.attachments ?? [];
-        const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
-        const result = entry.messagePreamble
-          ? (sharedMetadata
-              ? runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-                {
-                  ...sharedMetadata,
-                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                },
-              )
-              : runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-                {
-                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                },
-              ))
-          : (attachments.length > 0
-              ? (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, {
-                    ...sharedMetadata,
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })
-                  : runtime.send(entry.text, entry.commandId, attachments, undefined, {
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  }))
-              : (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, {
-                    ...sharedMetadata,
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })
-                  : runtime.send(entry.text, entry.commandId, undefined, undefined, {
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })));
-        if (result === 'sent' && !entry.timelineCommitted) {
+        const result = await deliverTransportResendEntry(runtime, entry, ownership);
+        if ((result === 'sent' || result === 'appended') && !entry.timelineCommitted) {
+          const clientMessageId = entry.clientMessageId;
+          if (!clientMessageId) {
+            logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend drain sent without clientMessageId; user.message projection skipped');
+            return result;
+          }
           timelineEmitter.emit(
             sessionName,
             'user.message',
@@ -1368,36 +2020,35 @@ async function drainTransportResendQueueIntoRuntime(
               text: entry.text,
               allowDuplicate: true,
               commandId: entry.commandId,
-              clientMessageId: entry.commandId,
+              clientMessageId,
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
-              ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+              // Resend delivers the expanded copy to the provider, so this
+              // user.message is the only place the alias anchor can land.
+              ...queuedUserMessageAttribution(entry),
             },
-            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
-        } else if (result === 'sent') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
+        } else if (result === 'sent' || result === 'appended') {
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
         } else if (result === 'queued') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'queued',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_resend_drain_queued'),
+            { source: 'daemon', confidence: 'high' },
+          );
         }
         return result;
       },
@@ -1413,7 +2064,11 @@ async function drainTransportResendQueueIntoRuntime(
           sessionName,
           'assistant.text',
           {
-            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            ...attachDaemonUserNotice(
+              DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED,
+              `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+              { count: expiredCount, minutes },
+            ),
             streaming: false,
             memoryExcluded: true,
           },
@@ -1425,27 +2080,265 @@ async function drainTransportResendQueueIntoRuntime(
           sessionName,
           'assistant.text',
           {
-            text: `⚠️ ${failedCount} 条排队消息重连后仍未能送达，已停止自动重发。请重新发送。`,
+            ...attachDaemonUserNotice(
+              DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_FAILED,
+              `⚠️ ${failedCount} 条排队消息重连后仍未能送达，已停止自动重发。请重新发送。`,
+              { count: failedCount },
+            ),
             streaming: false,
             memoryExcluded: true,
           },
           { source: 'daemon', confidence: 'high' },
         );
       },
+      ({ deliveryFacts }) => {
+        for (const fact of deliveryFacts) {
+          timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+            source: 'daemon',
+            confidence: 'high',
+          });
+        }
+      },
+      // The LIVE runtime's own identity, captured when it was constructed.
+      // Never read off the queued rows: that let a row authorise itself, so a
+      // same-named successor could drain the previous instance's work.
+      runtime.recipientIdentity ?? null,
     );
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(
+        sessionName,
+        runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        'transport_resend_drain_complete',
+      ),
+      { source: 'daemon', confidence: 'high' },
+    );
+    if (getResendCount(sessionName) > 0) {
+      scheduleTransportResendAuthorityRetry(runtime, sessionName);
+    } else {
+      clearTransportResendAuthorityRetry(sessionName);
+    }
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
+    if (getResendCount(sessionName) > 0) scheduleTransportResendAuthorityRetry(runtime, sessionName);
   }
 }
 
-function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
+/**
+ * Recover every durable queue holder only after the live runtime proves it may
+ * own the SQLite rows under this reusable session name. The proof also resumes
+ * the bounded legacy NULL-recipient migration. Keeping this sequence shared is
+ * security-critical: restore and relaunch must not diverge on ownership gates.
+ */
+async function recoverPersistedTransportQueue(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  context: 'reconnect' | 'launch',
+): Promise<number> {
+  const recipient = runtime.recipientIdentity;
+  const hadLegacyRows = getTransportQueueStore().hasLegacyRecipientRows(sessionName);
+  if (recipient && !runtime.adoptOrRebindQueueRecipient()) {
+    const discarded = runtime.discardDurableQueueStateForRecipientConflict();
+    logger.warn(
+      { session: sessionName, context, discarded },
+      'Transport queue recovery discarded stale recipient ownership instead of blocking session',
+    );
+  }
+  // An unexpired handoff may already have crossed the provider boundary in the
+  // previous process.  Reclaiming it eagerly on restart/upgrade replays old
+  // messages; leave it quarantined until its lease expires, when the durable
+  // queue can retry it under the same clientMessageId.
+  getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+  await drainTransportResendQueueIntoRuntime(runtime, sessionName, context);
+  // Launch historically relies on the resend holder and may contain queue rows
+  // whose ids are not represented identically in older resend records. Reading
+  // all already-owned rows again would duplicate them. Only the newly-adopted
+  // legacy case needs SQLite rehydrate on launch; reconnect always does.
+  const recoveredPending = context === 'reconnect'
+    || (recipient && (hadLegacyRows || runtime.queueRecipientRecoveryChanged))
+    ? runtime.rehydratePendingFromStore('startup')
+    : 0;
+  if (recoveredPending > 0) {
+    logger.info({ session: sessionName, recovered: recoveredPending, context }, 'Rehydrated queued transport messages from SQLite');
+    runtime.drainPendingIfIdle(`sqlite-${context}-rehydrate`);
+  }
+  return recoveredPending;
+}
+
+/** Drain control traffic that was deliberately persisted before delivery. */
+export async function drainTransportResendQueueForDispatch(sessionName: string): Promise<void> {
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime?.providerSessionId) return;
+  await drainTransportResendQueueIntoRuntime(runtime, sessionName, 'explicit-dispatch');
+}
+
+interface TransportSessionStatePayloadBuild {
+  /** Raw status mapped to the session-state vocabulary ('running' | 'idle' | 'error' | …). */
+  mapped: string;
+  /** `mapped` after the blocking-work override (idle with blocking work → running). */
+  effectiveState: string;
+  payload: Record<string, unknown>;
+  providerErrorMessage?: string;
+}
+
+/**
+ * Build the `session.state` timeline payload for a transport session's CURRENT
+ * runtime status. Shared between the live `onStatusChange` edge emitter and the
+ * server-link reconnect resync so both produce byte-identical authoritative
+ * payloads (`isAuthoritativeIdlePayloadShape` requires the exact idle field
+ * contract — see the pendingCount/pendingVersion alias note below).
+ */
+function buildTransportSessionStatePayload(
+  sessionName: string,
+  runtime: TransportSessionRuntime,
+  status: string,
+  decision: { decisionReason: string; clearSource: string; queueReason: string },
+): TransportSessionStatePayloadBuild {
+  const mapped = isWorkingSessionState(status) ? 'running' : status;
+  // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
+  // During running/streaming, command-handler's 'queued' event is the sole queue-update
+  // authority. This keeps queued messages visible in the UI until the drained turn completes.
+  const activity = runtime.getDiagnosticSnapshot();
+  const effectiveState = mapped === 'idle' && (activity.blockingWorkCount > 0 || activity.backgroundKeepsSessionRunning)
+    ? 'running'
+    : mapped;
+  const providerError = runtime.lastProviderError;
+  const payload: Record<string, unknown> = { state: effectiveState };
+  if (effectiveState === 'running') {
+    payload.activityGeneration = activity.activityGeneration;
+    payload.blockingWorkCount = activity.blockingWorkCount;
+    payload.activeWorkCount = activity.blockingWorkCount > 0
+      ? activity.blockingWorkCount
+      : (activity.backgroundKeepsSessionRunning ? activity.backgroundWorkCount : 0);
+    payload.activeToolCount = activity.activeToolCount;
+    payload.busyReasons = activity.busyReasons;
+    if (activity.capacityRetry) payload.capacityRetry = activity.capacityRetry;
+  }
+  if (effectiveState === 'idle') {
+    payload.authoritative = true;
+    payload.activityGeneration = activity.activityGeneration;
+    payload.blockingWorkCount = 0;
+    payload.activeWorkCount = 0;
+    payload.activeToolCount = 0;
+    payload.busyReasons = [];
+    payload.decisionReason = decision.decisionReason;
+    payload.clearInputs = [
+      { source: decision.clearSource, reason: 'clear', count: 0 },
+    ];
+    if (activity.completedTurn) {
+      payload[PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD] = activity.completedTurn;
+    }
+    const queuePayload = buildTransportQueueSnapshotPayload(sessionName, decision.queueReason);
+    Object.assign(payload, queuePayload);
+    // Canonical authoritative-idle contract fields. The shared validator
+    // (`isAuthoritativeIdlePayloadShape`) requires numeric `pendingCount` and
+    // `pendingVersion`; the queue snapshot only carries
+    // `pendingMessageVersion`/`pendingMessageEntries`, so without these two
+    // aliases the web demotes every daemon idle to a WEAK idle — and any
+    // unmatched tool.call in the timeline then keeps the session rendered
+    // "working" forever even though the reconciler proved clean idle
+    // (observed live on deck_sub_3l6z4l39).
+    payload.pendingCount = queuePayload.pendingMessageEntries.length;
+    payload.pendingVersion = queuePayload.pendingMessageVersion;
+  } else if (mapped === 'error' && providerError?.message) {
+    payload.error = providerError.message;
+  }
+  return {
+    mapped,
+    effectiveState,
+    payload,
+    ...(providerError?.message ? { providerErrorMessage: providerError.message } : {}),
+  };
+}
+
+/** Monotonic epoch so each reconnect resync gets its own stable eventId set. */
+let transportStateResyncEpoch = 0;
+
+/**
+ * Re-broadcast every live transport session's CURRENT authoritative
+ * `session.state` after the server link is restored.
+ *
+ * Why: live `timeline.event` messages are control-plane — `ServerLink.trySend`
+ * silently drops them while the socket is not OPEN, and there is no replay.
+ * A turn that settles during a link outage therefore emits its authoritative
+ * idle into a dead socket: the server (and every browser) keeps rendering the
+ * session as "working" forever, queued composer sends stay held, and no later
+ * event ever corrects it (observed live: deck_sub_26624c1t stuck "working"
+ * 23:46→01:43 while the daemon store/timeline were idle the whole time).
+ *
+ * The resync also re-pushes the session record through the persist callback so
+ * a store PUT lost in the same outage heals too. Payloads reuse the exact
+ * builder the live path uses, so authoritative-idle shape guarantees hold.
+ *
+ * `entries` is injectable for tests; production callers pass nothing.
+ */
+export function resyncTransportSessionStatesAfterLinkRestore(
+  entries?: ReadonlyArray<readonly [string, TransportSessionRuntime]>,
+): number {
+  const list = entries ?? [...transportRuntimes.entries()];
+  if (list.length === 0) return 0;
+  transportStateResyncEpoch += 1;
+  const epoch = transportStateResyncEpoch;
+  let emitted = 0;
+  for (const [sessionName, runtime] of list) {
+    try {
+      const built = buildTransportSessionStatePayload(sessionName, runtime, runtime.getStatus(), {
+        decisionReason: SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC,
+        clearSource: 'server-link-resync',
+        queueReason: 'server_link_resync',
+      });
+      // A resync RE-STATES what the daemon already knew; it is never a fresh
+      // completion, so it must never raise a push. Without this every link
+      // restore fanned one "Task complete" notification per idle session:
+      // observed live on the 43 deployment as ~90 dispatches inside 500ms,
+      // 276ms after four daemons re-authenticated following a gateway blip. The
+      // server's age guard cannot catch these because the events are newly
+      // minted (ts = now) even though the state they describe is old.
+      timelineEmitter.emit(sessionName, 'session.state', {
+        ...built.payload,
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-state-resync:${sessionName}:${epoch}`,
+      });
+      const record = getSession(sessionName);
+      if (record) emitSessionPersist(record, sessionName);
+      emitted += 1;
+    } catch (err) {
+      logger.warn({ err, session: sessionName }, 'transport session state resync failed');
+    }
+  }
+  logger.info({ sessions: emitted, epoch }, 'ServerLink resync: re-broadcast transport session states');
+  return emitted;
+}
+
+function wireTransportProviderReadyDrain(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+): void {
+  runtime.onProviderSessionReady = () => {
+    // The provider session just bound (initialize/reconnect completed). Drain
+    // any messages enqueued to resend while the runtime was not yet ready —
+    // notably Auto-Deliver prompts that took the resend path because
+    // `awaitTransportRuntime` raced the relaunch. Fire-and-forget: the launch/
+    // restore drains are the awaited ones; this is the mid-life safety net.
+    void drainTransportResendQueueIntoRuntime(runtime, sessionName, 'provider-ready');
+  };
+}
+
+function wireTransportCallbacks(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  options: { deferProviderReadyDrain?: boolean } = {},
+): void {
+  // The Brain delegation contract variant follows the session's supervision
+  // mode, read from the LIVE record on every turn -- never captured here -- so
+  // turning supervision off takes effect on the next turn without a restart.
+  runtime.setSupervisionSnapshotResolver(
+    () => extractSessionSupervisionSnapshot(getSession(sessionName)?.transportConfig ?? null),
+  );
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const persistTransportState = (state: unknown, error?: string): void => {
     if (state !== 'running' && state !== 'idle' && state !== 'error') return;
@@ -1469,65 +2362,53 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (status === 'thinking') {
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
-    const mapped = (status === 'streaming' || status === 'thinking' || status === 'tool_running') ? 'running' : status;
-    // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
-    // During running/streaming, command-handler's 'queued' event is the sole queue-update
-    // authority. This keeps queued messages visible in the UI until the drained turn completes.
-    const activity = runtime.getDiagnosticSnapshot();
-    const effectiveMapped = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
-    const providerError = runtime.lastProviderError;
-    persistTransportState(effectiveMapped, mapped === 'error' ? providerError?.message : undefined);
-    const payload: Record<string, unknown> = { state: effectiveMapped };
-    if (effectiveMapped === 'running') {
-      payload.activityGeneration = activity.activityGeneration;
-      payload.blockingWorkCount = activity.blockingWorkCount;
-      payload.activeWorkCount = activity.blockingWorkCount;
-      payload.activeToolCount = activity.activeToolCount;
-      payload.busyReasons = activity.busyReasons;
-    }
-    if (effectiveMapped === 'idle') {
-      payload.authoritative = true;
-      payload.activityGeneration = activity.activityGeneration;
-      payload.blockingWorkCount = 0;
-      payload.activeWorkCount = 0;
-      payload.activeToolCount = 0;
-      payload.busyReasons = [];
-      payload.decisionReason = 'activity_reconciler_clear';
-      payload.clearInputs = [
-        { source: 'transport-runtime', reason: 'clear', count: 0 },
-      ];
-      payload.pendingCount = runtime.pendingCount;
-      payload.pendingMessages = runtime.pendingMessages;
-      payload.pendingMessageEntries = runtime.pendingEntries;
-      payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
-      payload.pendingMessageVersion = payload.pendingVersion;
-    } else if (mapped === 'error' && providerError?.message) {
-      payload.error = providerError.message;
-    }
-    timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
+    const built = buildTransportSessionStatePayload(sessionName, runtime, status, {
+      decisionReason: 'activity_reconciler_clear',
+      clearSource: 'transport-runtime',
+      queueReason: 'transport_status_idle',
+    });
+    persistTransportState(built.effectiveState, built.mapped === 'error' ? built.providerErrorMessage : undefined);
+    timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {
       void recoverTransportRuntimeAfterError(sessionName, runtime);
     }
   };
+  // Show the capacity-retry notice once per episode and clear it when the turn goes through (payload.capacityRetry comes
+  // from the runtime's diagnostic snapshot, so an ended episode emits a state without it).
+  runtime.onCapacityRetryChange = () => {
+    const built = buildTransportSessionStatePayload(sessionName, runtime, runtime.getStatus(), {
+      decisionReason: 'activity_reconciler_clear',
+      clearSource: 'transport-runtime',
+      queueReason: 'transport_status_idle',
+    });
+    timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
+  };
   runtime.onDrain = (messages, merged, count, metadata) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
     // stale pre-drain snapshot can then never resurrect these entries.
     const drainedVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
     for (const entry of messages) {
+      const payload = {
+        text: entry.text,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        pendingMessageVersion: drainedVersion,
+        ...queuedUserMessageAttribution(entry),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          pendingMessageVersion: drainedVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
+      void appendTransportEvent(sessionName, {
+        type: 'user.message',
+        sessionId: sessionName,
+        ...payload,
+      });
     }
     if (messages.length === 0 && count === 0) {
       timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true, pendingMessageVersion: drainedVersion });
@@ -1537,25 +2418,57 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // leave the queue UI simultaneously. The runtime's pending queue is now [] (or
     // contains any NEW messages queued since drain started).
     persistTransportState('running');
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_drain', {
+        activityGeneration: metadata.activityGeneration,
+        drainMetadata: metadata,
+      }),
+      { source: 'daemon', confidence: 'high' },
+    );
+    });
+  };
+  runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);
+  runtime.onActiveAppend = (messages, snapshot) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
+    const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
+    for (const entry of messages) {
+      // Avoid a static cycle: supervision-automation owns runtimes through this
+      // module. The import resolves in the same process turn and only clears an
+      // already-queued intent after provider admission is authoritative.
+      void import('../daemon/supervision-automation.js').then(({ supervisionAutomation }) => {
+        supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      }).catch(() => {});
+      const payload = {
+        text: entry.text,
+        commandId: entry.clientMessageId,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        queueAppended: true,
+        pendingMessageVersion,
+        ...queuedUserMessageAttribution(entry),
+      };
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        payload,
+        { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
+      );
+      void appendTransportEvent(sessionName, {
+        type: 'user.message',
+        sessionId: sessionName,
+        ...payload,
+      });
+    }
+    persistTransportState('running');
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'running',
-      activityGeneration: metadata.activityGeneration,
-      drainMetadata: metadata,
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+      state: runtime.pendingCount > 0 ? 'queued' : 'running',
+      ...transportQueueSnapshotToPayload(snapshot),
     }, { source: 'daemon', confidence: 'high' });
+    });
   };
-  runtime.onProviderSessionReady = () => {
-    // The provider session just bound (initialize/reconnect completed). Drain
-    // any messages enqueued to resend while the runtime was not yet ready —
-    // notably Auto-Deliver prompts that took the resend path because
-    // `awaitTransportRuntime` raced the relaunch. Fire-and-forget: the launch/
-    // restore drains are the awaited ones; this is the mid-life safety net.
-    void drainTransportResendQueueIntoRuntime(runtime, sessionName, 'provider-ready');
-  };
+  if (!options.deferProviderReadyDrain) wireTransportProviderReadyDrain(runtime, sessionName);
   runtime.onStartupMemoryInjected = () => {
     const existing = getSession(sessionName);
     if (!existing) return;
@@ -1610,23 +2523,58 @@ function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpda
   return changed;
 }
 
-function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName: string, agentType: string): void {
+function agyNativeStartBarrier(runtime: TransportSessionRuntime, sessionName: string): () => Promise<void> {
+  return async () => {
+    const record = getSession(sessionName);
+    const owner = runtime.recipientIdentity;
+    if (!record || (owner && (record.sessionInstanceId !== owner.sessionInstanceId || record.runtimeEpoch !== owner.runtimeEpoch))
+      || record.providerSessionId !== runtime.providerSessionId) {
+      logger.warn({ session: sessionName, recordPresent: !!record,
+        instanceMatches: !!record && (!owner || record.sessionInstanceId === owner.sessionInstanceId),
+        epochMatches: !!record && (!owner || record.runtimeEpoch === owner.runtimeEpoch),
+        routeMatches: !!record && record.providerSessionId === runtime.providerSessionId,
+      }, 'AG native start owner guard rejected before native start');
+      throw agyNativeStartNotAttemptedError('AG start owner changed', PROVIDER_ERROR_CODES.CANCELLED);
+    }
+    await persistAgyNativeSessionStart(sessionName, { ...record }, () => transportRuntimes.get(sessionName) === runtime);
+  };
+}
+
+function wireTransportSessionInfo(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  agentType: string,
+  persistence?: {
+    canPersist(record: SessionRecord): boolean;
+    onPersisted?(record: SessionRecord): void;
+  },
+): () => SessionInfoUpdate | undefined {
+  let latestInfo: SessionInfoUpdate | undefined;
   runtime.onSessionInfoChange = (info) => {
     const existing = getSession(sessionName);
+    if (persistence && (!existing || !persistence.canPersist(existing))) return;
+    latestInfo = { ...(latestInfo ?? {}), ...info };
     if (!existing) return;
+    if (!persistence) {
+      const owner = runtime.recipientIdentity;
+      if (owner && (existing.sessionInstanceId !== owner.sessionInstanceId || existing.runtimeEpoch !== owner.runtimeEpoch)) return;
+      if (existing.agentType !== agentType) return;
+      if (runtime.providerSessionId && existing.providerSessionId !== runtime.providerSessionId) return;
+    }
     const next: SessionRecord = { ...existing };
     let changed = false;
 
     if (typeof info.resumeId === 'string' && info.resumeId) {
-      if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+      if (isClaudeCodeSdkAgentType(agentType) && next.ccSessionId !== info.resumeId) {
+        reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
         next.ccSessionId = info.resumeId;
         changed = true;
       }
-      if (agentType === 'codex-sdk' && next.codexSessionId !== info.resumeId) {
+      if (agentType === 'codex-sdk' && !isIncognitoSession(next) && next.codexSessionId !== info.resumeId) {
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') && next.providerResumeId !== info.resumeId) {
+      if (!isIncognitoSession(next) && usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -1638,14 +2586,20 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       }
     }
 
-    if (typeof info.model === 'string' && info.model) {
+    const presetSelectedModelIsAuthoritative = isClaudeCodeSdkAgentType(agentType)
+      && !!next.ccPreset
+      && !!next.requestedModel;
+    let modelChanged = false;
+    if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
       if (next.activeModel !== info.model) {
         next.activeModel = info.model;
         changed = true;
+        modelChanged = true;
       }
       if (next.modelDisplay !== info.model) {
         next.modelDisplay = info.model;
         changed = true;
+        modelChanged = true;
       }
     }
 
@@ -1669,6 +2623,24 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         effQuotaLabel = proactive.quotaLabel;
         effQuotaMeta = proactive.quotaMeta;
       }
+    } else if (agentType === 'agy-sdk') {
+      const proactive = peekAgyUsageQuotaCached();
+      if (proactive?.quotaMeta?.groups?.length) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
+    } else if (agentType === 'grok-sdk') {
+      const proactive = peekGrokUsageQuotaCached();
+      if (proactive?.quotaMeta) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
+    } else if (agentType === 'muse-code-sdk') {
+      const proactive = peekMuseUsageQuotaCached();
+      if (proactive?.quotaMeta) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
     }
 
     if (typeof effQuotaLabel === 'string' && effQuotaLabel && next.quotaLabel !== effQuotaLabel) {
@@ -1686,8 +2658,33 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
+    // THE CANONICAL LIMIT VERDICT, MERGED INTO THE SAME RECORD WE PERSIST.
+    //
+    // This MUST fold into `next`. `next` was snapshotted from the stored record
+    // at the top of this function, and the `upsertSession(next)` below writes
+    // it back whole -- so mutating the store separately here and letting the
+    // upsert follow would revert the limit we just recorded. That is not a
+    // theoretical ordering nit: Claude emits `quotaMeta` and `limitSignal` on
+    // the SAME `SessionInfoUpdate`, so the quota field guarantees `changed` is
+    // true and the very event reporting a refusal is the one whose write erases
+    // it. The store held the correct value for a moment, which is why nothing
+    // downstream noticed.
+    //
+    // `mergeProviderLimitSignal` shares its decision with the store's own
+    // mutator, so there is still exactly one rule for when a limit may be set
+    // or cleared. It reports whether the record actually changed, so a caller
+    // can notify once rather than on every repeated rate-limit event.
+    if (info.limitSignal && mergeProviderLimitSignal(next, info.limitSignal)) {
+      changed = true;
+    }
+
     if (typeof info.effort === 'string' && next.effort !== info.effort) {
       next.effort = info.effort;
+      changed = true;
+    }
+
+    if (typeof info.serviceTier === 'string' && next.serviceTier !== info.serviceTier) {
+      next.serviceTier = info.serviceTier;
       changed = true;
     }
 
@@ -1695,8 +2692,14 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
 
     if (!changed) return;
     upsertSession(next);
-    emitSessionPersist(next, sessionName);
+    const persisted = getSession(sessionName) ?? next;
+    persistence?.onPersisted?.(persisted);
+    emitSessionPersist(persisted, sessionName);
+    if (modelChanged) {
+      _onSessionInfoModelSync?.(sessionName);
+    }
   };
+  return () => latestInfo ? { ...latestInfo } : undefined;
 }
 
 /** providerSessionId → IM.codes sessionName routing map */
@@ -1771,11 +2774,43 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
   return transportRuntimes.get(name);
 }
 
+/** Persist and apply one fully-resolved identity contract without replacing history. */
+export function applyEffectiveSessionIdentity(
+  sessionName: string,
+  identityPrompt: string | undefined,
+  options: { refresh?: boolean } = {},
+): { applied: boolean; runtimeType?: 'process' | 'transport'; refreshPending?: boolean } {
+  const record = getSession(sessionName);
+  if (!record) return { applied: false };
+  const normalized = identityPrompt?.trim() || undefined;
+  // The text is not stored: the record keeps only the digest that says which identity this session runs with.
+  upsertSession({ ...record, appliedIdentityHash: identityPromptHash(normalized), updatedAt: Date.now() });
+  const runtime = transportRuntimes.get(sessionName);
+  if (!runtime) {
+    return { applied: true, runtimeType: 'process', refreshPending: true };
+  }
+  runtime.setIdentityPrompt(normalized);
+  if (options.refresh !== false) runtime.refreshIdentityPrompt();
+  return { applied: true, runtimeType: 'transport', refreshPending: false };
+}
+
 type RestoreOpenToolCall = {
   id: string;
   tool?: string;
-  activityGeneration?: unknown;
+  activityGeneration?: ActivityGenerationLike;
 };
+
+type RestoreOpenSdkSubagentCall = RestoreOpenToolCall & {
+  detail: SdkSubagentDetail;
+  key: string;
+  turnId?: string;
+};
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
 
 function readTransportToolCallId(event: Record<string, unknown>): string | null {
   for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
@@ -1804,7 +2839,7 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
       openTools.set(id, {
         id,
         ...(typeof event.tool === 'string' && event.tool.trim() ? { tool: event.tool.trim() } : {}),
-        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration } : {}),
+        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration as ActivityGenerationLike } : {}),
       });
     } else {
       openTools.delete(id);
@@ -1812,20 +2847,29 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
   }
   if (openTools.size === 0) return 0;
 
-  const activityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
   let closed = 0;
   for (const tool of openTools.values()) {
-    const payload: Record<string, unknown> = {
-      toolCallId: tool.id,
-      ...(tool.tool ? { tool: tool.tool } : {}),
+    const activityGeneration = tool.activityGeneration ?? fallbackActivityGeneration;
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
       terminalStatus: 'stale',
       terminalReason: 'daemon_restart_orphan',
       activityGeneration,
+      toolCallId: tool.id,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    const payload: Record<string, unknown> = {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
     };
     timelineEmitter.emit(sessionName, 'tool.result', payload, {
       source: 'daemon',
       confidence: 'high',
-      eventId: `transport-tool:${sessionName}:${tool.id}:daemon_restart_orphan`,
+      eventId: metadata.idempotencyKey,
     });
     await appendTransportEvent(sessionName, {
       type: 'tool.result',
@@ -1838,20 +2882,158 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
   return closed;
 }
 
+async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, runtime: TransportSessionRuntime): Promise<number> {
+  let events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  try {
+    const timelineEvents = await timelineStore.readByTypesPreferred(sessionName, ['tool.call', 'tool.result'], {
+      limit: TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT,
+    });
+    events = timelineEvents.map((event) => ({ type: event.type, payload: event.payload }));
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport restore sdk orphan reconcile could not read timeline history');
+    return 0;
+  }
+  if (events.length === 0) return 0;
+
+  const openSdk = new Map<string, RestoreOpenSdkSubagentCall>();
+  for (const event of events) {
+    const payload = record(event.payload);
+    if (!payload) continue;
+    const parsed = parseSdkSubagentDetail(payload.detail);
+    if (parsed.kind !== 'ok') continue;
+    const id = readTransportToolCallId(payload);
+    if (!id) continue;
+    const key = parsed.detail.meta.canonicalKey || id;
+    if (event.type === 'tool.call' && parsed.detail.meta.active && !parsed.detail.meta.terminal) {
+      openSdk.set(key, {
+        key,
+        id,
+        detail: parsed.detail,
+        ...(typeof payload.tool === 'string' && payload.tool.trim() ? { tool: payload.tool.trim() } : {}),
+        ...(payload.activityGeneration !== undefined ? { activityGeneration: payload.activityGeneration as ActivityGenerationLike } : {}),
+        ...(typeof payload.turnId === 'string' && payload.turnId.trim() ? { turnId: payload.turnId.trim() } : {}),
+      });
+    } else if (event.type === 'tool.result' || parsed.detail.meta.terminal) {
+      openSdk.delete(key);
+      openSdk.delete(id);
+    }
+  }
+  if (openSdk.size === 0) return 0;
+
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  let closed = 0;
+  for (const tool of openSdk.values()) {
+    const staleDetail = buildSdkSubagentSafeDetail({
+      ...tool.detail,
+      output: tool.detail.output ?? 'stale after daemon restart',
+      meta: {
+        ...tool.detail.meta,
+        normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+        rawStatus: 'daemon_restart_orphan',
+        active: false,
+        terminal: true,
+        diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+        ...(typeof tool.detail.meta.runningChildCount === 'number' ? { runningChildCount: 0 } : {}),
+      },
+    }, { allowRaw: false, sessionId: sessionName });
+    const itemKind = staleDetail.meta.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT
+      ? 'codex_collaboration'
+      : 'sdk_subagent';
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      activityGeneration: tool.activityGeneration ?? fallbackActivityGeneration,
+      toolCallId: tool.id,
+      ...(tool.turnId ? { turnId: tool.turnId } : {}),
+      itemKind,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    timelineEmitter.emit(sessionName, 'tool.result', {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
+      output: staleDetail.output,
+      detail: staleDetail,
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${sessionName}:${tool.id}:restore-orphan-result`,
+      hidden: true,
+    });
+    closed += 1;
+  }
+  logger.info({ sessionName, closed }, 'transport restore reconciled orphan sdk sub-agent rows');
+  return closed;
+}
+
 /**
  * Restore transport session runtimes for a specific provider.
  * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
  * Skips sessions that already have a runtime (rebuilt by oc-session-sync).
  */
+const transportSessionRestoreInFlight = new Map<string, Promise<void>>();
+
+function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
+  if (!isStoredTransportSession(record)
+    || (record.providerId ?? record.agentType) !== AGY_SDK_PROVIDER_ID
+    || isIncognitoSession(record)
+    || transportRuntimes.has(record.name)) {
+    return record;
+  }
+  const explicitModel = normalizeAgyModelId(record.requestedModel);
+  const targetActiveModel = explicitModel ?? AGY_DEFAULT_MODEL_ID;
+  if (record.requestedModel === explicitModel
+    && record.activeModel === targetActiveModel
+    && record.modelDisplay === targetActiveModel) {
+    return record;
+  }
+  const healed: SessionRecord = {
+    ...record,
+    requestedModel: explicitModel,
+    activeModel: targetActiveModel,
+    modelDisplay: targetActiveModel,
+  };
+  upsertSession(healed);
+  const persisted = getSession(healed.name) ?? healed;
+  emitSessionPersist(persisted, healed.name);
+  return persisted;
+}
+
 export async function restoreTransportSessions(
   providerId: string,
-  options: { onlyWithPendingResend?: boolean; concurrency?: number; interSessionDelayMs?: number } = {},
+  options: {
+    onlyWithPendingResend?: boolean;
+    sessionName?: string;
+    concurrency?: number;
+    interSessionDelayMs?: number;
+    /** Wait for the event loop to be healthy between two restores (the delay is then only the minimum gap). */
+    paceByEventLoopHealth?: boolean;
+  } = {},
 ): Promise<void> {
+  // Only the daemon owns transport runtimes. A helper process (MCP server, CLI)
+  // that restored them would open its own provider connection and drain the
+  // daemon's durable resend queue, racing the real owner.
+  if (isNonDaemonProcess()) {
+    logger.warn({ providerId, sessionName: options.sessionName }, 'restoreTransportSessions refused: this process is not the daemon');
+    return;
+  }
+  if (providerId === AGY_SDK_PROVIDER_ID) {
+    for (const record of storeSessions()) {
+      if (options.sessionName && record.name !== options.sessionName) continue;
+      healPersistedAgySessionModel(record);
+    }
+  }
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
+  const remoteSessionsByDirectory = new Map<string, Promise<RemoteSessionInfo[]>>();
   const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
     ? Math.trunc(options.concurrency!)
     : TRANSPORT_RESTORE_CONCURRENCY;
+  // One restore waits for event-loop health for at most this long in all (then only the floor between sessions applies).
+  const restorePaceBudget = options.paceByEventLoopHealth === true ? { leftMs: RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } : undefined;
   const restoreInterSessionDelayMs = Number.isFinite(options.interSessionDelayMs) && (options.interSessionDelayMs ?? -1) >= 0
     ? Math.trunc(options.interSessionDelayMs!)
     : TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS;
@@ -1866,14 +3048,145 @@ export async function restoreTransportSessions(
   // process; node:sqlite is synchronous so memory/context reads serialise on
   // the main thread anyway; every store write is keyed by session name.
   type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
+  type RestoreAuthority = {
+    agyNativeSessionState: string;
+    sessionInstanceId: string;
+    createdAt: number;
+    runtimeEpoch: string;
+    providerId: string;
+    agentType: string;
+    providerSessionId: string;
+    providerResumeId: string;
+    projectDirectory: string;
+    label: string;
+    requestedModel: string;
+    qwenModel: string;
+    ccPreset: string;
+    effort: string;
+    description: string;
+    qwenFreshOnResume: boolean;
+    transportConfig: string;
+  };
+  const buildRestoreAuthority = (record: SessionRecord): RestoreAuthority => ({
+    agyNativeSessionState: record.agyNativeSessionState ?? '',
+    sessionInstanceId: record.sessionInstanceId?.trim() ?? '',
+    createdAt: record.createdAt,
+    runtimeEpoch: record.runtimeEpoch?.trim() ?? '',
+    providerId: record.providerId ?? record.agentType,
+    agentType: record.agentType,
+    providerSessionId: record.providerSessionId?.trim() ?? '',
+    providerResumeId: record.providerResumeId?.trim() ?? '',
+    projectDirectory: canonicalizeTransportCwd(record.projectDir) ?? '',
+    label: record.label?.trim() ?? '',
+    requestedModel: record.requestedModel?.trim() ?? '',
+    qwenModel: record.qwenModel?.trim() ?? '',
+    ccPreset: record.ccPreset?.trim() ?? '',
+    effort: record.effort?.trim() ?? '',
+    description: record.description ?? '',
+    qwenFreshOnResume: record.qwenFreshOnResume === true,
+    transportConfig: JSON.stringify(record.transportConfig ?? null),
+  });
+  const matchesRestoreAuthority = (
+    current: SessionRecord,
+    expected: RestoreAuthority,
+  ): boolean => {
+    const actual = buildRestoreAuthority(current);
+    const sameLogicalInstance = expected.sessionInstanceId
+      ? actual.sessionInstanceId === expected.sessionInstanceId
+      : !actual.sessionInstanceId && actual.createdAt === expected.createdAt;
+    return sameLogicalInstance
+      && actual.runtimeEpoch === expected.runtimeEpoch
+      && actual.providerId === expected.providerId
+      && actual.agentType === expected.agentType
+      && actual.providerSessionId === expected.providerSessionId
+      && actual.providerResumeId === expected.providerResumeId
+      && actual.agyNativeSessionState === expected.agyNativeSessionState
+      && actual.projectDirectory === expected.projectDirectory
+      && actual.label === expected.label
+      && actual.requestedModel === expected.requestedModel
+      && actual.qwenModel === expected.qwenModel
+      && actual.ccPreset === expected.ccPreset
+      && actual.effort === expected.effort
+      && actual.description === expected.description
+      && actual.qwenFreshOnResume === expected.qwenFreshOnResume
+      && actual.transportConfig === expected.transportConfig;
+  };
+  const matchesRestoreRuntimeIdentity = (
+    current: SessionRecord,
+    expected: RestoreAuthority,
+  ): boolean => {
+    const actual = buildRestoreAuthority(current);
+    const sameLogicalInstance = expected.sessionInstanceId
+      ? actual.sessionInstanceId === expected.sessionInstanceId
+      : !actual.sessionInstanceId && actual.createdAt === expected.createdAt;
+    return sameLogicalInstance
+      && actual.runtimeEpoch === expected.runtimeEpoch
+      && actual.providerId === expected.providerId
+      && actual.agentType === expected.agentType
+      && actual.providerSessionId === expected.providerSessionId
+      && actual.projectDirectory === expected.projectDirectory;
+  };
   const pending = all.filter((s) =>
     isStoredTransportSession(s)
+    && !isIncognitoSession(s)
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
-    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0),
+    && (!options.sessionName || s.name === options.sessionName)
+    && (!options.onlyWithPendingResend
+      || getResendCount(s.name) > 0
+      || hasDurableTransportQueueEntries(s.name)
+      || hasPendingRestartContinuation(s.name)),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
+  // A permanent-by-construction failure (see transport-restore-backoff.ts):
+  // recorded so on-demand callers stop retrying it every few seconds, and
+  // warned once per backoff step rather than once per attempt.
+  const noteUnboundRestore = (s: Restorable, reason: TransportRestoreUnboundReason, message: string): void => {
+    const current = getSession(s.name);
+    if (!current) return;
+    const note = noteTransportRestoreUnbound(s.name, s.providerId, transportRestoreFingerprint(current), reason);
+    if (!note.logNow) return;
+    logger.warn({
+      session: s.name,
+      providerId: s.providerId,
+      backoffStep: note.attempts,
+      nextRetryInMs: note.retryInMs,
+    }, message);
+  };
   const restoreOne = async (s: Restorable, index: number): Promise<void> => {
-    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs);
+    let expectedAuthority = buildRestoreAuthority(s);
+    let restoreCommitted = false;
+    let providerRestoreDirectory: string | undefined;
+    const refreshRestoreAuthority = (record: SessionRecord): void => {
+      expectedAuthority = buildRestoreAuthority(record);
+    };
+    const rejectStaleRestoreInstance = (stage: string): boolean => {
+      const current = getSession(s.name);
+      const pending = transportSessionRestoreInFlight.get(s.name);
+      if (current && matchesRestoreAuthority(current, expectedAuthority)
+        && !(s.providerId === AGY_SDK_PROVIDER_ID && pending && cancelledTransportStarts.has(pending))) return false;
+      logger.warn({
+        session: s.name,
+        providerId: s.providerId,
+        stage,
+      }, 'Transport restore stopped because the session authority changed');
+      return true;
+    };
+    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs, restorePaceBudget);
+    if (rejectStaleRestoreInstance('restore_start')) return;
+    const latestPersistedResumeId = getSession(s.name)?.providerResumeId?.trim()
+      || s.providerResumeId?.trim();
+    if (latestPersistedResumeId) {
+      const owners = storedProviderResumeIdOwners(s.providerId, latestPersistedResumeId);
+      if (owners.length !== 1 || owners[0] !== s.name) {
+        logger.warn({
+          session: s.name,
+          providerId: s.providerId,
+          conflictingSessions: owners,
+        }, 'Transport restore refused a provider resume id owned by multiple local sessions');
+        return;
+      }
+      s.providerResumeId = latestPersistedResumeId;
+    }
     const existingRuntime = transportRuntimes.get(s.name);
     if (existingRuntime?.providerSessionId) return; // already rebuilt by oc-sync / warm restore
     if (existingRuntime) {
@@ -1881,62 +3194,246 @@ export async function restoreTransportSessions(
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
       }
-      await stopTransportRuntimeSession(s.name).catch((err) => {
+      await detachTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
         logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
       });
+      if (rejectStaleRestoreInstance('after_existing_runtime_stop')) return;
     }
     try {
       const provider = getProvider(s.providerId);
       if (!provider) return;
+      const unusedAgy = s.providerId === AGY_SDK_PROVIDER_ID
+        && s.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.UNSTARTED;
+      if (usesProviderResumeId(s.providerId) && !s.providerResumeId && !unusedAgy) {
+        if (!provider.listSessions) {
+          noteUnboundRestore(s, 'provider_cannot_list_sessions', 'Transport restore requires a durable provider id but the provider cannot list sessions');
+          return;
+        }
+        const directoryScopedListing = usesDirectoryScopedSessionListing(s.providerId);
+        const expectedDirectory = directoryScopedListing
+          ? canonicalizeTransportCwd(s.projectDir)
+          : undefined;
+        if (directoryScopedListing && !expectedDirectory?.trim()) {
+          noteUnboundRestore(s, 'project_directory_required', 'Transport restore requires a valid project directory for provider session discovery');
+          return;
+        }
+        const queryDirectories: Array<string | undefined> = directoryScopedListing
+          ? [...new Set([
+            expectedDirectory,
+            normalizeTransportCwd(s.projectDir),
+          ].filter((directory): directory is string => !!directory))]
+          : [undefined];
+        const remoteSessions: RemoteSessionInfo[] = [];
+        for (const queryDirectory of queryDirectories) {
+          const cacheKey = queryDirectory ?? '';
+          let listedSessions: RemoteSessionInfo[] | undefined;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            let remoteSessionsPromise = remoteSessionsByDirectory.get(cacheKey);
+            if (!remoteSessionsPromise) {
+              remoteSessionsPromise = provider.listSessions(
+                queryDirectory ? { directory: queryDirectory } : undefined,
+              );
+              remoteSessionsByDirectory.set(cacheKey, remoteSessionsPromise);
+            }
+            try {
+              listedSessions = await remoteSessionsPromise;
+              break;
+            } catch (error) {
+              if (remoteSessionsByDirectory.get(cacheKey) === remoteSessionsPromise) {
+                remoteSessionsByDirectory.delete(cacheKey);
+              }
+              if (attempt === 1) throw error;
+            }
+          }
+          if (listedSessions) remoteSessions.push(...listedSessions);
+        }
+        if (rejectStaleRestoreInstance('after_provider_session_list')) return;
+        const recoveredResumeId = findLegacyProviderResumeId(
+          s,
+          remoteSessions,
+          expectedDirectory,
+        );
+        if (!recoveredResumeId) {
+          logger.warn({
+            session: s.name,
+            providerId: s.providerId,
+            label: s.label,
+          }, 'Transport restore could not identify one exact legacy provider session; refusing to start a fresh conversation');
+          return;
+        }
+        providerRestoreDirectory = remoteSessions.find((session) => (
+          session.key === recoveredResumeId
+          && canonicalizeTransportCwd(session.directory) === expectedDirectory
+        ))?.directory?.trim();
+        const current = getSession(s.name);
+        if (!current || rejectStaleRestoreInstance('before_provider_resume_reservation')) return;
+        const currentResumeId = current.providerResumeId?.trim();
+        if (currentResumeId && currentResumeId !== recoveredResumeId) {
+          logger.warn({
+            session: s.name,
+            providerId: s.providerId,
+          }, 'Transport restore refused to replace a concurrently persisted provider resume id');
+          return;
+        }
+        if (currentResumeId) {
+          const currentOwners = storedProviderResumeIdOwners(s.providerId, currentResumeId);
+          if (currentOwners.length !== 1 || currentOwners[0] !== s.name) {
+            logger.warn({
+              session: s.name,
+              providerId: s.providerId,
+              conflictingSessions: currentOwners,
+            }, 'Transport restore refused a concurrently persisted provider resume id with conflicting ownership');
+            return;
+          }
+        }
+        if (!currentResumeId) {
+          const legacyClaimants = storeSessions()
+            .filter((record) => (
+              isStoredTransportSession(record)
+              && (record.providerId ?? record.agentType) === s.providerId
+              && !record.providerResumeId?.trim()
+            ))
+            .filter((record) => findLegacyProviderResumeId(
+              record,
+              remoteSessions,
+              usesDirectoryScopedSessionListing(s.providerId)
+                ? record.projectDir
+                : undefined,
+            ) === recoveredResumeId)
+            .map((record) => record.name);
+          if (legacyClaimants.length !== 1 || legacyClaimants[0] !== s.name) {
+            logger.warn({
+              session: s.name,
+              providerId: s.providerId,
+              competingSessions: legacyClaimants,
+            }, 'Transport restore found multiple local legacy sessions claiming one provider conversation');
+            return;
+          }
+          const existingOwners = storedProviderResumeIdOwners(s.providerId, recoveredResumeId);
+          if (existingOwners.some((owner) => owner !== s.name)) {
+            logger.warn({
+              session: s.name,
+              providerId: s.providerId,
+              conflictingSessions: existingOwners,
+            }, 'Transport restore refused a provider conversation already owned by another local session');
+            return;
+          }
+          const recoveredRecord = {
+            ...current,
+            providerResumeId: recoveredResumeId,
+            updatedAt: Date.now(),
+          };
+          upsertSession(recoveredRecord);
+          const persistedRecoveredRecord = getSession(s.name) ?? recoveredRecord;
+          refreshRestoreAuthority(persistedRecoveredRecord);
+          emitSessionPersist(persistedRecoveredRecord, s.name);
+        }
+        s.providerResumeId = recoveredResumeId;
+      }
       let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-      } else if (s.providerId === 'claude-code-sdk' && requestedTransportModel) {
+      } else if (isClaudeCodeSdkAgentType(s.providerId) && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
         // SDK sees it — symmetric with the model-change path (command-handler) and the
         // codex branch above. Without this, a restored session passed the raw alias and
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
+      } else if (s.providerId === AGY_SDK_PROVIDER_ID) {
+        requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
       }
-      const runtime = new TransportSessionRuntime(provider, s.name);
-      wireTransportCallbacks(runtime, s.name);
-      wireTransportSessionInfo(runtime, s.name, s.agentType);
+      const runtime = new TransportSessionRuntime(
+        provider,
+        s.name,
+        recipientFromSessionRecord(s),
+        { sessionCreatedAt: s.createdAt },
+      );
+      // initialize emits provider-ready before returning. A restore has not
+      // won its final authority check at that point, so defer resend drain
+      // until the runtime is committed below.
+      wireTransportCallbacks(runtime, s.name, { deferProviderReadyDrain: true });
+      const getLatestSessionInfo = wireTransportSessionInfo(runtime, s.name, s.agentType, {
+        canPersist: (record) => {
+          if (s.providerId === AGY_SDK_PROVIDER_ID) {
+            const pending = transportSessionRestoreInFlight.get(s.name);
+            if ((pending && cancelledTransportStarts.has(pending))
+              || (restoreCommitted && transportRuntimes.get(s.name) !== runtime)) return false;
+          }
+          return restoreCommitted
+            ? matchesRestoreRuntimeIdentity(record, expectedAuthority)
+            : matchesRestoreAuthority(record, expectedAuthority);
+        },
+        onPersisted: refreshRestoreAuthority,
+      });
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
+      // A codex session persisted as 'running' is RESUMED, not replaced: a restart
+      // during a turn used to discard the whole conversation for a fresh thread.
+      // A thread that genuinely cannot continue is handled where that is known --
+      // the provider replaces it on an active-writer conflict and on unreadable or
+      // never-materialized history -- and the restored runtime still settles idle.
+      const freshQoderRestore = s.providerId === 'qoder-sdk';
+      const freshOnRestore = freshAfterCancel || freshQoderRestore;
+      const needsEphemeralRouteKey = isClaudeCodeSdkAgentType(s.providerId)
         || s.providerId === 'codex-sdk'
-        || s.providerId === 'cursor-headless'
-        || s.providerId === 'copilot-sdk'
-        || s.providerId === 'kimi-sdk';
-      const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
-      const resumeId = s.providerId === 'claude-code-sdk'
+        || s.providerId === 'qoder-sdk'
+        || usesProviderResumeId(s.providerId);
+      const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
+      const resumeId = isClaudeCodeSdkAgentType(s.providerId)
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
-          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
+          : usesProviderResumeId(s.providerId)
             ? s.providerResumeId
             : undefined;
+      const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true;
+      if (freshQoderRestore) {
+        logger.info({
+          session: s.name,
+          providerId: s.providerId,
+          previousProviderSessionId: s.providerSessionId,
+        }, 'Qoder SDK durable resume is unproven; restoring with a fresh provider route');
+      }
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
-      const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+      let availableCodexModels: string[] | undefined;
+      let dshLlmConfig: DshLlmConfig | undefined;
+      let piLlmConfig: PiLlmConfig | undefined;
+      const boundServerId = await loadBoundServerIdForManagedMcp();
+      const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
+      const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
+        sessionId: s.name,
+        providerId: provider.id,
+        serverId: boundServerId,
+        trustedOwnerId: capabilityOwnerId,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
+        ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
       });
-      const contextBootstrap = await resolveRuntimeContextBootstrap();
-      runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
-      if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
+      const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(s.name, resolveRuntimeContextBootstrap);
+      runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+      if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
+      if (isClaudeCodeSdkAgentType(s.providerId) && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-        extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
-        const presetOverrides = await getPresetTransportOverrides(s.ccPreset);
+        extraEnv = await resolvePresetEnv(
+          s.ccPreset,
+          s.ccSessionId ?? undefined,
+          effectiveRequestedModel,
+        );
+        const presetOverrides = await getPresetTransportOverrides(
+          s.ccPreset,
+          effectiveRequestedModel,
+        );
         if (!effectiveRequestedModel && presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
+        restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
         systemPrompt = presetOverrides.systemPrompt;
       } else if (s.providerId === 'qwen' && s.ccPreset) {
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
@@ -1955,24 +3452,83 @@ export async function restoreTransportSessions(
         // preset's runtime-facts prompt — without this, the model introduces
         // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'deepseek-harness' && s.ccPreset) {
+        const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getDshPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        dshLlmConfig = presetConfig.llm;
+        const presetPreferredModel = presetConfig.model;
+        if (presetPreferredModel) effectiveRequestedModel = presetPreferredModel;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'codex-sdk' && s.ccPreset) {
+        const applied = await applyCodexPresetConfig({
+          ccPreset: s.ccPreset,
+          requestedModel: effectiveRequestedModel,
+          env: extraEnv,
+          contextWindow: restoredPresetContextWindow,
+          systemPrompt,
+          settings: transportSettings,
+        });
+        extraEnv = applied.env;
+        effectiveRequestedModel = applied.model;
+        restoredPresetContextWindow = applied.contextWindow;
+        systemPrompt = applied.systemPrompt;
+        availableCodexModels = applied.availableModels;
+        transportSettings = applied.settings;
+      } else if (s.providerId === 'pi' && s.ccPreset) {
+        const { getPiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getPiPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        piLlmConfig = presetConfig.piLlm;
+        if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
         && !s.ccPreset
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
-      const boundServerId = await loadBoundServerIdForManagedMcp();
+      if (rejectStaleRestoreInstance('before_runtime_initialize')) {
+        await runtime.kill({ detachProviderSession: true }).catch(() => {});
+        return;
+      }
+      const restoreAuthContext = await resolveLaunchAuthContext(provider.id, extraEnv);
+      // The persisted identity is the startup sweep's ownership authority.
+      // Omitting it makes `agentResourceOwner()` return null, so a restored
+      // per-session provider registers no AGENT lease — and after a daemon
+      // crash the original orphan leak comes straight back. The fresh-launch
+      // path already passes all three fields; restore silently passed one.
+      //
+      // Read the LIVE record rather than the captured `s`: the authority check
+      // immediately above has just confirmed the live record still matches the
+      // expected restore authority, so this is the identity that will own the
+      // process we are about to start.
+      const restoreIdentity = getSession(s.name) ?? s;
+      const restoredSessionInstanceId = restoreIdentity.sessionInstanceId?.trim();
+      const restoredRuntimeEpoch = s.providerId === AGY_SDK_PROVIDER_ID
+        ? randomUUID() : restoreIdentity.runtimeEpoch?.trim();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         sessionName: s.name,
+        ...(restoredSessionInstanceId ? { sessionInstanceId: restoredSessionInstanceId } : {}),
+        ...(restoredRuntimeEpoch ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         projectName: s.projectName,
         serverId: boundServerId,
-        bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
-        skipCreate: !freshAfterCancel && !!s.providerSessionId,
-        env: buildTransportSessionEnv(s.name, s.label, extraEnv),
-        cwd: s.projectDir,
+        providerId: provider.id,
+        fresh: freshOnRestore,
+        bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
+        skipCreate: !freshOnRestore && !!s.providerSessionId,
+        env: buildTransportSessionEnv(s.name, s.label, { ...(extraEnv ?? {}), ...(restoreAuthContext?.env ?? {}) }, provider.id),
+        authContext: restoreAuthContext,
+        // Directory-scoped providers may persist a symlinked path spelling.
+        // Reuse the provider's authoritative spelling for the resume RPC while
+        // keeping the local projectDir unchanged for product configuration.
+        cwd: providerRestoreDirectory ?? s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
+        identityPrompt: await resolveEffectiveIdentityPrompt(s),
         // User-authored systemPrompt only; the IM.codes identity block and
         // Generated Image Reporting protocol are injected at the assembly
         // layer (peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`) via
@@ -1988,26 +3544,57 @@ export async function restoreTransportSessions(
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         agentId: effectiveRequestedModel,
+        ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
+        ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         resumeId,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, s.name) } : {}),
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
         // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
         // conversation already has its history preamble and we must not repeat it.
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
-      if (s.description) runtime.setDescription(s.description);
+      if (rejectStaleRestoreInstance('after_runtime_initialize')) {
+        await runtime.kill({ detachProviderSession: true }).catch((err) => {
+          logger.warn({ err, session: s.name }, 'Failed to clean up stale initialized transport runtime');
+        });
+        return;
+      }
+      const currentForFinalize = getSession(s.name);
+      if (!currentForFinalize || !matchesRestoreAuthority(currentForFinalize, expectedAuthority)) {
+        await runtime.kill({ detachProviderSession: true }).catch((err) => {
+          logger.warn({ err, session: s.name }, 'Failed to clean up transport runtime after final authority check');
+        });
+        return;
+      }
+      const latestSessionInfo = getLatestSessionInfo();
+      if (currentForFinalize.description) runtime.setDescription(currentForFinalize.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
-      runtime.setSessionIdentity(s.name, s.label);
+      runtime.setSessionIdentity(s.name, currentForFinalize.label, currentForFinalize.role);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
-      if (s.effort) runtime.setEffort(s.effort);
+      if (currentForFinalize.effort) runtime.setEffort(currentForFinalize.effort);
+      // AG's first native spawn is fenced by the persisted epoch. Bind the
+      // old queue owner before rotating, then move it to the committed epoch.
+      if (s.providerId === AGY_SDK_PROVIDER_ID && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) {
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
       const restoredRecord: SessionRecord = {
-        ...s,
+        ...currentForFinalize,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         state: 'idle',
         updatedAt: Date.now(),
-        ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
+        ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
+        ...(freshQoderRestore
+          ? { providerResumeId: undefined }
+          : {}),
+        ...(!freshQoderRestore && usesProviderResumeId(s.providerId) && latestSessionInfo?.resumeId
+          ? { providerResumeId: latestSessionInfo.resumeId }
+          : {}),
+        ...((freshOnRestore || currentForFinalize.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
           : {}),
         contextNamespace: contextBootstrap.namespace,
@@ -2016,43 +3603,58 @@ export async function restoreTransportSessions(
         contextLocalProcessedFreshness: contextBootstrap.localProcessedFreshness,
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
-        requestedModel: effectiveRequestedModel ?? s.requestedModel,
-        activeModel: effectiveRequestedModel ?? s.activeModel ?? s.modelDisplay,
-        modelDisplay: effectiveRequestedModel ?? s.modelDisplay,
-        // Preserve transportConfig exactly via ...s spread — never force `{}` which
+        requestedModel: effectiveRequestedModel ?? currentForFinalize.requestedModel,
+        activeModel: effectiveRequestedModel ?? currentForFinalize.activeModel ?? currentForFinalize.modelDisplay,
+        modelDisplay: effectiveRequestedModel ?? currentForFinalize.modelDisplay,
+        // Preserve transportConfig exactly via ...currentForFinalize spread —
+        // never force `{}` which
         // would wipe user-set supervision settings on every daemon restart.
-        ...(effectiveRequestedModel && s.providerId === 'qwen' ? { qwenModel: effectiveRequestedModel } : {}),
+        ...(effectiveRequestedModel && currentForFinalize.providerId === 'qwen' ? { qwenModel: effectiveRequestedModel } : {}),
         // When a qwen preset is active we're running `qwen --auth-type anthropic`
         // against a user-provided API key (BYO tier). The user-level
         // `~/.qwen/settings.json` tier labels ("Free", "No longer available")
         // are misleading in that context, so override them for preset sessions.
-        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
+        qwenAuthType: (currentForFinalize.providerId === 'qwen' && currentForFinalize.ccPreset && qwenPresetUsesApiKey)
           ? QWEN_AUTH_TYPES.API_KEY
-          : (qwenRuntime?.authType ?? s.qwenAuthType),
-        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
+          : (qwenRuntime?.authType ?? currentForFinalize.qwenAuthType),
+        qwenAuthLimit: (currentForFinalize.providerId === 'qwen' && currentForFinalize.ccPreset && qwenPresetUsesApiKey)
           ? undefined
-          : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
+          : (qwenRuntime?.authLimit ?? currentForFinalize.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
         ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
-          authType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
+          authType: (currentForFinalize.providerId === 'qwen' && currentForFinalize.ccPreset && qwenPresetUsesApiKey)
             ? QWEN_AUTH_TYPES.API_KEY
-            : (qwenRuntime?.authType ?? s.qwenAuthType),
-          authLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
+            : (qwenRuntime?.authType ?? currentForFinalize.qwenAuthType),
+          authLimit: (currentForFinalize.providerId === 'qwen' && currentForFinalize.ccPreset && qwenPresetUsesApiKey)
             ? undefined
-            : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
-          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
+            : (qwenRuntime?.authLimit ?? currentForFinalize.qwenAuthLimit),
+          quotaUsageLabel: (currentForFinalize.providerId === 'qwen' && currentForFinalize.ccPreset && qwenPresetUsesApiKey)
             ? undefined
-            : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
+            : ((qwenRuntime?.authType ?? currentForFinalize.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
       };
       upsertSession(restoredRecord);
-      emitSessionPersist(restoredRecord, s.name);
+      const persistedRestoredRecord = getSession(s.name) ?? restoredRecord;
+      const oldRecipient = runtime.recipientIdentity;
+      const newRecipient = recipientFromSessionRecord(persistedRestoredRecord);
+      if (s.providerId === AGY_SDK_PROVIDER_ID && oldRecipient && newRecipient
+        && !runtime.rebindQueueRecipient(oldRecipient, newRecipient)) {
+        transportRuntimes.delete(s.name); unregisterProviderRoute(actualProviderSid);
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
+      refreshRestoreAuthority(persistedRestoredRecord);
+      restoreCommitted = true;
+      emitTransportSessionRestored(s.name);
+      emitSessionPersist(persistedRestoredRecord, s.name);
+      wireTransportProviderReadyDrain(runtime, s.name);
       await reconcileTransportRestoreOrphanTools(s.name, runtime);
+      await reconcileTimelineRestoreOrphanSdkSubagents(s.name, runtime);
       const restoredActivity = runtime.getDiagnosticSnapshot();
-      timelineEmitter.emit(s.name, 'session.state', {
-        state: 'idle',
+      timelineEmitter.emit(s.name, 'session.state', buildTransportQueueSessionStatePayload(s.name, 'idle', 'restore_reconnect_observed', {
         activityGeneration: restoredActivity.activityGeneration,
         blockingWorkCount: restoredActivity.blockingWorkCount,
         activeWorkCount: restoredActivity.blockingWorkCount,
@@ -2060,13 +3662,13 @@ export async function restoreTransportSessions(
         busyReasons: restoredActivity.busyReasons,
         decisionReason: 'restore_reconnect_observed',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: runtime.pendingCount,
-        pendingMessages: runtime.pendingMessages,
-        pendingMessageEntries: runtime.pendingEntries,
-        pendingVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-        pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-      }, { source: 'daemon', confidence: 'high' });
-      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
+      }), { source: 'daemon', confidence: 'high' });
+      logger.info({
+        session: s.name,
+        providerId: s.providerId,
+        providerSid: s.providerSessionId,
+        freshAfterCancel,
+      }, 'Restored transport session runtime');
 
       // Drain messages that arrived while the provider was offline. The
       // enqueue path deliberately did NOT emit a user.message event (the
@@ -2089,7 +3691,32 @@ export async function restoreTransportSessions(
       // `transportRuntimes.set` and `drainResend`, which WOULD reintroduce
       // a real race window letting msg-2 arrive at `handleSend` while
       // `_sending` is still false.
-      await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
+      // Reclaim ONLY leases inherited from the dead daemon process, before this
+      // restore creates any new handoffs of its own.
+      try {
+        await recoverPersistedTransportQueue(runtime, s.name, 'reconnect');
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to recover transport queue after restart');
+      }
+      try {
+        const cont = await dispatchTransportRestartContinuation({
+          preRestoreSession: s,
+          currentSession: getSession(s.name) ?? persistedRestoredRecord,
+          runtime,
+          getResendCount,
+          hasQueuedDurableEntries: (name) => getTransportQueueStore().hasQueuedEntries(name),
+          emitUserMessage: (name, commandId) =>
+            emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'transport'),
+        });
+        if (cont.dispatched) {
+          logger.info(
+            { session: s.name, commandId: cont.commandId, reason: cont.reason },
+            'Dispatched automatic restart continue for transport session',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to dispatch restart continuation after restore');
+      }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
@@ -2102,7 +3729,23 @@ export async function restoreTransportSessions(
     concurrency: restoreConcurrency,
     interSessionDelayMs: restoreInterSessionDelayMs,
   }, 'Restoring transport session runtimes');
-  await mapWithConcurrency(pending, restoreConcurrency, restoreOne);
+  const restoreOneCoalesced = async (session: Restorable, index: number): Promise<void> => {
+    const existing = transportSessionRestoreInFlight.get(session.name);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const restore = restoreOne(session, index);
+    transportSessionRestoreInFlight.set(session.name, restore);
+    try {
+      await restore;
+    } finally {
+      if (transportSessionRestoreInFlight.get(session.name) === restore) {
+        transportSessionRestoreInFlight.delete(session.name);
+      }
+    }
+  };
+  await mapWithConcurrency(pending, restoreConcurrency, restoreOneCoalesced);
   logger.info({ providerId, count: pending.length }, 'Transport session runtime restore completed');
 }
 
@@ -2121,17 +3764,49 @@ export async function restoreTransportSessions(
  */
 const transportLaunchInFlight = new Map<string, Promise<void>>();
 
+/** How long a launch waits on an earlier in-flight launch of the same session before giving up. */
+export const DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = 45_000;
+export function getTransportLaunchInFlightWaitMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS',
+    DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS,
+    50,
+    10 * 60_000,
+    { allowZero: false },
+  );
+}
+
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name } = opts;
+  // Every fresh launch outside an owning relaunchSessionWithSettings supersedes
+  // any in-flight async handoff pack so `/clear` never resurrects stale context.
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(name);
+  }
+  // A (re)launch is an explicit session change: forget any restore backoff.
+  clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
-    await inFlight.catch(() => {});
+    // A wedged earlier launch must not hold every later launch of this session forever: wait a
+    // bounded time, then fail loudly so the caller (and the user) sees why nothing started.
+    const waitMs = getTransportLaunchInFlightWaitMs();
+    const outcome = await withTimeoutOutcome(inFlight.catch(() => {}), waitMs);
+    if (outcome.timedOut) {
+      incrementCounter('transport.launch.inflight_wait_timeout');
+      logger.warn({ sessionName: name, waitMs }, 'previous transport launch is still in progress; giving up waiting for it');
+      throw new Error(`Session ${name} is still starting from an earlier launch (no result after ${Math.round(waitMs / 1000)}s); try again once it settles or restart the daemon`);
+    }
     // A non-fresh caller only needs the session up: if the prior launch
     // registered a runtime, we're done. A fresh caller must proceed (it
     // intentionally tears down + recreates).
     if (!opts.fresh && transportRuntimes.has(name)) return;
   }
-  const launch = launchTransportSessionInner(opts);
+  const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
+  if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
+  if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
+  opts = { ...opts, ...(incognito ? { incognito: true } : {}) };
+  setSessionIncognito(name, incognito);
+  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts));
   const tracked = launch.then(() => {}, () => {});
   transportLaunchInFlight.set(name, tracked);
   try {
@@ -2144,13 +3819,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
-  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
-  const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
-    && existing?.agentType === 'claude-code'
-    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
-    && typeof inheritedClaudeResumeId === 'string'
-    && inheritedClaudeResumeId.length > 0;
-
+  // A fresh launch is an explicit replacement. Remove the old runtime before
+  // any asynchronous identity/resource work so callers never observe stale
+  // runtime state while the replacement is starting.
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
     if (existingRuntime) {
@@ -2164,12 +3835,62 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       }
     }
   }
+  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
+  // that carries none -- derives it from the identity store, the same as a restore.
+  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
+  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
+  if (opts.fresh || !existing) clearSummarySyncHistory(name);
+  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
+  const shouldResumeClaudeCliConversation = isClaudeCodeSdkAgentType(agentType)
+    && existing?.agentType === 'claude-code'
+    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
+    && typeof inheritedClaudeResumeId === 'string'
+    && inheritedClaudeResumeId.length > 0;
+
+  if (existing && !transportRuntimes.has(name)) {
+    // Only a non-fresh relaunch of the same agent resumes the same provider
+    // thread (codex-sdk keeps it loaded; its hosted MCP must survive). A fresh
+    // reset or an agent switch abandons that thread, so its hosted MCP -- of
+    // any earlier epoch -- is reaped here instead of leaking.
+    const previousResources = await releaseSessionChildResources(existing, {
+      providerThreadContinues: !opts.fresh && existing.agentType === agentType,
+    });
+    if (previousResources.failed > 0) {
+      throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
+    }
+  }
 
   const provider = await ensureProviderConnected(agentType, {});
 
-  const runtime = new TransportSessionRuntime(provider, name);
-  wireTransportCallbacks(runtime, name);
-  wireTransportSessionInfo(runtime, name, agentType);
+  const launchRecord = getSession(name);
+  const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
+    sessionInstanceId: resourceSessionInstanceId,
+    runtimeEpoch: resourceRuntimeEpoch,
+  };
+  const runtime = new TransportSessionRuntime(
+    provider,
+    name,
+    launchRecipient,
+    launchRecord ? { sessionCreatedAt: launchRecord.createdAt } : undefined,
+  );
+  wireTransportCallbacks(runtime, name, { deferProviderReadyDrain: agentType === AGY_SDK_PROVIDER_ID });
+  let agyLaunchCommitted = false;
+  const ownsAgyLaunch = (record: SessionRecord | null | undefined): boolean => {
+    const pending = transportLaunchInFlight.get(name);
+    if (pending && cancelledTransportStarts.has(pending)) return false;
+    if (agyLaunchCommitted) {
+      const owner = runtime.recipientIdentity;
+      return !!record && transportRuntimes.get(name) === runtime && record.providerSessionId === runtime.providerSessionId
+        && (!owner || (record.sessionInstanceId === owner.sessionInstanceId && record.runtimeEpoch === owner.runtimeEpoch));
+    }
+    return existing ? !!record && record.sessionInstanceId === existing.sessionInstanceId
+      && record.runtimeEpoch === existing.runtimeEpoch && record.providerSessionId === existing.providerSessionId
+      && record.providerResumeId === existing.providerResumeId && record.createdAt === existing.createdAt
+      && record.agentType === existing.agentType : !record;
+  };
+  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType,
+    agentType === AGY_SDK_PROVIDER_ID ? { canPersist: record => agyLaunchCommitted && ownsAgyLaunch(record) } : undefined);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -2179,15 +3900,32 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
-  const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
-  const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
+  let dshLlmConfig: DshLlmConfig | undefined;
+  let piLlmConfig: PiLlmConfig | undefined;
+  if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
+    && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
+    throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch. Use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
+  }
+  // Session model choice is session configuration (not conversation history):
+  // preserve existing.requestedModel across fresh/reset ("Start over" / 重启新建)
+  // whenever the provider stays the same, while never inheriting a foreign
+  // provider's model ID on cross-provider switches.
+  const storedRequestedModel = (existing?.providerId ?? existing?.agentType) === agentType
+    ? existing?.requestedModel
+    : undefined;
+  const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
+    ? existing?.providerResumeId
+    : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-  } else if (agentType === 'claude-code-sdk' && requestedTransportModel) {
+  } else if (isClaudeCodeSdkAgentType(agentType) && requestedTransportModel) {
     // Resolve the picker alias (e.g. "fable") to the documented API id at launch —
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
+  } else if (agentType === AGY_SDK_PROVIDER_ID) {
+    requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
@@ -2201,16 +3939,26 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
   // explicit reset) still wins — same rule applied to transportConfig above.
   const effectiveCcPreset: string | undefined =
-    opts.ccPreset ?? (!opts.fresh ? existing?.ccPreset : undefined);
+    opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined);
   const effectiveUserCreated: boolean | undefined =
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
     opts.parentSession ?? (!opts.fresh ? existing?.parentSession : undefined);
+  // Effort is durable session configuration, not conversation state or a
+  // launch-time default. A restore/reconnect/fresh-conversation caller may
+  // omit it while rebuilding an existing runtime; carrying the persisted value
+  // here prevents that rebuild from erasing an explicit low/medium/max
+  // selection and letting providers fall back to high. The default is only
+  // appropriate for a session that has never had an explicit effort.
+  const effectiveEffort: LaunchOpts['effort'] =
+    opts.effort ?? existing?.effort;
   // recentInjectionHistory is maintained out-of-band by recent-injection-history.ts.
   // If we don't carry it forward, upsertSession below wipes the dedup ring buffer
   // and previously-injected memories get re-injected into the same conversation.
   const preservedRecentInjectionHistory: string[][] | undefined =
     !opts.fresh ? existing?.recentInjectionHistory : undefined;
+  const preservedSummarySyncFingerprints: string[] | undefined =
+    !opts.fresh ? existing?.summarySyncFingerprints : undefined;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
@@ -2220,13 +3968,23 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // below, causing a TDZ `Cannot access before initialization` at launch —
   // see commit f13c511 which moved the read site without moving the decl.
   const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
-  const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+  const boundServerId = await loadBoundServerIdForManagedMcp();
+  const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
+  const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
     projectDir,
+    sessionId: name,
+    providerId: provider.id,
+    serverId: boundServerId,
+    trustedOwnerId: capabilityOwnerId,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
+    ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
   });
-  const contextBootstrap = await resolveRuntimeContextBootstrap();
-  runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
+  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = opts.incognito
+    ? { bootstrap: {}, deferred: undefined }
+    : await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
+  if (!opts.incognito) runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+  if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
     if (agentType === 'qwen') {
       const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
       qwenAuthType = qwenRuntime?.authType;
@@ -2261,7 +4019,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       effectiveBindExistingKey = undefined;
       effectiveSkipCreate = false;
     }
-  } else if (agentType === 'claude-code-sdk') {
+  } else if (isClaudeCodeSdkAgentType(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
@@ -2274,10 +4032,17 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (shouldResumeClaudeCliConversation) {
       effectiveSkipCreate = true;
     }
-    if (effectiveCcPreset) {
+    const ccPresetAgent = agentType === 'claude-code-sdk' || isClaudeCodeSdkAgentType(agentType);
+    if (ccPresetAgent && effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId)) };
-      const presetOverrides = await getPresetTransportOverrides(effectiveCcPreset);
+      transportEnv = {
+        ...(transportEnv ?? {}),
+        ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId, requestedTransportModel)),
+      };
+      const presetOverrides = await getPresetTransportOverrides(
+        effectiveCcPreset,
+        requestedTransportModel,
+      );
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
       presetContextWindow = presetOverrides.contextWindow;
       transportSystemPrompt = presetOverrides.systemPrompt;
@@ -2292,20 +4057,89 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (agentType === 'codex-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
-    if (!opts.fresh && transportResumeId) {
+    transportResumeId = opts.incognito
+      ? undefined
+      : (opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined));
+    if (!opts.fresh && !opts.incognito && transportResumeId) {
       effectiveSkipCreate = true;
     }
-    sdkDisplay = mergeCodexDisplayMetadata(
+    let availableCodexModels: string[] | undefined;
+    if (effectiveCcPreset) {
+      const applied = await applyCodexPresetConfig({
+        ccPreset: effectiveCcPreset,
+        requestedModel: requestedTransportModel,
+        env: transportEnv,
+        contextWindow: presetContextWindow,
+        systemPrompt: transportSystemPrompt,
+        settings: transportSettings,
+      });
+      transportEnv = applied.env;
+      requestedTransportModel = applied.model;
+      presetContextWindow = applied.contextWindow;
+      transportSystemPrompt = applied.systemPrompt;
+      availableCodexModels = applied.availableModels;
+      transportSettings = applied.settings;
+    }
+    const rawSdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       existing,
     );
-  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
+    sdkDisplay = {
+      ...rawSdkDisplay,
+      ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
+    };
+  } else if (agentType === 'qoder-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
-    if (transportResumeId) {
-      effectiveSkipCreate = true;
+    effectiveSkipCreate = false;
+    transportResumeId = undefined;
+  } else if (agentType === 'deepseek-harness') {
+    if (effectiveCcPreset) {
+      const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getDshPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      dshLlmConfig = presetConfig.llm;
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
+    effectiveSkipCreate = !!transportResumeId;
+  } else if (agentType === 'pi') {
+    if (effectiveCcPreset) {
+      const { getPiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getPiPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      piLlmConfig = presetConfig.piLlm;
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
+    effectiveSkipCreate = !!transportResumeId;
+  } else if (usesProviderResumeId(agentType)) {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.incognito || (agentType === AGY_SDK_PROVIDER_ID && opts.fresh)
+      ? undefined : opts.providerResumeId ?? storedProviderResumeId;
+    // providerSessionId is only an IM.codes route key for this family. Durable
+    // continuity comes exclusively from providerResumeId, so a stale route key
+    // must never make us skip session creation without a real resume target.
+    effectiveSkipCreate = !!transportResumeId;
+    if (agentType === 'grok-sdk') {
+      const [grokConfig, grokQuota] = await Promise.all([
+        getGrokSdkRuntimeConfig().catch(() => ({})),
+        getGrokUsageQuota().catch(() => null),
+      ]);
+      sdkDisplay = {
+        ...grokConfig,
+        ...(grokQuota?.quotaLabel ? { quotaLabel: grokQuota.quotaLabel } : {}),
+        ...(grokQuota?.quotaMeta ? { quotaMeta: grokQuota.quotaMeta } : {}),
+      };
     }
   }
 
@@ -2316,18 +4150,38 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // conversation already has its history preamble. `opts.fresh` is the
   // authoritative "force fresh" signal from /clear or explicit user action.
 
+  const restoredHandoff = existing?.crossVendorHandoff?.pending;
+  if (restoredHandoff && !opts.fresh) {
+    // Install before initialize: initialize notifies readiness and may drain a
+    // queued send immediately, so acceptance must already have a durable clear.
+    runtime.setPendingHandoffConsumedHandler(() => {
+      const current = getSession(name);
+      const pending = current?.crossVendorHandoff?.pending;
+      if (!pending || pending.cutoff.epoch !== restoredHandoff.cutoff.epoch || pending.cutoff.seq !== restoredHandoff.cutoff.seq) return;
+      const state = current.crossVendorHandoff ?? {};
+      upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: restoredHandoff.cutoff } }, updatedAt: Date.now() });
+      incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.TRANSPORT, source: 'restart' });
+    });
+  }
+
   // Create session on provider
-  const boundServerId = await loadBoundServerIdForManagedMcp();
+  const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
+    ...(opts.incognito ? { incognito: true } : {}),
     sessionKey: effectiveSessionKey,
     sessionName: name,
+    sessionInstanceId: resourceSessionInstanceId,
+    runtimeEpoch: resourceRuntimeEpoch,
     projectName,
     serverId: boundServerId,
+    providerId: provider.id,
     fresh: !!opts.fresh,
-    env: buildTransportSessionEnv(name, label, transportEnv),
+    env: buildTransportSessionEnv(name, label, { ...(transportEnv ?? {}), ...(launchAuthContext?.env ?? {}) }, agentType),
+    authContext: launchAuthContext,
     cwd: projectDir,
     label: label || name,
     description,
+    identityPrompt,
     // User-authored only. Identity + image-reporting are injected at
     // the assembly layer via `SessionConfig.sessionName` / `label` ->
     // `runtime.setSessionIdentity`, peer-level with
@@ -2335,6 +4189,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // cap. See p2p audit 37bfbb85-430 N-A.
     systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
+    ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
+    ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
@@ -2345,9 +4201,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
-        effort: opts.effort,
+    ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
+    effort: effectiveEffort,
+    ...(existing?.crossVendorHandoff?.pending && !opts.fresh
+      ? { pendingHandoff: existing.crossVendorHandoff.pending }
+      : {}),
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
-      });
+  });
+  if (agentType === AGY_SDK_PROVIDER_ID && !ownsAgyLaunch(getSession(name))) {
+    await runtime.kill({ detachProviderSession: true });
+    throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+  }
+  const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
   transportRuntimes.set(name, runtime);
@@ -2355,8 +4220,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
 
   try {
     if (!skipStore) {
-      const record: SessionRecord = {
+      const record = markSessionLaunchIdentity<SessionRecord>({
+        ...(opts.incognito ? { incognito: true } : {}),
         name,
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
         projectName,
         role,
         agentType,
@@ -2369,11 +4237,15 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'kimi-sdk') && transportResumeId
-          ? { providerResumeId: transportResumeId }
+        ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito ? {
+          agyNativeSessionState: transportResumeId || latestSessionInfo?.resumeId
+            ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED,
+        } : {}),
+        ...(!opts.incognito && usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
+          ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
-        ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
-        ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
+        ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
+        ...(agentType === 'codex-sdk' && transportResumeId && !opts.incognito ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
         contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
@@ -2398,8 +4270,9 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
         ...(sdkDisplay ?? {}),
-        ...(opts.effort ? { effort: opts.effort } : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         description,
+        appliedIdentityHash: identityPromptHash(identityPrompt),
         ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),
         ...(presetContextWindow ? { presetContextWindow } : {}),
         label,
@@ -2415,11 +4288,68 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedRecentInjectionHistory && preservedRecentInjectionHistory.length > 0
           ? { recentInjectionHistory: preservedRecentInjectionHistory }
           : {}),
-      };
+        ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
+          ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
+          : {}),
+        ...(existing?.crossVendorHandoff ? {
+          crossVendorHandoff: stripPendingCrossVendorHandoff(
+            (getSession(name) ?? existing)?.crossVendorHandoff,
+            opts.fresh,
+          ),
+        } : {}),
+      });
+      const launchGapEntries = getResendEntries(name);
+      if (launchGapEntries.length > 0 && launchGapEntries.every((entry) => !entry.recipient)) {
+        const clientMessageIds = launchGapEntries.map((entry) => entry.clientMessageId?.trim() ?? '');
+        if (!getTransportQueueStore().bindFreshLaunchRecipient(name, launchRecipient, clientMessageIds)) {
+          throw new Error('transport queue fresh-launch recipient binding rejected');
+        }
+      }
+      // Repair legacy NULL recipients and same-instance mixed epochs against
+      // the CURRENT persisted SessionRecord before upsert is allowed to rotate
+      // runtimeEpoch. Doing this after upsert is too late: the ordinary epoch
+      // rebind deliberately rejects mixed rows, which used to leave the new
+      // record persisted but the runtime rolled back with
+      // "transport queue recipient rotation rejected". The next enqueue could
+      // then add yet another epoch to the same aggregate, making cards visible
+      // but neither drainable nor cancellable.
+      if (runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) {
+        const discarded = runtime.discardDurableQueueStateForRecipientConflict();
+        logger.warn(
+          { session: name, discarded },
+          'Transport queue canonical recipient recovery discarded stale ownership instead of rejecting launch',
+        );
+      }
       upsertSession(record);
-      emitSessionPersist(record, name);
+      const persistedRecord = getSession(name);
+      const persistedRecipient = recipientFromSessionRecord(persistedRecord);
+      const runtimeRecipient = runtime.recipientIdentity;
+      if (runtimeRecipient && persistedRecipient
+        && (runtimeRecipient.sessionInstanceId !== persistedRecipient.sessionInstanceId
+          || runtimeRecipient.runtimeEpoch !== persistedRecipient.runtimeEpoch)) {
+        if (!runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)) {
+          const discarded = runtime.discardDurableQueueStateForRecipientConflict(persistedRecipient);
+          logger.warn(
+            { session: name, discarded },
+            'Transport queue recipient rotation discarded stale ownership instead of rejecting launch',
+          );
+        }
+      }
+      emitSessionPersist(persistedRecord ?? record, name);
     }
 
+    if (skipStore && agentType === AGY_SDK_PROVIDER_ID && existing && !opts.incognito) {
+      const current = getSession(name);
+      if (!current || current.sessionInstanceId !== existing.sessionInstanceId) throw new Error('AG launch owner changed');
+      upsertSession({ ...current, providerSessionId: providerSid ?? undefined,
+        providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId,
+        agyNativeSessionState: latestSessionInfo?.resumeId || transportResumeId
+          ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED });
+      const recipient = recipientFromSessionRecord(getSession(name));
+      if (recipient && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) throw new Error('AG launch recipient changed');
+    }
+    agyLaunchCommitted = true;
+    if (agentType === AGY_SDK_PROVIDER_ID) wireTransportProviderReadyDrain(runtime, name);
     emitSessionEvent('started', name, 'idle');
     logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
   } catch (err) {
@@ -2440,10 +4370,85 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // `runExclusiveSessionRelaunch`) does not resolve until the resend
   // queue has been fully transferred into the runtime. See the matching
   // change in `restoreTransportSessions` above for the full rationale.
-  await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
+  // The old runtime has been killed and cannot complete any lease it left.
+  // Reclaim those old-generation handoffs before this runtime creates new ones;
+  // the durable attempt counter bounds repeated relaunch recovery.
+  await recoverPersistedTransportQueue(runtime, name, 'launch');
 }
 
-const pendingResendRelaunches = new Set<string>();
+const transportRuntimeRecoveries = new Map<string, Promise<void>>();
+
+/**
+ * Ensure one persisted transport session has a live provider-bound runtime.
+ *
+ * Unlike the bulk startup warm restore, this is an on-demand, session-scoped
+ * recovery path for work that cannot wait for every provider/session ahead of
+ * it in the startup queue. Concurrent callers await the same recovery instead
+ * of observing the missing runtime and failing or launching duplicates.
+ */
+export async function ensureTransportRuntimeAvailable(
+  sessionName: string,
+  options: {
+    /** A message was just delivered to this session: attempt the restore even inside a backoff window. */
+    bypassBackoff?: boolean;
+  } = {},
+): Promise<TransportSessionRuntime | undefined> {
+  const existing = getTransportRuntime(sessionName);
+  if (existing?.providerSessionId) return existing;
+  // Recovery launches/restores a runtime and drains its queue: daemon-only work.
+  if (isNonDaemonProcess()) return undefined;
+
+  // A restore that already proved permanently unbound for this exact record
+  // state is not retried until its backoff window ends or the record/provider
+  // changes (fingerprint / provider reconnect). Sends bypass this.
+  if (!options.bypassBackoff) {
+    const current = getSession(sessionName);
+    if (current && isTransportRestoreBackedOff(sessionName, transportRestoreFingerprint(current))) return undefined;
+  }
+
+  let recovery = transportRuntimeRecoveries.get(sessionName);
+  if (!recovery) {
+    recovery = (async () => {
+      const record = getSession(sessionName);
+      if (!record || !isTransportAgent(record.agentType as AgentType) || isIncognitoSession(record)) return;
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime?.providerSessionId) return;
+      if (runtime) {
+        // Registered but unbound (half-dead — e.g. post-cancel / mid-init
+        // error): preserve queued work before replacing it.
+        const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
+        if (preservation.preservedCount > 0) {
+          logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before on-demand recovery');
+        }
+        await stopTransportRuntimeSession(sessionName, {
+          preserveTransportQueue: preservation.preservedCount > 0,
+        }).catch(() => {});
+      }
+      const providerId = record.providerId ?? record.agentType;
+      await ensureProviderConnected(providerId, {});
+      if (record.providerSessionId) {
+        await restoreTransportSessions(providerId, {
+          sessionName,
+          concurrency: 1,
+          interSessionDelayMs: 0,
+        });
+      } else {
+        await launchTransportSession(buildTransportResumeLaunchOpts(record));
+      }
+    })();
+    transportRuntimeRecoveries.set(sessionName, recovery);
+  }
+
+  try {
+    await recovery;
+  } finally {
+    if (transportRuntimeRecoveries.get(sessionName) === recovery) {
+      transportRuntimeRecoveries.delete(sessionName);
+    }
+  }
+  const restored = getTransportRuntime(sessionName);
+  return restored?.providerSessionId ? restored : undefined;
+}
 
 /**
  * Ensure a transport session that has NO live, provider-bound runtime gets
@@ -2463,41 +4468,51 @@ const pendingResendRelaunches = new Set<string>();
  * coalescing inside `launchTransportSession` (which drains the resend queue on
  * success) is the final concurrency guard.
  */
-export async function ensureTransportRuntimeForPendingResend(sessionName: string): Promise<void> {
-  if (pendingResendRelaunches.has(sessionName)) return;
-  const record = getSession(sessionName);
-  if (!record || !isTransportAgent(record.agentType as AgentType)) return;
-  const runtime = getTransportRuntime(sessionName);
-  if (runtime && runtime.providerSessionId) return; // already bound — nothing to recover
-  pendingResendRelaunches.add(sessionName);
+export async function ensureTransportRuntimeForPendingResend(
+  sessionName: string,
+  options: {
+    bypassBackoff?: boolean;
+    /**
+     * A user message was just queued for this session: if the restore proves the
+     * session can never be restored (permanent-by-construction), say so once per
+     * backoff step. The message itself stays queued.
+     */
+    notifyIfPermanentlyUnbound?: boolean;
+  } = {},
+): Promise<void> {
   try {
-    if (runtime) {
-      // Registered but unbound (half-dead — e.g. post-cancel / mid-init error):
-      // preserve its queued work into resend and stop it before relaunch.
-      const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
-      if (preservation.preservedCount > 0) {
-        logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before pending-resend relaunch');
-      }
-      await stopTransportRuntimeSession(sessionName).catch(() => {});
-    }
-    await launchTransportSession(buildTransportResumeLaunchOpts(record));
+    const runtime = await ensureTransportRuntimeAvailable(sessionName, { bypassBackoff: options.bypassBackoff });
+    if (!runtime && options.notifyIfPermanentlyUnbound) emitTransportRestoreUnboundNotice(sessionName);
   } catch (err) {
     logger.error({ err, sessionName }, 'ensureTransportRuntimeForPendingResend failed');
-  } finally {
-    pendingResendRelaunches.delete(sessionName);
   }
 }
 
+function emitTransportRestoreUnboundNotice(sessionName: string): void {
+  const record = getSession(sessionName);
+  if (!record) return;
+  if (!claimTransportRestoreNotice(sessionName, transportRestoreFingerprint(record))) return;
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
 export async function launchSession(opts: LaunchOpts): Promise<void> {
+  if (!isSessionAgentType(opts.agentType)) {
+    throw unsupportedAgentTypeError(String(opts.agentType));
+  }
   // Transport-backed agents don't use tmux — delegate to dedicated handler
   if (isTransportAgent(opts.agentType)) {
     await launchTransportSession(opts);
     return;
   }
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(opts.name);
+  }
 
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
-  // Inject IMCODES_SESSION so agents can auto-detect their own session identity
-  const mergedEnv: Record<string, string> = { IMCODES_SESSION: name, ...extraEnv };
   const driver = getDriver(agentType);
   const agentVersion = await getAgentVersion(agentType);
 
@@ -2513,6 +4528,24 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   const exists = await sessionExists(name);
+  const storedBeforeLaunch = getSession(name);
+  const pendingHandoffOnRestart = !fresh ? storedBeforeLaunch?.crossVendorHandoff?.pending : undefined;
+  const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = !exists ? randomUUID() : storedBeforeLaunch?.runtimeEpoch ?? randomUUID();
+  // Inject both the display identity and the exact logical/runtime owner tuple.
+  // Only a pane this call creates receives the new environment; an adopted live pane keeps the process (and credential, if any) it has.
+  const hookCredential = exists ? storedBeforeLaunch?.hookCredential : mintHookCredential();
+  const mergedEnv: Record<string, string> = {
+    ...extraEnv,
+    ...imcodesStateDirEnv(),
+    IMCODES_SESSION: name,
+    ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+    ...hookCredentialEnv(hookCredential),
+  };
+  // A missing tmux pane can be a non-fresh crash restart of the same logical
+  // conversation. Only explicit fresh launches or genuinely new records reset
+  // the conversation-lifetime summary ledger.
+  if (fresh || (!exists && !storedBeforeLaunch)) clearSummarySyncHistory(name);
 
   let ccSessionId = opts.ccSessionId;
   if (agentType === 'claude-code' && !fresh) {
@@ -2523,7 +4556,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   // Cache context window for preset so watcher can use it in usage.update
-  if (opts.ccPreset && agentType === 'claude-code') {
+  if (opts.ccPreset && (agentType === 'claude-code' || agentType === 'codex')) {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     await resolvePresetEnv(opts.ccPreset, ccSessionId);
   }
@@ -2533,21 +4566,31 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   let codexSessionId = opts.codexSessionId;
   if (agentType === 'codex' && !fresh && !codexSessionId) codexSessionId = getSession(name)?.codexSessionId;
-  let geminiSessionId = opts.geminiSessionId;
-  if (agentType === 'gemini' && !fresh && !geminiSessionId) geminiSessionId = getSession(name)?.geminiSessionId;
   let opencodeSessionId = opts.opencodeSessionId;
   if (agentType === 'opencode' && !fresh && !opencodeSessionId) opencodeSessionId = getSession(name)?.opencodeSessionId;
-  ({ ccSessionId, codexSessionId, geminiSessionId } = await resolveStructuredSessionBootstrap({
+  ({ ccSessionId, codexSessionId } = await resolveStructuredSessionBootstrap({
     sessionName: name,
     agentType,
     projectDir,
     isNewSession: !exists,
     ccSessionId,
     codexSessionId,
-    geminiSessionId,
   }));
 
-  if (!exists) {
+  const releaseRecovery = (!fresh && !exists && opts.onPostLaunchReady && agentType !== 'shell' && agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
+  let nativeAgentsFenced = false;
+  let launchedNativeAgentFence: SessionRecord['nativeAgentLaunchFence'];
+  try {
+    if (!exists) {
+    if (storedBeforeLaunch) {
+      const previousResources = await releaseSessionResources(storedBeforeLaunch);
+      if (previousResources.failed > 0) {
+        throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
+      }
+    }
     // CC: if JSONL already exists (restart via killSession+newSession), use --resume to
     // launchSession is only for NEW tmux sessions (--session-id for CC).
     // Restarts go through respawnSession which uses respawnPane + --resume.
@@ -2557,8 +4600,25 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       knownOpenCodeSessionIds = (await listOpenCodeSessions(projectDir, 50)).map((session) => session.id);
     }
     const launchStart = Date.now();
-    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
-    await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+    nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({ sessionName: name, role, parentSession: opts.parentSession });
+    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, opencodeSessionId, nativeAgentsFenced });
+    try {
+      await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+    } catch (error) {
+      const existing = getSession(name);
+      if (existing) throw markLaunchFailure(existing, error);
+      throw error;
+    }
+    launchedNativeAgentFence = {
+      fence: processLaunchFence(agentType, {
+        nativeAgentsFenced,
+        // Only an explicit fresh launch without a stored thread id creates a new conversation.
+        resumesExistingConversation: !fresh || Boolean(codexSessionId),
+      }),
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      decidedAt: Date.now(),
+    };
     if (agentType === 'opencode' && !opencodeSessionId) {
       const { waitForOpenCodeSessionId } = await import('../daemon/opencode-history.js');
       opencodeSessionId = await waitForOpenCodeSessionId(projectDir, {
@@ -2567,7 +4627,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         knownSessionIds: knownOpenCodeSessionIds,
       });
     }
-    logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId }, 'Launched session');
+    logger.info({ session: name, agentType, ccSessionId, codexSessionId, opencodeSessionId }, 'Launched session');
   }
 
   // Always record paneId — it changes on each session creation/restart
@@ -2579,20 +4639,37 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
+  let familyDisplay: Partial<SessionRecord> | undefined;
   if (agentType === 'codex') {
-    familyDisplay = mergeCodexDisplayMetadata(
+    let availableCodexModels: string[] | undefined;
+    if (opts.ccPreset) {
+      const { getPreset, getPresetAvailableModelIds } = await import('../daemon/cc-presets.js');
+      const preset = await getPreset(opts.ccPreset);
+      if (preset) {
+        const models = getPresetAvailableModelIds(preset);
+        if (models.length > 0) availableCodexModels = models;
+      }
+    }
+    const rawDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       getSession(name),
     );
+    familyDisplay = {
+      ...rawDisplay,
+      ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
+    };
   } else if (agentType === 'claude-code' && !opts.ccPreset) {
     familyDisplay = undefined;
   }
 
   if (!skipStore) {
     const existing = getSession(name);
+    const summarySyncFingerprints = getSummarySyncFingerprints(name);
     const record: SessionRecord = {
       name,
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      ...(hookCredential ? { hookCredential } : {}),
       projectName,
       role,
       agentType,
@@ -2606,34 +4683,63 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       paneId,
       ...(ccSessionId ? { ccSessionId } : {}),
       ...(codexSessionId ? { codexSessionId } : {}),
-      ...(geminiSessionId ? { geminiSessionId } : {}),
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+      ...(opts.requestedModel ? {
+        requestedModel: opts.requestedModel,
+        activeModel: opts.requestedModel,
+        modelDisplay: opts.requestedModel,
+      } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
+      ...(existing?.crossVendorHandoff ? {
+        crossVendorHandoff: stripPendingCrossVendorHandoff(
+          (getSession(name) ?? existing)?.crossVendorHandoff,
+          fresh,
+        ),
+      } : {}),
+      ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
+      ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
     };
-    upsertSession(record);
+    try {
+      await registerTmuxSessionResource(record);
+    } catch (error) {
+      if (!exists) await killSession(name).catch(() => {});
+      throw error;
+    }
+    upsertSession(markSessionLaunchIdentity(record));
     emitSessionPersist(record, name);
   } else {
     const existing = getSession(name);
     if (existing) {
       const merged: SessionRecord = {
         ...existing,
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
+        ...(hookCredential ? { hookCredential } : {}),
         ...(paneId ? { paneId } : {}),
         ...(ccSessionId ? { ccSessionId } : {}),
         ...(codexSessionId ? { codexSessionId } : {}),
-        ...(geminiSessionId ? { geminiSessionId } : {}),
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         ...(opts.description ? { description: opts.description } : {}),
+        ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
+        ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(existing.crossVendorHandoff ? {
+          crossVendorHandoff: stripPendingCrossVendorHandoff(existing.crossVendorHandoff, fresh),
+        } : {}),
+        ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);
+      const persistedRecord = getSession(name);
+      if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
       emitSessionPersist(merged, name);
     }
   }
@@ -2641,14 +4747,80 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   emitSessionEvent('started', name, 'idle');
 
   // Start structured-event watchers for supported agent types
-  startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
+  startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, opencodeSessionId });
 
-  // Auto-dismiss startup prompts (trust folder, settings errors, update dialogs)
-  if (driver.postLaunch) {
-    driver.postLaunch(
-      () => capturePane(name),
-      (key) => sendKey(name, key),
-    ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+    if (fresh) {
+      retireRestartContinuation(name);
+    }
+    // Auto-dismiss startup prompts before delivering the initial context. A
+    // selected identity file has already been resolved to bytes by the UI/MCP;
+    // process agents must receive those same bytes on their first launch rather
+    // than only after a later respawn.
+    recoveryHandedOff = true;
+    void (async () => {
+      try {
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(name),
+            (key) => sendKey(name, key),
+          ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+        }
+        if (pendingHandoffOnRestart) {
+          try {
+            const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+            let injected = false;
+            await runWithProcessSessionSendLock(name, async () => {
+              const current = getSession(name);
+              if (!current?.crossVendorHandoff?.pending
+                || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
+                || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
+              const writePrivate = await prepareProcessSessionPrivateWriter(name);
+              writePrivate(pendingHandoffOnRestart.text);
+              injected = true;
+            });
+            if (injected) {
+              const current = getSession(name);
+              if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
+                && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
+                const state = current.crossVendorHandoff;
+                upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
+              }
+              incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+            }
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
+            incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+          }
+        }
+        if (agentType === 'shell' || agentType === 'script') return;
+        if (fresh) {
+          retireRestartContinuation(name);
+        }
+        // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
+        // when the session has one, so leaving it out would look up the project NAME and miss that profile.
+        const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
+        const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
+        if (initialContext) {
+          try {
+            await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+          }
+        }
+        if (!fresh && opts.onPostLaunchReady) {
+          try {
+            await opts.onPostLaunchReady();
+          } catch (err) {
+            logger.warn({ err, session: name }, 'Post-launch continuation hook failed');
+          }
+        }
+      } finally {
+        releaseRecovery?.();
+      }
+    })();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
   }
 }
 

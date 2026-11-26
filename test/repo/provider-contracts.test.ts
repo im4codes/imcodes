@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { execFileMock } = vi.hoisted(() => ({
   execFileMock: vi.fn(),
@@ -8,6 +8,7 @@ vi.mock('node:child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
+import { resetGhAuthCacheForTests } from '../../src/repo/gh-auth.js';
 import { GitHubProvider } from '../../src/repo/github-provider.js';
 import { GitLabProvider } from '../../src/repo/gitlab-provider.js';
 
@@ -27,6 +28,13 @@ function rejectExec(error: unknown) {
 describe('GitHubProvider contracts', () => {
   beforeEach(() => {
     execFileMock.mockReset();
+    resetGhAuthCacheForTests();
+    vi.stubEnv('GH_TOKEN', 'test-contract-token');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetGhAuthCacheForTests();
   });
 
   it('guards owner and repo names before shelling out', () => {
@@ -107,6 +115,26 @@ describe('GitHubProvider contracts', () => {
 
     rejectExec({ exitCode: 1, stderr: 'boom' });
     await expect(provider.listCommits()).rejects.toMatchObject({ code: 'cli_error' });
+  });
+
+  it('preserves hasMore from raw pre-filter issue page count even when PR-only or mixed pages filter to []', async () => {
+    const provider = new GitHubProvider('octo', 'repo', '/tmp/project');
+    const now = Date.parse('2026-05-11T00:00:00.000Z');
+
+    // Page 1 has 2 raw items that were both PRs -> jq returns { rawCount: 2, items: [] }
+    complete({ rawCount: 2, items: [] });
+    const page1 = await provider.listIssues({ page: 1, perPage: 2, state: 'all' });
+    expect(page1).toMatchObject({ page: 1, hasMore: true, rawCount: 2, items: [] });
+    expect(String(execFileMock.mock.calls.at(-1)?.[1][3])).toContain('rawCount: length');
+
+    // Page 2 has 1 filtered issue out of 1 raw item -> true EOF
+    complete({
+      rawCount: 1,
+      items: [{ id: '11', number: 11, title: 'Real issue', body: '', state: 'open', author: 'ana', labels: [], url: 'https://github.com/octo/repo/issues/11', assignee: null, createdAt: now, updatedAt: now }],
+    });
+    const page2 = await provider.listIssues({ page: 2, perPage: 2, state: 'all' });
+    expect(page2).toMatchObject({ page: 2, hasMore: false, rawCount: 1 });
+    expect(page2.items).toHaveLength(1);
   });
 });
 

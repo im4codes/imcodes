@@ -13,14 +13,25 @@ describe('web model context resolution', () => {
     expect(resolveContextWindow(undefined, 'gpt-5.4')).toBe(1_000_000);
   });
 
-  it('resolves claude sonnet 4 family to 1M', () => {
+  it('resolves claude sonnet 4 and 5 family to 1M', () => {
     expect(inferContextWindow('sonnet')).toBe(1_000_000);
     expect(resolveContextWindow(200_000, 'claude-sonnet-4-6')).toBe(1_000_000);
+    expect(inferContextWindow('claude-sonnet-5-5-high')).toBe(1_000_000);
   });
 
-  it('resolves claude opus family to 1M', () => {
+  it('resolves claude opus 4 and 5 family to 1M', () => {
     expect(inferContextWindow('claude-opus-4-1')).toBe(1_000_000);
     expect(resolveContextWindow(200_000, 'claude-opus-4-6')).toBe(1_000_000);
+    expect(inferContextWindow('claude-opus-5-5-high')).toBe(1_000_000);
+  });
+
+  it('resolves gemini flash to 1M and pro to 2M', () => {
+    expect(inferContextWindow('flash')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-3.8-flash-high')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-medium')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-low')).toBe(1_000_000);
+    expect(inferContextWindow('pro')).toBe(2_000_000);
+    expect(inferContextWindow('gemini-3.8-pro')).toBe(2_000_000);
   });
 
   it('resolves GPT-5.x pre-5.4 families to 400k', () => {

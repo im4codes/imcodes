@@ -26,10 +26,11 @@ function b64url(buf: Buffer | string): string {
 
 export function signJwt(payload: Record<string, unknown>, signingKey: string, expiresInSecs: number): string {
   const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const nowSec = Math.floor(Date.now() / 1000);
   const claims = b64url(JSON.stringify({
     ...payload,
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + expiresInSecs,
+    iat: typeof payload.iat === 'number' ? payload.iat : nowSec,
+    exp: typeof payload.exp === 'number' ? payload.exp : nowSec + expiresInSecs,
   }));
   const signingInput = `${header}.${claims}`;
   const sig = createHmac('sha256', signingKey).update(signingInput).digest();
@@ -106,9 +107,9 @@ export function decryptBotConfig(encrypted: string, encryptionKey: string): Reco
 
 /** Constant-time string comparison */
 export function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
   const bufA = Buffer.from(a, 'utf8');
   const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
   return nodeTimingSafeEqual(bufA, bufB);
 }
 

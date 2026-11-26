@@ -1,8 +1,16 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { resolveUserByIdentifier } from '../db/user-lookup.js';
+import type { Database } from '../db/client.js';
+import { withTransaction } from '../db/queries.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
+import { mutateAndRevalidateMachineGroupAccess } from '../ws/machine-group-revalidation.js';
+import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
+
+/** A group name is a label, never a paragraph. */
+const GROUP_NAME_MAX_CHARS = 120;
 
 export const teamRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -107,18 +115,20 @@ teamRoutes.post('/join/:token', requireAuth(), async (c) => {
   const token = c.req.param('token');
   const now = Date.now();
 
-  const invite = await c.env.DB
-    .queryOne<{ id: string; team_id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND used_at IS NULL AND expires_at > $2', [token, now]);
+  const invite = await withTransaction(c.env.DB, async (tx) => {
+    const row = await tx.queryOne<{ id: string; team_id: string; role: string }>(
+      'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, team_id, role',
+      [now, token],
+    );
+    if (!row) return null;
+
+    await tx.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+      [row.team_id, userId, row.role, now],
+    );
+    return row;
+  });
   if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
-
-  // Add to team
-  await c.env.DB.execute(
-    'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-    [invite.team_id, userId, invite.role, now],
-  );
-
-  // Mark invite used
-  await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
 
   await logAudit({ userId, action: 'team.joined', details: { teamId: invite.team_id, via: 'invite' } }, c.env.DB);
 
@@ -133,21 +143,145 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
   const now = Date.now();
 
   if (body.token) {
-    const invite = await c.env.DB
-      .queryOne<{ id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND team_id = $2 AND used_at IS NULL AND expires_at > $3', [body.token, teamId, now]);
+    const invite = await withTransaction(c.env.DB, async (tx) => {
+      const row = await tx.queryOne<{ id: string; role: string }>(
+        'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND team_id = $3 AND used_at IS NULL AND expires_at > $1 RETURNING id, role',
+        [now, body.token, teamId],
+      );
+      if (!row) return null;
+
+      await tx.execute(
+        'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [teamId, userId, row.role, now],
+      );
+      return row;
+    });
     if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
-    await c.env.DB.execute(
-      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-      [teamId, userId, invite.role, now],
-    );
-
-    await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
     await logAudit({ userId, action: 'team.joined', details: { teamId, via: 'invite' } }, c.env.DB);
     return c.json({ ok: true, role: invite.role });
   }
 
   return c.json({ error: 'token required' }, 400);
+});
+
+// PATCH /api/team/:id — rename a group (owner/admin)
+teamRoutes.patch('/:id', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+  const body = await c.req.json<{ name?: string }>().catch(() => null);
+  const name = body?.name?.trim();
+  if (!name) return c.json({ error: 'group_name_required' }, 400);
+  if (name.length > GROUP_NAME_MAX_CHARS) return c.json({ error: 'group_name_too_long' }, 400);
+
+  const manager = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')",
+    [teamId, userId],
+  );
+  if (!manager) return c.json({ error: 'group_manage_denied' }, 403);
+
+  const renamed = await c.env.DB.queryOne<{ id: string }>(
+    'UPDATE teams SET name = $2 WHERE id = $1 RETURNING id',
+    [teamId, name],
+  );
+  if (!renamed) return c.json({ error: 'not_found' }, 404);
+
+  await logAudit({ userId, action: 'team.rename', details: { teamId, name } }, c.env.DB);
+  return c.json({ ok: true, id: teamId, name });
+});
+
+// DELETE /api/team/:id — delete an empty group (owner only)
+//
+// Refused while any machine is still in it.
+//
+// Membership does cascade now, so nothing would dangle -- but a group being
+// deleted is exactly when its machines silently lose the access it granted, and
+// the owner is the only one who can tell whether that is intended. Emptying it
+// first makes that a decision rather than a side effect, one machine at a time.
+teamRoutes.delete('/:id', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+
+  // Owner only. An admin manages who is in a group; destroying the group is not
+  // the same act, and it cannot be undone by the person it was taken from.
+  const owner = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role = 'owner'",
+    [teamId, userId],
+  );
+  if (!owner) return c.json({ error: 'group_owner_required' }, 403);
+
+  const machines = await c.env.DB.query<{ server_id: string }>(
+    `SELECT mg.server_id FROM machine_groups mg
+       JOIN servers s ON s.id = mg.server_id AND s.revoked_at IS NULL
+      WHERE mg.team_id = $1`,
+    [teamId],
+  );
+  if (machines.length > 0) {
+    return c.json({ error: 'group_has_machines', machineCount: machines.length }, 409);
+  }
+
+  // Members and invites carry ON DELETE CASCADE, so they go with it. Machines
+  // deliberately do not, which is what the check above exists to cover.
+  await c.env.DB.execute('DELETE FROM teams WHERE id = $1', [teamId]);
+  await logAudit({ userId, action: 'team.delete', details: { teamId } }, c.env.DB);
+  return c.json({ ok: true });
+});
+
+// POST /api/team/:id/member — add someone by username (owner/admin only)
+//
+// An invite link is the right tool when you cannot reach the person directly.
+// When you already know who they are, making you generate a link, send it, and
+// wait for them to open it is ceremony -- you are the one with the authority to
+// add them, so you add them.
+teamRoutes.post('/:id/member', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+  const body = await c.req.json<{ user?: string; role?: string }>().catch(() => null);
+  const identifier = body?.user?.trim();
+  if (!identifier) return c.json({ error: 'user_required' }, 400);
+  const role = body?.role === 'admin' ? 'admin' : 'member';
+
+  // Only a manager of THIS team may add to it. Checked before the lookup so a
+  // non-manager cannot use this route to probe which usernames exist.
+  const manager = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')",
+    [teamId, userId],
+  );
+  if (!manager) return c.json({ error: 'group_manage_denied' }, 403);
+  if (role === 'admin' && manager.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_for_admin_role' }, 403);
+  }
+
+  const target = await resolveUserByIdentifier(c.env.DB as Database, identifier);
+  // The specific cause travels as `error`, which is the field the client reads
+  // to choose a message. A bare 'not_found' arrives at the UI as "404" and the
+  // person is left guessing whether the group, the route or the name was wrong.
+  if (!target) return c.json({ error: 'user_not_found' }, 404);
+  if (target.id === userId) return c.json({ error: 'self_add_denied' }, 400);
+
+  // Already a member: succeed without changing their role. Re-adding someone
+  // must never quietly demote an admin back to member.
+  const existing = await c.env.DB.queryOne<{ role: string }>(
+    'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+    [teamId, target.id],
+  );
+  if (!existing) {
+    await c.env.DB.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4)',
+      [teamId, target.id, role, Date.now()],
+    );
+    await logAudit({ userId, action: 'team.member_add', details: { teamId, memberId: target.id, role } }, c.env.DB);
+  }
+
+  return c.json({
+    ok: true,
+    member: {
+      user_id: target.id,
+      username: target.username,
+      display_name: target.display_name,
+      role: existing?.role ?? role,
+    },
+  }, existing ? 200 : 201);
 });
 
 // PUT /api/team/:id/member/:memberId/role — change member role
@@ -176,11 +310,10 @@ teamRoutes.put('/:id/member/:memberId/role', requireAuth(), async (c) => {
     return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
   }
 
-  await c.env.DB.execute(
+  await mutateAndRevalidateMachineGroupAccess(c.env.DB, { teamId: teamId!, actorId: memberId! }, (tx) => tx.execute(
     'UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3',
     [body!.role, teamId, memberId],
-  );
-
+  ));
   await logAudit({ userId, action: 'team.role_change', details: { teamId, memberId, role: body!.role } }, c.env.DB);
   return c.json({ ok: true });
 });
@@ -203,11 +336,11 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
     return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
   }
 
-  await c.env.DB.execute(
+  await mutateAndRevalidateMachineGroupAccess(c.env.DB, { teamId: teamId!, actorId: memberId! }, (tx) => tx.execute(
     'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
     [teamId, memberId],
-  );
-
+  ));
+  await pauseRevokedSharedCronJobs(c.env.DB, { teamId, userId: memberId });
   await logAudit({ userId, action: 'team.member_removed', details: { teamId, memberId } }, c.env.DB);
   return c.json({ ok: true });
 });

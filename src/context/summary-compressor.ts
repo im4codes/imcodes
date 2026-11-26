@@ -22,7 +22,7 @@ import {
   type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
 } from './processing-provider-config.js';
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { compressToolEvent } from './tool-compressors.js';
 import { redactSensitiveText } from '../util/redact-secrets.js';
 import { ensurePinnedNotesSection, redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
@@ -43,6 +43,9 @@ export interface CompressionInput {
   previousSummaryMaxTokens?: number;
   extraRedactPatterns?: RegExp[];
   pinnedNotes?: string[];
+  watchdogSessionName?: string;
+  watchdogTrigger?: string;
+  watchdogEventCount?: number;
 }
 
 export interface CompressionResult {
@@ -121,6 +124,12 @@ function getBreaker(backend: string): BreakerStats {
     breakers.set(backend, b);
   }
   return b;
+}
+
+/** Would `canCall` let a request through? Read-only: never moves the breaker. */
+function breakerWouldAllow(backend: string, now: number): boolean {
+  const b = getBreaker(backend);
+  return b.state !== 'open' || now - b.openedAt >= b.cooldownMs;
 }
 
 function canCall(backend: string, now: number): boolean {
@@ -291,10 +300,12 @@ function agentInstallHint(backend: string): string {
       return 'install Claude Code CLI: npm install -g @anthropic-ai/claude-code';
     case 'codex-sdk':
       return 'install Codex CLI (see codex.openai.com docs)';
-    case 'qwen':
-      return 'install qwen CLI on PATH';
-    case 'gemini-sdk':
-      return 'install Gemini CLI on PATH';
+    case 'agy-sdk':
+      return 'install Antigravity (agy) CLI on PATH';
+    case 'opencode-sdk':
+      return 'install OpenCode CLI on PATH';
+    case 'muse-code-sdk':
+      return 'install Muse Code CLI on PATH (see api.meta.ai/muse-launcher.sh)';
     default:
       return `install the ${backend} CLI on PATH or configure a different primaryContextBackend`;
   }
@@ -319,6 +330,8 @@ export const __testing__ = {
   recordSuccess,
   recordFailure,
   classifyCompressionError,
+  truncateEventText,
+  trimToTokenBudget,
 };
 
 // ── Compression provider (shared with the global registry singleton) ─────────
@@ -376,6 +389,7 @@ async function getCompressionProvider(
     ...(sessionConfig.env ? { env: sessionConfig.env } : {}),
     ...(sessionConfig.settings ? { settings: sessionConfig.settings } : {}),
     ...(sessionConfig.agentId ? { agentId: sessionConfig.agentId } : {}),
+    ...(sessionConfig.sessionModel ? { model: sessionConfig.sessionModel } : {}),
   });
   // Out-of-band session: compression uses its own per-call listeners and
   // never registers with the providerRouting map. Mark the sid so
@@ -432,7 +446,7 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
     usedBackup: false,
     fromSdk: true,
     inputTokens: 0,
-    outputTokens: countTokens(summary),
+    outputTokens: await countTokensAsync(summary),
     targetTokens: input.targetTokens ?? 0,
     durationMs: 0,
   };
@@ -469,6 +483,78 @@ export interface CompressionQueueState {
   activeCount: number;
   queued: number;
   idle: boolean;
+}
+
+export interface ActiveCompressionRun {
+  runId: string;
+  sessionName: string;
+  startedAt: number;
+  mode: CompressionMode;
+  trigger?: string;
+  eventCount: number;
+}
+
+export interface CompressionWatchRun extends ActiveCompressionRun {
+  finishedAt?: number;
+}
+
+const activeCompressionRuns = new Map<string, ActiveCompressionRun>();
+const compressionWatchRuns = new Map<string, CompressionWatchRun>();
+
+function beginActiveCompressionRun(input: CompressionInput): ActiveCompressionRun | null {
+  const sessionName = input.watchdogSessionName?.trim();
+  if (!sessionName) return null;
+  const run: ActiveCompressionRun = {
+    runId: randomUUID(),
+    sessionName,
+    startedAt: Date.now(),
+    mode: input.mode ?? 'auto',
+    ...(input.watchdogTrigger ? { trigger: input.watchdogTrigger } : {}),
+    eventCount: input.watchdogEventCount ?? input.events.length,
+  };
+  activeCompressionRuns.set(run.runId, run);
+  compressionWatchRuns.set(run.runId, { ...run });
+  return run;
+}
+
+function finishActiveCompressionRun(run: ActiveCompressionRun | null): void {
+  if (!run) return;
+  activeCompressionRuns.delete(run.runId);
+  const watchRun = compressionWatchRuns.get(run.runId);
+  if (watchRun) compressionWatchRuns.set(run.runId, { ...watchRun, finishedAt: Date.now() });
+}
+
+export function getActiveCompressionRuns(): ActiveCompressionRun[] {
+  return [...activeCompressionRuns.values()].map((run) => ({ ...run }));
+}
+
+export function getStaleSessionCompressionRun(
+  sessionName: string,
+  nowMs = Date.now(),
+  staleMs = 4 * 60_000,
+): CompressionWatchRun | null {
+  let staleRun: CompressionWatchRun | null = null;
+  for (const [runId, run] of compressionWatchRuns.entries()) {
+    if (run.finishedAt) {
+      if (nowMs - run.startedAt > 30 * 60_000) compressionWatchRuns.delete(runId);
+      continue;
+    }
+    if (run.sessionName !== sessionName) continue;
+    if (nowMs - run.startedAt < staleMs) continue;
+    if (!staleRun || run.startedAt < staleRun.startedAt) staleRun = run;
+  }
+  return staleRun ? { ...staleRun } : null;
+}
+
+export function resolveSessionCompressionWatchRuns(sessionName: string): void {
+  for (const [runId, run] of compressionWatchRuns.entries()) {
+    if (run.sessionName === sessionName) compressionWatchRuns.delete(runId);
+  }
+}
+
+export function resetActiveCompressionRunsForTests(): void {
+  activeCompressionRuns.clear();
+  compressionWatchRuns.clear();
 }
 
 export function getCompressionQueueState(): CompressionQueueState {
@@ -511,7 +597,7 @@ export async function awaitCompressionIdle(timeoutMs: number): Promise<{ idle: b
   }
 }
 
-function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
+function enqueueExclusive<T>(job: () => Promise<T>, inputForActiveRun: CompressionInput): Promise<T> {
   const prev = compressionChain;
   let release!: () => void;
   queuedCompressionCount += 1;
@@ -522,9 +608,12 @@ function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
   }).then(async () => {
     queuedCompressionCount = Math.max(0, queuedCompressionCount - 1);
     activeCompressionCount += 1;
+    let activeRun: ActiveCompressionRun | null = null;
     try {
+      activeRun = beginActiveCompressionRun(inputForActiveRun);
       return await job();
     } finally {
+      finishActiveCompressionRun(activeRun);
       activeCompressionCount = Math.max(0, activeCompressionCount - 1);
       release();
     }
@@ -539,7 +628,7 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
     incrementCounter('mem.compression.admission_closed', { reason });
     throw new CompressionAdmissionClosedError(reason);
   }
-  return enqueueExclusive(() => compressWithSdkInner(input));
+  return enqueueExclusive(() => compressWithSdkInner(input), input);
 }
 
 
@@ -561,19 +650,19 @@ export function computeTargetTokens(inputTokens: number, mode: CompressionMode =
   return Math.max(min, Math.min(max, computed));
 }
 
-function trimToTokenBudget(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
+async function trimToTokenBudget(text: string, maxTokens: number): Promise<string> {
+  if (await countTokensAsync(text) <= maxTokens) return text;
   let lo = 0;
   let hi = text.length;
   while (lo < hi) {
     const mid = Math.floor((lo + hi + 1) / 2);
-    if (countTokens(text.slice(0, mid)) <= maxTokens) lo = mid;
+    if (await countTokensAsync(text.slice(0, mid)) <= maxTokens) lo = mid;
     else hi = mid - 1;
   }
   return text.slice(0, lo).trimEnd() + '\n\n[... earlier summary truncated to bound prompt token budget ...]';
 }
 
-function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): string | undefined {
+async function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): Promise<string | undefined> {
   if (!previousSummary) return previousSummary;
   return trimToTokenBudget(previousSummary, maxTokens);
 }
@@ -583,7 +672,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
   const mode = input.mode ?? 'auto';
   const startedAt = Date.now();
   const extraRedactPatterns = input.extraRedactPatterns ?? [];
-  const previousSummary = trimPreviousSummary(
+  const previousSummary = await trimPreviousSummary(
     mode === 'auto'
       ? undefined
       : input.previousSummary
@@ -598,9 +687,32 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
       summary,
       model: '', backend: '', usedBackup: false, fromSdk: false,
       inputTokens: 0,
-      outputTokens: countTokens(summary),
+      outputTokens: await countTokensAsync(summary),
       targetTokens: input.targetTokens ?? 0,
       durationMs: Date.now() - startedAt,
+    };
+  }
+
+  // Every tier's breaker open: the answer is the local fallback, which needs
+  // none of the serialization, token counting and prompt building below.
+  // Doing that work anyway -- for every materialization target, while a
+  // backend is down for up to 30 minutes -- was pure main-thread waste.
+  const probeNow = Date.now();
+  const anyTierCallable = breakerWouldAllow(modelConfig.primaryContextBackend, probeNow)
+    || Boolean(modelConfig.backupContextBackend && modelConfig.backupContextModel
+      && breakerWouldAllow(modelConfig.backupContextBackend, probeNow));
+  if (!anyTierCallable) {
+    logger.debug({ backend: modelConfig.primaryContextBackend }, 'All compression backends open — local fallback');
+    const fallbackSummary = ensurePinnedNotesSection(
+      buildLocalFallbackSummary(events, previousSummary),
+      input.pinnedNotes ?? [],
+      extraRedactPatterns,
+    );
+    return {
+      summary: fallbackSummary,
+      model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
+      inputTokens: 0, outputTokens: 0,
+      targetTokens: input.targetTokens ?? 0, durationMs: Date.now() - startedAt,
     };
   }
 
@@ -608,7 +720,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
     maxEventChars: input.maxEventChars ?? DEFAULT_MAX_EVENT_CHARS,
     extraRedactPatterns,
   });
-  const inputTokens = countTokens(`${previousSummary ?? ''}
+  const inputTokens = await countTokensAsync(`${previousSummary ?? ''}
 ${serializedEvents}`);
   const targetTokens = input.targetTokens ?? computeTargetTokens(inputTokens, mode);
   const prompt = buildCompressionPrompt(events, previousSummary, targetTokens, {
@@ -637,7 +749,7 @@ ${serializedEvents}`);
         model: modelConfig.primaryContextModel,
         backend: modelConfig.primaryContextBackend,
         usedBackup: false, fromSdk: true,
-        inputTokens, outputTokens: countTokens(summary),
+        inputTokens, outputTokens: await countTokensAsync(summary),
         targetTokens, durationMs: Date.now() - startedAt,
       };
     } catch (err) {
@@ -668,7 +780,7 @@ ${serializedEvents}`);
           model: modelConfig.backupContextModel,
           backend: modelConfig.backupContextBackend,
           usedBackup: true, fromSdk: true,
-          inputTokens, outputTokens: countTokens(summary),
+          inputTokens, outputTokens: await countTokensAsync(summary),
           targetTokens, durationMs: Date.now() - startedAt,
         };
       } catch (err) {
@@ -695,7 +807,7 @@ ${serializedEvents}`);
   return {
     summary: fallbackSummary,
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
-    inputTokens, outputTokens: countTokens(fallbackSummary),
+    inputTokens, outputTokens: await countTokensAsync(fallbackSummary),
     targetTokens, durationMs: Date.now() - startedAt,
     errorCode: errorClassification?.code,
     errorMessage: errorMessage ? errorMessage.slice(0, 500) : undefined,
@@ -704,12 +816,12 @@ ${serializedEvents}`);
 
 // ── Provider send with completion wait ───────────────────────────────────────
 
-// MiniMax/Qwen-compatible endpoints can legitimately take longer than the
-// 20s budget when producing a structured summary. Keep the lane bounded, but
-// make the timeout configurable so field recovery can extend it without a code
-// change. The default is deliberately higher than the old 20s value while still
-// finite so a wedged provider cannot pin daemon shutdown/upgrade indefinitely.
-const DEFAULT_COMPRESSION_TIMEOUT_MS = 60_000;
+// MiniMax/Qwen-compatible endpoints can legitimately take well over 60s when
+// producing a structured summary. Default to 240s (4 minutes) globally so
+// deployments need no extra env configuration, while still allowing
+// IMCODES_COMPRESSION_TIMEOUT_MS to extend up to 10 minutes (bounded so a
+// wedged provider cannot pin daemon shutdown/upgrade indefinitely).
+const DEFAULT_COMPRESSION_TIMEOUT_MS = 240_000;
 const MIN_COMPRESSION_TIMEOUT_MS = 5_000;
 const MAX_COMPRESSION_TIMEOUT_MS = 10 * 60_000;
 
@@ -734,7 +846,18 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
   // hook adds CLI flags that cause exit code 1 in one-shot compression mode.
   // SDK query() handles subprocess lifecycle and subscription auth correctly.
   if (selection.backend === 'claude-code-sdk') {
-    return sendViaSdkQuery(prompt);
+    const selectedModel = selection.model?.trim() || undefined;
+    // Apply a CC preset's third-party endpoint env (ANTHROPIC_BASE_URL/API_KEY/
+    // pinned model) so memory compression honors the configured provider
+    // instead of silently falling back to the default Anthropic endpoint.
+    const preset = selection.preset?.trim();
+    if (preset) {
+      const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+      const presetEnv = await resolvePresetEnv(preset, undefined, selectedModel);
+      const resolvedModel = presetEnv['ANTHROPIC_MODEL']?.trim() || selectedModel;
+      return sendViaSdkQuery(prompt, presetEnv, resolvedModel);
+    }
+    return sendViaSdkQuery(prompt, undefined, selectedModel);
   }
 
   // Other backends: use the transport provider's send/onComplete flow.
@@ -781,7 +904,7 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
  * Strips CLAUDECODE env to avoid nested-session detection.
  * SDK manages subprocess lifecycle and subscription auth.
  */
-async function sendViaSdkQuery(prompt: string): Promise<string> {
+async function sendViaSdkQuery(prompt: string, presetEnv?: Record<string, string>, model?: string): Promise<string> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const abortController = new AbortController();
   let timedOut = false;
@@ -803,6 +926,10 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
         maxTurns: 1,
         pathToClaudeCodeExecutable,
         abortController,
+        // CLAUDECODE is already stripped from process.env above, so the merged
+        // env is safe to forward; preset vars override the default endpoint.
+        ...(presetEnv && Object.keys(presetEnv).length > 0 ? { env: { ...process.env, ...presetEnv } } : {}),
+        ...(model ? { model } : {}),
       },
     }) as AsyncIterable<unknown> & { close?: () => void };
     for await (const msg of stream) {
@@ -1093,20 +1220,27 @@ export function serializeEvents(events: LocalContextEvent[], options: SerializeE
         : undefined;
     const compressed = compressToolEvent(toolName, content, event.id, maxEventChars);
     const redacted = redactSensitiveText(compressed, options.extraRedactPatterns ?? []);
-    const truncated = truncateByTokens(redacted, Math.max(1, countTokens(redacted.slice(0, maxEventChars))));
-    parts.push(`[${event.eventType}] ${truncated}`);
+    parts.push(`[${event.eventType}] ${truncateEventText(redacted, maxEventChars)}`);
   }
   return parts.join('\n\n');
 }
 
-function truncateByTokens(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
-  const headBudget = Math.max(1, Math.floor(maxTokens * 0.9));
-  const tailBudget = Math.max(1, maxTokens - headBudget);
-  const head = trimToTokenBudget(text, headBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const reversedTail = trimToTokenBudget([...text].reverse().join(''), tailBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const tail = [...reversedTail].reverse().join('');
-  return `${head}\n...[truncated]...\n${tail}`;
+/**
+ * Keep an event's first 90% and last 10% of `maxChars`. This used to be done
+ * in tokens -- but the token budget was itself "the tokens in the first
+ * maxChars characters", so it was a character limit computed by running the
+ * exact tokenizer over every event twice, plus a binary search of further
+ * tokenizer runs whenever it cut. Synchronous WASM on the main thread: over a
+ * few hundred events that froze the daemon for 0.5-1.3 s per compression (seen
+ * live on a 87-session node, several times a minute, with the SDK backend
+ * failing so every one of those runs was thrown away).
+ */
+function truncateEventText(text: string, maxChars: number): string {
+  const chars = [...text];
+  if (chars.length <= maxChars) return text;
+  const headChars = Math.max(1, Math.floor(maxChars * 0.9));
+  const tailChars = Math.max(1, maxChars - headChars);
+  return `${chars.slice(0, headChars).join('')}\n...[truncated]...\n${chars.slice(-tailChars).join('')}`;
 }
 
 // ── Local fallback ───────────────────────────────────────────────────────────

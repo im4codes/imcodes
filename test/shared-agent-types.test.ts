@@ -1,11 +1,31 @@
 import { describe, expect, it } from 'vitest';
-import { getSessionRuntimeType, isTransportSessionAgentType } from '../shared/agent-types.js';
+import {
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+  REMOVED_SESSION_AGENT_TYPES,
+  getSessionRuntimeType,
+  isRemovedSessionAgentType,
+  isTransportSessionAgentType,
+} from '../shared/agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../shared/codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from '../shared/agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../shared/hermes-agent.js';
 
 describe('shared agent type helpers', () => {
   it('recognizes transport-backed session agent types', () => {
     expect(isTransportSessionAgentType('claude-code-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe(true);
     expect(isTransportSessionAgentType('codex-sdk')).toBe(true);
+    expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
+    expect(isTransportSessionAgentType('muse-code-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(HERMES_AGENT_PROVIDER_ID)).toBe(true);
+    expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(AGY_SDK_PROVIDER_ID)).toBe(true);
+    expect(isTransportSessionAgentType('deepseek-harness')).toBe(true);
+    expect(isTransportSessionAgentType('pi')).toBe(true);
+    expect(isTransportSessionAgentType(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe(true);
+    expect(isTransportSessionAgentType(CODEBUDDY_PROVIDER_IDS.INTERNATIONAL)).toBe(true);
+    expect(isTransportSessionAgentType('opencode-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qwen')).toBe(true);
     expect(isTransportSessionAgentType('openclaw')).toBe(true);
     expect(isTransportSessionAgentType('claude-code')).toBe(false);
@@ -13,9 +33,29 @@ describe('shared agent type helpers', () => {
 
   it('maps session agent types to runtime types', () => {
     expect(getSessionRuntimeType('claude-code-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe('transport');
     expect(getSessionRuntimeType('codex-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('qoder-sdk')).toBe('transport');
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('muse-code-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(HERMES_AGENT_PROVIDER_ID)).toBe('transport');
+    expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(AGY_SDK_PROVIDER_ID)).toBe('transport');
+    expect(getSessionRuntimeType('opencode-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('pi')).toBe('transport');
+    expect(getSessionRuntimeType(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe('transport');
+    expect(getSessionRuntimeType(CODEBUDDY_PROVIDER_IDS.INTERNATIONAL)).toBe('transport');
+    expect(getSessionRuntimeType('opencode')).toBe('process');
     expect(getSessionRuntimeType('claude-code')).toBe('process');
     expect(getSessionRuntimeType('shell')).toBe('process');
+  });
+
+  it('identifies removed legacy session agent types', () => {
+    expect(REMOVED_SESSION_AGENT_TYPES).toEqual(['gemini', 'gemini-sdk']);
+    expect(isRemovedSessionAgentType('gemini')).toBe(true);
+    expect(isRemovedSessionAgentType('gemini-sdk')).toBe(true);
+    expect(isRemovedSessionAgentType('claude-code')).toBe(false);
+    expect(isRemovedSessionAgentType('codex-sdk')).toBe(false);
+    expect(isRemovedSessionAgentType('totally-unknown')).toBe(false);
   });
 });

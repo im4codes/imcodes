@@ -1,6 +1,34 @@
-import { render, screen, cleanup } from '@testing-library/preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { render, screen, cleanup, act } from '@testing-library/preact';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MobileDpad, DPAD_ARROW_SEQUENCES, resolveDpadDirection } from '../../src/components/MobileDpad.js';
+
+function dispatchPointer(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel',
+  values: { pointerId: number; clientX: number; clientY: number },
+): void {
+  const eventName =
+    type === 'pointerdown' && !('onpointerdown' in target)
+      ? 'PointerDown'
+      : type === 'pointermove' && !('onpointermove' in target)
+        ? 'PointerMove'
+        : type === 'pointerup' && !('onpointerup' in target)
+          ? 'PointerUp'
+          : type === 'pointercancel' && !('onpointercancel' in target)
+            ? 'PointerCancel'
+            : type;
+  const event = new MouseEvent(eventName, {
+    bubbles: true,
+    cancelable: true,
+    clientX: values.clientX,
+    clientY: values.clientY,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: values.pointerId },
+    pointerType: { value: 'touch' },
+  });
+  target.dispatchEvent(event);
+}
 
 afterEach(cleanup);
 
@@ -69,5 +97,51 @@ describe('MobileDpad render', () => {
     const pad = screen.getByRole('button', { name: 'Arrow keys' });
     expect(pad.getAttribute('data-disabled')).toBe('true');
     expect(pad.getAttribute('aria-disabled')).toBe('true');
+  });
+
+  it('appends optional className while preserving shortcut-dpad and uses latest onDirection on hold repeat without stale closures', () => {
+    vi.useFakeTimers();
+    try {
+      const received: string[] = [];
+      const firstCb = (seq: string) => received.push(`first:${seq}`);
+      const secondCb = (seq: string) => received.push(`second:${seq}`);
+
+      const { rerender } = render(
+        <MobileDpad className="remote-desktop-combo-dpad" onDirection={firstCb} title="Arrow keys" />,
+      );
+      const pad = screen.getByRole('button', { name: 'Arrow keys' });
+      expect(pad.className).toContain('shortcut-btn');
+      expect(pad.className).toContain('shortcut-dpad');
+      expect(pad.className).toContain('remote-desktop-combo-dpad');
+
+      act(() => {
+        dispatchPointer(pad, 'pointerdown', { pointerId: 1, clientX: 50, clientY: 50 });
+        dispatchPointer(pad, 'pointermove', { pointerId: 1, clientX: 20, clientY: 50 });
+      });
+      expect(received).toEqual([`first:${DPAD_ARROW_SEQUENCES.left}`]);
+
+      // Parent re-renders with a new callback before auto-repeat fires
+      rerender(
+        <MobileDpad className="remote-desktop-combo-dpad" onDirection={secondCb} title="Arrow keys" />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(received).toEqual([
+        `first:${DPAD_ARROW_SEQUENCES.left}`,
+        `second:${DPAD_ARROW_SEQUENCES.left}`,
+      ]);
+
+      // Flipping disabled=true mid-hold stops auto-repeat immediately
+      rerender(
+        <MobileDpad className="remote-desktop-combo-dpad" disabled onDirection={secondCb} title="Arrow keys" />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(received).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

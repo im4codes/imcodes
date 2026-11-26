@@ -2,39 +2,57 @@
  * SubSessionWindow — floating, draggable/resizable window for a sub-session.
  * Uses the full SessionControls for input (same as the main session).
  */
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
-import { SessionControls } from './SessionControls.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
-import { useTimeline } from '../hooks/useTimeline.js';
-import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { DaemonRemoteDesktopControl } from './DaemonRemoteDesktopControl.js';
+import type { MachineListItem } from '../api/machines.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
+import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
+import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import { useQuickData } from './QuickInputPanel.js';
-import { useSharedGitChanges } from '../git-status-store.js';
+import { useSharedGitChangesCount } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
+import { dispatchSessionSend } from '../session-send-transport.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
+import { isShareScopedState, type SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
+import { shouldSuppressSubSessionBarForKeyboard } from '../mobile-keyboard.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
+import { focusComposerElement } from '../util/composer-focus.js';
+import { startFloatingWindowDrag, startFloatingWindowResize } from './window-drag.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
+  isWindowChromeDoubleClickTarget,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
+  resolveSessionTabsBottom,
   shouldPersistGeometry,
   viewportWorkspaceBelowSessionTabs,
   type WindowGeometry,
@@ -43,8 +61,12 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
-import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
+import { usePendingTaskQuote, type PendingTaskQuotePayload } from '../hooks/usePendingTaskQuote.js';
+import { useStableCallback } from '../hooks/useStableCallback.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import { RESIZE_DIRS, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -56,12 +78,30 @@ interface Props {
   sub: SubSession;
   ws: WsClient | null;
   connected: boolean;
-  /** When false, timeline and terminal subscriptions are paused to save CPU. */
+  /** Whether this is the focused/topmost visible sub-session window. */
   active: boolean;
+  /** False while its owning main-session tab is hidden; the mounted window and
+   * chat state are retained so returning to the tab never rebuilds a blank pane. */
+  visible?: boolean;
+  /** Split executor visit: start collapsed without changing session filtering or saved preferences. */
+  taskPairPanelVisitKey?: string;
+  /** Render task-pair details in this window; split pairs show them only on the auditor side. */
+  showTaskPairPanel?: boolean;
+  /** Pair split metadata; absent for ordinary sub-session windows. */
+  pairTaskTitle?: string | null;
+  pairRole?: 'executor' | 'auditor' | null;
+  /** Report the trailing pending ask.question (or null) for dialog re-surface. */
+  onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
+  /** Submit an inline timeline answer for a trailing ask.question event. */
+  onAskAnswer?: (toolUseId: string, answer: string) => boolean | void;
+  /** Notify parent when this sub-session window switches between chat and terminal mode. */
+  onViewModeChange?: (sessionName: string, viewMode: 'chat' | 'terminal') => void;
   idleFlashToken?: number;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
+  /** Leave this task's paired layout without stopping either session. */
+  onClosePairSplit?: () => void;
   onClose: () => void;
   maximized?: boolean;
   onToggleMaximized?: () => void;
@@ -70,12 +110,19 @@ interface Props {
   desktopLayoutCapable?: boolean;
   onRestart: () => void;
   onRename: () => void;
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  onLiveSessionStateChange?: (state: SubSession['state']) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
+  /** Open a Remote Desktop window by nodeId or serverId. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -92,6 +139,10 @@ interface Props {
   onDesktopFileBrowserOpen?: () => void;
   onDesktopFileBrowserFocus?: () => void;
   onDesktopFileBrowserClose?: () => void;
+  /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
+  onInputRef?: (el: HTMLDivElement | null) => void;
+  /** Optional: register this sub-session's chat scroll-to-bottom callback with app.tsx. */
+  onChatScrollFn?: (fn: () => void) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -109,11 +160,28 @@ interface Props {
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
+  pendingTaskQuote?: PendingTaskQuotePayload | null;
+  onPendingTaskQuoteConsumed?: (nonce: number) => void;
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  sharedState?: SharedStateSummary | null;
   accentColor?: string;
+  /**
+   * Whether the daemon behind `serverId` is currently reachable. Gates the
+   * remote-desktop quick-open/install button placed to the left of this
+   * window's own file-browser toggle — same machine `serverId` and the
+   * nested FileBrowser already target, same signal the main-session toolbar
+   * uses for its own DaemonRemoteDesktopControl.
+   */
+  daemonOnline?: boolean;
+  /** Opens the remote-desktop workspace for a machine. Same callback the main-session toolbar passes to its own DaemonRemoteDesktopControl. */
+  onOpenRemoteDesktop?: (machine: MachineListItem) => void;
+  /** This user owns the daemon: its remote-desktop button may offer setup. */
+  remoteDesktopCanSetUp?: boolean;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -174,8 +242,7 @@ export function measureMobileSubSessionBarHeight(
 }
 
 function isMobileSubSessionBarSuppressed(doc: Document = document): boolean {
-  const root = doc.documentElement;
-  return root.classList.contains('kb-open') || root.classList.contains('input-focused');
+  return shouldSuppressSubSessionBarForKeyboard(doc);
 }
 
 function getInitialMobileSubSessionBarHeight(isMobile: boolean): number {
@@ -193,11 +260,11 @@ function currentDesktopBounds(): WorkspaceBounds {
   }));
 }
 
-function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
+function clampDesktopGeom(geom: WindowGeometry, options?: { minW?: number; minH?: number }): WindowGeometry {
   const bounds = currentDesktopBounds();
   return clampGeometryFullyIntoWorkspace(geom, bounds, {
-    minW: MIN_W,
-    minH: MIN_H,
+    minW: options?.minW ?? MIN_W,
+    minH: options?.minH ?? MIN_H,
   });
 }
 
@@ -227,9 +294,12 @@ function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
   try {
     const raw = localStorage.getItem(LOCAL_KEY(id));
     if (raw) {
-      const parsed = JSON.parse(raw) as { geom?: unknown; viewMode?: unknown };
+      const parsed = JSON.parse(raw) as { geom?: unknown; viewMode?: unknown; isSplit?: boolean };
+      const isSplit = Boolean(parsed.isSplit || (parsed.geom as { isSplit?: boolean } | undefined)?.isSplit);
+      const minW = isSplit ? Math.min(MIN_W, Math.max(200, (parsed.geom as { w?: number } | undefined)?.w ?? MIN_W)) : MIN_W;
+      const minH = isSplit ? Math.min(MIN_H, Math.max(150, (parsed.geom as { h?: number } | undefined)?.h ?? MIN_H)) : MIN_H;
       return {
-        geom: clampDesktopGeom(normalizeWindowGeometry(parsed.geom, fallback)),
+        geom: clampDesktopGeom(normalizeWindowGeometry(parsed.geom, fallback), { minW, minH }),
         viewMode: parsed.viewMode === 'terminal' || parsed.viewMode === 'chat' ? parsed.viewMode : 'chat',
       };
     }
@@ -244,21 +314,22 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
 }: Props) {
+  recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
   const { t } = useTranslation();
-  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, visible);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const isDesktopMaximized = desktopLayoutCapable && maximized;
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
   // ── Shared git-changes cache for the 📁 badge ─────────────────────────────
   // Uses the same git-status-store as the main session and FileBrowser.
-  // When cwd matches another consumer (main session, other sub-sessions),
-  // a single `fs.git_status` request feeds all of them. No separate polling
-  // loop needed — `useSharedGitChanges` polls every 30s automatically.
-  const sharedGitFiles = useSharedGitChanges(ws, sub.cwd ?? null);
-  const gitChangesCount = sharedGitFiles.length;
+  // When no FileBrowser list consumer is mounted, sends lightweight summaryOnly
+  // count requests; when cwd matches FileBrowser, shares/reuses its updates.
+  // Gated on `visible` so hidden/minimized retained windows don't poll every 30s.
+  const gitChangesCount = useSharedGitChangesCount(ws, visible ? (sub.cwd ?? null) : null, { serverId });
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
@@ -268,14 +339,36 @@ export function SubSessionWindow({
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     forceRefresh: timelineForceRefresh,
+    loadingOlder,
+    hasOlderHistory,
+    loadOlderEvents,
+    historyGap,
+    loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
+    // Exactly one focused/topmost window owns opportunistic recovery. Other
+    // visible windows stay subscribed and cache-warm, but must not all launch
+    // HTTP/IDB work together when the browser resumes after sleep.
     isActiveSession: active,
-    // Window mounted = visible; participate in resume broadcast even when
-    // minimized/inactive so timeline stays fresh on focus / online / probe.
-    isVisible: true,
+    isVisible: visible,
+    subscriptionMode: visible ? 'full' : 'summary',
+    // Keep visible inactive windows live-subscribed, but defer their expensive
+    // history/IDB bootstrap until focus. This preserves the full live stream
+    // contract without issuing N large history reads during startup.
+    // On-screen windows must paint their local cache and obtain one bounded
+    // tail/delta even before focus; hidden windows defer bootstrap entirely.
+    bootstrapWhenVisible: visible,
+    incognito: sub.incognito,
   });
+
+  // Re-surface a still-pending question in the dedicated dialog from history
+  // (only the focused window, to avoid multiple windows racing the app dialog).
+  useEffect(() => {
+    if (!active || !onPendingQuestion) return;
+    onPendingQuestion(sub.sessionName, findTrailingAskQuestion(events));
+  }, [active, onPendingQuestion, sub.sessionName, events]);
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
 
@@ -285,24 +378,59 @@ export function SubSessionWindow({
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
-  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const pendingUserSend = useMemo(() => hasPendingUserSend(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
+  const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
+  const activeTimelineTurn = useMemo(() => (
+    sub.authoritativeIdleAt != null
+      && timelineLastEventTs != null
+      && timelineLastEventTs <= sub.authoritativeIdleAt
+      ? false
+      : hasActiveTimelineTurn(events)
+  ), [events, sub.authoritativeIdleAt, timelineLastEventTs]);
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
-    () => getTailSessionState(events) ?? sub.state ?? null,
-    [events, sub.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: sub.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+      authoritativeIdleAt: sub.authoritativeIdleAt,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.authoritativeIdleAt, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
+
+  const handleLiveSessionStateChange = useStableCallback((state: SubSession['state']) => {
+    onLiveSessionStateChange?.(state);
+  });
+
+  useEffect(() => {
+    if (!liveSessionState || liveSessionState === sub.state) return;
+    if (liveSessionState === 'running' || liveSessionState === 'idle' || liveSessionState === 'queued') {
+      handleLiveSessionStateChange(liveSessionState as SubSession['state']);
+    }
+  }, [liveSessionState, sub.state, handleLiveSessionStateChange]);
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own
   // cwd, so opening 📁 here should browse THIS sub-session's working directory
-  // (not the parent main session's). The overlay/panel is rendered locally so
-  // it layers above this sub-session window instead of being hidden behind it.
+  // (not the parent main session's). The mobile overlay is portaled to body so
+  // the sub-session's lower stacking context cannot trap it below app chrome.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
+  const baseOpenNodeGroups = useNodeGroupsNav();
+  const handleOpenNodeGroupsFromBrowser = useCallback(() => {
+    if (isMobile) setShowFileBrowser(false);
+    baseOpenNodeGroups?.();
+  }, [isMobile, baseOpenNodeGroups]);
 
   // Sync the desktop child file-browser open/close into the shared window
   // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
-  // an inline overlay, not a managed floating window).
+  // a portaled full-screen overlay, not a managed floating window).
   useEffect(() => {
-    if (isMobile) return;
+    if (isMobile || !visible) return;
     if (showFileBrowser) {
       onDesktopFileBrowserOpen?.();
     } else {
@@ -311,12 +439,30 @@ export function SubSessionWindow({
   }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
-  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
+  const [taskQuote, setTaskQuote] = useState<string | null>(null);
   const [composerText, setComposerText] = useState('');
-  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
-  const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
+  const {
+    state: executionCloneLaunchState,
+    launch: launchExecutionClones,
+  } = useExecutionCloneLaunch({
+    ws,
+    connected,
+    sessionName: sub.sessionName,
+    ownerSessionName: sub.parentSession ?? sub.sessionName,
+  });
+  const addQuote = useCallback((text: string) => {
+    setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
+  }, []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
+  const clearTaskQuote = useCallback(() => setTaskQuote(null), []);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Mirrors the main-session SessionPane handler so optimistic-UX behavior is
@@ -325,7 +471,7 @@ export function SubSessionWindow({
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
-    if (!ws || !connected) return;
+    if (!ws && !serverId) return;
     const failedEvent = eventsRef.current.find(
       (e) => e.type === 'user.message'
         && e.payload.failed === true
@@ -340,12 +486,18 @@ export function SubSessionWindow({
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', {
+      // Retry replays the ORIGINAL send verbatim: `resendExtra` already carries
+      // the alias A′ map resolved when the user first composed it, so we do NOT
+      // re-resolve here (Cx1-2/Cx1-3).
+      dispatchSessionSend(ws, serverId, {
         sessionName: sub.sessionName,
         text,
         ...(resendExtra ?? {}),
         commandId: newCommandId,
+      }, (err) => {
+        markOptimisticFailed(newCommandId, err instanceof Error ? err.message : String(err || 'Send failed'));
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -353,7 +505,7 @@ export function SubSessionWindow({
       ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
       ...(resendExtra ? { resendExtra } : {}),
     });
-  }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
+  }, [markOptimisticFailed, retryOptimisticMessage, serverId, sub.sessionName, ws]);
 
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -362,11 +514,53 @@ export function SubSessionWindow({
   const isTransport = effectiveRuntimeType === 'transport';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.subId === sub.id && detail?.geom) {
+        setGeom(clampDesktopGeom(detail.geom, {
+          minW: Math.min(MIN_W, Math.max(200, detail.geom.w)),
+          minH: Math.min(MIN_H, Math.max(150, detail.geom.h)),
+        }));
+      }
+    };
+    window.addEventListener('deck:subsession-geom', handler);
+    return () => window.removeEventListener('deck:subsession-geom', handler);
+  }, [isMobile, sub.id]);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
+  useEffect(() => {
+    onViewModeChange?.(sub.sessionName, viewMode);
+  }, [onViewModeChange, sub.sessionName, viewMode]);
   const [maximizeBoundsVersion, setMaximizeBoundsVersion] = useState(0);
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
+  usePendingTaskQuote(visible, pendingTaskQuote, onPendingTaskQuoteConsumed, setTaskQuote, inputRef);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
+  useEffect(() => {
+    if (!visible) {
+      onInputRefRef.current?.(null);
+      return;
+    }
+    if (inputRef.current && inputRef.current.isConnected) {
+      onInputRefRef.current?.(inputRef.current);
+      return;
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      const id = requestAnimationFrame(() => {
+        const el = inputRef.current;
+        onInputRefRef.current?.(el && el.isConnected ? el : null);
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    return undefined;
+  }, [visible, active, viewMode]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -375,8 +569,33 @@ export function SubSessionWindow({
   viewModeRef.current = viewMode;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
+  const onChatScrollFnRef = useRef(onChatScrollFn);
+  onChatScrollFnRef.current = onChatScrollFn;
   const onTermScrollBottomFn = useCallback((fn: () => void) => { termScrollRef.current = fn; }, []);
-  const onChatScrollBottomFn = useCallback((fn: () => void) => { chatScrollRef.current = fn; }, []);
+  const onChatScrollBottomFn = useCallback((fn: () => void) => {
+    chatScrollRef.current = fn;
+    onChatScrollFnRef.current?.(fn);
+  }, []);
+
+  // Scroll sub-session chat to bottom whenever this window becomes visible & active
+  // (e.g. opened, restored from retained/minimized state, or focused via shortcut).
+  const prevActiveVisibleChatRef = useRef(false);
+  useEffect(() => {
+    const isActiveVisibleChat = Boolean(visible && active && viewMode === 'chat');
+    const becameActiveVisible = isActiveVisibleChat && !prevActiveVisibleChatRef.current;
+    prevActiveVisibleChatRef.current = isActiveVisibleChat;
+    if (!becameActiveVisible) return undefined;
+    if (chatScrollRef.current) {
+      chatScrollRef.current();
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      const id = requestAnimationFrame(() => {
+        chatScrollRef.current?.();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    return undefined;
+  }, [visible, active, viewMode]);
 
   // SessionInfo shape for SessionControls — read metadata from sub-session object directly
   const sessionInfo: SessionInfo = {
@@ -397,6 +616,7 @@ export function SubSessionWindow({
               ? 'error'
               : 'idle',
     projectDir: sub.cwd ?? undefined,
+    ccPreset: sub.ccPresetId ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
@@ -408,13 +628,31 @@ export function SubSessionWindow({
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
     quotaMeta: sub.quotaMeta ?? undefined,
+    codexCreditsBalance: sub.codexCreditsBalance ?? undefined,
+    codexCreditsUnlimited: sub.codexCreditsUnlimited ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: effectiveRuntimeType,
+    sessionInstanceId: sub.sessionInstanceId ?? undefined,
+    runtimeEpoch: sub.runtimeEpoch ?? undefined,
+    providerId: sub.providerId ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
+    supervisionMode: sub.supervisionMode ?? undefined,
+    supervisionHeartbeat: sub.supervisionHeartbeat ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
+    sharedState,
+    incognito: sub.incognito,
   };
+  // Keep the controls' working sweep on the same reconciled live state as the
+  // footer. Transport sub-session metadata can lag the authoritative timeline
+  // idle edge; passing the stale outer `sub.state` made the footer show idle
+  // while SessionControls continued rendering its running scan indefinitely.
+  const controlsSessionInfo: SessionInfo = isTransport
+    && liveSessionState
+    && liveSessionState !== sessionInfo.state
+    ? { ...sessionInfo, state: liveSessionState as SessionInfo['state'] }
+    : sessionInfo;
 
   useEffect(() => {
     if (!shouldPersistGeometry(isDesktopMaximized)) return;
@@ -422,52 +660,76 @@ export function SubSessionWindow({
   }, [sub.id, geom, viewMode, isDesktopMaximized]);
 
   useEffect(() => {
-    if (isMobile) return;
+    if (isMobile || !visible) return;
     const onResize = () => {
       if (isDesktopMaximized) {
         setMaximizeBoundsVersion((v) => v + 1);
       } else {
-        setGeom((g) => clampDesktopGeom(g));
+        setGeom((g) => {
+          const next = clampDesktopGeom(g);
+          return next.x === g.x && next.y === g.y && next.w === g.w && next.h === g.h ? g : next;
+        });
       }
     };
     window.addEventListener('resize', onResize);
-    requestAnimationFrame(onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, [isMobile, isDesktopMaximized]);
+    // Cancel on unmount: a frame firing after the window closed would set
+    // state on an unmounted component and schedule a render nobody owns.
+    const frame = requestAnimationFrame(onResize);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [isMobile, isDesktopMaximized, visible]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
   useEffect(() => {
+    if (!visible) return undefined;
     if (viewMode === 'chat') {
-      setTimeout(() => chatScrollRef.current?.(), 50);
-    } else if (viewMode === 'terminal') {
-      requestAnimationFrame(() => {
+      const timer = setTimeout(() => chatScrollRef.current?.(), 50);
+      return () => clearTimeout(timer);
+    }
+    if (viewMode === 'terminal') {
+      const frame = requestAnimationFrame(() => {
         termFitFnRef.current?.();
         if (ws && connected && active) {
           try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
         }
       });
+      return () => cancelAnimationFrame(frame);
     }
-  }, [viewMode, ws, connected, active, sub.sessionName]);
+    return undefined;
+  }, [viewMode, ws, connected, active, sub.sessionName, visible]);
 
-  // Re-subscribe terminal on mount so the server sends a fresh snapshot.
-  // SubSessionWindow unmounts on minimize, so without this the remounted
-  // TerminalView would start empty (no snapshot, only incremental data).
+  // Shell/script window: hold the raw PTY stream for the window's ENTIRE
+  // visible lifetime — NOT just while focused. Users often keep one at the
+  // side to observe, so it must keep updating regardless of focus. Hidden
+  // retained windows release the stream without discarding their UI state.
+  // (Previously this bailed with
+  // `if (isShell && !active) return` and unsubscribed on focus loss, which froze
+  // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
+  useTerminalRawHold(ws, connected, visible && isShell && !isTransport, sub.sessionName);
+
+  // These arrive from app.tsx as inline arrows and would otherwise change
+  // identity on every timeline event, defeating ChatView's memo boundary.
+  const stableOnViewRepo = useStableCallback(onViewRepo);
+  const stableOnPreviewFile = useStableCallback(onPreviewFile);
+  const stableOnOpenLocalWebPreview = useStableCallback(onOpenLocalWebPreview);
+  const stableOnCloudDocClick = useStableCallback(onCloudDocClick);
+  const stableOnRemoteDesktopClick = useStableCallback(onRemoteDesktopClick);
+
+  // Non-shell window: subscribe raw only while focused (full-fidelity view); when
+  // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
+  // Re-subscribe on mount/restore so the server sends a fresh snapshot.
   useEffect(() => {
-    if (!ws || !connected || isTransport) return;
-    if (isShell && !active) return;
+    if (!visible || !ws || !connected || isTransport || isShell) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
-    if (!raw) {
-      return;
-    }
+    if (!raw) return;
     return () => {
-      try {
-        if (isShell) ws.unsubscribeTerminal(sub.sessionName);
-        else ws.subscribeTerminal(sub.sessionName, false);
-      } catch { /* ignore */ }
+      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
+  }, [ws, connected, sub.sessionName, active, visible, isTransport, isShell]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
@@ -475,15 +737,6 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
-  const memorySummaryProjectId = useMemo(() => {
-    const parent = sub.parentSession
-      ? sessions?.find((session) => session.name === sub.parentSession)
-      : undefined;
-    return sub.contextNamespace?.projectId
-      ?? parent?.contextNamespace?.projectId
-      ?? null;
-  }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
-
   const executionTemplateDisplayName = useMemo(() => {
     const template = executionRouting.templateSessionName;
     if (!template) return null;
@@ -511,50 +764,25 @@ export function SubSessionWindow({
   const handleRunExecutionClones = useCallback(() => {
     const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
-    const commandId = globalThis.crypto?.randomUUID?.()
-      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setExecutionClonesBusy(true);
-    try {
-      ws.sendExecutionClones({
-        sessionName: sub.sessionName,
-        text,
-        commandId,
-        dedicatedExecutionRouting: {
-          enabled: true,
-          templateSessionName: executionRouting.templateSessionName,
-          maxParallelClones: executionRouting.limits.maxParallelClones,
-          maxQueuedClones: executionRouting.limits.maxQueuedClones,
-          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
-          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
-        },
-      });
-    } finally {
-      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
-    }
-  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
-
-  const handleSyncMemorySummaries = useCallback(async () => {
-    if (!ws || !connected || syncingMemorySummaries) return;
-    setSyncingMemorySummaries(true);
-    try {
-      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId, undefined, {
-        sources: [localPersonalMemorySummarySource(ws)],
-      });
-      if (!text) return;
-      const commandId = globalThis.crypto?.randomUUID?.()
-        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
-      addOptimisticUserMessage(text, commandId);
-      scrollToBottom();
-    } catch {
-      // Non-blocking context sync: leave normal chat/send controls untouched.
-    } finally {
-      setSyncingMemorySummaries(false);
-    }
-  }, [addOptimisticUserMessage, connected, memorySummaryProjectId, scrollToBottom, sub.sessionName, syncingMemorySummaries, t, ws]);
+    // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
+    // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
+    // dispatched through the delegation path, not the direct human
+    // handleSend path, so — like P2P / agent send_message — it deliberately
+    // carries NO resolvedAliases.
+    launchExecutionClones({
+      text,
+      templateSessionName: executionRouting.templateSessionName,
+      ...executionRouting.limits,
+    });
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
-  const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
+  const activeInteractionCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => {
+    activeInteractionCleanupRef.current?.();
+    activeInteractionCleanupRef.current = null;
+  }, []);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
     const clamped = clampDesktopGeom({ x, y, w, h });
@@ -567,43 +795,43 @@ export function SubSessionWindow({
       return;
     }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
-    dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
-    onFocus();
-    const onMove = (me: MouseEvent) => {
-      if (!dragStart.current) return;
-      const dx = me.clientX - dragStart.current.mx;
-      const dy = me.clientY - dragStart.current.my;
-      setGeom((g) => {
-        const { x, y } = clampPos(dragStart.current!.ox + dx, dragStart.current!.oy + dy, g.w);
-        return { ...g, x, y };
-      });
-    };
-    const onUp = () => {
-      dragStart.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
     e.preventDefault();
-  }, [isDesktopMaximized, onFocus, clampPos]);
+    activeInteractionCleanupRef.current?.();
+    onFocus();
+    const cancel = startFloatingWindowDrag({
+      element: swipeBackRef.current,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: geomRef.current,
+      clampPos: (x, y, w, h) => clampPos(x, y, w, h),
+      onCommit: (x, y) => {
+        activeInteractionCleanupRef.current = null;
+        setGeom((g) => (g.x === x && g.y === y ? g : { ...g, x, y }));
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
+  }, [isDesktopMaximized, onFocus, clampPos, swipeBackRef]);
 
   const onHeaderMouseDown = startDrag;
 
   // ── Resizing ──────────────────────────────────────────────────────────────
-  type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+  // Which edge is being dragged, or null. Drives the lit affordance: a resize
+  // routinely drags the pointer off the 6px strip, so `:hover` alone would blink
+  // the indicator out mid-gesture.
+  const [resizingDir, setResizingDir] = useState<ResizeDir | null>(null);
 
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
+    activeInteractionCleanupRef.current?.();
     onFocus();
+    setResizingDir(dir);
     const startG = { ...geomRef.current };
-    const sx = e.clientX, sy = e.clientY;
-    const onMove = (me: MouseEvent) => {
-      const dx = me.clientX - sx;
-      const dy = me.clientY - sy;
-      setGeom((_g) => {
+    const cancel = startFloatingWindowResize({
+      startX: e.clientX,
+      startY: e.clientY,
+      computeGeometry: (dx, dy) => {
         let { x, y, w, h } = { ...startG };
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
@@ -615,18 +843,21 @@ export function SubSessionWindow({
           h = startBottom - y;
         }
         return clampDesktopGeom({ x, y, w, h });
-      });
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+      },
+      onUpdate: (next) => setGeom(next),
+      onEnd: () => {
+        activeInteractionCleanupRef.current = null;
+        setResizingDir(null);
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
   }, [isDesktopMaximized, onFocus]);
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const pairWindow = pairTaskTitle !== null && pairRole !== null;
+  const titleText = pairWindow ? (pairTaskTitle || t('taskPair.panel_untitled')) : typeLabel;
+  const subtitleText = pairWindow ? (typeLabel || sub.sessionName || agentTag) : null;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar
   const isPinnable = !!onPin;
@@ -643,6 +874,16 @@ export function SubSessionWindow({
     onFocus();
     onToggleMaximized?.();
   }, [onFocus, onToggleMaximized]);
+
+  // Double-click on the header toggles the same in-window maximize as the
+  // header button (not browser/OS fullscreen). Header controls keep their own
+  // behaviour: only the bare chrome (drag icon, title text, empty space) counts.
+  const handleHeaderDoubleClick = useCallback((event: MouseEvent) => {
+    if (!desktopLayoutCapable || !onToggleMaximized) return;
+    if (!isWindowChromeDoubleClickTarget(event.target)) return;
+    event.preventDefault();
+    handleToggleMaximized();
+  }, [desktopLayoutCapable, handleToggleMaximized, onToggleMaximized]);
 
   const restoreBeforeClosing = useCallback(() => {
     if (maximized) onRestoreBeforeClose?.();
@@ -713,23 +954,37 @@ export function SubSessionWindow({
   }, [lastCostEvent?.costUsd, sub.sessionName]);
 
   const [vvh, setVvh] = useState(() => window.visualViewport?.height ?? window.innerHeight);
+  const [, setUiZoomTick] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
     const vv = window.visualViewport;
-    if (!vv) return;
-    const update = () => setVvh(vv.height);
-    vv.addEventListener('resize', update);
-    return () => vv.removeEventListener('resize', update);
+    const update = () => {
+      setVvh(( window.visualViewport?.height ?? window.innerHeight));
+      setUiZoomTick((n) => n + 1);
+    };
+    vv?.addEventListener('resize', update);
+    window.addEventListener(UI_SCALE_EVENT, update);
+    return () => {
+      vv?.removeEventListener('resize', update);
+      window.removeEventListener(UI_SCALE_EVENT, update);
+    };
   }, [isMobile]);
 
   const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
+  const [sessionTabsBottom, setSessionTabsBottom] = useState(() => (
+    isMobile && typeof document !== 'undefined' ? resolveSessionTabsBottom(document) : 0
+  ));
   useLayoutEffect(() => {
-    if (!isMobile) return;
+    if (!isMobile || !visible) return undefined;
     let raf = 0;
     let ro: ResizeObserver | null = null;
+    const observedEls = new Set<HTMLElement>();
     const vv = window.visualViewport;
 
     const update = () => {
+      const measuredTabsBottom = resolveSessionTabsBottom(document);
+      setSessionTabsBottom((prev) => (prev === measuredTabsBottom ? prev : measuredTabsBottom));
+
       const measured = measureMobileSubSessionBarHeight();
       if (measured <= 0) {
         if (isMobileSubSessionBarSuppressed()) {
@@ -739,20 +994,48 @@ export function SubSessionWindow({
       }
       setSubSessionBarHeight((prev) => (prev === measured ? prev : measured));
     };
-    const scheduleUpdate = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        update();
-      });
-    };
     const observeTargets = () => {
       if (typeof ResizeObserver === 'undefined') return;
-      ro?.disconnect();
-      ro = new ResizeObserver(scheduleUpdate);
+      const desired = new Set<HTMLElement>();
       for (const el of getExternalMobileSubSessionBarElements()) {
-        ro.observe(el);
+        desired.add(el);
       }
+      const tabBar = document.querySelector<HTMLElement>('.tab-bar');
+      if (tabBar) desired.add(tabBar);
+      // Observe the content column too. When the tab bar is missing at this
+      // moment nothing else would ever re-measure, and the window stays pinned
+      // to the top of the viewport with its title bar under the app header.
+      const mainContent = document.querySelector<HTMLElement>('.main');
+      if (mainContent) desired.add(mainContent);
+
+      if (!ro) {
+        ro = new ResizeObserver(scheduleUpdate);
+      }
+      for (const el of observedEls) {
+        if (!el.isConnected || !desired.has(el)) {
+          ro.unobserve(el);
+          observedEls.delete(el);
+        }
+      }
+      for (const el of desired) {
+        if (!observedEls.has(el)) {
+          ro.observe(el);
+          observedEls.add(el);
+        }
+      }
+    };
+    const scheduleUpdate = () => {
+      if (typeof requestAnimationFrame !== 'function') {
+        observeTargets();
+        update();
+        return;
+      }
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        observeTargets();
+        update();
+      });
     };
 
     observeTargets();
@@ -761,7 +1044,6 @@ export function SubSessionWindow({
     const mo = typeof MutationObserver === 'undefined'
       ? null
       : new MutationObserver(() => {
-        observeTargets();
         scheduleUpdate();
       });
     mo?.observe(document.body, {
@@ -775,6 +1057,7 @@ export function SubSessionWindow({
       attributeFilter: ['class'],
     });
     window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener(UI_SCALE_EVENT, scheduleUpdate);
     document.addEventListener('focusin', scheduleUpdate, true);
     document.addEventListener('focusout', scheduleUpdate, true);
     vv?.addEventListener('resize', scheduleUpdate);
@@ -782,14 +1065,16 @@ export function SubSessionWindow({
     return () => {
       if (raf) cancelAnimationFrame(raf);
       ro?.disconnect();
+      observedEls.clear();
       mo?.disconnect();
       window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
       document.removeEventListener('focusin', scheduleUpdate, true);
       document.removeEventListener('focusout', scheduleUpdate, true);
       vv?.removeEventListener('resize', scheduleUpdate);
       vv?.removeEventListener('scroll', scheduleUpdate);
     };
-  }, [isMobile]);
+  }, [isMobile, visible]);
 
   const displayGeom = useMemo(() => {
     if (!isDesktopMaximized || isMobile) return geom;
@@ -798,55 +1083,113 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
-  const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
-  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileSubSessionBarHeight}px)`;
+  const cssZoom = getActiveCssZoom();
+  const scaledVvh = cssZoom === 1 ? vvh : Math.round(vvh / cssZoom);
+  const scaledBarHeight = cssZoom === 1 ? subSessionBarHeight : Math.round(subSessionBarHeight / cssZoom);
+  const scaledTabsBottom = cssZoom === 1 ? sessionTabsBottom : Math.round(sessionTabsBottom / cssZoom);
+  const minRemainCss = cssZoom === 1 ? 120 : Math.round(120 / cssZoom);
+  const mobileSubSessionBarHeight = Math.max(0, Math.min(scaledBarHeight, Math.max(0, scaledVvh - minRemainCss)));
+  const measuredMobileWindowTop = Math.max(
+    0,
+    Math.min(scaledTabsBottom, Math.max(0, scaledVvh - mobileSubSessionBarHeight)),
+  );
+  const mobileWindowTop = measuredMobileWindowTop > 0
+    ? `${measuredMobileWindowTop}px`
+    : 'var(--sat, 0px)';
+  const mobileWindowHeight = `calc(${scaledVvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
 
   const style: Record<string, string | number> = isMobile
     ? {
         '--subsession-accent-color': accentColor,
         position: 'fixed',
-        top: 'var(--sat, 0px)',
+        top: mobileWindowTop,
         left: 0,
         right: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
         bottom: `${mobileSubSessionBarHeight}px`,
         height: mobileWindowHeight,
         maxHeight: mobileWindowHeight,
         minHeight: 0,
+        boxSizing: 'border-box',
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
   const rootClass = [
     'subsession-window',
+    sub.incognito ? 'incognito' : '',
     isDesktopMaximized ? 'subsession-window-maximized' : '',
     desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
+    resizingDir ? 'is-resizing' : '',
   ].filter(Boolean).join(' ');
 
   return (
     <div
       ref={swipeBackRef}
       class={rootClass}
+      data-subsession-id={sub.id}
+      data-view-mode={viewMode}
       style={style}
+      // Capture phase: an inner widget (xterm with mouse reporting on, a
+      // canvas, a future third-party embed) may stopPropagation on the way up,
+      // which used to leave a background window unraisable depending on where
+      // you happened to click. Capture runs before any of them. `onMouseDown`
+      // stays for environments without pointer events; raising twice is a
+      // no-op because the stack ignores an already-frontmost window.
+      onPointerDownCapture={onFocus}
       onMouseDown={onFocus}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
-      {/* 8-direction resize handles (desktop only) */}
-      {!isMobile && !isDesktopMaximized && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
-        <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />
-      ))}
-
       {/* Header */}
       <div
         class="subsession-header"
         onMouseDown={onHeaderMouseDown}
+        onDblClick={handleHeaderDoubleClick}
         draggable={!!isPinnable && !isDesktopMaximized}
         onDragStart={handleDragStart}
       >
         <span class="subsession-drag-icon">⠿</span>
-        <span class="subsession-title">{typeLabel}</span>
+        {pairWindow ? (
+          <>
+            <div class={`subsession-title-group is-pair`}>
+              <span class="subsession-title" title={titleText}>{titleText}</span>
+              {subtitleText && <small class="subsession-subtitle" title={subtitleText}>{subtitleText}</small>}
+            </div>
+            <span class={`subsession-pair-role is-${pairRole}`} title={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')} aria-label={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}>
+              {t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}
+            </span>
+          </>
+        ) : (
+          <span class="subsession-title"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={typeLabel} /></span>
+        )}
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
+          {!isMobile && onClosePairSplit && <button
+            type="button"
+            class="subsession-minimize-btn subsession-close-split-btn"
+            title={t('taskPair.panel_close_split')}
+            aria-label={t('taskPair.panel_close_split')}
+            onMouseDown={(event) => { focusInactiveDesktopWindow(event, { suppressFollowingClick: true }); }}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) onClosePairSplit();
+            }}
+          ><span aria-hidden="true">◫×</span></button>}
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {/* Left of the file-manager button, on purpose — same convention
+              as the main-session toolbar's DaemonRemoteDesktopControl: it
+              targets the exact same `serverId` (and so the exact same
+              machine) this window's own FileBrowser below is rooted on. */}
+          <div class="subsession-hidden-actions" hidden style={{ display: 'none' }}>
+          <DaemonRemoteDesktopControl
+            compact
+            offerLoginScreenSetup={false}
+            ws={ws}
+            serverId={serverId ?? null}
+            daemonOnline={daemonOnline ?? false}
+            onOpen={(machine) => onOpenRemoteDesktop?.(machine)}
+            canSetUp={remoteDesktopCanSetUp}
+          />
           {/* File browser — placed to the LEFT of the pin button in the
               sub-session window header. Each sub-session owns its own
               FileBrowser instance rooted at sub.cwd, so selected paths land
@@ -863,7 +1206,16 @@ export function SubSessionWindow({
             <span aria-hidden="true">{'\u{1F4C1}'}</span>
             {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
           </button>
-          {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
+          </div>
+          {isPinnable && (
+            <button
+              type="button"
+              class="subsession-minimize-btn"
+              onClick={() => onPin?.(viewMode)}
+              title={t('sidebar.pin_to_sidebar')}
+              aria-label={t('sidebar.pin_to_sidebar')}
+            >📌</button>
+          )}
           {desktopLayoutCapable && onToggleMaximized && (
             <DesktopWindowMaximizeButton
               maximized={isDesktopMaximized}
@@ -879,6 +1231,7 @@ export function SubSessionWindow({
             onClick={(event) => { if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) handleMinimize(); }}
             title={t('window.minimize')}
             aria-label={t('window.minimize')}
+            hidden style={{ display: 'none' }}
           >▾</button>
           <button
             class="subsession-close-btn"
@@ -894,35 +1247,51 @@ export function SubSessionWindow({
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
-          <TerminalView
-            sessionName={sub.sessionName}
-            ws={ws}
-            connected={connected}
-            active={active && viewMode === 'terminal'}
-            onDiff={(apply) => onDiff(sub.sessionName, apply)}
-            onHistory={(apply) => onHistory(sub.sessionName, apply)}
-            onFitFn={(fn) => { termFitFnRef.current = fn; }}
-            onScrollBottomFn={onTermScrollBottomFn}
-            mobileInput={isShell}
-          />
+          {visible && <TerminalView
+              sessionName={sub.sessionName}
+              ws={ws}
+              connected={connected}
+              active={(isShell || active) && viewMode === 'terminal'}
+              autoFocus={active && viewMode === 'terminal'}
+              onDiff={(apply) => onDiff(sub.sessionName, apply)}
+              onHistory={(apply) => onHistory(sub.sessionName, apply)}
+              onFitFn={(fn) => { termFitFnRef.current = fn; }}
+              onScrollBottomFn={onTermScrollBottomFn}
+              mobileInput={isShell}
+              onRestart={onRestart}
+            />}
         </div>
-        {viewMode === 'chat' && (
+        {visible && viewMode === 'chat' && (
           <ChatView
+            visible={visible}
             events={events}
             loading={false}
             refreshing={refreshing}
             historyStatus={historyStatus}
+            loadingOlder={loadingOlder}
+            hasOlderHistory={hasOlderHistory}
+            onLoadOlder={loadOlderEvents}
+            historyGap={historyGap}
+            onLoadMessageContext={loadMessageContext}
             sessionId={sub.sessionName}
             onForceSync={timelineForceRefresh}
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
-            onViewRepo={onViewRepo}
-            onPreviewFile={onPreviewFile}
+            onViewRepo={stableOnViewRepo}
+            onPreviewFile={stableOnPreviewFile}
+            onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
+            onCloudDocClick={onCloudDocClick ? stableOnCloudDocClick : undefined}
+            onRemoteDesktopClick={onRemoteDesktopClick ? stableOnRemoteDesktopClick : undefined}
             serverId={serverId}
+            scopeTaskPairs={showTaskPairPanel}
+            taskPairPanelVisitKey={taskPairPanelVisitKey}
+            canManageFileShares={effectiveCanManageFileShares}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}
+            onAskAnswer={onAskAnswer}
+            messagePinsEnabled
           />
         )}
       </div>
@@ -934,26 +1303,28 @@ export function SubSessionWindow({
           sessionName={sub.sessionName}
           sessionState={liveSessionState}
           agentType={sessionInfo?.agentType}
+          wsClient={ws}
+          connected={connected}
           modelOverride={resolveEffectiveSessionModel(sessionInfo, effectiveDetectedModel, lastUsage?.model)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           quotaMeta={sessionInfo?.quotaMeta}
+          codexCreditsBalance={sessionInfo?.codexCreditsBalance}
+          codexCreditsUnlimited={sessionInfo?.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
           transportActivityDetail={transportActivityDetail}
           sessionError={sessionInfo?.error}
           now={thinkingNow}
-          onSyncMemorySummaries={handleSyncMemorySummaries}
-          syncMemorySummariesBusy={syncingMemorySummaries}
-          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
           onRunExecutionClones={handleRunExecutionClones}
-          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesBusy={executionCloneLaunchState.phase === 'pending'}
           runExecutionClonesDisabled={
-            executionClonesBusy
+            executionCloneLaunchState.phase === 'pending'
             || !connected
             || !ws
             || !hasValidExecutionTemplate
@@ -961,13 +1332,23 @@ export function SubSessionWindow({
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
+          runExecutionClonesFeedback={executionCloneLaunchState}
         />
       )}
 
-      {/* Full SessionControls — with sub-session action overrides */}
-      <SessionControls
+      {/* Full SessionControls — with sub-session action overrides. Keep the
+          composer mounted for every visible desktop window, not just the
+          frontmost one: an unfocused sub-session is still an independent
+          conversation and its input must remain visible for draft review and
+          direct interaction. `keyboardActive` gates only global keyboard
+          handling (for example Escape cancellation), while the existing
+          connected/shared-state guards keep genuinely read-only sessions
+          disabled. Hidden windows (an inactive main-session tab) retain their
+          timeline state but defer this expensive control tree until shown. */}
+      {visible ? <SessionControls
         ws={ws}
-        activeSession={sessionInfo}
+        connected={connected}
+        activeSession={controlsSessionInfo}
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
@@ -992,12 +1373,15 @@ export function SubSessionWindow({
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+            ...(meta?.queueAppend ? { queueAppend: true } : {}),
           });
           if (meta?.commandId && meta.localFailure) {
             markOptimisticFailed(meta.commandId, meta.localFailure);
           }
           scrollToBottom();
         }}
+        onRemoveOptimisticMessage={removeOptimisticMessage}
+        onSendFailed={markOptimisticFailed}
         onSubRestart={onRestart}
         onSubNew={onRestart}
         onSubStop={handleClose}
@@ -1005,9 +1389,13 @@ export function SubSessionWindow({
         onSettings={onSettings}
         onShareSession={onShareSession}
         subSessionId={sub.id}
+        hideWorkflowControls
+        canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
+        activeTransportTurn={activeTimelineTurn}
+        transportTimelineEvents={events}
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}
@@ -1015,12 +1403,27 @@ export function SubSessionWindow({
         detectedModel={effectiveDetectedModel ?? lastUsage?.model}
         quotes={quotes}
         onRemoveQuote={removeQuote}
+        taskQuote={taskQuote}
+        onRemoveTaskQuote={clearTaskQuote}
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
         onVersionSensitiveAction={onVersionSensitiveAction}
         onComposerTextChange={setComposerText}
-      />
+      /> : null}
       </div>
+
+      {/* Keep resize hit surfaces in a final sibling layer.  The composer,
+          usage footer, task panel, and SDK panels may each create their own
+          stacking context; placing handles after the content and giving them
+          the shared raised z-index prevents any of those descendants from
+          stealing the bottom edge/corner hit test. */}
+      {!isMobile && !isDesktopMaximized && (
+        <div class="resize-handle-layer" aria-hidden="true">
+          {RESIZE_DIRS.map((dir) => (
+            <div key={dir} class={resizeHandleClass(dir, resizingDir)} {...resizeHandleHoverEvents} onMouseDown={onResizeMouseDown(dir)} />
+          ))}
+        </div>
+      )}
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
           Desktop: floating panel layered via the shared desktop window stack
@@ -1029,8 +1432,8 @@ export function SubSessionWindow({
           `zIndex` within the band, while a newer unrelated peer can still
           sit above the entire owner-child group. */}
       {showFileBrowser && ws && (
-        isMobile ? (
-          <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
+        isMobile ? createPortal(
+          <div class="mobile-fb-overlay">
             <div class="mobile-fb-header">
               <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {t('picker.files')}</span>
               <button class="fb-close" onClick={() => setShowFileBrowser(false)}>✕</button>
@@ -1039,6 +1442,9 @@ export function SubSessionWindow({
               ws={ws}
               serverId={serverId}
               sessionName={sub.sessionName}
+              scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
+              readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1053,13 +1459,15 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
                 setShowFileBrowser(false);
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
-          </div>
+          </div>,
+          document.body,
         ) : (
           <FloatingPanel
             id={DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id)}
@@ -1074,6 +1482,9 @@ export function SubSessionWindow({
               ws={ws}
               serverId={serverId}
               sessionName={sub.sessionName}
+              scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
+              readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1088,10 +1499,11 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
           </FloatingPanel>
         )

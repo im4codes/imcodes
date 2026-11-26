@@ -10,7 +10,7 @@ export const MIN_PREVIEW_READ_WORKERS_TARGET = 1;
 export const HARD_MAX_PREVIEW_READ_WORKERS = 4;
 export const DEFAULT_PREVIEW_READ_POOL_QUEUE_CAP = 32;
 
-export type PreviewReadPreviewKind = 'text' | 'image' | 'office' | 'video' | 'too_large' | 'unknown';
+export type PreviewReadPreviewKind = 'text' | 'image' | 'office' | 'video' | 'audio' | 'too_large' | 'unknown';
 
 export interface PreviewReadClassification {
   previewKind: PreviewReadPreviewKind;

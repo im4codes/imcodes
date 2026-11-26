@@ -104,6 +104,26 @@ describe('LiveContextIngestion', () => {
     });
   });
 
+  it('never ingests a user-deleted message as memory, live or through backfill', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+    // What a delete of a mid-stream message emits: hidden, non-streaming, userDeleted.
+    const tombstone = { ...makeEvent('assistant.text', 110, { text: 'partial text the user deleted', streaming: false, userDeleted: true }), hidden: true };
+    const tombstonedUser = { ...makeEvent('user.message', 120, { text: 'phantom', userDeleted: true }), hidden: true };
+
+    await ingestion.handleTimelineEvent(tombstone);
+    await ingestion.handleTimelineEvent(tombstonedUser);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+
+    // Backfill reads persisted rows, which now contain tombstones (and the original before it).
+    const original = makeEvent('assistant.text', 100, { text: 'partial text the user deleted', streaming: false });
+    await ingestion.backfillSessionFromEvents(session.name, [{ ...original, eventId: tombstone.eventId, seq: 100 }, tombstone]);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+  });
+
   it('ignores streaming assistant deltas and only records the finalized assistant text', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
@@ -544,6 +564,48 @@ describe('LiveContextIngestion', () => {
     ingestion.dispose();
   });
 
+  it('bounds the sessions draining at once across the backoff timers too, not only within one sweep', async () => {
+    // Many sessions failing for the same reason have their backoff timers fall due together. Each timer drains its own session, so without
+    // a bound that is shared with the sweep, all of them hit the overloaded store at once.
+    vi.useFakeTimers();
+    try {
+      const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+        thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+        sessionLookup: (sessionName) => ({ ...session, name: sessionName }),
+        resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      });
+      let active = 0;
+      let maxActive = 0;
+      let started = 0;
+      vi.spyOn(ingestion.coordinator, 'ingestEvent').mockImplementation(async () => {
+        active += 1;
+        started += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active -= 1;
+        throw new ContextStoreError(CONTEXT_STORE_RPC_ERROR.overloaded, 'worker saturated');
+      });
+      for (let index = 0; index < 10; index += 1) {
+        const sessionName = `${session.name}_timers_${index}`;
+        enqueuePreparedRetryableEventForTest(
+          ingestion,
+          makePreparedIngest(makeEvent('user.message', 2_000 + index, { text: `buffered ${index}` }, sessionName), namespace, sessionName, `timers:${index}`),
+          new ContextStoreError(CONTEXT_STORE_RPC_ERROR.unavailable, 'initial outage'),
+          0,
+        );
+      }
+      // Every session's first backoff timer (250 ms) falls due in this one step.
+      await vi.advanceTimersByTimeAsync(300);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(started).toBeGreaterThanOrEqual(10);
+      expect(maxActive).toBeGreaterThan(1);
+      expect(maxActive).toBeLessThanOrEqual(8);
+      ingestion.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not stage a duplicate when backfill replays the same logical live event', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
@@ -798,6 +860,36 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).not.toContain('fetch failed');
   });
 
+  it('does not carry a provider idle-timeout error into the next context turn', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: echoCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Continue after the failed request' }));
+    // This mirrors the relay's terminal partial-error bubble.  The test omits
+    // memoryExcluded deliberately: old persisted rows may not have carried
+    // that marker, so the provider-error metadata must remain a safe fallback.
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, {
+      text: 'partial answer\n\n⚠️ Error: API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded',
+      streaming: false,
+      providerErrorCode: 'PROVIDER_ERROR',
+      providerErrorRecoverable: true,
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 120, {
+      text: 'normal successful follow-up',
+      streaming: false,
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('Continue after the failed request');
+    expect(summary?.summary).toContain('normal successful follow-up');
+    expect(summary?.summary).not.toContain('stream idle timeout');
+    expect(summary?.summary).not.toContain('partial answer');
+  });
+
   it('ignores memory-excluded assistant warnings so runtime errors do not enter processed memory', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
@@ -991,6 +1083,7 @@ describe('LiveContextIngestion', () => {
     });
 
     await ingestion.backfillSessionFromEvents(session.name, [
+      makeEvent('user.message', 99, { text: '/model gpt-5.4' }),
       makeEvent('user.message', 100, { text: 'Summarize the deployment plan' }),
       makeEvent('assistant.text', 101, { text: 'Deployment plan captured' }),
     ]);
@@ -1001,6 +1094,8 @@ describe('LiveContextIngestion', () => {
         summary: expect.stringContaining('**Assistant:** Deployment plan captured'),
       }),
     ]);
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })[0]?.summary)
+      .not.toContain('/model gpt-5.4');
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
       totalRecords: 1,
       stagedEventCount: 0,
@@ -1174,6 +1269,102 @@ describe('LiveContextIngestion', () => {
     const summaries = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
     expect(summaries).toHaveLength(2);
     expect(summaries[0]?.summary).toContain('Second prompt too soon');
+  });
+
+  it('auto-adapts materialization backend from live sessionLister while ignoring stopped, test, and clone sessions', async () => {
+    const seenConfigs: Array<Record<string, unknown>> = [];
+    const capturingCompressor = async (input: CompressionInput): Promise<CompressionResult> => {
+      seenConfigs.push({
+        modelSelectionMode: input.modelConfig?.modelSelectionMode,
+        primaryContextBackend: input.modelConfig?.primaryContextBackend,
+        primaryContextModel: input.modelConfig?.primaryContextModel,
+        backupContextBackend: input.modelConfig?.backupContextBackend,
+        backupContextModel: input.modelConfig?.backupContextModel,
+      });
+      return {
+        summary: `Compressed ${input.events.length} events.`,
+        model: input.modelConfig?.primaryContextModel ?? 'unknown',
+        backend: input.modelConfig?.primaryContextBackend ?? 'unknown',
+        usedBackup: false,
+        fromSdk: true,
+      };
+    };
+
+    const activeClaudeSameProject = {
+      ...session,
+      name: 'deck_repo_exec',
+      role: 'w1' as const,
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/repo',
+      state: 'running' as const,
+      updatedAt: 500,
+    };
+    const newerStoppedAgy = {
+      ...session,
+      name: 'deck_stopped_agy',
+      role: 'w2' as const,
+      agentType: 'agy',
+      projectDir: '/tmp/repo',
+      state: 'stopped' as const,
+      updatedAt: 9_000,
+    };
+    const newerTestSession = {
+      ...session,
+      name: 'deck_test_preview_fake_w1',
+      role: 'w3' as const,
+      agentType: 'opencode',
+      projectDir: '/tmp/repo',
+      state: 'running' as const,
+      updatedAt: 9_500,
+    };
+    const newerCloneSession = {
+      ...session,
+      name: 'deck_clone_opencode',
+      role: 'w4' as const,
+      agentType: 'opencode',
+      projectDir: '/tmp/repo',
+      state: 'running' as const,
+      updatedAt: 9_600,
+      executionCloneMetadata: {
+        parentSessionName: 'deck_repo_brain',
+        createdAt: 9_600,
+      },
+    };
+    const otherProjectNewerAgy = {
+      ...session,
+      name: 'deck_other_brain',
+      role: 'brain' as const,
+      agentType: 'agy',
+      projectDir: '/tmp/other-project',
+      state: 'idle' as const,
+      updatedAt: 2_000,
+    };
+
+    const ingestion = new LiveContextIngestion({
+      compressor: capturingCompressor,
+      thresholds: { eventCount: 1, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => activeClaudeSameProject,
+      sessionLister: () => [
+        newerStoppedAgy,
+        newerTestSession,
+        newerCloneSession,
+        otherProjectNewerAgy,
+        activeClaudeSameProject,
+      ],
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Auto-adapt from live session' }, activeClaudeSameProject.name));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 110, { state: 'idle' }, activeClaudeSameProject.name));
+
+    expect(seenConfigs).toHaveLength(1);
+    expect(seenConfigs[0]).toMatchObject({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
+    });
   });
 });
 

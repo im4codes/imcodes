@@ -93,15 +93,18 @@ describe("shared/transport-events", () => {
     expect(Object.keys(TRANSPORT_EVENT)).toHaveLength(6);
   });
 
-  it("TRANSPORT_MSG has correct values for all 7 message types", () => {
+  it("TRANSPORT_MSG has correct values for all 10 message types", () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe("chat.subscribe");
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe("chat.unsubscribe");
     expect(TRANSPORT_MSG.CHAT_HISTORY).toBe("chat.history");
+    expect(TRANSPORT_MSG.CHAT_APPROVAL).toBe("chat.approval");
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe("provider.status");
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe("provider.list_sessions");
     expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe("provider.sessions_response");
     expect(TRANSPORT_MSG.APPROVAL_RESPONSE).toBe("chat.approval_response");
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(8);
+    expect(TRANSPORT_MSG.LIST_MODELS).toBe("transport.list_models");
+    expect(TRANSPORT_MSG.MODELS_RESPONSE).toBe("transport.models_response");
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(10);
   });
 
   it("TRANSPORT_AGENT_STATUSES contains all 7 statuses", () => {
@@ -163,7 +166,7 @@ describe("src/agent/transport-provider", () => {
     expect(Object.keys(SESSION_OWNERSHIP)).toHaveLength(3);
   });
 
-  it("PROVIDER_ERROR_CODES has all 9 codes", () => {
+  it("PROVIDER_ERROR_CODES has all 10 codes", () => {
     expect(PROVIDER_ERROR_CODES.AUTH_FAILED).toBe("AUTH_FAILED");
     expect(PROVIDER_ERROR_CODES.CONFIG_ERROR).toBe("CONFIG_ERROR");
     expect(PROVIDER_ERROR_CODES.CONNECTION_LOST).toBe("CONNECTION_LOST");
@@ -173,7 +176,8 @@ describe("src/agent/transport-provider", () => {
     expect(PROVIDER_ERROR_CODES.CANCELLED).toBe("CANCELLED");
     expect(PROVIDER_ERROR_CODES.PARSE_ERROR).toBe("PARSE_ERROR");
     expect(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND).toBe("PROVIDER_NOT_FOUND");
-    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(9);
+    expect(PROVIDER_ERROR_CODES.SDK_TURN_LOST).toBe("SDK_TURN_LOST");
+    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(10);
   });
 });
 
@@ -242,9 +246,8 @@ describe("src/agent/detect — transport/process classification", () => {
       "opencode",
       "shell",
       "script",
-      "gemini",
     ];
-    expect(PROCESS_AGENTS.size).toBe(6);
+    expect(PROCESS_AGENTS.size).toBe(5);
     for (const agent of expected) {
       expect(PROCESS_AGENTS.has(agent as any)).toBe(true);
     }

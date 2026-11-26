@@ -170,7 +170,7 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     }).ok).toBe(false);
   });
 
-  it('maps active OpenSpec prompt ids while denying legacy ids as selected Team combos', () => {
+  it('maps active OpenSpec prompt ids while allowing valid Team combos and denying invalid or legacy ids', () => {
     expect(activeOpenSpecPromptIdForAutoDeliverStage('spec_audit_repair')).toBe('proposal_audit');
     expect(activeOpenSpecPromptIdForAutoDeliverStage('implementation_audit_repair')).toBe('implementation_audit');
     expect(evaluateOpenSpecAutoDeliverComboCompatibility(
@@ -182,7 +182,12 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       'audit>plan',
       'spec_audit_repair',
       'proposal_audit',
-    )).toEqual({ ok: false, reason: 'custom_combo_unsupported' });
+    )).toEqual({ ok: true });
+    expect(evaluateOpenSpecAutoDeliverComboCompatibility(
+      'audit>unknown',
+      'spec_audit_repair',
+      'proposal_audit',
+    )).toEqual({ ok: false, reason: 'combo_unsupported' });
     expect(evaluateOpenSpecAutoDeliverComboCompatibility(
       OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS.SPEC_AUDIT_REPAIR,
       'spec_audit_repair',

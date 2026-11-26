@@ -1,12 +1,32 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ContextNamespace } from '../../shared/context-types.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
-import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_TOOL_CONTRACTS,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
+import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import { SUPERVISION_TASK_AUDIT_POLICIES } from '../../shared/supervision-config.js';
+import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
+import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
-import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import {
+  createMemoryMcpToolHandlers,
+  resolveIntegrationCallerProvenance,
+} from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: vi.fn() }));
+
+import { makeMemoryShortRef, registerMemoryShortRef, resetMemoryShortRefsForTests, seedMemoryShortRefCollisionForTests } from '../../src/context/memory-short-ref.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
@@ -39,9 +59,209 @@ function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
+function projection(overrides: Partial<ProcessedContextProjection> = {}): ProcessedContextProjection {
+  return {
+    id: 'proj-1',
+    namespace: { scope: 'personal', userId: 'user-1', projectId: 'repo-1' },
+    class: 'durable_memory_candidate',
+    sourceEventIds: ['evt-1'],
+    summary: 'existing memory',
+    content: { text: 'existing memory' },
+    createdAt: 1,
+    updatedAt: 1,
+    status: 'active',
+    ...overrides,
+  };
+}
+
 describe('memory MCP tool schema firewall', () => {
+  let shortRefDir: string;
+  let priorShortRefPath: string | undefined;
+  let priorLegacyPath: string | undefined;
+
   beforeEach(() => {
+    // Registering a handle now persists it, and the default target is the
+    // context store — which would build a real SQLite database and WAL in the
+    // runner's home directory just from exercising these handlers. Point
+    // persistence at a scratch file, and the legacy cache at a path that does
+    // not exist. The collision cases also emit a throttled warning, so the
+    // warning module is stubbed above to keep that content out of the daemon
+    // log. Two writes remain outside this suite's reach and are NOT claimed to
+    // be isolated: the daemon logger creates its file when the module is
+    // imported, and one pre-existing observation-expansion case below builds the
+    // context store.
+    shortRefDir = mkdtempSync(join(tmpdir(), 'imc-mcp-shortref-'));
+    priorShortRefPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    priorLegacyPath = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    process.env.IMCODES_MEMORY_SHORT_REF_PATH = join(shortRefDir, 'refs.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = join(shortRefDir, 'absent-legacy.json');
     resetMemoryShortRefsForTests();
+  });
+
+  afterEach(() => {
+    resetMemoryShortRefsForTests();
+    if (priorShortRefPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorShortRefPath;
+    if (priorLegacyPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = priorLegacyPath;
+    rmSync(shortRefDir, { recursive: true, force: true });
+  });
+
+  it('publishes task-start paths as evidence and removes legacy claim admission', () => {
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START];
+    expect(contract.inputSchema.properties?.scopeFiles?.description).toContain('never an implementation ACL');
+    expect(contract.inputSchema.properties).not.toHaveProperty('claimMode');
+  });
+
+  it.each([
+    ['subset', ['src/one.ts']],
+    ['superset', ['src/one.ts', 'src/two.ts', 'src/reported-only.ts']],
+    ['omitted', undefined],
+  ] as const)('keeps %s ownedFiles as record-only provenance while enforcing manifest bytes', (_label, ownedFiles) => {
+    const manifest = [
+      { path: 'src/one.ts', sha256: '1'.repeat(64) },
+      { path: 'src/two.ts', sha256: '2'.repeat(64) },
+    ];
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: { ownedFiles, integrationManifest: manifest },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toEqual({ refusals: [], ownedFiles: ownedFiles ?? [], integrationManifest: manifest });
+
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: {
+        ownedFiles,
+        integrationManifest: [{ path: 'src/one.ts', sha256: 'f'.repeat(64) }],
+      },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toMatchObject({
+      refusals: [expect.objectContaining({ code: 'bundle_mismatch', field: 'integrationManifest' })],
+    });
+  });
+
+  it('rejects partial structured integration finalization instead of falling back to legacy prose finish', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_owner',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      evidence: 'must not select the legacy branch',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'integration_finalize rejected',
+      refusals: expect.arrayContaining([
+        expect.objectContaining({ code: 'missing_field', field: 'auditRevision' }),
+      ]),
+    });
+  });
+
+  it('does not require caller-reported path metadata at the finalization schema boundary', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_missing',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      auditRevision: 'combined-r1',
+      verdict: 'PASS',
+      integrationOwner: 'deck_proj_brain',
+      commitSha: '1'.repeat(40),
+      pushResult: 'pushed',
+      pushRemoteRef: 'refs/heads/dev',
+      externalRunId: 'run-1',
+      externalHeadSha: '1'.repeat(40),
+      ciResult: 'success',
+    });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(String(result.message)).not.toContain('invalid structured finalization');
+  });
+
+  it('submits peer audit replies only through the strict structured dependency', async () => {
+    const peerAuditReply = vi.fn(async () => ({ ok: true }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
+    const valid = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
+      attemptId: 'attempt_12345678',
+      revision: 'revision_12345678',
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'Focused tests passed.',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
+    };
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({
+      ...valid,
+      verdict: undefined,
+    })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(peerAuditReply).not.toHaveBeenCalled();
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](valid)).resolves.toEqual({ status: 'ok', accepted: true });
+    expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
+      version: 'peer_audit_reply_v1',
+      attemptId: valid.attemptId,
+      receiptKind: 'final',
+    }));
+    expect(peerAuditReply.mock.calls[0]?.[0]).not.toHaveProperty('replyCapability');
+
+    const forged = await handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({ ...valid, injectedTarget: 'other-session' });
+    expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(peerAuditReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('submits delegation replies only through the strict structured dependency', async () => {
+    const delegationReply = vi.fn(async () => ({ ok: true, delivered: true }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { delegationReply });
+    const valid = {
+      delegationId: 'delegation_identity_1234567890',
+      result: 'Completed with exact evidence.',
+    };
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY](valid)).resolves.toEqual({
+      status: 'ok',
+      accepted: true,
+      delivered: true,
+    });
+    expect(delegationReply).toHaveBeenCalledWith({
+      version: 'agent_delegation_reply_v1',
+      ...valid,
+    });
+
+    const forged = await handlers[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]({
+      ...valid,
+      replyTo: 'deck_other_brain',
+    });
+    expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(delegationReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
+    const peerAuditReply = vi.fn(async () => ({
+      ok: false,
+      error: 'identity_mismatch',
+      message: 'audit sender identity rejected: runtimeEpoch expected="epoch-a" actual="epoch-b"',
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
+    const structureOnlyPass = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
+      attemptId: 'attempt_12345678',
+      revision: 'revision_12345678',
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'No executable evidence was supplied.',
+      validations: [],
+    };
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](structureOnlyPass)).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      message: expect.stringContaining('runtimeEpoch expected="epoch-a" actual="epoch-b"'),
+    });
+    expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
+      version: 'peer_audit_reply_v1',
+      verdict: 'PASS',
+      validations: [],
+    }));
   });
 
   it('strips forged memory authority fields before search and write helpers', async () => {
@@ -111,6 +331,168 @@ describe('memory MCP tool schema firewall', () => {
       sourceProjectName: 'proj',
       sourceServerId: 'srv-1',
     }));
+  });
+
+  it('strips forged authority fields before MCP memory management actions', async () => {
+    const getProcessedProjectionById = vi.fn((id: string) => projection({ id }));
+    const archiveMemory = vi.fn(() => true);
+    const restoreArchivedMemory = vi.fn(() => true);
+    const deleteMemory = vi.fn(() => true);
+    const updateProcessedProjectionSummary = vi.fn((input: { projectionId: string; summary: string }) => projection({ id: input.projectionId, summary: input.summary }));
+    const recordMemoryHits = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      getProcessedProjectionById,
+      archiveMemory,
+      restoreArchivedMemory,
+      deleteMemory,
+      updateProcessedProjectionSummary,
+      recordMemoryHits,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]({
+      projectionId: 'proj-1',
+      userId: 'mallory',
+      namespace: { scope: 'personal', userId: 'mallory', projectId: 'evil' },
+      projectId: 'evil',
+    })).resolves.toMatchObject({ status: 'ok', projectionId: 'proj-1', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]({ projectionId: 'proj-1', canonicalRepoId: 'evil' })).resolves.toMatchObject({ status: 'ok', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]({
+      projectionId: 'proj-1',
+      text: 'corrected memory',
+      ownerUserId: 'mallory',
+      updatedByUserId: 'mallory',
+    })).resolves.toMatchObject({ status: 'ok', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]({
+      projectionId: 'proj-1',
+      feedback: 'relevant',
+      projectRoot: '/evil',
+    })).resolves.toMatchObject({ status: 'ok', action: 'hit_recorded', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]({ projectionId: 'proj-1', scope: 'org_shared' })).resolves.toMatchObject({ status: 'ok', changed: true });
+
+    expect(getProcessedProjectionById).toHaveBeenCalledWith('proj-1');
+    expect(archiveMemory).toHaveBeenCalledWith('proj-1');
+    expect(restoreArchivedMemory).toHaveBeenCalledWith('proj-1');
+    expect(deleteMemory).toHaveBeenCalledWith('proj-1');
+    expect(recordMemoryHits).toHaveBeenCalledWith(['proj-1']);
+    expect(updateProcessedProjectionSummary).toHaveBeenCalledWith({
+      projectionId: 'proj-1',
+      summary: 'corrected memory',
+      ownerUserId: 'user-1',
+      updatedByUserId: 'user-1',
+    });
+  });
+
+  it('blocks MCP memory management for projections outside the caller namespace', async () => {
+    const archiveMemory = vi.fn(() => true);
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      getProcessedProjectionById: vi.fn(() => projection({
+        namespace: { scope: 'personal', userId: 'other-user', projectId: 'repo-1' },
+      })),
+      archiveMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]({ projectionId: 'proj-foreign' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+    });
+    expect(archiveMemory).not.toHaveBeenCalled();
+  });
+
+  it('supports compact projection refs and not_relevant feedback archives memory', async () => {
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'proj-ref', namespace });
+    const archiveMemory = vi.fn(() => true);
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getProcessedProjectionById: vi.fn(() => projection({ id: 'proj-ref', namespace })),
+      archiveMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]({ ref, feedback: 'not_relevant' })).resolves.toMatchObject({
+      status: 'ok',
+      projectionId: 'proj-ref',
+      feedback: 'not_relevant',
+      action: 'archived',
+      changed: true,
+    });
+    expect(archiveMemory).toHaveBeenCalledWith('proj-ref');
+  });
+
+  it('rejects a kind that disagrees with an ambiguous ref instead of expanding it', async () => {
+    // The single-candidate path validates the requested kind; the ambiguous
+    // path returned candidates regardless, silently dropping the caller's
+    // constraint. Resolver-level tests could not see this — it needs the handler.
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'collide-a', namespace });
+    registerMemoryShortRef({ kind: 'projection', id: 'collide-b', namespace });
+    // Force both onto one handle so the ambiguous branch is exercised.
+    seedMemoryShortRefCollisionForTests(ref, [
+      { kind: 'projection', id: 'collide-a', namespace },
+      { kind: 'projection', id: 'collide-b', namespace },
+    ]);
+    const getProcessedProjectionById = vi.fn(() => projection({ id: 'collide-a', namespace }));
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getProcessedProjectionById,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref, kind: 'observation' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+  });
+
+  it('declares how many records an ambiguous ref covers when expansion is bounded', async () => {
+    // Expansion is capped, so a caller told it received "every match" would stop
+    // looking while the answer sat in an omitted record.
+    //
+    // The orchestrator MUST be injected: without it the handler falls through to
+    // the real one, which builds an actual SQLite store (plus WAL and a log) in
+    // the runner's home directory.
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ids = ['c1', 'c2', 'c3', 'c4', 'c5'];
+    const ref = registerMemoryShortRef({ kind: 'projection', id: ids[0]!, namespace });
+    seedMemoryShortRefCollisionForTests(ref, ids.map((id) => ({ kind: 'projection' as const, id, namespace })));
+    const getMemorySourcesOrchestrator = vi.fn(async (projectionId: string) => ({
+      status: 'ok' as const,
+      projectionId,
+      sourceEventCount: 1,
+      sources: [{ eventId: `evt-${projectionId}`, status: 'ok', content: `body ${projectionId}` }],
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getMemorySourcesOrchestrator,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref }) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: 'ok', ambiguousRef: true, candidateCount: 5, truncated: true });
+    const candidates = result.candidates as Array<Record<string, unknown>>;
+    // Exactly the cap, carrying real expanded content — `length < 5` alone would
+    // also pass on an empty array.
+    expect(candidates).toHaveLength(4);
+    expect(candidates.map((candidate) => candidate.projectionId)).toEqual(['c1', 'c2', 'c3', 'c4']);
+    expect(candidates[0]).toMatchObject({ kind: 'projection', sources: [expect.objectContaining({ content: 'body c1' })] });
+  });
+
+  it('marks an ambiguous ref untruncated when every candidate fits', async () => {
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'pair-a', namespace });
+    seedMemoryShortRefCollisionForTests(ref, [
+      { kind: 'projection', id: 'pair-a', namespace },
+      { kind: 'projection', id: 'pair-b', namespace },
+    ]);
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getMemorySourcesOrchestrator: vi.fn(async (projectionId: string) => ({
+        status: 'ok' as const, projectionId, sourceEventCount: 0, sources: [],
+      })),
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref }) as Record<string, unknown>;
+    expect(result).toMatchObject({ ambiguousRef: true, candidateCount: 2, truncated: false });
+    expect((result.candidates as unknown[])).toHaveLength(2);
   });
 
   it('short-circuits memory disabled gates before backend calls', async () => {
@@ -288,7 +670,7 @@ describe('memory MCP tool schema firewall', () => {
       items: [
         {
           projectionId,
-          ref: 'proj:1111111111',
+          ref: makeMemoryShortRef('projection', projectionId),
           recordKind: 'projection',
           sourceLookup: { tool: 'get_memory_sources', kind: 'projection', projectionId },
           summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
@@ -310,7 +692,7 @@ describe('memory MCP tool schema firewall', () => {
       limit: 5,
     }));
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
-      ref: 'proj:1111111111',
+      ref: makeMemoryShortRef('projection', projectionId),
       kind: 'projection',
     })).resolves.toMatchObject({
       status: 'ok',
@@ -355,7 +737,7 @@ describe('memory MCP tool schema firewall', () => {
       items: [
         {
           observationId,
-          ref: 'obs:aaaaaaaaaa',
+          ref: makeMemoryShortRef('observation', observationId),
           recordKind: 'observation',
           sourceLookup: { tool: 'get_memory_sources', kind: 'observation', observationId },
           observationClass: 'note',
@@ -371,7 +753,7 @@ describe('memory MCP tool schema firewall', () => {
       serverId: 'attacker-srv',
     });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
-      ref: 'obs:aaaaaaaaaa',
+      ref: makeMemoryShortRef('observation', observationId),
       kind: 'observation',
     })).resolves.toMatchObject({
       status: 'ok',
@@ -407,6 +789,569 @@ describe('memory MCP tool schema firewall', () => {
     expect(cronList).toHaveBeenCalled();
   });
 
+  it('keeps self out of send_list_targets while returning only the bound caller from session_runtime_identity_get', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', requestedModel: 'gpt-5.6', runtimeType: 'transport', providerId: 'codex',
+    });
+    const peer = sessionRecord({ name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', activeModel: 'opus[1M]', agentType: 'claude-code-sdk', runtimeType: 'transport', providerId: 'claude', userCreated: true });
+    const handlers = createMemoryMcpToolHandlers(caller(), { sendDeps: { listSessions: () => [self, peer] } });
+    const targets = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({});
+    expect(targets).toMatchObject({ status: 'ok', items: [expect.objectContaining({ target: 'deck_proj_w1' })] });
+    expect((targets as { items: Array<{ target: string }> }).items.some((item) => item.target === 'deck_proj_brain')).toBe(false);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({})).resolves.toMatchObject({
+      status: 'ok',
+      identity: {
+        sessionName: 'deck_proj_brain', sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch',
+        agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai',
+        normalizedModelId: 'gpt-5.6', effectiveModelId: 'gpt-5.6', modelMetadataState: 'known',
+        modelMetadataSource: 'active_model', modelMetadataConfidence: 'daemon_observed',
+      },
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({ sessionName: 'deck_proj_w1', model: 'opus' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+  });
+
+  it('threads the optional executionPool contract through MCP ingress without changing default discovery', async () => {
+    const codexConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const qwenConfig = {
+      agentType: 'qwen', providerFamily: 'alibaba', runtimeType: 'transport' as const, model: 'qwen3-coder-plus',
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [{ ...codexConfig, capabilityId: buildSupervisionExecutionCapabilityId(codexConfig) }] },
+            economyTaskPool: { configs: [{ ...qwenConfig, capabilityId: buildSupervisionExecutionCapabilityId(qwenConfig) }] },
+          },
+        },
+      },
+    });
+    const primary = sessionRecord({
+      name: 'deck_proj_codex', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'codex-instance', runtimeEpoch: 'codex-epoch',
+      agentType: codexConfig.agentType, activeModel: codexConfig.model, runtimeType: 'transport',
+    });
+    const economy = sessionRecord({
+      name: 'deck_proj_qwen', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'qwen-instance', runtimeEpoch: 'qwen-epoch',
+      agentType: qwenConfig.agentType, activeModel: qwenConfig.model, runtimeType: 'transport',
+    });
+    const outside = sessionRecord({
+      name: 'deck_proj_cc', role: 'w3', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'cc-instance', runtimeEpoch: 'cc-epoch',
+      agentType: 'claude-code-sdk', activeModel: 'opus[1M]', runtimeType: 'transport',
+    });
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: { listSessions: () => [self, primary, economy, outside] },
+    });
+
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
+    expect(contract.inputSchema.properties?.executionPool).toMatchObject({ enum: ['primary', 'economy'] });
+    expect(contract.outputSchema.properties).toHaveProperty('executionPoolsState');
+    expect(contract.outputSchema.properties).toHaveProperty('items');
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'configured',
+      items: [
+        expect.objectContaining({ target: primary.name, eligiblePools: ['primary'] }),
+        expect.objectContaining({ target: economy.name, eligiblePools: ['economy'] }),
+        expect.objectContaining({ target: outside.name, eligiblePools: [] }),
+      ],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'primary' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'primary', items: [expect.objectContaining({ target: primary.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'economy' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'economy', items: [expect.objectContaining({ target: economy.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'audit' })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+  });
+
+  it('publishes and preserves optional ccPresetId through the real send_message MCP ingress', async () => {
+    const presetConfig = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+      ccPresetId: 'preset-a',
+    };
+    const requestedExecutionType = {
+      ...presetConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(presetConfig),
+    };
+    const legacyConfig = {
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      runtimeType: 'transport' as const,
+      model: 'gpt-5.6',
+    };
+    const legacyRequestedExecutionType = {
+      ...legacyConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(legacyConfig),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [requestedExecutionType, legacyRequestedExecutionType] },
+            economyTaskPool: { configs: [] },
+          },
+        },
+      },
+    });
+    const presetPeer = sessionRecord({
+      name: 'deck_proj_cc_preset', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'preset-instance', runtimeEpoch: 'preset-epoch',
+      agentType: presetConfig.agentType, providerId: 'anthropic', activeModel: presetConfig.model,
+      runtimeType: presetConfig.runtimeType, ccPreset: presetConfig.ccPresetId,
+    });
+    const legacyPeer = sessionRecord({
+      name: 'deck_proj_codex_legacy', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch',
+      agentType: legacyConfig.agentType, providerId: 'openai', activeModel: legacyConfig.model,
+      runtimeType: legacyConfig.runtimeType,
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, presetPeer, legacyPeer], dispatchMessage },
+    });
+    const client = new Client({ name: 'cc-preset-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractTask = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.task as { properties?: Record<string, unknown> };
+      const contractRequested = contractTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(contractRequested.properties?.ccPresetId).toMatchObject({ type: 'string', minLength: 1 });
+      expect(contractRequested.required).not.toContain('ccPresetId');
+      expect(contractTask.properties?.auditPolicy).toMatchObject({
+        type: 'string', enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
+
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      const advertisedTask = advertised?.inputSchema.properties?.task as {
+        properties?: Record<string, unknown>;
+      };
+      const advertisedRequested = advertisedTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(advertisedRequested.properties?.ccPresetId).toMatchObject({ minLength: 1 });
+      expect(advertisedRequested.required).not.toContain('ccPresetId');
+      expect(advertisedTask.properties?.auditPolicy).toMatchObject({
+        enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
+
+      const exact = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: presetPeer.name,
+          message: 'preset-bound task',
+          task: {
+            taskId: 'supervision_task_missing_preset_ingress',
+            executionPool: 'primary',
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(exact.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const legacy = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: legacyPeer.name,
+          message: 'legacy task without preset identity',
+          task: {
+            taskId: 'supervision_task_missing_legacy_ingress',
+            executionPool: 'primary',
+            requestedExecutionType: legacyRequestedExecutionType,
+          },
+        },
+      });
+      expect(legacy.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const { ccPresetId: _omitted, ...missingPreset } = requestedExecutionType;
+      for (const malformed of [missingPreset, { ...requestedExecutionType, ccPresetId: 'preset-b' }]) {
+        const rejected = await client.callTool({
+          name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          arguments: {
+            target: presetPeer.name,
+            message: 'malformed preset identity',
+            task: {
+              taskId: 'supervision_task_missing_preset_ingress',
+              executionPool: 'primary',
+              requestedExecutionType: malformed,
+            },
+          },
+        });
+        expect(rejected.structuredContent).toMatchObject({
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        });
+      }
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('resolves an Agent identity file and carries the complete explicit config through MCP auto-provisioning', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-agent-identity-'));
+    const identityFile = 'release-engineer.md';
+    const identityPath = join(root, identityFile);
+    writeFileSync(identityPath, '  You are the release engineer.  \n', 'utf8');
+    const requestedBase = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+    };
+    const requestedExecutionType = {
+      ...requestedBase,
+      capabilityId: buildSupervisionExecutionCapabilityId(requestedBase),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance',
+      runtimeEpoch: 'self-epoch',
+      projectDir: root,
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      activeModel: 'gpt-5.6-sol',
+    });
+    const target = sessionRecord({
+      name: 'deck_sub_identity_file_target',
+      role: 'w1',
+      parentSession: self.name,
+      userCreated: true,
+      projectDir: root,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      runtimeType: 'transport',
+      activeModel: 'opus[1M]',
+      identityPrompt: 'You are the release engineer.',
+      sessionInstanceId: 'target-instance',
+      runtimeEpoch: 'target-epoch',
+    });
+    let liveSessions = [self];
+    const provisionSupervisionTarget = vi.fn(async () => {
+      liveSessions = [self, target];
+      return {
+        ok: true as const,
+        target,
+        evidence: {
+          selectedPool: 'primary' as const,
+          selectedConfig: requestedExecutionType,
+          origin: 'spawned' as const,
+          createdSessionName: target.name,
+        },
+      };
+    });
+    const profile = {
+      scope: 'session' as const,
+      scopeKey: `srv-1:${target.name}`,
+      content: 'You are the release engineer.',
+      contentHash: 'identity-content-hash',
+      revision: 1,
+      updatedAt: 1,
+      source: 'mcp' as const,
+      sourceFile: identityPath,
+    };
+    const setIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, profile }));
+    const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { projectRoot: string; assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: join(input.projectRoot, '.imcodes-worktrees', input.assignmentId),
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller({ projectRoot: null }), {
+      sendDeps: {
+        listSessions: () => liveSessions,
+        provisionSupervisionTarget,
+        ensureSupervisionAssignmentWorktree,
+        dispatchMessage,
+      },
+      setIdentityProfile,
+      getEffectiveIdentityProfiles,
+      applyEffectiveIdentity,
+    });
+    const client = new Client({ name: 'identity-auto-provision-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractIdentity = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.identity;
+      expect(contractIdentity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+      });
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      expect(advertised?.inputSchema.properties?.identity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        properties: { content: { type: 'string' }, filePath: { type: 'string' } },
+      });
+
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'ship the release',
+          idempotencyKey: 'identity-file-auto-provision-1',
+          identity: { filePath: identityFile },
+          task: {
+            objective: 'ship the release',
+            autoProvision: true,
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: 'accepted',
+        provisioning: { origin: 'spawned', createdSessionName: target.name },
+      });
+      expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        requestedCapabilityId: requestedExecutionType.capabilityId,
+        requestedExecutionConfig: requestedExecutionType,
+        identityPrompt: 'You are the release engineer.',
+        provenance: 'manual_explicit',
+      }));
+      expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
+        scope: 'session',
+        scopeKey: `srv-1:${target.name}`,
+        content: 'You are the release engineer.',
+        sourceFile: identityFile,
+      }), expect.any(Object));
+      expect(applyEffectiveIdentity).toHaveBeenCalledWith(
+        target.name,
+        expect.stringContaining('You are the release engineer.'),
+        { refresh: true },
+      );
+      expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledWith(expect.objectContaining({
+        projectRoot: root,
+      }));
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+
+      const invalid = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'must reject ambiguous identity input',
+          idempotencyKey: 'identity-file-auto-provision-invalid',
+          identity: { content: 'inline', filePath: identityPath },
+          task: { objective: 'reject', autoProvision: true, requestedExecutionType },
+        },
+      });
+      expect(invalid.isError).toBe(true);
+      expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports field-level autoProvision metadata errors and accepts the pool-shaped sibling payload', async () => {
+    const root = process.cwd();
+    const self = sessionRecord({
+      projectDir: root, runtimeType: 'process', activeModel: 'gpt-6-sol', sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [{
+              agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+              capabilityId: buildSupervisionExecutionCapabilityId({
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+              }),
+            }] },
+            economyTaskPool: { configs: [] },
+          },
+        },
+      },
+    });
+    const target = sessionRecord({
+      name: 'deck_sub_pool_payload_target', role: 'w1', parentSession: self.name,
+      userCreated: true, projectDir: root, agentType: 'codex-sdk', providerId: 'openai', runtimeType: 'process',
+      activeModel: 'gpt-6-luna', sessionInstanceId: 'pool-target-instance', runtimeEpoch: 'pool-target-epoch',
+    });
+    const canonicalConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process' as const,
+      model: 'gpt-6-luna',
+      capabilityId: buildSupervisionExecutionCapabilityId({
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+      }),
+    };
+    const provisionSupervisionTarget = vi.fn(async () => ({
+      ok: true as const, target,
+      evidence: { selectedPool: 'primary' as const, selectedConfig: canonicalConfig, origin: 'spawned' as const, createdSessionName: target.name },
+    }));
+    const dispatchMessage = vi.fn(async () => undefined);
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `${root}/.imcodes-worktrees/${input.assignmentId}`,
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller({ projectRoot: root }), {
+      sendDeps: {
+        listSessions: () => [self, target], provisionSupervisionTarget, dispatchMessage,
+        ensureSupervisionAssignmentWorktree,
+      },
+    });
+    const send = handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+
+    await expect(send({
+      message: 'spawn', idempotencyKey: 'metadata-missing-capability',
+      task: { autoProvision: true, requestedExecutionType: {
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+      } },
+    })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'task.requestedExecutionType.capabilityId is required',
+    });
+
+    await expect(send({
+      message: 'spawn', idempotencyKey: 'metadata-wrong-capability',
+      task: { autoProvision: true, requestedExecutionType: { ...canonicalConfig, capabilityId: 'codex' } },
+    })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'task.requestedExecutionType is invalid; capabilityId must match the canonical execution identity',
+    });
+
+    await expect(send({ message: 'spawn', task: { autoProvision: true } })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'task.autoProvision requires no target/broadcast/clone and a non-empty idempotencyKey',
+    });
+
+    // The successful sibling shape: identity comes from the configured pool,
+    // while idempotencyKey is top-level (not nested under task).
+    const poolResult = await send({
+      message: 'spawn from pool', idempotencyKey: 'pool-shaped-sibling-payload',
+      task: {
+        autoProvision: true, executionPool: 'primary', classification: 'independent_top_level',
+        baseRevision: 'a'.repeat(40),
+      },
+    });
+    expect(poolResult).toMatchObject({ status: 'accepted', provisioning: { createdSessionName: target.name } });
+    expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
+      pool: 'primary', idempotencyKey: 'pool-shaped-sibling-payload',
+    }));
+  });
+
+  it('carries deliveryMode through MCP ingress and refuses queue for an existing task continuation', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_append_peer', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', runtimeType: 'transport',
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, peer], dispatchMessage },
+    });
+    const client = new Client({ name: 'append-contract-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+      expect(contract.inputSchema.properties?.deliveryMode).toMatchObject({ enum: ['append', 'queue'] });
+      expect(contract.description).toContain('Inter-session sends append by default');
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: peer.name,
+          message: 'same task continuation',
+          deliveryMode: 'queue',
+          task: { taskId: 'supervision_task_existing', executionPool: 'primary' },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: expect.stringContaining('must use deliveryMode=append'),
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('retains an omitted live target from the authoritative directory but rejects an explicit stopped record', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch',
+      agentType: 'claude-code-sdk', runtimeType: 'transport', userCreated: true,
+    });
+    let snapshot = [self, peer];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const authoritative = vi.fn(async (candidate: SessionRecord) => candidate.name === peer.name);
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: {
+        listSessions: () => snapshot,
+        dispatchMessage,
+        isSessionAuthoritativelyActive: authoritative,
+      },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+
+    // Deterministic snapshot race: the directory refresh omits only the live
+    // peer. No timer is advanced; authority answers synchronously from the
+    // runtime directory and both list + send retain the same target.
+    snapshot = [self];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'continue after snapshot race',
+    })).resolves.toMatchObject({ status: 'accepted' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(authoritative).toHaveBeenCalledWith(expect.objectContaining({ name: peer.name }));
+
+    // An explicit stopped record is newer authority, not an omission. It must
+    // never be resurrected by the previous-good snapshot.
+    snapshot = [self, { ...peer, state: 'stopped' as const }];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'must reject stopped',
+    })).resolves.toMatchObject({ status: 'error' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('does not forward forged cron identity fields to the cron client', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
@@ -440,10 +1385,391 @@ describe('memory MCP tool schema firewall', () => {
     expect(cronCreate.mock.calls[0][1]).toMatchObject({ runtimeServerId: 'srv-1' });
   });
 
+  it('creates a self cron for the runtime-bound main session without session arguments', async () => {
+    const cronCreateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-self' } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronCreateSelf,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/20 * * * *',
+      message: 'Check the current work',
+      sessionName: 'deck_sub_forged',
+      projectName: 'other',
+      serverId: 'srv-forged',
+    });
+
+    expect(cronCreateSelf).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Check the current work',
+      cronExpr: '*/20 * * * *',
+      message: 'Check the current work',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: null,
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+    }), expect.objectContaining({ runtimeServerId: 'srv-1' }));
+    expect(result).toMatchObject({
+      status: 'ok',
+      preferredCronInterface: true,
+      jobId: 'job-self',
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+      controls: {
+        update: { tool: 'cron_update_self', args: { id: 'job-self' } },
+        cancel: { tool: 'cron_cancel_self', args: { id: 'job-self' }, forceRequired: true },
+      },
+    });
+  });
+
+  it('creates a self cron directly for the runtime-bound sub-session', async () => {
+    const cronCreateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-sub' } }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      sessionName: 'deck_sub_worker',
+      projectName: 'deck_sub_worker',
+    }), {
+      cronCreateSelf,
+      sendDeps: {
+        listSessions: () => [
+          sessionRecord(),
+          sessionRecord({
+            name: 'deck_sub_worker',
+            projectName: 'deck_sub_worker',
+            parentSession: 'deck_proj_brain',
+            role: 'w1',
+          }),
+        ],
+      },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      name: 'Sub reminder',
+      cronExpr: '0 9 * * *',
+      message: 'Continue this task',
+    });
+
+    expect(cronCreateSelf).toHaveBeenCalledWith(expect.objectContaining({
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_worker',
+      message: 'Continue this task',
+    }), expect.any(Object));
+  });
+
+  it('updates only a cron targeting the runtime-bound current session', async () => {
+    const cronUpdateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          { id: 'self-1', name: 'Progress', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          { id: 'worker-1', name: 'Worker progress', project_name: 'proj', target_role: 'w1', target_session_name: null },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronUpdateSelf,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'self-1',
+      cronExpr: '*/20 * * * *',
+      message: 'Check whether the work is complete',
+      sessionName: 'deck_proj_w1',
+      serverId: 'srv-forged',
+    });
+
+    expect(cronUpdateSelf).toHaveBeenCalledWith({
+      id: 'self-1',
+      projectName: 'proj',
+      name: undefined,
+      cronExpr: '*/20 * * * *',
+      message: 'Check whether the work is complete',
+      timezone: undefined,
+      expiresAt: undefined,
+      completionPolicy: undefined,
+      force: false,
+    }, expect.objectContaining({ runtimeServerId: 'srv-1' }));
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'worker-1',
+      name: 'Do not change',
+    })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(cronUpdateSelf).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires substantive shortIntervalReason for <20m agent crons while forwarding justified <20m and allowing >=20m without reason', async () => {
+    const cronCreateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-self-short' } }));
+    const cronUpdateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronCreate = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-cross-short' } }));
+    const cronUpdate = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          {
+            id: 'self-existing-10m',
+            name: 'Existing 10m',
+            cron_expr: '*/10 * * * *',
+            project_name: 'proj',
+            target_role: 'brain',
+            target_session_name: null,
+          },
+        ],
+      },
+    }));
+
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronCreateSelf,
+      cronUpdateSelf,
+      cronCreate,
+      cronUpdate,
+      cronList,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    // Reject missing or whitespace-only shortIntervalReason for <20m before calling client.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/5 * * * *',
+      message: 'Check deployment',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: expect.stringContaining('20 minutes'),
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/15 * * * *',
+      shortIntervalReason: '   ',
+      message: 'Check deployment',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE]({
+      name: 'Short cross send',
+      cronExpr: '*/10 * * * *',
+      action: { type: 'send', target: 'w1', message: 'ping' },
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'self-existing-10m',
+      cronExpr: '*/5 * * * *',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]({
+      id: 'job-cross-short',
+      cronExpr: '*/5 * * * *',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    expect(cronCreateSelf).not.toHaveBeenCalled();
+    expect(cronUpdateSelf).not.toHaveBeenCalled();
+    expect(cronCreate).not.toHaveBeenCalled();
+    expect(cronUpdate).not.toHaveBeenCalled();
+
+    // <5m still rejected even with a good reason.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/4 * * * *',
+      shortIntervalReason: 'User requested rapid 4m monitoring check during rollout',
+      message: 'Check deployment',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: expect.stringContaining('5 minutes'),
+    });
+
+    // Substantive shortIntervalReason allows <20m (including 5m / 10m) and forwards reason cleanly.
+    const validReason = 'User requested 5m rollout health checks until deployment finishes';
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: validReason,
+      message: 'Check deployment',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    })).resolves.toMatchObject({ status: 'ok' });
+    expect(cronCreateSelf).toHaveBeenCalledWith(expect.objectContaining({
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: validReason,
+    }), expect.any(Object));
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'self-existing-10m',
+      name: 'Updated Name Without Cron Change',
+    })).resolves.toMatchObject({ status: 'ok' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'self-existing-10m',
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: validReason,
+    })).resolves.toMatchObject({ status: 'ok' });
+    expect(cronUpdateSelf).toHaveBeenLastCalledWith(expect.objectContaining({
+      cronExpr: '*/5 * * * *',
+      shortIntervalReason: validReason,
+    }), expect.any(Object));
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE]({
+      name: 'Justified cross send',
+      cronExpr: '*/10 * * * *',
+      shortIntervalReason: '用户要求5分钟检查',
+      action: { type: 'send', target: 'w1', message: 'ping' },
+    })).resolves.toMatchObject({ status: 'ok' });
+    expect(cronCreate).toHaveBeenCalledWith(expect.objectContaining({
+      cronExpr: '*/10 * * * *',
+      shortIntervalReason: '用户要求5分钟检查',
+    }), expect.any(Object));
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]({
+      id: 'job-cross-short',
+      cronExpr: '*/20 * * * *',
+    })).resolves.toMatchObject({ status: 'ok' });
+  });
+
+  it('cancels only a uniquely named cron targeting the current session', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          {
+            id: 'self-1',
+            name: 'Daily check',
+            project_name: 'proj',
+            target_role: 'brain',
+            target_session_name: null,
+            completion_policy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+          },
+          { id: 'worker-1', name: 'Daily check', project_name: 'proj', target_role: 'w1', target_session_name: null },
+          { id: 'other-project', name: 'Daily check', project_name: 'other', target_role: 'brain', target_session_name: null },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({ name: 'Daily check' })).resolves.toEqual({
+      status: 'ok',
+      count: 1,
+      deleted: [{ id: 'self-1', name: 'Daily check' }],
+    });
+    expect(cronDelete).toHaveBeenCalledOnce();
+    expect(cronDelete).toHaveBeenCalledWith('self-1', expect.objectContaining({ runtimeServerId: 'srv-1' }), false);
+  });
+
+  it('requires force for recurring self cron cancellation and forwards the explicit latch', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          {
+            id: 'recurring-1',
+            name: 'Daily report',
+            project_name: 'proj',
+            target_role: 'brain',
+            target_session_name: null,
+            completion_policy: CRON_COMPLETION_POLICY.RECURRING,
+          },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({
+      id: 'recurring-1',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      protected: [{ id: 'recurring-1', name: 'Daily report' }],
+    });
+    expect(cronDelete).not.toHaveBeenCalled();
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({
+      id: 'recurring-1',
+      force: true,
+    })).resolves.toMatchObject({
+      status: 'ok',
+      count: 1,
+    });
+    expect(cronDelete).toHaveBeenCalledWith(
+      'recurring-1',
+      expect.objectContaining({ runtimeServerId: 'srv-1' }),
+      true,
+    );
+  });
+
+  it('forwards force through generic cron_delete so the server remains authoritative', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronDelete,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_DELETE]({ id: 'recurring-1', force: true });
+
+    expect(cronDelete).toHaveBeenCalledWith(
+      'recurring-1',
+      expect.objectContaining({ runtimeServerId: 'srv-1' }),
+      true,
+    );
+  });
+
+  it('requires an explicit unambiguous self-cron cancellation selector', async () => {
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          { id: 'self-1', name: 'Duplicate', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          { id: 'self-2', name: 'Duplicate', project_name: 'proj', target_role: 'brain', target_session_name: null },
+        ],
+      },
+    }));
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({})).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({ name: 'Duplicate' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      matches: [{ id: 'self-1' }, { id: 'self-2' }],
+    });
+    expect(cronDelete).not.toHaveBeenCalled();
+  });
+
   it('resolves cron project scope from the caller session store for sub-sessions', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller({
       sessionName: 'deck_sub_worker',
+      sourceSessionName: 'deck_sub_supervision_worker',
       projectName: 'deck_sub_worker',
       projectRoot: '/work/alpha',
     }), {
@@ -488,7 +1814,7 @@ describe('memory MCP tool schema firewall', () => {
 
     expect(cronCreate.mock.calls[0][0]).toMatchObject({
       projectName: 'alpha',
-      sourceSessionName: 'deck_sub_worker',
+      sourceSessionName: 'deck_sub_supervision_worker',
       sourceProjectName: 'alpha',
     });
   });
@@ -551,7 +1877,14 @@ describe('memory MCP tool schema firewall', () => {
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({ target: 'deck_proj_w1', message: 'hello' })).resolves.toMatchObject({
       status: 'accepted',
     });
-    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]({ target: 'Friendly', message: 'hello' })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'validation_failed',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]({ target: 'deck_proj_w1', message: 'hello' })).resolves.toMatchObject({
+      status: 'accepted',
+    });
+    expect(dispatchMessage).toHaveBeenCalledTimes(2);
   });
 
   it('strips forged serverId from get_memory_sources input — orchestrator never sees it', async () => {
@@ -684,5 +2017,68 @@ describe('memory MCP tool schema firewall', () => {
 
     expect(cronCreate.mock.calls[0][0]).toMatchObject({ name: '', cronExpr: '' });
     expect(cronList.mock.calls[0][0]).toEqual({ projectName: 'proj', limit: 5 });
+  });
+});
+
+describe('send_message identity ingress limit', () => {
+  // The MCP ingress rejects an oversized identity before anything is dispatched.
+  // send-tool validates again downstream, so this pins the earlier boundary and
+  // its exact contract rather than merely "rejected somewhere".
+  function handlersFor(root: string) {
+    const self = sessionRecord({ projectDir: root });
+    const dispatchMessage = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller({ projectRoot: root }), {
+      sendDeps: { listSessions: () => [self], dispatchMessage },
+    });
+    return { handlers, dispatchMessage };
+  }
+
+  it('rejects an inline identity one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-'));
+    try {
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-over', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1) },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an identity file one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-file-'));
+    try {
+      // ASCII, so the file stays under the byte pre-read bound and only the
+      // character limit can reject it.
+      writeFileSync(join(root, 'oversized.md'), 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1), 'utf8');
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-file-over', task: { autoProvision: true },
+        identity: { filePath: 'oversized.md' },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reject an identity at exactly the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-limit-'));
+    try {
+      const { handlers } = handlersFor(root);
+      const result = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-limit', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS) },
+      }) as { message?: string };
+      expect(result.message).not.toBe('identity is invalid');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

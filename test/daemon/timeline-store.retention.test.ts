@@ -27,6 +27,7 @@ const projectionMocks = vi.hoisted(() => ({
   queryByTypes: vi.fn(),
   queryCompletedTextTail: vi.fn(),
   getLatest: vi.fn(),
+  rebuildSession: vi.fn(async () => true),
   pruneSessionToAuthoritative: vi.fn(async () => undefined),
   deleteSession: vi.fn(),
   checkpointIfNeeded: vi.fn(),
@@ -63,6 +64,7 @@ function makeEvent(sessionId: string, seq: number, text: string) {
 describe('timeline-store async retention (T5-T6)', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalImcodesHome = process.env.IMCODES_HOME;
   let tempHome: string | null = null;
 
   beforeEach(() => {
@@ -71,6 +73,7 @@ describe('timeline-store async retention (T5-T6)', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-retention-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
   });
 
   afterEach(() => {
@@ -79,6 +82,8 @@ describe('timeline-store async retention (T5-T6)', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
   });
@@ -182,5 +187,42 @@ describe('timeline-store async retention (T5-T6)', () => {
     const final = readFileSync(filePath, 'utf-8').trimEnd().split('\n');
     expect(final).toHaveLength(5001);
     expect(JSON.parse(final[final.length - 1]!).seq).toBe(9999);
+  });
+
+  it('T6c: an append arriving during compaction is queued after the atomic rename', async () => {
+    let releaseTmpWrite!: () => void;
+    let tmpWriteStarted!: () => void;
+    const tmpWriteGate = new Promise<void>((resolve) => { releaseTmpWrite = resolve; });
+    const tmpWriteSeen = new Promise<void>((resolve) => { tmpWriteStarted = resolve; });
+    vi.doMock('fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+      return {
+        ...actual,
+        writeFile: vi.fn(async (...args: Parameters<typeof actual.writeFile>) => {
+          tmpWriteStarted();
+          await tmpWriteGate;
+          return actual.writeFile(...args);
+        }),
+      };
+    });
+
+    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const sessionId = 't6c-session';
+    const filePath = timelineStore.filePath(sessionId);
+    mkdirSync(join(tempHome!, '.imcodes', 'timeline'), { recursive: true });
+    const seed = Array.from({ length: 5100 }, (_, i) =>
+      JSON.stringify({ sessionId, seq: i + 1, epoch: 1, ts: i + 1, type: 'assistant.text', payload: { text: `seed-${i}` } }),
+    );
+    writeFileSync(filePath, seed.join('\n') + '\n', 'utf-8');
+
+    const truncatePromise = timelineStore.truncate(sessionId, 5000);
+    await tmpWriteSeen;
+    const appendPromise = timelineStore.append(makeEvent(sessionId, 9999, 'during-truncate'));
+    releaseTmpWrite();
+    await Promise.all([truncatePromise, appendPromise]);
+
+    const final = readFileSync(filePath, 'utf-8').trimEnd().split('\n');
+    expect(final).toHaveLength(5001);
+    expect(JSON.parse(final.at(-1)!).seq).toBe(9999);
   });
 });

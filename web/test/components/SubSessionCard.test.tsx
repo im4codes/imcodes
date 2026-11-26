@@ -46,6 +46,7 @@ const retryOptimisticMessageSpy = vi.fn();
 const useTimelineSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: (...args: unknown[]) => {
     useTimelineSpy(...args);
     return {
@@ -72,6 +73,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: any) => sessionControlsSpy(props),
 }));
 
+import { takeTrackedShareCancel } from '../../src/share-cancel-feedback.js';
 import { SubSessionCard } from '../../src/components/SubSessionCard.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 
@@ -106,6 +108,96 @@ describe('SubSessionCard', () => {
     localStorage.clear();
   });
 
+  it('shows its canonical task name/status in the preview-card title', () => {
+    const sub = makeSubSession();
+    (window as any).__imcodesTaskPairSnapshot = { authoritative: true, serverId: sub.serverId, tasks: [{ taskId: 'header-task', title: 'Current card task', pair: { status: 'in_audit', executor: sub.sessionName } }] };
+    try {
+      const view = render(<SubSessionCard sub={sub} ws={null} connected isOpen={false} onOpen={vi.fn()} onDiff={vi.fn()} onHistory={vi.fn()} />);
+      expect(view.container.querySelector('.subcard-label')?.textContent).toContain('Current card task');
+      expect(view.container.querySelector('.subsession-task-state')?.textContent).toBe('taskPair.status.in_audit');
+    } finally { delete (window as any).__imcodesTaskPairSnapshot; }
+  });
+
+  it('caps expanded model labels without shortening the control identity', () => {
+    const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
+    const props = { sub, ws: null, connected: true, isOpen: false,
+      quickData: { data: [], recordHistory: vi.fn() } as any,
+      onOpen: vi.fn(), onDiff: vi.fn(), onHistory: vi.fn() };
+    const view = render(<SubSessionCard {...props} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subcard-model')?.getAttribute('title')).toBe('gemini-4-argon-high');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gemini-4-argon-high');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: 'gpt-6.1-sol' }} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('6.1-sol');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gpt-6.1-sol');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: null }} />);
+    expect(view.container.querySelector('.subcard-model')).toBeNull();
+  });
+
+  it('projects canonical peer-audit identity/model metadata into compact SessionControls', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          sessionInstanceId: 'card-instance-1',
+          runtimeEpoch: 'card-runtime-1',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+        })}
+        ws={null}
+        connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession).toMatchObject({
+      name: 'deck_sub_sub-card-1',
+      sessionInstanceId: 'card-instance-1',
+      runtimeEpoch: 'card-runtime-1',
+      activeModel: 'gpt-5.6',
+      providerId: 'openai',
+    });
+  });
+
+  it('passes quota and heartbeat metadata into the compact SessionControls without restoring the removed ChatView status props', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          quotaLabel: '7d 55% 5d05h 9/26 18:39',
+          quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+          supervisionMode: 'supervised_audit',
+          supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+        } as any)}
+        ws={null}
+        connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    });
+    const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(chatViewProps).toMatchObject({ preview: true });
+    expect(chatViewProps).not.toHaveProperty('quotaLabel');
+    expect(chatViewProps).not.toHaveProperty('quotaMeta');
+    expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
+  });
+
   it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(
@@ -125,6 +217,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: false,
+      subscriptionMode: 'summary',
     });
 
     await act(async () => {
@@ -134,6 +227,67 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: true,
+      subscriptionMode: 'summary',
+    });
+  });
+
+
+  it('keeps an open but unfocused card passive while remaining visible', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+      subscriptionMode: 'summary',
+    });
+  });
+
+  it('lets the focused preview own recovery only when no floating window owns the session', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: true,
+      isVisible: true,
+      subscriptionMode: 'summary',
+    });
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 
@@ -364,14 +518,17 @@ describe('SubSessionCard', () => {
         text: 'echo hi',
         commandId: expect.any(String),
       }));
-      expect(terminalScrollBottomSpy).toHaveBeenCalled();
+      // Closed shell cards keep only the lightweight preview placeholder; the
+      // terminal is mounted when the card/window is actually opened.
+      expect(terminalScrollBottomSpy).not.toHaveBeenCalled();
     });
     expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 
   it('keeps shell cards in raw terminal preview mode', async () => {
     const releaseRaw = vi.fn();
-    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), subscribeTerminal: vi.fn() } as any;
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()), subscribeTerminal: vi.fn() } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
     const view = render(
       <SubSessionCard
         sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
@@ -380,7 +537,7 @@ describe('SubSessionCard', () => {
         isOpen={false}
         onOpen={vi.fn()}
         onDiff={vi.fn()}
-        onHistory={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
       />,
     );
 
@@ -388,13 +545,55 @@ describe('SubSessionCard', () => {
       expect(ws.holdTerminalRaw).toHaveBeenCalledWith('deck_sub_sub-card-1');
     });
 
-    const props = terminalViewPropsSpy.mock.calls.at(-1)?.[0];
-    expect(props.preview).toBe(true);
-    expect(props.mobileInput).toBe(true);
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
 
     view.unmount();
     expect(releaseRaw).toHaveBeenCalledOnce();
+  });
+
+  it('keeps recent shell output visible in a closed card without mounting xterm', async () => {
+    const releaseRaw = vi.fn();
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
+      />,
+    );
+
+    await waitFor(() => expect(historyApplyers.length).toBeGreaterThan(0));
+    historyApplyers.at(-1)?.('\u001b[32mrecent output\u001b[0m\nsecond line');
+    await waitFor(() => {
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('recent output');
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('second line');
+    });
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
+  });
+
+  it('mounts the live terminal immediately when a shell card opens', () => {
+    const ws = { holdTerminalRaw: vi.fn(() => vi.fn()), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(terminalViewPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_sub-card-1',
+      preview: true,
+    }));
   });
 
   it('fallback shell card cleanup unsubscribes instead of entering passive mode', async () => {
@@ -429,6 +628,7 @@ describe('SubSessionCard', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
+        sharedState={{ effectiveRole: 'participant', status: 'active', activeDispatchId: 'dispatch-sub-1' }}
         ws={ws}
         connected={true}
         isOpen={false}
@@ -446,14 +646,18 @@ describe('SubSessionCard', () => {
       expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', {
         sessionName: 'deck_sub_sub-card-1',
         commandId: expect.any(String),
+        observedDispatchId: 'dispatch-sub-1',
       });
     });
     // Stop must not be represented as a chat send.
     expect(ws.sendSessionCommandUrgent).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
+    // The cancel is registered, so a refusal (rate limit, turn changed...) is reported to the user instead of vanishing.
+    const sentCommandId = (ws.sendSessionCommandUrgent.mock.calls[0]![1] as { commandId: string }).commandId;
+    expect(takeTrackedShareCancel(sentCommandId)).toBe(true);
   });
 
-  it('renders the stop button when the card uses compact SessionControls', async () => {
+  it('uses SessionControls\' queue-aware Stop instead of a duplicate card Stop in compact mode', async () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
@@ -468,7 +672,12 @@ describe('SubSessionCard', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('.subcard-stop-btn')).not.toBeNull();
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+    expect(container.querySelector('.subcard-stop-btn')).toBeNull();
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      runtimeType: 'transport',
+      state: 'running',
     });
   });
 
@@ -505,6 +714,27 @@ describe('SubSessionCard', () => {
     await waitFor(() => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued send');
+    });
+  });
+
+
+  it('passes React connection state into shared session controls in compact mode', async () => {
+    const ws = { connected: false, sendSessionCommand: vi.fn(), subscribeTransportSession: vi.fn(), unsubscribeTransportSession: vi.fn() } as any;
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenLastCalledWith(expect.objectContaining({ connected: true }));
     });
   });
 
@@ -704,5 +934,55 @@ describe('SubSessionCard', () => {
         resendExtra: { mode: 'quick' },
       },
     );
+  });
+
+  it('renders sequence number corner badge in subcard header and updates on rerender', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={2}
+      />,
+    );
+    const seq = view.getByTestId('subsession-seq-sub-card-1');
+    expect(seq.tagName).toBe('SUP');
+    expect(seq.classList.contains('subcard-seq')).toBe(true);
+    expect(seq.textContent).toBe('2');
+    expect(view.container.querySelector('.subcard-header')?.classList.contains('has-seq')).toBe(true);
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={5}
+      />,
+    );
+    expect(view.getByTestId('subsession-seq-sub-card-1').textContent).toBe('5');
+  });
+
+  it('renders .incognito class on subcard when sub.incognito is true', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ incognito: true })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const card = view.container.querySelector('.subcard');
+    expect(card?.classList.contains('incognito')).toBe(true);
   });
 });

@@ -17,7 +17,7 @@ import {
   type DbOrchestrationRun,
 } from '../db/queries.js';
 import { sanitizeLegacyP2pProgressSnapshot } from '../p2p-workflow-sanitize.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import {
   deriveShareTransitionKey,
@@ -133,11 +133,11 @@ async function resolveDiscussionActor(
   target: ShareTarget,
   now: number,
 ): Promise<EffectiveDiscussionActor | null> {
-  const serverRole = await resolveServerRole(db, serverId, userId);
-  if (serverRole === 'owner' || serverRole === 'admin') {
+  const membership = await resolveServerMembershipRole(db, serverId, userId);
+  if (membership === 'owner' || membership === 'admin') {
     return { kind: 'member', effectiveActorRole: 'server-manager', snapshot: memberSnapshot(target, now) };
   }
-  if (serverRole === 'member') {
+  if (membership === 'member') {
     return { kind: 'member', effectiveActorRole: 'server-member', snapshot: memberSnapshot(target, now) };
   }
 
@@ -320,6 +320,18 @@ discussionRoutes.post('/:id/discussions/comments', async (c) => {
   const actionId = typeof raw.requestId === 'string' && raw.requestId.trim()
     ? raw.requestId.trim()
     : randomHex(16);
+  if (actor.kind === 'share' && actor.effectiveActorRole !== 'participant') {
+    await auditShareComment(c.env.DB, {
+      userId,
+      target,
+      actor,
+      actionId,
+      decision: 'rejected',
+      reason: 'share-role-denied',
+      now,
+    });
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
   if (type !== SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT || !body || body.length > MAX_COMMENT_BODY_CHARS) {
     await auditShareComment(c.env.DB, {
       userId,
@@ -336,7 +348,9 @@ discussionRoutes.post('/:id/discussions/comments', async (c) => {
   const comment = await insertDiscussionComment(c.env.DB, {
     id: randomHex(16),
     serverId,
-    threadId: typeof raw.threadId === 'string' && raw.threadId.trim() ? raw.threadId.trim() : shareTargetKey(target),
+    threadId: actor.kind === 'share'
+      ? shareTargetKey(target)
+      : (typeof raw.threadId === 'string' && raw.threadId.trim() ? raw.threadId.trim() : shareTargetKey(target)),
     scope: target,
     createdByUserId: userId,
     actorEnvelope,

@@ -1,32 +1,90 @@
+import { sniffAttachmentFileMime as sniffStagedUploadMime } from '../../../shared/attachment-mime-file.js';
+import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_MSG, R2_RELAY_CAPABILITY, R2_RELAY_LIMITS, R2_RELAY_PHASE, R2_RELAY_ERROR } from '../../../shared/r2-relay.js';
+import { r2RelayConfig, r2StagingKey, presignR2, r2Request } from '../services/r2-relay.js';
 /**
  * File transfer routes: upload and download via HTTP, relayed to daemon over WS.
  */
+import { isUserActive } from '../security/user-status.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
-import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferStagedUploadTtlMs,
+  fileTransferUploadTimeoutMs,
+  fileTransferLegacyFilename,
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_HTTP_HEADER,
+  FILE_TRANSFER_RELAY_HEADER,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR,
+  FILE_TRANSFER_DOWNLOAD_RESUME,
+  formatFileTransferContentRange,
+  parseFileTransferRangeRequest,
+  FILE_TRANSFER_DELETE_ERROR,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+  validateFileDeleteRequest,
+  validateFileDirectoryListRequest,
+  validateFilePathHandleRequest,
+  validateFileTransferSourceIdentity,
+  validateMacosOpenFullDiskAccessRequest,
 } from '../../../shared/transport/file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
+  isDirectFileTransferClientUploadId,
+} from '../../../shared/direct-file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  refreshMachineDirectUploadAuthority,
+  refreshMachineDirectFetchAuthority,
+  validateMachineDirectFetchRequest,
+  validateMachineDirectUploadRequest,
+} from '../../../shared/machine-direct-file-transfer.js';
+import {
+  resolveControlledMachineOperatorAccess,
+} from '../share/machine-access.js';
+import { describeActionPayload, gateMachineAction } from '../security/machine-action-gate.js';
+import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
+import { MACHINE_ACTION, MACHINE_ACTION_RATE_LIMIT, MACHINE_INTERACTIVE_SOURCE, evaluateMachineAction, type MachineAction } from '../../../shared/machine-access-policy.js';
+import { admitMachineAction, type MachineActionAdmissionInput } from '../share/shared-machine-authority.js';
+import { resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
   FileDownloadStreamRequest,
+  FilePathHandleRequest,
+  FileDirectoryListRequest,
+  FileDeleteRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, webcrypto } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { attachmentContentDisposition, resolveAttachmentDelivery } from '../../../shared/attachment-delivery.js';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -35,21 +93,29 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // without needing auth cookies. Android download handoff may request the same
 // URL more than once, so tokens are resource-bound and short-lived with a small
 // use budget instead of being consumed on the first GET.
-const DOWNLOAD_TOKEN_MAX_USES = 5;
+const DOWNLOAD_TOKEN_MAX_USES = FILE_TRANSFER_DOWNLOAD_RESUME.TOKEN_MAX_USES;
 const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
 const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
 const STAGED_DOWNLOAD_TTL_MS = FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS;
+const MACHINE_FILE_HANDLE_BODY_MAX_BYTES = FILE_TRANSFER_PATH_MAX_BYTES + 1024;
+type ControlledFileAdmission = Omit<MachineActionAdmissionInput, 'now' | 'signingKey'>;
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
   userId: string;
   expiresAt: number;
   remainingUses: number;
+  sessionName?: string;
+  controlledAdmission?: ControlledFileAdmission;
 }>();
 const stagedUploads = new Map<string, {
   serverId: string;
+  controlledAccessUserId?: string;
+  /** The shared-session participant behind the owner's agent: their own access is re-read with the owner's. */
+  controlledActorUserId?: string;
+  controlledAdmission?: ControlledFileAdmission;
   token: string;
   dir: string;
   filePath: string;
@@ -58,9 +124,13 @@ const stagedUploads = new Map<string, {
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
+  preserveUntilExpires?: boolean;
 }>();
 const stagedDownloads = new Map<string, {
   serverId: string;
+  controlledAccessUserId?: string;
+  controlledActorUserId?: string;
+  controlledAdmission?: ControlledFileAdmission;
   token: string;
   stream: PassThrough;
   ready: Promise<Record<string, unknown>>;
@@ -71,6 +141,48 @@ const stagedDownloads = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
   started: boolean;
 }>();
+
+/** Every attachment download advertises resume support. */
+function setAttachmentRangeHeaders(c: Context, offset: number, total: number | undefined): number {
+  c.header(FILE_TRANSFER_HTTP_HEADER.ACCEPT_RANGES, 'bytes');
+  if (offset > 0 && total !== undefined) {
+    c.header(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE, formatFileTransferContentRange(offset, total));
+    return 206;
+  }
+  return 200;
+}
+
+function rangeNotSatisfiable(c: Context, total: number): Response {
+  c.header(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE, `bytes */${total}`);
+  return c.json({ error: 'range_not_satisfiable' }, 416);
+}
+
+async function hasCurrentControlledStageAccess(
+  db: Env['DB'],
+  entry: { serverId: string; controlledAccessUserId?: string; controlledActorUserId?: string; controlledAdmission?: ControlledFileAdmission },
+  signingKey: string,
+): Promise<boolean> {
+  if (entry.controlledAdmission) {
+    if (entry.controlledAdmission.targetServerId !== entry.serverId) return false;
+    return (await admitMachineAction(db, { ...entry.controlledAdmission, signingKey, now: Date.now() })).ok;
+  }
+  if (entry.controlledActorUserId) return false; // Unknown delegated provenance must never become an owner stage.
+  if (!entry.controlledAccessUserId) return true;
+  // A staged download is a file READ on the node: it keeps passing the execute rule (exec switch, owner / execute grant) until the end,
+  // so the kill switch and a revoked grant stop a transfer that is already staged.
+  const now = Date.now();
+  const ownerAccess = await resolveControlledMachineOperatorAccess(db, entry.controlledAccessUserId, entry.serverId, now);
+  if (!ownerAccess) return false;
+  const access = ownerAccess;
+  const decision = evaluateMachineAction({
+    accessRole: access.access_role,
+    accessSource: access.access_source,
+    execGranted: access.exec_granted === true,
+    execEnabled: access.exec_enabled === true,
+    participantTurn: Boolean(entry.controlledActorUserId),
+  }, MACHINE_ACTION.FILE_FETCH);
+  return decision.allowed;
+}
 
 function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
   const entry = stagedDownloads.get(downloadId);
@@ -134,6 +246,7 @@ function deleteStagedUpload(uploadId: string): void {
 function scheduleStagedUploadFetchCleanup(uploadId: string): void {
   const entry = stagedUploads.get(uploadId);
   if (!entry || entry.deleteAfterFetchTimer) return;
+  if (entry.preserveUntilExpires) return;
   entry.deleteAfterFetchTimer = setTimeout(
     () => deleteStagedUpload(uploadId),
     STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS,
@@ -150,19 +263,235 @@ async function persistStagedUpload(file: File, filePath: string): Promise<number
   return fileStat.size;
 }
 
-function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: string, token: string): string {
-  const url = new URL(requestUrl);
+type ResumableBrowserUploadMeta = {
+  version: 1;
+  serverId: string;
+  userId: string;
+  clientUploadId: string;
+  filename: string;
+  originalName: string;
+  mime?: string;
+  destinationDirectory?: string;
+  totalSize: number;
+  lastModified: number;
+  expiresAt: number;
+  chunkSha256: Record<string, string>;
+};
+
+const resumableUploadLocks = new Map<string, Promise<void>>();
+let lastResumableUploadSweepAt = 0;
+
+async function sweepExpiredResumableUploads(now = Date.now()): Promise<void> {
+  if (now - lastResumableUploadSweepAt < 60 * 60 * 1000) return;
+  lastResumableUploadSweepAt = now;
+  const names = await readdir(tmpdir()).catch(() => []);
+  const prefix = `${STAGED_UPLOAD_PREFIX}resume-`;
+  await Promise.all(names.filter((name) => name.startsWith(prefix)).slice(0, 64).map(async (name) => {
+    const dir = path.join(tmpdir(), name);
+    const metaPath = path.join(dir, 'upload.json');
+    const expiresAt = await readFile(metaPath, 'utf8')
+      .then((raw) => (JSON.parse(raw) as { expiresAt?: unknown }).expiresAt)
+      .catch(() => undefined);
+    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + fileTransferStagedUploadTtlMs()).catch(() => 0);
+    if ((typeof expiresAt === 'number' ? expiresAt : fallbackExpiry) < now) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }));
+}
+
+async function withResumableUploadLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+  const prior = resumableUploadLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = prior.then(() => current);
+  resumableUploadLocks.set(key, queued);
+  await prior;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (resumableUploadLocks.get(key) === queued) resumableUploadLocks.delete(key);
+  }
+}
+
+function resumableUploadPaths(serverId: string, userId: string, clientUploadId: string): {
+  key: string;
+  dir: string;
+  filePath: string;
+  metaPath: string;
+} {
+  const key = createHash('sha256').update(`${serverId}\0${userId}\0${clientUploadId}`).digest('hex');
+  const dir = path.join(tmpdir(), `${STAGED_UPLOAD_PREFIX}resume-${key}`);
+  return { key, dir, filePath: path.join(dir, 'upload.part'), metaPath: path.join(dir, 'upload.json') };
+}
+
+async function writeResumableUploadMeta(metaPath: string, meta: ResumableBrowserUploadMeta): Promise<void> {
+  const temporary = `${metaPath}.${randomHex(8)}.tmp`;
+  await writeFile(temporary, JSON.stringify(meta), { mode: 0o600 });
+  await rename(temporary, metaPath);
+}
+
+async function sha256HexAsync(bytes: Uint8Array): Promise<string> {
+  const normalized = bytes.buffer instanceof ArrayBuffer
+    ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    : Uint8Array.from(bytes);
+  const digest = await webcrypto.subtle.digest('SHA-256', normalized);
+  return Buffer.from(digest).toString('hex');
+}
+
+async function hashExistingRange(filePath: string, offset: number, length: number): Promise<string> {
+  const handle = await open(filePath, 'r');
+  try {
+    const bytes = Buffer.allocUnsafe(length);
+    let read = 0;
+    while (read < length) {
+      const result = await handle.read(bytes, read, length - read, offset + read);
+      if (result.bytesRead <= 0) throw new Error('upload_state_short_read');
+      read += result.bytesRead;
+    }
+    return sha256HexAsync(bytes);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function acceptResumableBrowserChunk(params: {
+  serverId: string;
+  userId: string;
+  clientUploadId: string;
+  chunk: File;
+  offset: number;
+  totalSize: number;
+  originalName: string;
+  lastModified: number;
+  destinationDirectory?: string;
+  revalidate?: () => Promise<boolean>;
+}): Promise<{
+  complete: boolean;
+  committedBytes: number;
+  dir: string;
+  filePath: string;
+  filename: string;
+  mime?: string;
+}> {
+  const paths = resumableUploadPaths(params.serverId, params.userId, params.clientUploadId);
+  await sweepExpiredResumableUploads();
+  return withResumableUploadLock(paths.key, async () => {
+    if (params.revalidate && !await params.revalidate()) throw new Error('target_forbidden');
+    await mkdir(paths.dir, { recursive: true, mode: 0o700 });
+    let meta: ResumableBrowserUploadMeta | null = null;
+    try {
+      meta = JSON.parse(await readFile(paths.metaPath, 'utf8')) as ResumableBrowserUploadMeta;
+    } catch { /* first chunk */ }
+    if (!meta) {
+      if (params.offset !== 0) throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes: 0 });
+      meta = {
+        version: 1,
+        serverId: params.serverId,
+        userId: params.userId,
+        clientUploadId: params.clientUploadId,
+        // The daemon owns the durable layout. This is the stable attachment
+        // id; the original name is carried separately and sanitized there.
+        filename: randomHex(16),
+        originalName: params.originalName,
+        ...(params.chunk.type ? { mime: params.chunk.type } : {}),
+        ...(params.destinationDirectory ? { destinationDirectory: params.destinationDirectory } : {}),
+        totalSize: params.totalSize,
+        lastModified: params.lastModified,
+        expiresAt: Date.now() + fileTransferStagedUploadTtlMs(params.totalSize),
+        chunkSha256: {},
+      };
+      await writeFile(paths.filePath, new Uint8Array(0), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
+        const existing = await stat(paths.filePath).catch(() => null);
+        if (!existing) throw error;
+      });
+      await writeResumableUploadMeta(paths.metaPath, meta);
+    }
+    if (meta.version !== 1
+      || meta.serverId !== params.serverId
+      || meta.userId !== params.userId
+      || meta.clientUploadId !== params.clientUploadId
+      || meta.originalName !== params.originalName
+      || meta.totalSize !== params.totalSize
+      || meta.lastModified !== params.lastModified
+      || (meta.mime ?? '') !== (params.chunk.type || '')
+      || (meta.destinationDirectory ?? '') !== (params.destinationDirectory ?? '')) {
+      throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.IDENTITY_MISMATCH);
+    }
+    if (Date.now() > meta.expiresAt) {
+      await rm(paths.dir, { recursive: true, force: true });
+      throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.EXPIRED);
+    }
+    const committedBytes = await stat(paths.filePath).then((entry) => entry.size);
+    if (committedBytes > meta.totalSize) throw new Error('upload_state_invalid');
+    if (params.offset > committedBytes) {
+      throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes });
+    }
+    const chunkBytes = Buffer.from(await params.chunk.arrayBuffer());
+    if (params.revalidate && !await params.revalidate()) throw new Error('target_forbidden');
+    const chunkHash = await sha256HexAsync(chunkBytes);
+    if (params.offset < committedBytes) {
+      if (params.offset + chunkBytes.length > committedBytes) {
+        throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes });
+      }
+      const knownHash = meta.chunkSha256[String(params.offset)]
+        ?? await hashExistingRange(paths.filePath, params.offset, chunkBytes.length);
+      if (knownHash !== chunkHash) throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.CONTENT_MISMATCH);
+      return {
+        complete: committedBytes === meta.totalSize,
+        committedBytes,
+        dir: paths.dir,
+        filePath: paths.filePath,
+        filename: meta.filename,
+        ...(meta.mime ? { mime: meta.mime } : {}),
+      };
+    }
+    if (committedBytes + chunkBytes.length > meta.totalSize) throw new Error('upload_size_mismatch');
+    await appendFile(paths.filePath, chunkBytes);
+    const nextCommitted = committedBytes + chunkBytes.length;
+    meta.chunkSha256[String(params.offset)] = chunkHash;
+    meta.expiresAt = Date.now() + fileTransferStagedUploadTtlMs(meta.totalSize);
+    await writeResumableUploadMeta(paths.metaPath, meta);
+    return {
+      complete: nextCommitted === meta.totalSize,
+      committedBytes: nextCommitted,
+      dir: paths.dir,
+      filePath: paths.filePath,
+      filename: meta.filename,
+      ...(meta.mime ? { mime: meta.mime } : {}),
+    };
+  });
+}
+
+function buildRelayUrl(requestUrl: string, configuredServerUrl: string | undefined): URL {
+  return configuredServerUrl?.trim() ? new URL(configuredServerUrl) : new URL(requestUrl);
+}
+
+function buildStagedUploadUrl(requestUrl: string, configuredServerUrl: string | undefined, serverId: string, uploadId: string, token: string): string {
+  const url = buildRelayUrl(requestUrl, configuredServerUrl);
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
 }
 
-function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId: string, token: string): string {
-  const url = new URL(requestUrl);
+function buildStagedDownloadUrl(requestUrl: string, configuredServerUrl: string | undefined, serverId: string, downloadId: string, token: string): string {
+  const url = buildRelayUrl(requestUrl, configuredServerUrl);
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/download-staged/${encodeURIComponent(downloadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
 }
+
+/**
+ * The ONE place a download response gets its type, disposition and security headers (shared/attachment-delivery.ts): both the inline
+ * base64 path and the streaming relay go through it, so no download can be served inline as a document on the app origin.
+ */
+function setAttachmentDeliveryHeaders(c: Context, claimedMime: string | undefined, filename: string): void {
+  const delivery = resolveAttachmentDelivery(claimedMime);
+  c.header('Content-Type', delivery.contentType);
+  c.header('Content-Disposition', attachmentContentDisposition(delivery.disposition, filename));
+  for (const [name, value] of Object.entries(delivery.securityHeaders)) c.header(name, value);
+}
+
 
 /**
  * Send a `file.download_done` (base64 inline) daemon result to the browser as a
@@ -170,18 +499,22 @@ function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId
  * legacy (no-stream-capability) path, and the relay-failure fallback — repo
  * rule: never copy code.
  */
-function respondBase64Download(c: Context, result: Record<string, unknown>, attachmentId: string): Response {
-  const content = Buffer.from(result.content as string, 'base64');
-  const mime = (result.mime as string) || 'application/octet-stream';
+function respondBase64Download(
+  c: Context,
+  result: Record<string, unknown>,
+  attachmentId: string,
+  offset = 0,
+): Response {
+  const whole = Buffer.from(result.content as string, 'base64');
+  // A resumed request against the inline/base64 paths: the whole file is here,
+  // so serve just the missing tail.
+  if (offset > 0 && offset >= whole.length) return rangeNotSatisfiable(c, whole.length);
+  const content = offset > 0 ? whole.subarray(offset) : whole;
   const filename = (result.filename as string) || attachmentId;
-  c.header('Content-Type', mime);
+  const status = setAttachmentRangeHeaders(c, offset, whole.length);
+  setAttachmentDeliveryHeaders(c, result.mime as string | undefined, filename);
   c.header('Content-Length', String(content.length));
-  // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding. Include
-  // both for maximum client compatibility.
-  const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-  const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-  c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-  return c.body(content);
+  return c.body(content, status as 200 | 206);
 }
 
 /**
@@ -199,6 +532,10 @@ async function attemptStreamedDownload(
   bridge: ReturnType<typeof WsBridge.get>,
   serverId: string,
   attachmentId: string,
+  controlledAccessUserId?: string,
+  controlledActorUserId?: string,
+  offset = 0,
+  gate?: Extract<ControlledTargetGate, { ok: true }>,
 ): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
   const downloadId = randomHex(16);
   const token = randomHex(32);
@@ -218,6 +555,9 @@ async function attemptStreamedDownload(
   });
   stagedDownloads.set(downloadId, {
     serverId,
+    ...(controlledAccessUserId ? { controlledAccessUserId } : {}),
+    ...(controlledActorUserId ? { controlledActorUserId } : {}),
+    ...(gate?.admission ? { controlledAdmission: gate.admission } : {}),
     token,
     stream,
     ready,
@@ -233,9 +573,10 @@ async function attemptStreamedDownload(
     type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
     downloadId,
     attachmentId,
-    uploadUrl: buildStagedDownloadUrl(c.req.url, serverId, downloadId, token),
+    uploadUrl: buildStagedDownloadUrl(c.req.url, c.env.SERVER_URL, serverId, downloadId, token),
+    ...(offset > 0 ? { offset } : {}),
   };
-  void bridge.sendFileTransferRequest(
+  void sendControlledFileRequest(c, gate ?? { ok: true, bridge, controlled: false },
     downloadId,
     streamMsg as unknown as Record<string, unknown>,
     FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
@@ -270,25 +611,33 @@ async function attemptStreamedDownload(
     if (result.type === 'file.download_done') {
       // Small file returned inline — no relay/PassThrough involved.
       deleteStagedDownload(downloadId);
-      return { kind: 'done', response: respondBase64Download(c, result, attachmentId) };
+      return { kind: 'done', response: respondBase64Download(c, result, attachmentId, offset) };
     }
 
-    const mime = (result.mime as string) || 'application/octet-stream';
     const filename = (result.filename as string) || attachmentId;
     const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
       ? Math.trunc(result.size)
       : undefined;
-    c.header('Content-Type', mime);
+    // The node says where its body starts (the relay PUT's offset header); it
+    // must be exactly what was asked for.
+    const servedOffset = typeof result.offset === 'number' ? result.offset : 0;
+    if (servedOffset !== offset || (offset > 0 && size === undefined)) {
+      deleteStagedDownload(downloadId, new Error('download_offset_mismatch'));
+      return { kind: 'retry' };
+    }
+    const status = setAttachmentRangeHeaders(c, offset, size === undefined ? undefined : offset + size);
+    setAttachmentDeliveryHeaders(c, result.mime as string | undefined, filename);
     if (size !== undefined) c.header('Content-Length', String(size));
-    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
     c.header('Cache-Control', 'no-store');
     return {
       kind: 'done',
-      response: new Response(Readable.toWeb(stream) as ReadableStream, { status: 200, headers: c.res.headers }),
+      response: new Response(Readable.toWeb(stream) as ReadableStream, { status, headers: c.res.headers }),
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && ['target_forbidden', 'authorization_revoked'].includes(error.message)) {
+      deleteStagedDownload(downloadId, error);
+      return { kind: 'done', response: c.json({ error: 'forbidden' }, 403) };
+    }
     // Did not start delivering in time — retry / fall back.
     deleteStagedDownload(downloadId, new Error('download_stream_not_ready'));
     return { kind: 'retry' };
@@ -308,7 +657,13 @@ function jsonLine(payload: unknown): string {
 const authMiddleware = requireAuth();
 
 fileTransferRoutes.use('/:id/upload', authMiddleware);
+fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
+fileTransferRoutes.use('/:id/machine-file-list', authMiddleware);
+fileTransferRoutes.use('/:id/macos-open-full-disk-access', authMiddleware);
+fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
+fileTransferRoutes.use('/:id/machine-direct-fetch', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
+fileTransferRoutes.use('/:id/uploads/:attachmentId', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
   // Token-based auth bypass for native downloads (system browser has no app auth)
   const token = c.req.query('token');
@@ -323,19 +678,287 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
     if (entry.serverId !== serverId || entry.attachmentId !== attachmentId) {
       return c.json({ error: 'token_resource_mismatch' }, 403);
     }
+    // The token stands in for its issuer's login: a user disabled since it was issued downloads nothing (security/user-status.ts).
+    if (!await isUserActive(c.env.DB, entry.userId)) {
+      downloadTokens.delete(token);
+      return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
+    }
     entry.remainingUses -= 1;
     if (entry.remainingUses <= 0) downloadTokens.delete(token);
     c.set('userId' as never, entry.userId as never);
     c.set('tokenServerId' as never, entry.serverId as never);
     c.set('tokenAttachmentId' as never, entry.attachmentId as never);
+    if (entry.sessionName) c.set('tokenSessionName' as never, entry.sessionName as never);
+    if (entry.controlledAdmission) c.set('controlledTokenAdmission' as never, entry.controlledAdmission as never);
     return next();
   }
   // No token — fall back to cookie/bearer auth
   return (authMiddleware as any)(c, next);
 });
 
+type ControlledTargetGate =
+  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean; daemonGeneration?: number; delegatedActorUserId?: string; admission?: ControlledFileAdmission; accessSource?: string | null }
+  | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' | 'rate_limited' };
+
+/**
+ * What each file capability DOES on the node. Fetch/send/handle capabilities remain EXECUTE-class; directory listing uses the
+ * bounded FILE_LIST policy exception for group participants. A capability nobody mapped is treated as the strictest (a write).
+ */
+const FILE_CAPABILITY_ACTION: Readonly<Record<string, MachineAction>> = {
+  [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+  [FILE_TRANSFER_DIRECTORY_CAPABILITY]: MACHINE_ACTION.FILE_LIST,
+  [MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY]: MACHINE_ACTION.FILE_SEND,
+  [MACHINE_DIRECT_FILE_FETCH_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+  [FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY]: MACHINE_ACTION.FILE_SEND,
+  [FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+};
+
+async function authorizeControlledFileTarget(
+  c: Context,
+  serverId: string,
+  capability: string,
+  requireControlled: boolean,
+  allowInteractiveUser = false,
+): Promise<ControlledTargetGate> {
+  const target = await c.env.DB.queryOne(
+    'SELECT user_id, node_role, exec_enabled, revoked_at FROM servers WHERE id = $1',
+    [serverId],
+  ) as {
+    user_id: string;
+    node_role: string | null;
+    exec_enabled: boolean;
+    revoked_at: number | null;
+  } | null;
+  const controlled = target?.node_role === 'controlled';
+  if (!target || (requireControlled && !controlled)) return { ok: false, reason: 'target_forbidden' };
+
+  const bridge = WsBridge.get(serverId);
+  if (!controlled) return { ok: true, bridge, controlled: false };
+
+  const userId = c.get('userId' as never) as string;
+  const nodeRole = c.get('nodeRole' as never) as string | undefined;
+  const sourceServerId = c.get('authServerId' as never) as string | undefined;
+  const authenticatedFullDaemon = nodeRole === 'full'
+    && typeof sourceServerId === 'string'
+    && sourceServerId !== serverId;
+  const authenticatedInteractiveUser = allowInteractiveUser
+    && nodeRole === undefined
+    && sourceServerId === undefined;
+  if (!authenticatedFullDaemon && !authenticatedInteractiveUser) {
+    return { ok: false, reason: 'scoped_auth' };
+  }
+  const now = Date.now();
+  const action = FILE_CAPABILITY_ACTION[capability] ?? MACHINE_ACTION.FILE_SEND;
+  // One admission for both callers: a FULL daemon (possibly carrying a share participant's turn authority) or the signed-in user's own
+  // browser. Execute rule, audit (refusals too) and rate limit are the same for both.
+  const tokenAdmission = c.get('controlledTokenAdmission' as never) as ControlledFileAdmission | undefined;
+  if (tokenAdmission && (tokenAdmission.targetServerId !== serverId || tokenAdmission.sourceOwnerUserId !== userId)) {
+    return { ok: false, reason: 'target_forbidden' };
+  }
+  const admission: ControlledFileAdmission = tokenAdmission ? { ...tokenAdmission, action } : {
+    token: authenticatedFullDaemon ? c.req.header(SHARED_MACHINE_AUTHORITY_HEADER) : undefined,
+    authenticatedSourceServerId: authenticatedFullDaemon ? sourceServerId! : '',
+    sourceOwnerUserId: userId, targetServerId: serverId, action,
+  };
+  const gate = await gateMachineAction(c.env.DB, {
+    ...admission, signingKey: c.env.JWT_SIGNING_KEY, now,
+    payload: describeActionPayload(`${action}:${capability}`),
+  });
+  if (!gate.ok) {
+    return { ok: false, reason: gate.status === 429 ? 'rate_limited' : gate.wireReason === 'exec_disabled' ? 'exec_disabled' : 'target_forbidden' };
+  }
+  const operational = gate.admission;
+  // Recorded before the transfer starts, fail closed: a file operation that cannot be audited does not start.
+  try {
+    await recordMachineActionAuthorized(c.env.DB, {
+      correlationId: randomHex(16),
+      userId,
+      sourceServerId: authenticatedFullDaemon ? sourceServerId! : MACHINE_INTERACTIVE_SOURCE,
+      targetServerId: serverId,
+      ...describeActionPayload(`${action}:${capability}`),
+      shell: action,
+      now,
+      action,
+      ...(operational.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+      accessSource: operational.target.access_source,
+    });
+  } catch (err) {
+    logger.error({ serverId, action, err }, 'Refusing a machine file operation — durable audit could not be persisted');
+    return { ok: false, reason: 'daemon_offline' };
+  }
+  if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
+  // Capture the exact socket generation synchronously with the capability
+  // observation. Callers can spend time reading/validating request bodies, but
+  // must never dispatch the authorized command to a replacement generation.
+  const daemonGeneration = bridge.daemonConnectionGeneration();
+  if (!bridge.hasDaemonCapability(capability)) return { ok: false, reason: 'capability_unavailable' };
+  return {
+    ok: true, bridge, controlled: true, daemonGeneration, admission, accessSource: operational.target.access_source,
+    ...(operational.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+  };
+}
+
+async function hasCurrentControlledFileAccess(c: Context, gate: Extract<ControlledTargetGate, { ok: true }>): Promise<boolean> {
+  if (!gate.controlled) return true;
+  if (!gate.admission) return false;
+  return (await admitMachineAction(c.env.DB, { ...gate.admission, signingKey: c.env.JWT_SIGNING_KEY, now: Date.now() })).ok;
+}
+
+/** Recheck live resource/provenance after body staging, immediately before dispatch, and before consuming a device result. */
+async function sendControlledFileRequest(
+  c: Context, gate: Extract<ControlledTargetGate, { ok: true }>,
+  ...args: Parameters<ReturnType<typeof WsBridge.get>['sendFileTransferRequest']>
+): Promise<Record<string, unknown>> {
+  if (!await hasCurrentControlledFileAccess(c, gate)) throw new Error('target_forbidden');
+  const result = await (gate.controlled
+    ? gate.bridge.sendFileTransferRequest(args[0], args[1], args[2], args[3], gate.daemonGeneration ?? args[4])
+    : gate.bridge.sendFileTransferRequest(...args));
+  if (!await hasCurrentControlledFileAccess(c, gate)) throw new Error('target_forbidden');
+  return result;
+}
+
+// Actor-bound handle registrations are bounded and ephemeral, like the node's handles themselves.
+// A share authorizes the resource, never somebody else's short-lived handle; legacy owner handles remain usable.
+const controlledHandles = new Map<string, Map<string, number>>();
+function controlledHandleActor(c: Context, gate: Extract<ControlledTargetGate, { ok: true }>): string {
+  return gate.delegatedActorUserId ?? String(c.get('userId' as never));
+}
+function rememberControlledHandle(c: Context, gate: Extract<ControlledTargetGate, { ok: true }>, attachment: AttachmentRef): void {
+  if (!gate.controlled) return;
+  const key = JSON.stringify([attachment.serverId, attachment.id]);
+  const actors = controlledHandles.get(key) ?? new Map<string, number>();
+  actors.set(controlledHandleActor(c, gate), Date.now() + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS);
+  if (actors.size > 100) actors.delete(actors.keys().next().value!);
+  controlledHandles.delete(key); controlledHandles.set(key, actors);
+  if (controlledHandles.size > 10_000) controlledHandles.delete(controlledHandles.keys().next().value!);
+}
+function mayConsumeControlledHandle(c: Context, gate: Extract<ControlledTargetGate, { ok: true }>, serverId: string, attachmentId: string): boolean {
+  if (!gate.controlled || (!gate.delegatedActorUserId && gate.accessSource === 'owner')) return true;
+  const key = JSON.stringify([serverId, attachmentId]);
+  const actors = controlledHandles.get(key);
+  if (actors) {
+    const expires = actors.get(controlledHandleActor(c, gate));
+    return expires !== undefined && expires > Date.now();
+  }
+  return false;
+}
+
+function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetGate, { ok: true }>['reason']): Response {
+  if (reason === 'rate_limited') {
+    c.header('Retry-After', String(MACHINE_ACTION_RATE_LIMIT.WINDOW_MS / 1000));
+    return c.json({ error: reason }, 429);
+  }
+  if (reason === 'daemon_offline') return c.json({ error: reason }, 503);
+  if (reason === 'capability_unavailable') return c.json({ error: reason }, 409);
+  return c.json({ error: reason }, 403);
+}
+
+type SharedFileAccessMode = 'read' | 'write';
+
+async function authorizeSessionFileAccess(
+  c: Context,
+  serverId: string,
+  userId: string,
+  mode: SharedFileAccessMode,
+): Promise<{ ok: true; sessionName?: string } | { ok: false; reason: string }> {
+  let effectiveUserId = userId;
+  let pinnedSessionName: string | undefined;
+  let forceParticipantShareOnly = false;
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      targetServerId: serverId,
+      allowOwnerCrossServer: true,
+    });
+    if (!authority.ok) return { ok: false, reason: authority.reason };
+    effectiveUserId = authority.actorUserId;
+    if (authority.kind === 'participant_daemon') {
+      forceParticipantShareOnly = true;
+      if (authority.claims.shareTarget.kind !== 'server') {
+        pinnedSessionName = authority.claims.sessionName;
+      }
+    }
+  }
+
+  const member = forceParticipantShareOnly
+    ? { ok: false as const, reason: 'share-participant-pinned' }
+    : await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId: effectiveUserId });
+  const requestedSessionName = (
+    pinnedSessionName
+    ?? (c.get('tokenSessionName' as never) as string | undefined)
+    ?? c.req.query('sessionName')
+    ?? ''
+  ).trim();
+  if (member.ok) {
+    return mode === 'read'
+      ? { ok: true }
+      : { ok: true, ...(requestedSessionName ? { sessionName: requestedSessionName } : {}) };
+  }
+
+  const sessionName = requestedSessionName;
+
+  const serverAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId: effectiveUserId,
+    target: { kind: 'server', serverId },
+  });
+  if (serverAccess.actor.kind === 'share') {
+    if (mode === 'write' && serverAccess.actor.effectiveActorRole !== 'participant') {
+      return { ok: false, reason: 'share-role-denied' };
+    }
+    return mode === 'read'
+      ? { ok: true }
+      : { ok: true, sessionName: sessionName || undefined };
+  }
+
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target) return { ok: false, reason: member.reason };
+
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+    serverId,
+    userId: effectiveUserId,
+    target,
+  });
+  if (access.actor.kind !== 'share') return { ok: false, reason: member.reason };
+  if (mode === 'write' && access.actor.effectiveActorRole !== 'participant') {
+    return { ok: false, reason: 'share-role-denied' };
+  }
+  return { ok: true, sessionName };
+}
+
+async function readBoundedJsonObject(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; tooLarge: boolean }> {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false, tooLarge: true };
+  const reader = request.body?.getReader();
+  if (!reader) return { ok: false, tooLarge: false };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+    const parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, tooLarge: false };
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false, tooLarge: false };
+  }
+}
+
 // ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
 // Token-authenticated, relay-local temporary object fetch for daemon uploads.
+// Controlled-node stages also revalidate the issuing user's current grant
+// before bytes leave the Server, so a queued token cannot outlive revocation.
 // The token stays reusable for a short grace window after a successful read so
 // daemon-side HTTP retries do not fail, then the staged object is removed.
 
@@ -350,19 +973,34 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
     return c.json({ error: 'expired' }, 410);
   }
   if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  const accessCurrent = await hasCurrentControlledStageAccess(c.env.DB, entry, c.env.JWT_SIGNING_KEY);
+  if (stagedUploads.get(uploadId) !== entry) return c.json({ error: 'not_found' }, 404);
+  if (!accessCurrent) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'expired' }, 410);
+  }
 
-  const fileStream = createReadStream(entry.filePath);
+  const offset = parseFileTransferRangeRequest(c.req.header(FILE_TRANSFER_HTTP_HEADER.RANGE)) ?? 0;
+  if (offset >= entry.size && entry.size > 0) return rangeNotSatisfiable(c, entry.size);
+  const fileStream = createReadStream(entry.filePath, offset > 0 ? { start: offset } : undefined);
   fileStream.once('end', () => scheduleStagedUploadFetchCleanup(uploadId));
   fileStream.once('error', (err) => {
     logger.warn({ uploadId, err }, 'Staged upload stream failed');
   });
 
+  const status = setAttachmentRangeHeaders(c, offset, entry.size);
+  // This token-authenticated callback is still on the app origin: use the same locked delivery as the browser download route.
+  setAttachmentDeliveryHeaders(c, entry.mime, path.basename(entry.filePath));
+  c.header('Content-Length', String(entry.size - offset));
+  c.header('Cache-Control', 'no-store');
   return new Response(Readable.toWeb(fileStream) as ReadableStream, {
-    status: 200,
+    status,
     headers: {
-      'Content-Type': entry.mime || 'application/octet-stream',
-      'Content-Length': String(entry.size),
-      'Cache-Control': 'no-store',
+      ...Object.fromEntries(c.res.headers.entries()),
     },
   });
 });
@@ -371,6 +1009,13 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
 // Token-authenticated, relay-local sink for daemon → browser streaming
 // downloads. The daemon uploads raw bytes here; the browser GET response reads
 // the paired PassThrough, so large files never cross the daemon WS as base64.
+// Controlled-node stages revalidate access before accepting the first byte.
+
+function parseRelayOffset(header: string | undefined): number {
+  if (!header || !/^\d{1,16}$/.test(header)) return 0;
+  const offset = Number(header);
+  return Number.isSafeInteger(offset) ? offset : 0;
+}
 
 fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
   const serverId = c.req.param('id')!;
@@ -383,6 +1028,16 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
     return c.json({ error: 'expired' }, 410);
   }
   if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  const accessCurrent = await hasCurrentControlledStageAccess(c.env.DB, entry, c.env.JWT_SIGNING_KEY);
+  if (stagedDownloads.get(downloadId) !== entry) return c.json({ error: 'not_found' }, 404);
+  if (!accessCurrent) {
+    deleteStagedDownload(downloadId, new Error('authorization_revoked'));
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedDownload(downloadId, new Error('expired'));
+    return c.json({ error: 'expired' }, 410);
+  }
   if (entry.started) return c.json({ error: 'already_started' }, 409);
 
   const contentLengthHeader = c.req.header('content-length');
@@ -401,8 +1056,9 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
     type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
     downloadId,
     mime: c.req.header('content-type') || 'application/octet-stream',
-    filename: decodeRelayFilename(c.req.header('x-imcodes-filename')),
+    filename: decodeRelayFilename(c.req.header(FILE_TRANSFER_RELAY_HEADER.FILENAME)),
     size: Number.isFinite(contentLength) && contentLength >= 0 ? Math.trunc(contentLength) : undefined,
+    offset: parseRelayOffset(c.req.header(FILE_TRANSFER_RELAY_HEADER.OFFSET)),
   });
   try {
     await pipeline(
@@ -420,13 +1076,285 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
 
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
 
+// A FULL daemon asks a CONTROLLED node to turn one explicit regular-file path
+// into the existing short-lived attachment handle. Directory browsing and
+// arbitrary filesystem CRUD remain outside this route.
+fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+    true,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const boundedBody = await readBoundedJsonObject(c.req.raw, MACHINE_FILE_HANDLE_BODY_MAX_BYTES);
+  if (!boundedBody.ok) {
+    return boundedBody.tooLarge
+      ? c.json({ error: 'request_too_large' }, 413)
+      : c.json({ error: 'invalid_body' }, 400);
+  }
+  const body = boundedBody.value;
+  if (Object.keys(body).length !== 1 || !Object.prototype.hasOwnProperty.call(body, 'path')) {
+    return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  }
+  const requestId = randomHex(16);
+  const parsed = validateFilePathHandleRequest({
+    ...body,
+    type: FILE_TRANSFER_MSG.PATH_HANDLE,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      requestId,
+      parsed.value as FilePathHandleRequest as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
+      const reason = typeof result.error === 'string' ? result.error : 'path_handle_failed';
+      if (reason === 'not_found') return c.json({ error: reason }, 404);
+      return c.json({ error: reason }, 400);
+    }
+    const sourceIdentity = validateFileTransferSourceIdentity(result.sourceIdentity);
+    if (result.type !== FILE_TRANSFER_MSG.PATH_HANDLE_DONE || !result.attachment || !sourceIdentity) {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = serverId;
+    rememberControlledHandle(c, gate, attachment);
+    return c.json({ ok: true, attachment, sourceIdentity });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'path_handle_failed';
+    if (reason === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    logger.error({ serverId, err }, 'Controlled node path handle failed');
+    return c.json({ error: 'path_handle_failed' }, 500);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    true,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const boundedBody = await readBoundedJsonObject(c.req.raw, MACHINE_FILE_HANDLE_BODY_MAX_BYTES);
+  if (!boundedBody.ok) {
+    return boundedBody.tooLarge
+      ? c.json({ error: 'request_too_large' }, 413)
+      : c.json({ error: 'invalid_body' }, 400);
+  }
+  const body = boundedBody.value;
+  // `path` is required; `query` is optional and is only ever forwarded to a node
+  // that advertises it (below). Anything else is rejected, as before.
+  if (!Object.prototype.hasOwnProperty.call(body, 'path')
+    || !Object.keys(body).every((key) => key === 'path' || key === 'query')) {
+    return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  }
+  const requestId = randomHex(16);
+  const parsed = validateFileDirectoryListRequest({
+    ...body,
+    type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  // A node that predates the query capability would reject a request carrying
+  // one. Dropping it answers the plain listing, which the browser shows with
+  // the metadata columns marked unavailable.
+  if (parsed.value.query && !gate.bridge.hasDaemonCapability(FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY)) {
+    delete parsed.value.query;
+  }
+
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      requestId,
+      parsed.value as FileDirectoryListRequest as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR) {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'directory_list_failed' }, 400);
+    }
+    if (result.type !== FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE
+      || !Array.isArray(result.entries)
+      || typeof result.resolvedPath !== 'string') {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    return c.json({
+      ok: true,
+      resolvedPath: result.resolvedPath,
+      entries: result.entries,
+      ...(result.truncated === true ? { truncated: true, total: result.total } : {}),
+      ...(result.partial === true ? { partial: true } : {}),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'directory_list_failed';
+    if (reason === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    return c.json({ error: 'directory_list_failed' }, 500);
+  }
+});
+
+/**
+ * Reveal the native macOS Full Disk Access settings pane on the controlled
+ * node, in the signed-in user's own session, after `/machine-file-list`
+ * reported `macos_full_disk_access_required`. No request body; reuses the
+ * directory capability gate since only a daemon that can list directories
+ * ever needs this. Non-macOS daemons answer `unsupported_platform`.
+ */
+fileTransferRoutes.post('/:id/macos-open-full-disk-access', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    true,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const requestId = randomHex(16);
+  const parsed = validateMacosOpenFullDiskAccessRequest({
+    type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      requestId,
+      parsed.value as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR) {
+      const reason = Object.values(MACOS_OPEN_FULL_DISK_ACCESS_ERROR).includes(result.error as never)
+        ? result.error
+        : 'open_failed';
+      return c.json({ error: reason }, 400);
+    }
+    if (result.type !== FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE) {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    return c.json({ ok: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'open_failed';
+    if (reason === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    return c.json({ error: 'open_failed' }, 500);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-direct-upload', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  const body = await readBoundedJsonObject(c.req.raw, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONTROL_BYTES);
+  if (!body.ok) return c.json({ error: body.tooLarge ? 'body_too_large' : 'invalid_body' }, body.tooLarge ? 413 : 400);
+  const parsed = validateMachineDirectUploadRequest(body.value);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  // The request reached this authenticated, pod-sticky endpoint now. Re-mint
+  // its short authority window from the Server clock so source clock skew can
+  // neither reject a fresh request nor create a long-lived target authority.
+  const forwarded = refreshMachineDirectUploadAuthority(parsed.value);
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      forwarded.requestId,
+      forwarded as unknown as Record<string, unknown>,
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'direct_failed' }, 409);
+    }
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = serverId;
+    rememberControlledHandle(c, gate, attachment);
+    return c.json({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: forwarded.requestId, attachment });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (message === 'timeout') return c.json({ error: 'direct_timeout' }, 504);
+    if (message === 'request_id_conflict') return c.json({ error: message }, 409);
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-direct-fetch', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, MACHINE_DIRECT_FILE_FETCH_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  const body = await readBoundedJsonObject(c.req.raw, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONTROL_BYTES);
+  if (!body.ok) return c.json({ error: body.tooLarge ? 'body_too_large' : 'invalid_body' }, body.tooLarge ? 413 : 400);
+  const parsed = validateMachineDirectFetchRequest(body.value);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const forwarded = refreshMachineDirectFetchAuthority(parsed.value);
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      forwarded.requestId,
+      forwarded as unknown as Record<string, unknown>,
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE
+      || result.requestId !== forwarded.requestId
+      || typeof result.size !== 'number') {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'direct_failed' }, 409);
+    }
+    return c.json({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE, requestId: forwarded.requestId, size: result.size });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (message === 'timeout') return c.json({ error: 'direct_timeout' }, 504);
+    if (message === 'request_id_conflict') return c.json({ error: message }, 409);
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
+});
+
 fileTransferRoutes.post('/:id/upload', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
 
-  // Permission check
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+    false,
+    true,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  // Controlled-node shares have their own DB-authoritative Owner/Participant
+  // grants. Standard daemons retain the existing member/session-share check.
+  let uploadSessionName: string | undefined;
+  if (!controlledGate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+    uploadSessionName = access.sessionName;
+  }
 
   const contentLengthHeader = c.req.header('content-length');
   const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
@@ -444,8 +1372,48 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const formData = await c.req.formData().catch(() => null);
   if (!formData) return c.json({ error: 'invalid_body' }, 400);
 
-  const file = formData.get('file');
+  const file = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE);
   if (!file || !(file instanceof File)) return c.json({ error: 'missing_file' }, 400);
+  const rawClientUploadId = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID);
+  const clientUploadId = typeof rawClientUploadId === 'string' && isDirectFileTransferClientUploadId(rawClientUploadId)
+    ? rawClientUploadId
+    : undefined;
+  const rawDestinationDirectory = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.DESTINATION_DIRECTORY);
+  const destinationDirectory = typeof rawDestinationDirectory === 'string' && rawDestinationDirectory.trim()
+    ? rawDestinationDirectory.trim()
+    : undefined;
+  if (destinationDirectory) {
+    if (Buffer.byteLength(destinationDirectory, 'utf8') > FILE_TRANSFER_PATH_MAX_BYTES) {
+      return c.json({ error: 'invalid_destination_directory' }, 400);
+    }
+    if (!controlledGate.controlled || !controlledGate.bridge.hasDaemonCapability(FILE_TRANSFER_DIRECTORY_CAPABILITY)) {
+      return c.json({ error: 'capability_unavailable' }, 409);
+    }
+  }
+
+  const rawUploadOffset = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET);
+  const rawUploadTotalSize = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE);
+  const rawUploadOriginalName = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME);
+  const rawUploadLastModified = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED);
+  const resumableRequested = rawUploadOffset !== null
+    || rawUploadTotalSize !== null
+    || rawUploadOriginalName !== null
+    || rawUploadLastModified !== null;
+  const uploadOffset = typeof rawUploadOffset === 'string' ? Number(rawUploadOffset) : Number.NaN;
+  const uploadTotalSize = typeof rawUploadTotalSize === 'string' ? Number(rawUploadTotalSize) : Number.NaN;
+  const uploadOriginalName = typeof rawUploadOriginalName === 'string' ? rawUploadOriginalName : '';
+  const storageName = sanitizeUploadFilename(uploadOriginalName || (file instanceof File ? file.name : 'file'));
+  const uploadLastModified = typeof rawUploadLastModified === 'string' ? Number(rawUploadLastModified) : Number.NaN;
+  if (resumableRequested && (
+    !clientUploadId
+    || !Number.isSafeInteger(uploadOffset) || uploadOffset < 0
+    || !Number.isSafeInteger(uploadTotalSize) || uploadTotalSize < 0 || uploadTotalSize > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE
+    || uploadOffset + file.size > uploadTotalSize
+    || !uploadOriginalName || Buffer.byteLength(uploadOriginalName, 'utf8') > 1024
+    || !Number.isSafeInteger(uploadLastModified) || uploadLastModified < 0
+  )) {
+    return c.json({ error: 'invalid_resumable_upload' }, 400);
+  }
 
   // Size check
   if (file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -456,30 +1424,86 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   }
 
   // Daemon connectivity check
-  const bridge = WsBridge.get(serverId);
+  const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
+  // The request has an exact-key daemon validator. Include the dedupe field
+  // only when the current clean v2 upload-recovery capability is advertised.
+  const negotiatedClientUploadId = (
+    bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY)
+    || bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY)
+  )
+    ? clientUploadId
+    : undefined;
 
   // Generate upload ID and sanitized filename
   const uploadId = randomHex(16);
-  const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
-  const filename = `${randomHex(16)}${ext}`;
-  const stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
-  const stagedPath = path.join(stagedDir, filename);
-  const stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
-    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
-    throw err;
-  });
-  if (stagedSize !== file.size) {
+  let filename: string;
+  let storageFilename: string;
+  let stagedDir: string;
+  let stagedPath: string;
+  let stagedSize: number;
+  if (!await hasCurrentControlledFileAccess(c, controlledGate)) return c.json({ error: 'target_forbidden' }, 403);
+  if (resumableRequested) {
+    let accepted;
+    try {
+      accepted = await acceptResumableBrowserChunk({
+        serverId,
+        userId: controlledHandleActor(c, controlledGate),
+        revalidate: () => hasCurrentControlledFileAccess(c, controlledGate),
+        clientUploadId: clientUploadId!,
+        chunk: file,
+        offset: uploadOffset,
+        totalSize: uploadTotalSize,
+        originalName: uploadOriginalName,
+        lastModified: uploadLastModified,
+        ...(destinationDirectory ? { destinationDirectory } : {}),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'upload_failed';
+      if (message === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+      const committedBytes = (error as { committedBytes?: unknown } | null)?.committedBytes;
+      return c.json({
+        error: message,
+        ...(typeof committedBytes === 'number' ? { committedBytes } : {}),
+      }, message === 'upload_offset_mismatch' ? 409 : 400);
+    }
+    if (!await hasCurrentControlledFileAccess(c, controlledGate)) return c.json({ error: 'target_forbidden' }, 403);
+    if (!accepted.complete) {
+      return c.json({ ok: true, complete: false, committedBytes: accepted.committedBytes });
+    }
+    storageFilename = accepted.filename;
+    filename = fileTransferLegacyFilename(storageFilename, uploadOriginalName);
+    stagedDir = accepted.dir;
+    stagedPath = accepted.filePath;
+    stagedSize = accepted.committedBytes;
+  } else {
+    storageFilename = randomHex(16);
+    filename = fileTransferLegacyFilename(storageFilename, file.name || 'file');
+    stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
+    stagedPath = path.join(stagedDir, storageFilename);
+    stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
+      await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    });
+  }
+  if (stagedSize !== (resumableRequested ? uploadTotalSize : file.size)) {
     await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
     return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
   }
+  // For resumable uploads this reads the assembled file from byte zero, including completion retries. The client MIME remains only a
+  // chunk-identity check; neither it nor the last chunk gets to label the attachment or the daemon fetch response.
+  const stagedMime = await sniffStagedUploadMime(stagedPath).catch(async (err) => {
+    if (!resumableRequested) await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  });
   const supportsRelayFetch = bridge.hasDaemonCapability(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   let relayStaged = false;
   let legacyStageDeleted = false;
   const cleanupUploadStage = () => {
     if (relayStaged) {
+      if (resumableRequested) return;
       deleteStagedUpload(uploadId);
       return;
     }
@@ -493,18 +1517,23 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let uploadMsg: FileUploadFetchRequest | FileUploadRequest;
   if (supportsRelayFetch) {
     const token = randomHex(32);
-    const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
-    const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    const stagedTtlMs = fileTransferStagedUploadTtlMs(stagedSize);
+    const expiresAt = Date.now() + stagedTtlMs;
+    const timer = setTimeout(() => deleteStagedUpload(uploadId), stagedTtlMs);
     timer.unref?.();
     stagedUploads.set(uploadId, {
       serverId,
+      ...(controlledGate.controlled ? { controlledAccessUserId: userId } : {}),
+      ...(controlledGate.delegatedActorUserId ? { controlledActorUserId: controlledGate.delegatedActorUserId } : {}),
+      ...(controlledGate.admission ? { controlledAdmission: controlledGate.admission } : {}),
       token,
       dir: stagedDir,
       filePath: stagedPath,
       size: stagedSize,
-      mime: file.type || undefined,
+      mime: stagedMime,
       expiresAt,
       timer,
+      ...(resumableRequested ? { preserveUntilExpires: true } : {}),
     });
     relayStaged = true;
 
@@ -512,43 +1541,59 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       type: 'file.upload_fetch',
       uploadId,
       filename,
-      originalName: file.name || undefined,
-      mime: file.type || undefined,
-      size: file.size,
-      downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
+      originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      sanitizedName: storageName,
+      mime: stagedMime,
+      size: stagedSize,
+      downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
+      ...(destinationDirectory ? { destinationDirectory } : {}),
+      ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
     };
   } else {
     uploadMsg = {
       type: 'file.upload',
       uploadId,
       filename,
-      originalName: file.name || undefined,
-      mime: file.type || undefined,
-      size: file.size,
+      originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      sanitizedName: storageName,
+      mime: stagedMime,
+      size: stagedSize,
       content: (await readFile(stagedPath)).toString('base64'),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
+      ...(destinationDirectory ? { destinationDirectory } : {}),
+      ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
     };
   }
 
   const runDaemonFetch = async (onProgress?: (msg: Record<string, unknown>) => void): Promise<Response> => {
     try {
-      const result = await bridge.sendFileTransferRequest(
+      const result = await sendControlledFileRequest(c, controlledGate,
         uploadId,
         uploadMsg as unknown as Record<string, unknown>,
-        FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+        fileTransferUploadTimeoutMs(stagedSize),
         onProgress,
+        controlledGate.daemonGeneration,
       );
 
       if (result.type === 'file.upload_error') {
-        logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
-        return c.json({ error: 'upload_failed', message: result.message }, 500);
+        const code = typeof (result as { code?: unknown }).code === 'string'
+          ? (result as { code: string }).code
+          : 'upload_failed';
+        logger.warn({ serverId, uploadId, error: result.message, code }, 'Daemon upload error');
+        // 507 Insufficient Storage when the daemon's disk is full; 500 otherwise.
+        const status = code === FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY ? 507 : 500;
+        return c.json({ error: code, message: result.message }, status);
       }
 
       const attachment = result.attachment as AttachmentRef;
       // Server fills serverId (daemon doesn't know it)
       attachment.serverId = serverId;
+      rememberControlledHandle(c, controlledGate, attachment);
       return c.json({ ok: true, attachment });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (msg === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
       if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') {
         return c.json({ error: 'daemon_offline' }, 503);
       }
@@ -568,12 +1613,37 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   }
 
   const encoder = new TextEncoder();
+  let streamTerminated = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      let closed = false;
+      const isInvalidStateError = (err: unknown): boolean => {
+        if (!(err instanceof Error)) return false;
+        return err.name === 'InvalidStateError'
+          || (err as Error & { code?: unknown }).code === 'ERR_INVALID_STATE';
+      };
+      const terminate = (): void => {
+        if (streamTerminated) return;
+        streamTerminated = true;
+        cleanupUploadStage();
+        try {
+          controller.close();
+        } catch (err) {
+          // A consumer may cancel the stream between the state check and close().
+          // Treat the resulting controller race as an already-terminated stream.
+          if (!isInvalidStateError(err)) throw err;
+        }
+      };
       const write = (payload: unknown) => {
-        if (closed) return;
-        controller.enqueue(encoder.encode(jsonLine(payload)));
+        if (streamTerminated) return;
+        try {
+          controller.enqueue(encoder.encode(jsonLine(payload)));
+        } catch (err) {
+          // cancel() and an in-flight daemon callback can interleave. Never let
+          // an enqueue against an externally closed controller escape to Node.
+          if (!isInvalidStateError(err)) throw err;
+          streamTerminated = true;
+          cleanupUploadStage();
+        }
       };
       try {
         write({
@@ -582,11 +1652,12 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           loaded: 0,
           total: file.size,
         });
-        const result = await bridge.sendFileTransferRequest(
+        const result = await sendControlledFileRequest(c, controlledGate,
           uploadId,
           uploadMsg as unknown as Record<string, unknown>,
-          FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+          fileTransferUploadTimeoutMs(stagedSize),
           (msg) => write(msg),
+          controlledGate.daemonGeneration,
         );
 
         if (result.type === 'file.upload_error') {
@@ -597,6 +1668,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
         const attachment = result.attachment as AttachmentRef;
         attachment.serverId = serverId;
+        rememberControlledHandle(c, controlledGate, attachment);
         write({ type: 'file.upload_done', uploadId, ok: true, attachment });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -610,12 +1682,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           write({ type: 'file.upload_error', uploadId, error: 'upload_failed' });
         }
       } finally {
-        cleanupUploadStage();
-        closed = true;
-        controller.close();
+        terminate();
       }
     },
     cancel() {
+      // Set the shared terminal state before cleanup so late daemon progress
+      // callbacks are discarded even while the async upload is still pending.
+      streamTerminated = true;
       cleanupUploadStage();
     }
   });
@@ -629,6 +1702,55 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   });
 });
 
+// ── DELETE /api/server/:id/uploads/:attachmentId ───────────────────────────
+
+fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const attachmentId = c.req.param('attachmentId')!;
+
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+    false,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  if (!gate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
+  if (!mayConsumeControlledHandle(c, gate, serverId, attachmentId)) return c.json({ error: 'forbidden' }, 403);
+  if (!gate.bridge.isDaemonConnected()) return c.json({ error: 'daemon_offline' }, 503);
+
+  const requestId = randomHex(16);
+  const parsed = validateFileDeleteRequest({ type: FILE_TRANSFER_MSG.DELETE, requestId, attachmentId });
+  if (!parsed.ok) return c.json({ error: 'invalid_attachment_id' }, 400);
+
+  try {
+    const result = await sendControlledFileRequest(c, gate,
+      requestId,
+      parsed.value as FileDeleteRequest as unknown as Record<string, unknown>,
+      30_000,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.DELETE_DONE) return c.json({ ok: true });
+    const reason = typeof result.error === 'string' ? result.error : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    return c.json({ error: reason }, reason === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN ? 403 : 500);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    logger.error({ serverId, attachmentId, error }, 'Attachment deletion failed');
+    return c.json({ error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED }, 500);
+  }
+});
+
 // ── POST /api/server/:id/uploads/:attachmentId/download-token ────────────────
 // Generate a one-time token for downloading without cookies (iOS native app).
 
@@ -637,13 +1759,24 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+    false,
+    true,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  const access = controlledGate.controlled
+    ? { ok: true as const, sessionName: undefined as string | undefined }
+    : await authorizeSessionFileAccess(c, serverId, userId, 'read');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
   }
 
+  if (!mayConsumeControlledHandle(c, controlledGate, serverId, attachmentId)) return c.json({ error: 'forbidden' }, 403);
   const token = randomHex(32);
   downloadTokens.set(token, {
     serverId,
@@ -651,6 +1784,8 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
     userId,
     expiresAt: Date.now() + 900_000,
     remainingUses: DOWNLOAD_TOKEN_MAX_USES,
+    ...(access.sessionName ? { sessionName: access.sessionName } : {}),
+    ...(controlledGate.admission ? { controlledAdmission: controlledGate.admission } : {}),
   });
 
   // Cleanup expired tokens periodically (max 1000 entries)
@@ -679,23 +1814,35 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     return c.json({ error: 'token_resource_mismatch' }, 403);
   }
 
-  // Permission check
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+    false,
+    true,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  if (!controlledGate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   // Validate attachment ID format (hex + optional extension)
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
   }
 
+  if (!mayConsumeControlledHandle(c, controlledGate, serverId, attachmentId)) return c.json({ error: 'forbidden' }, 403);
   // Daemon connectivity check
-  const bridge = WsBridge.get(serverId);
+  const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
 
   const downloadId = randomHex(16);
   const supportsStreamDownload = bridge.hasDaemonCapability?.(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY) === true;
+  // Resume of an interrupted download (`Range: bytes=N-`).
+  const offset = parseFileTransferRangeRequest(c.req.header(FILE_TRANSFER_HTTP_HEADER.RANGE));
 
   try {
     if (supportsStreamDownload) {
@@ -707,7 +1854,16 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       // missing-or-expired handle is terminal; everything else retries, then
       // falls through to base64.
       for (let attempt = 0; attempt < FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS; attempt++) {
-        const outcome = await attemptStreamedDownload(c, bridge, serverId, attachmentId);
+        const outcome = await attemptStreamedDownload(
+          c,
+          bridge,
+          serverId,
+          attachmentId,
+          controlledGate.controlled ? userId : undefined,
+          controlledGate.delegatedActorUserId,
+          offset,
+          controlledGate,
+        );
         if (outcome.kind === 'done') return outcome.response;
       }
       logger.warn(
@@ -727,7 +1883,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       downloadId: legacyDownloadId,
       attachmentId,
     };
-    const result = await bridge.sendFileTransferRequest(
+    const result = await sendControlledFileRequest(c, controlledGate,
       legacyDownloadId,
       downloadMsg as unknown as Record<string, unknown>,
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
@@ -740,14 +1896,118 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       return c.json({ error: 'download_failed', message: errMsg }, 500);
     }
 
-    return respondBase64Download(c, result, attachmentId);
+    return respondBase64Download(c, result, attachmentId, offset);
   } catch (err) {
     deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);
+    if (msg === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
     if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') return c.json({ error: 'daemon_offline' }, 503);
     if (msg === 'timeout') return c.json({ error: 'download_timeout' }, 504);
     if (msg === 'download_stream_not_ready') return c.json({ error: 'download_stream_not_ready' }, 504);
     logger.error({ serverId, downloadId, err }, 'Download relay failed');
     return c.json({ error: 'download_failed' }, 500);
   }
+});
+
+// R2 is a metadata/control plane only. No file bytes pass through this server.
+type R2UploadTicket = { serverId: string; userId: string; key: string; filename: string; size: number;
+  expiresAt: number; sessionName?: string; clientUploadId?: string; destinationDirectory?: string };
+const r2UploadTickets = new Map<string, R2UploadTicket>();
+fileTransferRoutes.use(`/:id/${R2_RELAY_API.ROOT}/*`, authMiddleware);
+
+async function r2RouteAccess(c: Context, mode: SharedFileAccessMode) {
+  const serverId = c.req.param('id')!;
+  const userId = c.get('userId' as never) as string;
+  const access = await authorizeSessionFileAccess(c, serverId, userId, mode);
+  if (!access.ok) return { response: c.json({ error: 'forbidden' }, 403) } as const;
+  const config = r2RelayConfig(c.env);
+  const target = await c.env.DB.queryOne('SELECT node_role FROM servers WHERE id = $1', [serverId]) as { node_role?: string } | null;
+  const bridge = WsBridge.get(serverId);
+  // Controlled nodes keep their established handle/authority path unchanged.
+  if (!config || !target || target.node_role === 'controlled' || !bridge.hasDaemonCapability(R2_RELAY_CAPABILITY)) {
+    return { response: c.body(null, 204) } as const;
+  }
+  if (!bridge.isDaemonConnected()) return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
+  return { config, bridge, serverId, userId, sessionName: access.sessionName } as const;
+}
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, async (c) => {
+  const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
+  const body = await readBoundedJsonObject(c.req.raw, 8192);
+  if (!body.ok) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  const { filename, size, clientUploadId, destinationDirectory } = body.value;
+  if (typeof filename !== 'string' || filename.length > 255 || !Number.isSafeInteger(size)
+    || (size as number) < 0 || (size as number) > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE
+    || (clientUploadId !== undefined && !isDirectFileTransferClientUploadId(clientUploadId))
+    || (destinationDirectory !== undefined && (typeof destinationDirectory !== 'string' || destinationDirectory.length > 4096))) {
+    return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  }
+  if (destinationDirectory) {
+    return c.json({ error: 'capability_unavailable' }, 409);
+  }
+  for (const [id, ticket] of r2UploadTickets) if (ticket.expiresAt <= Date.now()) r2UploadTickets.delete(id);
+  if (r2UploadTickets.size >= 1000) return c.json({ error: R2_RELAY_ERROR.FAILED }, 429);
+  const id = randomHex(16); const key = r2StagingKey(filename);
+  r2UploadTickets.set(id, { serverId: access.serverId, userId: access.userId, key, filename, size: size as number,
+    expiresAt: Date.now() + R2_RELAY_LIMITS.OBJECT_TTL_MS, sessionName: access.sessionName,
+    ...(typeof clientUploadId === 'string' ? { clientUploadId } : {}),
+    ...(typeof destinationDirectory === 'string' ? { destinationDirectory } : {}) });
+  return c.json({ id, url: presignR2(access.config, 'PUT', key, {}, Date.now(), { 'content-length': String(size) }) });
+});
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uploadId/commit`, async (c) => {
+  const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
+  const ticket = r2UploadTickets.get(c.req.param('uploadId'));
+  if (!ticket || ticket.serverId !== access.serverId || ticket.userId !== access.userId
+    || ticket.sessionName !== access.sessionName || ticket.expiresAt <= Date.now()) {
+    return c.json({ error: R2_RELAY_ERROR.EXPIRED }, 403);
+  }
+  if (ticket.destinationDirectory) {
+    return c.json({ error: 'capability_unavailable' }, 409);
+  }
+  try {
+    const head = await r2Request(access.config, 'HEAD', ticket.key);
+    if (Number(head.headers.get('content-length')) !== ticket.size) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+    const uploadId = randomHex(16);
+    const result = await access.bridge.sendFileTransferRequest(uploadId, {
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH, relayMode: FILE_RELAY_MODE.R2, uploadId, filename: fileTransferLegacyFilename(uploadId, ticket.filename),
+      originalName: ticket.filename, mime: 'application/octet-stream', size: ticket.size,
+      downloadUrl: presignR2(access.config, 'GET', ticket.key),
+      clientUploadId: ticket.clientUploadId ?? c.req.param('uploadId'),
+      ...(ticket.destinationDirectory ? { destinationDirectory: ticket.destinationDirectory } : {}),
+      ...(ticket.sessionName ? { sessionName: ticket.sessionName } : {}),
+    }, fileTransferUploadTimeoutMs(ticket.size));
+    if (result.type !== FILE_TRANSFER_MSG.UPLOAD_DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = access.serverId;
+    r2UploadTickets.delete(c.req.param('uploadId'));
+    return c.json({ ok: true, attachment });
+  } catch { return c.json({ error: R2_RELAY_ERROR.FAILED }, 502); }
+});
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/:attachmentId`, async (c) => {
+  const access = await r2RouteAccess(c, 'read'); if ('response' in access) return access.response;
+  const attachmentId = c.req.param('attachmentId');
+  if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  const downloadId = randomHex(16); const key = r2StagingKey('download');
+  let canceled = false;
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const write = (payload: unknown) => { if (!canceled) controller.enqueue(encoder.encode(jsonLine(payload))); };
+      try {
+        const result = await access.bridge.sendFileTransferRequest(downloadId, {
+          type: R2_RELAY_MSG.DOWNLOAD, downloadId, attachmentId, uploadUrl: presignR2(access.config, 'PUT', key),
+        }, fileTransferUploadTimeoutMs(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE), (msg) => {
+          if (msg.type === R2_RELAY_MSG.PROGRESS) write(msg);
+        });
+        if (result.type !== R2_RELAY_MSG.DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+        // Include a signed disposition so cross-origin native/browser navigation saves, not renders, the file.
+        const filename = String(result.filename || 'download');
+        const url = presignR2(access.config, 'GET', key, {
+          'response-content-disposition': attachmentContentDisposition('attachment', filename),
+        });
+        write({ phase: R2_RELAY_PHASE.READY, url });
+      } catch { write({ phase: R2_RELAY_PHASE.ERROR, error: R2_RELAY_ERROR.FAILED }); }
+      finally { if (!canceled) controller.close(); }
+    },
+    cancel() { canceled = true; },
+  }), { headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' } });
 });

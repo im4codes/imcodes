@@ -57,10 +57,13 @@ describe("TRANSPORT_MSG constant", () => {
       "CHAT_SUBSCRIBE",
       "CHAT_UNSUBSCRIBE",
       "CHAT_HISTORY",
+      "CHAT_APPROVAL",
       "APPROVAL_RESPONSE",
       "PROVIDER_STATUS",
       "LIST_SESSIONS",
       "SESSIONS_RESPONSE",
+      "LIST_MODELS",
+      "MODELS_RESPONSE",
     ];
     for (const key of expectedKeys) {
       expect(TRANSPORT_MSG).toHaveProperty(key);
@@ -68,7 +71,7 @@ describe("TRANSPORT_MSG constant", () => {
   });
 
   it("has exactly the expected number of keys", () => {
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(8);
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(10);
   });
 
   it("has no duplicate values", () => {
@@ -81,10 +84,13 @@ describe("TRANSPORT_MSG constant", () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe("chat.subscribe");
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe("chat.unsubscribe");
     expect(TRANSPORT_MSG.CHAT_HISTORY).toBe("chat.history");
+    expect(TRANSPORT_MSG.CHAT_APPROVAL).toBe("chat.approval");
     expect(TRANSPORT_MSG.APPROVAL_RESPONSE).toBe("chat.approval_response");
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe("provider.status");
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe("provider.list_sessions");
     expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe("provider.sessions_response");
+    expect(TRANSPORT_MSG.LIST_MODELS).toBe("transport.list_models");
+    expect(TRANSPORT_MSG.MODELS_RESPONSE).toBe("transport.models_response");
   });
 });
 

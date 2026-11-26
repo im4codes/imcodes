@@ -1,0 +1,484 @@
+import { normalizeTaskPairEventVerb, taskPairEventAction } from '../task-pair-event-action.js';
+import { TaskPairEventDecisions } from './TaskPairEventDecisions.js';
+import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { useTranslation } from 'react-i18next';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
+import { isHoverPreviewSuppressed, onHoverPreviewSuppressed } from '../hover-preview-gate.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
+import {
+  isTaskPairAggregateId,
+  TASK_PAIR_BRAIN_NOTICE_STATUSES,
+  TASK_PAIR_NOTICE_VERB,
+  TASK_PAIR_STATUSES,
+  TASK_PAIR_WORKSPACE_EVENT_VERB,
+  type TaskPairEventPayload,
+  type TaskPairStatus,
+} from '@shared/task-pair.js';
+import { normalizeTaskPairAuditDetails, parseTaskPairAuditDetails } from '@shared/task-pair-notification.js';
+
+type SessionModelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
+
+const HOVER_PREVIEW_OPEN_DELAY_MS = 180;
+const HOVER_PREVIEW_CLOSE_DELAY_MS = 140;
+let hoverPreviewSequence = 0;
+
+function isStatus(value: unknown): value is TaskPairStatus {
+  return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
+}
+
+// Diagnostic text is still a display surface; protocol IDs and role runtime
+// metadata remain in the event, not in the rendered payload dump.
+const DISPLAY_OMITTED_KEYS = new Set(['taskId', 'topLevelTaskId', 'pairTaskId', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking']);
+
+const SENSITIVE_KEY_RE = /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|secret|authorization|cookie|credential)/iu;
+
+/** Redact credentials and private home-directory components before audit text
+ * reaches the browser. Notices and payloads are daemon-authored but can carry
+ * command output, paths, or credentials from a real workspace. */
+function safeDetailText(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/((?:["']?(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|secret|authorization|cookie|credential)["']?\s*[:=]\s*))(?:["']?)[^\s,;}"']+/giu, '$1•••')
+    .replace(/((?:authorization)\s+bearer\s+)[^\s,;}]+/giu, '$1•••')
+    .replace(/\/(?:Users|home)\/[^/\s]+/gu, '/<user-home>')
+    .replace(/[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+/gu, '<user-home>');
+}
+
+/** Strip raw internal `tsk_...` IDs before rendering visible notice text. */
+function safeNoticeText(value: unknown): string {
+  return safeDetailText(value)
+    .replace(/\bPair\s+tsk_[A-Za-z0-9._:-]+/g, 'Pair')
+    .replace(/\btsk_[A-Za-z0-9._:-]+/g, '[task]');
+}
+
+function safePayloadValue(value: unknown, key?: string): unknown {
+  if (key && SENSITIVE_KEY_RE.test(key)) return '•••';
+  if (typeof value === 'string') return safeDetailText(value);
+  if (Array.isArray(value)) return value.map((entry) => safePayloadValue(entry));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([entryKey]) => !DISPLAY_OMITTED_KEYS.has(entryKey))
+      .map(([entryKey, entryValue]) => [entryKey, safePayloadValue(entryValue, entryKey)]));
+  }
+  return value;
+}
+
+/** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
+export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { eventId: string; payload: Record<string, unknown>; timestamp?: number; sessions?: readonly SessionModelEntry[] }) {
+  const { t, i18n } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const [isMobile, setIsMobile] = useState(isMobileLayout);
+  const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
+    return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
+  });
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      setActiveSplitTaskId(detail?.activeTaskId ?? null);
+    };
+    window.addEventListener('deck:pair-split-state', handler);
+    return () => window.removeEventListener('deck:pair-split-state', handler);
+  }, []);
+  useEffect(() => {
+    const onChange = () => setIsMobile(isMobileLayout());
+    onChange();
+    return subscribeDeviceLayoutChange(onChange);
+  }, []);
+  const [hoverPreviewAnchor, setHoverPreviewAnchor] = useState<DOMRect | null>(null);
+  const cardRef = useRef<HTMLElement | null>(null);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const keyboardPreviewRef = useRef(false);
+  const focusPreviewRef = useRef(false);
+  const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverPreviewIdRef = useRef<string | null>(null);
+  if (hoverPreviewIdRef.current === null) hoverPreviewIdRef.current = `task-pair-hover-preview-${++hoverPreviewSequence}`;
+  const hoverPreviewId = hoverPreviewIdRef.current;
+  const event = payload as Partial<TaskPairEventPayload>;
+  const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
+  const isAggregate = event.aggregate === true || isTaskPairAggregateId(taskId);
+  const canOpenSplit = !isMobile
+    && !isAggregate
+    && typeof event.executor === 'string' && !!event.executor && event.executor !== 'none'
+    && typeof event.auditor === 'string' && !!event.auditor && event.auditor !== 'none'
+    && activeSplitTaskId !== String(taskId);
+  const writer = typeof event.writer === 'string' ? event.writer.trim() : '';
+  const isCancelledEvent = event.toStatus === 'cancelled';
+  const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
+    ? event.cancelActor.trim()
+    : event.cancelProvenanceTrusted ? writer : '';
+  const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
+    ? event.cancelSource.trim()
+    : event.cancelProvenanceTrusted && typeof event.source === 'string' ? event.source : '';
+  const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
+    ? event.cancelReason.trim()
+    : t('taskPair.card_cancel_reason_unknown');
+  const normalizedVerb = normalizeTaskPairEventVerb(event.verb);
+  const action = taskPairEventAction(t, event);
+  const verb = action?.label;
+  // A notice that states no lifecycle shows a neutral badge, never a guessed status.
+  const status = isStatus(event.toStatus)
+    ? t(`taskPair.status.${event.toStatus}`)
+    : normalizedVerb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
+  const hasRoleMetadata = (typeof event.executor === 'string' && event.executor.length > 0)
+    || (typeof event.auditor === 'string' && event.auditor.length > 0);
+  const showRoles = !isAggregate && (normalizedVerb !== TASK_PAIR_NOTICE_VERB || hasRoleMetadata);
+  const isGenericNoticeStatus = !isStatus(event.toStatus) && normalizedVerb === TASK_PAIR_NOTICE_VERB;
+  const showDistinctOverviewVerb = Boolean(verb && verb !== status && !isGenericNoticeStatus);
+  const counts = event.severityCounts
+    ? AUDIT_SEVERITY_LEVELS
+      .filter((level) => (event.severityCounts?.[level] ?? 0) > 0)
+      .map((level) => t('taskPair.severity', { level, count: event.severityCounts?.[level] }))
+      .join(' · ')
+    : '';
+  const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
+  const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
+  const title = isAggregate
+    ? t('taskPair.card_aggregate_title')
+    : taskPairDisplayTitle(event.title, taskId, (event as Record<string, unknown>).brief) ?? t('taskPair.card_untitled');
+  const displayPayload = {
+    ...payload,
+    title,
+    executorLabel: typeof event.executor === 'string' ? taskPairResolveDisplaySessionLabel(event.executor, event.executorLabel, sessions?.find((entry) => entry.name === event.executor)) : undefined,
+    auditorLabel: typeof event.auditor === 'string' ? taskPairResolveDisplaySessionLabel(event.auditor, event.auditorLabel, sessions?.find((entry) => entry.name === event.auditor)) : undefined,
+  };
+  const payloadForDetails = typeof timestamp === 'number' && Number.isFinite(timestamp)
+    ? { ...displayPayload, _eventTimestamp: new Date(timestamp).toISOString() }
+    : displayPayload;
+  const payloadJson = JSON.stringify(safePayloadValue(payloadForDetails), null, 2) ?? '{}';
+  const eventTime = typeof timestamp === 'number' && Number.isFinite(timestamp)
+    ? new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))
+    : '';
+  // Only a daemon that records Brain notices sends this; its absence shows nothing.
+  const brainNotice = event.brainNotice;
+  const brainNoticeShown = !!brainNotice
+    && (TASK_PAIR_BRAIN_NOTICE_STATUSES as readonly unknown[]).includes(brainNotice.status)
+    && typeof brainNotice.at === 'number' && Number.isFinite(brainNotice.at);
+  const brainNoticeText = brainNoticeShown
+    ? t(`taskPair.brain_notice_${brainNotice!.status}`, {
+      time: new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(brainNotice!.at)),
+    })
+    : '';
+  const noticeText = typeof (event as Record<string, unknown>).noticeText === 'string'
+    ? (event as Record<string, unknown>).noticeText as string
+    : '';
+  const fromEvent = normalizeTaskPairAuditDetails(event);
+  const fromNotice = parseTaskPairAuditDetails(noticeText);
+  const parsedAuditDetails = fromEvent && fromNotice ? {
+    findings: fromEvent.findings?.length ? fromEvent.findings : fromNotice.findings,
+    summary: fromEvent.summary ?? fromNotice.summary,
+    validation: fromEvent.validation ?? fromNotice.validation,
+    reason: fromEvent.reason ?? fromNotice.reason,
+    nextStep: fromEvent.nextStep ?? fromNotice.nextStep,
+  } : (fromEvent ?? fromNotice);
+  const blockedNote = typeof event.blockedNote === 'string' ? event.blockedNote.trim() : '';
+  const auditDetails = parsedAuditDetails || blockedNote
+    ? {
+      ...(parsedAuditDetails ?? {}),
+      ...(!parsedAuditDetails?.reason && blockedNote ? { reason: blockedNote } : {}),
+    }
+    : undefined;
+  const findings = auditDetails?.findings ?? [];
+  const hasAuditDetails = Boolean(auditDetails && Object.values(auditDetails).some((value) => Array.isArray(value) ? value.length > 0 : Boolean(value)));
+  const blockingLevels = Array.isArray(event.blocking) && event.blocking.length > 0
+    ? event.blocking
+    : ['P0', 'P1'] as const;
+  const noBlockingFindings = (event.toStatus === 'passed' || event.toStatus === 'done')
+    && findings.length === 0
+    && (event.severityCounts ? blockingLevels.every((level) => (event.severityCounts?.[level] ?? 0) === 0) : true);
+  const rawPreviewNotice = safeNoticeText(noticeText);
+  const previewNoticeText = rawPreviewNotice.slice(0, 320);
+  const rawOverviewNotice = writer === 'daemon' && (normalizedVerb === 'DISPATCH' || normalizedVerb === 'QUEUE')
+    ? safeDetailText(auditDetails?.reason)
+    : rawPreviewNotice;
+  const overviewNoticeText = rawOverviewNotice.slice(0, 320);
+  // One colour per status (styles.css `.task-pair-chip--<status>`).
+  const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
+  const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
+  const clearHoverTimers = () => {
+    if (hoverOpenTimerRef.current) clearTimeout(hoverOpenTimerRef.current);
+    if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+    hoverOpenTimerRef.current = null;
+    hoverCloseTimerRef.current = null;
+  };
+  const closeHoverPreview = () => {
+    clearHoverTimers();
+    keyboardPreviewRef.current = false;
+    focusPreviewRef.current = false;
+    setHoverPreviewAnchor(null);
+  };
+  const supportsDesktopHover = () => typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+  const scheduleHoverPreview = (pointerType?: string) => {
+    // Only the shrink-wrapped title/icon calls this. Keyboard preview is an
+    // explicit shortcut, never a side effect of mouse/touch focus.
+    if (isHoverPreviewSuppressed()) return;
+    if (pointerType && pointerType !== 'mouse' && pointerType !== 'pen') return;
+    if (!supportsDesktopHover()) return;
+    keyboardPreviewRef.current = false;
+    if (!cardRef.current || expanded) return;
+    if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+    hoverCloseTimerRef.current = null;
+    if (hoverPreviewAnchor) return;
+    if (hoverOpenTimerRef.current) clearTimeout(hoverOpenTimerRef.current);
+    hoverOpenTimerRef.current = setTimeout(() => {
+      hoverOpenTimerRef.current = null;
+      if (!cardRef.current || expanded) return;
+      setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
+    }, HOVER_PREVIEW_OPEN_DELAY_MS);
+  };
+  const scheduleHoverPreviewClose = () => {
+    if (hoverOpenTimerRef.current) clearTimeout(hoverOpenTimerRef.current);
+    hoverOpenTimerRef.current = null;
+    if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+    hoverCloseTimerRef.current = setTimeout(() => {
+      hoverCloseTimerRef.current = null;
+      if (keyboardPreviewRef.current && document.getElementById(hoverPreviewId)?.contains(document.activeElement)) return;
+      setHoverPreviewAnchor(null);
+    }, HOVER_PREVIEW_CLOSE_DELAY_MS);
+  };
+  const showHoverPreviewForKeyboard = () => {
+    if (!cardRef.current || expanded) return;
+    clearHoverTimers();
+    keyboardPreviewRef.current = true;
+    focusPreviewRef.current = true;
+    setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
+  };
+  useEffect(() => {
+    const unsubscribe = onHoverPreviewSuppressed(closeHoverPreview);
+    return () => {
+      unsubscribe();
+      clearHoverTimers();
+    };
+  }, []);
+  useEffect(() => { closeHoverPreview(); }, [eventId, taskId, expanded]);
+  useEffect(() => {
+    if (hoverPreviewAnchor && focusPreviewRef.current) {
+      focusPreviewRef.current = false;
+      document.getElementById(hoverPreviewId)?.focus({ preventScroll: true });
+    }
+  }, [hoverPreviewAnchor]);
+  useEffect(() => {
+    if (!hoverPreviewAnchor) return;
+    const syncAnchor = () => {
+      if (cardRef.current) setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
+    };
+    const onEscape = (key: KeyboardEvent) => { if (key.key === 'Escape') closeHoverPreview(); };
+    window.addEventListener('keydown', onEscape);
+    window.addEventListener('scroll', syncAnchor, true);
+    window.addEventListener('resize', syncAnchor);
+    return () => {
+      window.removeEventListener('keydown', onEscape);
+      window.removeEventListener('scroll', syncAnchor, true);
+      window.removeEventListener('resize', syncAnchor);
+    };
+  }, [Boolean(hoverPreviewAnchor)]);
+  const sessionLabel = (id: unknown, label: unknown, compact = false) => {
+    if (typeof id !== 'string' || !id || id === 'none') return null;
+    const name = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id));
+    const fullName = name ? `${name} (${id})` : id;
+    const text = compact && name ? name : fullName;
+    return <button type="button" class="task-pair-chip-session" title={fullName} aria-label={fullName} onClick={(click) => {
+      click.stopPropagation();
+      window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
+    }}>{text}</button>;
+  };
+  const resolveModel = (id: unknown, payloadModel: unknown): string | undefined => {
+    if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+    if (typeof id !== 'string' || !id) return undefined;
+    const session = sessions?.find((entry) => entry.name === id);
+    return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
+  };
+  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor', compact = false) => {
+    const session = sessionLabel(id, label, compact);
+    const model = resolveModel(id, modelValue);
+    return <span class="task-pair-card-role">
+      <span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>
+      {session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}
+      {session && model && <span class="task-pair-card-role-model" title={model}>{t('taskPair.card_model', { value: model })}</span>}
+    </span>;
+  };
+  const previewRole = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
+    const session = sessionLabel(id, label);
+    const model = resolveModel(id, modelValue);
+    return <div class="task-pair-card-hover-role">
+      <span class="task-pair-card-hover-role-name">{t(`taskPair.card_${role}`)}</span>
+      {session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}
+      {session && model && <span class="task-pair-card-hover-role-meta">{t('taskPair.card_model', { value: model })}</span>}
+    </div>;
+  };
+  const renderHoverPreview = () => {
+    if (!hoverPreviewAnchor || typeof document === 'undefined' || expanded) return null;
+    const margin = 10;
+    const width = Math.min(960, Math.max(180, window.innerWidth - margin * 2));
+    const spaceAbove = hoverPreviewAnchor.top;
+    const placeBelow = spaceAbove < 250 && window.innerHeight - hoverPreviewAnchor.bottom > spaceAbove;
+    const maxHeight = Math.max(150, (placeBelow ? window.innerHeight - hoverPreviewAnchor.bottom : hoverPreviewAnchor.top) - margin * 2);
+    const left = Math.min(Math.max(margin, hoverPreviewAnchor.left), Math.max(margin, window.innerWidth - width - margin));
+    const position = placeBelow
+      ? { top: `${hoverPreviewAnchor.bottom + margin}px` }
+      : { bottom: `${window.innerHeight - hoverPreviewAnchor.top + margin}px` };
+    return createPortal(<div
+      id={hoverPreviewId}
+      class="task-pair-card-hover-preview"
+      role="dialog"
+      aria-modal="false"
+      tabIndex={-1}
+      aria-label={title}
+      onFocusIn={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onFocusOut={(focus) => { if (!focus.currentTarget.contains(focus.relatedTarget as Node | null)) scheduleHoverPreviewClose(); }}
+      onKeyDown={(key) => { if (key.key === 'Escape') { key.preventDefault(); closeHoverPreview(); toggleRef.current?.focus({ preventScroll: true }); } }}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
+      onPointerEnter={() => { keyboardPreviewRef.current = false; if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onPointerLeave={scheduleHoverPreviewClose}
+    >
+      <div class="task-pair-card-hover-preview-head">
+        <strong>{title}</strong>
+        <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+        {eventTime && <time dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
+      </div>
+      <div class="task-pair-card-hover-preview-body">
+        {showDistinctOverviewVerb && <span class="task-pair-card-hover-preview-event">{verb}</span>}
+        {showRoles && previewRole(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+        {showRoles && previewRole(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+        {previewNoticeText && <p>{previewNoticeText}{rawPreviewNotice.length > 320 ? '…' : ''}</p>}
+        {isCancelledEvent && <p>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+        {!isAggregate && isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
+      </div>
+    </div>, document.body);
+  };
+  const isVerdictEvent = normalizedVerb === 'PASS' || normalizedVerb === 'REWORK';
+  const renderAuditDetails = () => {
+    if (!hasAuditDetails && !noBlockingFindings && !isVerdictEvent) return null;
+    return <section class="task-pair-card-audit-details" aria-label={t('taskPair.card_audit_details')}>
+      <h4>{t('taskPair.card_audit_details')}</h4>
+      {findings.length > 0 ? findings.map((finding, index) => <article class="task-pair-card-finding" key={`${index}-${finding.severity ?? ''}`}>
+        <div class="task-pair-card-finding-head">
+          <strong>{t('taskPair.card_finding', { index: index + 1 })}</strong>
+          {finding.severity && <span class="task-pair-card-finding-severity">{safeDetailText(finding.severity)}</span>}
+        </div>
+        {finding.summary && <p class="task-pair-card-finding-summary">{safeDetailText(finding.summary)}</p>}
+        {finding.invariant && <p><b>{t('taskPair.card_invariant')}:</b> {safeDetailText(finding.invariant)}</p>}
+        {finding.location && <p><b>{t('taskPair.card_location')}:</b> {safeDetailText(finding.location)}</p>}
+        {finding.evidence && <p><b>{t('taskPair.card_evidence')}:</b> {safeDetailText(finding.evidence)}</p>}
+        {finding.proposal && <p><b>{t('taskPair.card_proposal')}:</b> {safeDetailText(finding.proposal)}</p>}
+        {finding.tradeoffs && <p><b>{t('taskPair.card_tradeoffs')}:</b> {safeDetailText(finding.tradeoffs)}</p>}
+      </article>) : null}
+      {auditDetails?.summary && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_summary')}:</b> {safeDetailText(auditDetails.summary)}</p>}
+      {auditDetails?.validation && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_validation')}:</b> {safeDetailText(auditDetails.validation)}</p>}
+      {auditDetails?.reason && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_reason')}:</b> {safeDetailText(auditDetails.reason)}</p>}
+      {auditDetails?.nextStep && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_next_step')}:</b> {safeDetailText(auditDetails.nextStep)}</p>}
+      {noBlockingFindings && <p class="task-pair-card-detail-line">{t('taskPair.card_no_blocking')}</p>}
+      {!hasAuditDetails && !noBlockingFindings && isVerdictEvent && <p class="task-pair-card-details-unavailable">{t('taskPair.card_details_unavailable')}</p>}
+    </section>;
+  };
+  return (
+    <section
+      ref={cardRef}
+      class={`chat-event chat-system task-pair-chip task-pair-event-card${expanded ? ' is-expanded' : ''}${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
+      data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
+      data-event-id={eventId}
+      data-task-id={taskId}
+    >
+      <header class={`task-pair-card-head${canOpenSplit ? ' has-split' : ''}`}>
+        <button
+          ref={toggleRef}
+          type="button"
+          class="task-pair-card-toggle"
+          aria-label={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
+          title={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
+          aria-expanded={expanded}
+          aria-describedby={hoverPreviewAnchor ? hoverPreviewId : undefined}
+          aria-description={`${title}. ${t('taskPair.card_preview_hint')}`}
+          aria-keyshortcuts="ArrowDown"
+          onKeyDown={(key) => {
+            if (key.key === 'ArrowDown' && !expanded) { key.preventDefault(); showHoverPreviewForKeyboard(); }
+            else if (key.key === 'Escape') closeHoverPreview();
+          }}
+          onBlur={scheduleHoverPreviewClose}
+          onFocusOut={scheduleHoverPreviewClose}
+          onClick={() => { closeHoverPreview(); setExpanded((value) => !value); }}
+        >
+          <span class="task-pair-card-heading">
+            <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
+          </span>
+          <span class="task-pair-card-meta">
+            <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+            {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
+            <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
+          </span>
+          <span class="task-pair-chip-task" title={title}>
+            <svg class="task-pair-title-preview-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
+              onPointerMove={(pointer) => { if (!hoverPreviewAnchor && !hoverOpenTimerRef.current) scheduleHoverPreview(pointer.pointerType); }}
+              onPointerLeave={scheduleHoverPreviewClose}>
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
+            </svg>
+            <strong class="task-pair-title-preview-trigger"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
+              onPointerMove={(pointer) => { if (!hoverPreviewAnchor && !hoverOpenTimerRef.current) scheduleHoverPreview(pointer.pointerType); }}
+              onPointerLeave={scheduleHoverPreviewClose}>{title}</strong>
+          </span>
+          {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
+        </button>
+        {canOpenSplit && <button
+          type="button"
+          class="task-pair-split-btn"
+          title={t('taskPair.panel_open_split')}
+          aria-label={t('taskPair.panel_open_split')}
+          onPointerEnter={closeHoverPreview}
+          onFocus={closeHoverPreview}
+          onClick={(e) => {
+            e.stopPropagation();
+            closeHoverPreview();
+            window.dispatchEvent(new CustomEvent('deck:pair-split', {
+              detail: { taskId: String(taskId), title: typeof event.title === 'string' ? event.title : undefined, executor: event.executor, auditor: event.auditor, action: 'open' },
+            }));
+          }}
+        ><span class="task-pair-split-icon" aria-hidden="true">◫</span></button>}
+      </header>
+      {!isMobile && <div class="task-pair-card-overview">
+        {showDistinctOverviewVerb && <span class="task-pair-card-event-meta">{verb}</span>}
+        {showRoles && <div class="task-pair-card-overview-roles">
+          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor', !expanded)}
+          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor', !expanded)}
+        </div>}
+        {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note" title={overviewNoticeText}>{overviewNoticeText}{rawOverviewNotice.length > 320 ? '…' : ''}</p>}
+        {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note" title={cancelReason}>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+      </div>}
+      {expanded && <>
+        <div class="task-pair-card-body">
+          {verb && <span class="task-pair-chip-text">
+            {normalizedVerb === TASK_PAIR_WORKSPACE_EVENT_VERB ? (action?.detail ?? verb)
+              : writer ? t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb }) : verb}
+          </span>}
+          {renderAuditDetails()}
+          {rawPreviewNotice && <pre class="task-pair-card-notice">{rawPreviewNotice}</pre>}
+          {verb && <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>}
+          {isMobile && showRoles && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {isMobile && showRoles && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {!isAggregate && isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
+          {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
+            <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
+            <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>
+            <span>{t('taskPair.card_cancel_reason', { value: cancelReason })}</span>
+          </div>}
+        </div>
+        {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
+          {counts && <span class="task-pair-chip-counts">{counts}</span>}
+          {verdict && <span class="task-pair-chip-verdict">{t('taskPair.card_verdict', { value: verdict })}</span>}
+          {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
+          {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
+        </footer>}
+        <details class="task-pair-card-payload">
+          <summary class="task-pair-card-payload-label">{t('taskPair.card_payload')}</summary>
+          <pre>{payloadJson}</pre>
+        </details>
+      </>}
+      {renderHoverPreview()}
+    </section>
+  );
+}

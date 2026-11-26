@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
+import { AgySdkProvider } from '../../../src/agent/providers/agy-sdk.js';
 import { CursorHeadlessProvider } from '../../../src/agent/providers/cursor-headless.js';
-import { GeminiSdkProvider } from '../../../src/agent/providers/gemini-sdk.js';
+import { GrokSdkProvider } from '../../../src/agent/providers/grok-sdk.js';
 import { OpenClawProvider } from '../../../src/agent/providers/openclaw.js';
 import { QwenProvider } from '../../../src/agent/providers/qwen.js';
 
@@ -18,16 +19,14 @@ describe('provider compact capabilities', () => {
     });
   });
 
-  it('keeps Gemini ACP unsupported because its ACP command registry has no compress/compact command', () => {
-    const provider = new GeminiSdkProvider();
-
-    expect(provider.capabilities.compact).toMatchObject({
-      execution: 'unsupported',
+  it('marks Grok ACP compact as negotiated provider-native support', () => {
+    expect(new GrokSdkProvider().capabilities.compact).toMatchObject({
+      execution: 'slash-command',
+      providerCommand: '/compact',
       verified: true,
-      completion: 'none',
-      cancellation: 'none',
+      completion: 'command-result',
+      cancellation: 'provider-cancel',
     });
-    expect(provider.capabilities.compact?.reason).toMatch(/--acp command registry/i);
   });
 
   it('keeps Cursor headless and OpenClaw unsupported with verified reasons', () => {
@@ -39,5 +38,15 @@ describe('provider compact capabilities', () => {
       execution: 'unsupported',
       verified: true,
     });
+  });
+
+  it('keeps Antigravity (agy) compact unsupported because agy compacts its own context automatically', () => {
+    expect(new AgySdkProvider().capabilities.compact).toMatchObject({
+      execution: 'unsupported',
+      verified: true,
+      completion: 'none',
+      cancellation: 'none',
+    });
+    expect(new AgySdkProvider().capabilities.compact?.reason).toMatch(/compacts its own context automatically/i);
   });
 });

@@ -9,6 +9,7 @@ import { parseNamespaceKey } from '../../shared/memory-namespace.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getContextModelConfig } from './context-model-config.js';
 import logger from '../util/logger.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 export interface ProcessedContextReplicationCredentials {
   workerUrl: string;
@@ -28,6 +29,7 @@ export async function replicatePendingProcessedContext(
   credentials: ProcessedContextReplicationCredentials,
   namespaces?: ContextNamespace[],
 ): Promise<ProcessedContextReplicationResult> {
+  if (!isMemoryDaemonEnabled()) return { replicatedNamespaces: 0, replicatedProjections: 0, failures: [] };
   const config = getContextModelConfig();
   const personalSyncEnabled = config.enablePersonalMemorySync === true;
   const client = getContextStoreClient();

@@ -368,4 +368,22 @@ describe('render-stability invariants (stack-level)', () => {
     }
     expect(s.getZIndex('b')).toBe(zBefore);
   });
+
+  it('lets a sub-session be raised above the remote-desktop window', () => {
+    // Regression: the remote-desktop panel used to render at a hardcoded
+    // z-index of 10020 while the managed stack tops out near 7000 + 10 * N.
+    // No amount of clicking could raise any other window over it, which is
+    // what made background windows look unclickable. It must participate in
+    // the same stack so ordinary raise/lower works both ways.
+    const stack = new MutableDesktopWindowStack();
+    const remote = DESKTOP_WINDOW_IDS.remoteDesktop('srv-1');
+    const sub = DESKTOP_WINDOW_IDS.subSession('sub-1');
+    stack.ensureWindow(sub, { kind: DESKTOP_WINDOW_KINDS.subSession });
+    stack.ensureWindow(remote, { kind: DESKTOP_WINDOW_KINDS.remoteDesktop });
+    stack.bringToFront(remote);
+    expect(stack.getZIndex(remote)!).toBeGreaterThan(stack.getZIndex(sub)!);
+
+    expect(stack.bringToFront(sub)).toBe(true);
+    expect(stack.getZIndex(sub)!).toBeGreaterThan(stack.getZIndex(remote)!);
+  });
 });

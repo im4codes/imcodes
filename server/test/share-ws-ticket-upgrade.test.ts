@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { WebSocket } from 'ws';
@@ -7,6 +8,11 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import type { ShareAuthorizationSnapshot, ShareTarget } from '../../shared/tab-sharing.js';
+import {
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_SERVER_ID_QUERY,
+  REMOTE_DESKTOP_SIGNALING_PATH,
+} from '../../shared/remote-desktop.js';
 
 type ConnectResult = { opened: true; ws: WebSocket } | { opened: false; statusCode?: number };
 
@@ -42,6 +48,7 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
   const memberUserIds = new Set(options.memberUserIds ?? ['member-user']);
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('select exists (select 1 from servers where id = $1)')) {
         return { exists: params[0] === serverId } as T;
@@ -52,8 +59,11 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
       if (normalized.includes('select exists (select 1 from sub_sessions where server_id = $1 and id = $2')) {
         return { exists: params[0] === serverId && existingSubSessions.has(String(params[1])) } as T;
       }
-      if (normalized.includes('select team_id, user_id from servers where id = $1')) {
-        return { team_id: null, user_id: 'member-user' } as T;
+      if ((normalized.startsWith('select user_id') && normalized.includes('from servers where id = $1'))) {
+        return { user_id: 'member-user', owner_status: 'active', actor_status: 'active' } as T;
+      }
+      if (normalized.includes('from servers where id = $1 and revoked_at is null')) {
+        return { node_role: 'full', user_id: 'member-user', owner_status: 'active', actor_status: 'active' } as T;
       }
       if (normalized.includes('runtime_type')) return { runtime_type: 'transport' } as T;
       return null;
@@ -119,9 +129,9 @@ function makeEnv(db: Database): Env {
   } as Env;
 }
 
-function connect(url: string): Promise<ConnectResult> {
+function connect(url: string, origin?: string): Promise<ConnectResult> {
   return new Promise((resolve) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, origin ? { origin } : undefined);
     let settled = false;
     const done = (result: ConnectResult) => {
       if (settled) return;
@@ -172,6 +182,12 @@ function shareTicket(env: Env, claims: {
 
 function wsUrl(port: number, serverId: string, ticket: string): string {
   return `ws://127.0.0.1:${port}/api/server/${serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
+}
+
+function remoteDesktopWsUrl(port: number, serverId: string, ticket?: string): string {
+  const query = new URLSearchParams({ [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId });
+  if (ticket) query.set('ticket', ticket);
+  return `ws://127.0.0.1:${port}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
 }
 
 describe('share websocket ticket upgrade semantics', () => {
@@ -268,6 +284,38 @@ describe('share websocket ticket upgrade semantics', () => {
     const memberSecond = await connect(memberUrl);
     expect(memberSecond.opened).toBe(false);
     if (!memberSecond.opened) expect(memberSecond.statusCode).toBe(401);
+  });
+
+  it('routes account signaling by ticket and quarantines ticket-less guest sockets until proof', async () => {
+    const memberTicket = signJwt({
+      type: 'ws-ticket',
+      sub: 'member-user',
+      sid: serverId,
+      jti: `remote-desktop-member-jti-${serverId}`,
+    }, env.JWT_SIGNING_KEY, 30);
+
+    const connected = await connect(remoteDesktopWsUrl(port, serverId, memberTicket));
+    expect(connected.opened).toBe(true);
+    if (connected.opened) await closeWs(connected.ws);
+
+    const noOrigin = await connect(remoteDesktopWsUrl(port, serverId));
+    expect(noOrigin.opened).toBe(false);
+    if (!noOrigin.opened) expect(noOrigin.statusCode).toBe(403);
+
+    const withoutTicket = await connect(remoteDesktopWsUrl(port, serverId), 'http://localhost');
+    expect(withoutTicket.opened).toBe(true);
+    if (withoutTicket.opened) {
+      const closed = new Promise<number>((resolve) => withoutTicket.ws.once('close', resolve));
+      withoutTicket.ws.send(JSON.stringify({ type: REMOTE_DESKTOP_MSG.START }));
+      expect(await closed).toBe(1008);
+    }
+
+    const secretInUrl = await connect(
+      `${remoteDesktopWsUrl(port, serverId)}&bootstrapTicket=raw-secret`,
+      'http://localhost',
+    );
+    expect(secretInUrl.opened).toBe(false);
+    if (!secretInUrl.opened) expect(secretInUrl.statusCode).toBe(403);
   });
 
   it('admits share-only concrete main-tab and sub-session tickets without server membership', async () => {

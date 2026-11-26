@@ -9,6 +9,9 @@ describe('p2p-config-store', () => {
 
   beforeEach(async () => {
     homeDir = await mkdtemp(join(tmpdir(), 'p2p-config-store-'));
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('USERPROFILE', homeDir);
+    vi.stubEnv('IMCODES_HOME', join(homeDir, '.imcodes'));
     warnMock = vi.fn();
     vi.resetModules();
     vi.doMock('node:os', () => ({
@@ -27,6 +30,7 @@ describe('p2p-config-store', () => {
   afterEach(async () => {
     vi.doUnmock('node:os');
     vi.doUnmock('../../src/util/logger.js');
+    vi.unstubAllEnvs();
     await rm(homeDir, { recursive: true, force: true });
   });
 

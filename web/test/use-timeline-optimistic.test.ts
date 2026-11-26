@@ -13,7 +13,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, act, cleanup, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
+import i18next from 'i18next';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { SESSION_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
 
 // Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
 // (resolves) or "fails" (rejects). The auto-retry-on-command.failed flow ends
@@ -31,6 +34,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
 
 import {
   __clearPersistedTimelineSnapshotsForTests,
+  __getTimelineHistoryAfterTsForTests,
   __resetTimelineCacheForTests,
   useTimeline,
   type UseTimelineResult,
@@ -91,6 +95,10 @@ describe('useTimeline optimistic send flow', () => {
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
     vi.useFakeTimers();
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(
+      (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0) as unknown as number,
+    );
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id: number) => clearTimeout(id));
     sendSessionViaHttpMock.mockReset();
     // Default: HTTP fallback rejects (matches "the network is broken" tests).
     // Individual tests can override via `sendSessionViaHttpMock.mockResolvedValue`.
@@ -99,8 +107,123 @@ describe('useTimeline optimistic send flow', () => {
 
   afterEach(async () => {
     await cleanupRenderedTimeline();
+    // Drain frame callbacks WHILE the timer-backed rAF mock is still installed.
+    // Restoring first can leave a queued callback that fires after teardown and
+    // dereferences a cancelAnimationFrame that no longer exists — the exact
+    // hazard web/vitest.fake-timers.ts documents, and it surfaced as an
+    // unhandled error under full-suite load before this drain existed.
+    vi.runOnlyPendingTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each(['session', 'local'] as const)('reconciles scoped %s snapshot rows with raw live and history identities', (tier) => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = `deck_opt_scoped_replay_${tier}`;
+    const old = {
+      eventId: 'transport-history:cached-legacy', sessionId: `srv:${sessionId}`,
+      ts: 123, epoch: 0, seq: 1, source: 'daemon', confidence: 'high', type: 'user.message',
+      payload: { text: 'One scoped cached send', commandId: 'stable-command', allowDuplicate: true },
+    };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:srv:${sessionId}`, JSON.stringify([old]));
+    render(h(Probe, { sessionId }));
+    expect(ref.current!.events).toHaveLength(1);
+    const primary = { ...old, eventId: 'primary-live-id', sessionId, epoch: 1, seq: 2 };
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.HISTORY, sessionName: sessionId, events: [primary], epoch: 1 } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].sessionId).toBe(sessionId);
+    // Normalization is immutable: neither the on-disk nor input row is restamped in place.
+    expect(old.sessionId).toBe(`srv:${sessionId}`);
+  });
+
+  it('reconciles authoritative replays on a receiver with no local optimistic send', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_remote_identity';
+    render(h(Probe, { sessionId }));
+    for (let index = 0; index < 4; index += 1) {
+      act(() => {
+        handlerBox.fn?.({
+          type: 'timeline.event',
+          event: {
+            eventId: `remote-projection-${index}`, sessionId, ts: Date.now(),
+            epoch: 1, seq: index + 1, source: 'daemon', confidence: 'high',
+            type: 'user.message',
+            payload: { text: 'One intentional remote send', commandId: 'remote-command-1', allowDuplicate: true },
+          },
+        } as unknown as ServerMessage);
+      });
+    }
+    expect(ref.current!.events.filter((event) => event.type === 'user.message')).toHaveLength(1);
+  });
+
+  it('does not replace another pending send or deduplicate distinct commands just because their text matches', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_distinct_identity';
+    render(h(Probe, { sessionId }));
+    act(() => ref.current!.addOptimisticUserMessage('Same intentional text', 'local-command'));
+    for (let index = 0; index < 2; index += 1) act(() => handlerBox.fn?.({
+      type: 'timeline.event', event: {
+        eventId: `remote-${index}`, sessionId, ts: Date.now(), epoch: 1, seq: index + 1,
+        source: 'daemon', confidence: 'high', type: 'user.message',
+        payload: { text: 'Same intentional text', commandId: `other-command-${index}` },
+      },
+    } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(3);
+    expect(ref.current!.events.find((event) => event.payload.commandId === 'local-command')?.payload.pending).toBe(true);
+  });
+
+  it.each([true, false])('folds legacy fallback with live/history identity without losing attribution (eventId supplied=%s)', (withEventId) => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_fallback_identity';
+    render(h(Probe, { sessionId }));
+    const sharedActor = { actorUserId: 'synthetic-participant', actorDisplayName: 'Synthetic Participant' };
+    act(() => handlerBox.fn?.({ type: 'chat.history', sessionId, events: [{
+      type: 'user.message', text: '', _ts: 123, commandId: 'remote-command',
+      ...(withEventId ? { eventId: 'primary-id' } : {}), sharedActor,
+      attachments: [{ name: 'synthetic.png' }], allowDuplicate: true,
+    }] } as unknown as ServerMessage));
+    expect(ref.current!.events[0].payload.sharedActor).toEqual(sharedActor);
+    if (withEventId) expect(ref.current!.events[0].eventId).toBe('primary-id');
+    for (const type of ['timeline.event', 'timeline.history']) {
+      const event = { eventId: 'primary-id', sessionId, ts: 123, epoch: 1, seq: 1,
+        source: 'daemon', confidence: 'high', type: 'user.message',
+        payload: { text: '', commandId: 'remote-command', allowDuplicate: true } };
+      act(() => handlerBox.fn?.(type === 'timeline.event' ? { type, event } as unknown as ServerMessage
+        : { type, sessionName: sessionId, events: [event], epoch: 1 } as unknown as ServerMessage));
+    }
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].payload.sharedActor).toEqual(sharedActor);
+    expect(ref.current!.events[0].payload.attachments).toEqual([{ name: 'synthetic.png' }]);
+  });
+
+  it('reconciles an attachment-only empty-body echo by identity without consuming another pending send', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_empty_identity';
+    render(h(Probe, { sessionId }));
+    act(() => {
+      ref.current!.addOptimisticUserMessage('', 'empty-one');
+      ref.current!.addOptimisticUserMessage('', 'empty-two');
+    });
+    act(() => handlerBox.fn?.({ type: 'timeline.event', event: {
+      eventId: 'empty-primary', sessionId, ts: Date.now(), epoch: 1, seq: 1,
+      source: 'daemon', confidence: 'high', type: 'user.message',
+      payload: { text: '', commandId: 'empty-one', attachments: [{ name: 'test.png' }] },
+    } } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(2);
+    expect(ref.current!.events.find((e) => e.payload.commandId === 'empty-one')?.payload.pending).toBeUndefined();
+    expect(ref.current!.events.find((e) => e.payload.commandId === 'empty-two')?.payload.pending).toBe(true);
   });
 
   it('injects a pending user.message bubble keyed by commandId', () => {
@@ -182,7 +305,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
-  it('replaces the pending bubble in place when the authoritative user.message arrives', () => {
+  it('moves a drained message after intervening output instead of keeping its queued slot', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -205,7 +328,7 @@ describe('useTimeline optimistic send flow', () => {
       } as unknown as ServerMessage);
     });
     act(() => {
-      ref.current!.addOptimisticUserMessage('keep my slot', 'cmd-in-place-success');
+      ref.current!.addOptimisticUserMessage('./scripts/restart-daemon.sh restart', 'cmd-in-place-success');
     });
     const optimisticId = ref.current!.events[1].eventId;
 
@@ -213,25 +336,43 @@ describe('useTimeline optimistic send flow', () => {
       handlerBox.fn?.({
         type: 'timeline.event',
         event: {
-          eventId: 'real-in-place-success',
+          eventId: 'assistant-cancelled-before-drain',
           sessionId: 'deck_opt_in_place_success',
-          ts: Date.now(),
+          ts: Date.now() + 10,
           epoch: 1,
           seq: 2,
           source: 'daemon',
           confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'the previous pull finished or the active turn was cancelled' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-in-place-success',
+          sessionId: 'deck_opt_in_place_success',
+          ts: Date.now() + 20,
+          epoch: 1,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
           type: 'user.message',
-          payload: { text: 'keep my slot', commandId: 'cmd-in-place-success' },
+          payload: { text: './scripts/restart-daemon.sh restart', commandId: 'cmd-in-place-success' },
         },
       } as unknown as ServerMessage);
     });
 
     expect(ref.current!.events.map((event) => event.eventId)).toEqual([
       'assistant-before',
+      'assistant-cancelled-before-drain',
       'real-in-place-success',
     ]);
     expect(ref.current!.events.map((event) => event.eventId)).not.toContain(optimisticId);
-    expect(ref.current!.events[1].payload.pending).toBeFalsy();
+    expect(ref.current!.events[2].payload.pending).toBeFalsy();
   });
 
   it('removes a transport optimistic bubble when the daemon authoritatively queues the send', () => {
@@ -243,6 +384,8 @@ describe('useTimeline optimistic send flow', () => {
     act(() => {
       ref.current!.addOptimisticUserMessage('queue me', 'cmd-queued');
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
     expect(ref.current!.events).toHaveLength(1);
 
     act(() => {
@@ -259,15 +402,606 @@ describe('useTimeline optimistic send flow', () => {
           type: 'session.state',
           payload: {
             state: 'queued',
-            pendingMessages: ['queue me'],
+            queueEpoch: 'epoch-queued',
+            queueAuthorityId: 'authority-queued',
+            pendingMessageVersion: 1,
+            pendingMessages: ['legacy ignored'],
             pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'queue me' }],
           },
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].type).toBe('session.state');
+  });
+
+  it('keeps an Append-mode bubble in the timeline through queue frames until the daemon appended user.message replaces it', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_append' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('steer this turn', 'cmd-append', {
+        resendExtra: { deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND },
+      });
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+    const optimisticBubbles = () => ref.current!.events.filter(
+      (event) => event.type === 'user.message' && event.eventId.startsWith('optimistic:'),
+    );
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // The daemon stages an Append row in its durable queue while it waits for
+    // the provider's next safe boundary, so a queued snapshot DOES list it.
+    // That must not retire the bubble the way it retires a FIFO send.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'append-queued-state',
+          sessionId: 'deck_opt_append',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-append',
+            queueAuthorityId: 'authority-append',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-append', text: 'steer this turn' }],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(90_001); });
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // Provider admission finalizes the row (delivery fact) ...
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_append',
+        clientMessageId: 'cmd-append',
+        queueEpoch: 'epoch-append',
+        queueAuthorityId: 'authority-append',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'frame-append',
+        deliveryFrameVersion: 2,
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // ... and the daemon's own row for it arrives with the stable queue id.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:cmd-append',
+          sessionId: 'deck_opt_append',
+          ts: Date.now() + 5_000,
+          epoch: 1,
+          seq: 6,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: {
+            text: 'steer this turn',
+            clientMessageId: 'cmd-append',
+            allowDuplicate: true,
+            queueAppended: true,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+
+    const userMessages = ref.current!.events.filter((event) => event.type === 'user.message');
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0]!.eventId).toBe('transport-user:cmd-append');
+  });
+
+  it('keeps a manually selected queue Append visible across stale snapshots until its exact echo arrives', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_manual_append' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('append now', 'append-client-1', { queueAppend: true });
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'stale-queue-after-append',
+          sessionId: 'deck_opt_manual_append',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-append',
+            queueAuthorityId: 'authority-append',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'append-client-1', text: 'append now' }],
+          },
+        },
+      } as unknown as ServerMessage);
+      vi.advanceTimersByTime(90_001);
+    });
+
+    const stillPending = ref.current!.events.find((event) => event.payload.text === 'append now');
+    expect(stillPending?.payload.pending).toBe(true);
+    expect(stillPending?.payload.failed).not.toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_manual_append',
+        clientMessageId: 'append-client-1',
+        queueEpoch: 'epoch-append',
+        queueAuthorityId: 'authority-append',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'append-frame-1',
+        deliveryFrameVersion: 1,
+      } as unknown as ServerMessage);
+      vi.advanceTimersByTime(20);
+    });
+
+    const delivered = ref.current!.events.find((event) => event.payload.text === 'append now');
+    expect(delivered?.payload.pending).toBe(false);
+    expect(delivered?.payload.acked).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:append-client-1',
+          sessionId: 'deck_opt_manual_append',
+          ts: Date.now() + 1,
+          epoch: 1,
+          seq: 5,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: {
+            text: 'append now',
+            commandId: 'append-client-1',
+            clientMessageId: 'append-client-1',
+            queueAppended: true,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    const matching = ref.current!.events.filter((event) => event.payload.text === 'append now');
+    expect(matching).toHaveLength(1);
+    expect(matching[0]!.eventId).toBe('transport-user:append-client-1');
+    expect(matching[0]!.payload.pending).not.toBe(true);
+  });
+
+  it('routes structured queue snapshots through the shared reducer and ignores pendingCount as authority', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_structured_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('line one\nline two', 'cmd-structured');
+    });
+    expect(ref.current!.events).toHaveLength(1);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-structured',
+          sessionId: 'deck_opt_structured_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-1',
+            queueAuthorityId: 'authority-1',
+            pendingMessageVersion: 1,
+            pendingCount: 99,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-structured', text: 'line one\nline two' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe('queued-state-structured');
+    expect(ref.current!.events[0].payload.pendingCount).toBe(99);
+  });
+
+  it('rejects stale same-epoch queue snapshots before they can clear optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_stale_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-v2',
+          sessionId: 'deck_opt_stale_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-stale',
+            queueAuthorityId: 'authority-stale',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('must survive stale', 'cmd-stale');
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-v1-stale',
+          sessionId: 'deck_opt_stale_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-stale',
+            queueAuthorityId: 'authority-stale',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-stale', text: 'must survive stale' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+  });
+
+  it('rejects same-epoch authority mismatch queue snapshots before they can clear optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_authority_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-authority-1',
+          sessionId: 'deck_opt_authority_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-authority',
+            queueAuthorityId: 'authority-a',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('must survive mismatch', 'cmd-mismatch');
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-authority-2',
+          sessionId: 'deck_opt_authority_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-authority',
+            queueAuthorityId: 'authority-b',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-mismatch', text: 'must survive mismatch' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+  });
+
+  it('routes direct queue receipts and failures through timeline optimistic reconciliation', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_direct_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('accepted direct', 'cmd-direct-accepted');
+      ref.current!.addOptimisticUserMessage('failed direct', 'cmd-direct-failed');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.receipt',
+        sessionName: 'deck_opt_direct_queue',
+        commandId: 'cmd-direct-accepted',
+        status: 'accepted',
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    const accepted = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-accepted');
+    expect(accepted?.payload.acked).toBe(true);
+    // The receipt ends the blocking spinner (delivery is a separate fact).
+    expect(accepted?.payload.pending).toBe(false);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.failure',
+        sessionName: 'deck_opt_direct_queue',
+        queueEpoch: 'epoch-direct',
+        queueAuthorityId: 'authority-direct',
+        pendingMessageVersion: 1,
+        clientMessageId: 'cmd-direct-failed',
+        failureReason: 'failed',
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    const failed = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-failed');
+    expect(failed?.payload.failed).toBe(true);
+    expect(failed?.payload.pending).toBe(false);
+  });
+
+  it('routes direct queue delivery facts through the reducer and clears delivered optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delivery_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delivered direct', 'cmd-delivered');
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_delivery_queue',
+        queueEpoch: 'epoch-delivery',
+        queueAuthorityId: 'authority-delivery',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_delivery_queue',
+        clientMessageId: 'cmd-delivered',
+        queueEpoch: 'epoch-delivery',
+        queueAuthorityId: 'authority-delivery',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'frame-1',
+        deliveryFrameVersion: 1,
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+  });
+
+  it('routes timeline-wrapped queue delivery facts through the reducer', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeline_delivery_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('timeline delivered', 'cmd-timeline-delivered');
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queue-delivery-event',
+          sessionId: 'deck_opt_timeline_delivery_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'transport.queue.delivery',
+          payload: {
+            type: 'transport.queue.delivery',
+            sessionName: 'deck_opt_timeline_delivery_queue',
+            clientMessageId: 'cmd-timeline-delivered',
+            queueEpoch: 'epoch-timeline-delivery',
+            queueAuthorityId: 'authority-timeline-delivery',
+            pendingMessageVersion: 2,
+            deliveryFrameId: 'frame-timeline',
+            deliveryFrameVersion: 2,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+    expect(ref.current!.events.some((event) => event.eventId === 'queue-delivery-event')).toBe(true);
+  });
+
+  it('routes direct queue reset events so the next epoch snapshot is accepted', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_reset_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-before-reset',
+        queueAuthorityId: 'authority-before-reset',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('reset accepted', 'cmd-reset');
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.reset',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-after-reset',
+        queueAuthorityId: 'authority-after-reset',
+        pendingMessageVersion: 1,
+        resetReason: 'runtime_recreated',
+      } as unknown as ServerMessage);
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-after-reset',
+        queueAuthorityId: 'authority-after-reset',
+        pendingMessageVersion: 2,
+        pendingMessageEntries: [{ clientMessageId: 'cmd-reset', text: 'reset accepted', status: 'queued', placement: 'normal', ordinal: 0, createdAt: 0, updatedAt: 0 }],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+  });
+
+  it('applies running empty queue snapshots through the reducer without using pendingCount', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_running_empty_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('running empty', 'cmd-running-empty');
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'running-empty-state',
+          sessionId: 'deck_opt_running_empty_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'running',
+            queueEpoch: 'epoch-running',
+            queueAuthorityId: 'authority-running',
+            pendingMessageVersion: 1,
+            pendingCount: 7,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+    expect(ref.current!.events.some((event) => event.eventId === 'running-empty-state')).toBe(true);
+  });
+
+  it('does not clear optimistic bubbles from legacy text-only queue evidence or pendingCount', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_legacy_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('legacy text', 'cmd-legacy');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-legacy',
+          sessionId: 'deck_opt_legacy_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            pendingCount: 1,
+            pendingMessages: ['legacy text'],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
+
+    expect(ref.current!.events.map((event) => event.eventId)).toContain('queued-state-legacy');
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
   });
 
   it('late echo also clears a previously-failed bubble (retry arrived)', () => {
@@ -380,7 +1114,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.failureReason).toBe('timeout');
   });
 
-  it('success-ish command.ack marks daemon receipt but keeps the local bubble pending', () => {
+  it('success-ish command.ack marks daemon receipt and ends the spinner, but keeps the command open', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -403,12 +1137,99 @@ describe('useTimeline optimistic send flow', () => {
       vi.advanceTimersByTime(120_000);
     });
 
-    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.pending).toBe(false);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
   });
 
-  it('keeps a pending bubble visible when command.ack is delivered as a timeline event', () => {
+  it('delegation accepted ack clears the optimistic pending state immediately', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_ack' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate this', 'cmd-delegate-accepted', {
+        resendExtra: { delegateTarget: { session: 'deck_sub_w1' } },
+      });
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-accepted',
+        status: 'accepted',
+        session: 'deck_opt_delegation_ack',
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('delegated ack metadata clears pending even when the local optimistic resend metadata is absent', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_ack_wire' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate without local metadata', 'cmd-delegate-wire');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-wire',
+        status: 'accepted',
+        session: 'deck_opt_delegation_ack_wire',
+        delegated: true,
+        targetSession: 'deck_sub_w1',
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('maps delegation ack error codes to localized visible errors', () => {
+    const translateSpy = vi.spyOn(i18next, 't').mockImplementation((key: string, fallback?: string) => (
+      key === 'delegation.error.delegation_target_unavailable'
+        ? 'Localized unavailable target'
+        : (fallback ?? key)
+    ) as any);
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_error' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate this', 'cmd-delegate-error', {
+        resendExtra: { delegateTarget: { session: 'deck_sub_w1' } },
+      });
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-error',
+        status: 'error',
+        session: 'deck_opt_delegation_error',
+        error: 'delegation_target_unavailable: target not found',
+      } as unknown as ServerMessage);
+    });
+
+    expect(translateSpy).toHaveBeenCalledWith(
+      'delegation.error.delegation_target_unavailable',
+      'delegation_target_unavailable: target not found',
+    );
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+    expect(ref.current!.events[0].payload.failureReason).toBe('Localized unavailable target');
+  });
+
+  it('ends the spinner but keeps the bubble visible when command.ack is delivered as a timeline event', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -440,7 +1261,7 @@ describe('useTimeline optimistic send flow', () => {
     });
 
     const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-timeline-ack'));
-    expect(optimistic?.payload.pending).toBe(true);
+    expect(optimistic?.payload.pending).toBe(false);
     expect(optimistic?.payload.acked).toBe(true);
     expect(optimistic?.payload.failed).toBeFalsy();
   });
@@ -478,7 +1299,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(optimistic?.payload.failureReason).toBe('duplicate_command_id');
   });
 
-  it('keeps a pending bubble visible when command.ack is recovered through history', () => {
+  it('ends the spinner but keeps the bubble visible when command.ack is recovered through history', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -512,7 +1333,7 @@ describe('useTimeline optimistic send flow', () => {
     });
 
     const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-history-ack'));
-    expect(optimistic?.payload.pending).toBe(true);
+    expect(optimistic?.payload.pending).toBe(false);
     expect(optimistic?.payload.acked).toBe(true);
     expect(optimistic?.payload.failed).toBeFalsy();
   });
@@ -534,7 +1355,14 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.text).toBe('still visible');
-    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith('deck_opt_reconnect_pending', 300);
+    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      'deck_opt_reconnect_pending',
+      200,
+      undefined,
+      undefined,
+      { epoch: 0, afterSeq: 0, direction: 'newer' },
+      1024 * 1024,
+    );
   });
 
   it('does not show ack_timeout failure when authoritative history arrives', () => {
@@ -692,6 +1520,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.map((event) => event.eventId)).toEqual([
       'real-memory-user',
@@ -746,7 +1576,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
-  it('persists an acked-but-pending local send across refresh and replaces it with authoritative history by commandId', async () => {
+  it('persists an acked local send across refresh and replaces it with authoritative history by commandId', async () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -763,7 +1593,7 @@ describe('useTimeline optimistic send flow', () => {
         session: 'deck_opt_refresh_ack',
       } as unknown as ServerMessage);
     });
-    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.pending).toBe(false);
     expect(ref.current!.events[0].payload.acked).toBe(true);
 
     cleanup();
@@ -777,7 +1607,7 @@ describe('useTimeline optimistic send flow', () => {
     await waitFor(() => {
       expect(refAfterReload.current!.events).toHaveLength(1);
       expect(refAfterReload.current!.events[0].payload.acked).toBe(true);
-      expect(refAfterReload.current!.events[0].payload.pending).toBe(true);
+      expect(refAfterReload.current!.events[0].payload.pending).toBe(false);
     });
 
     act(() => {
@@ -1195,7 +2025,7 @@ describe('useTimeline dual-ack (audit 0419d1ac-1f4 / N-R2)', () => {
         session: 'deck_dual_ack_a',
       } as unknown as ServerMessage);
     });
-    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.pending).toBe(false);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
 
@@ -1255,5 +2085,563 @@ describe('useTimeline dual-ack (audit 0419d1ac-1f4 / N-R2)', () => {
 
     // Bubble MUST stay failed — terminal state is sticky.
     expect(ref.current!.events[0].payload.failed).toBe(true);
+  });
+});
+
+/**
+ * tsk_cd_send_spinner_console_sync: "sending" must feel instant. The core-lane
+ * link worker acks `command.ack accepted` within milliseconds, independent of
+ * the (possibly stalled) daemon main thread and of the agent's queue. That
+ * receipt alone must end the spinner; nothing later (queue snapshot, delivery
+ * fact, echo) may be required to clear it.
+ */
+describe('useTimeline send spinner ends on the daemon receipt (tsk_cd_send_spinner_console_sync)', () => {
+  beforeEach(() => {
+    __resetTimelineCacheForTests();
+    __clearPersistedTimelineSnapshotsForTests();
+    cleanup();
+    vi.useFakeTimers();
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(
+      (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0) as unknown as number,
+    );
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id: number) => clearTimeout(id));
+    sendSessionViaHttpMock.mockReset();
+    sendSessionViaHttpMock.mockRejectedValue(new Error('http unavailable in test'));
+  });
+
+  afterEach(async () => {
+    await cleanupRenderedTimeline();
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function setup(sessionId: string) {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId }));
+    const bubble = (commandId: string) => ref.current!.events.find(
+      (event) => event.type === 'user.message' && event.payload.commandId === commandId,
+    );
+    const ack = (commandId: string, status = 'accepted', extra: Record<string, unknown> = {}) => act(() => {
+      handlerBox.fn?.({ type: 'command.ack', commandId, status, session: sessionId, ...extra } as unknown as ServerMessage);
+    });
+    const queueState = (commandId: string, text: string, seq: number) => act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `queued-state-${seq}`,
+          sessionId,
+          ts: Date.now(),
+          epoch: 1,
+          seq,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-spin',
+            queueAuthorityId: 'authority-spin',
+            pendingMessageVersion: seq,
+            pendingMessageEntries: [{ clientMessageId: commandId, text }],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    const delivery = (commandId: string, version: number) => act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: sessionId,
+        clientMessageId: commandId,
+        queueEpoch: 'epoch-spin',
+        queueAuthorityId: 'authority-spin',
+        pendingMessageVersion: version,
+        deliveryFrameId: `frame-${version}`,
+        deliveryFrameVersion: version,
+      } as unknown as ServerMessage);
+    });
+    return { ref, handlerBox, bubble, ack, queueState, delivery };
+  }
+
+  it('ends the spinner within 200ms of the accepted receipt, with no queue frame, delivery fact or echo', () => {
+    const { ref, bubble, ack } = setup('deck_spin_receipt');
+    act(() => { ref.current!.addOptimisticUserMessage('hello', 'cmd-spin-1'); });
+    expect(bubble('cmd-spin-1')?.payload.pending).toBe(true);
+
+    ack('cmd-spin-1');
+    // The main thread / agent queue never answers: only time passes.
+    act(() => { vi.advanceTimersByTime(200); });
+
+    const sent = bubble('cmd-spin-1');
+    expect(sent).toBeDefined();
+    expect(sent?.payload.pending).toBe(false);
+    expect(sent?.payload.acked).toBe(true);
+    expect(sent?.payload.failed).toBeFalsy();
+    expect(sent?.payload.queued).toBeUndefined();
+  });
+
+  it('still turns the acked bubble into a retryable failure when the queue later reports it failed', () => {
+    const { ref, bubble, ack, handlerBox } = setup('deck_spin_failure');
+    act(() => { ref.current!.addOptimisticUserMessage('will fail', 'cmd-spin-fail'); });
+    ack('cmd-spin-fail');
+    expect(bubble('cmd-spin-fail')?.payload.pending).toBe(false);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.failure',
+        sessionName: 'deck_spin_failure',
+        queueEpoch: 'epoch-spin',
+        queueAuthorityId: 'authority-spin',
+        pendingMessageVersion: 3,
+        clientMessageId: 'cmd-spin-fail',
+        failureReason: 'failed',
+      } as unknown as ServerMessage);
+    });
+
+    const failed = bubble('cmd-spin-fail');
+    expect(failed?.payload.failed).toBe(true);
+    expect(failed?.payload.pending).toBe(false);
+  });
+
+  it('a later echo with the same commandId replaces the acked bubble (no duplicate)', () => {
+    const { ref, bubble, ack, handlerBox } = setup('deck_spin_echo');
+    act(() => { ref.current!.addOptimisticUserMessage('echo me', 'cmd-spin-echo'); });
+    ack('cmd-spin-echo');
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-echo',
+          sessionId: 'deck_spin_echo',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 10,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'echo me', commandId: 'cmd-spin-echo' },
+        },
+      } as unknown as ServerMessage);
+    });
+    const users = ref.current!.events.filter((event) => event.type === 'user.message');
+    expect(users.map((event) => event.eventId)).toEqual(['real-echo']);
+    expect(bubble('cmd-spin-echo')?.eventId).toBe('real-echo');
+  });
+
+  it('an echo WITHOUT a commandId (JSONL scraper) still dedupes an acked bubble by text', () => {
+    const { ref, ack, handlerBox } = setup('deck_spin_legacy_echo');
+    act(() => { ref.current!.addOptimisticUserMessage('legacy echo', 'cmd-spin-legacy'); });
+    ack('cmd-spin-legacy');
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-legacy-echo',
+          sessionId: 'deck_spin_legacy_echo',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 11,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'legacy echo' },
+        },
+      } as unknown as ServerMessage);
+    });
+    const users = ref.current!.events.filter((event) => event.type === 'user.message');
+    expect(users.map((event) => event.eventId)).toEqual(['real-legacy-echo']);
+  });
+
+  it('FIFO send: no spinner after the receipt, no bubble marker, and it still retires into the queue strip when the queue lists it', () => {
+    const { ref, bubble, ack, queueState } = setup('deck_spin_fifo');
+    act(() => { ref.current!.addOptimisticUserMessage('queue me', 'cmd-spin-fifo'); });
+    ack('cmd-spin-fifo');
+    expect(bubble('cmd-spin-fifo')?.payload.pending).toBe(false);
+    expect(bubble('cmd-spin-fifo')?.payload.queued).toBeUndefined();
+
+    queueState('cmd-spin-fifo', 'queue me', 4);
+    act(() => { vi.advanceTimersByTime(20); });
+    // The strip card is its queued display; the local bubble is retired.
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+  });
+
+  it('Append send: marker appears while the queue lists it and disappears on delivery; the bubble stays', () => {
+    const { ref, bubble, ack, queueState, delivery } = setup('deck_spin_append');
+    act(() => {
+      ref.current!.addOptimisticUserMessage('steer', 'cmd-spin-append', { queueAppend: true });
+    });
+    ack('cmd-spin-append');
+    expect(bubble('cmd-spin-append')?.payload.pending).toBe(false);
+    expect(bubble('cmd-spin-append')?.payload.queued).toBeUndefined();
+
+    queueState('cmd-spin-append', 'steer', 4);
+    expect(bubble('cmd-spin-append')?.payload.queued).toBe(true);
+    expect(bubble('cmd-spin-append')?.payload.pending).toBe(false);
+
+    delivery('cmd-spin-append', 5);
+    const delivered = bubble('cmd-spin-append');
+    expect(delivered).toBeDefined();
+    expect(delivered?.payload.queued).toBeUndefined();
+    expect(delivered?.payload.pending).toBe(false);
+  });
+
+  it('Append send: a failure clears the marker and shows the retryable failed bubble', () => {
+    const { ref, bubble, ack, queueState, handlerBox } = setup('deck_spin_append_fail');
+    act(() => {
+      ref.current!.addOptimisticUserMessage('steer', 'cmd-spin-append-fail', { queueAppend: true });
+    });
+    ack('cmd-spin-append-fail');
+    queueState('cmd-spin-append-fail', 'steer', 4);
+    expect(bubble('cmd-spin-append-fail')?.payload.queued).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.failure',
+        sessionName: 'deck_spin_append_fail',
+        queueEpoch: 'epoch-spin',
+        queueAuthorityId: 'authority-spin',
+        pendingMessageVersion: 6,
+        clientMessageId: 'cmd-spin-append-fail',
+        failureReason: 'failed',
+      } as unknown as ServerMessage);
+    });
+    const failed = bubble('cmd-spin-append-fail');
+    expect(failed?.payload.failed).toBe(true);
+    expect(failed?.payload.queued).toBeUndefined();
+  });
+
+  it('a delegated ack keeps its terminal-at-ack behaviour (a later failure is swallowed)', () => {
+    const { ref, bubble, ack, handlerBox } = setup('deck_spin_delegated');
+    act(() => { ref.current!.addOptimisticUserMessage('delegate', 'cmd-spin-del', { resendExtra: { delegateTarget: { session: 'deck_sub_w1' } } }); });
+    ack('cmd-spin-del', 'accepted', { delegated: true });
+    expect(bubble('cmd-spin-del')?.payload.pending).toBe(false);
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.failure',
+        sessionName: 'deck_spin_delegated',
+        queueEpoch: 'e', queueAuthorityId: 'a', pendingMessageVersion: 1,
+        clientMessageId: 'cmd-spin-del', failureReason: 'failed',
+      } as unknown as ServerMessage);
+    });
+    expect(bubble('cmd-spin-del')?.payload.failed).toBeFalsy();
+  });
+
+  it('an acked local bubble never feeds the history cursor (client clock may be skewed)', () => {
+    const { ref, bubble, ack } = setup('deck_spin_cursor');
+    act(() => { ref.current!.addOptimisticUserMessage('cursor', 'cmd-spin-cursor'); });
+    ack('cmd-spin-cursor');
+    const local = bubble('cmd-spin-cursor')!;
+    const skewedFuture = { ...local, ts: 9_999_999_999_999 };
+    const real = { ...local, eventId: 'real-1', ts: 1_000, type: 'user.message' as const, payload: { text: 'real' } };
+    const withoutLocal = __getTimelineHistoryAfterTsForTests([real]);
+    expect(withoutLocal).toBeLessThan(1_000);
+    expect(__getTimelineHistoryAfterTsForTests([real, skewedFuture])).toBe(withoutLocal);
+  });
+
+  describe('silent drop, reconnect replay, and cache hydration recovery', () => {
+    it('replays a silently lost send after 6s silence, falls back to HTTP with _resendExtra after 8s, and marks retryable failed when HTTP rejects', async () => {
+      const ref = { current: null as HookRef };
+      const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { ws, Probe } = captureHookRef(ref, handlerBox);
+      const urgentSpy = vi.fn(() => undefined);
+      (ws as unknown as { sendSessionCommandUrgent?: typeof urgentSpy }).sendSessionCommandUrgent = urgentSpy;
+      const sessionId = 'deck_silent_fail';
+      render(h(Probe, { sessionId }));
+
+      act(() => {
+        ref.current!.addOptimisticUserMessage('silent lost', 'cmd-silent-fail', {
+          resendExtra: { p2pAtTargets: [{ session: 'deck_sub_w1', mode: 'audit' }] },
+        });
+      });
+
+      const getBubble = () => ref.current!.events.find((e) => e.payload.commandId === 'cmd-silent-fail');
+      expect(getBubble()?.payload.pending).toBe(true);
+
+      // Before 6s watchdog: no replay yet
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_900); });
+      expect(urgentSpy).not.toHaveBeenCalled();
+
+      // At 6s: silence watchdog replays via urgent send with _resendExtra preserved
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      expect(urgentSpy).toHaveBeenCalledTimes(1);
+      expect(urgentSpy).toHaveBeenCalledWith('send', {
+        sessionName: sessionId,
+        text: 'silent lost',
+        commandId: 'cmd-silent-fail',
+        p2pAtTargets: [{ session: 'deck_sub_w1', mode: 'audit' }],
+      });
+      expect(sendSessionViaHttpMock).not.toHaveBeenCalled();
+
+      // At +8s: HTTP fallback fires and default-rejects -> flips immediately to retryable failed
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_100); });
+      expect(sendSessionViaHttpMock).toHaveBeenCalledTimes(1);
+      expect(sendSessionViaHttpMock).toHaveBeenCalledWith('srv', {
+        sessionName: sessionId,
+        text: 'silent lost',
+        commandId: 'cmd-silent-fail',
+        p2pAtTargets: [{ session: 'deck_sub_w1', mode: 'audit' }],
+      });
+      expect(getBubble()?.payload.failed).toBe(true);
+      expect(getBubble()?.payload.pending).toBe(false);
+    });
+
+    it('settles cleanly if command.ack arrives during HTTP confirmation window, and fails if HTTP 2xx never yields ack/echo', async () => {
+      // Subcase A: HTTP 2xx + no confirmation within 8s -> retryable failed
+      const refA = { current: null as HookRef };
+      const handlerBoxA = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { Probe: ProbeA } = captureHookRef(refA, handlerBoxA);
+      sendSessionViaHttpMock.mockResolvedValue({ ok: true });
+      render(h(ProbeA, { sessionId: 'deck_http_no_confirm' }));
+
+      act(() => { refA.current!.addOptimisticUserMessage('http unconfirmed', 'cmd-http-noconf'); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(14_100); });
+      expect(sendSessionViaHttpMock).toHaveBeenCalledTimes(1);
+      expect(refA.current!.events.find((e) => e.payload.commandId === 'cmd-http-noconf')?.payload.pending).toBe(true);
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_100); });
+      const failedA = refA.current!.events.find((e) => e.payload.commandId === 'cmd-http-noconf');
+      expect(failedA?.payload.failed).toBe(true);
+      expect(failedA?.payload.pending).toBe(false);
+
+      await cleanupRenderedTimeline();
+      sendSessionViaHttpMock.mockClear();
+
+      // Subcase B: HTTP 2xx + command.ack accepted arrives -> settles cleanly without failing
+      const refB = { current: null as HookRef };
+      const handlerBoxB = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { Probe: ProbeB } = captureHookRef(refB, handlerBoxB);
+      render(h(ProbeB, { sessionId: 'deck_http_acked' }));
+
+      act(() => { refB.current!.addOptimisticUserMessage('http confirmed', 'cmd-http-conf'); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(14_100); });
+      expect(sendSessionViaHttpMock).toHaveBeenCalledTimes(1);
+
+      act(() => {
+        handlerBoxB.fn?.({
+          type: 'command.ack',
+          session: 'deck_http_acked',
+          commandId: 'cmd-http-conf',
+          status: 'accepted',
+        } as unknown as ServerMessage);
+      });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+      const settledB = refB.current!.events.find((e) => e.payload.commandId === 'cmd-http-conf');
+      expect(settledB?.payload.pending).toBe(false);
+      expect(settledB?.payload.acked).toBe(true);
+      expect(settledB?.payload.failed).toBeFalsy();
+    });
+
+    it('auto-replays un-acked sends after probe_recovered, full reconnect, and daemon.reconnected while ignoring acked ones', async () => {
+      const ref = { current: null as HookRef };
+      const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { ws, Probe } = captureHookRef(ref, handlerBox);
+      const urgentSpy = vi.fn(() => undefined);
+      (ws as unknown as { sendSessionCommandUrgent?: typeof urgentSpy }).sendSessionCommandUrgent = urgentSpy;
+      const sessionId = 'deck_reconn_replay';
+      render(h(Probe, { sessionId }));
+
+      act(() => {
+        ref.current!.addOptimisticUserMessage('acked msg', 'cmd-already-acked');
+        ref.current!.addOptimisticUserMessage('unacked msg', 'cmd-needs-replay', {
+          resendExtra: { deliveryMode: 'append' },
+        });
+      });
+      act(() => {
+        handlerBox.fn?.({
+          type: 'command.ack',
+          session: sessionId,
+          commandId: 'cmd-already-acked',
+          status: 'accepted',
+        } as unknown as ServerMessage);
+      });
+
+      // Disconnect -> back-to-back connected (probe_recovered) + daemon.reconnected coalesce into one replay pass
+      act(() => {
+        handlerBox.fn?.({ type: 'session.event', event: 'disconnected' } as unknown as ServerMessage);
+        handlerBox.fn?.({ type: 'session.event', event: 'connected', reason: 'probe_recovered' } as unknown as ServerMessage);
+        handlerBox.fn?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+      });
+
+      // Reconnect replay triggers scheduleAutoRetry after RECONNECT_UNACKED_REPLAY_DELAY_MS (1500ms)
+      // plus CLIENT_RETRY_DELAYS_MS[0] (800ms) = 2300ms total.
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_200); });
+      expect(urgentSpy).not.toHaveBeenCalled();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      expect(urgentSpy).toHaveBeenCalledTimes(1);
+      expect(urgentSpy).toHaveBeenCalledWith('send', {
+        sessionName: sessionId,
+        text: 'unacked msg',
+        commandId: 'cmd-needs-replay',
+        deliveryMode: 'append',
+      });
+
+      // Echo arrives -> optimistic bubble replaced, zero duplicates
+      act(() => {
+        handlerBox.fn?.({
+          type: 'timeline.event',
+          event: {
+            eventId: 'real-replayed-echo',
+            sessionId,
+            ts: Date.now(),
+            epoch: 1,
+            seq: 20,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'user.message',
+            payload: { text: 'unacked msg', commandId: 'cmd-needs-replay' },
+          },
+        } as unknown as ServerMessage);
+      });
+      const matching = ref.current!.events.filter((e) => e.payload.commandId === 'cmd-needs-replay');
+      expect(matching).toHaveLength(1);
+      expect(matching[0].eventId).toBe('real-replayed-echo');
+    });
+
+    it('re-tracks fresh cached pending bubbles on hydration, expires >=90s stale bubbles, and drops confirmed duplicates', async () => {
+      const now = Date.now();
+      const sessionId = 'deck_hydrate_recovery';
+      const confirmedReal = {
+        eventId: 'real-confirmed-1',
+        sessionId,
+        ts: now - 5_000,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'already echoed', commandId: 'cmd-dup' },
+      };
+      const staleDupPending = {
+        eventId: 'optimistic:srv:cmd-dup',
+        sessionId,
+        ts: now - 4_000,
+        epoch: 0,
+        seq: 0,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'already echoed', commandId: 'cmd-dup', pending: true },
+      };
+      const expiredPending = {
+        eventId: 'optimistic:srv:cmd-expired',
+        sessionId,
+        ts: now - 95_000,
+        epoch: 0,
+        seq: 0,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'too old', commandId: 'cmd-expired', pending: true },
+      };
+      const freshPending = {
+        eventId: 'optimistic:srv:cmd-fresh',
+        sessionId,
+        ts: now - 1_000,
+        epoch: 0,
+        seq: 0,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'still pending', commandId: 'cmd-fresh', pending: true },
+      };
+
+      sessionStorage.setItem(
+        `rcc_timeline_snapshot:srv:${sessionId}`,
+        JSON.stringify([confirmedReal, staleDupPending, expiredPending, freshPending]),
+      );
+
+      const ref = { current: null as HookRef };
+      const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { ws, Probe } = captureHookRef(ref, handlerBox);
+      render(h(Probe, { sessionId }));
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+
+      // Duplicate pending dropped; >=90s stale pending flipped to failed immediately; fresh pending stays armed
+      const dupMatches = ref.current!.events.filter((e) => e.payload.commandId === 'cmd-dup');
+      expect(dupMatches.map((e) => e.eventId)).toEqual(['real-confirmed-1']);
+
+      const expired = ref.current!.events.find((e) => e.payload.commandId === 'cmd-expired');
+      expect(expired?.payload.pending).toBe(false);
+      expect(expired?.payload.failed).toBe(true);
+
+      const fresh = ref.current!.events.find((e) => e.payload.commandId === 'cmd-fresh');
+      expect(fresh?.payload.pending).toBe(true);
+
+      // Fresh hydrated pending bubble automatically triggers 6s silence replay + fails cleanly when HTTP rejects
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_100); });
+      expect((ws as unknown as { sendSessionCommand: ReturnType<typeof vi.fn> }).sendSessionCommand).toHaveBeenCalledWith('send', {
+        sessionName: sessionId,
+        text: 'still pending',
+        commandId: 'cmd-fresh',
+      });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_100); });
+      expect(sendSessionViaHttpMock).toHaveBeenCalledTimes(1);
+      const freshAfterFail = ref.current!.events.find((e) => e.payload.commandId === 'cmd-fresh');
+      expect(freshAfterFail?.payload.pending).toBe(false);
+      expect(freshAfterFail?.payload.failed).toBe(true);
+    });
+
+    it('recovers un-acked isAppend sends via silence watchdog while preserving queue-confirmed isAppend sends', async () => {
+      const ref = { current: null as HookRef };
+      const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+      const { ws, Probe } = captureHookRef(ref, handlerBox);
+      const sessionId = 'deck_append_watchdog';
+      render(h(Probe, { sessionId }));
+
+      act(() => {
+        ref.current!.addOptimisticUserMessage('lost append', 'cmd-append-lost', { queueAppend: true });
+        ref.current!.addOptimisticUserMessage('queued append', 'cmd-append-queued', { queueAppend: true });
+      });
+
+      // Confirm only the second append via daemon queue snapshot (no command.ack needed)
+      act(() => {
+        handlerBox.fn?.({
+          type: 'timeline.event',
+          event: {
+            eventId: 'state-append-q',
+            sessionId,
+            ts: Date.now(),
+            epoch: 1,
+            seq: 5,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'session.state',
+            payload: {
+              state: 'queued',
+              queueEpoch: 'epoch-append',
+              queueAuthorityId: 'authority-append',
+              pendingMessageVersion: 5,
+              pendingMessageEntries: [{ clientMessageId: 'cmd-append-queued', text: 'queued append', status: 'queued' }],
+            },
+          },
+        } as unknown as ServerMessage);
+      });
+
+      // Queue-confirmed append marks queued and disarms silence watchdog (no replay or timeout failure)
+      const queuedBubble = () => ref.current!.events.find((e) => e.payload.commandId === 'cmd-append-queued');
+      expect(queuedBubble()?.payload.queued).toBe(true);
+      expect(queuedBubble()?.payload.failed).toBeFalsy();
+
+      // Un-acked append replays via silence watchdog at 6s and fails cleanly on HTTP rejection at +8s
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_100); });
+      expect((ws as unknown as { sendSessionCommand: ReturnType<typeof vi.fn> }).sendSessionCommand).toHaveBeenCalledTimes(1);
+      expect((ws as unknown as { sendSessionCommand: ReturnType<typeof vi.fn> }).sendSessionCommand).toHaveBeenCalledWith('send', {
+        sessionName: sessionId,
+        text: 'lost append',
+        commandId: 'cmd-append-lost',
+      });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_100); });
+      const lostBubble = ref.current!.events.find((e) => e.payload.commandId === 'cmd-append-lost');
+      expect(lostBubble?.payload.pending).toBe(false);
+      expect(lostBubble?.payload.failed).toBe(true);
+      expect(queuedBubble()?.payload.queued).toBe(true);
+      expect(queuedBubble()?.payload.failed).toBeFalsy();
+    });
   });
 });

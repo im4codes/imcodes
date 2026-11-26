@@ -2,16 +2,63 @@ import type { Database } from './db/client.js';
 
 /** Environment config loaded from process.env (no DB, that's injected at runtime). */
 export interface EnvConfig {
+  /** Explicit deployment opt-in; users must additionally select R2 in the UI. */
+  USE_R2_RELAY?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  /** Tier 1 controlled-node artifact distribution over R2 (default base URL: https://dl.im.codes; set USE_R2_ARTIFACT=false to disable). */
+  USE_R2_ARTIFACT?: string;
+  CONTROLLED_NODE_ARTIFACT_R2_BASE_URL?: string;
+  CONTROLLED_NODE_ARTIFACT_R2_PREFIX?: string;
+  /** Optional Tier 2 controlled-node artifact distribution over GitHub Releases. */
+  CONTROLLED_NODE_ARTIFACT_GITHUB_REPO?: string;
+  CONTROLLED_NODE_ARTIFACT_GITHUB_TAG?: string;
+  CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL?: string;
   // Database connection string
   DATABASE_URL: string;
 
   // Secrets
   JWT_SIGNING_KEY: string;
+  /**
+   * Symmetric secret used for platform bot credentials and controlled-node
+   * download tickets. Reusing this established key keeps existing deployments
+   * upgrade-compatible without introducing another required secret.
+   */
   BOT_ENCRYPTION_KEY: string;
 
   // GitHub OAuth (optional — disables GitHub login if absent)
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+
+  // Google OAuth (optional — falls back to AUTH_RELAY_URL if absent)
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+
+  // Auth relay for key-free Google/GitHub login on self-hosted servers (default: https://app.im.codes)
+  AUTH_RELAY_URL?: string;
+
+  // ONLYOFFICE Document Server integration (optional)
+  ONLYOFFICE_ENABLED?: string;
+  ONLYOFFICE_JWT_SECRET?: string;
+  ONLYOFFICE_PUBLIC_URL?: string;
+  ONLYOFFICE_INTERNAL_URL?: string;
+  IMCODES_CLOUD_DOCS_DIR?: string;
+
+  // Optional server-side OpenAI-compatible TTS defaults
+  TTS_BASE_URL?: string;
+  TTS_API_KEY?: string;
+  TTS_MODEL?: string;
+  TTS_VOICE?: string;
+  TTS_VOICES_BY_LANG?: string;
+  TTS_RESPONSE_FORMAT?: string;
+
+  // Optional server-side OpenAI-compatible ASR default service
+  ASR_BASE_URL?: string;
+  ASR_API_KEY?: string;
+  ASR_MODEL?: string;
+  ASR_NAME?: string;
 
   // Server URL (used to build webhook URLs)
   SERVER_URL: string;
@@ -47,6 +94,17 @@ export interface EnvConfig {
   /** Port to listen on. Default: 19138 */
   PORT?: string;
 
+  // Optional authenticated TURN relay
+  TURN_ENABLED?: string;
+  TURN_HOST?: string;
+  TURN_PORT?: string;
+  TURN_EXTERNAL_IP?: string;
+  TURN_SHARED_SECRET?: string;
+  TURN_CREDENTIAL_TTL_SECONDS?: string;
+  TURN_RELAY_MIN_PORT?: string;
+  TURN_RELAY_MAX_PORT?: string;
+  TURN_BITRATE_CAP_BPS?: string;
+
   // APNs push notifications (iOS)
   /** APNs auth key (.p8 file content, base64 encoded) */
   APNS_KEY?: string;
@@ -57,8 +115,11 @@ export interface EnvConfig {
   /** APNs bundle ID (e.g. app.imcodes) */
   APNS_BUNDLE_ID?: string;
 
-  // FCM push notifications (Android, International edition)
-  FCM_SERVER_KEY?: string;
+  // FCM HTTP v1 push notifications (Android, International edition)
+  /** Firebase service-account JSON (raw or base64-encoded). */
+  FCM_SERVICE_ACCOUNT_JSON?: string;
+  /** Optional project_id override for FCM HTTP v1. */
+  FCM_PROJECT_ID?: string;
 
   // JPush 极光推送 (Android, Mainland China edition — aggregates Huawei /
   // Xiaomi / OPPO / vivo / Honor vendor channels)
@@ -69,6 +130,10 @@ export interface EnvConfig {
 
   // Push relay for self-hosted servers without APNs keys (default: https://app.im.codes)
   PUSH_RELAY_URL?: string;
+  /** Optional shared bearer secret protecting POST /api/push/relay when configured. */
+  PUSH_RELAY_SECRET?: string;
+  /** Optional bearer secret sent by a self-hosted instance to its explicitly configured PUSH_RELAY_URL. */
+  PUSH_RELAY_CLIENT_SECRET?: string;
 
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
@@ -77,6 +142,16 @@ export interface EnvConfig {
   // Landing page
   /** Host that serves the landing page instead of the app (e.g. im.codes). */
   LANDING_HOST?: string;
+
+  // Database pool
+  /** Maximum PostgreSQL pool connections (default: 25). */
+  DB_POOL_MAX?: string;
+  /** PostgreSQL pool acquire timeout in ms (default: 5000). */
+  DB_POOL_CONNECTION_TIMEOUT_MS?: string;
+  /** PostgreSQL idle client timeout in ms (default: 30000). */
+  DB_POOL_IDLE_TIMEOUT_MS?: string;
+  /** PostgreSQL per-statement timeout in ms (default: 15000). */
+  DB_STATEMENT_TIMEOUT_MS?: string;
 
   // Runtime
   NODE_ENV?: string;
@@ -100,11 +175,40 @@ export function loadEnv(): EnvConfig {
   }
 
   return {
+    USE_R2_RELAY: process.env.USE_R2_RELAY,
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    USE_R2_ARTIFACT: process.env.USE_R2_ARTIFACT,
+    CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: process.env.CONTROLLED_NODE_ARTIFACT_R2_BASE_URL,
+    CONTROLLED_NODE_ARTIFACT_R2_PREFIX: process.env.CONTROLLED_NODE_ARTIFACT_R2_PREFIX,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_REPO: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_REPO,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_TAG: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_TAG,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL,
     DATABASE_URL: process.env.DATABASE_URL!,
     JWT_SIGNING_KEY: process.env.JWT_SIGNING_KEY!,
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',
     GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    AUTH_RELAY_URL: process.env.AUTH_RELAY_URL ?? 'https://app.im.codes',
+    ONLYOFFICE_ENABLED: process.env.ONLYOFFICE_ENABLED,
+    ONLYOFFICE_JWT_SECRET: process.env.ONLYOFFICE_JWT_SECRET,
+    ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
+    ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
+    IMCODES_CLOUD_DOCS_DIR: process.env.IMCODES_CLOUD_DOCS_DIR,
+    TTS_BASE_URL: process.env.TTS_BASE_URL,
+    TTS_API_KEY: process.env.TTS_API_KEY,
+    TTS_MODEL: process.env.TTS_MODEL,
+    TTS_VOICE: process.env.TTS_VOICE,
+    TTS_VOICES_BY_LANG: process.env.TTS_VOICES_BY_LANG,
+    TTS_RESPONSE_FORMAT: process.env.TTS_RESPONSE_FORMAT,
+    ASR_BASE_URL: process.env.ASR_BASE_URL,
+    ASR_API_KEY: process.env.ASR_API_KEY,
+    ASR_MODEL: process.env.ASR_MODEL,
+    ASR_NAME: process.env.ASR_NAME,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
@@ -113,16 +217,32 @@ export function loadEnv(): EnvConfig {
     WEBAUTHN_RP_ID: process.env.WEBAUTHN_RP_ID,
     BIND_HOST: process.env.BIND_HOST,
     PORT: process.env.PORT,
+    TURN_ENABLED: process.env.TURN_ENABLED,
+    TURN_HOST: process.env.TURN_HOST,
+    TURN_PORT: process.env.TURN_PORT,
+    TURN_EXTERNAL_IP: process.env.TURN_EXTERNAL_IP,
+    TURN_SHARED_SECRET: process.env.TURN_SHARED_SECRET,
+    TURN_CREDENTIAL_TTL_SECONDS: process.env.TURN_CREDENTIAL_TTL_SECONDS,
+    TURN_RELAY_MIN_PORT: process.env.TURN_RELAY_MIN_PORT,
+    TURN_RELAY_MAX_PORT: process.env.TURN_RELAY_MAX_PORT,
+    TURN_BITRATE_CAP_BPS: process.env.TURN_BITRATE_CAP_BPS,
     APNS_KEY: process.env.APNS_KEY,
     APNS_KEY_ID: process.env.APNS_KEY_ID,
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,
     APNS_BUNDLE_ID: process.env.APNS_BUNDLE_ID ?? 'app.imcodes',
-    FCM_SERVER_KEY: process.env.FCM_SERVER_KEY,
+    FCM_SERVICE_ACCOUNT_JSON: process.env.FCM_SERVICE_ACCOUNT_JSON,
+    FCM_PROJECT_ID: process.env.FCM_PROJECT_ID,
     JPUSH_APP_KEY: process.env.JPUSH_APP_KEY,
     JPUSH_MASTER_SECRET: process.env.JPUSH_MASTER_SECRET,
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
+    PUSH_RELAY_SECRET: process.env.PUSH_RELAY_SECRET,
+    PUSH_RELAY_CLIENT_SECRET: process.env.PUSH_RELAY_CLIENT_SECRET,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
+    DB_POOL_MAX: process.env.DB_POOL_MAX,
+    DB_POOL_CONNECTION_TIMEOUT_MS: process.env.DB_POOL_CONNECTION_TIMEOUT_MS,
+    DB_POOL_IDLE_TIMEOUT_MS: process.env.DB_POOL_IDLE_TIMEOUT_MS,
+    DB_STATEMENT_TIMEOUT_MS: process.env.DB_STATEMENT_TIMEOUT_MS,
     NODE_ENV: process.env.NODE_ENV,
     ENVIRONMENT: process.env.ENVIRONMENT,
   };

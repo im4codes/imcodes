@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import type { BotConfig, InboundMessage, OutboundMessage, PlatformCapabilities, PlatformHandler } from '../../types.js';
 import { splitMessage } from '../../validator.js';
 
@@ -45,7 +46,9 @@ export class FeishuHandler implements PlatformHandler {
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
 
-    return computed === signature;
+    const a = Buffer.from(computed, 'utf8');
+    const b = Buffer.from(signature, 'utf8');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   async normalizeInbound(req: Request, config: BotConfig): Promise<InboundMessage> {

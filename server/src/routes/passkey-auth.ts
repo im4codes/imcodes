@@ -1,3 +1,4 @@
+import { resolveAuthOutcome } from '../security/authorization.js';
 import { Hono } from 'hono';
 import { setCookie } from 'hono/cookie';
 import type { Context } from 'hono';
@@ -8,10 +9,12 @@ import {
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
 import type { Env } from '../env.js';
-import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword } from '../security/crypto.js';
+import { createUser, getUserById, getUserByUsername, withTransaction } from '../db/queries.js';
+import { randomHex, sha256Hex, signJwt, hashPassword } from '../security/crypto.js';
+import { alignedSessionIssuedAt, evaluateUserAccess } from '../security/user-status.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
-import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
+import { DOC_RELAY_TICKET_ID_PREFIX, issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 
@@ -46,35 +49,9 @@ function getRpInfo(c: Context<HonoEnv>): { rpId: string; origin: string } {
 }
 
 async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> {
-  // Try rcc_session cookie first (browser)
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
-  const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
-  if (cookieToken && c.env.JWT_SIGNING_KEY) {
-    const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user) return user.id;
-    }
-  }
-
-  // Try Bearer token (native app API key / CLI)
-  const auth = c.req.header('Authorization');
-  if (auth?.startsWith('Bearer ')) {
-    const bearerToken = auth.slice(7);
-    const jwt = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user) return user.id;
-    }
-    const keyHash = sha256Hex(bearerToken);
-    const row = await c.env.DB.queryOne<{ user_id: string }>(
-      'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL', [keyHash],
-    );
-    if (row) return row.user_id;
-  }
-
-  return null;
+  // The ONE credential resolver (security/authorization.ts). It used to accept a login of a DISABLED user here (no status check at all).
+  const resolution = await resolveAuthOutcome(c);
+  return resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
 }
 
 function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToken: string): void {
@@ -84,12 +61,47 @@ function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToke
   setCookie(c, 'rcc_csrf', randomHex(32), { httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
 }
 
-async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: string): Promise<void> {
-  const now = Date.now();
-  await db.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [randomHex(16), userId, refreshHash, randomHex(16), now + 30 * 24 * 3600 * 1000, now],
+/**
+ * Validate and canonicalize native callback URLs to a hierarchical `imcodes://<host>...` URL.
+ */
+function validateNativeCallbackUrl(raw: string | undefined): string | null {
+  if (!raw || !raw.startsWith('imcodes://')) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'imcodes:' || !parsed.hostname || parsed.username || parsed.password) {
+    return null;
+  }
+  return parsed.toString();
+}
+
+function safeInlineJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function escapeRefreshAttrUrl(value: string): string {
+  return value
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '%3C')
+    .replace(/>/g, '%3E');
+}
+
+function setNativePageSecurityHeaders(c: Context<HonoEnv>, nonce: string): void {
+  c.header(
+    'Content-Security-Policy',
+    `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
   );
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
 }
 
 /**
@@ -98,10 +110,14 @@ async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: str
  * but may not follow HTTP 302 redirects to non-HTTP schemes.
  */
 function nativeRedirectPage(c: Context<HonoEnv>, url: string): Response {
+  const validated = validateNativeCallbackUrl(url);
+  if (!validated) return c.text('Invalid callback URL', 400);
+  const nonce = randomHex(16);
+  setNativePageSecurityHeaders(c, nonce);
   const html = `<!DOCTYPE html><html><head>
-<meta http-equiv="refresh" content="0;url=${url.replace(/"/g, '&quot;')}">
+<meta http-equiv="refresh" content="0;url=${escapeRefreshAttrUrl(validated)}">
 </head><body>
-<script>window.location.href=${JSON.stringify(url)};</script>
+<script nonce="${nonce}">window.location.href=${safeInlineJson(validated)};</script>
 </body></html>`;
   return c.html(html);
 }
@@ -139,6 +155,8 @@ interface StoredPasskeyCredential {
   transports: string | null;
 }
 
+const DOC_RELAY_TICKET_ID_LIKE = `${DOC_RELAY_TICKET_ID_PREFIX}%`;
+
 async function saveChallenge(
   db: Env['DB'],
   id: string,
@@ -151,24 +169,29 @@ async function saveChallenge(
     'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
     [id, challenge, userId, displayName, now + 5 * 60 * 1000, now],
   );
-  // Clean up expired challenges opportunistically
-  await db.execute('DELETE FROM passkey_challenges WHERE expires_at < $1', [now]);
+  // Clean up expired passkey challenges opportunistically without touching doc-relay-ticket rows (keyed by id prefix).
+  await db.execute(
+    'DELETE FROM passkey_challenges WHERE expires_at < $1 AND id NOT LIKE $2',
+    [now, DOC_RELAY_TICKET_ID_LIKE],
+  );
 }
 
 async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
-    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
-    [id, Date.now()],
+    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND id NOT LIKE $3',
+    [id, Date.now(), DOC_RELAY_TICKET_ID_LIKE],
   );
   if (!row) return null;
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
 }
 
 async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
-  const row = await getChallenge(db, id);
+  const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
+    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND id NOT LIKE $3 RETURNING challenge, user_id, display_name',
+    [id, Date.now(), DOC_RELAY_TICKET_ID_LIKE],
+  );
   if (!row) return null;
-  await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [id]);
-  return row;
+  return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
 }
 
 async function listUserCredentialIds(db: Env['DB'], userId: string): Promise<Array<{ id: string; type: 'public-key' }>> {
@@ -183,6 +206,15 @@ async function getStoredPasskeyCredential(db: Env['DB'], credentialId: string): 
     'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1',
     [credentialId],
   );
+}
+
+function toWebAuthnCredential(storedCred: StoredPasskeyCredential) {
+  return {
+    id: storedCred.id,
+    publicKey: Uint8Array.from(Buffer.from(storedCred.public_key, 'base64')),
+    counter: storedCred.counter,
+    transports: storedCred.transports ? JSON.parse(storedCred.transports) : undefined,
+  };
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -235,7 +267,7 @@ passkeyRoutes.post('/register/begin', async (c) => {
     const { getSetting } = await import('../db/queries.js');
     const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
     if (regEnabled === 'false') {
-      return c.json({ error: 'registration_disabled' }, 403);
+      return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
     }
   }
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -247,7 +279,7 @@ passkeyRoutes.post('/register/begin', async (c) => {
     existingUser = await getUserById(c.env.DB, existingUserId);
     if (!existingUser) return c.json({ error: 'user_not_found' }, 404);
     if (existingUser.status !== 'active') {
-      return c.json({ error: existingUser.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+      return c.json({ error: existingUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
     }
   }
 
@@ -295,7 +327,7 @@ passkeyRoutes.post('/verify/begin', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const allowCredentials = await listUserCredentialIds(c.env.DB, userId);
@@ -321,6 +353,12 @@ const registerCompleteSchema = z.object({
 });
 
 passkeyRoutes.post('/register/complete', async (c) => {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+
   const body = await parseBody(c);
   const parsed = registerCompleteSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -349,7 +387,7 @@ passkeyRoutes.post('/register/complete', async (c) => {
     return c.json({ error: 'verification_failed' }, 400);
   }
 
-  const { credentialID, credentialPublicKey, counter } = verification.registrationInfo;
+  const { id: credentialID, publicKey: credentialPublicKey, counter } = verification.registrationInfo.credential;
 
   const existing = await c.env.DB.queryOne<{ id: string }>(
     'SELECT id FROM passkey_credentials WHERE id = $1', [credentialID],
@@ -357,6 +395,7 @@ passkeyRoutes.post('/register/complete', async (c) => {
   if (existing) return c.json({ error: 'credential_already_registered' }, 409);
 
   let userId = pending.userId;
+  let isPending = false;
   if (!userId) {
     userId = randomHex(16);
     await createUser(c.env.DB, userId);
@@ -368,13 +407,14 @@ passkeyRoutes.post('/register/complete', async (c) => {
     const { getSetting, updateUserStatus } = await import('../db/queries.js');
     const requireApproval = await getSetting(c.env.DB, 'require_approval');
     if (requireApproval === 'true') {
+      isPending = true;
       await updateUserStatus(c.env.DB, userId, 'pending');
     }
   } else {
     const user = await getUserById(c.env.DB, userId);
     if (!user) return c.json({ error: 'user_not_found' }, 404);
     if (user.status !== 'active') {
-      return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+      return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
     }
   }
 
@@ -392,22 +432,46 @@ passkeyRoutes.post('/register/complete', async (c) => {
     details: { credentialId: credentialID },
   }, c.env.DB);
 
+  // Do not mint API keys or session cookies for pending accounts awaiting admin approval
+  if (isPending) {
+    return c.json({ ok: true, pending: true });
+  }
+
   // Native callback: issue API key + redirect (skip the second login round-trip)
-  const nativeCallback = c.req.query('native_callback');
-  if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+  if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, { keyLabel: 'mobile-app' });
   }
 
-  const accessToken = signJwt({ sub: userId }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshToken = randomHex(32);
-  await storeRefreshToken(c.env.DB, userId, sha256Hex(refreshToken));
-  setSessionCookies(c, accessToken, refreshToken);
+  const refreshHash = sha256Hex(refreshToken);
+  const sessionTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+      'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const decision = evaluateUserAccess(
+      lockedUser ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 } : null,
+    );
+    if (!decision.ok) return { ok: false as const, code: decision.code };
+    const txNow = Date.now();
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), userId, refreshHash, randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    const token = signJwt(
+      { sub: userId, iat: alignedSessionIssuedAt(Number(lockedUser!.sessions_valid_after ?? 0) || 0, txNow) },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    return { ok: true as const, token };
+  });
+  if (!sessionTx.ok) return c.json({ error: sessionTx.code }, 403);
+  setSessionCookies(c, sessionTx.token, refreshToken);
 
   return c.json({ ok: true, userId });
 });
 
-// ── POST /api/auth/passkey/login/begin ────────────────────────────────────
-passkeyRoutes.post('/login/begin', async (c) => {
+async function createPasskeyLoginChallenge(c: Context<HonoEnv>): Promise<Record<string, unknown> & { challengeId: string }> {
   const { rpId } = getRpInfo(c);
 
   const options = await generateAuthenticationOptions({
@@ -418,7 +482,12 @@ passkeyRoutes.post('/login/begin', async (c) => {
   const challengeId = randomHex(16);
   await saveChallenge(c.env.DB, challengeId, options.challenge, null, '');
 
-  return c.json({ ...options, challengeId });
+  return { ...options, challengeId };
+}
+
+// ── POST /api/auth/passkey/login/begin ────────────────────────────────────
+passkeyRoutes.post('/login/begin', async (c) => {
+  return c.json(await createPasskeyLoginChallenge(c));
 });
 
 // ── POST /api/auth/passkey/login/complete ─────────────────────────────────
@@ -428,6 +497,12 @@ const loginCompleteSchema = z.object({
 });
 
 passkeyRoutes.post('/login/complete', async (c) => {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+
   const body = await parseBody(c);
   const parsed = loginCompleteSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -451,12 +526,7 @@ passkeyRoutes.post('/login/complete', async (c) => {
       expectedChallenge: pending.challenge,
       expectedOrigin: origin,
       expectedRPID: rpId,
-      authenticator: {
-        credentialID: storedCred.id,
-        credentialPublicKey: Uint8Array.from(Buffer.from(storedCred.public_key, 'base64')),
-        counter: storedCred.counter,
-        transports: storedCred.transports ? JSON.parse(storedCred.transports) : undefined,
-      },
+      credential: toWebAuthnCredential(storedCred),
     });
   } catch (err) {
     logger.warn({ err, rpId, origin }, '[passkey] authentication verification failed');
@@ -472,14 +542,17 @@ passkeyRoutes.post('/login/complete', async (c) => {
 
   // Reject disabled/pending users
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const now = Date.now();
-  await c.env.DB.execute(
-    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
-    [verification.authenticationInfo.newCounter, now, storedCred.id],
+  const counterUpdate = await c.env.DB.execute(
+    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3 AND counter = $4',
+    [verification.authenticationInfo.newCounter, now, storedCred.id, storedCred.counter],
   );
+  if (counterUpdate.changes === 0) {
+    return c.json({ error: 'verification_failed' }, 409);
+  }
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAuthAudit(c, {
@@ -491,11 +564,10 @@ passkeyRoutes.post('/login/complete', async (c) => {
 
   const isNativeReq = c.req.query('native') === '1';
 
-  const nativeCallback = c.req.query('native_callback');
   if (isNativeReq || nativeCallback) {
     // Native app: return a persistent API key instead of setting session cookies.
     // The client stores this key in biometric-protected storage.
-    if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+    if (nativeCallback) {
       // If native_callback is provided, redirect via HTTP 302 so ASWebAuthenticationSession
       // detects the custom-scheme navigation (JS window.location.href is unreliable).
       return issueNativeAuthRedirect(c, user.id, nativeCallback, { keyLabel: 'mobile-app' });
@@ -516,10 +588,31 @@ passkeyRoutes.post('/login/complete', async (c) => {
     return c.json({ ok: true, userId: user.id, nonce, apiKey: rawKey, keyId });
   }
 
-  const accessToken = signJwt({ sub: user.id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshToken = randomHex(32);
-  await storeRefreshToken(c.env.DB, user.id, sha256Hex(refreshToken));
-  setSessionCookies(c, accessToken, refreshToken);
+  const refreshHash = sha256Hex(refreshToken);
+  const sessionTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ status: string; sessions_valid_after: string | number }>(
+      'SELECT status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [user.id],
+    );
+    const decision = evaluateUserAccess(
+      lockedUser ? { status: lockedUser.status, sessionsValidAfter: Number(lockedUser.sessions_valid_after ?? 0) || 0 } : null,
+    );
+    if (!decision.ok) return { ok: false as const, code: decision.code };
+    const txNow = Date.now();
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), user.id, refreshHash, randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    const token = signJwt(
+      { sub: user.id, iat: alignedSessionIssuedAt(Number(lockedUser!.sessions_valid_after ?? 0) || 0, txNow) },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    return { ok: true as const, token };
+  });
+  if (!sessionTx.ok) return c.json({ error: sessionTx.code }, 403);
+  setSessionCookies(c, sessionTx.token, refreshToken);
 
   return c.json({ ok: true });
 });
@@ -535,6 +628,12 @@ const passwordSetupSchema = z.object({
 passkeyRoutes.post('/password/setup', async (c) => {
   const userId = await resolveAuthedUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
 
   const body = await parseBody(c);
   const parsed = passwordSetupSchema.safeParse(body);
@@ -552,18 +651,18 @@ passkeyRoutes.post('/password/setup', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
   if (user.password_hash) return c.json({ error: 'password_already_set' }, 400);
 
   const normalizedUsername = username.trim().toLowerCase();
   if (!/^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$/.test(normalizedUsername)) {
-    return c.json({ error: 'invalid_username_format' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser && existingUser.id !== userId) {
-    return c.json({ error: 'username_taken' }, 409);
+    return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
 
   const pending = await getChallenge(c.env.DB, challengeId);
@@ -584,12 +683,7 @@ passkeyRoutes.post('/password/setup', async (c) => {
       expectedChallenge: pending.challenge,
       expectedOrigin: origin,
       expectedRPID: rpId,
-      authenticator: {
-        credentialID: storedCred.id,
-        credentialPublicKey: Uint8Array.from(Buffer.from(storedCred.public_key, 'base64')),
-        counter: storedCred.counter,
-        transports: storedCred.transports ? JSON.parse(storedCred.transports) : undefined,
-      },
+      credential: toWebAuthnCredential(storedCred),
     });
   } catch (err) {
     logger.warn({ err, rpId, origin }, '[passkey] password setup verification failed');
@@ -605,14 +699,15 @@ passkeyRoutes.post('/password/setup', async (c) => {
   try {
     await c.env.DB.transaction(async (tx) => {
       const deleted = await tx.execute(
-        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3',
-        [challengeId, Date.now(), userId],
+        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3 AND id NOT LIKE $4',
+        [challengeId, Date.now(), userId, DOC_RELAY_TICKET_ID_LIKE],
       );
       if (deleted.changes === 0) throw new Error('challenge_expired');
-      await tx.execute(
-        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
-        [verification.authenticationInfo.newCounter, now, storedCred.id],
+      const counterUpdate = await tx.execute(
+        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3 AND counter = $4',
+        [verification.authenticationInfo.newCounter, now, storedCred.id, storedCred.counter],
       );
+      if (counterUpdate.changes === 0) throw new Error('verification_failed');
       await tx.execute(
         'UPDATE users SET username = $1, password_hash = $2, password_must_change = false WHERE id = $3',
         [normalizedUsername, newHash, userId],
@@ -622,8 +717,11 @@ passkeyRoutes.post('/password/setup', async (c) => {
     if (err instanceof Error && err.message === 'challenge_expired') {
       return c.json({ error: 'challenge_expired' }, 400);
     }
+    if (err instanceof Error && err.message === 'verification_failed') {
+      return c.json({ error: 'verification_failed' }, 409);
+    }
     if (isUniqueViolation(err)) {
-      return c.json({ error: 'username_taken' }, 409);
+      return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
     }
     throw err;
   }
@@ -636,8 +734,7 @@ passkeyRoutes.post('/password/setup', async (c) => {
     details: { credentialId: storedCred.id },
   }, c.env.DB);
 
-  const nativeCallback = c.req.query('native_callback');
-  if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+  if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, {
       keyLabel: 'mobile-password-setup',
       includeLegacyParams: false,
@@ -668,7 +765,7 @@ passkeyRoutes.get('/credentials', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const rows = await c.env.DB.query<{ id: string; device_name: string | null; created_at: number; last_used_at: number | null }>(
@@ -690,78 +787,186 @@ passkeyRoutes.get('/credentials', async (c) => {
 // Lightweight self-contained HTML page for native iOS passkey auth.
 // Replaces loading the full SPA bundle in ASWebAuthenticationSession.
 passkeyRoutes.get('/native', async (c) => {
-  const callback = c.req.query('callback');
+  const validatedCallback = validateNativeCallbackUrl(c.req.query('callback'));
   const action = c.req.query('action') === 'register' ? 'register' : 'login';
 
-  if (!callback || !callback.startsWith('imcodes://')) {
+  if (!validatedCallback) {
     return c.text('Invalid callback URL', 400);
   }
+
+  let initialOptions: (Record<string, unknown> & { challengeId: string }) | null = null;
+  if (action === 'login') {
+    try {
+      initialOptions = await createPasskeyLoginChallenge(c);
+    } catch (err) {
+      logger.warn({ err }, '[passkey] native login pre-challenge failed');
+    }
+  }
+
+  const nonce = randomHex(16);
+  setNativePageSecurityHeaders(c, nonce);
 
   const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IM.codes Auth</title>
-<style>
+<style nonce="${nonce}">
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111;color:#e0e0e0;font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.c{text-align:center;max-width:320px}
-.s{font-size:16px;margin-top:12px;color:#aaa}
-.e{color:#f44;margin-top:12px;font-size:14px;word-break:break-word}
-.r{margin-top:16px;padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer;display:none}
+.c{text-align:center;max-width:340px;width:100%}
+.s{font-size:16px;margin-top:12px;color:#e0e0e0;font-weight:500}
+.g{margin-top:10px;font-size:13px;line-height:1.5;color:#9ca3af;display:none}
+.e{color:#f87171;margin-top:12px;font-size:14px;word-break:break-word}
+.r{margin-top:18px;padding:12px 24px;width:100%;background:#2563eb;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;display:none}
+.r:disabled{opacity:0.6;cursor:default}
 .spinner{width:32px;height:32px;border:3px solid #333;border-top-color:#2563eb;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body>
 <div class="c">
 <div class="spinner" id="sp"></div>
 <div class="s" id="st">Authenticating\u2026</div>
+<div class="g" id="gd"></div>
 <div class="e" id="er"></div>
-<button class="r" id="rt" onclick="run()">Retry</button>
+<button class="r" id="rt" type="button">Continue with Passkey</button>
 </div>
-<script>
-var CB=${JSON.stringify(callback)};
-var ACTION=${JSON.stringify(action)};
+<script nonce="${nonce}">
+var CB=${safeInlineJson(validatedCallback)};
+var ACTION=${safeInlineJson(action)};
+var INITIAL_OPTS=${safeInlineJson(initialOptions)};
+var IS_ZH=/^zh/i.test(navigator.language||'');
+var TXT=IS_ZH?{
+auth:'正在调起通行密钥\\u2026',
+verify:'正在验证\\u2026',
+failed:'认证失败',
+ctaLogin:'使用通行密钥登录',
+ctaRegister:'创建通行密钥',
+tapHint:'请轻触下方按钮以调起系统通行密钥弹窗',
+tapBlockedTitle:'未能打开通行密钥弹窗',
+tapBlockedGuide:'若未弹出 Face ID / 通行密钥窗口，请检查 iPhone「设置 → Apple ID → iCloud → 密码与钥匙串」及「设置 → 通用 → 自动填充与密码」是否已开启，或返回使用密码 / 其他方式登录。',
+retry:'重试通行密钥'
+}:{
+auth:'Opening passkey\\u2026',
+verify:'Verifying\\u2026',
+failed:'Authentication failed',
+ctaLogin:'Continue with Passkey',
+ctaRegister:'Create Passkey',
+tapHint:'Tap below to open the system Passkey prompt',
+tapBlockedTitle:'Unable to open Passkey prompt',
+tapBlockedGuide:'If the Passkey prompt did not appear, check iPhone Settings → Apple ID → iCloud → Passwords & Keychain and Settings → General → AutoFill & Passwords, or go back and sign in with password/OAuth.',
+retry:'Retry Passkey'
+};
 function gc(n){var m=document.cookie.match(new RegExp('(?:^|;\\\\s*)'+n+'=([^;]+)'));return m?decodeURIComponent(m[1]):'';}
 function $(i){return document.getElementById(i);}
-function err(m){$('sp').style.display='none';$('er').textContent=m;$('rt').style.display='inline-block';$('st').textContent='Authentication failed';}
-async function run(){
-$('sp').style.display='block';$('er').textContent='';$('rt').style.display='none';$('st').textContent='Authenticating\\u2026';
-try{
+function prepareOptions(raw){
+if(!raw||!raw.challengeId)return null;
+var pk=Object.assign({},raw);
+var cid=pk.challengeId;
+delete pk.challengeId;
+if(ACTION==='register'){
+pk.user=Object.assign({},pk.user,{id:base64ToBuffer(pk.user.id)});
+pk.challenge=base64ToBuffer(pk.challenge);
+if(pk.excludeCredentials)pk.excludeCredentials=pk.excludeCredentials.map(function(c){return Object.assign({},c,{id:base64ToBuffer(c.id)});});
+}else{
+pk.challenge=base64ToBuffer(pk.challenge);
+if(pk.allowCredentials)pk.allowCredentials=pk.allowCredentials.map(function(c){return Object.assign({},c,{id:base64ToBuffer(c.id)});});
+}
+return {challengeId:cid,publicKey:pk,createdAt:Date.now()};
+}
+var prepared=prepareOptions(INITIAL_OPTS);
+var prefetchInFlight=null;
+var inFlight=false;
+async function fetchBeginOptions(){
 var csrf=gc('rcc_csrf');
 var h={'Content-Type':'application/json'};
 if(csrf)h['X-CSRF-Token']=csrf;
 var beginUrl=ACTION==='register'?'/api/auth/passkey/register/begin':'/api/auth/passkey/login/begin';
 var r=await fetch(beginUrl,{method:'POST',headers:h,credentials:'include',body:ACTION==='register'?'{"displayName":"Mobile User"}':'{}'});
-if(!r.ok){err('Server error: '+r.status);return;}
-var opts=await r.json();
-var cid=opts.challengeId;delete opts.challengeId;
-var cred;
-if(ACTION==='register'){
-opts.user.id=base64ToBuffer(opts.user.id);
-opts.challenge=base64ToBuffer(opts.challenge);
-if(opts.excludeCredentials)opts.excludeCredentials.forEach(function(c){c.id=base64ToBuffer(c.id);});
-cred=await navigator.credentials.create({publicKey:opts});
-}else{
-opts.challenge=base64ToBuffer(opts.challenge);
-if(opts.allowCredentials)opts.allowCredentials.forEach(function(c){c.id=base64ToBuffer(c.id);});
-cred=await navigator.credentials.get({publicKey:opts});
+if(!r.ok){
+var b=await r.json().catch(function(){return null;});
+throw new Error((b&&b.error)?String(b.error):('Server error: '+r.status));
 }
+return prepareOptions(await r.json());
+}
+function prefetchNext(){
+if(prepared||prefetchInFlight)return prefetchInFlight;
+prefetchInFlight=fetchBeginOptions().then(function(p){prepared=p;return p;}).catch(function(){return null;}).finally(function(){
+prefetchInFlight=null;
+var btn=$('rt');
+if(btn&&btn.disabled){btn.disabled=false;btn.textContent=btn.dataset.readyLabel||TXT.retry;}
+});
+return prefetchInFlight;
+}
+function showButton(label,status,guide){
+$('sp').style.display='none';
+$('st').textContent=status;
+if(guide){$('gd').textContent=guide;$('gd').style.display='block';}else{$('gd').textContent='';$('gd').style.display='none';}
+$('er').textContent='';
+var btn=$('rt');
+btn.dataset.readyLabel=label;
+if(prefetchInFlight&&!prepared){
+btn.disabled=true;
+btn.textContent=TXT.auth;
+}else{
+btn.disabled=false;
+btn.textContent=label;
+}
+btn.style.display='inline-block';
+}
+function err(m){$('sp').style.display='none';$('gd').style.display='none';$('er').textContent=m;var btn=$('rt');btn.disabled=false;btn.textContent=TXT.retry;btn.style.display='inline-block';$('st').textContent=TXT.failed;}
+async function run(source){
+if(inFlight)return;
+inFlight=true;
+var webAuthnStartedAt=0;
+var current=null;
+$('sp').style.display='block';$('er').textContent='';$('gd').style.display='none';$('rt').style.display='none';$('st').textContent=TXT.auth;
+try{
+if(prepared&&(Date.now()-prepared.createdAt)<240000){
+current=prepared;
+prepared=null;
+}else{
+prepared=null;
+current=prefetchInFlight?(await prefetchInFlight):(await fetchBeginOptions());
+}
+if(!current)throw new Error('Failed to load passkey options');
+webAuthnStartedAt=Date.now();
+var cred=ACTION==='register'
+?await navigator.credentials.create({publicKey:current.publicKey})
+:await navigator.credentials.get({publicKey:current.publicKey});
+if(!cred)throw new Error('NotAllowedError');
 var cbEnc=encodeURIComponent(CB);
 var completeUrl=(ACTION==='register'?'/api/auth/passkey/register/complete':'/api/auth/passkey/login/complete')+'?native=1&native_callback='+cbEnc;
-var payload=JSON.stringify({challengeId:cid,response:credToJSON(cred)});
-$('st').textContent='Verifying\\u2026';
+var payload=JSON.stringify({challengeId:current.challengeId,response:credToJSON(cred)});
+$('st').textContent=TXT.verify;
 var f=document.createElement('form');f.method='POST';f.action=completeUrl;
 var inp=document.createElement('input');inp.type='hidden';inp.name='json';inp.value=payload;
 f.appendChild(inp);document.body.appendChild(f);f.submit();
 }catch(e){
-var m=e.message||String(e);
-if(m.includes('NotAllowedError')||m.toLowerCase().includes('cancel')){$('sp').style.display='none';$('st').textContent='Cancelled';$('rt').style.display='inline-block';}
-else err(m);
+var name=(e&&e.name)?String(e.name):'';
+var m=(e&&e.message)?String(e.message):String(e);
+var isNotAllowed=name==='NotAllowedError'||m.indexOf('NotAllowedError')!==-1||m.toLowerCase().indexOf('cancel')!==-1;
+if(source==='auto'&&isNotAllowed){
+if(current&&webAuthnStartedAt>0&&(Date.now()-webAuthnStartedAt)<500){
+prepared=current;
+}else if(current){
+prefetchNext();
+}
+showButton(ACTION==='register'?TXT.ctaRegister:TXT.ctaLogin,TXT.tapHint,'');
+}else if(isNotAllowed){
+if(current)prefetchNext();
+showButton(TXT.retry,TXT.tapBlockedTitle,TXT.tapBlockedGuide);
+}else{
+if(current)prefetchNext();
+err(m);
+}
+}finally{
+inFlight=false;
 }}
 function base64ToBuffer(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;}
 function bufferToBase64(b){var a=new Uint8Array(b),s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
 function credToJSON(c){
 if(ACTION==='register')return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{attestationObject:bufferToBase64(c.response.attestationObject),clientDataJSON:bufferToBase64(c.response.clientDataJSON)},clientExtensionResults:c.getClientExtensionResults()};
 return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{authenticatorData:bufferToBase64(c.response.authenticatorData),clientDataJSON:bufferToBase64(c.response.clientDataJSON),signature:bufferToBase64(c.response.signature),userHandle:c.response.userHandle?bufferToBase64(c.response.userHandle):null},clientExtensionResults:c.getClientExtensionResults()};}
-run();
+$('rt').addEventListener('click',function(){run('tap');});
+run('auto');
 </script></body></html>`;
 
   return c.html(html);
@@ -774,7 +979,7 @@ passkeyRoutes.delete('/credentials/:credId', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const credId = c.req.param('credId');

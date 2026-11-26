@@ -49,6 +49,8 @@ export interface MobileDpadProps {
   disabled?: boolean;
   title?: string;
   ariaLabel?: string;
+  /** Optional extra CSS classes appended after `shortcut-btn shortcut-dpad`. */
+  className?: string;
 }
 
 /**
@@ -58,12 +60,16 @@ export interface MobileDpadProps {
  * (useful for scrolling lists in ncdu/less/etc.); dragging back through the
  * center re-arms so a wiggle fires again. Desktop keeps the discrete buttons.
  */
-export function MobileDpad({ onDirection, disabled, title, ariaLabel }: MobileDpadProps) {
+export function MobileDpad({ onDirection, disabled, title, ariaLabel, className }: MobileDpadProps) {
   const [activeDir, setActiveDir] = useState<DpadDirection | null>(null);
   const originRef = useRef<{ x: number; y: number } | null>(null);
   const pointerRef = useRef<number | null>(null);
   const dirRef = useRef<DpadDirection | null>(null);
   const repeatRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onDirectionRef = useRef(onDirection);
+  onDirectionRef.current = onDirection;
+  const disabledRef = useRef(Boolean(disabled));
+  disabledRef.current = Boolean(disabled);
 
   const clearRepeat = useCallback(() => {
     if (repeatRef.current) {
@@ -72,31 +78,38 @@ export function MobileDpad({ onDirection, disabled, title, ariaLabel }: MobileDp
     }
   }, []);
 
-  const scheduleRepeat = useCallback((delay: number) => {
-    clearRepeat();
-    repeatRef.current = setTimeout(() => {
-      const dir = dirRef.current;
-      if (!dir) return;
-      onDirection(DPAD_ARROW_SEQUENCES[dir]);
-      scheduleRepeat(REPEAT_INTERVAL_MS);
-    }, delay);
-  }, [clearRepeat, onDirection]);
-
-  const fireDirection = useCallback((dir: DpadDirection) => {
-    dirRef.current = dir;
-    setActiveDir(dir);
-    onDirection(DPAD_ARROW_SEQUENCES[dir]);
-    scheduleRepeat(REPEAT_DELAY_MS);
-  }, [onDirection, scheduleRepeat]);
-
   const recenter = useCallback(() => {
     clearRepeat();
     dirRef.current = null;
     setActiveDir(null);
   }, [clearRepeat]);
 
+  const scheduleRepeat = useCallback((delay: number) => {
+    clearRepeat();
+    repeatRef.current = setTimeout(() => {
+      if (disabledRef.current) {
+        pointerRef.current = null;
+        originRef.current = null;
+        recenter();
+        return;
+      }
+      const dir = dirRef.current;
+      if (!dir) return;
+      onDirectionRef.current(DPAD_ARROW_SEQUENCES[dir]);
+      scheduleRepeat(REPEAT_INTERVAL_MS);
+    }, delay);
+  }, [clearRepeat, recenter]);
+
+  const fireDirection = useCallback((dir: DpadDirection) => {
+    if (disabledRef.current) return;
+    dirRef.current = dir;
+    setActiveDir(dir);
+    onDirectionRef.current(DPAD_ARROW_SEQUENCES[dir]);
+    scheduleRepeat(REPEAT_DELAY_MS);
+  }, [scheduleRepeat]);
+
   const handlePointerDown = useCallback((e: PointerEvent) => {
-    if (disabled) return;
+    if (disabledRef.current) return;
     if (pointerRef.current !== null) return;
     pointerRef.current = e.pointerId;
     originRef.current = { x: e.clientX, y: e.clientY };
@@ -108,10 +121,16 @@ export function MobileDpad({ onDirection, disabled, title, ariaLabel }: MobileDp
       /* setPointerCapture unsupported (or jsdom) — drag still tracked via move events */
     }
     e.preventDefault();
-  }, [disabled]);
+  }, []);
 
   const handlePointerMove = useCallback((e: PointerEvent) => {
     if (pointerRef.current !== e.pointerId) return;
+    if (disabledRef.current) {
+      pointerRef.current = null;
+      originRef.current = null;
+      recenter();
+      return;
+    }
     const origin = originRef.current;
     if (!origin) return;
     const dir = resolveDpadDirection(e.clientX - origin.x, e.clientY - origin.y);
@@ -132,13 +151,20 @@ export function MobileDpad({ onDirection, disabled, title, ariaLabel }: MobileDp
     recenter();
   }, [recenter]);
 
+  useEffect(() => {
+    if (!disabled) return;
+    pointerRef.current = null;
+    originRef.current = null;
+    recenter();
+  }, [disabled, recenter]);
+
   // Stop the auto-repeat timer if the pad unmounts mid-drag (e.g. layout
   // switch to desktop, or session change) so it can't fire after teardown.
   useEffect(() => clearRepeat, [clearRepeat]);
 
   return (
     <div
-      class={`shortcut-btn shortcut-dpad${activeDir ? ` shortcut-dpad-active dpad-dir-${activeDir}` : ''}`}
+      class={`shortcut-btn shortcut-dpad${activeDir ? ` shortcut-dpad-active dpad-dir-${activeDir}` : ''}${className ? ` ${className}` : ''}`}
       role="button"
       aria-label={ariaLabel ?? title}
       title={title}

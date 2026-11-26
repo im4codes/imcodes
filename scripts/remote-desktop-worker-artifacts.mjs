@@ -1,0 +1,679 @@
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { lstat, open, readFile, readdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import macosIdentity from '../shared/remote-desktop-macos-identity.json' with { type: 'json' };
+import nativePins from '../shared/remote-desktop-native-pins.json' with { type: 'json' };
+
+export const REMOTE_DESKTOP_WORKER_FILENAME = 'imcodes-remote-desktop-worker.exe';
+export const REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX = '.manifest.json';
+// Bumped 3 -> 4 when the virtual-display helper became a shipped component.
+// A manifest that omits it is not merely older, it describes a component set
+// that cannot provide display control, so old and new must not be
+// interchangeable across self-upgrade.
+export const REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION = 4;
+export const REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND = 'macos-component-set';
+export const REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME = 'imcodes-remote-desktop.manifest.json';
+// Mirrored from shared/remote-desktop.ts and shared/remote-desktop-worker.ts,
+// which are TypeScript and therefore unreachable from a plain `node scripts/…`
+// invocation. `test/node/remote-desktop-worker-artifacts.test.ts` asserts each
+// of these equals its shared original, the same way the team ID already is.
+export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2;
+export const REMOTE_DESKTOP_WORKER_IPC_VERSION = 1;
+export const REMOTE_DESKTOP_MACOS_WORKER_FILENAME = 'imcodes-remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_WORKER_FILENAME = 'imcodes-linux-remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION = '2.31';
+export const REMOTE_DESKTOP_WORKER_SIDECAR_DIR = 'remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR = 'linux-x64';
+export const REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME = 'imcodes-remote-desktop-launch-agent';
+export const REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME = 'imcodes-remote-desktop-disclosure';
+export const REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME = 'imcodes-virtual-display-helper';
+export const REMOTE_DESKTOP_MACOS_ARCHITECTURES = Object.freeze(['arm64', 'x64']);
+export const REMOTE_DESKTOP_MACOS_COMPONENT_LIMITS = Object.freeze({
+  worker: 512 * 1024 * 1024,
+  launchAgent: 128 * 1024 * 1024,
+  disclosure: 128 * 1024 * 1024,
+  virtualDisplayHelper: 128 * 1024 * 1024,
+});
+const REMOTE_DESKTOP_MACOS_COMPONENT_FILES = Object.freeze({
+  worker: REMOTE_DESKTOP_MACOS_WORKER_FILENAME,
+  launchAgent: REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
+  disclosure: REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
+  virtualDisplayHelper: REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
+});
+export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME = 'imcodes-virtual-display.zip';
+export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME = 'imcodes-virtual-display.manifest.json';
+const GIT_REVISION_RE = /^[a-f0-9]{40}$/;
+if (!GIT_REVISION_RE.test(nativePins.libwebrtcRevision)
+  || !GIT_REVISION_RE.test(nativePins.depotToolsRevision)) {
+  throw new Error('invalid remote desktop native revision pins');
+}
+export const PINNED_LIBWEBRTC_REVISION = nativePins.libwebrtcRevision;
+export const PINNED_DEPOT_TOOLS_REVISION = nativePins.depotToolsRevision;
+
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const MACOS_VERSION_RE = /^(?:1[0-9]|[2-9][0-9])\.[0-9]{1,2}(?:\.[0-9]{1,2})?$/;
+const APPLE_TEAM_ID_RE = /^[A-Z0-9]{10}$/;
+const APPLE_BUNDLE_ID_RE = /^(?=.{3,255}$)(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*$/;
+const NOTARIZATION_SUBMISSION_ID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const WINDOWS_TARGET = Object.freeze({ os: 'win32', arch: 'x64' });
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function exactKeys(value, keys) {
+  const expected = new Set(keys);
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && Object.keys(value).every((key) => expected.has(key));
+}
+
+if (!isRecord(macosIdentity)
+  || !exactKeys(macosIdentity, ['teamId'])
+  || typeof macosIdentity.teamId !== 'string'
+  || !APPLE_TEAM_ID_RE.test(macosIdentity.teamId)) {
+  throw new Error('invalid remote desktop macos identity');
+}
+export const REMOTE_DESKTOP_MACOS_TEAM_ID = macosIdentity.teamId;
+
+function validPositiveSize(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * A value as the code-requirement language writes it.
+ *
+ * A fourth copy of a rule that also lives in shared/macos-code-requirement.ts,
+ * src/node/macos-apple-trust.mjs and macos_code_requirement.h. It is copied
+ * rather than imported because `shared/` is copied into the Docker image on
+ * its own and must not depend on `src/`, and this file must load as plain
+ * .mjs on a build machine with no TypeScript. Exported so
+ * test/node/macos-code-requirement-agreement.test.ts can hold all four to the
+ * same table of cases.
+ */
+export function remoteDesktopCodeRequirementLiteral(value) {
+  return /^[A-Za-z][A-Za-z0-9]*$/u.test(value) ? value : `"${value}"`;
+}
+
+const codeRequirementLiteral = remoteDesktopCodeRequirementLiteral;
+
+function validAppleDesignatedRequirement(value, bundleIdentifier, teamId) {
+  // Exactly what codesign emits for a Developer ID Application certificate:
+  // the two marker extensions sit between the anchor and the team clause.
+  return value === `identifier ${codeRequirementLiteral(bundleIdentifier)} and anchor apple generic`
+    + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
+    + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
+    + ` and certificate leaf[subject.OU] = ${codeRequirementLiteral(teamId)}`;
+}
+
+function validMacosCodeSignature(value) {
+  if (!isRecord(value)
+    || !exactKeys(value, ['teamId', 'bundles'])
+    || value.teamId !== REMOTE_DESKTOP_MACOS_TEAM_ID
+    || !isRecord(value.bundles)
+    || !exactKeys(value.bundles, ['worker', 'launchAgent', 'disclosure', 'virtualDisplayHelper'])) return false;
+  const bundleIdentifiers = new Set();
+  for (const kind of ['worker', 'launchAgent', 'disclosure', 'virtualDisplayHelper']) {
+    const bundle = value.bundles[kind];
+    if (!isRecord(bundle)
+      || !exactKeys(bundle, ['bundleIdentifier', 'designatedRequirement', 'hardenedRuntime'])
+      || typeof bundle.bundleIdentifier !== 'string'
+      || !APPLE_BUNDLE_ID_RE.test(bundle.bundleIdentifier)
+      || bundleIdentifiers.has(bundle.bundleIdentifier)
+      || bundle.hardenedRuntime !== true
+      || !validAppleDesignatedRequirement(
+        bundle.designatedRequirement,
+        bundle.bundleIdentifier,
+        REMOTE_DESKTOP_MACOS_TEAM_ID,
+      )) return false;
+    bundleIdentifiers.add(bundle.bundleIdentifier);
+  }
+  return true;
+}
+
+function validMacosComponent(value, kind) {
+  return isRecord(value)
+    && exactKeys(value, ['fileName', 'size', 'sha256', 'notarization'])
+    && value.fileName === REMOTE_DESKTOP_MACOS_COMPONENT_FILES[kind]
+    && validPositiveSize(value.size)
+    && value.size <= REMOTE_DESKTOP_MACOS_COMPONENT_LIMITS[kind]
+    && typeof value.sha256 === 'string'
+    && SHA256_RE.test(value.sha256)
+    && validMacosNotarization(value.notarization);
+}
+
+/**
+ * Accepts a stapled ticket, or an explicit statement that this artifact format
+ * cannot carry one.
+ *
+ * The second shape must carry its reason and must pair `false` with `false`.
+ * An evidence record that merely omitted the staple claim, or paired a missing
+ * staple with a validated one, is the downgrade this refuses.
+ */
+function validMacosNotarization(value) {
+  if (!isRecord(value)
+    || value.status !== 'accepted'
+    || typeof value.submissionId !== 'string'
+    || !NOTARIZATION_SUBMISSION_ID_RE.test(value.submissionId)
+    || typeof value.ticketSha256 !== 'string'
+    || !SHA256_RE.test(value.ticketSha256)) {
+    return false;
+  }
+  if (value.stapled === true) {
+    return exactKeys(value, ['status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated'])
+      && value.stapleValidated === true;
+  }
+  return exactKeys(value, [
+    'status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated', 'unstapledReason',
+  ])
+    && value.stapled === false
+    && value.stapleValidated === false
+    && value.unstapledReason === 'artifact_format_cannot_carry_a_ticket';
+}
+
+function validArtifactTarget(value) {
+  return isRecord(value)
+    && exactKeys(value, ['os', 'arch'])
+    && ((value.os === 'win32' && value.arch === 'x64')
+      || (value.os === 'darwin' && REMOTE_DESKTOP_MACOS_ARCHITECTURES.includes(value.arch)));
+}
+
+async function sha256File(path) {
+  const hash = createHash('sha256');
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(path);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', resolve);
+  });
+  return hash.digest('hex');
+}
+
+function validateWindowsRemoteDesktopWorkerReleaseManifest(value, expectedVersion) {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      'manifestVersion', 'workerVersion', 'protocolVersion', 'ipcVersion', 'os', 'arch',
+      'fileName', 'size', 'sha256', 'authenticodeSignerSha256', 'libwebrtcRevision',
+      'virtualDisplay', 'toolchain',
+    ])
+    || value.manifestVersion !== 2
+    || typeof value.workerVersion !== 'string' || !VERSION_RE.test(value.workerVersion)
+    || (expectedVersion !== undefined && value.workerVersion !== expectedVersion)
+    || value.protocolVersion !== 2
+    || value.ipcVersion !== 1
+    || value.os !== 'win32'
+    || value.arch !== 'x64'
+    || value.fileName !== REMOTE_DESKTOP_WORKER_FILENAME
+    || !validPositiveSize(value.size)
+    || typeof value.sha256 !== 'string' || !SHA256_RE.test(value.sha256)
+    || typeof value.authenticodeSignerSha256 !== 'string'
+    || !SHA256_RE.test(value.authenticodeSignerSha256)
+    || value.libwebrtcRevision !== PINNED_LIBWEBRTC_REVISION
+    || !isRecord(value.virtualDisplay)
+    || !exactKeys(value.virtualDisplay, [
+      'archiveFileName', 'packageManifestFileName', 'size', 'sha256',
+    ])
+    || value.virtualDisplay.archiveFileName !== REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME
+    || value.virtualDisplay.packageManifestFileName !== REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME
+    || typeof value.virtualDisplay.size !== 'number'
+    || !Number.isSafeInteger(value.virtualDisplay.size) || value.virtualDisplay.size <= 0
+    || typeof value.virtualDisplay.sha256 !== 'string'
+    || !SHA256_RE.test(value.virtualDisplay.sha256)
+    || !isRecord(value.toolchain)
+    || !exactKeys(value.toolchain, ['msvc', 'windowsSdk', 'cmake', 'ninja', 'depotTools'])
+    || !Object.values(value.toolchain).every((entry) => typeof entry === 'string' && VERSION_RE.test(entry))
+    || value.toolchain.depotTools !== PINNED_DEPOT_TOOLS_REVISION) {
+    return null;
+  }
+  return value;
+}
+
+function validateMacosRemoteDesktopWorkerReleaseManifest(value, expectedVersion) {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      'manifestVersion', 'artifactKind', 'workerVersion', 'protocolVersion', 'ipcVersion',
+      'os', 'arch', 'components', 'libwebrtcRevision', 'minimumOsVersion',
+      'codeSignature', 'toolchain',
+    ])
+    || value.manifestVersion !== REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION
+    || value.artifactKind !== REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND
+    || typeof value.workerVersion !== 'string' || !VERSION_RE.test(value.workerVersion)
+    || (expectedVersion !== undefined && value.workerVersion !== expectedVersion)
+    || value.protocolVersion !== 2
+    || value.ipcVersion !== 1
+    || value.os !== 'darwin'
+    || !REMOTE_DESKTOP_MACOS_ARCHITECTURES.includes(value.arch)
+    || !isRecord(value.components)
+    || !exactKeys(value.components, ['worker', 'launchAgent', 'disclosure', 'virtualDisplayHelper'])
+    || !['worker', 'launchAgent', 'disclosure', 'virtualDisplayHelper'].every(
+      (kind) => validMacosComponent(value.components[kind], kind),
+    )
+    || value.libwebrtcRevision !== PINNED_LIBWEBRTC_REVISION
+    || typeof value.minimumOsVersion !== 'string' || !MACOS_VERSION_RE.test(value.minimumOsVersion)
+    || !validMacosCodeSignature(value.codeSignature)
+    || !isRecord(value.toolchain)
+    || !exactKeys(value.toolchain, ['xcode', 'macosSdk', 'clang'])
+    || !Object.values(value.toolchain).every(
+      (entry) => typeof entry === 'string' && VERSION_RE.test(entry),
+    )) return null;
+  return value;
+}
+
+export function validateRemoteDesktopWorkerReleaseManifest(
+  value,
+  expectedVersion,
+  expectedTarget = WINDOWS_TARGET,
+) {
+  if (!validArtifactTarget(expectedTarget)) {
+    throw new Error('invalid remote desktop worker artifact target');
+  }
+  const manifest = expectedTarget.os === 'win32'
+    ? validateWindowsRemoteDesktopWorkerReleaseManifest(value, expectedVersion)
+    : validateMacosRemoteDesktopWorkerReleaseManifest(value, expectedVersion);
+  if (!manifest || manifest.os !== expectedTarget.os || manifest.arch !== expectedTarget.arch) {
+    throw new Error('invalid remote desktop worker manifest');
+  }
+  return manifest;
+}
+
+export async function verifyRemoteDesktopWorkerArtifactSet(
+  directory,
+  expectedVersion,
+  expectedTarget = WINDOWS_TARGET,
+) {
+  if (!validArtifactTarget(expectedTarget)) {
+    throw new Error('invalid remote desktop worker artifact target');
+  }
+  const isWindows = expectedTarget.os === 'win32';
+  const platformDirectory = join(
+    directory,
+    'remote-desktop-worker',
+    `${expectedTarget.os}-${expectedTarget.arch}`,
+  );
+  const executablePath = isWindows
+    ? join(platformDirectory, REMOTE_DESKTOP_WORKER_FILENAME)
+    : undefined;
+  const manifestPath = isWindows
+    ? `${executablePath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+    : join(platformDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME);
+  const archivePath = isWindows
+    ? join(platformDirectory, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME)
+    : undefined;
+  const expectedEntries = new Set([
+    ...(isWindows
+      ? [
+        REMOTE_DESKTOP_WORKER_FILENAME,
+        `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+        REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+      ]
+      : [REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME, ...Object.values(REMOTE_DESKTOP_MACOS_COMPONENT_FILES)]),
+  ]);
+  const entries = await readdir(platformDirectory, { withFileTypes: true });
+  if (entries.length !== expectedEntries.size
+    || entries.some((entry) => !entry.isFile() || !expectedEntries.has(entry.name))) {
+    throw new Error('remote desktop worker artifact set contains unexpected entries');
+  }
+  const componentPaths = isWindows ? undefined : Object.fromEntries(
+    Object.entries(REMOTE_DESKTOP_MACOS_COMPONENT_FILES).map(([kind, fileName]) => [
+      kind,
+      join(platformDirectory, fileName),
+    ]),
+  );
+  const [executableStat, manifestStat, archiveStat, componentStats] = await Promise.all([
+    executablePath === undefined ? Promise.resolve(undefined) : lstat(executablePath),
+    lstat(manifestPath),
+    archivePath === undefined ? Promise.resolve(undefined) : lstat(archivePath),
+    componentPaths === undefined
+      ? Promise.resolve(undefined)
+      : Promise.all(Object.values(componentPaths).map((path) => lstat(path))),
+  ]);
+  if ((executableStat !== undefined && (!executableStat.isFile() || executableStat.isSymbolicLink()))
+    || !manifestStat.isFile() || manifestStat.isSymbolicLink()
+    || (archiveStat !== undefined && (!archiveStat.isFile() || archiveStat.isSymbolicLink()))
+    || componentStats?.some((stat) => !stat.isFile() || stat.isSymbolicLink())) {
+    throw new Error('remote desktop worker artifact set contains a non-regular file');
+  }
+  const manifest = validateRemoteDesktopWorkerReleaseManifest(
+    JSON.parse(await readFile(manifestPath, 'utf8')),
+    expectedVersion,
+    expectedTarget,
+  );
+  if (isWindows && executableStat !== undefined && manifest.size !== executableStat.size) {
+    throw new Error(`remote desktop worker size mismatch: expected ${manifest.size}, got ${executableStat.size}`);
+  }
+  if (isWindows && archiveStat !== undefined
+    && manifest.virtualDisplay.size !== archiveStat.size) {
+    throw new Error(`virtual display archive size mismatch: expected ${manifest.virtualDisplay.size}, got ${archiveStat.size}`);
+  }
+  if (isWindows && executablePath !== undefined) {
+    const actualSha256 = await sha256File(executablePath);
+    if (actualSha256 !== manifest.sha256) {
+      throw new Error(`remote desktop worker sha256 mismatch: expected ${manifest.sha256}, got ${actualSha256}`);
+    }
+  } else if (componentPaths !== undefined && componentStats !== undefined) {
+    for (const [index, kind] of ['worker', 'launchAgent', 'disclosure', 'virtualDisplayHelper'].entries()) {
+      const component = manifest.components[kind];
+      const stat = componentStats[index];
+      if (stat.size !== component.size) {
+        throw new Error(`remote desktop ${kind} size mismatch: expected ${component.size}, got ${stat.size}`);
+      }
+      const actualSha256 = await sha256File(componentPaths[kind]);
+      if (actualSha256 !== component.sha256) {
+        throw new Error(`remote desktop ${kind} sha256 mismatch: expected ${component.sha256}, got ${actualSha256}`);
+      }
+    }
+  }
+  if (isWindows && archivePath !== undefined) {
+    const archiveSha256 = await sha256File(archivePath);
+    if (archiveSha256 !== manifest.virtualDisplay.sha256) {
+      throw new Error(`virtual display archive sha256 mismatch: expected ${manifest.virtualDisplay.sha256}, got ${archiveSha256}`);
+    }
+  }
+  return { executablePath, componentPaths, manifestPath, archivePath, manifest };
+}
+
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+const ELFCLASS64 = 2;
+const ELFDATA2LSB = 1;
+const EM_X86_64 = 0x3e;
+const SHT_GNU_VERNEED = 0x6ffffffe;
+const MAX_ELF_METADATA_BYTES = 16 * 1024 * 1024;
+
+function parseGlibcVersionTuple(versionString) {
+  const match = /^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?$/.exec(versionString);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), match[3] === undefined ? 0 : Number(match[3])];
+}
+
+function compareVersionTuples(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+function readElfCString(buffer, offset) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= buffer.length) {
+    throw new Error('malformed linux ELF string table offset');
+  }
+  const end = buffer.indexOf(0, offset);
+  const sliceEnd = end === -1 ? buffer.length : end;
+  return buffer.subarray(offset, sliceEnd).toString('utf8');
+}
+
+function parseElf64Header(header, totalSize) {
+  if (header.length < 64
+    || !header.subarray(0, 4).equals(ELF_MAGIC)
+    || header[4] !== ELFCLASS64
+    || header[5] !== ELFDATA2LSB) {
+    throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+  }
+  const machine = header.readUInt16LE(18);
+  if (machine !== EM_X86_64) {
+    throw new Error(`linux remote desktop worker has unexpected ELF machine: ${machine}`);
+  }
+  const shoff = Number(header.readBigUInt64LE(40));
+  const shentsize = header.readUInt16LE(58);
+  const shnum = header.readUInt16LE(60);
+  if (!Number.isSafeInteger(shoff) || shoff <= 0 || shentsize < 64 || shoff > totalSize) {
+    throw new Error('malformed linux ELF section header table');
+  }
+  return { shoff, shentsize, shnum };
+}
+
+function parseElf64SectionHeaders(sectionTable, shnum, shentsize, totalSize) {
+  const sections = [];
+  for (let index = 0; index < shnum; index += 1) {
+    const base = index * shentsize;
+    if (base + 64 > sectionTable.length) {
+      throw new Error('truncated linux ELF section header table');
+    }
+    const type = sectionTable.readUInt32LE(base + 4);
+    const offset = Number(sectionTable.readBigUInt64LE(base + 24));
+    const size = Number(sectionTable.readBigUInt64LE(base + 32));
+    const link = sectionTable.readUInt32LE(base + 40);
+    const info = sectionTable.readUInt32LE(base + 44);
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size < 0) {
+      throw new Error('malformed linux ELF section bounds');
+    }
+    if (type !== 8 && offset + size > totalSize) {
+      throw new Error('truncated linux ELF section payload');
+    }
+    sections.push({ type, offset, size, link, info });
+  }
+  return sections;
+}
+
+function parseVerneedSection(verneedBuf, dynstrBuf, entryCount) {
+  const requirements = [];
+  let pos = 0;
+  for (let entryIndex = 0; entryIndex < entryCount; entryIndex += 1) {
+    if (pos + 16 > verneedBuf.length) {
+      throw new Error('malformed linux ELF .gnu.version_r section');
+    }
+    const vnVersion = verneedBuf.readUInt16LE(pos);
+    const vnCnt = verneedBuf.readUInt16LE(pos + 2);
+    const vnFile = verneedBuf.readUInt32LE(pos + 4);
+    const vnAux = verneedBuf.readUInt32LE(pos + 8);
+    const vnNext = verneedBuf.readUInt32LE(pos + 12);
+    if (vnVersion !== 1 || vnAux < 16) {
+      throw new Error('malformed linux ELF .gnu.version_r entry');
+    }
+    const library = readElfCString(dynstrBuf, vnFile);
+    let auxPos = pos + vnAux;
+    for (let auxIndex = 0; auxIndex < vnCnt; auxIndex += 1) {
+      if (auxPos + 16 > verneedBuf.length) {
+        throw new Error('malformed linux ELF .gnu.version_r aux entry');
+      }
+      const vnaName = verneedBuf.readUInt32LE(auxPos + 8);
+      const vnaNext = verneedBuf.readUInt32LE(auxPos + 12);
+      requirements.push({ library, version: readElfCString(dynstrBuf, vnaName) });
+      if (auxIndex + 1 < vnCnt) {
+        if (vnaNext < 16) {
+          throw new Error('malformed linux ELF .gnu.version_r aux chain');
+        }
+        auxPos += vnaNext;
+      }
+    }
+    if (vnNext === 0) break;
+    if (vnNext < 16) {
+      throw new Error('malformed linux ELF .gnu.version_r chain');
+    }
+    pos += vnNext;
+  }
+  return requirements;
+}
+
+async function collectElf64VerneedRequirements(totalSize, readSlice) {
+  const header = await readSlice(0, 64, 'header');
+  const { shoff, shentsize, shnum: rawShnum } = parseElf64Header(header, totalSize);
+  let shnum = rawShnum;
+  if (shnum === 0) {
+    if (shoff + 64 > totalSize) {
+      throw new Error('truncated linux ELF section header table');
+    }
+    const firstSection = await readSlice(shoff, 64, 'section 0');
+    shnum = Number(firstSection.readBigUInt64LE(32));
+  }
+  const tableBytes = shnum * shentsize;
+  if (!Number.isSafeInteger(tableBytes) || shoff + tableBytes > totalSize) {
+    throw new Error('truncated linux ELF section header table');
+  }
+  const sectionTable = await readSlice(shoff, tableBytes, 'section header table');
+  const sections = parseElf64SectionHeaders(sectionTable, shnum, shentsize, totalSize);
+  const requirements = [];
+  for (const section of sections) {
+    if (section.type !== SHT_GNU_VERNEED) continue;
+    const strSection = sections[section.link];
+    if (!strSection) throw new Error('linux ELF .gnu.version_r links to missing string table');
+    const [verneedBuf, dynstrBuf] = await Promise.all([
+      readSlice(section.offset, section.size, '.gnu.version_r'),
+      readSlice(strSection.offset, strSection.size, '.dynstr'),
+    ]);
+    requirements.push(...parseVerneedSection(verneedBuf, dynstrBuf, section.info));
+  }
+  return requirements;
+}
+
+export async function parseElf64GlibcRequirements(elfBuffer) {
+  const buffer = Buffer.isBuffer(elfBuffer) ? elfBuffer : Buffer.from(elfBuffer);
+  if (buffer.length < 64) {
+    throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+  }
+  return collectElf64VerneedRequirements(
+    buffer.length,
+    async (offset, length) => buffer.subarray(offset, offset + length),
+  );
+}
+
+async function readExactSlice(handle, offset, length, label) {
+  if (length < 0 || length > MAX_ELF_METADATA_BYTES) {
+    throw new Error(`linux ELF ${label} exceeds supported metadata size`);
+  }
+  const out = Buffer.allocUnsafe(length);
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await handle.read(out, totalRead, length - totalRead, offset + totalRead);
+    if (bytesRead === 0) {
+      throw new Error(`truncated linux ELF ${label}`);
+    }
+    totalRead += bytesRead;
+  }
+  return out;
+}
+
+export async function readLinuxElf64GlibcRequirements(executablePath, knownSize) {
+  const handle = await open(executablePath, 'r');
+  try {
+    const fileSize = knownSize ?? (await handle.stat()).size;
+    if (fileSize < 64) {
+      throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+    }
+    return await collectElf64VerneedRequirements(
+      fileSize,
+      (offset, length, label) => readExactSlice(handle, offset, length, label),
+    );
+  } finally {
+    await handle.close();
+  }
+}
+
+export function assertLinuxElfGlibcCeiling(
+  requirements,
+  maxGlibcVersion = REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION,
+) {
+  const maxTuple = parseGlibcVersionTuple(maxGlibcVersion);
+  if (!maxTuple) {
+    throw new Error(`invalid max GLIBC version ceiling: ${maxGlibcVersion}`);
+  }
+  const violations = [];
+  for (const requirement of requirements) {
+    if (!requirement.version.startsWith('GLIBC_')) continue;
+    const tuple = parseGlibcVersionTuple(requirement.version.slice('GLIBC_'.length));
+    if (!tuple || compareVersionTuples(tuple, maxTuple) > 0) {
+      violations.push(`${requirement.library} (${requirement.version})`);
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error(
+      `linux remote desktop worker requires unsupported GLIBC version(s) above ${maxGlibcVersion}: ${violations.join(', ')}`,
+    );
+  }
+}
+
+/**
+ * The Linux worker is two files, the executable and its manifest, in remote-desktop-worker/linux-x64/ (the exact release version, size and sha256 included). The server serves
+ * the executable only together with a manifest that matches it (a missing or mismatching one answers "not published"),
+ * and a controlled-node self-upgrade fails its preflight without both, so a release that lacks either must fail HERE, at
+ * build time, not on every Linux node in the field. This is the full check -- both files present and regular, the
+ * executable bit, the strict manifest shape, size, sha256, ELF64 GLIBC symbol ceiling and (when given) the release
+ * version -- used on the build runner, on the downloaded artifact and on the final image.
+ */
+export async function verifyLinuxRemoteDesktopWorkerArtifactSet(
+  directory,
+  expectedVersion,
+  options = {},
+) {
+  const platformDirectory = join(directory, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+  const manifestName = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const executablePath = join(platformDirectory, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+  const manifestPath = join(platformDirectory, manifestName);
+  let entries;
+  try {
+    entries = await readdir(platformDirectory, { withFileTypes: true });
+  } catch {
+    throw new Error(`linux remote desktop worker directory is missing: ${platformDirectory}`);
+  }
+  const names = new Set(entries.map((entry) => entry.name));
+  for (const required of [REMOTE_DESKTOP_LINUX_WORKER_FILENAME, manifestName]) {
+    if (!names.has(required)) throw new Error(`linux remote desktop worker artifact set is incomplete: missing ${required}`);
+  }
+  // Other entries (the build may put its own subdirectory beside them) are not served and do not fail the gate; the two
+  // names the server and a node's preflight depend on must be plain files.
+  if (entries.some((entry) => (entry.name === REMOTE_DESKTOP_LINUX_WORKER_FILENAME || entry.name === manifestName) && !entry.isFile())) {
+    throw new Error('linux remote desktop worker artifact set contains a non-regular file');
+  }
+  const [executableStat, manifestStat] = await Promise.all([lstat(executablePath), lstat(manifestPath)]);
+  if (executableStat.isSymbolicLink() || manifestStat.isSymbolicLink()) {
+    throw new Error('linux remote desktop worker artifact set contains a non-regular file');
+  }
+  if ((executableStat.mode & 0o111) === 0) throw new Error('linux remote desktop worker is not executable');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  if (!isRecord(manifest) || !exactKeys(manifest, ['schemaVersion', 'artifact', 'build'])
+    || manifest.schemaVersion !== 1
+    || !isRecord(manifest.artifact) || !exactKeys(manifest.artifact, ['fileName', 'os', 'arch', 'size', 'sha256'])
+    || manifest.artifact.fileName !== REMOTE_DESKTOP_LINUX_WORKER_FILENAME
+    || manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64'
+    || !Number.isSafeInteger(manifest.artifact.size) || manifest.artifact.size <= 0
+    || typeof manifest.artifact.sha256 !== 'string' || !SHA256_RE.test(manifest.artifact.sha256)
+    || !isRecord(manifest.build) || !exactKeys(manifest.build, ['source', 'version'])
+    || typeof manifest.build.source !== 'string' || manifest.build.source.length === 0
+    || typeof manifest.build.version !== 'string' || !VERSION_RE.test(manifest.build.version)) {
+    throw new Error('invalid linux remote desktop worker manifest');
+  }
+  if (expectedVersion !== undefined && manifest.build.version !== expectedVersion) {
+    throw new Error(`linux remote desktop worker version mismatch: expected ${expectedVersion}, got ${manifest.build.version}`);
+  }
+  if (manifest.artifact.size !== executableStat.size) {
+    throw new Error(`linux remote desktop worker size mismatch: expected ${manifest.artifact.size}, got ${executableStat.size}`);
+  }
+  const actualSha256 = await sha256File(executablePath);
+  if (actualSha256 !== manifest.artifact.sha256) {
+    throw new Error(`linux remote desktop worker sha256 mismatch: expected ${manifest.artifact.sha256}, got ${actualSha256}`);
+  }
+  const glibcRequirements = await readLinuxElf64GlibcRequirements(executablePath, executableStat.size);
+  assertLinuxElfGlibcCeiling(glibcRequirements, options.maxGlibcVersion);
+  return { executablePath, manifestPath, manifest, sha256: actualSha256, glibcRequirements };
+}
+
+async function main() {
+  const [, , command, directory, expectedVersion, os, arch] = process.argv;
+  if (command !== 'verify' || !directory) {
+    throw new Error('usage: remote-desktop-worker-artifacts.mjs verify <artifact-directory> [expected-version] [os arch]');
+  }
+  if ((os === undefined) !== (arch === undefined)) {
+    throw new Error('remote desktop worker artifact target requires both os and arch');
+  }
+  if (os === 'linux') {
+    if (arch !== 'x64') throw new Error('remote desktop worker artifact target linux requires arch x64');
+    const linux = await verifyLinuxRemoteDesktopWorkerArtifactSet(directory, expectedVersion);
+    process.stdout.write(`verified ${linux.executablePath} (${linux.sha256})\n`);
+    return;
+  }
+  const target = os === undefined ? WINDOWS_TARGET : { os, arch };
+  const result = await verifyRemoteDesktopWorkerArtifactSet(directory, expectedVersion, target);
+  const verifiedPath = result.executablePath ?? result.componentPaths.worker;
+  const verifiedSha256 = result.manifest.sha256 ?? result.manifest.components.worker.sha256;
+  process.stdout.write(`verified ${verifiedPath} (${verifiedSha256})\n`);
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

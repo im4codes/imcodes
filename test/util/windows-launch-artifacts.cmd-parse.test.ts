@@ -158,10 +158,16 @@ describe('watchdog .cmd file (Windows cmd.exe parser regression)', () => {
     try {
       const { watchdogPath } = generateWatchdogInChildProcess(dir);
       const cmd = readFileSync(watchdogPath, 'utf8');
+      // The default install defines its home through %USERPROFILE% (expanded
+      // natively by cmd.exe) before any lock/log path uses %IMCODES_HOME%.
+      // Without it %IMCODES_HOME% expands to empty and the lock/log land at
+      // the drive root.
+      expect(cmd).toContain('set "IMCODES_HOME=%USERPROFILE%\\.imcodes"');
+      expect(cmd.indexOf('set "IMCODES_HOME=')).toBeLessThan(cmd.indexOf('%IMCODES_HOME%\\upgrade.lock'));
       // Lock file path
-      expect(cmd).toContain('%USERPROFILE%\\.imcodes\\upgrade.lock');
+      expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
       // Log file path
-      expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+      expect(cmd).toContain('%IMCODES_HOME%\\watchdog.log');
       // No raw drive-letter user paths leaking through
       expect(cmd).not.toMatch(/C:\\Users\\[^\\]+\\\.imcodes\\upgrade\.lock/);
     } finally {

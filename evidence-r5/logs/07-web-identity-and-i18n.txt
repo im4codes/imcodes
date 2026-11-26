@@ -1,0 +1,16 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+(node:61286) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:61285) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/i18n-coverage.test.ts (14 tests) 339ms
+ ✓ |web| test/components/SessionIdentityTabs.limit.test.tsx (15 tests) 224ms
+
+ Test Files  2 passed (2)
+      Tests  29 passed (29)
+   Start at  01:58:26
+   Duration  1.22s (transform 235ms, setup 58ms, collect 209ms, tests 563ms, environment 1.04s, prepare 75ms)
+
+exit=0

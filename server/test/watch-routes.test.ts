@@ -4,9 +4,10 @@ import type { Env } from '../src/env.js';
 import { IMCODES_POD_HEADER } from '../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_DETAIL_FIELD_PATHS } from '../../shared/timeline-protocol.js';
+import { runNewestWindowBackfill } from '../../web/src/timeline/catchup/backfill-pager.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
-const mockGetServersByUserId = vi.fn();
+const mockGetFullServersByUserId = vi.fn();
 const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
@@ -21,6 +22,7 @@ const mockSendToDaemon = vi.fn();
 const mockGetPodIdentity = vi.fn(() => 'pod-a');
 const mockDbQueryOne = vi.fn();
 const mockResolveHttpShareAccess = vi.fn();
+const mockResolveHttpShareAccessForCoveredSession = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -35,7 +37,7 @@ vi.mock('../src/db/queries.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/db/queries.js')>();
   return {
     ...actual,
-    getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+    getFullServersByUserId: (...args: unknown[]) => mockGetFullServersByUserId(...args),
     getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
     getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
     getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
@@ -64,6 +66,7 @@ vi.mock('../src/util/pod-identity.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
 function makeEnv(): Env {
@@ -111,7 +114,10 @@ describe('Watch routes', () => {
         ? { membership: 'none', actor: { kind: 'none' } }
         : { membership: role, actor: { kind: 'server-member', effectiveActorRole: role === 'member' ? 'server-member' : 'server-manager' } };
     });
-    mockGetServersByUserId.mockResolvedValue([]);
+    mockResolveHttpShareAccessForCoveredSession.mockImplementation(
+      (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+    );
+    mockGetFullServersByUserId.mockResolvedValue([]);
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
@@ -133,8 +139,8 @@ describe('Watch routes', () => {
     });
   });
 
-  it('GET /api/watch/servers returns visible servers with baseUrl', async () => {
-    mockGetServersByUserId.mockResolvedValue([
+  it('GET /api/watch/servers returns visible servers with baseUrl and isPinned', async () => {
+    mockGetFullServersByUserId.mockResolvedValue([
       { id: 'srv-1', name: 'Alpha' },
       { id: 'srv-2', name: 'Beta' },
     ]);
@@ -145,8 +151,35 @@ describe('Watch routes', () => {
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toEqual({
       servers: [
-        { id: 'srv-1', name: 'Alpha', baseUrl: 'https://app.im.codes' },
-        { id: 'srv-2', name: 'Beta', baseUrl: 'https://app.im.codes' },
+        { id: 'srv-1', name: 'Alpha', baseUrl: 'https://app.im.codes', isPinned: false },
+        { id: 'srv-2', name: 'Beta', baseUrl: 'https://app.im.codes', isPinned: false },
+      ],
+    });
+  });
+
+  it('GET /api/watch/servers sorts pinned servers first in server_pinned order, then server_order, then original order', async () => {
+    mockGetFullServersByUserId.mockResolvedValue([
+      { id: 'srv-a', name: 'Alpha' },
+      { id: 'srv-b', name: 'Beta' },
+      { id: 'srv-c', name: 'Gamma' },
+      { id: 'srv-d', name: 'Delta' },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'server_pinned') return JSON.stringify(JSON.stringify({ v: ['srv-c', 'srv-a'], t: 10 }));
+      if (key === 'server_order') return JSON.stringify({ v: ['srv-d', 'srv-b'], t: 9 });
+      return null;
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/servers');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      servers: [
+        { id: 'srv-c', name: 'Gamma', baseUrl: 'https://app.im.codes', isPinned: true },
+        { id: 'srv-a', name: 'Alpha', baseUrl: 'https://app.im.codes', isPinned: true },
+        { id: 'srv-d', name: 'Delta', baseUrl: 'https://app.im.codes', isPinned: false },
+        { id: 'srv-b', name: 'Beta', baseUrl: 'https://app.im.codes', isPinned: false },
       ],
     });
   });
@@ -272,6 +305,111 @@ describe('Watch routes', () => {
     expect(body.sessions[0]?.previewText).toBe('backfilled summary');
     expect(body.sessions[0]?.recentText?.[0]?.text).toBe('backfilled summary');
     expect(mockGetRecentTextForWatch).toHaveBeenCalledWith('deck_proj_brain');
+  });
+
+  it('GET /api/watch/sessions fetches recentText for all <= 5 main sessions and their active sub-sessions', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 5 }, (_, idx) => ({
+        name: `deck_proj_${idx + 1}`,
+        project_name: `proj-${idx + 1}`,
+        label: `Main ${idx + 1}`,
+        state: 'idle',
+        agent_type: 'codex',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 's5', type: 'shell', label: 'Sub 5', parent_session: 'deck_proj_5', closed_at: null },
+    ]);
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => [
+      { eventId: `e-${sessionName}`, type: 'assistant.text', text: `text-${sessionName}`, ts: 100 },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ sessionName: string; previewText?: string }> };
+    expect(body.sessions).toHaveLength(6);
+    expect(mockGetRecentTextForWatch).toHaveBeenCalledTimes(6);
+    expect(body.sessions.every((row) => row.previewText === `text-${row.sessionName}`)).toBe(true);
+  });
+
+  it('GET /api/watch/sessions skips recentText for unpinned/non-included sessions when mainSessions > 5 while keeping metadata', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 7 }, (_, idx) => ({
+        name: `deck_proj_${idx + 1}`,
+        project_name: `proj-${idx + 1}`,
+        label: `Main ${idx + 1}`,
+        state: idx === 0 ? 'running' : 'idle',
+        agent_type: 'claude-code',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'pinned-sub', type: 'codex', label: 'Pinned Sub', parent_session: 'deck_proj_2', closed_at: null },
+      { id: 'other-sub', type: 'shell', label: 'Other Sub', parent_session: 'deck_proj_4', closed_at: null },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_pinned') return JSON.stringify({ v: ['deck_proj_2'], t: 1 });
+      return null;
+    });
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => [
+      { eventId: `e-${sessionName}`, type: 'assistant.text', text: `text-${sessionName}`, ts: 100 },
+    ]);
+
+    const app = await buildTestApp();
+
+    // 1. Without includeSessions: only pinned main (deck_proj_2) + its sub (deck_sub_pinned-sub) fetch recentText
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      sessions: Array<{
+        sessionName: string;
+        title: string;
+        isSubSession: boolean;
+        parentTitle?: string;
+        isPinned: boolean;
+        previewText?: string;
+        recentText: unknown[];
+      }>;
+    };
+    expect(body.sessions).toHaveLength(9);
+    expect(mockGetRecentTextForWatch.mock.calls.map((c) => c[0])).toEqual([
+      'deck_proj_2',
+      'deck_sub_pinned-sub',
+    ]);
+    const pinnedRow = body.sessions.find((s) => s.sessionName === 'deck_proj_2')!;
+    const pinnedSubRow = body.sessions.find((s) => s.sessionName === 'deck_sub_pinned-sub')!;
+    const unpinnedRow = body.sessions.find((s) => s.sessionName === 'deck_proj_1')!;
+    const unpinnedSubRow = body.sessions.find((s) => s.sessionName === 'deck_sub_other-sub')!;
+    expect(pinnedRow.previewText).toBe('text-deck_proj_2');
+    expect(pinnedSubRow.previewText).toBe('text-deck_sub_pinned-sub');
+    expect(unpinnedRow.title).toBe('Main 1');
+    expect(unpinnedRow.previewText).toBeUndefined();
+    expect(unpinnedRow.recentText).toEqual([]);
+    expect(unpinnedSubRow.title).toBe('Other Sub');
+    expect(unpinnedSubRow.parentTitle).toBe('Main 4');
+    expect(unpinnedSubRow.previewText).toBeUndefined();
+    expect(unpinnedSubRow.recentText).toEqual([]);
+
+    // 2. With includeSessions=deck_proj_4: pinned + explicitly requested main & its sub fetch recentText
+    mockGetRecentTextForWatch.mockClear();
+    const resIncluded = await app.request('/api/watch/sessions?serverId=srv-1&includeSessions=deck_proj_4');
+    expect(resIncluded.status).toBe(200);
+    expect(mockGetRecentTextForWatch.mock.calls.map((c) => c[0])).toEqual([
+      'deck_proj_2',
+      'deck_proj_4',
+      'deck_sub_pinned-sub',
+      'deck_sub_other-sub',
+    ]);
+
+    // 3. > 5 sessions with 0 pinned and no includeSessions makes 0 RPC calls
+    mockGetRecentTextForWatch.mockClear();
+    mockGetUserPref.mockResolvedValue(null);
+    const resZeroPinned = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(resZeroPinned.status).toBe(200);
+    expect(mockGetRecentTextForWatch).not.toHaveBeenCalled();
+    const zeroBody = await resZeroPinned.json() as { sessions: unknown[] };
+    expect(zeroBody.sessions).toHaveLength(9);
   });
 
   it('GET /api/server/:id/timeline/history preserves event identity and pagination metadata', async () => {
@@ -474,6 +612,48 @@ describe('Watch routes', () => {
     }));
   });
 
+  it('GET /api/server/:id/timeline/history authorizes a child through its shared parent main session', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({ membership: 'none', actor: { kind: 'none' } });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-main'],
+          primaryShareId: 'share-main',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 2,
+      events: [{ eventId: 'child-event', sessionId: 'deck_sub_abc123', ts: 2, type: 'assistant.text', payload: { text: 'child history' } }],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_sub_abc123');
+
+    expect(res.status).toBe(200);
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        serverId: 'srv-1',
+        userId: 'user-1',
+        target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'abc123' },
+      },
+    );
+    expect(mockResolveHttpShareAccess).not.toHaveBeenCalled();
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_abc123',
+    }));
+  });
+
   it('GET /api/server/:id/timeline/history returns 503 when daemon is offline', async () => {
     mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
     const app = await buildTestApp();
@@ -518,6 +698,178 @@ describe('Watch routes', () => {
       budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
       includeDetails: true,
       abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history/full handles recoverable flags and infers it for older daemons', async () => {
+    const app = await buildTestApp();
+
+    // 1. Explicit recoverable: true is preserved
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      recoverable: true,
+      payloadBytes: 2,
+    });
+    let res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    let body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
+
+    // 2. Older daemon without recoverable field: inferred as recoverable: true for projection_busy
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
+
+    // 3. Explicit recoverable: false is strictly preserved
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      recoverable: false,
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.recoverable).toBe(false);
+
+    // 4. Genuine empty OK does not get recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'ok',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('ok');
+    expect(body.recoverable).toBeUndefined();
+
+    // 5. Non-recoverable error (e.g. internal_error) does not get recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'internal_error',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.recoverable).toBeUndefined();
+  });
+
+  it('GET /api/server/:id/timeline/history infers recoverable flag for older daemon busy responses', async () => {
+    const app = await buildTestApp();
+
+    // Older daemon without recoverable field on /timeline/history endpoint
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
+  });
+
+  it('connects older-daemon HTTP error response to production pager and recovers without restart', async () => {
+    const app = await buildTestApp();
+
+    // 1. Initial attempt: older daemon emits projection_busy without recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+
+    const errorRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=200');
+    const errorPage = await errorRes.json() as any;
+
+    // Verify pager marks page incomplete (terminal: 'truncated', NOT 'caught_up')
+    const pagerResult1 = await runNewestWindowBackfill(100, {
+      limit: 200,
+      fetchPage: async () => errorPage,
+      mergePage: async () => ({ candidateCount: 0, minTs: null, maxTs: null }),
+    });
+    expect(pagerResult1.terminal).toBe('truncated');
+
+    // 2. Recovery: subsequent attempt succeeds once projection warms up
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [
+        { eventId: 'e-rec-1', sessionId: 'deck_proj_brain', ts: 1050, type: 'user.message' },
+      ],
+      hasMore: false,
+      status: 'ok',
+      payloadBytes: 100,
+    });
+
+    const successRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=200');
+    const successPage = await successRes.json() as any;
+
+    const pagerResult2 = await runNewestWindowBackfill(100, {
+      limit: 200,
+      fetchPage: async () => successPage,
+      mergePage: async () => ({ candidateCount: 1, minTs: 1050, maxTs: 1050 }),
+    });
+    expect(pagerResult2.terminal).toBe('caught_up');
+    expect(pagerResult2.totalNew).toBe(1);
+  });
+
+  it('GET /api/server/:id/timeline/history/full clamps oversized pages to 200 events', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      hasMore: false,
+      events: Array.from({ length: 205 }, (_, index) => ({
+        eventId: `event-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: index + 1,
+        type: 'assistant.message',
+        payload: { text: `message-${index}` },
+      })),
+    });
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=999');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { events: unknown[]; hasMore: boolean };
+    expect(body.events).toHaveLength(200);
+    expect(body.hasMore).toBe(true);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 200,
     }));
   });
 
@@ -914,5 +1266,138 @@ describe('Watch routes', () => {
     expect(sendRes.status).toBe(200);
     expect(historyRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
     expect(sendRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+  });
+
+  it('GET /api/watch/sessions bounds concurrent getRecentTextForWatch calls to WATCH_RECENT_TEXT_CONCURRENCY', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 15 }, (_, m) => ({
+        name: `deck_proj_${m}_brain`,
+        project_name: `proj_${m}`,
+        label: `Main ${m}`,
+        state: 'idle',
+        agent_type: 'claude-code-sdk',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue(
+      Array.from({ length: 45 }, (_, s) => ({
+        id: `sub_${s}`,
+        type: 'codex-sdk',
+        label: `Sub ${s}`,
+        parent_session: `deck_proj_${s % 15}_brain`,
+        closed_at: null,
+      })),
+    );
+
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_pinned') {
+        return JSON.stringify({ v: Array.from({ length: 15 }, (_, m) => `deck_proj_${m}_brain`), t: 1 });
+      }
+      return null;
+    });
+
+    let active = 0;
+    let peak = 0;
+    mockGetRecentTextForWatch.mockImplementation(async () => {
+      active += 1;
+      if (active > peak) peak = active;
+      await new Promise((r) => setTimeout(r, 8));
+      active -= 1;
+      return [{ eventId: 'ev1', type: 'assistant.text', text: 'ok', ts: 1 }];
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: unknown[] };
+    expect(body.sessions).toHaveLength(60);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(20);
+  });
+
+  it('redacts TASK_PAIR_TIMELINE_EVENT sensitive fields for viewer shares on HTTP timeline/history and timeline/history/full, while keeping participant and owner access', async () => {
+    const { TASK_PAIR_TIMELINE_EVENT } = await import('../../shared/task-pair.js');
+    const pairEvent = {
+      eventId: 'evt-pair-1',
+      sessionId: 'deck_proj_brain',
+      seq: 10,
+      epoch: 1,
+      ts: 1_000,
+      type: TASK_PAIR_TIMELINE_EVENT,
+      payload: {
+        taskId: 'tsk_secret_1',
+        verb: 'DISPATCH',
+        toStatus: 'working',
+        round: 1,
+        flags: [],
+        title: 'Secret Task Title',
+        brief: 'Confidential brief details',
+        objective: 'Secret objective',
+        executorModel: 'claude-opus-secret',
+        auditorModel: 'gpt-secret',
+        blockedNote: 'Internal blocker note',
+        decisions: [{ summary: 'Secret decision' }],
+        text: 'Leaked free-text quoting Secret Task Title and claude-opus-secret',
+      },
+    };
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 1, events: [pairEvent] });
+    const app = await buildTestApp();
+
+    // 1. Tab-share viewer: full and watch history endpoints redact sensitive keys & free-text notice
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: { effectiveRole: 'viewer', primaryShareId: 'sh-v', coveringShareIds: ['sh-v'], shares: [] },
+      },
+    });
+    const viewerFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(viewerFullRes.status).toBe(200);
+    const viewerFullBody = await viewerFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(viewerFullBody.events[0]?.payload).toEqual({
+      taskId: 'tsk_secret_1',
+      verb: 'DISPATCH',
+      toStatus: 'working',
+      round: 1,
+      flags: [],
+    });
+
+    const viewerHistRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    expect(viewerHistRes.status).toBe(200);
+    const viewerHistBody = await viewerHistRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(viewerHistBody.events[0]?.payload.text).toBeUndefined();
+
+    // 2. Tab-share participant: retains pair brief/model/title fields matching WS policy
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: { effectiveRole: 'participant', primaryShareId: 'sh-p', coveringShareIds: ['sh-p'], shares: [] },
+      },
+    });
+    const partFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(partFullRes.status).toBe(200);
+    const partFullBody = await partFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(partFullBody.events[0]?.payload).toMatchObject({
+      taskId: 'tsk_secret_1',
+      title: 'Secret Task Title',
+      brief: 'Confidential brief details',
+      executorModel: 'claude-opus-secret',
+    });
+
+    // 3. Server member / owner: retains full unredacted fields
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'owner',
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
+    });
+    const ownerFullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain');
+    expect(ownerFullRes.status).toBe(200);
+    const ownerFullBody = await ownerFullRes.json() as { events: Array<{ payload: Record<string, unknown> }> };
+    expect(ownerFullBody.events[0]?.payload).toMatchObject({
+      title: 'Secret Task Title',
+      brief: 'Confidential brief details',
+      decisions: [{ summary: 'Secret decision' }],
+    });
   });
 });

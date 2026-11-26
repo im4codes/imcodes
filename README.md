@@ -2,15 +2,26 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
+**The IM for agents. AI remote desktop, shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes connects AI agents not only to coding sessions, but also to the computers where work happens. Enroll supported machines as restricted **Controlled Nodes**, then let an authorized agent directly operate one or many computers with scoped commands, file transfer, and typed Computer Use. When a person needs to see or take over, capable Windows nodes also provide browser-based remote desktop from desktop or mobile.
 
-> **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
+Alongside machine control, IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more. Terminal access, file and Git views, localhost preview, notifications, multi-agent workflows, OpenSpec Auto Deliver, Auto supervision, and cross-provider Team audit keep both human and agent work visible and connected.
+
+> **Disclaimer:** This is an actively developed personal source-available project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
+
+## Controlled Nodes: AI Remote Desktop
+
+Turn supported computers into AI-operated nodes without making each machine a full IM.codes source server.
+
+- **One AI, multiple computers.** Enroll multiple machines and let one agent—or a team of agents—operate them directly to get work done.
+- **Real computer actions.** Run scoped commands, move individual files, and control desktop applications through typed Computer Use tools.
+- **Remote desktop when humans need it.** Open a capable Windows node from a browser or mobile device to view the screen or take control directly.
+- **Scoped and revocable.** Every node has independent credentials, remains separate from normal server/session lists, and can have execution access disabled or revoked by its owner.
 
 ## Screenshots
 
@@ -114,6 +125,7 @@ IM.codes can drive supported agent sessions turn by turn — a supervisor with y
 
 - **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
 - **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
+- **Non-blocking resource telemetry.** Transient daemon memory or system pressure is recorded for diagnostics and does not block an otherwise valid supervision transition.
 - **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
 - **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
 - **Global defaults seed new sessions.** Set your default supervisor backend, model, and timeout once. New `supervised` / `supervised_audit` sessions snapshot them at enable time, and each session can still override backend/model/timeout and audit mode individually.
@@ -121,6 +133,26 @@ IM.codes can drive supported agent sessions turn by turn — a supervisor with y
 - **Built for real IM.codes workflows.** Auto supervision understands OpenSpec work, Team discussion/review flows, and `imcodes send`-style cross-agent coordination as valid agent actions, not immediate reasons to stop for a human.
 
 ## Features
+
+### Private Aliases
+
+Save owner-scoped reusable text snippets and insert them from the composer by typing `;` or selecting a `;;(name)` marker. The message keeps the marker visible while IM.codes resolves and delivers the value out of band. Agents can create, search, edit, and resolve aliases through managed MCP tools; bulk listings expose metadata only, so one call cannot dump every stored value into model context.
+
+### Controlled Nodes
+
+Enroll one or many computers, type `^` to choose a target (or insert `^^(name)` directly), and let authorized agents carry out work on the selected machine. Agents can run scoped commands, transfer individual files, and use typed Computer Use tools—making it practical to operate a fleet of computers directly from the same conversation. Execution remains owner-gated and revocable, every node receives independent credentials, and controlled nodes stay separate from normal server/session lists. Download links expire, but a downloaded installer can be kept and reused to enroll multiple machines.
+
+### Windows Remote Desktop
+
+Capable Windows controlled nodes provide remote desktop to authorized Owners and Participants directly in the browser. Use Control or View mode, switch displays and resolution, and invite multiple authorized viewers or controllers when collaboration is needed. On mobile, touch navigation and a virtual mouse make full desktop control practical from a phone or tablet.
+
+Remote desktop automatically uses the best available connection and falls back when a direct route is unavailable. Access remains permission-controlled and revocable. Remote desktop is currently available on supported Windows nodes; macOS and Linux controlled nodes can still use their other node capabilities, with remote desktop support planned.
+
+### Computer Use & Browser Automation
+
+Supported SDK agents can control desktop apps through typed Computer Use tools. The cross-platform desktop-app path integrates [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) by Leo ([iFurySt](https://github.com/iFurySt)), licensed under [MIT](https://github.com/iFurySt/open-codex-computer-use/blob/main/LICENSE); credit goes to that project for this integrated capability.
+
+Browser automation is a separate IM.codes feature built directly on Chrome DevTools Protocol (CDP): agents can open, inspect, navigate, click, fill, and evaluate pages, returning structured text by default and an optional screenshot only when requested. The managed browser exposes a loopback-only CDP endpoint so local Python or Node scripts can attach to the same live instance for complex work without launching another browser.
 
 ### Remote Terminal
 
@@ -271,7 +303,8 @@ The daemon runs on your dev machine and manages process-backed agent sessions th
 ## Install
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash
+# fallback: npm install -g imcodes
 ```
 
 ## Quick Start
@@ -323,7 +356,7 @@ Notes:
 Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
@@ -333,7 +366,7 @@ This generates all config, starts PostgreSQL + server + Caddy with automatic HTT
 To connect additional machines:
 
 ```bash
-npm install -g imcodes
+curl -fsSL https://im.codes/install.sh | bash   # fallback: npm install -g imcodes
 imcodes bind https://imc.example.com/bind/<api-key>
 ```
 
@@ -357,8 +390,9 @@ Windows is natively supported via [ConPTY](https://devblogs.microsoft.com/comman
 
 ### Install & Bind (Windows)
 
-```cmd
-npm install -g imcodes
+```powershell
+irm https://im.codes/install.ps1 | iex
+# fallback: npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
@@ -403,7 +437,7 @@ Check the daemon watchdog log for errors:
 ## Requirements
 
 - macOS or Linux (tested on both)
-- **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
+- **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `irm https://im.codes/install.ps1 | iex` (fallback: `npm install -g imcodes`) — no extra software needed. WSL also works.
 - Node.js >= 22
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
@@ -414,10 +448,15 @@ This is a personal project. I haven't written any code myself — it was built a
 
 ## Disclaimer
 
-IM.codes is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
+IM.codes is an independent source-available project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
 
 ## License
 
-[MIT](LICENSE)
+[Business Source License 1.1 (BSL 1.1)](LICENSE) — [Commercial Licensing Guide](COMMERCIAL-LICENSE.md) | [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+
+- **Non-Production & Personal Production Use:** Non-production use (evaluation, testing, development), copying, modification, and compliant redistribution preserving notices and trademark terms are free for any organization size under standard BSL 1.1. Personal production use by natural persons for personal development, learning, research, or personal self-hosting on personal devices/servers (not centrally deployed or shared across an organization, and excluding third-party hosting/SaaS/white-label commercial services) is permanently free regardless of employer size.
+- **Small-Team Internal Production Use:** Covered free under the Additional Use Grant only when **both** active users/seats **<= 5** **and** total organization headcount **<= 50**, aggregated across the legal entity, all affiliates, and all deployed instances.
+- **Outside the Additional Use Grant (Commercial License):** Prior to the Change Date, production use above either threshold (e.g. `6/50` or `5/51` across entity/affiliates/instances), or production use for hosted/managed/multi-tenant SaaS or commercial white-label services/resale (even by a single person), is excluded from the Additional Use Grant and requires a commercial license via `support@im.codes`.
+- **Change Date:** Converts to [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) 4 years after each version's public release (`2030-11-26` for this release).
 
 © 2026 [IM.codes](https://im.codes)

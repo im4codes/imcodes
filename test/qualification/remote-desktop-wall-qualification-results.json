@@ -1,0 +1,35 @@
+{
+  "schema": "imcodes.remote-desktop.wall-qualification-results.v1",
+  "change": "add-remote-desktop-access-and-workspace",
+  "tasks": ["15.2", "15.3", "15.4", "15.5", "15.9"],
+  "baseline": {
+    "name": "chromium-desktop-16stream-v1",
+    "browser": "production Chromium",
+    "viewport": "1920x1080",
+    "minimumLogicalCpu": 8,
+    "minimumRamGiB": 16,
+    "hardwareVideoDecode": true,
+    "windowMs": 300000
+  },
+  "deterministicFakeMedia": {
+    "status": "passed",
+    "routeModes": ["direct", "all_turn"],
+    "sourceCounts": [1, 4, 16],
+    "purpose": "Harness mechanics and mutation gates only; this is not real direct/TURN network qualification."
+  },
+  "realDirect16": {
+    "status": "unavailable",
+    "reason": "No named Chromium baseline runner with 16 controlled live sources was available in this delegated session."
+  },
+  "realAllTurn16": {
+    "status": "unavailable",
+    "reason": "No forced all-TURN 16-source controlled-device environment was available in this delegated session."
+  },
+  "taskReadiness": {
+    "15.2": "partial-harness-only",
+    "15.3": "partial-harness-only",
+    "15.4": "unavailable-real-turn-gate",
+    "15.5": "partial-harness-only",
+    "15.9": "partial-harness-only"
+  }
+}

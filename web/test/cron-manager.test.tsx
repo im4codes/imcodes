@@ -126,6 +126,110 @@ describe('CronManager', () => {
     expect(deleteBtn.disabled).toBe(true);
   });
 
+  it('scopes shared viewer requests to the covered session and hides mutations', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedSessionName="deck_cd_brain"
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining('sessionName=deck_cd_brain'));
+    expect(screen.queryByTitle('cron.create')).toBeNull();
+    expect((screen.getByText('▶') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✕') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('scopes shared participant requests to the covered project and allows creating and editing project jobs', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_sub_1"
+        sharedSessionName="deck_sub_1"
+        readOnly={false}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining('sessionName=deck_sub_1'));
+    const createBtn = screen.getByTitle('cron.create') as HTMLButtonElement;
+    expect(createBtn).toBeDefined();
+    expect(createBtn.disabled).toBe(false);
+
+    const triggerBtn = screen.getByText('▶') as HTMLButtonElement;
+    const editBtn = screen.getByText('✎') as HTMLButtonElement;
+    const deleteBtn = screen.getByText('✕') as HTMLButtonElement;
+    expect(triggerBtn.disabled).toBe(false);
+    expect(editBtn.disabled).toBe(false);
+    expect(deleteBtn.disabled).toBe(false);
+  });
+
+  it('scopes a whole-server participant to the selected server and keeps all controls editable', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob(), cronJob({ id: 'job-other-project', name: 'Other project job', project_name: 'other' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedScope
+        readOnly={false}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(await screen.findByText('Other project job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current');
+    expect(screen.getByTitle('cron.create')).toBeDefined();
+    expect((screen.getAllByText('▶')[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getAllByText('✎')[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getAllByText('✕')[0] as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('lists whole-server jobs for a shared viewer without inheriting the active session', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob(), cronJob({ id: 'job-other-project', name: 'Other project job', project_name: 'other' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedScope
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(await screen.findByText('Other project job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current');
+    expect(screen.queryByTitle('cron.create')).toBeNull();
+    expect((screen.getAllByText('▶')[0] as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getAllByText('✎')[0] as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getAllByText('✕')[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('renders other-tab jobs as read-only', async () => {
     apiFetch.mockResolvedValueOnce({
       jobs: [{
@@ -232,7 +336,25 @@ describe('CronManager', () => {
     expect((screen.getByLabelText('cron.send_reply') as HTMLInputElement).checked).toBe(true);
   });
 
-  it('creates send cron jobs from the normal form', async () => {
+  it.each([undefined, false, true])('exposes and saves manual-command idle policy when editing %s', async (onlyWhenIdle) => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob({ action: JSON.stringify({ type: 'command', command: 'check', onlyWhenIdle }) })] })
+      .mockResolvedValue({ jobs: [] });
+    render(<CronManager serverId="srv-current" projectName="cd" sessions={sessions} onBack={vi.fn()} />);
+    await screen.findByText('Current job');
+    fireEvent.click(screen.getByText('✎'));
+    const option = screen.getByLabelText(/cron.send_only_when_idle/) as HTMLInputElement;
+    expect(option.checked).toBe(onlyWhenIdle !== false);
+    fireEvent.click(option);
+    fireEvent.click(screen.getByText('cron.mode_advanced'));
+    fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
+    expect(option.checked).toBe(onlyWhenIdle === false);
+    fireEvent.click(screen.getByText('cron.save'));
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron/job-1', expect.objectContaining({ method: 'PUT' })));
+    const call = apiFetch.mock.calls.find(([, init]) => init?.method === 'PUT');
+    expect(JSON.parse(String(call?.[1]?.body)).action).toMatchObject({ type: 'command', onlyWhenIdle: onlyWhenIdle === false });
+  });
+
+  it('creates a direct-message cron for the active session without a second recipient', async () => {
     apiFetch
       .mockResolvedValueOnce({ jobs: [] })
       .mockResolvedValueOnce({})
@@ -244,6 +366,7 @@ describe('CronManager', () => {
         projectName="cd"
         sessions={sessions}
         subSessions={subSessions}
+        activeSession="deck_sub_52123h2r"
         onBack={vi.fn()}
         servers={[{ id: 'srv-current', name: 'Current' }]}
       />,
@@ -252,25 +375,94 @@ describe('CronManager', () => {
     expect(await screen.findByText('cron.no_tasks')).toBeDefined();
     fireEvent.click(screen.getByTitle('cron.create'));
 
-    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Send check' } });
+    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Direct check' } });
     fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
-    fireEvent.click(screen.getByLabelText('common.send'));
-    fireEvent.input(screen.getByPlaceholderText('cron.send_target_placeholder'), { target: { value: 'deck_sub_audit' } });
     fireEvent.input(screen.getByPlaceholderText('cron.send_message_placeholder'), { target: { value: 'Please check this task' } });
-    fireEvent.click(screen.getByLabelText('cron.send_reply'));
+    expect((screen.getByLabelText(/cron.send_only_when_idle/) as HTMLInputElement).checked).toBe(true);
     fireEvent.click(screen.getByText('cron.save'));
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron', expect.objectContaining({ method: 'POST' })));
     const createCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron');
     const payload = JSON.parse(String(createCall?.[1]?.body));
     expect(payload).toMatchObject({
-      name: 'Send check',
+      name: 'Direct check',
       cronExpr: '0 11 * * *',
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_52123h2r',
+      completionPolicy: 'recurring',
       action: {
-        type: 'send',
-        target: 'deck_sub_audit',
-        message: 'Please check this task',
-        reply: true,
+        type: 'command',
+        command: 'Please check this task',
+        onlyWhenIdle: true,
+      },
+    });
+    expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();
+  });
+
+  it('edits and persists the explicit cron lifecycle policy', async () => {
+    apiFetch
+      .mockResolvedValueOnce({
+        jobs: [cronJob({
+          id: 'bounded-job',
+          name: 'Bounded work',
+          completion_policy: 'until_complete',
+          action: JSON.stringify({
+            type: 'command',
+            command: 'hello',
+            selfManaged: true,
+            cronControl: {
+              contractId: 'supervision_cron_control_v2',
+              version: 2,
+              scheduleId: 'bounded-job',
+              constraints: { authorization: 'user_authorized_scheduled_execution' },
+            },
+          }),
+        })],
+      })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValue({ jobs: [] });
+
+    const { container } = render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('Bounded work')).toBeDefined();
+    expect(screen.getByText('cron.completion_until_complete')).toBeDefined();
+    fireEvent.click(screen.getByText('✎'));
+
+    const lifecycleSelect = Array.from(container.querySelectorAll('select'))
+      .find((select) => select.value === 'until_complete') as HTMLSelectElement | undefined;
+    expect(lifecycleSelect).toBeDefined();
+    fireEvent.input(lifecycleSelect!, { target: { value: 'recurring' } });
+    await screen.findByText('cron.completion_recurring_help');
+    fireEvent.input(lifecycleSelect!, { target: { value: 'until_complete' } });
+    await screen.findByText('cron.completion_until_complete_help');
+    fireEvent.click(screen.getByText('cron.save'));
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith(
+      '/api/cron/bounded-job',
+      expect.objectContaining({ method: 'PUT' }),
+    ));
+    const updateCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron/bounded-job');
+    expect(JSON.parse(String(updateCall?.[1]?.body))).toMatchObject({
+      completionPolicy: 'until_complete',
+      action: {
+        type: 'command',
+        selfManaged: true,
+        cronControl: {
+          contractId: 'supervision_cron_control_v2',
+          version: 2,
+          scheduleId: 'bounded-job',
+          constraints: { authorization: 'user_authorized_scheduled_execution' },
+        },
       },
     });
   });
@@ -303,7 +495,7 @@ describe('CronManager', () => {
     expect(expiresInput.value).toBe(expectedDateTimeLocalValue(expiresAt));
   });
 
-  it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
+  it('allows cron commands below 5000 chars and blocks longer inline commands with a file-reference hint', async () => {
     apiFetch.mockResolvedValueOnce({ jobs: [] });
 
     render(
@@ -329,15 +521,21 @@ describe('CronManager', () => {
     const cronExprInput = screen.getByPlaceholderText('0 9 * * 1-5') as HTMLInputElement;
     fireEvent.input(cronExprInput, { target: { value: '0 9 * * *' } });
 
-    const textarea = screen.getByPlaceholderText('cron.command_placeholder') as HTMLTextAreaElement;
-    const longCommand = '早上好主人！'.repeat(260);
+    const textarea = screen.getByPlaceholderText('cron.send_message_placeholder') as HTMLTextAreaElement;
+    const allowedCommand = '早上好主人！'.repeat(500);
+    fireEvent.input(textarea, { target: { value: allowedCommand } });
+
+    expect(screen.getByText('3000/5000')).toBeDefined();
+    expect(screen.queryByText(/Too long for inline entry/)).toBeNull();
+
+    const longCommand = '早上好主人！'.repeat(850);
     fireEvent.input(textarea, { target: { value: longCommand } });
 
-    expect(screen.getByText('1560/1500 · Too long for inline entry. Write it to a file and reference it with @/path/to/file.')).toBeDefined();
+    expect(screen.getByText('5100/5000 · Too long for inline entry. Write it to a file and reference it with @/path/to/file.')).toBeDefined();
 
     fireEvent.click(screen.getByText('cron.save'));
 
-    expect(screen.getByText('Command is too long (1560/1500). Write the prompt to a file and reference it directly with @/path/to/file.')).toBeDefined();
+    expect(screen.getByText('Command is too long (5100/5000). Write the prompt to a file and reference it directly with @/path/to/file.')).toBeDefined();
     expect(apiFetch).toHaveBeenCalledTimes(1);
   });
 
@@ -404,8 +602,10 @@ describe('CronManager', () => {
     fireEvent.click(screen.getByTitle('cron.create'));
 
     expect(screen.queryByLabelText('cron.action_p2p')).toBeNull();
-    expect(screen.getByLabelText('cron.action_command')).toBeDefined();
-    expect(screen.getByLabelText('common.send')).toBeDefined();
+    expect(screen.queryByLabelText('cron.action_command')).toBeNull();
+    expect(screen.queryByLabelText('common.send')).toBeNull();
+    expect(screen.getByPlaceholderText('cron.send_message_placeholder')).toBeDefined();
+    expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();
     expect(screen.queryByPlaceholderText('cron.p2p_topic_placeholder')).toBeNull();
   });
 
@@ -449,6 +649,8 @@ describe('CronManager', () => {
       method: 'PUT',
       body: expect.stringContaining('"topic":"Updated topic"'),
     }));
+    const updateCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron/edit-job');
+    expect(JSON.parse(String(updateCall?.[1]?.body)).timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
   it('opens job history, execution details, p2p discussions, and session navigation links', async () => {
@@ -489,8 +691,75 @@ describe('CronManager', () => {
     fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
     const detailPreview = await screen.findByText((_text, node) => node?.textContent === '## Result\nLine one');
     fireEvent.click(detailPreview);
+    expect(screen.getByText('cron.final_output')).toBeDefined();
     fireEvent.click(screen.getAllByText('cron.go_and_quote →').at(-1)!);
     expect(onNavigateSession).toHaveBeenCalledWith('deck_cd_brain', '## Result\nLine one');
+  });
+
+  it('keeps execution prompts to a compact one-line summary', async () => {
+    const longPrompt = `Inspect the deployment and summarize only the final result ${'without showing this repeated context '.repeat(8)}`;
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-compact', name: 'Compact prompt job' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'compact-1',
+          job_id: 'job-compact',
+          job_name: 'Compact prompt job',
+          server_id: 'srv-current',
+          project_name: 'cd',
+          cron_expr: '0 9 * * *',
+          target_role: 'brain',
+          target_session_name: null,
+          action: JSON.stringify({ type: 'command', command: longPrompt }),
+          status: 'dispatched',
+          detail: 'Final result only',
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Compact prompt job')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history')[0]);
+    await screen.findByText('Final result only');
+
+    expect(screen.queryByText(longPrompt)).toBeNull();
+    expect(screen.getByText((text) => text.startsWith('Inspect the deployment') && text.endsWith('…'))).toBeDefined();
+  });
+
+  it('shows only the latest snapshot for legacy cumulative execution output', async () => {
+    const snapshots = ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'];
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'legacy-stream', name: 'Legacy stream' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'legacy-stream-exec',
+          status: 'dispatched',
+          detail: snapshots.join('\n'),
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Legacy stream')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
+    expect(await screen.findByText(snapshots.at(-1)!)).toBeDefined();
+    expect(screen.queryByText(snapshots.join('\n'))).toBeNull();
   });
 
   it('loads cross-job executions and switches latest/all modes across servers', async () => {
@@ -616,4 +885,155 @@ describe('CronManager', () => {
 
     expect(await screen.findByText('MCP job')).toBeDefined();
   });
+
+  it('renders onlyWhenIdle badge for send action when enabled explicitly or inferred from short interval', async () => {
+    apiFetch.mockResolvedValueOnce({
+      jobs: [
+        cronJob({
+          id: 'job-send-short',
+          name: 'Short send job',
+          cron_expr: '*/5 * * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check' }),
+        }),
+        cronJob({
+          id: 'job-send-explicit-false',
+          name: 'Send explicit false',
+          cron_expr: '*/5 * * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check', onlyWhenIdle: false }),
+        }),
+        cronJob({
+          id: 'job-send-explicit-true',
+          name: 'Send explicit true',
+          cron_expr: '0 9 * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check', onlyWhenIdle: true }),
+        }),
+      ],
+    });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Short send job')).toBeDefined();
+    expect(screen.getByText('Send explicit false')).toBeDefined();
+    expect(screen.getByText('Send explicit true')).toBeDefined();
+
+    // 2 badges rendered (Short send job inferred + Send explicit true)
+    const badges = screen.getAllByText('cron.only_when_idle_badge');
+    expect(badges.length).toBe(2);
+  });
+
+  it('displays creator/maintainer provenance across task cards, history, detail, and edit panels and degrades cleanly when omitted', async () => {
+    const clipboardWrite = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: clipboardWrite },
+      configurable: true,
+    });
+
+    apiFetch
+      .mockResolvedValueOnce({
+        jobs: [
+          cronJob({
+            id: 'job-owner',
+            name: 'Owner Created Cron',
+            creator_user_id: 'usr-owner',
+            creator_name: 'Alice Owner',
+            creator_is_shared: false,
+          }),
+          cronJob({
+            id: 'job-participant',
+            name: 'Participant Created Cron',
+            creator_user_id: 'usr-part',
+            creator_name: 'Bob Participant',
+            creator_is_shared: true,
+          }),
+          cronJob({
+            id: 'job-legacy',
+            name: 'Legacy No Creator Cron',
+          }),
+        ],
+      })
+      .mockResolvedValueOnce({
+        executions: [
+          {
+            id: 'exec-part-1',
+            status: 'dispatched',
+            detail: 'Detailed cron execution output body',
+            created_at: Date.now(),
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        executions: [
+          {
+            id: 'cross-exec-1',
+            job_id: 'job-participant',
+            job_name: 'Participant Created Cron',
+            server_id: 'srv-current',
+            project_name: 'cd',
+            cron_expr: '0 9 * * *',
+            target_role: 'brain',
+            target_session_name: null,
+            action: JSON.stringify({ type: 'command', command: 'hello' }),
+            status: 'dispatched',
+            detail: 'Cross execution output',
+            created_at: Date.now(),
+            creator_user_id: 'usr-part',
+            creator_name: 'Bob Participant',
+            creator_is_shared: true,
+          },
+        ],
+      });
+
+    const { container } = render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Owner Created Cron')).toBeDefined();
+    expect(screen.getByText('Alice Owner')).toBeDefined();
+    expect(screen.getByText('cron.creator_owner')).toBeDefined();
+    expect(screen.getByText('Bob Participant')).toBeDefined();
+    expect(screen.getByText('cron.creator_participant')).toBeDefined();
+    expect(screen.getByText('Legacy No Creator Cron')).toBeDefined();
+    expect(container.textContent).not.toContain('undefined');
+
+    // Open edit panel for participant job -> edit form header displays creator provenance
+    const editButtons = screen.getAllByText('✎');
+    fireEvent.click(editButtons[1]);
+    expect(await screen.findByText('cron.last_modified_by:')).toBeDefined();
+    fireEvent.click(screen.getByText('cron.cancel'));
+
+    // Open job history -> summary header + detail view show creator and copy button works
+    const historyButtons = screen.getAllByText('cron.history');
+    // historyButtons[0] is the top tab button; task card buttons follow in order
+    fireEvent.click(historyButtons[2]);
+    expect(await screen.findByText('Detailed cron execution output body')).toBeDefined();
+    expect(screen.getAllByText('Bob Participant').length).toBeGreaterThanOrEqual(2);
+
+    fireEvent.click(screen.getByText('Detailed cron execution output body'));
+    expect(await screen.findByText('cron.final_output')).toBeDefined();
+    expect(screen.getAllByText('Bob Participant').length).toBeGreaterThanOrEqual(3);
+
+    fireEvent.click(screen.getByText('cron.copy_output'));
+    expect(clipboardWrite).toHaveBeenCalledWith('Detailed cron execution output body');
+    expect(screen.getByText('cron.copied')).toBeDefined();
+
+    // Switch to cross-job history tab -> execution card displays creator
+    fireEvent.click(historyButtons[0]);
+    expect(await screen.findByText('Cross execution output')).toBeDefined();
+    expect(screen.getAllByText('Bob Participant').length).toBeGreaterThanOrEqual(1);
+  });
 });
+

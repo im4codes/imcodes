@@ -20,13 +20,24 @@ import { useEffect, useState } from 'preact/hooks';
 import type { WsClient, ServerMessage } from './ws-client.js';
 
 export type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
+export type SharedChangesMeta = { totalCount: number; truncated: boolean };
 export type SharedChangesListener = (files: ChangeFile[]) => void;
+export type SharedChangesMetaListener = (meta: SharedChangesMeta) => void;
+export type SharedChangesRequestStatus = 'idle' | 'refreshing' | 'success' | 'error';
+export type SharedChangesStatusListener = (status: SharedChangesRequestStatus) => void;
 
 interface SharedChangesEntry {
   repoPath: string;
   files: ChangeFile[];
+  totalCount: number;
+  truncated: boolean;
   updatedAt: number;
+  /** Timestamp of the most recent full (non-summaryOnly) file list settlement. */
+  fullFilesUpdatedAt: number;
+  /** Timestamp of the most recent summary or full settlement (for badge TTL). */
+  summaryUpdatedAt: number;
   inFlightRequestId: string | null;
+  inFlightSummaryOnly: boolean;
   /** Wall-clock timestamp when `inFlightRequestId` was set — used to detect
    *  stuck requests whose response never arrived (WS drop, daemon restart,
    *  serverLink.send throw, etc.). Without this, a dropped response would
@@ -34,27 +45,41 @@ interface SharedChangesEntry {
    *  would silently take the "queued & return" branch. */
   inFlightStartedAt: number;
   queued: boolean;
+  queuedNeedsFull: boolean;
   listeners: Set<SharedChangesListener>;
+  metaListeners: Set<SharedChangesMetaListener>;
+  status: SharedChangesRequestStatus;
+  statusListeners: Set<SharedChangesStatusListener>;
   ws: WsClient | null;
+  sessionName?: string;
+  serverId?: string | null;
 }
 
 export const SHARED_CHANGES_TTL_MS = 5_000;
 /** If no response comes back for this long, treat the in-flight request as
  *  lost and fire a new one instead of queuing behind it forever. */
 export const SHARED_CHANGES_INFLIGHT_TIMEOUT_MS = 15_000;
+export const SHARED_CHANGES_MAX_ENTRIES = 30;
 
 const sharedChangesByKey = new Map<string, SharedChangesEntry>();
-const sharedChangesRequestKey = new Map<string, string>();
+const sharedChangesRequestMeta = new Map<string, { key: string; summaryOnly: boolean; serverId?: string | null }>();
 const checkoutRefreshGenerationByKey = new Map<string, number>();
 const wsIds = new WeakMap<WsClient, number>();
 const wsBridges = new WeakMap<WsClient, () => void>();
 let nextWsId = 1;
 
+export function clearSharedChangesCache(): void {
+  for (const entry of sharedChangesByKey.values()) {
+    entry.ws = null;
+  }
+  sharedChangesByKey.clear();
+  sharedChangesRequestMeta.clear();
+  checkoutRefreshGenerationByKey.clear();
+}
+
 /** Test-only reset. WeakMaps can't be cleared, but they're GC'd with the ws. */
 export function __resetSharedChangesForTests(): void {
-  sharedChangesByKey.clear();
-  sharedChangesRequestKey.clear();
-  checkoutRefreshGenerationByKey.clear();
+  clearSharedChangesCache();
   nextWsId = 1;
 }
 
@@ -67,36 +92,99 @@ function getWsId(ws: WsClient): number {
   return id;
 }
 
-export function getSharedChangesKey(ws: WsClient, repoPath: string): string {
-  return `${getWsId(ws)}::${repoPath}`;
+export function getSharedChangesKey(
+  ws: WsClient,
+  repoPath: string,
+  serverId?: string | null,
+  sessionName?: string | null,
+): string {
+  const trimmedServer = serverId?.trim();
+  const trimmedSession = sessionName?.trim();
+  const wsOrServer = trimmedServer ? `srv:${trimmedServer}` : `${getWsId(ws)}`;
+  return trimmedSession
+    ? `${wsOrServer}::ses:${trimmedSession}::${repoPath}`
+    : `${wsOrServer}::${repoPath}`;
+}
+
+function touchSharedEntry(key: string, entry: SharedChangesEntry): void {
+  sharedChangesByKey.delete(key);
+  sharedChangesByKey.set(key, entry);
+}
+
+function evictUnusedSharedEntries(): void {
+  if (sharedChangesByKey.size <= SHARED_CHANGES_MAX_ENTRIES) return;
+  for (const [candidateKey, candidate] of sharedChangesByKey) {
+    if (sharedChangesByKey.size <= SHARED_CHANGES_MAX_ENTRIES) break;
+    if (
+      candidate.listeners.size === 0
+      && candidate.metaListeners.size === 0
+      && candidate.statusListeners.size === 0
+      && !candidate.inFlightRequestId
+    ) {
+      candidate.ws = null;
+      sharedChangesByKey.delete(candidateKey);
+    }
+  }
 }
 
 function getEntry(key: string): SharedChangesEntry {
   let entry = sharedChangesByKey.get(key);
-  if (!entry) {
-    entry = {
-      repoPath: '',
-      files: [],
-      updatedAt: 0,
-      inFlightRequestId: null,
-      inFlightStartedAt: 0,
-      queued: false,
-      listeners: new Set(),
-      ws: null,
-    };
-    sharedChangesByKey.set(key, entry);
+  if (entry) {
+    touchSharedEntry(key, entry);
+    return entry;
   }
+  entry = {
+    repoPath: '',
+    files: [],
+    totalCount: 0,
+    truncated: false,
+    updatedAt: 0,
+    fullFilesUpdatedAt: 0,
+    summaryUpdatedAt: 0,
+    inFlightRequestId: null,
+    inFlightSummaryOnly: false,
+    inFlightStartedAt: 0,
+    queued: false,
+    queuedNeedsFull: false,
+    listeners: new Set(),
+    metaListeners: new Set(),
+    status: 'idle',
+    statusListeners: new Set(),
+    ws: null,
+  };
+  sharedChangesByKey.set(key, entry);
+  evictUnusedSharedEntries();
   return entry;
 }
 
+function cleanupEntryIfUnused(key: string, entry: SharedChangesEntry): void {
+  if (
+    entry.listeners.size === 0
+    && entry.metaListeners.size === 0
+    && entry.statusListeners.size === 0
+    && !entry.inFlightRequestId
+  ) {
+    entry.ws = null;
+    entry.queued = false;
+    entry.queuedNeedsFull = false;
+    if (entry.fullFilesUpdatedAt === 0 && entry.summaryUpdatedAt === 0) {
+      sharedChangesByKey.delete(key);
+    } else {
+      touchSharedEntry(key, entry);
+      evictUnusedSharedEntries();
+    }
+  }
+}
+
 /** Drop a stuck in-flight request so a fresh one can replace it. Safe to call
- *  even if nothing is in flight. The matching entry in `sharedChangesRequestKey`
+ *  even if nothing is in flight. The matching entry in `sharedChangesRequestMeta`
  *  is also removed, so a late-arriving response with the abandoned id becomes
  *  a no-op in `settleSharedChangesRequest`. */
 function abandonInFlight(entry: SharedChangesEntry): void {
   if (!entry.inFlightRequestId) return;
-  sharedChangesRequestKey.delete(entry.inFlightRequestId);
+  sharedChangesRequestMeta.delete(entry.inFlightRequestId);
   entry.inFlightRequestId = null;
+  entry.inFlightSummaryOnly = false;
   entry.inFlightStartedAt = 0;
 }
 
@@ -107,97 +195,228 @@ function isWebSocketNotConnectedError(error: unknown): boolean {
 export function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
   const entry = getEntry(key);
   entry.listeners.add(listener);
-  if (entry.updatedAt > 0) listener(entry.files);
+  if (entry.fullFilesUpdatedAt > 0) listener(entry.files);
   return () => {
     const current = sharedChangesByKey.get(key);
     if (!current) return;
     current.listeners.delete(listener);
-    if (current.listeners.size === 0 && !current.inFlightRequestId) {
-      sharedChangesByKey.delete(key);
-    }
+    cleanupEntryIfUnused(key, current);
   };
 }
 
-function publish(key: string, files: ChangeFile[]): void {
+export function subscribeSharedChangesMeta(key: string, listener: SharedChangesMetaListener): () => void {
   const entry = getEntry(key);
-  entry.files = files;
-  entry.updatedAt = Date.now();
-  for (const listener of entry.listeners) listener(files);
+  entry.metaListeners.add(listener);
+  if (entry.summaryUpdatedAt > 0 || entry.fullFilesUpdatedAt > 0) {
+    listener({ totalCount: entry.totalCount, truncated: entry.truncated });
+  }
+  return () => {
+    const current = sharedChangesByKey.get(key);
+    if (!current) return;
+    current.metaListeners.delete(listener);
+    cleanupEntryIfUnused(key, current);
+  };
 }
 
-export function requestSharedChanges(ws: WsClient, repoPath: string, force = false): void {
-  const key = getSharedChangesKey(ws, repoPath);
+/** Subscribe to real request settlement so controls can show useful feedback.
+ * A newly mounted listener only receives an existing in-flight state; settled
+ * success/error states belong to the interaction that observed them and must
+ * not flash again when another FileBrowser opens later. */
+export function subscribeSharedChangesStatus(key: string, listener: SharedChangesStatusListener): () => void {
+  const entry = getEntry(key);
+  entry.statusListeners.add(listener);
+  if (entry.status === 'refreshing') listener(entry.status);
+  return () => {
+    const current = sharedChangesByKey.get(key);
+    if (!current) return;
+    current.statusListeners.delete(listener);
+    cleanupEntryIfUnused(key, current);
+  };
+}
+
+function publishStatus(key: string, status: SharedChangesRequestStatus): void {
+  const entry = getEntry(key);
+  entry.status = status;
+  for (const listener of entry.statusListeners) listener(status);
+}
+
+function publishMeta(key: string, meta: SharedChangesMeta): void {
+  const entry = getEntry(key);
+  entry.totalCount = meta.totalCount;
+  entry.truncated = meta.truncated;
+  for (const listener of entry.metaListeners) listener(meta);
+}
+
+function publish(key: string, files: ChangeFile[], meta?: SharedChangesMeta): void {
+  const entry = getEntry(key);
+  const now = Date.now();
+  entry.files = files;
+  entry.updatedAt = now;
+  entry.fullFilesUpdatedAt = now;
+  entry.summaryUpdatedAt = now;
+  for (const listener of entry.listeners) listener(files);
+  publishMeta(key, meta ?? { totalCount: files.length, truncated: false });
+}
+
+function requestSharedChangesInternal(
+  ws: WsClient,
+  repoPath: string,
+  force: boolean,
+  sessionName: string | undefined,
+  preferSummaryOnly: boolean,
+  serverId?: string | null,
+): void {
+  const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
   const entry = getEntry(key);
   entry.ws = ws;
   entry.repoPath = repoPath;
+  if (sessionName !== undefined) entry.sessionName = sessionName;
+  if (serverId !== undefined) entry.serverId = serverId;
   ensureWsBridge(ws);
-  const fresh = entry.updatedAt > 0 && (Date.now() - entry.updatedAt) < SHARED_CHANGES_TTL_MS;
+
+  // If any full-list consumer (e.g. FileBrowser) is subscribed, upgrade summary polls to full list.
+  const wantsFullList = !preferSummaryOnly || entry.listeners.size > 0;
+  const summaryOnly = !wantsFullList;
+  const now = Date.now();
+  const latestMetaAt = Math.max(entry.fullFilesUpdatedAt, entry.summaryUpdatedAt);
+  const fresh = wantsFullList
+    ? (entry.fullFilesUpdatedAt > 0 && (now - entry.fullFilesUpdatedAt) < SHARED_CHANGES_TTL_MS)
+    : (latestMetaAt > 0 && (now - latestMetaAt) < SHARED_CHANGES_TTL_MS);
+
   if (!force && fresh) {
-    publish(key, entry.files);
+    if (wantsFullList) {
+      publish(key, entry.files, { totalCount: entry.totalCount, truncated: entry.truncated });
+    } else {
+      publishMeta(key, { totalCount: entry.totalCount, truncated: entry.truncated });
+    }
     return;
   }
   // Sweep stuck in-flight requests so a dropped response can't pin the entry
   // in "queued" mode forever. `force` is user-initiated (refresh button) and
-  // always wins over a pending request; non-force paths (30s poll, mount
-  // subscribes) bail out quickly if an in-flight request is still within the
-  // timeout window.
+  // always wins over a pending request; a full-list consumer also supersedes an
+  // in-flight `summaryOnly` request immediately so FileBrowser doesn't wait.
   if (entry.inFlightRequestId) {
     const stale = entry.inFlightStartedAt > 0
-      && (Date.now() - entry.inFlightStartedAt) > SHARED_CHANGES_INFLIGHT_TIMEOUT_MS;
-    if (force || stale) {
+      && (now - entry.inFlightStartedAt) > SHARED_CHANGES_INFLIGHT_TIMEOUT_MS;
+    if (force || stale || (wantsFullList && entry.inFlightSummaryOnly)) {
       abandonInFlight(entry);
     } else {
       entry.queued = true;
+      if (wantsFullList) entry.queuedNeedsFull = true;
       return;
     }
   }
+  if (ws.connected === false) {
+    entry.queued = true;
+    if (wantsFullList) entry.queuedNeedsFull = true;
+    return;
+  }
   let requestId: string;
   try {
-    requestId = ws.fsGitStatus(repoPath, { includeStats: true });
+    requestId = ws.fsGitStatus(
+      repoPath,
+      summaryOnly
+        ? (entry.sessionName ? { summaryOnly: true, sessionName: entry.sessionName } : { summaryOnly: true })
+        : (entry.sessionName ? { includeStats: true, sessionName: entry.sessionName } : { includeStats: true }),
+    );
   } catch (error) {
-    if (!isWebSocketNotConnectedError(error)) throw error;
     entry.queued = false;
+    entry.queuedNeedsFull = false;
+    publishStatus(key, 'error');
+    if (!isWebSocketNotConnectedError(error)) throw error;
     return;
   }
   entry.inFlightRequestId = requestId;
+  entry.inFlightSummaryOnly = summaryOnly;
   entry.inFlightStartedAt = Date.now();
   entry.queued = false;
-  sharedChangesRequestKey.set(requestId, key);
+  entry.queuedNeedsFull = false;
+  sharedChangesRequestMeta.set(requestId, { key, summaryOnly, serverId });
+  publishStatus(key, 'refreshing');
+}
+
+export function requestSharedChanges(
+  ws: WsClient,
+  repoPath: string,
+  force = false,
+  sessionName?: string,
+  serverId?: string | null,
+): void {
+  requestSharedChangesInternal(ws, repoPath, force, sessionName, false, serverId);
+}
+
+/** Lightweight count-only refresh used by folder badges when no list consumer is active. */
+export function requestSharedChangesCount(
+  ws: WsClient,
+  repoPath: string,
+  force = false,
+  sessionName?: string,
+  serverId?: string | null,
+): void {
+  requestSharedChangesInternal(ws, repoPath, force, sessionName, true, serverId);
 }
 
 export function forceRefreshSharedChangesForCheckout(
   ws: WsClient,
   repoPath: string,
   repoGeneration?: number,
+  sessionName?: string,
+  serverId?: string | null,
 ): void {
-  const key = getSharedChangesKey(ws, repoPath);
+  const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
   if (typeof repoGeneration === 'number' && Number.isFinite(repoGeneration)) {
     if (checkoutRefreshGenerationByKey.get(key) === repoGeneration) return;
     checkoutRefreshGenerationByKey.set(key, repoGeneration);
   }
-  requestSharedChanges(ws, repoPath, true);
+  requestSharedChanges(ws, repoPath, true, sessionName, serverId);
 }
 
-export function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {
-  const key = sharedChangesRequestKey.get(requestId);
-  if (!key) return false;
-  sharedChangesRequestKey.delete(requestId);
+export function settleSharedChangesRequest(
+  requestId: string,
+  files: ChangeFile[] | null,
+  meta?: { totalCount?: number; truncated?: boolean },
+): boolean {
+  const requestMeta = sharedChangesRequestMeta.get(requestId);
+  if (!requestMeta) return false;
+  sharedChangesRequestMeta.delete(requestId);
+  const { key, summaryOnly } = requestMeta;
   const entry = sharedChangesByKey.get(key);
   if (!entry) return true;
   // Only clear in-flight tracking when this response matches the current
   // request. A force-refresh may have already kicked off a newer request
-  // with a different id; in that case we still publish the fresh files (no
+  // with a different id; in that case we still publish the fresh data (no
   // reason to discard perfectly good data) but must NOT null out the newer
   // request's in-flight state.
   if (entry.inFlightRequestId === requestId) {
     entry.inFlightRequestId = null;
+    entry.inFlightSummaryOnly = false;
     entry.inFlightStartedAt = 0;
   }
-  if (files) publish(key, files);
-  if (entry.queued && entry.ws && !entry.inFlightRequestId) {
-    entry.queued = false;
-    requestSharedChanges(entry.ws, entry.repoPath, true);
+  if (files) {
+    const resolvedTotalCount = typeof meta?.totalCount === 'number' && Number.isFinite(meta.totalCount)
+      ? meta.totalCount
+      : files.length;
+    const resolvedTruncated = typeof meta?.truncated === 'boolean' ? meta.truncated : false;
+    if (summaryOnly) {
+      // Summary-only responses carry `files: []` by design; never overwrite
+      // `entry.files` or `fullFilesUpdatedAt` so FileBrowser list consumers
+      // never see a summary response as a full file list.
+      entry.summaryUpdatedAt = Date.now();
+      publishMeta(key, { totalCount: resolvedTotalCount, truncated: resolvedTruncated });
+    } else {
+      publish(key, files, { totalCount: resolvedTotalCount, truncated: resolvedTruncated });
+    }
+    publishStatus(key, 'success');
+  } else {
+    publishStatus(key, 'error');
   }
+  if (entry.queued && entry.ws && !entry.inFlightRequestId) {
+    const needsFull = entry.queuedNeedsFull || entry.listeners.size > 0;
+    entry.queued = false;
+    entry.queuedNeedsFull = false;
+    requestSharedChangesInternal(entry.ws, entry.repoPath, true, entry.sessionName, !needsFull, requestMeta.serverId);
+  }
+  cleanupEntryIfUnused(key, entry);
   return true;
 }
 
@@ -208,11 +427,32 @@ export function settleSharedChangesRequest(requestId: string, files: ChangeFile[
 function ensureWsBridge(ws: WsClient): void {
   if (wsBridges.has(ws)) return;
   const unsub = ws.onMessage((msg: ServerMessage) => {
+    if (msg.type === 'session.event' && (msg as { event?: string }).event === 'connected') {
+      for (const entry of sharedChangesByKey.values()) {
+        if (entry.ws === ws && entry.queued && !entry.inFlightRequestId && entry.repoPath) {
+          const needsFull = entry.queuedNeedsFull || entry.listeners.size > 0;
+          entry.queued = false;
+          entry.queuedNeedsFull = false;
+          requestSharedChangesInternal(ws, entry.repoPath, false, entry.sessionName, !needsFull, entry.serverId);
+        }
+      }
+      return;
+    }
     if (msg.type !== 'fs.git_status_response') return;
-    const requestId = (msg as { requestId?: string }).requestId;
+    const response = msg as {
+      requestId?: string;
+      status?: string;
+      files?: ChangeFile[];
+      totalCount?: number;
+      truncated?: boolean;
+    };
+    const requestId = response.requestId;
     if (!requestId) return;
-    const files = msg.status === 'ok' ? ((msg.files as ChangeFile[] | undefined) ?? null) : null;
-    settleSharedChangesRequest(requestId, files);
+    const files = response.status === 'ok' ? (response.files ?? null) : null;
+    settleSharedChangesRequest(requestId, files, {
+      totalCount: response.totalCount,
+      truncated: response.truncated,
+    });
   });
   wsBridges.set(ws, unsub);
 }
@@ -224,25 +464,68 @@ function ensureWsBridge(ws: WsClient): void {
 export function useSharedGitChanges(
   ws: WsClient | null,
   repoPath: string | null | undefined,
-  opts: { pollMs?: number } = {},
+  opts: { pollMs?: number; serverId?: string | null; sessionName?: string | null } = {},
 ): ChangeFile[] {
-  const { pollMs = 30_000 } = opts;
-  const [files, setFiles] = useState<ChangeFile[]>([]);
+  const { pollMs = 30_000, serverId = null, sessionName = null } = opts;
+  const [files, setFiles] = useState<ChangeFile[]>(() => {
+    if (!ws || !repoPath) return [];
+    const entry = sharedChangesByKey.get(getSharedChangesKey(ws, repoPath, serverId, sessionName));
+    return entry && entry.fullFilesUpdatedAt > 0 ? entry.files : [];
+  });
 
   useEffect(() => {
     if (!ws || !repoPath) {
       setFiles([]);
       return;
     }
-    const key = getSharedChangesKey(ws, repoPath);
+    const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
+    const cached = sharedChangesByKey.get(key);
+    if (!cached || cached.fullFilesUpdatedAt === 0) {
+      setFiles([]);
+    }
     const unsub = subscribeSharedChanges(key, (next) => setFiles(next));
-    requestSharedChanges(ws, repoPath);
-    const timer = pollMs > 0 ? setInterval(() => requestSharedChanges(ws, repoPath), pollMs) : null;
+    requestSharedChanges(ws, repoPath, false, sessionName ?? undefined, serverId);
+    const timer = pollMs > 0 ? setInterval(() => requestSharedChanges(ws, repoPath, false, sessionName ?? undefined, serverId), pollMs) : null;
     return () => {
       unsub();
       if (timer) clearInterval(timer);
     };
-  }, [ws, repoPath, pollMs]);
+  }, [ws, repoPath, pollMs, serverId, sessionName]);
 
   return files;
+}
+
+/** Lightweight React hook for badge counters: uses `summaryOnly` when no list consumer is mounted, while still displaying exact `totalCount`. */
+export function useSharedGitChangesCount(
+  ws: WsClient | null,
+  repoPath: string | null | undefined,
+  opts: { pollMs?: number; serverId?: string | null; sessionName?: string | null } = {},
+): number {
+  const { pollMs = 30_000, serverId = null, sessionName = null } = opts;
+  const [totalCount, setTotalCount] = useState<number>(() => {
+    if (!ws || !repoPath) return 0;
+    const entry = sharedChangesByKey.get(getSharedChangesKey(ws, repoPath, serverId, sessionName));
+    return entry && (entry.summaryUpdatedAt > 0 || entry.fullFilesUpdatedAt > 0) ? entry.totalCount : 0;
+  });
+
+  useEffect(() => {
+    if (!ws || !repoPath) {
+      setTotalCount(0);
+      return;
+    }
+    const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
+    const cached = sharedChangesByKey.get(key);
+    if (!cached || (cached.summaryUpdatedAt === 0 && cached.fullFilesUpdatedAt === 0)) {
+      setTotalCount(0);
+    }
+    const unsub = subscribeSharedChangesMeta(key, (meta) => setTotalCount(meta.totalCount));
+    requestSharedChangesCount(ws, repoPath, false, sessionName ?? undefined, serverId);
+    const timer = pollMs > 0 ? setInterval(() => requestSharedChangesCount(ws, repoPath, false, sessionName ?? undefined, serverId), pollMs) : null;
+    return () => {
+      unsub();
+      if (timer) clearInterval(timer);
+    };
+  }, [ws, repoPath, pollMs, serverId, sessionName]);
+
+  return totalCount;
 }

@@ -9,11 +9,9 @@
  *   4. $TMUX_PANE — query tmux for the session name of that pane
  */
 
-import { execFile as execFileCb } from 'child_process';
-import { promisify } from 'util';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { execFileOffMain as execFile } from './exec-helper.js';
 
-const execFile = promisify(execFileCb);
 
 /**
  * Detect the current session name from the environment.

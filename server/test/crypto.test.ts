@@ -93,4 +93,9 @@ describe('timingSafeEqual', () => {
   it('returns false for different length strings', () => {
     expect(timingSafeEqual('abc', 'abcd')).toBe(false);
   });
+
+  it('compares UTF-8 byte lengths safely for equal-char-length multibyte strings without throwing', () => {
+    expect(timingSafeEqual('aé', 'ab')).toBe(false);
+    expect(timingSafeEqual('café', 'café')).toBe(true);
+  });
 });

@@ -1,0 +1,293 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type WebSocket from 'ws';
+import { REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_MSG, REMOTE_DESKTOP_PROTOCOL_VERSION, REMOTE_DESKTOP_TERMINAL_REASON } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { createDatabase, type Database } from '../src/db/client.js';
+import { runMigrations } from '../src/db/migrate.js';
+import { createServer, createUser } from '../src/db/queries.js';
+import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
+import { createOrUpdateShare } from '../src/db/tab-sharing.js';
+import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
+import { resolveServerWebSocketAccess } from '../src/security/authorization.js';
+
+const hex = (bytes: number) => randomBytes(bytes).toString('hex');
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+let db: Database;
+
+beforeAll(async () => {
+  db = createDatabase(process.env.TEST_DATABASE_URL!);
+  await runMigrations(db);
+});
+
+afterAll(async () => { await db.close(); });
+
+/** Live group read coverage is independent of a controlled node's direct share authorization. */
+async function seedDesk(ownerId: string): Promise<string> {
+  const teamId = `rd-desk-${ownerId}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, 'AI Desk', $2, 'free', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  return teamId;
+}
+
+async function createControlledNode(ownerId: string): Promise<string> {
+  const serverId = `rd-ctl-${hex(6)}`;
+  const teamId = await seedDesk(ownerId);
+  await db.execute(
+    `INSERT INTO servers
+       (id, user_id, name, token_hash, status, created_at, last_heartbeat_at,
+        node_role, exec_enabled, revoked_at, ref_name, display_name, os,
+        controlled_capabilities, node_id, team_id)
+     VALUES ($1,$2,'remote-desktop',$3,'online',$4,$4,$5,true,NULL,$6,
+             'Remote desktop test','win',$7::jsonb,$8,$9)`,
+    [
+      serverId,
+      ownerId,
+      sha256(hex(16)),
+      Date.now(),
+      NODE_ROLE.CONTROLLED,
+      `rd-ref-${hex(4)}`,
+      JSON.stringify([REMOTE_DESKTOP_CAPABILITY]),
+      generateControlledNodeId(),
+      teamId,
+    ],
+  );
+  await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
+  return serverId;
+}
+
+async function grant(
+  ownerId: string,
+  recipientId: string,
+  serverId: string,
+  role: 'viewer' | 'participant',
+  expiresAt: number | null = null,
+) {
+  // The recipient is deliberately NOT put in the machine's team. Team
+  // membership is a grant in its own right, so adding it here would keep the
+  // session alive after this share is downgraded or expires -- and downgrade
+  // and expiry are exactly what these tests exist to prove.
+  return createOrUpdateShare(db, {
+    id: `rd-share-${hex(8)}`,
+    target: { kind: 'server', serverId },
+    targetUserId: recipientId,
+    role,
+    createdBy: ownerId,
+    expiresAt,
+    now: Date.now(),
+  });
+}
+
+function fixture(serverId: string) {
+  const daemonMessages: Array<Record<string, unknown>> = [];
+  const browserMessages = new Map<WebSocket, Array<Record<string, unknown>>>();
+  const router = new RemoteDesktopRouter({
+    serverId: () => serverId,
+    database: () => db,
+    daemonAvailable: () => true,
+    daemonSupportsRemoteDesktop: () => true,
+    daemonRemoteDesktopCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
+    featureEnabled: () => true,
+    daemonGeneration: () => 7,
+    iceServers: () => ({ iceServers: [] }),
+    sendDaemon: (message, generation) => {
+      if (generation !== 7) return false;
+      daemonMessages.push(message);
+      return true;
+    },
+    sendBrowser: (socket, message) => {
+      const current = browserMessages.get(socket) ?? [];
+      current.push(message);
+      browserMessages.set(socket, current);
+    },
+  });
+  return {
+    router,
+    daemonMessages,
+    messages: (socket: WebSocket) => browserMessages.get(socket) ?? [],
+  };
+}
+
+async function start(
+  f: ReturnType<typeof fixture>,
+  userId: string,
+  socket: WebSocket,
+): Promise<Record<string, unknown>> {
+  const requestId = `request-${hex(12)}`;
+  await f.router.handleBrowser(socket, userId, {
+    type: REMOTE_DESKTOP_MSG.START,
+    protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+    requestId,
+  });
+  return f.messages(socket).at(-1)!;
+}
+
+describe('remote desktop real-PostgreSQL authorization and teardown', () => {
+  it('uses the same shared host authority for account WebSocket tickets and signaling', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const directId = `rd-direct-${hex(5)}`;
+    const groupId = `rd-group-${hex(5)}`;
+    const viewerId = `rd-viewer-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, directId), createUser(db, groupId), createUser(db, viewerId)]);
+    const serverId = await createControlledNode(ownerId);
+    await grant(ownerId, directId, serverId, 'participant');
+    await grant(ownerId, viewerId, serverId, 'viewer');
+    const teamId = await seedDesk(ownerId);
+    await db.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)',
+      [teamId, groupId, 'member', Date.now()],
+    );
+    await db.execute(
+      'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)',
+      [serverId, teamId, Date.now()],
+    );
+
+    // This is the exact account-ticket gate used before the browser reaches
+    // RemoteDesktopRouter. Owner, participant and read-only Viewer shares,
+    // plus group members, cross it; an unrelated account must not.
+    await expect(resolveServerWebSocketAccess(db, serverId, ownerId)).resolves.toMatchObject({ kind: 'controlled', role: 'owner' });
+    await expect(resolveServerWebSocketAccess(db, serverId, directId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, groupId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, viewerId)).resolves.toMatchObject({ kind: 'controlled', role: 'viewer' });
+    await expect(resolveServerWebSocketAccess(db, serverId, `rd-outsider-${hex(5)}`)).resolves.toBeNull();
+  });
+
+  it('fails active Participant sessions closed after committed downgrade and expiry', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const participantId = `rd-participant-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
+    const serverId = await createControlledNode(ownerId);
+    const share = await grant(ownerId, participantId, serverId, 'participant');
+    const f = fixture(serverId);
+
+    const firstSocket = {} as WebSocket;
+    expect(await start(f, participantId, firstSocket)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+    });
+    await grant(ownerId, participantId, serverId, 'viewer');
+    await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(0);
+    expect(f.daemonMessages.at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.STOP });
+    expect(f.messages(firstSocket).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+
+    await grant(ownerId, participantId, serverId, 'participant', Date.now() + 60_000);
+    const secondSocket = {} as WebSocket;
+    expect(await start(f, participantId, secondSocket)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+    });
+    await db.execute('UPDATE server_shares SET expires_at = $2 WHERE id = $1', [share.id, Date.now() - 1]);
+    await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(0);
+    expect(f.messages(secondSocket).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('revalidates execution disable and node revoke against the real row predicates', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    await createUser(db, ownerId);
+    const serverId = await createControlledNode(ownerId);
+    const f = fixture(serverId);
+
+    const execSocket = {} as WebSocket;
+    expect(await start(f, ownerId, execSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await db.execute('UPDATE servers SET exec_enabled = false WHERE id = $1', [serverId]);
+    await f.router.revalidateUser(ownerId);
+    expect(f.messages(execSocket).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED,
+    });
+
+    await db.execute('UPDATE servers SET exec_enabled = true WHERE id = $1', [serverId]);
+    const revokedSocket = {} as WebSocket;
+    expect(await start(f, ownerId, revokedSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await db.execute('UPDATE servers SET revoked_at = $2 WHERE id = $1', [serverId, Date.now()]);
+    await f.router.revalidateUser(ownerId);
+    expect(f.messages(revokedSocket).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('revocation and reconnect retain independent live group Control coverage, but losing the final group closes', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const participantId = `rd-participant-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
+    const serverId = await createControlledNode(ownerId);
+    const teamId = await seedDesk(ownerId);
+    await db.execute('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)', [teamId, participantId, 'member', Date.now()]);
+    await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [serverId, teamId, Date.now()]);
+    const f = fixture(serverId);
+    const groupSocket = {} as WebSocket;
+    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
+    f.router.stopAll();
+    const share = await grant(ownerId, participantId, serverId, 'participant');
+    const socket = {} as WebSocket;
+    expect(await start(f, participantId, socket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await db.execute('UPDATE server_shares SET revoked_at = $2 WHERE id = $1', [share.id, Date.now()]);
+    await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(1);
+    expect(f.messages(socket).at(-1)).not.toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL });
+    f.router.stopAll();
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
+    await db.execute('DELETE FROM machine_groups WHERE server_id=$1 AND team_id=$2', [serverId, teamId]);
+    await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(0);
+    const dispatches = f.daemonMessages.length;
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
+    expect(f.daemonMessages).toHaveLength(dispatches);
+    expect(await start(f, ownerId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    f.router.stopAll();
+    // The same group-only actor still has the established non-controlled FULL desktop path.
+    const fullId = `rd-full-${hex(6)}`;
+    await createServer(db, fullId, ownerId, 'FULL desktop', sha256(hex(16)));
+    await db.execute('UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1', [fullId, 'online', Date.now()]);
+    await ensureCanonicalHostForServer({ db, serverId: fullId, now: Date.now() });
+    await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)', [fullId, teamId, Date.now()]);
+    const full = fixture(fullId);
+    expect(await start(full, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await full.router.revalidateUser(participantId);
+    expect(full.router.stats().active).toBe(1);
+    full.router.stopAll();
+  });
+
+  it('serializes concurrent real-DB starts and isolates an unrelated user', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const outsiderId = `rd-outsider-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, outsiderId)]);
+    const serverId = await createControlledNode(ownerId);
+    const f = fixture(serverId);
+    const ownerSockets = [{}, {}, {}] as WebSocket[];
+    const outsiderSocket = {} as WebSocket;
+
+    const [one, two, three, outsider] = await Promise.all([
+      start(f, ownerId, ownerSockets[0]!),
+      start(f, ownerId, ownerSockets[1]!),
+      start(f, ownerId, ownerSockets[2]!),
+      start(f, outsiderId, outsiderSocket),
+    ]);
+    expect([one, two, three].filter((message) => (
+      message.type === REMOTE_DESKTOP_MSG.AUTHORIZED
+    ))).toHaveLength(2);
+    expect([one, two, three].filter((message) => (
+      message.type === REMOTE_DESKTOP_MSG.ERROR
+    ))).toHaveLength(1);
+    expect(outsider).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
+    expect(f.router.stats().active).toBe(2);
+  });
+});

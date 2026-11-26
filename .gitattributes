@@ -39,3 +39,23 @@ bin/* text eol=lf
 *.bat text eol=crlf
 *.vbs text eol=crlf
 *.ps1 text eol=crlf
+
+# ── Native sources and their spec fixtures: LF everywhere ──
+#
+# Why: the specs under test/spec read these files and the Windows CI runner's checkout (`core.autocrlf=true`, Git for Windows'
+# default) turned every LF into CRLF, so a multi-line marker such as `'UserDataFolder();\n  Log("window_shown"'` was "not found"
+# (job `aiDesk panel window host (Windows build)`, run 37785752309). The specs now read sources through test/helpers/read-source.ts,
+# which is the real fix; this keeps the C++/header/CMake sources themselves identical on every machine (MSVC, clang and cmake all
+# accept LF). No file of these kinds is stored with CRLF in the index, so nothing is renormalised.
+native/**/*.cc text eol=lf
+native/**/*.cpp text eol=lf
+native/**/*.h text eol=lf
+native/**/*.hpp text eol=lf
+native/**/*.mm text eol=lf
+native/**/*.m text eol=lf
+native/**/*.in text eol=lf
+native/**/*.cmake text eol=lf
+native/**/CMakeLists.txt text eol=lf
+native/**/*.manifest text eol=lf
+test/spec/*.cc text eol=lf
+test/spec/*.mm text eol=lf

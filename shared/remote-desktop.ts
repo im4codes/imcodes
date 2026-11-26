@@ -1,0 +1,1996 @@
+import {
+  DIRECT_CONNECTIVITY_ROUTE,
+  isDirectFileTransferIceServerConfig,
+  type DirectFileTransferIceServerConfig,
+} from './direct-file-transfer.js';
+import {
+  hasExactRemoteDesktopKeys,
+  isBoundedRemoteDesktopString,
+  isRemoteDesktopId,
+  isRemoteDesktopRecord,
+  isSafeNonNegativeRemoteDesktopInteger,
+  remoteDesktopUtf8Bytes,
+} from './remote-desktop-contract-primitives.js';
+
+export const REMOTE_DESKTOP_CAPABILITY = 'remote.desktop.windows.h264.v2' as const;
+export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2 as const;
+export const REMOTE_DESKTOP_SIGNALING_PATH = '/api/remote-desktop/ws' as const;
+export const REMOTE_DESKTOP_SERVER_ID_QUERY = 'serverId' as const;
+
+export const REMOTE_DESKTOP_ROUTE = DIRECT_CONNECTIVITY_ROUTE;
+export type RemoteDesktopRoute = typeof REMOTE_DESKTOP_ROUTE[keyof typeof REMOTE_DESKTOP_ROUTE];
+
+export const REMOTE_DESKTOP_STATE = {
+  AUTHORIZING: 'authorizing',
+  PREPARING: 'preparing',
+  CONNECTING: 'connecting',
+  DIRECT: 'direct',
+  RELAYED: 'relayed',
+  SWITCHING_DISPLAY: 'switching_display',
+  RECONNECTING: 'reconnecting',
+  STOPPING: 'stopping',
+  STOPPED: 'stopped',
+  FAILED: 'failed',
+} as const;
+
+export type RemoteDesktopState = typeof REMOTE_DESKTOP_STATE[keyof typeof REMOTE_DESKTOP_STATE];
+
+export const REMOTE_DESKTOP_MSG = {
+  BOOTSTRAP_REDEEMED: 'remote_desktop.bootstrap_redeemed',
+  START: 'remote_desktop.start',
+  RESUME: 'remote_desktop.resume',
+  AUTHORIZED: 'remote_desktop.authorized',
+  RESUMED: 'remote_desktop.resumed',
+  PREPARE: 'remote_desktop.prepare',
+  OFFER: 'remote_desktop.offer',
+  ANSWER: 'remote_desktop.answer',
+  ICE: 'remote_desktop.ice',
+  LEASE: 'remote_desktop.lease',
+  MODE_SET: 'remote_desktop.mode_set',
+  MODE_STATE: 'remote_desktop.mode_state',
+  CANCEL: 'remote_desktop.cancel',
+  STOP: 'remote_desktop.stop',
+  STATUS: 'remote_desktop.status',
+  // Daemon → browser: the native worker/peer behind this session was replaced
+  // (a real Windows logoff destroys its console session). The browser keeps
+  // its mounted PeerConnection and ICE-restarts it toward the replacement.
+  // Carries no new grant: session, lease and input epoch all continue unchanged.
+  RENEGOTIATE: 'remote_desktop.renegotiate',
+  ACTIVE_ROUTES: 'remote_desktop.active_routes',
+  TERMINAL: 'remote_desktop.terminal',
+  ERROR: 'remote_desktop.error',
+} as const;
+
+export const REMOTE_DESKTOP_DATA_MSG = {
+  DISPLAY_TOPOLOGY: 'remote_desktop.data.display_topology',
+  QUALITY: 'remote_desktop.data.quality',
+  CLIPBOARD: 'remote_desktop.data.clipboard',
+  CLIPBOARD_UPDATE: 'remote_desktop.data.clipboard_update',
+  POINTER: 'remote_desktop.data.pointer',
+  KEYBOARD: 'remote_desktop.data.keyboard',
+  CONTROL: 'remote_desktop.data.control',
+  RELEASE_ALL: 'remote_desktop.data.release_all',
+  // Worker → browser: a control command was understood but could not be
+  // carried out. Success is already visible through the topology and status
+  // frames; without this, a refusal looks exactly like a lost click.
+  CONTROL_REJECTED: 'remote_desktop.data.control_rejected',
+  // Worker → browser: which codec and encoder are ACTUALLY producing the
+  // picture. A message of its own rather than extra keys on QUALITY on purpose:
+  // every viewer validates QUALITY with an exact key set and drops the whole
+  // message on an unknown key, so adding keys there would blank the status bar
+  // of every older web. An older web drops an unknown data-message TYPE silently
+  // (handleData ignores what does not validate), and a newer web simply never
+  // receives it from an older node.
+  ENCODER: 'remote_desktop.data.encoder',
+  // Viewer → worker: the keys and buttons the viewer believes it is holding down
+  // RIGHT NOW. The worker releases anything it holds that the viewer does not
+  // declare (a key-up it never received, or dropped, which the viewer has long
+  // since forgotten), so a lost key-up can no longer leave a modifier latched on
+  // the remote machine. A message TYPE of its own, ignored by workers that do not
+  // know it (the macOS, Linux and Windows dispatchers all drop an unknown type).
+  HELD_INPUT: 'remote_desktop.data.held_input',
+} as const;
+
+/** Timing of the held-input declaration; the worker side is pinned to these by the
+ *  cross-layer test (the kHeldInput constants of the native data-channel constants header). */
+export const REMOTE_DESKTOP_HELD_INPUT = {
+  /** After a key or button changes, wait this long (collapsing a burst of
+   *  keystrokes into one message) before declaring what is held. */
+  SETTLE_MS: 300,
+  /** While anything is held, declare it again this often, so a legitimately held
+   *  modifier (a Shift held through a long drag) stays held for as long as the
+   *  viewer says so. */
+  REFRESH_MS: 2_000,
+  /** A worker that has received declarations from a viewer and then hears none for
+   *  this long while it holds keys releases them: the viewer's page is frozen or
+   *  gone. Five times the refresh interval, so a few late messages never trip it. */
+  SILENCE_MS: 10_000,
+} as const;
+
+export const REMOTE_DESKTOP_CHANNEL = {
+  CONTROL: 'imcodes-rd-control',
+  KEYBOARD: 'imcodes-rd-keyboard',
+  POINTER: 'imcodes-rd-pointer',
+} as const;
+
+export const REMOTE_DESKTOP_TERMINAL_REASON = {
+  STOPPED_BY_CONTROLLER: 'stopped_by_controller',
+  STOPPED_BY_LOCAL_USER: 'stopped_by_local_user',
+  CAPABILITY_UNAVAILABLE: 'capability_unavailable',
+  UNSUPPORTED_PLATFORM: 'unsupported_platform',
+  AUTHORITY_REVOKED: 'authority_revoked',
+  AUTHORITY_EXPIRED: 'authority_expired',
+  LEASE_EXPIRED: 'lease_expired',
+  IDLE_TIMEOUT: 'idle_timeout',
+  EXECUTION_DISABLED: 'execution_disabled',
+  BROWSER_DISCONNECTED: 'browser_disconnected',
+  DAEMON_REPLACED: 'daemon_replaced',
+  WORKER_FAILED: 'worker_failed',
+  // Emitted only when the native worker finds no display at all during its
+  // initial prepare. The daemon may create its headless fallback for this
+  // condition, but must not do so for ordinary capture failures.
+  HEADLESS_DISPLAY: 'headless_display',
+  MEDIA_UNAVAILABLE: 'media_unavailable',
+  NEGOTIATION_TIMEOUT: 'negotiation_timeout',
+  PEER_FAILED: 'peer_failed',
+  PROTECTED_DESKTOP: 'protected_desktop',
+  SESSION_LIMIT: 'session_limit',
+  PROTOCOL_ERROR: 'protocol_error',
+  INTERNAL_ERROR: 'internal_error',
+} as const;
+
+export const REMOTE_DESKTOP_ERROR = {
+  INVALID_REQUEST: 'invalid_request',
+  INVALID_AUTHORITY: 'invalid_authority',
+  AUTHORITY_EXPIRED: 'authority_expired',
+  CAPABILITY_UNAVAILABLE: 'capability_unavailable',
+  ACCESS_DENIED: 'access_denied',
+  CONSENT_CANCELLED: 'consent_cancelled',
+  EXECUTION_DISABLED: 'execution_disabled',
+  DAEMON_OFFLINE: 'daemon_offline',
+  UNSUPPORTED_PLATFORM: 'unsupported_platform',
+  SESSION_LIMIT: 'session_limit',
+  NEGOTIATION_TIMEOUT: 'negotiation_timeout',
+  INTERNAL_ERROR: 'internal_error',
+} as const;
+
+export const REMOTE_DESKTOP_ACCESS_MODE = {
+  VIEW: 'view',
+  CONTROL: 'control',
+} as const;
+
+export type RemoteDesktopAccessMode = typeof REMOTE_DESKTOP_ACCESS_MODE[
+  keyof typeof REMOTE_DESKTOP_ACCESS_MODE
+];
+
+export const REMOTE_DESKTOP_MODE_REASON = {
+  INITIAL: 'initial',
+  USER_SELECTED: 'user_selected',
+  AUTHORITY_LOST: 'authority_lost',
+} as const;
+
+export type RemoteDesktopModeReason = typeof REMOTE_DESKTOP_MODE_REASON[
+  keyof typeof REMOTE_DESKTOP_MODE_REASON
+];
+
+export type RemoteDesktopTerminalReason = typeof REMOTE_DESKTOP_TERMINAL_REASON[keyof typeof REMOTE_DESKTOP_TERMINAL_REASON];
+
+/**
+ * Browser-owned reason for ending an otherwise authorized route.
+ *
+ * This is deliberately more precise than `stopped_by_controller`: an
+ * automatic presentation cleanup must never be indistinguishable from the
+ * operator pressing Close, and a reconnect replacement must not look like a
+ * user decision in the durable audit row.
+ */
+export const REMOTE_DESKTOP_STOP_ORIGIN = {
+  USER_CLOSE: 'user_close',
+  PANEL_UNMOUNT: 'panel_unmount',
+  WALL_REMOVE: 'wall_remove',
+  WALL_CLOSE: 'wall_close',
+  WORKSPACE_HOST_CLOSE: 'workspace_host_close',
+  WORKSPACE_CLOSE: 'workspace_close',
+  APP_SIGN_OUT: 'app_sign_out',
+  APP_UNMOUNT: 'app_unmount',
+  STANDALONE_UNMOUNT: 'standalone_unmount',
+  MANAGER_RECONNECT: 'manager_reconnect',
+  EXECUTION_ENDPOINT_CHANGE: 'execution_endpoint_change',
+  GUEST_UNMOUNT: 'guest_unmount',
+  GUEST_RETRY: 'guest_retry',
+  START_FAILURE: 'start_failure',
+} as const;
+
+export type RemoteDesktopStopOrigin = typeof REMOTE_DESKTOP_STOP_ORIGIN[
+  keyof typeof REMOTE_DESKTOP_STOP_ORIGIN
+];
+
+export const REMOTE_DESKTOP_POINTER_KIND = {
+  MOVE: 'move',
+  BUTTON_DOWN: 'button_down',
+  BUTTON_UP: 'button_up',
+  BUTTON_CLICK: 'button_click',
+  WHEEL: 'wheel',
+} as const;
+
+export const REMOTE_DESKTOP_POINTER_BUTTON = {
+  LEFT: 'left',
+  MIDDLE: 'middle',
+  RIGHT: 'right',
+  BACK: 'back',
+  FORWARD: 'forward',
+} as const;
+
+export const REMOTE_DESKTOP_KEYBOARD_KIND = {
+  KEY_DOWN: 'key_down',
+  KEY_UP: 'key_up',
+  TEXT: 'text',
+} as const;
+
+export const REMOTE_DESKTOP_CONTROL_KIND = {
+  HELLO: 'hello',
+  FRAME_PRESENTED: 'frame_presented',
+  SELECT_DISPLAY: 'select_display',
+  SET_DISPLAY_MODE: 'set_display_mode',
+  SET_DISPLAY_SCALE: 'set_display_scale',
+  COPY_SELECTION: 'copy_selection',
+  // Paste text through bounded control chunks; the node assembles them, writes
+  // its OS clipboard once, then injects the platform paste shortcut once.
+  PASTE_TEXT: 'paste_text',
+  // Viewer → worker: enable or disable passive remote clipboard push updates
+  // (`remote_desktop.data.clipboard_update`). Older workers ignore unknown kinds.
+  SET_CLIPBOARD_SYNC: 'set_clipboard_sync',
+  // Viewer → worker: enable or disable system desktop audio transmission
+  // (allowed in both view and control modes). Older workers ignore unknown kinds.
+  SET_AUDIO: 'set_audio',
+  // Ask the node to answer the sign-in screen with its stored secret now.
+  // Auto unlock does this on its own, but the sign-in UI can swallow a
+  // keystroke, so a watching controller keeps a way to say "try again".
+  UNLOCK: 'unlock',
+  KEEPALIVE: 'keepalive',
+  INPUT_ACK: 'input_ack',
+  // Viewer quality preference (resolution/fps/bitrate caps and priority).
+  // Only sent to workers whose status advertises `qualityPreference`.
+  SET_QUALITY_PREFERENCE: 'set_quality_preference',
+} as const;
+
+/**
+ * Why a connected, controlling session still cannot send input.
+ *
+ * Input goes off for ordinary reasons — a desktop switch, a display change —
+ * and comes back once the viewer acknowledges a frame of the new layout. When
+ * it does not come back, every control in the toolbar is greyed with nothing
+ * to explain it, which is indistinguishable from a broken session.
+ */
+export const REMOTE_DESKTOP_INPUT_BLOCKED = {
+  /** This session is watching, not controlling. */
+  NO_CONTROL: 'no_control',
+  /** The input channels are not open yet. */
+  CHANNELS: 'channels',
+  /** The node is waiting for a frame of the current layout to be acknowledged. */
+  AWAITING_FRAME: 'awaiting_frame',
+  /** No display is selected, so there is nothing to aim input at. */
+  SELECT_DISPLAY: 'select_display',
+  /** The node cannot reach the desktop that currently receives input. */
+  INPUT_UNAVAILABLE: 'input_unavailable',
+} as const;
+
+export type RemoteDesktopInputBlocked = typeof REMOTE_DESKTOP_INPUT_BLOCKED[
+  keyof typeof REMOTE_DESKTOP_INPUT_BLOCKED
+];
+
+export type RemoteDesktopControlKind = typeof REMOTE_DESKTOP_CONTROL_KIND[
+  keyof typeof REMOTE_DESKTOP_CONTROL_KIND
+];
+
+/**
+ * Why the worker refused a control command. These are the node's answer to
+ * "nothing happened": each one maps to a distinct thing the operator can do,
+ * so they must stay distinguishable rather than collapse into a generic error.
+ */
+export const REMOTE_DESKTOP_CONTROL_REJECTION = {
+  /** The session holds no input authority, or input is not ready yet. */
+  NOT_PERMITTED: 'not_permitted',
+  /** Too many layout commands in the rate window. */
+  RATE_LIMITED: 'rate_limited',
+  /** No such display, it went away, or Windows exposes no adapter for it. */
+  DISPLAY_UNAVAILABLE: 'display_unavailable',
+  /** The driver rejected the mode — common on a GPU with no monitor attached. */
+  MODE_UNSUPPORTED: 'mode_unsupported',
+  /** The mode tested fine but Windows refused to apply it. */
+  MODE_CHANGE_FAILED: 'mode_change_failed',
+  /** The live encoder/relay cannot satisfy the requested quality without a peer restart. */
+  QUALITY_UNAVAILABLE: 'quality_unavailable',
+  /** The scale change was refused by Windows. */
+  SCALE_CHANGE_FAILED: 'scale_change_failed',
+  /** The display exists but capture could not be moved to it. */
+  CAPTURE_FAILED: 'capture_failed',
+  /** No stored sign-in secret, or nothing to unlock right now. */
+  UNLOCK_UNAVAILABLE: 'unlock_unavailable',
+  /** The node's clipboard is not ready, or the paste action itself failed/timed out. */
+  PASTE_UNAVAILABLE: 'paste_unavailable',
+  /** Too large for a single clipboard-paste message; typed instead. Never sent by the node -- the browser knows its own paste's size. */
+  PASTE_TOO_LARGE: 'paste_too_large',
+} as const;
+
+export type RemoteDesktopControlRejection = typeof REMOTE_DESKTOP_CONTROL_REJECTION[
+  keyof typeof REMOTE_DESKTOP_CONTROL_REJECTION
+];
+
+/**
+ * Bounds for a resolution a controller may ask for. The offered list comes from
+ * the node's own driver; this only keeps a request inside sane limits.
+ */
+export const REMOTE_DESKTOP_DISPLAY_MODE_LIMITS = {
+  /** 640x480 is the smallest mode Windows drivers still offer. */
+  MIN_EDGE: 480,
+  MAX_EDGE: 16_384,
+  MAX_MODES: 32,
+} as const;
+
+/**
+ * Fallback list for nodes that do not report their driver's modes yet. A node
+ * that does report them replaces this entirely.
+ */
+export const REMOTE_DESKTOP_COMMON_DISPLAY_MODES = [
+  { width: 1280, height: 720, label: '720p', recommendedDpiScalePercent: 125 },
+  { width: 1920, height: 1080, label: '1080p', recommendedDpiScalePercent: 150 },
+  { width: 2560, height: 1440, label: '1440p', recommendedDpiScalePercent: 175 },
+  { width: 3840, height: 2160, label: '4K', recommendedDpiScalePercent: 225 },
+] as const;
+
+export const REMOTE_DESKTOP_DPI_SCALE_PERCENTS = [
+  100, 125, 150, 175, 200, 225, 250, 300,
+] as const;
+
+export const REMOTE_DESKTOP_DISPLAY_ROTATION = {
+  ROTATE_0: 0,
+  ROTATE_90: 90,
+  ROTATE_180: 180,
+  ROTATE_270: 270,
+} as const;
+
+export const REMOTE_DESKTOP_QUALITY_PRESET = {
+  P2160_30: '2160p30',
+  P1440_60: '1440p60',
+  P2160_15: '2160p15',
+  P1440_30: '1440p30',
+  P1080_60: '1080p60',
+  P1080_30: '1080p30',
+  P1080_15: '1080p15',
+  P720_60: '720p60',
+  P900_30: '900p30',
+  P720_30: '720p30',
+  P720_15: '720p15',
+  P540_30: '540p30',
+  P540_15: '540p15',
+  P360_30: '360p30',
+  P720_10: '720p10',
+  P540_10: '540p10',
+  P360_5: '360p5',
+} as const;
+
+/**
+ * How a viewer trades resolution against frame rate. Mirrors
+ * the native common quality ladder (QualityPriority).
+ */
+export const REMOTE_DESKTOP_QUALITY_PRIORITY = {
+  FRAMERATE: 'framerate',
+  BALANCED: 'balanced',
+  RESOLUTION: 'resolution',
+} as const;
+export type RemoteDesktopQualityPriority =
+  typeof REMOTE_DESKTOP_QUALITY_PRIORITY[keyof typeof REMOTE_DESKTOP_QUALITY_PRIORITY];
+
+/** Resolution ceilings a viewer may pick; 0 = native, 2160 = 4K. */
+export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440, 2160] as const;
+/** Minimum encoded height for a source that can provide a full HD frame. */
+export const REMOTE_DESKTOP_QUALITY_MIN_HEIGHT = 1080;
+export const REMOTE_DESKTOP_QUALITY_MAX_FPS = [15, 30, 60] as const;
+
+/** Per-viewer quality preference sent with `set_quality_preference`. */
+export interface RemoteDesktopQualityPreference {
+  maxHeight: typeof REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS[number];
+  maxFps: typeof REMOTE_DESKTOP_QUALITY_MAX_FPS[number];
+  /**
+   * 0 = the default per-viewer ceiling (BITRATE_CAP.MAX_BPS). Above it the
+   * ceiling is RAISED, up to BITRATE_CAP.MAX_VIEWER_BPS (Ultra); only workers
+   * advertising `qualityUltra` accept that.
+   */
+  maxBitrateBps: number;
+  priority: RemoteDesktopQualityPriority;
+}
+
+/** The quick modes offered in the viewer toolbar. */
+export const REMOTE_DESKTOP_QUALITY_MODE = {
+  SMOOTH: 'smooth',
+  BALANCED: 'balanced',
+  SHARP: 'sharp',
+  /** 4K: 2160p with a raised bitrate ceiling. */
+  ULTRA: 'ultra',
+  SAVER: 'saver',
+  CUSTOM: 'custom',
+} as const;
+export type RemoteDesktopQualityMode =
+  typeof REMOTE_DESKTOP_QUALITY_MODE[keyof typeof REMOTE_DESKTOP_QUALITY_MODE];
+export const DEFAULT_REMOTE_DESKTOP_QUALITY_MODE: RemoteDesktopQualityMode =
+  REMOTE_DESKTOP_QUALITY_MODE.BALANCED;
+
+/** The minimum physical rung and target bitrate promised by each quick mode. */
+export const REMOTE_DESKTOP_QUALITY_MODE_FLOORS = Object.freeze({
+  smooth: { minHeight: 1080, targetBitrateBps: 6_000_000 },
+  balanced: { minHeight: 1080, targetBitrateBps: 10_000_000 },
+  sharp: { minHeight: 1080, targetBitrateBps: 15_000_000 },
+  ultra: { minHeight: 2160, targetBitrateBps: 30_000_000 },
+  saver: { minHeight: 1080, targetBitrateBps: 1_800_000 },
+} as const);
+
+/** What each quick mode means on the wire. Custom supplies its own values. */
+export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
+  Exclude<RemoteDesktopQualityMode, 'custom'>, RemoteDesktopQualityPreference
+>> = Object.freeze({
+  // The bitrate is an explicit target floor as well as the viewer ceiling;
+  // the native ladder rejects a relayed path that cannot satisfy it instead
+  // of silently selecting a blurry rung.
+  smooth: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.targetBitrateBps, priority: 'framerate' },
+  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.balanced.targetBitrateBps, priority: 'balanced' },
+  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.sharp.targetBitrateBps, priority: 'resolution' },
+  ultra: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.targetBitrateBps, priority: 'resolution' },
+  // Saver lowers bitrate and frame rate, never the 1080p resolution floor.
+  saver: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.minHeight, maxFps: 15, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.targetBitrateBps, priority: 'balanced' },
+});
+
+/** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */
+export const REMOTE_DESKTOP_QUALITY_BITRATE_CAP = {
+  MIN_BPS: 350_000,
+  /** The default per-viewer ceiling (kPerPeerVideoBitrateBps); relay caps stay within it. */
+  MAX_BPS: 15_000_000,
+  /** The most a viewer may raise its own stream to (kMaxViewerVideoBitrateBps). */
+  MAX_VIEWER_BPS: 30_000_000,
+} as const;
+
+export const REMOTE_DESKTOP_ENCODER_CLASS = {
+  HARDWARE: 'hardware',
+  SOFTWARE: 'software',
+} as const;
+
+/** `codec` of an ENCODER data message: what the picture is encoded with. `pending`
+ *  until a codec has been negotiated for the route. */
+export const REMOTE_DESKTOP_ENCODER_CODEC = {
+  VP9: 'vp9',
+  VP8: 'vp8',
+  H264: 'h264',
+  PENDING: 'pending',
+} as const;
+
+/** Why a route may or may not send VP9/VP8 (the node's raw-codec decision), so a
+ *  viewer can say "H.264, forced by the setting" rather than guess. */
+export const REMOTE_DESKTOP_ENCODER_RAW_CODECS = {
+  ALLOWED: 'allowed',
+  HARDWARE_H264: 'hardware_h264',
+  CAPTURE_CANNOT_SCALE: 'capture_cannot_scale',
+  DISABLED_BY_SETTING: 'disabled_by_setting',
+} as const;
+
+export const REMOTE_DESKTOP_AUDIT_EVENT = {
+  REQUESTED: 'remote_desktop.requested',
+  ADMITTED: 'remote_desktop.admitted',
+  CONNECTED: 'remote_desktop.connected',
+  INPUT_ENABLED: 'remote_desktop.input_enabled',
+  DISPLAY_CHANGED: 'remote_desktop.display_changed',
+  RECONNECTING: 'remote_desktop.reconnecting',
+  STOPPED: 'remote_desktop.stopped',
+  REVOKED: 'remote_desktop.revoked',
+  FAILED: 'remote_desktop.failed',
+  AUTO_UNLOCK_SUCCEEDED: 'remote_desktop.auto_unlock_succeeded',
+} as const;
+
+export const REMOTE_DESKTOP_LIMITS = {
+  REQUEST_ID_BYTES: 128,
+  SESSION_ID_BYTES: 128,
+  CAPABILITY_BYTES: 128,
+  DISPLAY_ID_BYTES: 128,
+  DISPLAY_LABEL_BYTES: 256,
+  SDP_BYTES: 256 * 1024,
+  ICE_CANDIDATE_BYTES: 16 * 1024,
+  ICE_MID_BYTES: 256,
+  ICE_SERVER_ENTRIES: 8,
+  DISPLAYS: 16,
+  KEY_CODE_BYTES: 64,
+  KEY_VALUE_BYTES: 64,
+  /** Most keys a held-input declaration can name, and its comma-separated list's bytes. */
+  HELD_INPUT_KEYS: 16,
+  HELD_INPUT_LIST_BYTES: 16 * 65,
+  TEXT_BYTES: 4 * 1024,
+  TEXT_CODE_UNITS: 2 * 1024,
+  PASTE_TEXT_BYTES: 64 * 1024,
+  // Worst-case JSON escaping stays safely under the 16 KiB native frame cap.
+  PASTE_TEXT_CHUNK_BYTES: 2 * 1024,
+  CLIPBOARD_TEXT_BYTES: 12 * 1024,
+  ERROR_DETAIL_BYTES: 512,
+  // A cold Windows path includes Authenticode re-verification, active-user
+  // worker launch, DXGI's first presentable frame, and ICE.  Production data
+  // showed healthy direct sessions taking about 10s, so the former 15s bound
+  // cut off normal cold starts with almost no scheduling/network headroom.
+  NEGOTIATION_TIMEOUT_MS: 45_000,
+  // The lease remains a fail-closed backstop: if the Server can no longer
+  // revalidate the controller, the native worker stops itself without relying
+  // on a best-effort STOP frame.  Fifteen seconds, however, left only two
+  // renewal opportunities after a normal 5 s tick.  A brief database stall,
+  // daemon reconnect, or Windows scheduling pause could therefore end a live
+  // session as `lease_expired`.  Keep the bound short enough to contain an
+  // orphaned session, while leaving three full renewal windows for recovery.
+  LEASE_DURATION_MS: 60_000,
+  /**
+   * Slack for the host's clock trailing the Server's when a Server-stamped
+   * absolute deadline is checked against the local clock. The Server sets a
+   * renewal to exactly its own now + LEASE_DURATION_MS; a Mac 0.4 s behind saw
+   * that as further in the future than allowed and killed every session at its
+   * first renewal. Matches the native parser's kLeaseMaxFutureMs (75 s).
+   */
+  CLOCK_SKEW_TOLERANCE_MS: 15_000,
+  LEASE_RENEW_INTERVAL_MS: 15_000,
+  KEEPALIVE_TIMEOUT_MS: 15_000,
+  DATA_KEEPALIVE_INTERVAL_MS: 30_000,
+  MEDIA_PROGRESS_TIMEOUT_MS: 10_000,
+  /**
+   * How long a connected peer may take to deliver its first video bytes.
+   *
+   * The stall rule above measures media that stopped; it cannot measure media
+   * that has not started, and applying it before the first byte kills healthy
+   * connections. A relayed path (TURN over TCP, which is what a node behind
+   * blocked UDP actually gets) plus a cold worker — signature check, WebRTC
+   * init, first keyframe — routinely needs longer than the stall window.
+   */
+  FIRST_MEDIA_TIMEOUT_MS: 30_000,
+  IDLE_TIMEOUT_MS: 15 * 60_000,
+  ABSOLUTE_LIFETIME_MS: 2 * 60 * 60_000,
+  MAX_PER_BROWSER: 1,
+  MAX_PER_USER: 2,
+  MAX_PER_MACHINE: 4,
+  MAX_PEER_CONNECTIONS_PER_WORKER: 4,
+  MAX_TURN_ALLOCATIONS_PER_MACHINE: 4,
+  MAX_ICE_CANDIDATES: 128,
+  MAX_SIGNALING_PER_MINUTE: 600,
+  MAX_SIGNALING_PER_MACHINE_PER_MINUTE: 2_400,
+  MAX_STARTS_PER_MINUTE: 10,
+  MAX_STARTS_PER_USER_PER_MINUTE: 20,
+  MAX_STARTS_PER_MACHINE_PER_MINUTE: 40,
+  MAX_AUDITS_PER_MACHINE_PER_MINUTE: 120,
+  /**
+   * Keep an already-authorized route alive while only its signaling socket is
+   * unavailable. Media stays peer-to-peer; the server fences the old browser
+   * input epoch immediately and destroys the route when this bound expires.
+   */
+  SIGNALING_RECONNECT_GRACE_MS: 5 * 60_000,
+  SIGNALING_RECONNECT_BACKOFF_MS: 250,
+  SIGNALING_RECONNECT_MAX_BACKOFF_MS: 5_000,
+  SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS: 5_000,
+  MAX_SIGNALING_RECONNECT_ATTEMPTS: 64,
+  MAX_RECONNECT_ATTEMPTS: 4,
+  // Retry transient route failures promptly, then give an old Windows
+  // hardware MFT progressively more time to release its queued surfaces.
+  RECONNECT_BACKOFF_BASE_MS: 1_000,
+  // Bound each outage independently. A connection that remains healthy for
+  // this window earns a fresh retry budget, so a later transient drop does not
+  // permanently strand a long-running remote-control panel.
+  RECONNECT_STABILITY_RESET_MS: 30_000,
+  MAX_ICE_RESTARTS: 8,
+  MAX_MODE_CHANGES_PER_MINUTE: 30,
+  MAX_POINTER_EVENTS_PER_SECOND: 240,
+  MAX_KEYBOARD_EVENTS_PER_SECOND: 120,
+  MAX_MONITOR_CHANGES_PER_MINUTE: 30,
+  /** One viewer's stream at most (an Ultra viewer's raised ceiling). */
+  MAX_VIDEO_BITRATE_BPS: 30_000_000,
+  MAX_AGGREGATE_VIDEO_BITRATE_BPS: 60_000_000,
+  MAX_DISTINCT_CAPTURE_SOURCES: 4,
+  MAX_GPU_CAPTURE_SURFACES: 4,
+  MAX_WORKER_MEMORY_BYTES: 1024 * 1024 * 1024,
+  MAX_ENCODER_QUEUE_FRAMES: 3,
+} as const;
+
+export const REMOTE_DESKTOP_QUALITY_LADDER = [
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_30, width: 3840, height: 2160, fps: 30, targetBitrateBps: 15_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_60, width: 2560, height: 1440, fps: 60, targetBitrateBps: 14_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_15, width: 3840, height: 2160, fps: 15, targetBitrateBps: 12_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_30, width: 2560, height: 1440, fps: 30, targetBitrateBps: 10_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_60, width: 1920, height: 1080, fps: 60, targetBitrateBps: 9_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_15, width: 1920, height: 1080, fps: 15, targetBitrateBps: 1_800_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_60, width: 1280, height: 720, fps: 60, targetBitrateBps: 4_800_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P900_30, width: 1600, height: 900, fps: 30, targetBitrateBps: 4_500_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_30, width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_15, width: 1280, height: 720, fps: 15, targetBitrateBps: 1_800_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_30, width: 960, height: 540, fps: 30, targetBitrateBps: 1_600_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_15, width: 960, height: 540, fps: 15, targetBitrateBps: 1_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P360_30, width: 640, height: 360, fps: 30, targetBitrateBps: 700_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_10, width: 1280, height: 720, fps: 10, targetBitrateBps: 450_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_10, width: 960, height: 540, fps: 10, targetBitrateBps: 380_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P360_5, width: 640, height: 360, fps: 5, targetBitrateBps: 350_000 },
+] as const;
+
+export interface RemoteDesktopStart {
+  type: typeof REMOTE_DESKTOP_MSG.START;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  requestId: string;
+  reconnectAttempt?: number;
+}
+
+/** Browser proof that a replacement signaling socket owns the exact live
+ * route. The capability is already a route-scoped bearer secret; no new grant
+ * or lifetime is minted by resume. */
+export interface RemoteDesktopResume {
+  type: typeof REMOTE_DESKTOP_MSG.RESUME;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+}
+
+/** Server acknowledgement that the anonymous socket's sole bootstrap frame
+ * was atomically redeemed. The browser MUST wait for this content-free frame
+ * before sending START or any other signaling message. */
+export interface RemoteDesktopBootstrapRedeemed {
+  type: typeof REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED;
+}
+
+export interface RemoteDesktopAuthority {
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  expiresAt: number;
+  leaseExpiresAt: number;
+  daemonGeneration: number;
+  mode: RemoteDesktopAccessMode;
+  inputEpoch: number;
+  iceServers: DirectFileTransferIceServerConfig[];
+}
+
+export interface RemoteDesktopAuthorized extends RemoteDesktopAuthority {
+  type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED;
+  /** Server clock at send; lets the browser translate expiresAt onto its clock. */
+  serverTime?: number;
+  /**
+   * Operator ceiling for relayed (TURN) video, when enabled. Informational for
+   * the browser (badge, greyed-out options); the worker enforces it.
+   */
+  relayBitrateCapBps?: number;
+}
+
+/** Server acknowledgement for an exact same-route signaling rebind. */
+export interface RemoteDesktopResumed extends RemoteDesktopAuthority {
+  type: typeof REMOTE_DESKTOP_MSG.RESUMED;
+  /** Server clock at send; see RemoteDesktopAuthorized.serverTime. */
+  serverTime?: number;
+}
+
+export interface RemoteDesktopPrepare extends RemoteDesktopAuthority {
+  type: typeof REMOTE_DESKTOP_MSG.PREPARE;
+  /**
+   * Independent route incarnation fence. This is deliberately not the daemon
+   * generation: one authenticated daemon connection may replace a WebRTC
+   * route while a management-privacy epoch is active, and the replacement
+   * must join that epoch as a distinct route generation before it can expose
+   * captured pixels.
+   */
+  /**
+   * Required when the selected adapter advertises capture-privacy support.
+   * It remains optional on the v2 base wire solely so a new Server can keep
+   * legacy authenticated access working for old nodes that cannot expose the
+   * controlled-computer management surface.
+   */
+  routeGeneration?: number;
+  reconnectAttempt?: number;
+  /**
+   * Operator ceiling for relayed (TURN) video, enforced by the worker only
+   * while the route is relayed. Sent only to nodes advertising
+   * REMOTE_DESKTOP_RELAY_CAP_CAPABILITY: older nodes and workers reject
+   * unknown prepare keys.
+   */
+  relayBitrateCapBps?: number;
+}
+
+export interface RemoteDesktopOffer {
+  type: typeof REMOTE_DESKTOP_MSG.OFFER;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  sdp: string;
+}
+
+export interface RemoteDesktopAnswer extends Omit<RemoteDesktopOffer, 'type'> {
+  type: typeof REMOTE_DESKTOP_MSG.ANSWER;
+}
+
+export interface RemoteDesktopIce {
+  type: typeof REMOTE_DESKTOP_MSG.ICE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  candidate: string;
+  mid: string;
+}
+
+export interface RemoteDesktopLease {
+  type: typeof REMOTE_DESKTOP_MSG.LEASE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  leaseExpiresAt: number;
+  daemonGeneration: number;
+  /** Must remain equal to PREPARE when capture-privacy is advertised. */
+  routeGeneration?: number;
+  mode: RemoteDesktopAccessMode;
+  inputEpoch: number;
+}
+
+/**
+ * Qualification fence for the capture-privacy adapter. Legacy authenticated
+ * v2 routes may omit the field, but such a route is never eligible to join or
+ * acknowledge a management-privacy epoch.
+ */
+export function hasRemoteDesktopIndependentRouteGeneration(
+  value: { routeGeneration?: unknown },
+): value is { routeGeneration: number } {
+  return isSafeNonNegativeRemoteDesktopInteger(value.routeGeneration);
+}
+
+export interface RemoteDesktopModeSet {
+  type: typeof REMOTE_DESKTOP_MSG.MODE_SET;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  mode: RemoteDesktopAccessMode;
+}
+
+export interface RemoteDesktopModeState {
+  type: typeof REMOTE_DESKTOP_MSG.MODE_STATE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  mode: RemoteDesktopAccessMode;
+  inputEpoch: number;
+  reason: RemoteDesktopModeReason;
+}
+
+export interface RemoteDesktopRenegotiate {
+  type: typeof REMOTE_DESKTOP_MSG.RENEGOTIATE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+}
+
+export interface RemoteDesktopStop {
+  type: typeof REMOTE_DESKTOP_MSG.STOP;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  stopOrigin: RemoteDesktopStopOrigin;
+  aggregateBytesReceived?: number;
+}
+
+export interface RemoteDesktopCancel {
+  type: typeof REMOTE_DESKTOP_MSG.CANCEL;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+}
+
+/** Server → daemon STOP deliberately omits browser diagnostics metadata. */
+export type RemoteDesktopDaemonStop = Omit<RemoteDesktopStop, 'stopOrigin' | 'aggregateBytesReceived'>;
+
+export interface RemoteDesktopStatus {
+  type: typeof REMOTE_DESKTOP_MSG.STATUS;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  mode: RemoteDesktopAccessMode;
+  inputEpoch: number;
+  state: RemoteDesktopState;
+  route?: RemoteDesktopRoute;
+  selectedDisplayId?: string;
+  layoutRevision?: number;
+  inputEnabled: boolean;
+  /** Native PeerConnection reached kConnected; route selection alone is insufficient. */
+  peerConnected?: boolean;
+  /** All three authenticated input/control data channels are open. */
+  dataChannelsReady?: boolean;
+  /** Native outbound RTP stats observed non-zero video bytes. */
+  mediaStarted?: boolean;
+  /** Browser acknowledged presentation of a frame for the current layout. */
+  firstFramePresented?: boolean;
+  /** This worker can atomically inject the second click of a desktop double-click. */
+  atomicButtonClick?: boolean;
+  /** This worker honours `set_quality_preference`; never send it otherwise. */
+  qualityPreference?: boolean;
+  /** ...including maxHeight 2160 and a raised bitrate ceiling (Ultra). */
+  qualityUltra?: boolean;
+  viewerCount?: number;
+  controllerCount?: number;
+  /**
+   * The node is showing the Windows sign-in/lock screen rather than a signed-in
+   * desktop. The picture keeps streaming either way; this is what lets the
+   * viewer be told what it is looking at, and what gates the unlock control.
+   */
+  signInScreen?: boolean;
+  /** The node holds a stored sign-in secret it can be asked to type. */
+  unlockAvailable?: boolean;
+  /**
+   * The node's built-in auto unlock typed its stored sign-in secret for this
+   * session and the lock screen then ended. Sticky for the session, so a status
+   * replay repeats it; the Server notifies the owner at most once per route.
+   */
+  autoUnlockSucceeded?: true;
+  /** Present only while input is off, naming what it is waiting on. */
+  inputBlocked?: RemoteDesktopInputBlocked;
+}
+
+export interface RemoteDesktopTerminal {
+  type: typeof REMOTE_DESKTOP_MSG.TERMINAL;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  reason: RemoteDesktopTerminalReason;
+  detail?: string;
+}
+
+export interface RemoteDesktopError {
+  type: typeof REMOTE_DESKTOP_MSG.ERROR;
+  requestId: string;
+  error: typeof REMOTE_DESKTOP_ERROR[keyof typeof REMOTE_DESKTOP_ERROR];
+  retryable: boolean;
+  detail?: string;
+}
+
+export interface RemoteDesktopActiveRouteSummary {
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  expiresAt: number;
+  leaseExpiresAt: number;
+  mode: RemoteDesktopAccessMode;
+  inputEpoch: number;
+  routeGeneration?: number;
+  peerConnected?: boolean;
+  state?: RemoteDesktopState;
+}
+
+export interface RemoteDesktopActiveRoutes {
+  type: typeof REMOTE_DESKTOP_MSG.ACTIVE_ROUTES;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  routes: RemoteDesktopActiveRouteSummary[];
+}
+
+/** One resolution a node's display driver actually offers. */
+export interface RemoteDesktopDisplayMode {
+  width: number;
+  height: number;
+}
+
+/**
+ * Platform logical coordinates used for input. These deliberately do not
+ * reuse encoded frame pixels: Retina/Wayland capture can produce a different
+ * pixel size from the coordinates accepted by the native input backend.
+ */
+export interface RemoteDesktopLogicalBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface RemoteDesktopDisplayOperations {
+  setMode: boolean;
+  setScale: boolean;
+}
+
+export interface RemoteDesktopDisplay {
+  id: string;
+  label: string;
+  primary: boolean;
+  available: boolean;
+  /** Encoded/captured pixel dimensions; retained names preserve protocol v2. */
+  width: number;
+  height: number;
+  dpiScale: number;
+  rotation: typeof REMOTE_DESKTOP_DISPLAY_ROTATION[keyof typeof REMOTE_DESKTOP_DISPLAY_ROTATION];
+  /** Required by the common v3 profile, absent from legacy Windows v2. */
+  inputBounds?: RemoteDesktopLogicalBounds;
+  /** Required by the common v3 profile, absent from legacy Windows v2. */
+  operations?: RemoteDesktopDisplayOperations;
+  /**
+   * The resolutions this display's driver reports, largest first. Absent from
+   * older nodes, which is the only reason the common-mode list still exists:
+   * offering a size the driver does not have is a control that cannot work.
+   */
+  modes?: RemoteDesktopDisplayMode[];
+}
+
+export interface RemoteDesktopDisplayTopology {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  layoutRevision: number;
+  displays: RemoteDesktopDisplay[];
+  selectedDisplayId?: string;
+}
+
+export interface RemoteDesktopQuality {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.QUALITY;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  preset: typeof REMOTE_DESKTOP_QUALITY_PRESET[keyof typeof REMOTE_DESKTOP_QUALITY_PRESET];
+  encoderClass: typeof REMOTE_DESKTOP_ENCODER_CLASS[keyof typeof REMOTE_DESKTOP_ENCODER_CLASS];
+  width: number;
+  height: number;
+  fps: number;
+  bitrateBps: number;
+  droppedFrames: number;
+  rttMs: number;
+}
+
+export interface RemoteDesktopEncoderInfo {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.ENCODER;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  codec: typeof REMOTE_DESKTOP_ENCODER_CODEC[keyof typeof REMOTE_DESKTOP_ENCODER_CODEC];
+  implementation: typeof REMOTE_DESKTOP_ENCODER_CLASS[keyof typeof REMOTE_DESKTOP_ENCODER_CLASS];
+  /** The encoder's own name, e.g. "libvpx" or "Apple H.264 (SW)". Display only. */
+  name: string;
+  /** Encoder threads (0 when it does not say). */
+  threads: number;
+  rawCodecs: typeof REMOTE_DESKTOP_ENCODER_RAW_CODECS[keyof typeof REMOTE_DESKTOP_ENCODER_RAW_CODECS];
+}
+
+export interface RemoteDesktopClipboard {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CLIPBOARD;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  requestId: string;
+  available: boolean;
+  text?: string;
+}
+
+export interface RemoteDesktopClipboardUpdate {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CLIPBOARD_UPDATE;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  text: string;
+  /** Authoritative worker inputEpoch that originated this clipboard push. */
+  inputEpoch: number;
+}
+
+export interface RemoteDesktopControlRejected {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  kind: RemoteDesktopControlKind;
+  reason: RemoteDesktopControlRejection;
+  /** The display the command targeted, when it named one. */
+  displayId?: string;
+}
+
+interface RemoteDesktopInputBase {
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  layoutRevision: number;
+  inputEpoch: number;
+}
+
+export interface RemoteDesktopPointer extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.POINTER;
+  kind: typeof REMOTE_DESKTOP_POINTER_KIND[keyof typeof REMOTE_DESKTOP_POINTER_KIND];
+  x?: number;
+  y?: number;
+  button?: typeof REMOTE_DESKTOP_POINTER_BUTTON[keyof typeof REMOTE_DESKTOP_POINTER_BUTTON];
+  deltaX?: number;
+  deltaY?: number;
+}
+
+export interface RemoteDesktopKeyboard extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.KEYBOARD;
+  kind: typeof REMOTE_DESKTOP_KEYBOARD_KIND[keyof typeof REMOTE_DESKTOP_KEYBOARD_KIND];
+  code?: string;
+  key?: string;
+  repeat?: boolean;
+  text?: string;
+}
+
+export interface RemoteDesktopControl extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CONTROL;
+  kind: typeof REMOTE_DESKTOP_CONTROL_KIND[keyof typeof REMOTE_DESKTOP_CONTROL_KIND];
+  enabled?: boolean;
+  displayId?: string;
+  width?: number;
+  height?: number;
+  dpiScalePercent?: number;
+  requestId?: string;
+  frameWidth?: number;
+  frameHeight?: number;
+  acknowledgedSequence?: number;
+  /** set_quality_preference only. */
+  maxHeight?: number;
+  maxFps?: number;
+  maxBitrateBps?: number;
+  priority?: RemoteDesktopQualityPriority;
+  /** paste_text only, bounded by PASTE_TEXT_CHUNK_BYTES. */
+  text?: string;
+  /** paste_text only; identifies one chunked paste transfer. */
+  pasteId?: string;
+  /** paste_text only; zero-based chunk ordinal and total chunk count. */
+  chunkIndex?: number;
+  chunkCount?: number;
+}
+
+export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL;
+}
+
+export interface RemoteDesktopHeldInput extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.HELD_INPUT;
+  /** Comma-separated KeyboardEvent.code values held down; "" when none. */
+  keys: string;
+  /** Comma-separated pointer button names held down; "" when none. */
+  buttons: string;
+}
+
+export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopResume | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
+export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopDaemonStop;
+export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
+export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopResumed | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
+export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopEncoderInfo | RemoteDesktopClipboard | RemoteDesktopClipboardUpdate | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopHeldInput | RemoteDesktopControlRejected;
+
+export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
+
+export interface RemoteDesktopSequenceState {
+  sessionId: string;
+  layoutRevision: number;
+  inputEpoch: number;
+  lastSequence: number;
+}
+
+export interface RemoteDesktopNormalizedPoint {
+  x: number;
+  y: number;
+}
+
+export interface RemoteDesktopPhysicalPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * Decoded video may be adaptively scaled, but it must preserve the selected
+ * display aspect before the browser can acknowledge that layout for input.
+ */
+export function isRemoteDesktopPresentedFrameCompatible(
+  frameWidth: number,
+  frameHeight: number,
+  displayWidth: number,
+  displayHeight: number,
+): boolean {
+  const dimensions = [frameWidth, frameHeight, displayWidth, displayHeight];
+  if (!dimensions.every((value) => (
+    Number.isSafeInteger(value) && value > 0 && value <= 16_384
+  ))) return false;
+  const first = frameWidth * displayHeight;
+  const second = frameHeight * displayWidth;
+  return Math.abs(first - second) * 100 <= Math.max(first, second);
+}
+
+export interface RemoteDesktopVideoPointMapping {
+  clientX: number;
+  clientY: number;
+  viewportLeft: number;
+  viewportTop: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  videoWidth: number;
+  videoHeight: number;
+}
+
+const CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
+const STATES = new Set<string>(Object.values(REMOTE_DESKTOP_STATE));
+const ROUTES = new Set<string>(Object.values(REMOTE_DESKTOP_ROUTE));
+const TERMINAL_REASONS = new Set<string>(Object.values(REMOTE_DESKTOP_TERMINAL_REASON));
+const ERRORS = new Set<string>(Object.values(REMOTE_DESKTOP_ERROR));
+const ACCESS_MODES = new Set<string>(Object.values(REMOTE_DESKTOP_ACCESS_MODE));
+const MODE_REASONS = new Set<string>(Object.values(REMOTE_DESKTOP_MODE_REASON));
+const ROTATIONS = new Set<number>(Object.values(REMOTE_DESKTOP_DISPLAY_ROTATION));
+const QUALITY_PRESETS = new Set<string>(Object.values(REMOTE_DESKTOP_QUALITY_PRESET));
+const ENCODER_CLASSES = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_CLASS));
+const ENCODER_CODECS = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_CODEC));
+const ENCODER_RAW_CODECS = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_RAW_CODECS));
+/** Longest encoder name a worker may report (bytes); it is only ever displayed. */
+export const REMOTE_DESKTOP_ENCODER_NAME_BYTES = 64;
+const POINTER_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_KIND));
+const POINTER_BUTTONS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_BUTTON));
+const KEYBOARD_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_KEYBOARD_KIND));
+const CONTROL_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_CONTROL_KIND));
+const CONTROL_REJECTIONS = new Set<string>(Object.values(REMOTE_DESKTOP_CONTROL_REJECTION));
+
+function invalid<T>(): RemoteDesktopValidationResult<T> {
+  return { ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
+}
+
+// One definition of each primitive, shared with every other remote-desktop
+// contract module. See ./remote-desktop-contract-primitives.ts.
+const isRecord = isRemoteDesktopRecord;
+const hasExactKeys = hasExactRemoteDesktopKeys;
+const isBoundedString = isBoundedRemoteDesktopString;
+const isId = isRemoteDesktopId;
+
+function isCapability(value: unknown): value is string {
+  return typeof value === 'string' && CAPABILITY_RE.test(value);
+}
+
+const isSafeNonNegative = isSafeNonNegativeRemoteDesktopInteger;
+
+/** Operator relay cap: 0 is meaningless (absent means "no cap"). */
+function isRelayBitrateCap(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
+    && value <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS;
+}
+
+function isSafePositive(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function isFiniteRange(value: unknown, min: number, max: number): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+}
+
+function hasSessionCorrelation(value: Record<string, unknown>): boolean {
+  return isId(value.requestId) && isId(value.sessionId) && isCapability(value.capability);
+}
+
+function hasInputCorrelation(value: Record<string, unknown>): boolean {
+  return value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && isSafePositive(value.layoutRevision)
+    && isSafeNonNegative(value.inputEpoch);
+}
+
+function validateAuthority(value: Record<string, unknown>): boolean {
+  return hasSessionCorrelation(value)
+    && isSafePositive(value.expiresAt)
+    && isSafePositive(value.leaseExpiresAt)
+    && value.leaseExpiresAt <= value.expiresAt
+    && isSafePositive(value.daemonGeneration)
+    && typeof value.mode === 'string' && ACCESS_MODES.has(value.mode)
+    && isSafeNonNegative(value.inputEpoch)
+    && (value.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL || (value.inputEpoch as number) > 0)
+    && Array.isArray(value.iceServers)
+    && value.iceServers.length <= REMOTE_DESKTOP_LIMITS.ICE_SERVER_ENTRIES
+    && value.iceServers.every(isDirectFileTransferIceServerConfig);
+}
+
+/**
+ * PREPARE establishes the first input fence for a route.  A viewer has no
+ * input authority (epoch zero); a control route may be a fresh route or a
+ * bounded worker replacement carrying a newer, still-live epoch.  Keeping
+ * this rule in the shared validator prevents the TypeScript daemon and the
+ * native worker from disagreeing and turning a valid shared viewer into a
+ * terminal protocol error.
+ */
+function validateInitialAuthority(value: Record<string, unknown>): boolean {
+  if (typeof value.inputEpoch !== 'number') return false;
+  return value.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+    ? value.inputEpoch === 0
+    : value.inputEpoch > 0;
+}
+
+function validateSdp(value: Record<string, unknown>): boolean {
+  return hasSessionCorrelation(value) && isBoundedString(value.sdp, REMOTE_DESKTOP_LIMITS.SDP_BYTES);
+}
+
+/**
+ * An ICE candidate line, or the empty string.
+ *
+ * JSEP spells "I have no more candidates for this m-line" as a candidate
+ * event carrying an EMPTY candidate string, and Firefox emits exactly that
+ * (measured on Firefox 156: one empty-string event, then the null one) where
+ * Chromium emits only the null one. Refusing it as a malformed message
+ * terminated the whole session with `invalid_request` the moment gathering
+ * finished -- every Firefox session, on every host. It carries no address, so
+ * it is accepted here and dropped rather than forwarded.
+ */
+function isIceCandidateLine(value: unknown): value is string {
+  return typeof value === 'string'
+    && remoteDesktopUtf8Bytes(value) <= REMOTE_DESKTOP_LIMITS.ICE_CANDIDATE_BYTES;
+}
+
+export function isRemoteDesktopEndOfCandidates(candidate: unknown): boolean {
+  return candidate === '';
+}
+
+function validateIce(value: Record<string, unknown>): boolean {
+  return hasSessionCorrelation(value)
+    && isIceCandidateLine(value.candidate)
+    && isBoundedString(value.mid, REMOTE_DESKTOP_LIMITS.ICE_MID_BYTES);
+}
+
+export function validateRemoteDesktopBrowserMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopBrowserMessage> {
+  if (!isRecord(value) || typeof value.type !== 'string') return invalid();
+  if (value.type === REMOTE_DESKTOP_MSG.START) {
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'requestId'], ['reconnectAttempt'])
+      || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+      || !isId(value.requestId)
+      || (value.reconnectAttempt !== undefined
+        && (!isSafeNonNegative(value.reconnectAttempt)
+          || value.reconnectAttempt > REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS))) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopStart };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.RESUME) {
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'requestId', 'sessionId', 'capability'])
+      || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopResume };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.OFFER) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'sdp']) || !validateSdp(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopOffer };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.ICE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'candidate', 'mid']) || !validateIce(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopIce };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.MODE_SET) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode'])
+      || !hasSessionCorrelation(value)
+      || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopModeSet };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.CANCEL) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability']) || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopCancel };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.STOP) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'stopOrigin'], ['aggregateBytesReceived'])
+      || !hasSessionCorrelation(value)
+      || typeof value.stopOrigin !== 'string'
+      || !(Object.values(REMOTE_DESKTOP_STOP_ORIGIN) as string[]).includes(value.stopOrigin)
+      || (value.aggregateBytesReceived !== undefined
+        && !isSafeNonNegative(value.aggregateBytesReceived))) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopStop };
+  }
+  return invalid();
+}
+
+export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDaemonCommand> {
+  if (!isRecord(value) || typeof value.type !== 'string') return invalid();
+  if (value.type === REMOTE_DESKTOP_MSG.PREPARE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt', 'relayBitrateCapBps'])
+      || !validateAuthority(value)
+      || !validateInitialAuthority(value)
+      || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
+      || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
+      || (value.reconnectAttempt !== undefined
+        && (!isSafeNonNegative(value.reconnectAttempt)
+          || value.reconnectAttempt > REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS))) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopPrepare };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.LEASE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch'], ['routeGeneration'])
+      || !hasSessionCorrelation(value)
+      || !isSafePositive(value.leaseExpiresAt)
+      || !isSafePositive(value.daemonGeneration)
+      || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
+      || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
+      || !isSafeNonNegative(value.inputEpoch)
+      || (value.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL && (value.inputEpoch as number) === 0)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopLease };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.MODE_STATE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'reason'])
+      || !hasSessionCorrelation(value)
+      || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
+      || !isSafeNonNegative(value.inputEpoch)
+      || (value.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL && (value.inputEpoch as number) === 0)
+      || typeof value.reason !== 'string'
+      || !MODE_REASONS.has(value.reason)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopModeState };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.STOP) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability'])
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopDaemonStop };
+  }
+  const browser = validateRemoteDesktopBrowserMessage(value);
+  if (browser.ok
+    && browser.value.type !== REMOTE_DESKTOP_MSG.START
+    && browser.value.type !== REMOTE_DESKTOP_MSG.RESUME
+    && browser.value.type !== REMOTE_DESKTOP_MSG.MODE_SET) {
+    return { ok: true, value: browser.value };
+  }
+  return invalid();
+}
+
+export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDaemonMessage> {
+  if (!isRecord(value) || typeof value.type !== 'string') return invalid();
+  if (value.type === REMOTE_DESKTOP_MSG.ANSWER) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'sdp']) || !validateSdp(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopAnswer };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.ICE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'candidate', 'mid']) || !validateIce(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopIce };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.MODE_STATE) {
+    const command = validateRemoteDesktopDaemonCommand(value);
+    return command.ok && command.value.type === REMOTE_DESKTOP_MSG.MODE_STATE
+      ? { ok: true, value: command.value }
+      : invalid();
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'qualityPreference', 'qualityUltra', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
+      || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
+      || (value.autoUnlockSucceeded !== undefined && value.autoUnlockSucceeded !== true)
+      || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
+      || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
+      || (value.qualityPreference !== undefined && typeof value.qualityPreference !== 'boolean')
+      || (value.qualityUltra !== undefined && typeof value.qualityUltra !== 'boolean')
+      || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')
+      || (value.dataChannelsReady !== undefined && typeof value.dataChannelsReady !== 'boolean')
+      || (value.mediaStarted !== undefined && typeof value.mediaStarted !== 'boolean')
+      || (value.firstFramePresented !== undefined && typeof value.firstFramePresented !== 'boolean')
+      || (value.inputBlocked !== undefined
+        && !(Object.values(REMOTE_DESKTOP_INPUT_BLOCKED) as string[]).includes(value.inputBlocked as string))
+      || (value.inputBlocked !== undefined && value.inputEnabled === true)
+      || !hasSessionCorrelation(value)
+      || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
+      || !isSafeNonNegative(value.inputEpoch)
+      || typeof value.state !== 'string' || !STATES.has(value.state)
+      || (value.route !== undefined && (typeof value.route !== 'string' || !ROUTES.has(value.route)))
+      || (value.selectedDisplayId !== undefined
+        && !isBoundedString(value.selectedDisplayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES))
+      || (value.layoutRevision !== undefined
+        && (!Number.isSafeInteger(value.layoutRevision) || (value.layoutRevision as number) <= 0))
+      || ((value.selectedDisplayId === undefined) !== (value.layoutRevision === undefined))
+      || typeof value.inputEnabled !== 'boolean'
+      || (value.viewerCount !== undefined
+        && (!isSafeNonNegative(value.viewerCount) || value.viewerCount > REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE))
+      || (value.controllerCount !== undefined
+        && (!isSafeNonNegative(value.controllerCount) || value.controllerCount > REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE))
+      || (value.viewerCount !== undefined && value.controllerCount !== undefined
+        && value.controllerCount > value.viewerCount)
+      || (value.inputEnabled && (value.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL || (value.inputEpoch as number) === 0))) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopStatus };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.RENEGOTIATE) {
+    // Authority-shaped and nothing else: a replacement worker must not be able
+    // to smuggle a new grant, mode or epoch through the handover.
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability'])
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopRenegotiate };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'reason'], ['detail'])
+      || !hasSessionCorrelation(value)
+      || typeof value.reason !== 'string' || !TERMINAL_REASONS.has(value.reason)
+      || (value.detail !== undefined && !isBoundedString(value.detail, REMOTE_DESKTOP_LIMITS.ERROR_DETAIL_BYTES))) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopTerminal };
+  }
+  return invalid();
+}
+
+export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopValidationResult<RemoteDesktopAuthorized> {
+  if (!isRecord(value)
+    || value.type !== REMOTE_DESKTOP_MSG.AUTHORIZED
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime', 'relayBitrateCapBps'])
+    // The Server's clock at send, so the browser can place expiresAt on its own
+    // clock (shared/clock-sync.ts). Optional: older Servers omit it.
+    || (value.serverTime !== undefined && (!Number.isSafeInteger(value.serverTime) || (value.serverTime as number) <= 0))
+    || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
+    || !validateAuthority(value)) return invalid();
+  return { ok: true, value: value as unknown as RemoteDesktopAuthorized };
+}
+
+export function validateRemoteDesktopResumed(value: unknown): RemoteDesktopValidationResult<RemoteDesktopResumed> {
+  if (!isRecord(value)
+    || value.type !== REMOTE_DESKTOP_MSG.RESUMED
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime'])
+    // The Server's clock at send, so the browser can place expiresAt on its own
+    // clock (shared/clock-sync.ts). Optional: older Servers omit it.
+    || (value.serverTime !== undefined && (!Number.isSafeInteger(value.serverTime) || (value.serverTime as number) <= 0))
+    || !validateAuthority(value)) return invalid();
+  return { ok: true, value: value as unknown as RemoteDesktopResumed };
+}
+
+export function validateRemoteDesktopServerMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopServerMessage> {
+  if (isRecord(value)
+    && value.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED
+    && hasExactKeys(value, ['type'])) {
+    return { ok: true, value: value as unknown as RemoteDesktopBootstrapRedeemed };
+  }
+  const authorized = validateRemoteDesktopAuthorized(value);
+  if (authorized.ok) return authorized;
+  const resumed = validateRemoteDesktopResumed(value);
+  if (resumed.ok) return resumed;
+  const daemon = validateRemoteDesktopDaemonMessage(value);
+  if (daemon.ok) return daemon;
+  const command = validateRemoteDesktopDaemonCommand(value);
+  if (command.ok && command.value.type === REMOTE_DESKTOP_MSG.MODE_STATE) {
+    return { ok: true, value: command.value as RemoteDesktopModeState };
+  }
+  if (!isRecord(value)
+    || value.type !== REMOTE_DESKTOP_MSG.ERROR
+    || !hasExactKeys(value, ['type', 'requestId', 'error', 'retryable'], ['detail'])
+    || !isId(value.requestId)
+    || typeof value.error !== 'string' || !ERRORS.has(value.error)
+    || typeof value.retryable !== 'boolean'
+    || (value.detail !== undefined && !isBoundedString(value.detail, REMOTE_DESKTOP_LIMITS.ERROR_DETAIL_BYTES))) return invalid();
+  return { ok: true, value: value as unknown as RemoteDesktopError };
+}
+
+export function validateRemoteDesktopActiveRouteSummary(
+  value: unknown,
+): RemoteDesktopValidationResult<RemoteDesktopActiveRouteSummary> {
+  if (!isRecord(value)
+    || !hasExactKeys(
+      value,
+      ['requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'mode', 'inputEpoch'],
+      ['routeGeneration', 'peerConnected', 'state'],
+    )
+    || !hasSessionCorrelation(value)
+    || !isSafePositive(value.expiresAt)
+    || !isSafePositive(value.leaseExpiresAt)
+    || value.leaseExpiresAt > value.expiresAt
+    || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
+    || !isSafeNonNegative(value.inputEpoch)
+    || (value.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL && (value.inputEpoch as number) === 0)
+    || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
+    || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')
+    || (value.state !== undefined && (typeof value.state !== 'string' || !STATES.has(value.state)))) {
+    return invalid();
+  }
+  return { ok: true, value: value as unknown as RemoteDesktopActiveRouteSummary };
+}
+
+export function validateRemoteDesktopActiveRoutesList(
+  value: unknown,
+): RemoteDesktopValidationResult<RemoteDesktopActiveRouteSummary[]> {
+  if (!Array.isArray(value) || value.length > REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE) return invalid();
+  const routes: RemoteDesktopActiveRouteSummary[] = [];
+  const seenSessions = new Set<string>();
+  for (const entry of value) {
+    const parsed = validateRemoteDesktopActiveRouteSummary(entry);
+    if (!parsed.ok || seenSessions.has(parsed.value.sessionId)) return invalid();
+    seenSessions.add(parsed.value.sessionId);
+    routes.push(parsed.value);
+  }
+  return { ok: true, value: routes };
+}
+
+export function validateRemoteDesktopActiveRoutes(
+  value: unknown,
+): RemoteDesktopValidationResult<RemoteDesktopActiveRoutes> {
+  if (!isRecord(value)
+    || value.type !== REMOTE_DESKTOP_MSG.ACTIVE_ROUTES
+    || !hasExactKeys(value, ['type', 'protocolVersion', 'routes'])
+    || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION) {
+    return invalid();
+  }
+  const routes = validateRemoteDesktopActiveRoutesList(value.routes);
+  if (!routes.ok) return invalid();
+  return {
+    ok: true,
+    value: {
+      type: REMOTE_DESKTOP_MSG.ACTIVE_ROUTES,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      routes: routes.value,
+    },
+  };
+}
+
+function isDisplay(value: unknown): value is RemoteDesktopDisplay {
+  if (!isRecord(value)
+    || !hasExactKeys(
+      value,
+      ['id', 'label', 'primary', 'available', 'width', 'height', 'dpiScale', 'rotation'],
+      ['modes', 'inputBounds', 'operations'],
+    )) return false;
+  return isBoundedString(value.id, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+    && isBoundedString(value.label, REMOTE_DESKTOP_LIMITS.DISPLAY_LABEL_BYTES)
+    && typeof value.primary === 'boolean'
+    && typeof value.available === 'boolean'
+    && isSafePositive(value.width) && value.width <= 16_384
+    && isSafePositive(value.height) && value.height <= 16_384
+    && isFiniteRange(value.dpiScale, 0.5, 8)
+    && typeof value.rotation === 'number' && ROTATIONS.has(value.rotation)
+    && (value.inputBounds === undefined || isLogicalBounds(value.inputBounds))
+    && (value.operations === undefined || isDisplayOperations(value.operations))
+    && (value.modes === undefined || isDisplayModeList(value.modes));
+}
+
+function isLogicalBounds(value: unknown): value is RemoteDesktopLogicalBounds {
+  return isRecord(value)
+    && hasExactKeys(value, ['x', 'y', 'width', 'height'])
+    && isFiniteRange(value.x, -1_000_000, 1_000_000)
+    && isFiniteRange(value.y, -1_000_000, 1_000_000)
+    && isFiniteRange(value.width, 1, 1_000_000)
+    && isFiniteRange(value.height, 1, 1_000_000);
+}
+
+function isDisplayOperations(value: unknown): value is RemoteDesktopDisplayOperations {
+  return isRecord(value)
+    && hasExactKeys(value, ['setMode', 'setScale'])
+    && typeof value.setMode === 'boolean'
+    && typeof value.setScale === 'boolean';
+}
+
+/** Common-profile workers must provide the geometry/operation refinement. */
+export function hasRemoteDesktopCrossPlatformDisplayGeometry(
+  display: RemoteDesktopDisplay,
+): display is RemoteDesktopDisplay & {
+  inputBounds: RemoteDesktopLogicalBounds;
+  operations: RemoteDesktopDisplayOperations;
+} {
+  return display.inputBounds !== undefined && display.operations !== undefined;
+}
+
+function isDisplayModeList(value: unknown): value is RemoteDesktopDisplayMode[] {
+  if (!Array.isArray(value) || value.length === 0
+    || value.length > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_MODES) return false;
+  const seen = new Set<string>();
+  for (const mode of value) {
+    if (!isRecord(mode) || !hasExactKeys(mode, ['width', 'height'])
+      || !isSafePositive(mode.width) || !isSafePositive(mode.height)
+      || (mode.width as number) < REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      || (mode.height as number) < REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      || (mode.width as number) > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
+      || (mode.height as number) > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE) {
+      return false;
+    }
+    const key = `${mode.width}x${mode.height}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
+}
+
+function hasUniqueDisplayIds(displays: readonly RemoteDesktopDisplay[]): boolean {
+  return new Set(displays.map((display) => display.id)).size === displays.length;
+}
+
+function validateDisplayTopology(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'displays'], ['selectedDisplayId'])
+    || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+    || !isId(value.sessionId)
+    || !isSafeNonNegative(value.sequence)
+    || !isSafePositive(value.layoutRevision)
+    || !Array.isArray(value.displays)
+    || value.displays.length === 0
+    || value.displays.length > REMOTE_DESKTOP_LIMITS.DISPLAYS
+    || !value.displays.every(isDisplay)
+    || !hasUniqueDisplayIds(value.displays)) return false;
+  return value.selectedDisplayId === undefined
+    || (isBoundedString(value.selectedDisplayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && value.displays.some((display) => display.id === value.selectedDisplayId && display.available));
+}
+
+function validateQuality(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'preset', 'encoderClass', 'width', 'height', 'fps', 'bitrateBps', 'droppedFrames', 'rttMs'])
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && typeof value.preset === 'string' && QUALITY_PRESETS.has(value.preset)
+    && typeof value.encoderClass === 'string' && ENCODER_CLASSES.has(value.encoderClass)
+    && isSafePositive(value.width) && value.width <= 16_384
+    && isSafePositive(value.height) && value.height <= 16_384
+    && isFiniteRange(value.fps, 0, 240)
+    && isSafeNonNegative(value.bitrateBps) && value.bitrateBps <= REMOTE_DESKTOP_LIMITS.MAX_VIDEO_BITRATE_BPS
+    && isSafeNonNegative(value.droppedFrames)
+    && isFiniteRange(value.rttMs, 0, 3_600_000);
+}
+
+function validateEncoderInfo(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'codec', 'implementation', 'name', 'threads', 'rawCodecs'])
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && typeof value.codec === 'string' && ENCODER_CODECS.has(value.codec)
+    && typeof value.implementation === 'string' && ENCODER_CLASSES.has(value.implementation)
+    && isBoundedString(value.name, REMOTE_DESKTOP_ENCODER_NAME_BYTES)
+    && isSafeNonNegative(value.threads) && value.threads <= 256
+    && typeof value.rawCodecs === 'string' && ENCODER_RAW_CODECS.has(value.rawCodecs);
+}
+
+const HELD_CODE_RE = /^[A-Za-z0-9_.-]+$/;
+
+/** A comma-separated list of 0..max tokens, each matching `accept`, no duplicates. */
+function isHeldList(value: unknown, max: number, accept: (token: string) => boolean): value is string {
+  if (typeof value !== 'string' || value.length > REMOTE_DESKTOP_LIMITS.HELD_INPUT_LIST_BYTES) return false;
+  if (value === '') return true;
+  const tokens = value.split(',');
+  return tokens.length <= max
+    && new Set(tokens).size === tokens.length
+    && tokens.every((token) => token.length > 0
+      && remoteDesktopUtf8Bytes(token) <= REMOTE_DESKTOP_LIMITS.KEY_CODE_BYTES
+      && accept(token));
+}
+
+function validateHeldInput(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'keys', 'buttons'])
+    && hasInputCorrelation(value)
+    && isSafePositive(value.inputEpoch)
+    && isHeldList(value.keys, REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS, (token) => HELD_CODE_RE.test(token))
+    && isHeldList(value.buttons, POINTER_BUTTONS.size, (token) => POINTER_BUTTONS.has(token));
+}
+
+/** Wire-shape check for a viewer quality preference (also used by the web). */
+export function isRemoteDesktopQualityPreference(value: unknown): value is RemoteDesktopQualityPreference {
+  if (!isRecord(value)) return false;
+  return (REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS as readonly unknown[]).includes(value.maxHeight)
+    && (REMOTE_DESKTOP_QUALITY_MAX_FPS as readonly unknown[]).includes(value.maxFps)
+    && typeof value.maxBitrateBps === 'number' && Number.isSafeInteger(value.maxBitrateBps)
+    && (value.maxBitrateBps === 0 || (
+      value.maxBitrateBps >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
+      && value.maxBitrateBps <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_VIEWER_BPS))
+    && typeof value.priority === 'string'
+    && (Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY) as string[]).includes(value.priority);
+}
+
+/**
+ * Normalize a viewer preference before it reaches a worker. A 720p cap was
+ * accepted by older clients, but a capable source must not be instructed to
+ * send below the 1080p floor. Keeping 720 in the wire union preserves decode
+ * compatibility while making new sends safe.
+ */
+export function normalizeRemoteDesktopQualityPreference(
+  preference: RemoteDesktopQualityPreference,
+): RemoteDesktopQualityPreference {
+  return preference.maxHeight > 0 && preference.maxHeight < REMOTE_DESKTOP_QUALITY_MIN_HEIGHT
+    ? { ...preference, maxHeight: REMOTE_DESKTOP_QUALITY_MIN_HEIGHT }
+    : { ...preference };
+}
+
+/**
+ * The same preference for a worker that does not advertise `qualityUltra`,
+ * which refuses 2160 and a raised ceiling. Its ladder tops out at 2160, so
+ * native picks the same rungs; the bitrate falls back to its default ceiling.
+ */
+export function legacyRemoteDesktopQualityPreference(
+  preference: RemoteDesktopQualityPreference,
+): RemoteDesktopQualityPreference {
+  const normalized = normalizeRemoteDesktopQualityPreference(preference);
+  return {
+    ...normalized,
+    maxHeight: normalized.maxHeight === 2160 ? 0 : normalized.maxHeight,
+    maxBitrateBps: normalized.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
+      ? 0
+      : normalized.maxBitrateBps,
+  };
+}
+
+function validateClipboard(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(
+    value,
+    ['type', 'protocolVersion', 'sessionId', 'sequence', 'requestId', 'available'],
+    ['text'],
+  )
+    || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+    || !isId(value.sessionId)
+    || !isSafeNonNegative(value.sequence)
+    || !isId(value.requestId)
+    || typeof value.available !== 'boolean') return false;
+  return value.available
+    ? isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.CLIPBOARD_TEXT_BYTES)
+    : value.text === undefined;
+}
+
+function validateClipboardUpdate(value: Record<string, unknown>): boolean {
+  return hasExactKeys(
+    value,
+    ['type', 'protocolVersion', 'sessionId', 'sequence', 'inputEpoch', 'text'],
+  )
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && isSafePositive(value.inputEpoch)
+    && isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.CLIPBOARD_TEXT_BYTES);
+}
+
+function validatePointer(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['x', 'y', 'button', 'deltaX', 'deltaY'])
+    || !hasInputCorrelation(value)
+    || !isSafePositive(value.inputEpoch)
+    || typeof value.kind !== 'string' || !POINTER_KINDS.has(value.kind)) return false;
+  if (value.kind === REMOTE_DESKTOP_POINTER_KIND.MOVE) {
+    return isFiniteRange(value.x, 0, 1) && isFiniteRange(value.y, 0, 1)
+      && value.button === undefined && value.deltaX === undefined && value.deltaY === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_DOWN
+    || value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_UP
+    || value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK) {
+    return typeof value.button === 'string' && POINTER_BUTTONS.has(value.button)
+      && (value.x === undefined || isFiniteRange(value.x, 0, 1))
+      && (value.y === undefined || isFiniteRange(value.y, 0, 1))
+      && value.deltaX === undefined && value.deltaY === undefined;
+  }
+  return isFiniteRange(value.deltaX, -10_000, 10_000)
+    && isFiniteRange(value.deltaY, -10_000, 10_000)
+    && value.button === undefined
+    && (value.x === undefined || isFiniteRange(value.x, 0, 1))
+    && (value.y === undefined || isFiniteRange(value.y, 0, 1));
+}
+
+function validateKeyboard(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['code', 'key', 'repeat', 'text'])
+    || !hasInputCorrelation(value)
+    || !isSafePositive(value.inputEpoch)
+    || typeof value.kind !== 'string' || !KEYBOARD_KINDS.has(value.kind)) return false;
+  if (value.kind === REMOTE_DESKTOP_KEYBOARD_KIND.TEXT) {
+    return isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.TEXT_BYTES)
+      && value.code === undefined && value.key === undefined && value.repeat === undefined;
+  }
+  return isBoundedString(value.code, REMOTE_DESKTOP_LIMITS.KEY_CODE_BYTES)
+    && isBoundedString(value.key, REMOTE_DESKTOP_LIMITS.KEY_VALUE_BYTES)
+    && typeof value.repeat === 'boolean'
+    && value.text === undefined;
+}
+
+function validateControl(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['enabled', 'displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence', 'maxHeight', 'maxFps', 'maxBitrateBps', 'priority', 'text', 'pasteId', 'chunkIndex', 'chunkCount'])
+    || !hasInputCorrelation(value)
+    || typeof value.kind !== 'string' || !CONTROL_KINDS.has(value.kind)) return false;
+  const qualityFieldsAbsent = value.maxHeight === undefined && value.maxFps === undefined
+    && value.maxBitrateBps === undefined && value.priority === undefined;
+  const enabledAbsent = value.enabled === undefined;
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_CLIPBOARD_SYNC
+    || value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_AUDIO) {
+    return typeof value.enabled === 'boolean'
+      && qualityFieldsAbsent
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+      && value.text === undefined && value.pasteId === undefined
+      && value.chunkIndex === undefined && value.chunkCount === undefined;
+  }
+  if (!enabledAbsent) return false;
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE) {
+    return isRemoteDesktopQualityPreference(value)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+      && value.text === undefined && value.pasteId === undefined
+      && value.chunkIndex === undefined && value.chunkCount === undefined;
+  }
+  if (!qualityFieldsAbsent) return false;
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SELECT_DISPLAY) {
+    return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && value.width === undefined && value.height === undefined
+      && value.dpiScalePercent === undefined && value.requestId === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE) {
+    // Bounded, not enumerated: which resolutions exist is the node's answer,
+    // and a wire contract that hardcodes four of them can only ever offer four.
+    return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && isSafePositive(value.width) && isSafePositive(value.height)
+      && (value.width as number) >= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      && (value.height as number) >= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      && (value.width as number) <= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
+      && (value.height as number) <= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
+      && value.dpiScalePercent === undefined && value.requestId === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE) {
+    return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && typeof value.dpiScalePercent === 'number'
+      && REMOTE_DESKTOP_DPI_SCALE_PERCENTS.includes(
+        value.dpiScalePercent as typeof REMOTE_DESKTOP_DPI_SCALE_PERCENTS[number],
+      )
+      && value.width === undefined && value.height === undefined
+      && value.requestId === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION) {
+    return isId(value.requestId)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT) {
+    return isId(value.pasteId)
+      && isSafeNonNegative(value.chunkIndex)
+      && isSafePositive(value.chunkCount)
+      && value.chunkCount <= Math.ceil(
+        REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES / REMOTE_DESKTOP_LIMITS.PASTE_TEXT_CHUNK_BYTES,
+      )
+      && value.chunkIndex < value.chunkCount
+      && isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.PASTE_TEXT_CHUNK_BYTES)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.requestId === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.UNLOCK) {
+    return value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+      && value.text === undefined && value.pasteId === undefined
+      && value.chunkIndex === undefined && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED) {
+    return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && isSafePositive(value.frameWidth) && (value.frameWidth as number) <= 16_384
+      && isSafePositive(value.frameHeight) && (value.frameHeight as number) <= 16_384
+      && value.width === undefined && value.height === undefined
+      && value.dpiScalePercent === undefined && value.requestId === undefined
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK) {
+    return isSafeNonNegative(value.acknowledgedSequence)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  return value.displayId === undefined && value.width === undefined
+    && value.height === undefined && value.frameWidth === undefined
+    && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+    && value.dpiScalePercent === undefined && value.requestId === undefined
+    && value.text === undefined && value.pasteId === undefined
+    && value.chunkIndex === undefined && value.chunkCount === undefined;
+}
+
+function validateControlRejected(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'kind', 'reason'], ['displayId'])
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && typeof value.kind === 'string' && CONTROL_KINDS.has(value.kind)
+    && typeof value.reason === 'string' && CONTROL_REJECTIONS.has(value.reason)
+    && (value.displayId === undefined
+      || isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES));
+}
+
+export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDataMessage> {
+  if (!isRecord(value) || typeof value.type !== 'string') return invalid();
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY && validateDisplayTopology(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopDisplayTopology };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.QUALITY && validateQuality(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopQuality };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.ENCODER && validateEncoderInfo(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopEncoderInfo };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD && validateClipboard(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopClipboard };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD_UPDATE && validateClipboardUpdate(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopClipboardUpdate };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.POINTER && validatePointer(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopPointer };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.KEYBOARD && validateKeyboard(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopKeyboard };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL && validateControl(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopControl };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED && validateControlRejected(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopControlRejected };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.HELD_INPUT && validateHeldInput(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopHeldInput };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL
+    && hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch'])
+    && hasInputCorrelation(value)
+    && isSafePositive(value.inputEpoch)) {
+    return { ok: true, value: value as unknown as RemoteDesktopReleaseAll };
+  }
+  return invalid();
+}
+
+/**
+ * Stateless replay/layout guard for a caller-owned per-channel sequence state.
+ * The caller advances lastSequence only after the validated operation succeeds.
+ */
+export function isRemoteDesktopSequenceAccepted(
+  message: Pick<RemoteDesktopInputBase, 'sessionId' | 'sequence' | 'layoutRevision' | 'inputEpoch'>,
+  state: RemoteDesktopSequenceState,
+): boolean {
+  return message.sessionId === state.sessionId
+    && message.layoutRevision === state.layoutRevision
+    && message.inputEpoch === state.inputEpoch
+    && Number.isSafeInteger(message.sequence)
+    && message.sequence > state.lastSequence;
+}
+
+/** Converts a browser pointer to normalized video-content coordinates. */
+export function mapRemoteDesktopVideoPoint(
+  mapping: RemoteDesktopVideoPointMapping,
+): RemoteDesktopNormalizedPoint | null {
+  if (!Object.values(mapping).every((value) => typeof value === 'number' && Number.isFinite(value))
+    || mapping.viewportWidth <= 0
+    || mapping.viewportHeight <= 0
+    || mapping.videoWidth <= 0
+    || mapping.videoHeight <= 0) return null;
+
+  const scale = Math.min(
+    mapping.viewportWidth / mapping.videoWidth,
+    mapping.viewportHeight / mapping.videoHeight,
+  );
+  const contentWidth = mapping.videoWidth * scale;
+  const contentHeight = mapping.videoHeight * scale;
+  const contentLeft = mapping.viewportLeft + ((mapping.viewportWidth - contentWidth) / 2);
+  const contentTop = mapping.viewportTop + ((mapping.viewportHeight - contentHeight) / 2);
+  const contentX = mapping.clientX - contentLeft;
+  const contentY = mapping.clientY - contentTop;
+
+  if (contentX < 0 || contentY < 0 || contentX > contentWidth || contentY > contentHeight) return null;
+  return {
+    x: Math.min(1, Math.max(0, contentX / contentWidth)),
+    y: Math.min(1, Math.max(0, contentY / contentHeight)),
+  };
+}
+
+/**
+ * Maps normalized post-rotation video coordinates to monitor-relative physical
+ * pixels. dpiScale is diagnostic and must not be multiplied in again.
+ */
+export function mapRemoteDesktopPointToPhysicalPixels(
+  point: RemoteDesktopNormalizedPoint,
+  display: Pick<RemoteDesktopDisplay, 'width' | 'height' | 'dpiScale' | 'rotation' | 'available'>,
+  inputLayoutRevision: number,
+  currentLayoutRevision: number,
+): RemoteDesktopPhysicalPoint | null {
+  if (!display.available
+    || !isSafePositive(inputLayoutRevision)
+    || inputLayoutRevision !== currentLayoutRevision
+    || !isSafePositive(display.width)
+    || !isSafePositive(display.height)
+    || !isFiniteRange(display.dpiScale, 0.5, 8)
+    || !ROTATIONS.has(display.rotation)
+    || !isFiniteRange(point.x, 0, 1)
+    || !isFiniteRange(point.y, 0, 1)) return null;
+
+  return {
+    x: Math.min(display.width - 1, Math.floor(point.x * display.width)),
+    y: Math.min(display.height - 1, Math.floor(point.y * display.height)),
+  };
+}
+
+export function isRemoteDesktopMessageType(value: unknown): value is string {
+  return typeof value === 'string' && (Object.values(REMOTE_DESKTOP_MSG) as string[]).includes(value);
+}
+
+export function isRemoteDesktopDaemonMessageType(value: unknown): boolean {
+  return value === REMOTE_DESKTOP_MSG.ANSWER
+    || value === REMOTE_DESKTOP_MSG.ICE
+    || value === REMOTE_DESKTOP_MSG.MODE_STATE
+    || value === REMOTE_DESKTOP_MSG.STATUS
+    || value === REMOTE_DESKTOP_MSG.TERMINAL;
+}

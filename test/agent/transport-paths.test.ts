@@ -8,6 +8,8 @@ import {
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
+  resolveAgyPathForSdk,
+  resolveGrokPathForSdk,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -54,6 +56,57 @@ describe('resolveClaudeCodePathForSdk (macOS/Linux bundled-binary resolution)', 
     if (process.platform === 'win32') return;
     expect(resolveClaudeCodePathForSdk('/custom/bin/claude')).toBe('/custom/bin/claude');
     expect(resolveClaudeCodePathForSdk('claude-canary')).toBe('claude-canary');
+  });
+});
+
+describe('resolveAgyPathForSdk (per-user and system candidate resolution)', () => {
+  it('honours an explicit caller-provided binary path unchanged', () => {
+    if (process.platform === 'win32') return;
+    expect(resolveAgyPathForSdk('/custom/bin/agy')).toBe('/custom/bin/agy');
+  });
+
+  it('resolves agy from candidates or falls back gracefully', () => {
+    if (process.platform === 'win32') return;
+    const resolved = resolveAgyPathForSdk('agy');
+    expect(typeof resolved).toBe('string');
+    expect(resolved.length).toBeGreaterThan(0);
+  });
+});
+
+describe('resolveGrokPathForSdk (per-user and system candidate resolution)', () => {
+  it('honours an explicit caller-provided binary path unchanged', () => {
+    if (process.platform === 'win32') return;
+    expect(resolveGrokPathForSdk('/custom/bin/grok')).toBe('/custom/bin/grok');
+  });
+
+  it('resolves grok from candidates or falls back gracefully', () => {
+    if (process.platform === 'win32') return;
+    const resolved = resolveGrokPathForSdk('grok');
+    expect(typeof resolved).toBe('string');
+    expect(resolved.length).toBeGreaterThan(0);
+  });
+
+  it('resolves grok from GROK_HOME candidate when configured', () => {
+    if (process.platform === 'win32') return;
+    const origHome = process.env.GROK_HOME;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'grok-home-'));
+    try {
+      const binDir = path.join(tmpDir, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const fakeGrok = path.join(binDir, 'grok');
+      fs.writeFileSync(fakeGrok, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(fakeGrok, 0o755);
+
+      process.env.GROK_HOME = tmpDir;
+      expect(resolveGrokPathForSdk('grok')).toBe(fakeGrok);
+    } finally {
+      if (origHome === undefined) {
+        delete process.env.GROK_HOME;
+      } else {
+        process.env.GROK_HOME = origHome;
+      }
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
   });
 });
 

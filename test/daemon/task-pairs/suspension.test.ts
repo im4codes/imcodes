@@ -1,0 +1,493 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
+import { pausePair, resumePair, validatePairDependencies } from '../../../src/daemon/task-pairs/suspension.js';
+import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { queuedPairWakeAllowed } from '../../../src/daemon/task-pairs/wake-authority.js';
+import { resolveTransportQueueEntryAdmission } from '../../../src/daemon/delegation-reply-task-liveness.js';
+import { isTaskPairSuspended, TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_RESUME_REASON } from '../../../shared/task-pair-suspension.js';
+import { taskPairSideToAct, type TaskPairState } from '../../../shared/task-pair.js';
+import { getSession, removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
+import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+
+const P = 'pair-pause-test', B = 'deck_e2e_pause_brain', E = 'deck_e2e_pause_exec', A = 'deck_e2e_pause_aud';
+let now: number, busy: Set<string>, messages: Array<{ target: string; id: string; text: string }>;
+let automation: TaskPairAutomation;
+const state = (id: string, status: TaskPairState['status'] = 'working'): TaskPairState => ({
+  taskId: id, brain: B, executor: E, auditor: A, status, title: '暂停与依赖测试', brief: '- [ ][ ] work',
+  workspaceKind: 'none', flags: [], flagSides: {}, round: 2, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 2,
+  material: { kind: 'report' }, createdAt: now, updatedAt: now,
+} as TaskPairState);
+const get = (id: string) => getTaskPairStore().getPair(P, id)!.state;
+const save = (id: string, status: TaskPairState['status'] = 'working') => putTaskPairFixture(getTaskPairStore(), P, state(id, status));
+const makeAutomation = () => new TaskPairAutomation({ now: () => now, isBusy: (id) => busy.has(id), isLimited: () => false, importLegacy: () => undefined, mainCheckoutRoots: () => [], brainMainCheckoutActive: () => false });
+beforeEach(() => {
+  now = Date.now(); busy = new Set(); messages = [];
+  process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+  setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+  for (const [name, role] of [[B, 'brain'], [E, 'w1'], [A, 'w2']]) upsertSession({ name, role, projectName: P, projectDir: process.env.HOME!, agentType: 'codex-sdk', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now } as SessionRecord);
+  setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { messages.push({ target, text, id }); } });
+  automation = makeAutomation(); taskPairService.setScheduler(automation);
+});
+afterEach(async () => {
+  automation.stop(); await taskPairService.waitForIdle(); taskPairService.setScheduler(undefined);
+  setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined);
+  for (const id of [B, E, A]) removeSession(id);
+  delete process.env.IMCODES_SUPERVISION_ENGINE;
+});
+
+describe('durable cooperative suspension', () => {
+  it.each(['working', 'in_audit', 'awaiting_audit', 'rework', 'passed', 'queued'] as const)('preserves lifecycle/material and suppresses all nudges (%s)', async (status) => {
+    save('task', status); const before = get('task');
+    pausePair(P, 'task', B, 'manual', [], 'waiting for owner');
+    for (let i = 0; i < 4; i++) { now += 6 * 60_000; await automation.tick(); await automation.checkBothIdlePairs(); automation.publishBadges(); }
+    expect(messages).toEqual([]);
+    expect(get('task')).toMatchObject({ status, round: before.round, material: before.material, brief: before.brief, scheduling: { manual: true } });
+    expect(taskPairSideToAct(get('task'))).toBeUndefined();
+  });
+  it('pauses idempotently and ordinary stale saves cannot clear it', () => {
+    save('task'); const stale = get('task'); pausePair(P, 'task', B, 'manual'); const epoch = get('task').scheduling!.epoch;
+    pausePair(P, 'task', B, 'manual'); expect(get('task').scheduling!.epoch).toBe(epoch);
+    putTaskPairFixture(getTaskPairStore(), P, { ...stale, status: 'in_audit', round: 3 });
+    expect(get('task')).toMatchObject({ status: 'in_audit', round: 3, scheduling: { epoch, manual: true } });
+  });
+  it('waits for a running turn to settle and sends one resume to the preserved audit side', async () => {
+    save('task', 'in_audit'); pausePair(P, 'task', B, 'manual'); busy.add(A); resumePair(P, 'task', B);
+    await automation.reconcileSuspensions(); expect(messages).toEqual([]); expect(isTaskPairSuspended(get('task'))).toBe(true);
+    busy.clear(); await automation.reconcileSuspensions(); await automation.reconcileSuspensions();
+    expect(messages).toHaveLength(1); expect(messages[0]!.target).toBe(A); expect(messages[0]!.id).toContain(TASK_PAIR_RESUME_REASON);
+    expect(get('task')).toMatchObject({ status: 'in_audit', round: 2, scheduling: { resumePending: false } });
+    expect(taskPairSideToAct(get('task'))).toBe('auditor');
+  });
+  it('persists pause across a real SQLite reopen and rejects stale scheduling CAS writes', () => {
+    const path = join(process.env.HOME!, 'pause-state.sqlite'); setTaskPairStoreForTests(new TaskPairStore(path));
+    save('task'); pausePair(P, 'task', B, 'manual'); const paused = get('task').scheduling!;
+    setTaskPairStoreForTests(undefined); setTaskPairStoreForTests(new TaskPairStore(path));
+    expect(get('task').scheduling).toEqual(paused);
+    resumePair(P, 'task', B);
+    expect(getTaskPairStore().patchScheduling(P, 'task', paused, { ...paused, manual: true }, now)).toBeUndefined();
+    expect(get('task').scheduling?.manual).toBe(false);
+  });
+  it.each(['done', 'cancelled'] as const)('cannot revive a terminal pair (%s)', (status) => {
+    save('task', status); expect(() => pausePair(P, 'task', B, 'manual')).toThrow(); expect(() => resumePair(P, 'task', B)).toThrow(); expect(get('task').status).toBe(status);
+  });
+  it('retains resource claims and refuses non-Brain changes', () => {
+    save('task'); const claim = getTaskPairStore().tryClaimResource({ project: P, taskId: 'task', owner: E, resource: 'pause-test-owned-resource', mode: 'exclusive', ttlMs: 60_000, now });
+    pausePair(P, 'task', B, 'manual'); expect(getTaskPairStore().listResourceClaimsForPair(P, 'task', now)).toEqual(claim.ok ? [claim.claim] : []);
+    expect(() => resumePair(P, 'task', E)).toThrow();
+  });
+});
+
+describe('event/state-driven dependencies', () => {
+  it('waits through PASS; accepted DONE wakes once, not on every check', async () => {
+    save('upstream', 'passed'); save('child'); pausePair(P, 'child', B, 'dependencies', ['upstream']);
+    await automation.reconcileSuspensions(); expect(messages).toEqual([]);
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('upstream'), status: 'done' });
+    await automation.reconcileSuspensions(); await automation.reconcileSuspensions();
+    expect(messages).toHaveLength(1); expect(isTaskPairSuspended(get('child'))).toBe(false);
+  });
+  it('requires all dependencies and never cancels a manual pause automatically', async () => {
+    save('a'); save('b'); save('child'); pausePair(P, 'child', B, 'dependencies', ['a', 'b']); pausePair(P, 'child', B, 'manual');
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('a'), status: 'done' }); await automation.reconcileSuspensions(); expect(messages).toEqual([]);
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('b'), status: 'done' }); await automation.reconcileSuspensions();
+    expect(get('child').scheduling).toMatchObject({ manual: true, dependsOn: [] }); expect(messages).toEqual([]);
+    resumePair(P, 'child', B); await automation.reconcileSuspensions(); expect(messages).toHaveLength(1);
+  });
+  it('does not bypass dependencies on resume and reports cancellation only once', async () => {
+    save('a', 'cancelled'); save('child'); pausePair(P, 'child', B, 'dependencies', ['a']);
+    const epoch = get('child').scheduling!.epoch; resumePair(P, 'child', B); expect(get('child').scheduling!.epoch).toBe(epoch);
+    for (let i = 0; i < 4; i++) await automation.reconcileSuspensions();
+    expect(messages).toHaveLength(1); expect(messages[0]!.target).toBe(B); expect(isTaskPairSuspended(get('child'))).toBe(true);
+  });
+  it('rejects self/cycles, missing/cross-project ids, too many dependencies; accepts all supported id punctuation', () => {
+    for (const id of ['a.b', 'a_b', 'a-b', 'a:b', 'a.b_c-d:e']) save(id);
+    save('child'); expect(() => pausePair(P, 'child', B, 'dependencies')).toThrow(); expect(validatePairDependencies(P, 'child', ['a.b_c-d:e'])).toEqual(['a.b_c-d:e']);
+    for (const deps of [['child'], ['absent'], Array(TASK_PAIR_MAX_DEPENDENCIES + 1).fill('a.b')]) expect(() => pausePair(P, 'child', B, 'dependencies', deps)).toThrow();
+    pausePair(P, 'child', B, 'dependencies', ['a.b']); expect(() => pausePair(P, 'a.b', B, 'dependencies', ['child'])).toThrow();
+  });
+  it('recovers dependency completion after scheduler/DB restart without another model check', async () => {
+    const path = join(process.env.HOME!, 'pause-deps.sqlite'); setTaskPairStoreForTests(new TaskPairStore(path));
+    save('a'); save('child'); pausePair(P, 'child', B, 'dependencies', ['a']); putTaskPairFixture(getTaskPairStore(), P, { ...get('a'), status: 'done' });
+    setTaskPairStoreForTests(undefined); setTaskPairStoreForTests(new TaskPairStore(path)); automation = makeAutomation();
+    await automation.reconcileSuspensions(); expect(messages).toHaveLength(1); expect(isTaskPairSuspended(get('child'))).toBe(false);
+  });
+  it('waits for capacity on resume', async () => {
+    save('active'); save('paused'); getTaskPairStore().setMaxConcurrency(B, 1); pausePair(P, 'paused', B, 'manual'); resumePair(P, 'paused', B);
+    await automation.reconcileSuspensions(); expect(messages).toEqual([]);
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('active'), status: 'done' }); await automation.reconcileSuspensions(); expect(messages).toHaveLength(1);
+  });
+});
+
+describe('durable late-wakeup admission', () => {
+  it.each(['task', 'task.with-colon:and_dashes-x'])('rejects pre-pause queued wakeups after pause/resume/restart (%s)', async (id) => {
+    save(id); await sendTaskPairMessage(E, id, 'nudge-executor', 'wake'); const oldId = messages[0]!.id;
+    expect(queuedPairWakeAllowed(E, oldId)).toBe(true);
+    pausePair(P, id, B, 'manual'); expect(queuedPairWakeAllowed(E, oldId)).toBe(false);
+    resumePair(P, id, B); await automation.reconcileSuspensions(); expect(queuedPairWakeAllowed(E, oldId)).toBe(false);
+    expect(resolveTransportQueueEntryAdmission(E, { clientMessageId: oldId, text: 'wake' })).toBe('stale');
+    expect(resolveTransportQueueEntryAdmission(E, { clientMessageId: 'ordinary-human', text: 'hello' })).toBe('authorized');
+  });
+  it('invalidates queued Brain aggregates and excludes paused pairs from newly built wakes', async () => {
+    save('task'); await sendTaskPairMessage(B, '__aggregate__', 'brain-heartbeat', 'task needs action'); const id = messages[0]!.id;
+    pausePair(P, 'task', B, 'manual'); expect(queuedPairWakeAllowed(B, id)).toBe(false);
+    expect(await sendTaskPairMessage(B, '__aggregate__', 'brain-heartbeat', 'do not wake')).toBe('suspended'); expect(messages).toHaveLength(1);
+  });
+});
+
+it('releases only quiescent execution slots, without reusing paused sessions', async () => {
+  const e2 = 'deck_e2e_pause_spare_exec', a2 = 'deck_e2e_pause_spare_aud';
+  for (const [name, role] of [[e2, 'w3'], [a2, 'w4']]) upsertSession({ name, role, projectName: P, projectDir: process.env.HOME!, agentType: 'codex-sdk', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now } as SessionRecord);
+  try {
+    save('paused'); pausePair(P, 'paused', B, 'manual'); getTaskPairStore().setMaxConcurrency(B, 1);
+    putTaskPairFixture(getTaskPairStore(), P, { ...state('next', 'queued'), executor: e2, auditor: a2 });
+    busy.add(E); await automation.runQueue(P, B); expect(get('next').status).toBe('queued');
+    busy.clear(); await automation.runQueue(P, B); await taskPairService.waitForIdle();
+    expect(get('next').status).toBe('working'); expect(get('paused').executor).toBe(E); expect(isTaskPairSuspended(get('paused'))).toBe(true);
+  } finally { removeSession(e2); removeSession(a2); }
+});
+it('accepts the maximum dependency count and permits an explicit wait correction', async () => {
+  const ids = Array.from({ length: TASK_PAIR_MAX_DEPENDENCIES }, (_, i) => `upstream-${i}`); ids.forEach((id) => save(id, 'done')); save('child');
+  pausePair(P, 'child', B, 'dependencies', ids); await automation.reconcileSuspensions(); expect(messages).toHaveLength(1);
+  save('bad-upstream', 'cancelled'); pausePair(P, 'child', B, 'dependencies', ['bad-upstream']); await automation.reconcileSuspensions();
+  pausePair(P, 'child', B, 'dependencies', []); await automation.reconcileSuspensions(); expect(isTaskPairSuspended(get('child'))).toBe(false);
+});
+it('legacy colon-id nudges and legacy aggregates cannot return after pause/resume', async () => {
+  const id = 'a:b_c-d.e'; save(id); pausePair(P, id, B, 'manual'); resumePair(P, id, B); await automation.reconcileSuspensions();
+  for (const old of [`task-pair-nudge:${id}:nudge-executor:old`, 'task-pair-nudge:__aggregate__:brain-heartbeat:old']) expect(resolveTransportQueueEntryAdmission(E === B ? E : (old.includes('__aggregate__') ? B : E), { clientMessageId: old, text: 'old' })).toBe('stale');
+});
+it('event-triggered dependency completion wakes once without waiting for heartbeat ticks', async () => {
+  save('upstream'); save('child'); pausePair(P, 'child', B, 'dependencies', ['upstream']);
+  automation.start(60 * 60_000); await automation.waitForSuspensionIdle();
+  putTaskPairFixture(getTaskPairStore(), P, { ...get('upstream'), status: 'done' }); await automation.waitForSuspensionIdle();
+  expect(messages.filter((m) => m.id.includes(TASK_PAIR_RESUME_REASON))).toHaveLength(1);
+  await automation.reconcileSuspensions(); expect(messages.filter((m) => m.id.includes(TASK_PAIR_RESUME_REASON))).toHaveLength(1);
+});
+it('normal legacy lifecycle saves do not introduce a scheduling field', () => {
+  save('legacy'); putTaskPairFixture(getTaskPairStore(), P, { ...get('legacy'), status: 'in_audit' });
+  expect(get('legacy')).not.toHaveProperty('scheduling');
+});
+it('pause/resume invalidates an already armed Brain follow-up', async () => {
+  const { BrainDecisionFollowUps } = await import('../../../src/daemon/task-pairs/brain-decision-followup.js');
+  save('decision', 'awaiting_brain_decision');
+  const followUps: string[] = [];
+  const follow = new BrainDecisionFollowUps({ now: () => now, send: async (_brain, _reason, text) => { followUps.push(text); return 'sent'; } });
+  follow.arm({ brain: B, taskIds: ['decision'], messageIdPrefix: 'notice', result: 'sent' });
+  follow.observe({ sessionId: B, type: 'session.state', payload: { state: 'running' } });
+  pausePair(P, 'decision', B, 'manual'); resumePair(P, 'decision', B); await automation.reconcileSuspensions();
+  follow.observe({ sessionId: B, type: 'session.state', payload: { state: 'idle' } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(followUps).toEqual([]); expect(messages).toEqual([]);
+});
+
+
+describe('asynchronous scheduling epochs', () => {
+  it('cannot reassign from a provisioning operation started before pause/resume', async () => {
+    save('task', 'in_audit');
+    let release!: (name: string) => void;
+    const provisioned = new Promise<string>((resolve) => { release = resolve; });
+    const replacement = new TaskPairAutomation({ now: () => now, isBusy: () => false,
+      pickCandidate: () => undefined, provision: () => provisioned });
+    const pending = replacement.replaceAuditor(P, 'task', 'test stale provisioning', { dueToLimit: true });
+    pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B);
+    await automation.reconcileSuspensions(); messages.length = 0;
+    release('new-auditor');
+    expect(await pending).toBe(false);
+    expect(get('task').auditor).toBe(A); expect(messages).toEqual([]);
+    replacement.stop();
+  });
+  it.each(['ready', 'reassign'] as const)('abandons obsolete provisioning after %s even without a scheduling epoch change; a fresh operation works', async (change) => {
+    save('task', 'working');
+    let release!: (name: string) => void;
+    const provisioned = new Promise<string>((resolve) => { release = resolve; });
+    const replacement = new TaskPairAutomation({ now: () => now, isBusy: () => false,
+      pickCandidate: () => undefined, provision: () => provisioned });
+    const before = getTaskPairStore().getPair(P, 'task')!;
+    const pending = replacement.replaceAuditor(P, 'task', 'test canonical context changed', { dueToLimit: true });
+    const verb = change === 'ready' ? 'READY_FOR_AUDIT' : 'REASSIGN';
+    const result = taskPairService.applyMarker({ project: P, writer: change === 'ready' ? E : B,
+      marker: { verb, knownVerb: verb, taskId: 'task', attrs: change === 'reassign' ? { auditor: 'new-auditor' } : {} },
+      source: 'marker', eventId: `test-cas-${change}`, now: ++now });
+    expect(result.unusual).toBe(false);
+    expect(get('task').scheduling?.epoch).toBe(before.state.scheduling?.epoch);
+    const current = getTaskPairStore().getPair(P, 'task')!;
+    messages.length = 0;
+    release('candidate-from-obsolete-operation');
+    expect(await pending).toBe(false);
+    expect(getTaskPairStore().getPair(P, 'task')!.revision).toBe(current.revision);
+    expect(messages.some(message => message.target === 'candidate-from-obsolete-operation')).toBe(false);
+    // Freshly read authority is not permanently fenced by the previous conflict.
+    expect(await replacement.replaceAuditor(P, 'task', 'fresh retry', { dueToLimit: true })).toBe(true);
+    expect(get('task').auditor).toBe('candidate-from-obsolete-operation');
+    replacement.stop();
+  });
+  it('uses a stable resume delivery id on retry after an uncertain send outcome', async () => {
+    save('task'); pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B);
+    const ids: string[] = [];
+    setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { ids.push(id); if (ids.length === 1) throw new Error('uncertain send'); } });
+    await automation.reconcileSuspensions();
+    expect(get('task').scheduling).toMatchObject({ admitted: false, resumePending: true });
+    await automation.reconcileSuspensions(); expect(ids).toHaveLength(1);
+    now += 30_001; await automation.reconcileSuspensions();
+    expect(ids).toHaveLength(2); expect(ids[0]).toBe(ids[1]);
+    expect(isTaskPairSuspended(get('task'))).toBe(false);
+  });
+});
+
+
+describe('bounded reconciliation cost', () => {
+  it('does not deserialize full unrelated briefs or call models when checking a large active list', async () => {
+    for (let i = 0; i < 500; i++) putTaskPairFixture(getTaskPairStore(), P, { ...state(`ordinary-${i}`), brief: 'x'.repeat(20_000) });
+    save('upstream'); save('child'); pausePair(P, 'child', B, 'dependencies', ['upstream']);
+    const started = performance.now();
+    for (let i = 0; i < 10; i++) await automation.reconcileSuspensions();
+    const elapsed = performance.now() - started;
+    console.info(`pause-reconcile: 502 active pairs, 20KB unrelated briefs, 10 passes = ${elapsed.toFixed(2)}ms`);
+    expect(elapsed).toBeLessThan(5_000); expect(messages).toEqual([]);
+  });
+});
+
+
+it('does not replay an old recovery handoff after pause/resume during restart', async () => {
+  save('task'); upsertSession({ ...getSession(E)!, state: 'error' });
+  let started!: () => void, finish!: (ok: boolean) => void;
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  const restarting = new Promise<boolean>((resolve) => { finish = resolve; });
+  const recovery = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined,
+    mainCheckoutRoots: () => [], brainMainCheckoutActive: () => false,
+    restartParticipant: async () => { started(); return restarting; } });
+  const pending = recovery.tick(); await entered;
+  pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B); await automation.reconcileSuspensions();
+  messages.length = 0; finish(true); await pending;
+  expect(messages.filter((m) => m.id.includes('recovery-resume'))).toEqual([]);
+  recovery.stop();
+});
+
+
+it('a missing resume target releases capacity without a CAS-listener retry spin', async () => {
+  save('task'); pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B);
+  removeSession(E); setTaskPairDeliveryDepsForTests(undefined);
+  automation.start(1_000_000);
+  await automation.reconcileSuspensions(); await automation.waitForSuspensionIdle();
+  expect(get('task').scheduling).toMatchObject({ admitted: false, resumePending: true });
+  expect(get('task').scheduling!.resumeRetryAt).toBeGreaterThan(now);
+  await automation.reconcileSuspensions(); expect(messages).toEqual([]);
+});
+
+it('projects dependencyTitles into buildPairConsoleRow and timeline events under details.brief while omitting raw-ID titles', async () => {
+  const { buildPairConsoleRow } = await import('../../../src/daemon/supervision-console-pair-projection.js');
+  const { buildDependencyTitleRecord } = await import('../../../shared/task-pair-display.js');
+
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_upstream_done', 'done'), title: 'Upstream completed fix' });
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_placeholder', 'working'), title: 'tsk_placeholder', brief: '' });
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_child_proj', 'queued'), title: 'Child task' });
+  pausePair(P, 'tsk_child_proj', B, 'dependencies', ['tsk_upstream_done', 'tsk_placeholder']);
+
+  const stored = getTaskPairStore().getPair(P, 'tsk_child_proj')!;
+  const dependencyTitles = buildDependencyTitleRecord(['tsk_upstream_done', 'tsk_placeholder', 'tsk_unknown'], (id) => getTaskPairStore().getPair(P, id)?.state);
+  expect(dependencyTitles).toEqual({ tsk_upstream_done: 'Upstream completed fix' });
+
+  const row = buildPairConsoleRow(stored, { inlineBrief: false, dependencyTitles });
+  expect(row.task.pair?.scheduling?.dependencyTitles).toBeUndefined();
+  expect(row.task.pair?.scheduling?.details?.brief?.dependencyTitles).toEqual({
+    tsk_upstream_done: 'Upstream completed fix',
+  });
+
+  // Ensure service timeline emission also includes dependencyTitles in details.brief
+  const { timelineEmitter } = await import('../../../src/daemon/timeline-emitter.js');
+  const { TASK_PAIR_TIMELINE_EVENT } = await import('../../../shared/task-pair.js');
+  const emitted: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const off = timelineEmitter.on((ev) => {
+    if (ev.type === TASK_PAIR_TIMELINE_EVENT) emitted.push({ type: ev.type, payload: ev.payload as Record<string, unknown> });
+  });
+  try {
+    pausePair(P, 'tsk_child_proj', B, 'manual', [], 'check emit');
+    const last = emitted[emitted.length - 1];
+    const emittedScheduling = last?.payload?.scheduling as { dependencyTitles?: unknown; details?: { brief?: { dependencyTitles?: unknown } } } | undefined;
+    expect(emittedScheduling?.dependencyTitles).toBeUndefined();
+    expect(emittedScheduling?.details?.brief?.dependencyTitles).toEqual({
+      tsk_upstream_done: 'Upstream completed fix',
+    });
+  } finally {
+    off();
+  }
+});
+
+describe('brain-line-pass-done wake authority across passed -> done', () => {
+  it('admits queued PASS notice after executor DONE and delivers DONE backstop while keeping cancelled/dismissed/non-brain stale', async () => {
+    save('pass-race', 'in_audit');
+    await taskPairService.applyMarker({
+      project: P,
+      writer: A,
+      marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'pass-race', attrs: { blocking: 'P0' } },
+      source: 'timeline',
+      eventId: 'ev-pass-race-pass',
+    });
+    await taskPairService.waitForIdle();
+    const passNotice = messages.find((m) => m.target === B && m.id.includes(':brain-line-pass-done:'));
+    expect(passNotice).toBeDefined();
+
+    // Executor emits DONE before Brain's transport queue finishes draining PASS notice.
+    await taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'pass-race', attrs: {} },
+      source: 'timeline',
+      eventId: 'ev-pass-race-done',
+    });
+    await taskPairService.waitForIdle();
+    expect(get('pass-race').status).toBe('done');
+
+    expect(queuedPairWakeAllowed(B, passNotice!.id)).toBe(true);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: passNotice!.id, text: passNotice!.text })).toBe('authorized');
+    // Non-Brain sessions remain blocked.
+    expect(queuedPairWakeAllowed(E, passNotice!.id)).toBe(false);
+    expect(queuedPairWakeAllowed(A, passNotice!.id)).toBe(false);
+    // Worker nudges on the same done pair remain stale.
+    const workerNudge = `task-pair-nudge:pass-race:nudge-executor:${passNotice!.id.slice(passNotice!.id.indexOf(':wake-v1:'))}`.replace('brain-line-pass-done', 'nudge-executor');
+    expect(queuedPairWakeAllowed(E, workerNudge)).toBe(false);
+
+    // Dismissing integration drops queued brain-line-pass-done.
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('pass-race'), integrationDismissedAt: now + 1 });
+    expect(queuedPairWakeAllowed(B, passNotice!.id)).toBe(false);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: passNotice!.id, text: passNotice!.text })).toBe('stale');
+
+    // Direct DONE backstop when no PASS notice was previously sent succeeds and binds wake-v1.
+    messages.length = 0;
+    putTaskPairFixture(getTaskPairStore(), P, { ...state('done-backstop', 'passed'), passRound: 2, scheduling: { epoch: 1, manual: false, dependsOn: [], since: now, writer: B } });
+    // Simulate a passed round whose earlier PASS notice was missed in liveness.notified.
+    await taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'done-backstop', attrs: {} },
+      source: 'timeline',
+      eventId: 'ev-done-backstop',
+    });
+    await taskPairService.waitForIdle();
+    expect(get('done-backstop').status).toBe('done');
+    const backstopNotice = messages.find((m) => m.target === B && m.id.includes(':brain-line-pass-done:'));
+    expect(backstopNotice).toBeDefined();
+    expect(queuedPairWakeAllowed(B, backstopNotice!.id)).toBe(true);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: backstopNotice!.id, text: backstopNotice!.text })).toBe('authorized');
+
+    // Cancelled pair keeps brain-line-pass-done blocked.
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('done-backstop'), status: 'cancelled' });
+    expect(queuedPairWakeAllowed(B, backstopNotice!.id)).toBe(false);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: backstopNotice!.id, text: backstopNotice!.text })).toBe('stale');
+  });
+});
+
+describe('resume note clearing, active-execution settle, and idle reconciliation', () => {
+  it('clears stale pause note on resumePair when no dependencies remain, while preserving dependency note when dependsOn is non-empty', async () => {
+    save('plain-pause');
+    pausePair(P, 'plain-pause', B, 'manual', [], '暂停以重写准确brief');
+    expect(get('plain-pause').scheduling?.note).toBe('暂停以重写准确brief');
+    resumePair(P, 'plain-pause', B);
+    expect(get('plain-pause').scheduling?.note).toBeUndefined();
+    expect(get('plain-pause').scheduling?.resumePending).toBe(true);
+
+    save('dep');
+    save('dep-and-manual');
+    pausePair(P, 'dep-and-manual', B, 'manual');
+    pausePair(P, 'dep-and-manual', B, 'dependencies', ['dep'], 'Wait for dep');
+    resumePair(P, 'dep-and-manual', B);
+    expect(get('dep-and-manual').scheduling).toMatchObject({ manual: false, dependsOn: ['dep'], resumePending: false, note: 'Wait for dep' });
+
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('dep'), status: 'done' });
+    await automation.reconcileSuspensions();
+    expect(get('dep-and-manual').scheduling?.note).toBeUndefined();
+    expect(get('dep-and-manual').scheduling?.resumePending).toBe(false);
+    expect(get('dep-and-manual').scheduling?.resumedAt).toBeTypeOf('number');
+  });
+
+  it('settles resumePending immediately when Brain dispatches the active busy worker or the active worker emits pair activity, without redundant Resume nudges or breaking maxConcurrency', async () => {
+    save('active-send');
+    pausePair(P, 'active-send', B, 'manual', [], 'stale pause note');
+    busy.add(E);
+    resumePair(P, 'active-send', B);
+    await automation.reconcileSuspensions();
+    expect(isTaskPairSuspended(get('active-send'))).toBe(true);
+
+    // Brain sends a direct task message to the busy executor after resume:
+    // settles immediately without waiting for idle or sending a Resume nudge.
+    taskPairService.implicitDispatch({
+      project: P,
+      sender: B,
+      target: E,
+      taskId: 'active-send',
+      message: 'Continue with the updated brief',
+      eventId: 'ev-brain-resume-send',
+    });
+    expect(isTaskPairSuspended(get('active-send'))).toBe(false);
+    expect(get('active-send').scheduling).toMatchObject({
+      resumePending: false,
+      admitted: false,
+    });
+    expect(get('active-send').scheduling?.note).toBeUndefined();
+    expect(get('active-send').scheduling?.resumedAt).toBeTypeOf('number');
+    await automation.reconcileSuspensions();
+    expect(messages.filter((m) => m.id.includes(TASK_PAIR_RESUME_REASON))).toEqual([]);
+
+    // Active worker submitting a marker (even while busy, e.g. CHECK / READY_FOR_AUDIT)
+    // settles resumePending immediately too; manual pause stays paused even on stray messages.
+    save('active-marker');
+    pausePair(P, 'active-marker', B, 'manual', [], 'keep while manual');
+    taskPairService.implicitDispatch({
+      project: P,
+      sender: B,
+      target: E,
+      taskId: 'active-marker',
+      message: 'stray message while manual',
+      eventId: 'ev-manual-stray',
+    });
+    expect(get('active-marker').scheduling?.manual).toBe(true);
+    expect(isTaskPairSuspended(get('active-marker'))).toBe(true);
+
+    resumePair(P, 'active-marker', B);
+    expect(get('active-marker').scheduling?.resumePending).toBe(true);
+    taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'CHECK', knownVerb: 'CHECK', taskId: 'active-marker', attrs: { box: 'implemented', items: '1' } },
+      source: 'marker',
+      eventId: 'ev-worker-check',
+    });
+    expect(isTaskPairSuspended(get('active-marker'))).toBe(false);
+    expect(get('active-marker').scheduling?.resumePending).toBe(false);
+    expect(get('active-marker').scheduling?.note).toBeUndefined();
+
+    // Concurrency cap remains enforced for queued pairs after active-send settles.
+    getTaskPairStore().setMaxConcurrency(B, 1);
+    const e2 = 'deck_e2e_cap_exec', a2 = 'deck_e2e_cap_aud';
+    for (const [name, role] of [[e2, 'w3'], [a2, 'w4']]) upsertSession({ name, role, projectName: P, projectDir: process.env.HOME!, agentType: 'codex-sdk', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now } as SessionRecord);
+    try {
+      putTaskPairFixture(getTaskPairStore(), P, { ...state('queued-cap', 'queued'), executor: e2, auditor: a2 });
+      await automation.runQueue(P, B);
+      expect(get('queued-cap').status).toBe('queued');
+    } finally {
+      removeSession(e2); removeSession(a2);
+    }
+  });
+
+  it('triggers reconcileSuspensions promptly when a resumePending participant transitions to idle', async () => {
+    save('idle-hook', 'in_audit');
+    pausePair(P, 'idle-hook', B, 'manual', [], 'wait for idle');
+    busy.add(A);
+    resumePair(P, 'idle-hook', B);
+    await automation.reconcileSuspensions();
+    expect(messages).toEqual([]);
+    expect(isTaskPairSuspended(get('idle-hook'))).toBe(true);
+
+    // Participant transitions to idle: observeTimelineEvent runs reconcileSuspensions immediately.
+    busy.delete(A);
+    automation.observeTimelineEvent({ sessionId: A, type: 'session.state', payload: { state: 'idle' } });
+    await automation.waitForSuspensionIdle();
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.target).toBe(A);
+    expect(messages[0]!.id).toContain(TASK_PAIR_RESUME_REASON);
+    expect(isTaskPairSuspended(get('idle-hook'))).toBe(false);
+    expect(get('idle-hook').scheduling?.note).toBeUndefined();
+  });
+});

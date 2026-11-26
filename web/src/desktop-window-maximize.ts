@@ -28,8 +28,22 @@ export interface DomRectLike {
 export type StackOrderEntry = string | { id: string };
 
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
-const SESSION_TAB_BUTTON_SELECTOR = '.tab-bar [role="tab"]';
 const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
+interface SessionTabMeasureState {
+  tabBar: HTMLElement | null;
+  bottom: number;
+  dirty: boolean;
+  observedRoot: Node | null;
+  mutationObserver?: MutationObserver;
+  resizeObserver?: ResizeObserver;
+}
+const sessionTabMeasureCache = new WeakMap<Document, SessionTabMeasureState>();
+/**
+ * Last-resort floor for the workspace top. `.main` is the content column, which
+ * sits below the app header by construction, so its top is always a safe
+ * boundary even when the tab bar cannot be measured.
+ */
+const MAIN_CONTENT_SELECTOR = '.main';
 
 const DEFAULT_MIN_W = 1;
 const DEFAULT_MIN_H = 1;
@@ -82,14 +96,80 @@ export function reserveWorkspaceBottom(
 
 export function resolveSessionTabsBottom(doc: Document | null = typeof document === 'undefined' ? null : document): number {
   if (!doc) return 0;
-  const tabButtons = Array.from(doc.querySelectorAll<HTMLElement>(SESSION_TAB_BUTTON_SELECTOR));
+  // Pointer frames must not read layout or walk the document.  A single
+  // observer invalidates this snapshot when tabs/geometry change; hot calls
+  // return the last number without querySelectorAll/getBoundingClientRect.
+  let state = sessionTabMeasureCache.get(doc);
+  if (!state) {
+    state = { tabBar: doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR), bottom: 0, dirty: true, observedRoot: null };
+    sessionTabMeasureCache.set(doc, state);
+    const invalidate = () => { state!.dirty = true; };
+    if (typeof MutationObserver !== 'undefined' && state.tabBar) {
+      state.mutationObserver = new MutationObserver(invalidate);
+      // Observe only the stable tab bar. Observing document.subtree would
+      // invalidate the snapshot for every chat/timeline DOM mutation and put
+      // the layout read back on the pointer hot path.
+      state.mutationObserver.observe(state.tabBar, { childList: true, subtree: true });
+      state.observedRoot = state.tabBar;
+    }
+    if (typeof ResizeObserver !== 'undefined') {
+      state.resizeObserver = new ResizeObserver(invalidate);
+      if (state.tabBar) state.resizeObserver.observe(state.tabBar);
+    }
+  }
+  // MutationObserver delivery is asynchronous; detect a removed/replaced tab
+  // bar synchronously before taking the cached fast path.
+  if (!state.tabBar?.isConnected) state.dirty = true;
+  if (!state.dirty) return state.bottom;
+  const tabBar = state.tabBar?.isConnected
+    ? state.tabBar
+    : (state.tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR));
+  if (tabBar && !state.mutationObserver && typeof MutationObserver !== 'undefined') {
+    state.mutationObserver = new MutationObserver(() => { state!.dirty = true; });
+    state.mutationObserver.observe(tabBar, { childList: true, subtree: true });
+    state.observedRoot = tabBar;
+  }
+  if (tabBar) state.resizeObserver?.observe(tabBar);
+  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+  const tabButtons = tabBar
+    ? Array.from(tabBar.querySelectorAll<HTMLElement>('[role="tab"]'))
+    : [];
   const tabButtonBottoms = tabButtons
     .map((button) => finiteOr(button.getBoundingClientRect().bottom, 0))
     .filter((bottom) => bottom > 0);
-  if (tabButtonBottoms.length > 0) return Math.max(...tabButtonBottoms);
+  if (tabButtonBottoms.length > 0) {
+    const bottom = Math.max(...tabButtonBottoms);
+    state.bottom = bottom;
+    state.dirty = false;
+    return bottom;
+  }
 
-  const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
-  return tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+  // A present-but-unmeasured tab bar reports bottom 0 (pre-layout, or hidden).
+  // Returning that is the same failure as having no tab bar at all, so only
+  // accept a positive measurement and otherwise fall through to the floor
+  // below. The previous version returned the 0 and pinned the window to the
+  // top of the viewport, under the app header.
+  if (tabBarBottom > 0) {
+    state.bottom = tabBarBottom;
+    state.dirty = false;
+    return tabBarBottom;
+  }
+
+  // Falling through to 0 pins a window to the very top of the viewport, which
+  // slides its own title bar — and the close button in it — underneath the app
+  // header. That is reachable whenever the tab bar is absent or not yet laid
+  // out: on mobile the window top reads this value and drops back to the safe
+  // area inset alone when it is 0, and the ResizeObserver that would correct it
+  // only attaches if `.tab-bar` already exists when the effect runs.
+  //
+  // `.main` starts below the header, so its top is a strictly safer floor. This
+  // can only push the boundary DOWN relative to the old behaviour.
+  const mainContent = doc.querySelector<HTMLElement>(MAIN_CONTENT_SELECTOR);
+  state.bottom = mainContent ? Math.max(0, finiteOr(mainContent.getBoundingClientRect().top, 0)) : 0;
+  // Keep probing while the tab bar has not mounted yet; the first render can
+  // occur before the app inserts it and MutationObserver delivery is async.
+  state.dirty = !tabBar;
+  return state.bottom;
 }
 
 export function viewportWorkspaceBelowSessionTabs(options: {
@@ -154,6 +234,25 @@ export function clampGeometryFullyIntoWorkspace(
     w,
     h,
   };
+}
+
+/**
+ * Double-clicking a window's title bar toggles the SAME in-window maximize the
+ * title-bar button drives (never browser/OS fullscreen). Anything interactive
+ * inside the chrome -- buttons, links, form controls, contenteditable -- keeps
+ * its own double-click behaviour and must never toggle the window.
+ */
+const WINDOW_CHROME_INTERACTIVE_SELECTOR = [
+  'button', 'a', 'input', 'select', 'textarea', 'label', 'summary',
+  '[role="button"]', '[role="tab"]', '[role="menuitem"]', '[contenteditable]:not([contenteditable="false"])',
+].join(', ');
+
+export function isWindowChromeDoubleClickTarget(target: EventTarget | null): boolean {
+  const element = target && typeof (target as Element).closest === 'function'
+    ? target as Element
+    : null;
+  if (!element) return false;
+  return element.closest(WINDOW_CHROME_INTERACTIVE_SELECTOR) === null;
 }
 
 export function shouldPersistGeometry(isMaximized: boolean): boolean {

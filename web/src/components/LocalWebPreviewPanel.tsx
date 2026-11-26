@@ -198,6 +198,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
   const requestSeqRef = useRef(0);
   const currentPreviewRef = useRef<ActivePreview | null>(null);
   const autoOpenAttemptedRef = useRef(false);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   // Only sync from a controlled prop when it is explicitly provided (!== undefined);
   // never overwrite locally-restored input with an empty/default initial value.
@@ -316,6 +317,26 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
     void closePreview();
   }, [closePreview]);
 
+  /**
+   * Drive the iframe's own session history rather than an app-level URL stack,
+   * so in-page link navigations the user makes *inside* the preview are part of
+   * the same history — an app-level stack would only know about the addresses
+   * this panel opened and would silently skip those.
+   *
+   * The proxy URL is same-origin by default (`getApiBaseUrl()` falls back to
+   * `window.location.origin`) and the sandbox grants `allow-same-origin`, so
+   * `contentWindow.history` is reachable. A custom API host makes the frame
+   * cross-origin, where touching `history` throws a SecurityError — swallow it
+   * and no-op instead of breaking the toolbar.
+   */
+  const navigateHistory = useCallback((delta: -1 | 1) => {
+    try {
+      iframeRef.current?.contentWindow?.history.go(delta);
+    } catch {
+      // Cross-origin preview: browsers forbid history access. Nothing to do.
+    }
+  }, []);
+
   useEffect(() => {
     requestSeqRef.current += 1;
     currentPreviewRef.current = null;
@@ -377,6 +398,28 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
           </form>
 
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button
+              class="btn btn-secondary"
+              type="button"
+              onClick={() => navigateHistory(-1)}
+              disabled={!preview}
+              title={t('localWebPreview.back')}
+              aria-label={t('localWebPreview.back')}
+              style={{ padding: '4px 10px', lineHeight: 1 }}
+            >
+              <span aria-hidden="true">←</span>
+            </button>
+            <button
+              class="btn btn-secondary"
+              type="button"
+              onClick={() => navigateHistory(1)}
+              disabled={!preview}
+              title={t('localWebPreview.forward')}
+              aria-label={t('localWebPreview.forward')}
+              style={{ padding: '4px 10px', lineHeight: 1 }}
+            >
+              <span aria-hidden="true">→</span>
+            </button>
             <button class="btn btn-secondary" type="button" onClick={() => void openPreview()} disabled={!isReady || loading}>
               {t('localWebPreview.refresh')}
             </button>
@@ -401,6 +444,28 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
 
       {collapsed && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
+          <button
+            class="btn btn-secondary"
+            type="button"
+            onClick={() => navigateHistory(-1)}
+            disabled={!preview}
+            title={t('localWebPreview.back')}
+            aria-label={t('localWebPreview.back')}
+            style={{ padding: '2px 7px', fontSize: 11, lineHeight: 1 }}
+          >
+            <span aria-hidden="true">←</span>
+          </button>
+          <button
+            class="btn btn-secondary"
+            type="button"
+            onClick={() => navigateHistory(1)}
+            disabled={!preview}
+            title={t('localWebPreview.forward')}
+            aria-label={t('localWebPreview.forward')}
+            style={{ padding: '2px 7px', fontSize: 11, lineHeight: 1 }}
+          >
+            <span aria-hidden="true">→</span>
+          </button>
           <button class="btn btn-secondary" type="button" onClick={() => void openPreview()} disabled={!isReady || loading} style={{ padding: '2px 8px', fontSize: 11 }}>
             {t('localWebPreview.refresh')}
           </button>
@@ -422,6 +487,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
         {preview ? (
           <iframe
             key={preview.previewId}
+            ref={iframeRef}
             src={preview.previewUrl}
             title={t('localWebPreview.title')}
             sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"

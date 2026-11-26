@@ -113,6 +113,20 @@ function makeMockDb() {
       if (s.includes('select * from teams where id = $1')) {
         return (teams.get(params[0] as string) ?? null) as T | null;
       }
+      if (s.includes('update team_invites set used_at = $1 where token = $2 and used_at is null and expires_at > $1 returning')) {
+        const now = Number(params[0]);
+        const invite = [...invites.values()].find((entry) => entry.token === params[1]);
+        if (!invite || invite.used_at != null || invite.expires_at <= now) return null;
+        invite.used_at = now;
+        return invite as T;
+      }
+      if (s.includes('update team_invites set used_at = $1 where token = $2 and team_id = $3 and used_at is null and expires_at > $1 returning')) {
+        const now = Number(params[0]);
+        const invite = [...invites.values()].find((entry) => entry.token === params[1] && entry.team_id === params[2]);
+        if (!invite || invite.used_at != null || invite.expires_at <= now) return null;
+        invite.used_at = now;
+        return invite as T;
+      }
       if (s.includes('select * from team_invites where token = $1')) {
         const invite = [...invites.values()].find((entry) => entry.token === params[0]);
         if (!invite) return null;
@@ -126,6 +140,20 @@ function makeMockDb() {
         if (invite.used_at != null) return null;
         if (invite.expires_at <= Number(params[2])) return null;
         return invite as T;
+      }
+      if (s.includes('select id from shared_context_workspaces where id = $1 and enterprise_id = $2')) {
+        const ws = workspaces.get(params[0] as string);
+        return ws && ws.enterprise_id === params[1] ? ({ id: ws.id } as T) : null;
+      }
+      if (s.includes('select id from shared_project_enrollments where id = $1 and enterprise_id = $2')) {
+        const enrollment = enrollments.get(params[0] as string);
+        return enrollment && enrollment.enterprise_id === params[1] ? ({ id: enrollment.id } as T) : null;
+      }
+      if (s.includes('select v.id from shared_context_document_versions v join shared_context_documents d on d.id = v.document_id where v.id = $1 and d.id = $2 and d.enterprise_id = $3')) {
+        const version = versions.get(params[0] as string);
+        if (!version || version.document_id !== params[1]) return null;
+        const document = documents.get(version.document_id);
+        return document && document.enterprise_id === params[2] ? ({ id: version.id } as T) : null;
       }
       if (s.includes('select enterprise_id from shared_project_enrollments where id = $1')) {
         const enrollment = enrollments.get(params[0] as string);
@@ -266,12 +294,16 @@ function makeMockDb() {
           created_by: entry.created_by,
         })) as T[];
       }
-      if (s.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id where b.enterprise_id = $1 and b.status = \'active\' and v.status = \'active\'')) {
+      if (s.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id')) {
         return [...bindings.values()]
           .filter((entry) => entry.enterprise_id === params[0] && entry.status === 'active')
           .map((entry) => {
             const version = versions.get(entry.version_id);
             if (!version || version.status !== 'active') return null;
+            if (s.includes('join shared_context_documents d')) {
+              const doc = documents.get(version.document_id);
+              if (!doc || doc.enterprise_id !== entry.enterprise_id || doc.id !== entry.document_id) return null;
+            }
             return {
               binding_id: entry.id,
               binding_mode: entry.binding_mode,
@@ -1072,6 +1104,112 @@ describe('shared-agent-context server control plane', () => {
           updatedAt: 1700000000100,
         },
       ],
+    });
+  });
+
+  it('rejects cross-enterprise document/version/workspace/enrollment bindings, enroll workspace IDOR, and blocks cross-enterprise content leakage', async () => {
+    // Seed a foreign enterprise team-2 with its own workspace, enrollment, document, and active version
+    mockDb.workspaces.set('ws-foreign', { id: 'ws-foreign', enterprise_id: 'team-2', name: 'Foreign WS' });
+    mockDb.enrollments.set('enr-foreign', {
+      id: 'enr-foreign',
+      enterprise_id: 'team-2',
+      workspace_id: 'ws-foreign',
+      canonical_repo_id: 'github.com/foreign/repo',
+      display_name: 'Foreign Repo',
+      scope: 'project_shared',
+      status: 'active',
+    });
+    mockDb.documents.set('doc-foreign', { id: 'doc-foreign', enterprise_id: 'team-2', kind: 'coding_standard', title: 'Foreign Secret' });
+    mockDb.versions.set('ver-foreign', { id: 'ver-foreign', document_id: 'doc-foreign', version_number: 1, status: 'active', content: 'TOP_SECRET_TENANT2_PROMPT' });
+
+    // Create legitimate team-1 entities
+    const ws1Res = await app.request(...req('/api/shared-context/enterprises/team-1/workspaces', 'POST', { name: 'Team1 WS' }, 'user-owner'));
+    const ws1 = (await ws1Res.json()) as { id: string };
+    const enr1Res = await app.request(...req('/api/shared-context/enterprises/team-1/projects/enroll', 'POST', {
+      canonicalRepoId: 'github.com/acme/repo',
+      workspaceId: ws1.id,
+      scope: 'project_shared',
+    }, 'user-owner'));
+    const enr1 = (await enr1Res.json()) as { id: string };
+    const doc1Res = await app.request(...req('/api/shared-context/enterprises/team-1/documents', 'POST', {
+      kind: 'coding_standard',
+      title: 'Team1 Doc',
+    }, 'user-owner'));
+    const doc1 = (await doc1Res.json()) as { id: string };
+    const ver1Res = await app.request(...req(`/api/shared-context/documents/${doc1.id}/versions`, 'POST', {
+      contentMd: 'Team1 ok rule',
+    }, 'user-owner'));
+    const ver1 = (await ver1Res.json()) as { id: string };
+
+    // 1. projects/enroll rejects foreign workspaceId
+    const enrollIdor = await app.request(...req('/api/shared-context/enterprises/team-1/projects/enroll', 'POST', {
+      canonicalRepoId: 'github.com/acme/other',
+      workspaceId: 'ws-foreign',
+      scope: 'project_shared',
+    }, 'user-owner'));
+    expect(enrollIdor.status).toBe(404);
+
+    // 2. document-bindings rejects foreign documentId/versionId, foreign workspaceId, and foreign enrollmentId
+    const badDocBind = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: 'doc-foreign',
+      versionId: 'ver-foreign',
+      workspaceId: ws1.id,
+      mode: 'required',
+    }, 'user-owner'));
+    expect(badDocBind.status).toBe(404);
+
+    const badWsBind = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: doc1.id,
+      versionId: ver1.id,
+      workspaceId: 'ws-foreign',
+      mode: 'required',
+    }, 'user-owner'));
+    expect(badWsBind.status).toBe(404);
+
+    const badEnrBind = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: doc1.id,
+      versionId: ver1.id,
+      enrollmentId: 'enr-foreign',
+      mode: 'required',
+    }, 'user-owner'));
+    expect(badEnrBind.status).toBe(404);
+    expect(mockDb.bindings.size).toBe(0);
+
+    // 3. Even if a legacy tampered binding row exists in team-1 pointing to ver-foreign, runtime-authored-context & diagnostics do not leak it
+    mockDb.bindings.set('tampered-bind', {
+      id: 'tampered-bind',
+      enterprise_id: 'team-1',
+      workspace_id: ws1.id,
+      enrollment_id: enr1.id,
+      document_id: 'doc-foreign',
+      version_id: 'ver-foreign',
+      status: 'active',
+      binding_mode: 'required',
+      applicability_repo_id: 'github.com/acme/repo',
+      applicability_language: null,
+      applicability_path_pattern: null,
+    });
+
+    const rtRes = await app.request(...req(
+      `/api/shared-context/enterprises/team-1/runtime-authored-context?canonicalRepoId=github.com/acme/repo&workspaceId=${ws1.id}&enrollmentId=${enr1.id}`,
+      'GET',
+      undefined,
+      'user-member',
+    ));
+    expect(rtRes.status).toBe(200);
+    const rtText = await rtRes.text();
+    expect(rtText).not.toContain('TOP_SECRET_TENANT2_PROMPT');
+    expect(JSON.parse(rtText)).toEqual({ enterpriseId: 'team-1', bindings: [] });
+
+    const diagRes = await app.request(...req(
+      `/api/shared-context/enterprises/team-1/diagnostics?canonicalRepoId=github.com/acme/repo&workspaceId=${ws1.id}&enrollmentId=${enr1.id}`,
+      'GET',
+      undefined,
+      'user-member',
+    ));
+    expect(diagRes.status).toBe(200);
+    expect(await diagRes.json()).toMatchObject({
+      diagnostics: { activeBindingCount: 0, appliedDocumentVersionIds: [] },
     });
   });
 });

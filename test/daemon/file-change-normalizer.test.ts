@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 import {
   normalizeClaudeFileChange,
   normalizeCodexSdkFileChange,
-  normalizeGeminiFileChange,
   normalizeOpenCodeFileChange,
   normalizeQwenFileChange,
 } from '../../src/daemon/file-change-normalizer.js';
@@ -157,22 +156,6 @@ describe('file-change-normalizer', () => {
       filePath: 'src/qwen.ts',
       confidence: 'derived',
     }));
-  });
-
-  it('normalizes Gemini explicit file tools and ignores shell-only tools', () => {
-    const batch = normalizeGeminiFileChange(loadFixture('gemini-write-file.json'));
-
-    expect(batch?.patches[0]).toEqual(expect.objectContaining({
-      filePath: 'src/gemini.ts',
-      confidence: 'derived',
-    }));
-
-    expect(normalizeGeminiFileChange({
-      toolName: 'run_shell_command',
-      toolCallId: 'gm-2',
-      args: { command: 'sed -i ...' },
-      status: 'success',
-    })).toBeNull();
   });
 
   it('does not emit patches when file identity is missing', () => {

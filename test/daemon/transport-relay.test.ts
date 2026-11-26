@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // ── Module mocks (must be hoisted before any imports) ───────────────────────
 
 const getSessionMock = vi.hoisted(() => vi.fn());
+const getCachedPresetContextWindowMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
@@ -26,16 +27,22 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
 // Mock resolveSessionName to return identity mapping (providerSid === sessionName for tests)
 vi.mock('../../src/agent/session-manager.js', () => ({
   resolveSessionName: (providerSid: string) => providerSid,
+  getTransportRuntime: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
 }));
 
+vi.mock('../../src/daemon/cc-presets.js', () => ({
+  getCachedPresetContextWindow: getCachedPresetContextWindowMock,
+}));
+
 // ── Imports after mocks ──────────────────────────────────────────────────────
 
 import {
   setTransportRelaySend,
+  setTransportToolExecutionEvaluator,
   wireProviderToRelay,
   emitTransportUserMessage,
   broadcastProviderStatus,
@@ -45,7 +52,23 @@ import {
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
-import { PROVIDER_ERROR_CODES, type TransportProvider } from '../../src/agent/transport-provider.js';
+import {
+  PROVIDER_CANCEL_ORIGINS,
+  PROVIDER_ERROR_CODES,
+  SDK_TURN_LOST_RECOVERY_CLASSIFIERS,
+  SDK_TURN_LOST_RECOVERY_PHASES,
+  SDK_TURN_LOST_RECOVERY_REASON,
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  SDK_TURN_LOST_REPLAY_DECISIONS,
+  sanitizeSdkTurnLostRecoveryMetadata,
+  isSdkTurnLostRecovery,
+  type TransportProvider,
+} from '../../src/agent/transport-provider.js';
+import { AgySubagentTracker } from '../../src/agent/agy-subagents.js';
+import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -62,10 +85,11 @@ import {
 
 type DeltaCb = (sessionId: string, delta: MessageDelta) => void;
 type CompleteCb = (sessionId: string, message: AgentMessage) => void;
-type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
+type MockProviderError = { code: string; message: string; recoverable: boolean; details?: unknown };
+type ErrorCb = (sessionId: string, error: MockProviderError) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
-type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
+type UsageCb = (sessionId: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -89,10 +113,10 @@ function makeMockProvider() {
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
-    fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
+    fireError: (sid: string, err: MockProviderError) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
-    fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
+    fireUsage: (sid: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -148,6 +172,31 @@ function makeSdkSubagentDetail(overrides: {
   };
 }
 
+function makeSdkTurnLostDetails(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey: 'sess-lost',
+    sessionName: 'sess-lost',
+    providerId: 'codex-sdk',
+    providerSessionId: 'sess-lost',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    activityGeneration: 7,
+    leaseStartedAt: 1_800_000_000_000,
+    lastStrongActivityAt: 1_800_000_010_000,
+    heartbeatStartedAt: 1_800_000_060_000,
+    heartbeatCompletedAt: 1_800_000_060_120,
+    heartbeatDurationMs: 120,
+    silenceDurationMs: 50_000,
+    heartbeatFailureCount: 1,
+    classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+    attempt: 1,
+    correlationId: 'sdk-turn-lost-correlation-1',
+    replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.PENDING,
+    ...overrides,
+  };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('transport-relay (timeline-emitter based)', () => {
@@ -167,6 +216,7 @@ describe('transport-relay (timeline-emitter based)', () => {
     emitMock.mockClear();
     appendMock.mockClear();
     getSessionMock.mockReset();
+    getCachedPresetContextWindowMock.mockReset();
   });
 
   afterEach(() => {
@@ -222,6 +272,74 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock.mock.calls[1][2].text).toBe('abc');
 
       vi.useRealTimers();
+    });
+
+    it('forwards the delegation-claim projection onto the finalized assistant.text event', () => {
+      // Without this the projection stops at the daemon: the relay reads
+      // metadata only for usage/model, so the UI would have no authority fact
+      // to render and would be left with the prose alone -- the exact gap.
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const claim = {
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp-1', taskId: 'tsk-1', assignmentId: 'asg-1',
+          deliveries: [{ target: 'deck-worker', status: 'delivered' }],
+        }],
+      };
+      fireComplete('sess-claim', {
+        id: 'msg-claim', sessionId: 'sess-claim', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: claim },
+      } as AgentMessage);
+
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(
+        finalized[0].delegationClaim,
+        'the authority projection must reach the timeline payload',
+      ).toEqual(claim);
+    });
+
+    it('drops a legacy machine-control-only claim before timeline persistence', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-ocu', {
+        id: 'msg-ocu', sessionId: 'sess-ocu', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: {
+          status: 'substantiated',
+          dispatches: [{
+            dispatchId: 'mcp-ocu', kind: 'machine-control', tool: 'computer_use_call', machine: 'local',
+            deliveries: [{ target: 'local', status: 'delivered' }],
+          }],
+        } },
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .find((payload) => payload.streaming === false);
+      expect(finalized).toBeDefined();
+      expect(Object.keys(finalized)).not.toContain('delegationClaim');
+    });
+
+    it('omits the delegation-claim key entirely when the turn carried no projection', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-noclaim', {
+        id: 'msg-noclaim', sessionId: 'sess-noclaim', kind: 'text', role: 'assistant',
+        content: 'hi', timestamp: Date.now(), status: 'complete',
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(Object.keys(finalized[0])).not.toContain('delegationClaim');
     });
 
     it('finalizes the previous message (full text, streaming:false) when messageId changes', () => {
@@ -282,6 +400,63 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(finals.map(c => c[3]?.eventId)).toEqual(
         expect.arrayContaining(['transport:sess-multi:item-1', 'transport:sess-multi:item-2']),
       );
+    });
+
+    it('immediately cancels throttle and persists delta.final=true while avoiding duplicate onComplete', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireDelta, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // 1) Non-authoritative chunk streams 'Checking' (first frame emits streaming:true),
+      //    then 'Checking service' is buffered in throttle, then final:true flushes immediately.
+      fireDelta('sess-final', makeDelta({ messageId: 'msg-1', delta: 'Checking' }));
+      fireDelta('sess-final', makeDelta({ messageId: 'msg-1', delta: 'Checking service' }));
+      fireDelta('sess-final', makeDelta({ messageId: 'msg-1', delta: 'Checking service status.', final: true }));
+
+      const finalsBeforeComplete = emitMock.mock.calls.filter(
+        (c) => c[1] === 'assistant.text' && c[2]?.streaming === false,
+      );
+      expect(finalsBeforeComplete).toHaveLength(1);
+      expect(finalsBeforeComplete[0]![2]).toMatchObject({ text: 'Checking service status.', streaming: false });
+      expect(finalsBeforeComplete[0]![3]).toMatchObject({ eventId: 'transport:sess-final:msg-1' });
+      expect(appendMock.mock.calls.filter((c) => c[1]?.type === 'assistant.text')).toHaveLength(1);
+
+      // Advancing timers must not emit a stale throttled streaming:true frame over streaming:false.
+      vi.advanceTimersByTime(500);
+      const afterWait = emitMock.mock.calls.filter((c) => c[1] === 'assistant.text');
+      expect(afterWait).toHaveLength(2); // 1 live streaming:true ('Checking') + 1 streaming:false ('Checking service status.')
+
+      // 2) Later onComplete with the exact same messageId + content must NOT emit a duplicate assistant.text,
+      //    while still emitting usage.update.
+      fireComplete('sess-final', makeMessage({
+        id: 'msg-1',
+        content: 'Checking service status.',
+        metadata: { usage: { input_tokens: 120, output_tokens: 30, model_context_window: 200000 } },
+      }));
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'assistant.text' && c[2]?.streaming === false)).toHaveLength(1);
+      expect(appendMock.mock.calls.filter((c) => c[1]?.type === 'assistant.text')).toHaveLength(1);
+      expect(emitMock.mock.calls.some((c) => c[1] === 'usage.update' && c[2]?.inputTokens === 120)).toBe(true);
+
+      // 3) Multiple mid-turn final:true messages followed by an empty onComplete skip empty bubble emission.
+      emitMock.mockClear();
+      appendMock.mockClear();
+      fireDelta('sess-final', makeDelta({ messageId: 'step-a', delta: 'First schedule reply', final: true }));
+      fireDelta('sess-final', makeDelta({ messageId: 'step-b', delta: 'Second schedule reply', final: true }));
+      fireComplete('sess-final', makeMessage({
+        id: 'empty-end',
+        content: '',
+        metadata: { usage: { input_tokens: 200, output_tokens: 40, model_context_window: 200000 } },
+      }));
+      const persistedTexts = appendMock.mock.calls
+        .filter((c) => c[1]?.type === 'assistant.text')
+        .map((c) => c[1]?.text);
+      expect(persistedTexts).toEqual(['First schedule reply', 'Second schedule reply']);
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'assistant.text' && c[2]?.streaming === false)).toHaveLength(2);
+      expect(emitMock.mock.calls.some((c) => c[1] === 'usage.update' && c[2]?.inputTokens === 200)).toBe(true);
+
+      vi.useRealTimers();
     });
 
     it('throttles independently per session', () => {
@@ -400,6 +575,9 @@ describe('transport-relay (timeline-emitter based)', () => {
         cacheTokens: 5,
         model: 'qwen3-coder-plus',
       });
+      expect(usageCall![3]).toMatchObject({
+        eventId: 'transport:sess-1:msg-usage:usage',
+      });
     });
 
     it('emits Codex SDK current-window context usage instead of cumulative billing usage', () => {
@@ -437,7 +615,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(12_000);
     });
 
-    it('emits provider usage updates even when they arrive outside message completion', () => {
+    it('emits provider usage updates as streaming-only events outside message completion', () => {
       const { provider, fireUsage } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -459,7 +637,124 @@ describe('transport-relay (timeline-emitter based)', () => {
         model: 'gpt-5.5',
         contextWindow: 258_400,
         contextWindowSource: 'provider',
+        streaming: true,
       });
+      expect(usageCall![3]).toMatchObject({
+        eventId: 'transport:sess-1:usage:usage',
+      });
+    });
+
+    it('persists a finalized late provider usage frame on its completed message id', () => {
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        messageId: 'msg-late-usage',
+        finalized: true,
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        streaming: false,
+      });
+      expect(usageCall?.[3]).toMatchObject({
+        eventId: 'transport:sess-1:msg-late-usage:usage',
+      });
+    });
+
+    it('uses the current preset window instead of a stale launch-time session copy', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+    });
+
+    it('keeps the configured preset window authoritative over model-family inference', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'LongContext',
+        presetContextWindow: 200_000,
+        activeModel: 'claude-haiku-4-5',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'claude-haiku-4-5',
+        usage: { input_tokens: 100_000, cache_read_input_tokens: 0 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 100_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+    });
+
+    it('reconciles a metadata-only preset completion with trailing result usage on one event id', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireDelta, fireComplete, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-result-usage', delta: 'Done' }));
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-result-usage',
+        content: 'Done',
+        metadata: { model: 'MiniMax-M3' },
+      }));
+      fireUsage('sess-1', {
+        messageId: 'msg-result-usage',
+        finalized: true,
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 14_000, cache_read_input_tokens: 710_000 },
+      });
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0]?.[2]).toMatchObject({
+        model: 'MiniMax-M3',
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+      expect(usageCalls[1]?.[2]).toMatchObject({
+        inputTokens: 14_000,
+        cacheTokens: 710_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+        streaming: false,
+      });
+      expect(usageCalls[0]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
+      expect(usageCalls[1]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
     });
 
     it('honors Codex SDK provider effective window for GPT-5.5', () => {
@@ -630,6 +925,32 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![3].eventId).toBe('transport:sess-1:msg-4');
     });
 
+    it('uses the assistant final event id as the final usage id base after partial usage updates', () => {
+      const { provider, fireDelta, fireUsage, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-final-usage', delta: 'hi' }));
+      fireUsage('sess-1', {
+        model: 'gpt-5.5',
+        usage: { input_tokens: 10, output_tokens: 1 },
+      });
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-final-usage',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: { input_tokens: 10, output_tokens: 2 },
+        },
+      }));
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0][2]).toMatchObject({ streaming: true, outputTokens: 1 });
+      expect(usageCalls[0][3]).toMatchObject({ eventId: 'transport:sess-1:msg-final-usage:usage' });
+      expect(usageCalls[1][2]).toMatchObject({ outputTokens: 2 });
+      expect(usageCalls[1][2].streaming).toBeUndefined();
+      expect(usageCalls[1][3]).toMatchObject({ eventId: 'transport:sess-1:msg-final-usage:usage' });
+    });
+
     it('emits final completion immediately even when a throttled delta is pending', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
@@ -713,47 +1034,86 @@ describe('transport-relay (timeline-emitter based)', () => {
   // ── wireProviderToRelay — onError ────────────────────────────────────────
 
   describe('onError', () => {
-    it('emits assistant.text with warning prefix before session.state', () => {
+    it('emits assistant.text and leaves lifecycle state to TransportSessionRuntime', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireError('sess-err', { code: 'RATE_LIMITED', message: 'Too many requests', recoverable: true });
 
-      // Should emit 2 timeline events: assistant.text + session.state
       const timelineCalls = emitMock.mock.calls;
-      expect(timelineCalls.length).toBeGreaterThanOrEqual(2);
 
-      // First emit: assistant.text with the warning message
       const textCall = timelineCalls.find(c => c[1] === 'assistant.text');
       expect(textCall).toBeDefined();
       expect(textCall![0]).toBe('sess-err');
       expect(textCall![2].text).toBe('⚠️ Error: Too many requests');
       expect(textCall![2].streaming).toBe(false);
+      expect(textCall![2].memoryExcluded).toBe(true);
+      expect(timelineCalls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
-    it('emits session.state error with error message', () => {
-      const { provider, fireError } = makeMockProvider();
+    it('does not duplicate a provider error already present in streamed text', () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireError('sess-err', { code: 'RATE_LIMITED', message: 'Too many requests', recoverable: true });
+      const message = 'API Error: Connection closed mid-response. The response above may be incomplete.';
+      fireDelta('sess-err', makeDelta({ messageId: 'msg-disconnect', delta: message }));
+      emitMock.mockClear();
+      fireError('sess-err', { code: 'CONNECTION_LOST', message, recoverable: true });
 
-      const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
-      expect(stateCall).toBeDefined();
-      expect(stateCall![0]).toBe('sess-err');
-      expect(stateCall![2].state).toBe('error');
-      expect(stateCall![2].error).toBe('Too many requests');
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall?.[2].text).toBe(message);
+      expect(textCall?.[2].text.match(/Connection closed mid-response/g)).toHaveLength(1);
+      expect(textCall?.[2].memoryExcluded).toBe(true);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
-    it('emits assistant.text BEFORE session.state (order matters for UI)', () => {
+    it('a transient (capacity) failure that the runtime retries adds NO error bubble and NO session.error row, however many attempts', async () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
 
-      fireError('sess-err', { code: 'PROVIDER_ERROR', message: 'Overloaded', recoverable: true });
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        fireError('sess-cap', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'Selected model is at capacity. Please try a different model.', recoverable: false });
+      }
+      await Promise.resolve();
 
-      const textIdx = emitMock.mock.calls.findIndex(c => c[1] === 'assistant.text');
-      const stateIdx = emitMock.mock.calls.findIndex(c => c[1] === 'session.state');
-      expect(textIdx).toBeGreaterThanOrEqual(0);
-      expect(stateIdx).toBeGreaterThan(textIdx);
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+    });
+
+    it('a transient failure still finalizes a partial streamed bubble (no hanging "streaming"), without an error suffix or a persisted row', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireDelta('sess-cap-partial', makeDelta({ messageId: 'msg-cap', delta: 'partial output' }));
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cap-partial', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 529 Overloaded', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2]).toMatchObject({ text: 'partial output', streaming: false, memoryExcluded: true });
+      expect(texts[0]![2].taskPairTerminalFlush).toBe(true);
+      expect(texts[0]![2].text).not.toContain('Error');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+    });
+
+    it('COUNTEREXAMPLE: a permanent error (401) still produces exactly one error bubble and one session.error', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-401', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 401 Invalid authentication credentials', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2].text).toBe('⚠️ Error: API Error: 401 Invalid authentication credentials');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(1);
     });
 
     it('caches to JSONL via appendTransportEvent with type session.error', async () => {
@@ -772,26 +1132,327 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.code).toBe('PROVIDER_ERROR');
     });
 
-    it('renders CANCELLED as a visible cancellation notice without session error state', async () => {
+    it('preserves partial streamed content on CANCELLED and persists it (no truncation on Esc/stop)', async () => {
       const { provider, fireDelta, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireDelta('sess-cancelled', makeDelta({ messageId: 'msg-cancelled', delta: 'partial before stop' }));
       emitMock.mockClear();
+      appendMock.mockClear();
 
       fireError('sess-cancelled', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
       await Promise.resolve();
 
+      // The accumulated streamed text must be preserved (with a cancel marker),
+      // NOT replaced by only the cancel notice — that was the "suddenly loses a
+      // big chunk" bug when pressing Esc/stop mid-stream.
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall).toBeDefined();
       expect(textCall![0]).toBe('sess-cancelled');
+      expect(textCall![2]).toMatchObject({
+        text: 'partial before stop\n\n⚠️ Turn cancelled',
+        streaming: false,
+        memoryExcluded: true,
+        taskPairTerminalFlush: true,
+      });
+      // A clean cancel must NOT emit a session error state.
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+      // The partial must be persisted (落盘) so it survives refresh/reconnect.
+      const appended = appendMock.mock.calls.find(c => c[1]?.type === 'assistant.text');
+      expect(appended?.[1]).toMatchObject({
+        type: 'assistant.text',
+        sessionId: 'sess-cancelled',
+        text: 'partial before stop\n\n⚠️ Turn cancelled',
+      });
+    });
+
+    it('CANCELLED with no streamed content shows only the cancel notice and does not persist', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cancel-empty', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![2]).toMatchObject({
         text: '⚠️ Turn cancelled: Cancelled',
         streaming: false,
         memoryExcluded: true,
       });
+      // Nothing streamed → nothing to persist.
+      expect(appendMock.mock.calls.some(c => c[1]?.type === 'assistant.text')).toBe(false);
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
-      expect(appendMock).not.toHaveBeenCalled();
+    });
+
+    it('does not duplicate "Turn cancelled: Turn cancelled" when provider message is "Turn cancelled"', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cancel-turn', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Turn cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Turn cancelled',
+        streaming: false,
+        memoryExcluded: true,
+      });
+      expect(textCall![2].text).not.toContain('Turn cancelled: Turn cancelled');
+    });
+
+    it('labels cancel for queue dispatch distinctly and attaches noticeCode', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      const { getTransportRuntime } = await import('../../src/agent/session-manager.js');
+      vi.mocked(getTransportRuntime).mockReturnValueOnce({ isStoppingForQueue: true } as never);
+
+      fireError('sess-cancel-queue', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Turn cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Stopped previous turn — sending queued message(s)',
+        noticeCode: 'turn_stopped_for_queue',
+        streaming: false,
+        memoryExcluded: true,
+      });
+    });
+
+    it('labels watchdog recovery distinctly from a user cancellation and persists it', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-watchdog', {
+        code: PROVIDER_ERROR_CODES.CANCELLED,
+        message: 'OpenCode was unresponsive and was automatically recovered.',
+        recoverable: true,
+        details: {
+          cancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+          reason: 'health-poll-stale-active-turn',
+        },
+      });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall?.[2]).toMatchObject({
+        text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+        streaming: false,
+        memoryExcluded: true,
+        automation: true,
+        providerErrorCode: PROVIDER_ERROR_CODES.CANCELLED,
+        providerErrorRecoverable: true,
+        providerCancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-watchdog', {
+        type: 'assistant.text',
+        sessionId: 'sess-watchdog',
+        text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+        memoryExcluded: true,
+      });
+    });
+
+    it('recognizes typed sdk_turn_lost with a machine-readable helper, not message parsing', () => {
+      const details = makeSdkTurnLostDetails({
+        rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_PROJECT' },
+        error: 'UNBOUNDED_ERROR_SHOULD_NOT_PROJECT',
+      });
+      const error = {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'any human text can change',
+        recoverable: true,
+        details,
+      };
+
+      expect(isSdkTurnLostRecovery(error)).toBe(true);
+      expect(isSdkTurnLostRecovery({
+        ...error,
+        message: 'a completely different localized message',
+      })).toBe(true);
+      expect(isSdkTurnLostRecovery({
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'sdk_turn_lost',
+        recoverable: true,
+        details: { classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN },
+      })).toBe(false);
+
+      const sanitized = sanitizeSdkTurnLostRecoveryMetadata(details);
+      expect(sanitized).toMatchObject({
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+        correlationId: 'sdk-turn-lost-correlation-1',
+      });
+      expect(JSON.stringify(sanitized)).not.toContain('SECRET_PROMPT_SHOULD_NOT_PROJECT');
+      expect(JSON.stringify(sanitized)).not.toContain('UNBOUNDED_ERROR_SHOULD_NOT_PROJECT');
+    });
+
+    it('emits a privacy-safe detected phase for recoverable sdk_turn_lost and no generic final error', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-lost', makeDelta({ messageId: 'msg-lost', delta: 'partial before heartbeat' }));
+      emitMock.mockClear();
+
+      fireError('sess-lost', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'Raw provider error SECRET_PROMPT_SHOULD_NOT_PROJECT',
+        recoverable: true,
+        details: makeSdkTurnLostDetails({
+          rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_PROJECT' },
+          toolInput: 'SECRET_TOOL_INPUT_SHOULD_NOT_PROJECT',
+          env: { OPENAI_API_KEY: 'SECRET_ENV_SHOULD_NOT_PROJECT' },
+        }),
+      });
+      await Promise.resolve();
+
+      expect(emitMock.mock.calls.some(c => c[1] === 'assistant.text')).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state' && c[2]?.state === 'error')).toBe(false);
+
+      const phaseCall = emitMock.mock.calls.find(c => c[1] === 'agent.status');
+      expect(phaseCall).toBeDefined();
+      expect(phaseCall![0]).toBe('sess-lost');
+      expect(phaseCall![2]).toMatchObject({
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        correlationId: 'sdk-turn-lost-correlation-1',
+        recovery: {
+          reason: SDK_TURN_LOST_RECOVERY_REASON,
+          classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+          replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.PENDING,
+        },
+      });
+      expect(phaseCall![3]).toMatchObject({
+        eventId: 'transport-recovery:sess-lost:sdk-turn-lost-correlation-1:detected',
+      });
+
+      const projected = JSON.stringify([phaseCall![2], appendMock.mock.calls]);
+      expect(projected).not.toContain('SECRET_PROMPT_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('SECRET_TOOL_INPUT_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('SECRET_ENV_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('Raw provider error');
+      expect(appendMock).toHaveBeenCalledWith('sess-lost', expect.objectContaining({
+        type: 'agent.status',
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+      }));
+    });
+
+    it('drops recovery phases with conflicting provider session metadata instead of guessing ownership', () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const sharedProviderSessionId = 'ambiguous-provider-session-id';
+      const details = makeSdkTurnLostDetails({
+        providerSessionId: sharedProviderSessionId,
+        correlationId: 'correlation-shared-provider-sid',
+      });
+
+      fireError('owner-a', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost',
+        recoverable: true,
+        details,
+      });
+      fireError('owner-a', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost duplicate',
+        recoverable: true,
+        details,
+      });
+      fireError('owner-b', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost',
+        recoverable: true,
+        details: makeSdkTurnLostDetails({
+          providerSessionId: sharedProviderSessionId,
+          correlationId: 'correlation-shared-provider-sid',
+        }),
+      });
+
+      const phases = emitMock.mock.calls.filter(c => c[1] === 'agent.status');
+      expect(phases).toHaveLength(0);
+      expect(emitMock.mock.calls.some(c => c[0] === sharedProviderSessionId)).toBe(false);
+    });
+
+    it('accepts route-keyed recovery phases when provider session metadata matches current route', () => {
+      const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest(
+        'deck_cd_brain',
+        makeSdkTurnLostDetails({
+          localSessionKey: 'provider-route-id',
+          sessionName: undefined,
+          providerSessionId: 'provider-route-id',
+          correlationId: 'correlation-route-keyed',
+        }),
+        SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        'provider-route-id',
+      );
+
+      expect(emitted).toBe(true);
+      const phaseCall = emitMock.mock.calls.find(c => c[1] === 'agent.status');
+      expect(phaseCall).toBeDefined();
+      expect(phaseCall![0]).toBe('deck_cd_brain');
+      expect(phaseCall![2]).toMatchObject({
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        correlationId: 'correlation-route-keyed',
+      });
+    });
+
+    it('rejects recovery phases when sessionName conflicts even if provider route matches', () => {
+      const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest(
+        'deck_cd_brain',
+        makeSdkTurnLostDetails({
+          localSessionKey: 'provider-route-id',
+          sessionName: 'other-session',
+          providerSessionId: 'provider-route-id',
+          correlationId: 'correlation-conflicting-session',
+        }),
+        SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        'provider-route-id',
+      );
+
+      expect(emitted).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'agent.status')).toBe(false);
+    });
+
+    it('emits explicit recovery phase metadata for recovering/recovered/failed without generic error state', () => {
+      const phases = [
+        SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
+        SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED,
+        SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+      ];
+
+      for (const phase of phases) {
+        const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest('sess-phase', makeSdkTurnLostDetails({
+          localSessionKey: 'sess-phase',
+          sessionName: 'sess-phase',
+          phase,
+          correlationId: `corr-${phase}`,
+          replayDecision: phase === SDK_TURN_LOST_RECOVERY_PHASES.FAILED
+            ? SDK_TURN_LOST_REPLAY_DECISIONS.FAILED
+            : SDK_TURN_LOST_REPLAY_DECISIONS.SAFE_REPLAY,
+        }));
+        expect(emitted).toBe(true);
+      }
+
+      const phaseCalls = emitMock.mock.calls.filter(c => c[1] === 'agent.status');
+      expect(phaseCalls.map(c => c[2].phase)).toEqual(phases);
+      expect(phaseCalls.map(c => c[2].status)).toEqual([
+        SDK_TURN_LOST_RECOVERY_STATUS,
+        SDK_TURN_LOST_RECOVERY_STATUS,
+        SDK_TURN_LOST_RECOVERY_STATUS,
+      ]);
+      expect(emitMock.mock.calls.some(c => c[1] === 'assistant.text' && String(c[2].text).includes('⚠️ Error'))).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state' && c[2].state === 'error')).toBe(false);
     });
 
     it('does NOT call sendToServer', () => {
@@ -807,10 +1468,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service overloaded', recoverable: true });
+      // (A transient message such as "overloaded" is retried by the runtime and deliberately not bubbled per attempt: see the
+      // capacity tests above.)
+      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service returned malformed output', recoverable: true });
 
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
-      expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
+      expect(textCall![2].text).toBe('⚠️ Error: AI service returned malformed output');
     });
 
     it('reuses the streaming eventId on error and preserves partial text', () => {
@@ -867,7 +1530,12 @@ describe('transport-relay (timeline-emitter based)', () => {
     });
 
     it('caches user.message to JSONL via appendTransportEvent', async () => {
-      emitTransportUserMessage('sess-u', 'cached message');
+      emitTransportUserMessage('sess-u', 'cached message', {
+        commandId: 'queued-1',
+        clientMessageId: 'queued-1',
+        queueAppended: true,
+        pendingMessageVersion: 7,
+      }, 'transport-user:queued-1');
 
       await Promise.resolve();
 
@@ -877,6 +1545,27 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('user.message');
       expect(event.text).toBe('cached message');
       expect(event.sessionId).toBe('sess-u');
+      expect(event.commandId).toBe('queued-1');
+      expect(event.clientMessageId).toBe('queued-1');
+      expect(event.queueAppended).toBe(true);
+      expect(event.pendingMessageVersion).toBe(7);
+      expect(event.eventId).toBe('transport-user:queued-1');
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-u',
+        'user.message',
+        expect.objectContaining({
+          text: 'cached message',
+          commandId: 'queued-1',
+          clientMessageId: 'queued-1',
+          queueAppended: true,
+        }),
+        expect.objectContaining({
+          source: 'daemon',
+          confidence: 'high',
+          eventId: 'transport-user:queued-1',
+        }),
+      );
     });
 
     it('emits with daemon source and high confidence', () => {
@@ -968,15 +1657,65 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({
+      expect(call![2]).toMatchObject({
+        sessionId: 'sess-tool',
         toolCallId: 'tool-1',
         terminalStatus: 'succeeded',
         terminalReason: 'provider_result',
+        synthetic: false,
+        source: 'app_server_jsonrpc',
+        decisionReason: 'provider_result',
+        idempotencyKey: expect.stringContaining('tool-1:succeeded:provider_result'),
         output: 'done',
         detail: { kind: 'tool_result', output: 'done' },
       });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
       expect(call![3].hidden).not.toBe(true);
+    });
+
+    it('preserves canonical lifecycle terminal metadata from provider tool events', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-tool', {
+        id: 'tool-1',
+        name: 'WebSearch',
+        status: 'complete',
+        output: 'done',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        terminalSynthetic: true,
+        terminalSource: 'daemon_synthetic',
+        terminalDecisionReason: 'local_stop',
+        terminalIdempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call?.[2]).toMatchObject({
+        sessionId: 'sess-tool',
+        toolCallId: 'tool-1',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        itemKind: 'web_search',
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-tool', expect.objectContaining({
+        type: 'tool.result',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+      }));
     });
 
     it('emits a visible checklist tool.call for completed-only update_plan snapshots', () => {
@@ -1036,6 +1775,23 @@ describe('transport-relay (timeline-emitter based)', () => {
         toolCallId: 'todo-1',
         tool: 'update_plan',
       }));
+    });
+
+    it('keeps AG invocation title/child binding/terminal projections hidden and canonical', async () => {
+      const {provider,fireTool}=makeMockProvider();wireProviderToRelay(provider);
+      const tracker=new AgySubagentTracker('parent-native');
+      const launch={id:'ag-launch',name:'Run invoke_subagent {"Model":"inherit","Prompt":"work"}',status:'running' as const};
+      const start=tracker.tool(launch);
+      const bound=tracker.tool({...launch,status:'complete',output:JSON.stringify({conversationId:'child-native'})});
+      const terminal=tracker.snapshot({conversationId:'child-native',status:'completed'});
+      for(const event of [...start,...bound,...terminal]) fireTool('sess-agy',event);
+      await Promise.resolve();
+      const calls=emitMock.mock.calls.filter(c=>c[1]==='tool.call'||c[1]==='tool.result');
+      expect(calls).toHaveLength(3);
+      expect(calls.every(c=>c[3].hidden===true)).toBe(true);
+      expect(new Set(calls.map(c=>c[2].detail.meta.canonicalKey)).size).toBe(1);
+      expect(calls.at(-1)?.[2].detail.meta).toMatchObject({agentPath:'child-native',terminal:true});
+      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('emits hidden tool.call for running SDK sub-agent snapshots', async () => {
@@ -1374,6 +2130,99 @@ describe('transport-relay (timeline-emitter based)', () => {
         expect.objectContaining({ source: 'daemon', confidence: 'high' }),
       );
     });
+
+    // Regression: a cc-preset reasoning model (MiniMax-M3) reports live thinking
+    // progress on nearly every reasoning token — measured 3–36 updates/s. Each
+    // one used to become an agent.status frame on the same daemon→server socket
+    // that carries the 40ms streaming-text frames.
+    it('coalesces rapid label churn within one status and keeps the latest label', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      for (let tokens = 1; tokens <= 40; tokens += 1) {
+        fireStatus('sess-status', { status: 'thinking', label: `Thinking (${tokens} tokens)` });
+      }
+
+      const statusCalls = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status');
+      expect(statusCalls()).toHaveLength(1);
+      expect(statusCalls()[0][2]).toMatchObject({ status: 'thinking', label: 'Thinking (1 tokens)' });
+
+      vi.advanceTimersByTime(249);
+      expect(statusCalls()).toHaveLength(1);
+
+      // Trailing edge carries the newest count, not a stale intermediate one.
+      vi.advanceTimersByTime(1);
+      expect(statusCalls()).toHaveLength(2);
+      expect(statusCalls()[1][2]).toMatchObject({ status: 'thinking', label: 'Thinking (40 tokens)' });
+
+      vi.useRealTimers();
+    });
+
+    it('emits a status NAME transition immediately without reordering it behind coalesced churn', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (2 tokens)' }); // coalesced
+      fireStatus('sess-status', { status: 'compacting', label: 'Compacting conversation...' });
+
+      const statusCalls = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status');
+      expect(statusCalls()).toHaveLength(2);
+      expect(statusCalls()[1][2]).toMatchObject({ status: 'compacting' });
+
+      // The dropped 'thinking (2 tokens)' frame must never land after it.
+      vi.advanceTimersByTime(1000);
+      expect(statusCalls()).toHaveLength(2);
+
+      vi.useRealTimers();
+    });
+
+    it('discards a coalesced status frame when the turn completes', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (2 tokens)' }); // coalesced
+      fireComplete('sess-status', makeMessage({ id: 'msg-done', content: 'done' }));
+
+      const statusCallCount = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status').length;
+      expect(statusCallCount()).toBe(1);
+
+      // Would otherwise pin the UI to "Thinking" after the turn already ended.
+      vi.advanceTimersByTime(1000);
+      expect(statusCallCount()).toBe(1);
+
+      vi.useRealTimers();
+    });
+
+    it('treats the first status after a completed turn as a transition (emitted immediately)', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireComplete('sess-status', makeMessage({ id: 'msg-done', content: 'done' }));
+      emitMock.mockClear();
+
+      // Same status name as the previous turn, but the memo was cleared — so it
+      // must not be held back by the window the previous turn opened.
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'agent.status')).toHaveLength(1);
+
+      vi.useRealTimers();
+    });
   });
 
   describe('onApprovalRequest', () => {
@@ -1385,6 +2234,10 @@ describe('transport-relay (timeline-emitter based)', () => {
         id: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       });
       await Promise.resolve();
 
@@ -1394,10 +2247,15 @@ describe('transport-relay (timeline-emitter based)', () => {
         requestId: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       }));
       expect(appendMock).toHaveBeenCalledWith('sess-approval', expect.objectContaining({
         type: TRANSPORT_EVENT.CHAT_APPROVAL,
         requestId: 'approval-1',
+        providerToolUseId: 'tool-1',
       }));
     });
   });
@@ -1431,7 +2289,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(sessionId).toBe('sess-a');
       expect(payload.toolUseId).toBe('tu-1');
       expect(payload.questions).toEqual(askInput.questions);
-      expect(payload.waitMs).toBe(60_000); // ASK_QUESTION_WAIT_MS — drives the web countdown
+      expect(payload.waitMs).toBe(120_000); // ASK_QUESTION_WAIT_MS — drives the web countdown
       expect(meta.eventId).toBe('transport-ask:sess-a:tu-1');
     });
 
@@ -1490,6 +2348,260 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(askCalls).toHaveLength(0);
       expect(toolCalls).toHaveLength(1);
       expect(toolCalls[0][2].tool).toBe('Read');
+    });
+
+    it('normalizes Antigravity ask_question (string[] options + is_multi_select) to ask.question', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-agy', {
+        id: 'agy-1',
+        name: 'ask_question',
+        status: 'complete',
+        input: {
+          question: 'Pick targets',
+          header: 'Targets',
+          is_multi_select: true,
+          options: ['Web', 'Daemon'],
+        },
+      });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      expect(toolCalls).toHaveLength(0);
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2]).toEqual({
+        toolUseId: 'agy-1',
+        questions: [{
+          question: 'Pick targets',
+          header: 'Targets',
+          multiSelect: true,
+          options: [{ label: 'Web' }, { label: 'Daemon' }],
+        }],
+        waitMs: 120_000,
+      });
+
+      // Follow-up generic tool result is suppressed once surfaced
+      emitMock.mockClear();
+      fireTool('sess-agy', { id: 'agy-1', name: 'tool', status: 'complete', output: '[Targets] Web' });
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('surfaces Antigravity ask_question with populated input at running without duplicating on complete', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const input = { question: 'Continue?', options: ['Yes', 'No'], is_multi_select: false };
+      fireTool('sess-agy', { id: 'agy-run', name: 'ask_question', status: 'running', input });
+      fireTool('sess-agy', { id: 'agy-run', name: 'ask_question', status: 'complete', input });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2].questions).toEqual([{
+        question: 'Continue?',
+        multiSelect: false,
+        options: [{ label: 'Yes' }, { label: 'No' }],
+      }]);
+    });
+
+    it('falls back to generic tool.call + tool.result when ask_question has malformed object, invalid JSON string, or completed empty input', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // 1. Malformed object at completion
+      fireTool('sess-agy', { id: 'agy-malformed', name: 'ask_question', status: 'complete', input: { foo: 'bar' } });
+      // 2. Invalid JSON string (running then complete — emits tool.call once + tool.result)
+      fireTool('sess-agy', { id: 'agy-bad-json', name: 'ask_question', status: 'running', input: '{not valid json' });
+      fireTool('sess-agy', { id: 'agy-bad-json', name: 'ask_question', status: 'complete', input: '{not valid json' });
+      // 3. Completed empty object
+      fireTool('sess-agy', { id: 'agy-empty', name: 'ask_question', status: 'complete', input: {} });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      const toolResults = emitMock.mock.calls.filter((c) => c[1] === 'tool.result');
+      expect(askCalls).toHaveLength(0);
+      expect(toolCalls).toHaveLength(3);
+      expect(toolCalls.map((c) => c[2].toolCallId)).toEqual(['agy-malformed', 'agy-bad-json', 'agy-empty']);
+      expect(toolResults).toHaveLength(3);
+    });
+
+    it('surfaces Antigravity ACP "Run ask_question" at running, suppresses duplicates on complete, and ignores generic tool result', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const input = { question: 'Approve deploy?', options: ['Yes', 'No'], is_multi_select: false };
+      fireTool('sess-agy-acp', { id: 'agy-acp-1', name: 'Run ask_question', status: 'running', input });
+      fireTool('sess-agy-acp', { id: 'agy-acp-1', name: 'Run ask_question', status: 'complete', input });
+      fireTool('sess-agy-acp', { id: 'agy-acp-1', name: 'tool', status: 'complete', output: 'Yes' });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      const toolResults = emitMock.mock.calls.filter((c) => c[1] === 'tool.result');
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2]).toEqual({
+        toolUseId: 'agy-acp-1',
+        questions: [{
+          question: 'Approve deploy?',
+          multiSelect: false,
+          options: [{ label: 'Yes' }, { label: 'No' }],
+        }],
+        waitMs: 120_000,
+      });
+      expect(toolCalls).toHaveLength(0);
+      expect(toolResults).toHaveLength(0);
+    });
+
+    it('surfaces "Run ask_question {...}" inline JSON when tool.input is absent', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-agy-acp', {
+        id: 'agy-acp-inline',
+        name: 'Run ask_question {"questions":[{"question":"Which region?","options":["US","EU"]}]}',
+        status: 'running',
+      });
+      fireTool('sess-agy-acp', {
+        id: 'agy-acp-inline',
+        name: 'Run ask_question {"questions":[{"question":"Which region?","options":["US","EU"]}]}',
+        status: 'complete',
+      });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2].questions).toEqual([{
+        question: 'Which region?',
+        options: [{ label: 'US' }, { label: 'EU' }],
+      }]);
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'tool.call')).toHaveLength(0);
+    });
+
+    it('keeps running empty "Run ask_question" silent and falls back to generic tool.call on completed empty input', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-agy-acp', { id: 'agy-acp-empty', name: 'Run ask_question', status: 'running', input: {} });
+      expect(emitMock).not.toHaveBeenCalled();
+
+      fireTool('sess-agy-acp', { id: 'agy-acp-empty', name: 'Run ask_question', status: 'complete', input: {} });
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'ask.question')).toHaveLength(0);
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'tool.call')).toHaveLength(1);
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'tool.result')).toHaveLength(1);
+    });
+
+    it('does not treat "Run echo ask_question" as an ask_question tool', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-agy-acp', { id: 'echo-1', name: 'Run echo ask_question', status: 'running', input: { question: 'ignored' } });
+      fireTool('sess-agy-acp', { id: 'echo-1', name: 'Run echo ask_question', status: 'complete', input: { question: 'ignored' }, output: 'ok' });
+
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'ask.question')).toHaveLength(0);
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      const toolResults = emitMock.mock.calls.filter((c) => c[1] === 'tool.result');
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0][2].tool).toBe('Run echo ask_question');
+      expect(toolResults).toHaveLength(1);
+    });
+
+    it('finalizes in-flight assistant.text BEFORE ask.question and deduplicates late delta.final / onComplete with trimEnd or different step messageId', () => {
+      const { provider, fireDelta, fireTool, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // 1. Pre-ask assistant prose streams into inFlightMessages
+      fireDelta('sess-order', makeDelta({
+        messageId: 'stream-1',
+        delta: 'Let me clarify one detail first.\n',
+      }));
+
+      // 2. Model calls ask_question before delta.final arrives
+      fireTool('sess-order', {
+        id: 'call-ask-1',
+        name: 'ask_question',
+        status: 'running',
+        input: { question: 'Which environment?', options: ['Staging', 'Prod'] },
+      });
+
+      // 3. 59ms later kimi-sdk / agy-sdk emits transcript-step delta.final with different messageId
+      //    and trailing newline difference, then onComplete with .trimEnd()
+      fireDelta('sess-order', makeDelta({
+        messageId: 'acp-sess:step:24477',
+        delta: 'Let me clarify one detail first.',
+        final: true,
+      }));
+      fireComplete('sess-order', makeMessage({
+        id: 'acp-sess:step:24477',
+        content: 'Let me clarify one detail first.',
+        metadata: { usage: { input_tokens: 90, output_tokens: 12, model_context_window: 200000 } },
+      }));
+
+      const timelineOrder = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text' || c[1] === 'ask.question')
+        .map((c) => ({
+          type: c[1],
+          text: c[2]?.text,
+          streaming: c[2]?.streaming,
+          eventId: c[3]?.eventId,
+        }));
+      expect(timelineOrder).toEqual([
+        {
+          type: 'assistant.text',
+          text: 'Let me clarify one detail first.\n',
+          streaming: true,
+          eventId: 'transport:sess-order:stream-1',
+        },
+        {
+          type: 'assistant.text',
+          text: 'Let me clarify one detail first.\n',
+          streaming: false,
+          eventId: 'transport:sess-order:stream-1',
+        },
+        {
+          type: 'ask.question',
+          text: undefined,
+          streaming: undefined,
+          eventId: 'transport-ask:sess-order:call-ask-1',
+        },
+      ]);
+      // No assistant.text emitted or persisted after ask.question
+      const persistedTexts = appendMock.mock.calls
+        .filter((c) => c[1]?.type === 'assistant.text')
+        .map((c) => c[1]?.text);
+      expect(persistedTexts).toEqual(['Let me clarify one detail first.\n']);
+      expect(emitMock.mock.calls.some((c) => c[1] === 'usage.update' && c[2]?.inputTokens === 90)).toBe(true);
+    });
+
+    it('clears whitespace-only in-flight text before ask.question without emitting an empty bubble, and resets pre-ask dedup on user reply', () => {
+      const { provider, fireDelta, fireTool, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-ws', makeDelta({ messageId: 'stream-ws', delta: '   \n\t ' }));
+      fireTool('sess-ws', {
+        id: 'call-ask-ws',
+        name: 'ask_question',
+        status: 'running',
+        input: { question: 'Ready?', options: ['Yes', 'No'] },
+      });
+      fireComplete('sess-ws', makeMessage({ id: 'stream-ws', content: '' }));
+
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'assistant.text' && c[2]?.streaming === false)).toHaveLength(0);
+      expect(appendMock.mock.calls.filter((c) => c[1]?.type === 'assistant.text')).toHaveLength(0);
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'ask.question')).toHaveLength(1);
+
+      // New user answer clears preAskFinalizedTexts so subsequent turn text is never suppressed
+      emitMock.mockClear();
+      fireDelta('sess-ws', makeDelta({ messageId: 'pre-2', delta: 'Confirming choice' }));
+      fireTool('sess-ws', {
+        id: 'call-ask-2',
+        name: 'ask_question',
+        status: 'running',
+        input: { question: 'Proceed?', options: ['Go'] },
+      });
+      emitTransportUserMessage('sess-ws', 'Go');
+      fireDelta('sess-ws', makeDelta({ messageId: 'post-2', delta: 'Confirming choice', final: true }));
+      const postTexts = emitMock.mock.calls.filter(
+        (c) => c[1] === 'assistant.text' && c[2]?.streaming === false && c[3]?.eventId === 'transport:sess-ws:post-2',
+      );
+      expect(postTexts).toHaveLength(1);
     });
   });
 });
@@ -1588,5 +2700,172 @@ describe('same-eventId replacement semantics (appendEvent logic)', () => {
     expect(state).toHaveLength(2);
     expect(state[0].eventId).toBe(stableId);
     expect(state[1].eventId).toBe('transport:sess:msg-2');
+  });
+});
+
+describe('tool-execution guard seam (pair participants and the main checkout)', () => {
+  function wire() {
+    let installed: ((sid: string, request: { toolName: string; input: unknown; cwd?: string }) => { allow: boolean; reason?: string }) | undefined;
+    const { provider } = makeMockProvider();
+    (provider as unknown as { setToolExecutionGuard: (guard: typeof installed) => void }).setToolExecutionGuard = (guard) => { installed = guard; };
+    wireProviderToRelay(provider);
+    return installed!;
+  }
+  afterEach(() => setTransportToolExecutionEvaluator(undefined));
+
+  it('allows everything until the daemon lifecycle installs an evaluator', () => {
+    expect(wire()('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' } })).toEqual({ allow: true });
+  });
+
+  it('passes the resolved IM.codes session name and the request to the evaluator and returns its decision', () => {
+    const evaluator = vi.fn((_session: string, request: { input: unknown }) => (
+      JSON.stringify(request.input).includes('reset') ? { allow: false as const, reason: 'refused' } : { allow: true as const }
+    ));
+    setTransportToolExecutionEvaluator(evaluator);
+    const guard = wire();
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' })).toEqual({ allow: false, reason: 'refused' });
+    expect(evaluator).toHaveBeenCalledWith('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' });
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git status' } })).toEqual({ allow: true });
+  });
+});
+
+describe('AgySdkProvider -> transport-relay -> timeline multi-turn historical error E2E', () => {
+  let dir: string;
+  let agyProvider: AgySdkProvider;
+  let emitMock: ReturnType<typeof vi.fn>;
+  let appendMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    relayTesting.resetRelayState();
+    setTransportRelaySend(vi.fn());
+    emitMock = vi.mocked(timelineEmitter.emit);
+    emitMock.mockClear();
+    appendMock = vi.mocked(appendTransportEvent);
+    appendMock.mockClear();
+    dir = mkdtempSync(path.join(tmpdir(), 'imcodes-agy-relay-e2e-'));
+    const fakeCli = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--help' || args.includes('/usage')) { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
+const resumeIdx = args.indexOf('--conversation');
+const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : '11111111-1111-4111-8111-111111111111';
+const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+let step = 0;
+let buf = '';
+const STREAM_ERR = 'The stream was interrupted. Please continue the task you were working on.';
+process.stdin.on('data', (d) => {
+  buf += d.toString();
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const text = JSON.parse(line).message.content;
+    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
+    const idx = step++;
+    if (text.includes('TURN1_INTERRUPTED')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Partial turn 1 output' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'system_error', text_delta: STREAM_ERR } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: 'Partial turn 1 output', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN2_COMPLETE_WITH_STALE_ERR')) {
+      const reply = 'Turn 2 complete reply without error';
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: reply + '\\n', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN3_COMPLETE_WITH_QUOTED_ERR')) {
+      const reply = 'Turn 3 normal text quoting Error: The stream was interrupted. Please continue the task you were working on.';
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: reply + '\\n', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN4_GENUINE_EMPTY_FAIL')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'system_error', text_delta: STREAM_ERR } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+  }
+});
+`;
+    const binPath = path.join(dir, 'agy');
+    writeFileSync(binPath, fakeCli);
+    chmodSync(binPath, 0o755);
+    agyProvider = new AgySdkProvider();
+    await agyProvider.connect({ binaryPath: binPath, env: { HOME: dir } });
+    wireProviderToRelay(agyProvider);
+  });
+
+  afterEach(async () => {
+    await agyProvider.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+    setTransportRelaySend(() => {});
+  });
+
+  it('appends warning on Turn 1 real stream interruption, omits stale warning on Turn 2 & Turn 3 complete replies, and still emits session.error on Turn 4 genuine failure', async () => {
+    const sid = await agyProvider.createSession({ sessionKey: 'deck_agy_e2e', cwd: dir, fresh: true });
+
+    // Turn 1: real stream interruption after partial text -> finalized assistant.text has ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN1_INTERRUPTED');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn1Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn1Final[2].text).toBe(
+      'Partial turn 1 output\n\n⚠️ Error: The stream was interrupted. Please continue the task you were working on.',
+    );
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(true);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 2: complete DONE reply carrying historical stream-interrupted error -> finalized assistant.text has NO ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN2_COMPLETE_WITH_STALE_ERR');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn2Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn2Final[2].text).toBe('Turn 2 complete reply without error');
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(false);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 3: complete DONE reply whose own assistant text quotes the error string -> preserved verbatim without extra ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN3_COMPLETE_WITH_QUOTED_ERR');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn3Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn3Final[2].text).toBe(
+      'Turn 3 normal text quoting Error: The stream was interrupted. Please continue the task you were working on.',
+    );
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(false);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 4: genuine current failure with no partial output -> emits ⚠️ Error bubble and session.error transport event
+    await agyProvider.send(sid, 'TURN4_GENUINE_EMPTY_FAIL');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn4Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn4Final[2].text).toBe('⚠️ Error: The stream was interrupted. Please continue the task you were working on.');
+    expect(turn4Final[2].memoryExcluded).toBe(true);
+    const turn4SessionErr = appendMock.mock.calls.find(([, evt]) => evt?.type === 'session.error');
+    expect(turn4SessionErr).toBeDefined();
+    expect(turn4SessionErr![1]).toMatchObject({
+      type: 'session.error',
+      sessionId: 'deck_agy_e2e',
+      error: 'The stream was interrupted. Please continue the task you were working on.',
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+    });
   });
 });

@@ -36,6 +36,55 @@ describe('desktop-window-maximize helpers', () => {
 
   afterEach(() => {
     document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
+    document.querySelectorAll('.main').forEach((node) => node.remove());
+  });
+
+  function addMainContent(top: number): HTMLElement {
+    const main = document.createElement('main');
+    main.className = 'main';
+    main.getBoundingClientRect = () => ({ ...rectWithBottom(0), top, y: top }) as DOMRect;
+    document.body.appendChild(main);
+    return main;
+  }
+
+  it('falls back to the content column top when no tab bar exists', () => {
+    // Returning 0 here pins a floating window to the very top of the viewport,
+    // putting its own title bar — and the close button in it — under the app
+    // header. `.main` starts below the header, so it is a safe floor.
+    addMainContent(96);
+    expect(resolveSessionTabsBottom()).toBe(96);
+    expect(viewportWorkspaceBelowSessionTabs({
+      viewportWidth: 1280,
+      viewportHeight: 900,
+      minW: 1,
+      minH: 1,
+    }).y).toBe(96);
+  });
+
+  it('falls through to the content column when the tab bar measures zero', () => {
+    // Present but unmeasured — pre-layout, or hidden by the current layout.
+    // Returning that 0 is the same failure as having no tab bar at all.
+    addMainContent(96);
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    tabBar.getBoundingClientRect = () => rectWithBottom(0);
+    document.body.appendChild(tabBar);
+
+    expect(resolveSessionTabsBottom()).toBe(96);
+  });
+
+  it('prefers a measurable tab bar over the content column', () => {
+    addMainContent(96);
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    tabBar.getBoundingClientRect = () => rectWithBottom(140);
+    document.body.appendChild(tabBar);
+
+    expect(resolveSessionTabsBottom()).toBe(140);
+  });
+
+  it('still reports 0 when neither the tab bar nor the content column exists', () => {
+    expect(resolveSessionTabsBottom()).toBe(0);
   });
 
   it('converts workspace bounds into exact maximized geometry', () => {

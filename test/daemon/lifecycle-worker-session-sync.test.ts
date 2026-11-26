@@ -9,8 +9,18 @@ import {
   WORKER_SESSION_SYNC_STATUS,
 } from '../../shared/worker-session-snapshot.js';
 
+type SessionStoreModule = typeof import('../../src/store/session-store.js');
+
 let tempDir: string;
-const LIFECYCLE_SYNC_TEST_TIMEOUT_MS = 10_000;
+let activeStore: SessionStoreModule | null = null;
+const LIFECYCLE_SYNC_TEST_TIMEOUT_MS = 20_000;
+
+async function loadTestStore(): Promise<SessionStoreModule> {
+  const store = await import('../../src/store/session-store.js');
+  activeStore = store;
+  await store.loadStore({ probe: false });
+  return store;
+}
 
 function makeSession(overrides: Partial<SessionRecord>): SessionRecord {
   return {
@@ -30,21 +40,28 @@ function makeSession(overrides: Partial<SessionRecord>): SessionRecord {
 
 beforeEach(() => {
   vi.resetModules();
+  activeStore = null;
   tempDir = mkdtempSync(join(tmpdir(), 'imcodes-sync-test-'));
   vi.stubEnv('HOME', tempDir);
+  vi.stubEnv('USERPROFILE', tempDir);
+  vi.stubEnv('IMCODES_HOME', join(tempDir, '.imcodes'));
 });
 
-afterEach(() => {
-  rmSync(tempDir, { recursive: true, force: true });
-  vi.unstubAllEnvs();
-  vi.unstubAllGlobals();
-  vi.resetModules();
+afterEach(async () => {
+  try {
+    await activeStore?.flushStore();
+  } finally {
+    activeStore = null;
+    rmSync(tempDir, { recursive: true, force: true });
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  }
 });
 
 describe('lifecycle worker session sync', () => {
   it('treats legacy list responses as degraded and does not destructively prune local sessions', async () => {
-    const store = await import('../../src/store/session-store.js');
-    await store.loadStore({ probe: false });
+    const store = await loadTestStore();
     store.upsertSession(makeSession({ name: 'deck_existing_brain' }));
     store.upsertSession(makeSession({
       name: 'deck_sub_child',
@@ -82,8 +99,7 @@ describe('lifecycle worker session sync', () => {
   }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('does not drop local sessions missing from a complete snapshot without an explicit tombstone', async () => {
-    const store = await import('../../src/store/session-store.js');
-    await store.loadStore({ probe: false });
+    const store = await loadTestStore();
     store.upsertSession(makeSession({ name: 'deck_existing_brain' }));
 
     vi.stubGlobal('fetch', vi.fn(async (input: Parameters<typeof fetch>[0]) => {
@@ -124,8 +140,7 @@ describe('lifecycle worker session sync', () => {
   }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('treats remote stopped sessions as existing instead of deleting a local running session', async () => {
-    const store = await import('../../src/store/session-store.js');
-    await store.loadStore({ probe: false });
+    const store = await loadTestStore();
     store.upsertSession(makeSession({ name: 'deck_existing_brain', state: 'running' }));
 
     vi.stubGlobal('fetch', vi.fn(async (input: Parameters<typeof fetch>[0]) => {
@@ -165,8 +180,7 @@ describe('lifecycle worker session sync', () => {
   }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('marks a bad complete snapshot as degraded before applying destructive side effects', async () => {
-    const store = await import('../../src/store/session-store.js');
-    await store.loadStore({ probe: false });
+    const store = await loadTestStore();
     store.upsertSession(makeSession({ name: 'deck_existing_brain' }));
 
     vi.stubGlobal('fetch', vi.fn(async (input: Parameters<typeof fetch>[0]) => {

@@ -1,0 +1,7 @@
+"CFBundleDisplayName" = "IM.codes";
+"share.notificationBody" = "已儲存 %d 個檔案，輕點進入 IM.codes 傳送";
+"share.notificationBodyText" = "已儲存分享內容，輕點進入 IM.codes 傳送";
+"share.openApp" = "檔案已儲存。請輕點頂部通知橫幅，或開啟 IM.codes 選擇伺服器與工作階段。";
+"share.openAppText" = "分享內容已儲存。請輕點頂部通知橫幅，或開啟 IM.codes 選擇伺服器與工作階段。";
+"share.done" = "完成";
+"share.error" = "無法匯入分享內容，請重試。";

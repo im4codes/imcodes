@@ -31,7 +31,7 @@
  * ────────
  * Same as the daemon-side bash repair: check each of SHARP_REQUIRED_DEPS
  * for a `package.json`. If any are missing, run
- *   npm install --no-save --ignore-scripts sharp@0.34.5
+ *   npm install --no-save --ignore-scripts sharp@0.35.5
  * inside the imcodes package dir. The nested install does not hit the
  * same edge case as the top-level global install and reconciles every
  * sharp transitive dep at once.
@@ -52,7 +52,7 @@
  *   itself runs `npm install`, the postinstall fires too. We detect dev
  *   by checking for a `.git` parent or absence of a global-install
  *   marker, and skip repair in that case so dev environments aren't
- *   forcibly reset to sharp@0.34.5.
+ *   forcibly reset to sharp@0.35.5.
  */
 import { existsSync, rmdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -87,7 +87,7 @@ function runRepair(): boolean {
   // package root we're almost certainly running inside the imcodes git
   // worktree (`npm install` for development). Skip repair — the
   // developer has their own deps under control and we shouldn't
-  // forcibly install sharp@0.34.5 on top of whatever they're testing.
+  // forcibly install sharp@0.35.5 on top of whatever they're testing.
   if (isInsideGitWorktree(pkgRoot)) {
     console.log(`${TAG} dev checkout detected — skipping sharp repair`);
     return false;
@@ -144,7 +144,7 @@ function runRepair(): boolean {
   // hazard where a JS execpath gets concatenated with the args and then
   // re-parsed by /bin/sh into a single non-existent binary path.
   const npmExec = process.env.npm_execpath;
-  const installArgs = ['install', '--no-save', '--ignore-scripts', 'sharp@0.34.5'];
+  const installArgs = ['install', '--no-save', '--ignore-scripts', 'sharp@0.35.5'];
   let cmd: string;
   let argv: string[];
   let useShell = false;
@@ -188,7 +188,7 @@ function runRepair(): boolean {
     console.error(
       `${TAG} sharp repair FAILED (exit ${result.status ?? 'unknown'}). ` +
         `Run manually: cd "$(npm root -g)/imcodes" && ` +
-        `npm install --no-save --ignore-scripts sharp@0.34.5`,
+        `npm install --no-save --ignore-scripts sharp@0.35.5`,
     );
   }
   return true;

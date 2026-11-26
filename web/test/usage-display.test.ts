@@ -43,7 +43,12 @@ describe('usage display behavior', () => {
 
   it('keeps model labels consistent across GPT-5.4 variants', () => {
     expect(usageSummary(1, 1, undefined, 'gpt-5.4').label).toBe('gpt-5.4');
-    expect(usageSummary(1, 1, undefined, 'gpt-5.4-mini').label).toBe('gpt-5.4-mini');
-    expect(usageSummary(1, 1, undefined, 'gpt-5.4-pro').label).toBe('gpt-5.4-pro');
+    expect(usageSummary(1, 1, undefined, 'gpt-5.4-mini').label).toBe('5.4-mini');
+    expect(usageSummary(1, 1, undefined, 'gpt-5.4-pro').label).toBe('5.4-pro');
+  });
+
+  it('shortens multi-segment Gemini model labels to their last two segments', () => {
+    expect(usageSummary(1, 1, undefined, 'gemini-4-hydrogen-high').label).toBe('hydrogen-high');
+    expect(usageSummary(1, 1, undefined, 'gemini-4-argon-high').label).toBe('argon-high');
   });
 });

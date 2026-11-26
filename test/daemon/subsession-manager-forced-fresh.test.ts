@@ -22,12 +22,13 @@ import {
   EXECUTION_CLONE_KIND,
   type ExecutionCloneMetadata,
 } from '../../shared/execution-clone.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 const {
   upsertSessionMock, getSessionMock, removeSessionMock,
   startWatchingFileMock, jsonlStartWatchingMock, jsonlIsWatchingMock,
-  jsonlStopWatchingMock, codexStopWatchingMock, geminiStopWatchingMock, opencodeStopWatchingMock,
-  codexStartWatchingByIdMock, geminiStartWatchingMock, opencodeStartWatchingMock,
+  jsonlStopWatchingMock, codexStopWatchingMock, opencodeStopWatchingMock,
+  codexStartWatchingByIdMock, opencodeStartWatchingMock,
   sessionExistsMock, newSessionMock, getDriverMock,
   killSessionMock, timelineEmitMock, emitSessionInlineErrorMock,
   launchTransportSessionMock, getTransportRuntimeMock, stopTransportRuntimeSessionMock,
@@ -43,10 +44,8 @@ const {
   jsonlIsWatchingMock: vi.fn().mockReturnValue(false),
   jsonlStopWatchingMock: vi.fn(),
   codexStopWatchingMock: vi.fn(),
-  geminiStopWatchingMock: vi.fn(),
   opencodeStopWatchingMock: vi.fn(),
   codexStartWatchingByIdMock: vi.fn().mockResolvedValue(undefined),
-  geminiStartWatchingMock: vi.fn().mockResolvedValue(undefined),
   opencodeStartWatchingMock: vi.fn().mockResolvedValue(undefined),
   sessionExistsMock: vi.fn().mockResolvedValue(false),
   newSessionMock: vi.fn().mockResolvedValue(undefined),
@@ -69,9 +68,11 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
   getSession: getSessionMock,
   removeSession: removeSessionMock,
+  createRuntimeEpoch: vi.fn(() => 'runtime-epoch-new'),
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatchingFile: startWatchingFileMock,
   startWatching: jsonlStartWatchingMock,
   stopWatching: jsonlStopWatchingMock,
@@ -91,13 +92,6 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   isWatching: vi.fn().mockReturnValue(false),
   isFileClaimedByOther: vi.fn().mockReturnValue(false),
   findRolloutPathByUuid: vi.fn().mockResolvedValue(null),
-}));
-
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({
-  startWatching: geminiStartWatchingMock,
-  startWatchingDiscovered: vi.fn().mockResolvedValue(undefined),
-  stopWatching: geminiStopWatchingMock,
-  isWatching: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({
@@ -121,6 +115,16 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sendKey: vi.fn().mockResolvedValue(undefined),
   sendKeys: vi.fn().mockResolvedValue(undefined),
   getPanePids: vi.fn().mockResolvedValue([]),
+  getPaneId: vi.fn().mockResolvedValue('%1'),
+}));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -189,9 +193,9 @@ describe('startSubSession — forced fresh (transport families)', () => {
     vi.clearAllMocks();
   });
 
-  // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk are the
+  // openclaw included; qwen/cursor-headless/copilot-sdk/grok-sdk/agy-sdk are the
   // families the OLD code never passed `fresh` to.
-  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'gemini-sdk', 'openclaw'] as const;
+  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'opencode-sdk', 'grok-sdk', AGY_SDK_PROVIDER_ID, 'codebuddy-cn', 'codebuddy-international', 'openclaw'] as const;
 
   for (const type of TRANSPORT_FAMILIES) {
     it(`${type}: fresh:true reaches launch, NO old identity / bind reaches launchTransportSession`, async () => {
@@ -268,7 +272,6 @@ describe('startSubSession — forced fresh (process families)', () => {
     resolveBootstrapMock.mockImplementation(async () => ({
       ccSessionId: 'fresh-cc-id',
       codexSessionId: 'fresh-codex-id',
-      geminiSessionId: 'fresh-gemini-id',
     }));
   });
 
@@ -276,7 +279,7 @@ describe('startSubSession — forced fresh (process families)', () => {
     vi.clearAllMocks();
   });
 
-  const PROCESS_FAMILIES = ['claude-code', 'codex', 'gemini', 'opencode'] as const;
+  const PROCESS_FAMILIES = ['claude-code', 'codex', 'opencode'] as const;
 
   for (const type of PROCESS_FAMILIES) {
     it(`${type}: no old id reaches resolveStructuredSessionBootstrap or driver launch opts; fresh:true reaches launch opts`, async () => {
@@ -370,6 +373,85 @@ describe('startSubSession — non-fresh path unchanged (no regression)', () => {
     expect(arg.skipCreate).toBe(true);
     // The old behavior forwards sub.fresh (undefined here) under providerSessionId
     expect(arg.fresh).toBeUndefined();
+  });
+
+  it('grok-sdk non-fresh resumes only from providerResumeId and never binds the stale route key', async () => {
+    await startSubSession({
+      id: 'nf-grok',
+      type: 'grok-sdk',
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      providerSessionId: 'stale-local-route',
+      providerResumeId: 'grok-acp-session',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBe('grok-acp-session');
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(true);
+    expect(arg.fresh).toBeUndefined();
+  });
+
+  it('grok-sdk ignores a local route key without providerResumeId and starts fresh', async () => {
+    await startSubSession({
+      id: 'nf-grok-stale-route',
+      type: 'grok-sdk',
+      cwd: '/proj',
+      providerSessionId: 'stale-local-route',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBeUndefined();
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(false);
+    expect(arg.fresh).toBe(true);
+  });
+
+  it('agy-sdk non-fresh resumes only from providerResumeId and never binds the stale route key', async () => {
+    await startSubSession({
+      id: 'nf-agy',
+      type: AGY_SDK_PROVIDER_ID,
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      providerSessionId: 'stale-local-route',
+      providerResumeId: 'agy-conv-session',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBe('agy-conv-session');
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(true);
+    expect(arg.fresh).toBeUndefined();
+  });
+
+  it('agy-sdk ignores a local route key without providerResumeId and starts fresh', async () => {
+    await startSubSession({
+      id: 'nf-agy-stale-route',
+      type: AGY_SDK_PROVIDER_ID,
+      cwd: '/proj',
+      providerSessionId: 'stale-local-route',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBeUndefined();
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(false);
+    expect(arg.fresh).toBe(true);
+  });
+
+  it('CodeBuddy ignores a local route key without providerResumeId and starts fresh', async () => {
+    await startSubSession({
+      id: 'nf-codebuddy-stale-route',
+      type: 'codebuddy-cn',
+      cwd: '/proj',
+      providerSessionId: 'stale-local-route',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBeUndefined();
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(false);
+    expect(arg.fresh).toBe(true);
   });
 
   it('process non-fresh forwards stored ccSessionId into bootstrap + launch opts (existing behavior)', async () => {

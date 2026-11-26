@@ -108,6 +108,10 @@ export const TRANSPORT_MSG = {
   LIST_SESSIONS: "provider.list_sessions",
   /** Daemon → Browser: response with remote sessions list. */
   SESSIONS_RESPONSE: "provider.sessions_response",
+  /** Browser → Daemon: list models for a transport provider or CC preset. */
+  LIST_MODELS: "transport.list_models",
+  /** Daemon → Browser: response with provider/preset model options. */
+  MODELS_RESPONSE: "transport.models_response",
 } as const;
 
 /** Union of all TRANSPORT_MSG values. */
@@ -196,6 +200,14 @@ export type TransportEvent =
       description: string;
       /** Tool name that triggered the approval request, if available. */
       tool?: string;
+      /** Provider that originated this approval request, if provider-scoped. */
+      provider?: string;
+      /** Provider turn generation that originated this request. */
+      providerGeneration?: number;
+      /** Provider-native tool use identifier used to validate approval routing. */
+      providerToolUseId?: string;
+      /** Bounded, redacted preview of provider-native tool input. */
+      inputPreview?: string;
     }
   | {
       /** Browser-originated approval response broadcast back to transport subscribers. */

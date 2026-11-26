@@ -49,8 +49,16 @@ const CRITICAL_DEPS = [
   '@huggingface/transformers',
 ];
 
+function resolveImcodesStateDir() {
+  const configured = process.env.IMCODES_HOME?.trim();
+  if (configured) return resolve(configured);
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return resolve(join(home, '.imcodes'));
+}
+
+const IMCODES_HOME = resolveImcodesStateDir();
 const REPAIR_LOG = process.env.IMCODES_LAUNCH_REPAIR_LOG
-  ?? join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'launch-repair.log');
+  ?? join(IMCODES_HOME, 'launch-repair.log');
 
 function log(line) {
   // Emit to stderr so the watchdog's `>> watchdog.log 2>&1` captures it,
@@ -93,8 +101,8 @@ function readPinnedVersion() {
 // re-created right after watchdog's cleanup, or upgrade.lock.d/ from
 // the Unix-style bash upgrade ended up here cross-platform).
 function clearStaleUpgradeLock() {
-  const lockDir = join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'upgrade.lock.d');
-  const lockFile = join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'upgrade.lock');
+  const lockDir = join(IMCODES_HOME, 'upgrade.lock.d');
+  const lockFile = join(IMCODES_HOME, 'upgrade.lock');
   const stalenessSec = parseInt(
     process.env.IMCODES_LAUNCH_LOCK_STALE_AFTER_SEC ?? '1800',
     10,
@@ -135,6 +143,27 @@ if (!existsSync(entryPath)) {
   missing.push('dist/src/index.js');
 }
 
+// Run the newly installed package's own optional-native repair before daemon
+// launch. This closes the one-version bootstrap gap: an old daemon cannot put
+// new repair logic into the upgrade runner that installs the first fixed build.
+const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const nodeDatachannelRepair = join(PKG_ROOT, 'dist', 'src', 'util', 'node-datachannel-repair.mjs');
+function repairNodeDatachannel() {
+  if (!existsSync(nodeDatachannelRepair)) return;
+  const repair = spawnSync(process.execPath, [nodeDatachannelRepair, PKG_ROOT], {
+    env: { ...process.env, IMCODES_NPM_BIN: npmCmd },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
+    timeout: 6 * 60 * 1000,
+    windowsHide: true,
+  });
+  if (repair.stderr) {
+    try { appendFileSync(REPAIR_LOG, repair.stderr); } catch { /* ignore */ }
+  }
+  if (repair.status !== 0) log('node-datachannel launch repair unavailable — relay remains enabled');
+}
+repairNodeDatachannel();
+
 if (!needsRepair) {
   // Healthy install — hand back to the watchdog with no action.
   process.exit(0);
@@ -151,7 +180,6 @@ log(`node_modules half-installed (missing: ${missing.join(', ')}) — reinstalli
 // Reinstall with the same flags the bash launcher uses. `npm.cmd` is
 // the Windows shim; npm itself isn't on PATH as `npm` after a custom
 // prefix install on some configurations.
-const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const r = spawnSync(
   npmCmd,
   ['install', '-g', '--ignore-scripts', '--prefer-online', `imcodes@${pinned}`],
@@ -173,6 +201,10 @@ if (r.stderr) {
 
 if (r.status === 0) {
   log('self-repair OK');
+  // The global reinstall deliberately suppresses lifecycle scripts and can
+  // replace a native addon repaired above. Verify/repair the freshly installed
+  // tree again before handing control back to the watchdog.
+  repairNodeDatachannel();
 } else {
   log(`self-repair FAILED (npm exit ${r.status}; signal ${r.signal ?? 'none'}) — see ${REPAIR_LOG}`);
 }

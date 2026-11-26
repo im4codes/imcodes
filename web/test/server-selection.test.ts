@@ -1,16 +1,22 @@
-import { describe, expect, it } from 'vitest';
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, expect, it, beforeEach } from 'vitest';
 
 import {
   getDaemonBadgeState,
   getSelectedServerName,
+  mergeServerNavigation,
   hasResolvedActiveSession,
   hasSelectedServer,
   isServerOnline,
   pickAutoEntryServer,
   pickMostRecentMainSession,
+  resolveServerSessionSnapshot,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from '../src/server-selection.js';
+import { readServerSession, serverSessionStorageKey, writeServerSession } from '../src/server-tab-state.js';
 
 describe('getSelectedServerName', () => {
   it('uses the persisted fallback before the server list is loaded', () => {
@@ -34,6 +40,31 @@ describe('getSelectedServerName', () => {
       [{ id: 'srv-1', name: 'Server One' }],
       'Server One',
     )).toBeNull();
+  });
+});
+
+describe('server-scoped tab snapshots', () => {
+  beforeEach(() => localStorage.clear());
+  it('keeps each server tab independent, including same-named sessions', () => {
+    localStorage.clear();
+    writeServerSession('server-a', 'deck_shared_brain');
+    writeServerSession('server-b', 'deck_shared_brain');
+    expect(serverSessionStorageKey('server-a')).not.toBe(serverSessionStorageKey('server-b'));
+    expect(readServerSession('server-a')).toBe('deck_shared_brain');
+    expect(readServerSession('server-b')).toBe('deck_shared_brain');
+    writeServerSession('server-a', 'deck_other_brain');
+    expect(readServerSession('server-a')).toBe('deck_other_brain');
+    expect(readServerSession('server-b')).toBe('deck_shared_brain');
+  });
+
+  it('drops invalid or removed snapshots instead of restoring them', () => {
+    localStorage.clear();
+    writeServerSession('server-a', '');
+    expect(readServerSession('server-a')).toBeNull();
+    localStorage.setItem(serverSessionStorageKey('server-a'), 'x'.repeat(1025));
+    expect(readServerSession('server-a')).toBeNull();
+    writeServerSession('server-a', null);
+    expect(localStorage.getItem(serverSessionStorageKey('server-a'))).toBeNull();
   });
 });
 
@@ -129,6 +160,30 @@ describe('pickAutoEntryServer', () => {
   });
 });
 
+describe('resolveServerSessionSnapshot', () => {
+  it('falls back when the saved tab was deleted or is no longer navigable', () => {
+    const sessions = [
+      { serverId: 'srv-a', sessionName: 'deck_deleted_brain', isSubSession: true, previewUpdatedAt: 100 },
+      { serverId: 'srv-a', sessionName: 'deck_project_w1', previewUpdatedAt: 90 },
+      { serverId: 'srv-a', sessionName: 'deck_project_brain', previewUpdatedAt: 10 },
+      { serverId: 'srv-b', sessionName: 'deck_other_brain', previewUpdatedAt: 999 },
+    ];
+
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_deleted_brain', sessions)).toBe('deck_project_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_missing_brain', sessions)).toBe('deck_project_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_other_brain', sessions)).toBe('deck_project_brain');
+  });
+
+  it('restores a valid snapshot only for its own server', () => {
+    const sessions = [
+      { serverId: 'srv-a', sessionName: 'deck_shared_brain', previewUpdatedAt: 10 },
+      { serverId: 'srv-b', sessionName: 'deck_shared_brain', previewUpdatedAt: 20 },
+    ];
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_shared_brain', sessions)).toBe('deck_shared_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_missing_brain', sessions)).toBe('deck_shared_brain');
+  });
+});
+
 describe('isServerOnline', () => {
   it('returns true for a recent non-offline heartbeat', () => {
     expect(isServerOnline({
@@ -176,5 +231,23 @@ describe('getDaemonBadgeState', () => {
 
   it('uses connecting when the browser websocket itself is still reconnecting', () => {
     expect(getDaemonBadgeState(false, true, false, null)).toBe('connecting');
+  });
+});
+
+describe('mergeServerNavigation', () => {
+  it('preserves visited active shares while refreshing owned metadata and removing deleted servers', () => {
+    const previous = [{ id: 'own', name: 'Old' }, { id: 'shared', name: '本机' }, { id: 'deleted', name: 'Deleted' }];
+    const incoming = [{ id: 'own', name: 'Renamed' }];
+    expect(mergeServerNavigation(incoming, previous, new Set(['shared']))).toEqual([
+      { id: 'own', name: 'Renamed' }, { id: 'shared', name: '本机' },
+    ]);
+    expect(previous).toHaveLength(3);
+    expect(incoming).toHaveLength(1);
+  });
+  it('never duplicates ids or retains revoked shares, and supports empty full-server inventories', () => {
+    const shared = { id: 'shared', name: '本机' };
+    expect(mergeServerNavigation([], [shared, shared], new Set(['shared']))).toEqual([shared]);
+    expect(mergeServerNavigation([], [shared], new Set())).toEqual([]);
+    expect(mergeServerNavigation([shared], [shared], new Set(['shared']))).toEqual([shared]);
   });
 });

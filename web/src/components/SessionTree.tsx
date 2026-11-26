@@ -27,6 +27,9 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { onExecutionCloneGroupReveal } from '../execution-clone-ui.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
   serverId?: string | null;
@@ -98,7 +101,7 @@ function splitChildren(children: SubSession[]): {
 // ── State dot ────────────────────────────────────────────────────────────────
 function StateDot({ state }: { state: string }) {
   let color: string;
-  if (state === 'running' || state === 'queued') color = '#4ade80';
+  if (isWorkingSessionState(state)) color = '#4ade80';
   else if (state === 'idle') color = '#64748b';
   else if (state === 'stopping') color = '#f59e0b';
   else if (state === 'stopped' || state === 'error') color = '#ef4444';
@@ -151,7 +154,7 @@ function SessionNode({
   ].filter(Boolean).join(' ');
 
   return (
-    <button class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
+    <button type="button" class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
       {activeIdleFlashToken ? <IdleFlashLayer key={`tree-idle-${activeIdleFlashToken}`} variant="fill" /> : null}
       {/* Icon: only for sub-sessions (main sessions use the tree toggle arrow) */}
       {isSub && (
@@ -190,23 +193,23 @@ function SessionNode({
 }
 
 // ── Collapse state persistence ────────────────────────────────────────────────
-const LS_COLLAPSED_KEY = 'rcc_tree_collapsed';
-function collapsedStorageKey(serverId?: string | null): string {
-  return serverId ? `${LS_COLLAPSED_KEY}:${serverId}` : LS_COLLAPSED_KEY;
+const LS_EXPANDED_KEY = 'rcc_tree_expanded';
+function expandedStorageKey(serverId?: string | null): string {
+  return serverId ? `${LS_EXPANDED_KEY}:${serverId}` : LS_EXPANDED_KEY;
 }
-function loadCollapsed(serverId?: string | null): Set<string> {
+function loadExpanded(serverId?: string | null): Set<string> {
   try {
-    const scopedRaw = localStorage.getItem(collapsedStorageKey(serverId));
-    if (scopedRaw) return new Set(JSON.parse(scopedRaw));
-    const legacyRaw = localStorage.getItem(LS_COLLAPSED_KEY);
-    return legacyRaw ? new Set(JSON.parse(legacyRaw)) : new Set();
+    const raw = localStorage.getItem(expandedStorageKey(serverId));
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.filter((v): v is string => typeof v === 'string')) : new Set();
   } catch {
     return new Set();
   }
 }
-function saveCollapsed(serverId: string | null | undefined, set: Set<string>) {
+function saveExpanded(serverId: string | null | undefined, set: Set<string>) {
   try {
-    localStorage.setItem(collapsedStorageKey(serverId), JSON.stringify([...set]));
+    localStorage.setItem(expandedStorageKey(serverId), JSON.stringify([...set]));
   } catch { /* ignore */ }
 }
 
@@ -228,7 +231,7 @@ function SessionTreeInner({
   onResizeHeight,
 }: Props) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(serverId));
+  const [expanded, setExpanded] = useState<Set<string>>(() => loadExpanded(serverId));
   // Execution-clone groups default to COLLAPSED; this set tracks the ones the
   // user has explicitly EXPANDED (ephemeral — not persisted across reloads,
   // since clones are short-lived).
@@ -241,18 +244,25 @@ function SessionTreeInner({
   });
 
   useEffect(() => {
-    setCollapsed(loadCollapsed(serverId));
+    setExpanded(loadExpanded(serverId));
   }, [serverId]);
 
-  useEffect(() => {
-    const validNames = new Set(sessions.map((session) => session.name));
-    setCollapsed((prev) => {
-      const next = new Set([...prev].filter((name) => validNames.has(name)));
-      if (next.size === prev.size) return prev;
-      saveCollapsed(serverId, next);
+  useEffect(() => onExecutionCloneGroupReveal(({ ownerSessionName, parentRunId }) => {
+    const groupKey = cloneGroupKey(ownerSessionName, parentRunId);
+    setOpenCloneGroups((prev) => {
+      if (prev.has(groupKey)) return prev;
+      const next = new Set(prev);
+      next.add(groupKey);
       return next;
     });
-  }, [serverId, sessions]);
+    setExpanded((prev) => {
+      if (prev.has(ownerSessionName)) return prev;
+      const next = new Set(prev);
+      next.add(ownerSessionName);
+      saveExpanded(serverId, next);
+      return next;
+    });
+  }), [serverId]);
 
   const toggleCloneGroup = (key: string) => {
     setOpenCloneGroups((prev) => {
@@ -263,26 +273,27 @@ function SessionTreeInner({
   };
 
   const toggleCollapse = (name: string) => {
-    setCollapsed((prev) => {
+    setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name); else next.add(name);
-      saveCollapsed(serverId, next);
+      saveExpanded(serverId, next);
       return next;
     });
   };
 
   const collapseAll = () => {
-    const all = new Set(sessions.map(s => s.name));
-    setCollapsed(all);
-    saveCollapsed(serverId, all);
+    const empty = new Set<string>();
+    setExpanded(empty);
+    saveExpanded(serverId, empty);
   };
 
   const expandAll = () => {
-    setCollapsed(new Set());
-    saveCollapsed(serverId, new Set());
+    const all = new Set(sessions.map(s => s.name));
+    setExpanded(all);
+    saveExpanded(serverId, all);
   };
 
-  const allCollapsed = sessions.length > 0 && sessions.every(s => collapsed.has(s.name));
+  const allCollapsed = sessions.length > 0 && sessions.every(s => !expanded.has(s.name));
   const subSessionsByParent = useMemo(() => {
     const byParent = new Map<string, SubSession[]>();
     const unparented: SubSession[] = [];
@@ -319,6 +330,7 @@ function SessionTreeInner({
       <div class="session-tree-header">
         {hasSubs && (
           <button
+            type="button"
             class="session-tree-collapse-all"
             onClick={allCollapsed ? expandAll : collapseAll}
             title={allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
@@ -327,7 +339,7 @@ function SessionTreeInner({
           </button>
         )}
         {onNewSession && (
-          <button class="session-tree-add-btn" data-onboarding="new-main-session" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
+          <button type="button" class="session-tree-add-btn" data-onboarding="new-main-session" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
         )}
       </div>
 
@@ -350,7 +362,7 @@ function SessionTreeInner({
         // Execution clones never render as flat peers — split them into per-run
         // groups; ordinary sub-sessions still render flat as before.
         const { normalSubs, cloneGroups } = splitChildren(children);
-        const isCollapsed = collapsed.has(session.name);
+        const isCollapsed = !expanded.has(session.name);
 
         // Render a single sub-session node (shared by the flat list and the
         // execution-clone groups).
@@ -382,6 +394,7 @@ function SessionTreeInner({
             <div class="session-tree-main-row">
               {children.length > 0 && (
                 <button
+                  type="button"
                   class="session-tree-toggle"
                   onClick={(e) => { e.stopPropagation(); toggleCollapse(session.name); }}
                   title={isCollapsed ? 'Expand' : 'Collapse'}
@@ -404,6 +417,7 @@ function SessionTreeInner({
               />
               {onNewSubSession && (
                 <button
+                  type="button"
                   class="session-tree-add-sub-btn"
                   onClick={(e) => { e.stopPropagation(); onSelectSession(session.name); onNewSubSession(); }}
                   title={t('session.new_sub', 'New sub-session')}
@@ -425,6 +439,7 @@ function SessionTreeInner({
               return (
                 <div key={groupKey} class="session-tree-clone-group" role="group">
                   <button
+                    type="button"
                     class="session-tree-toggle session-tree-clone-group-toggle"
                     onClick={(e) => { e.stopPropagation(); toggleCloneGroup(groupKey); }}
                     title={isGroupCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
@@ -450,7 +465,8 @@ function SessionTreeInner({
       </div>
       {resizable && (
         <div
-          class="sidebar-pinned-resize-handle"
+          class="sidebar-pinned-resize-handle resize-hover-surface"
+          {...resizeHandleHoverEvents}
           onMouseDown={onResizeMouseDown}
           onTouchStart={onResizeTouchStart}
           aria-hidden="true"

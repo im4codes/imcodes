@@ -1,5 +1,6 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -45,6 +46,43 @@ const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRun
   }),
 }));
 
+const { truncatedTasksReads, blockedTasksReads } = vi.hoisted(() => ({
+  truncatedTasksReads: { pending: 0 },
+  blockedTasksReads: {
+    pending: 0,
+    started: undefined as (() => void) | undefined,
+    wait: undefined as Promise<void> | undefined,
+    release: undefined as (() => void) | undefined,
+  },
+}));
+
+/**
+ * Default pass-through. Armed only by `truncateNextTasksRead()`, so every other
+ * test in this file sees the real filesystem unchanged.
+ *
+ * This reproduces what a real agent does when it checks a task off: a
+ * non-atomic rewrite is briefly observable as an empty file by the
+ * orchestrator's own 20ms poll.
+ */
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === 'string' && path.endsWith('tasks.md') && truncatedTasksReads.pending > 0) {
+        truncatedTasksReads.pending -= 1;
+        return '';
+      }
+      if (typeof path === 'string' && path.endsWith('tasks.md') && blockedTasksReads.pending > 0) {
+        blockedTasksReads.pending -= 1;
+        blockedTasksReads.started?.();
+        await blockedTasksReads.wait;
+      }
+      return (actual.readFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+    },
+  };
+});
+
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
   listSessions: listSessionsMock,
@@ -68,66 +106,163 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 
 import {
   clearOpenSpecAutoDeliverRunsForTests,
+  describeOpenSpecAutoDeliverRunsForTests,
   dropOpenSpecAutoDeliverImplementationMarkerForTests,
+  getOpenSpecAutoDeliverRun,
   getOpenSpecAutoDeliverTransitionTarget,
   handleOpenSpecAutoDeliverDaemonRestartCleanup,
   handleOpenSpecAutoDeliverCommand,
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
 import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, classifyUserMessageOrigin } from '../../shared/chat-message-origin.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
 let projectDir: string;
 let extraTempDirs: string[];
 const execFileAsync = promisify(execFile);
 
+// This suite drives the REAL auto-deliver orchestrator: child-process openspec
+// validation, git init/commit/push, and file I/O. It runs inside the full
+// `test:unit` daemon suite, so on a loaded/contended CI runner an awaited
+// websocket/transport send can legitimately arrive several seconds late — which
+// Full Node 24 CI runs more than 500 daemon test files on the same worker. A
+// saturated event loop can consume most of a 15s wall-clock polling deadline
+// without giving this file enough polling turns, even though the in-process
+// transport send is recorded correctly (the same failing case completes in
+// ~1.5s alone and the complete file passes). Keep the wait bounded, but leave
+// enough headroom for full-suite contention; a genuinely absent send still
+// fails explicitly at the deadline.
+//
+// 30s (bumped from the original 15s above) still wasn't enough headroom: a
+// plain (non-coverage) Node 22 CI run timed out on the 'commit&push' wait in
+// the "audit PASS when opted in" case, which chains several of these waits
+// back to back around real git operations. The suite has only grown since
+// the 15s->30s bump, so the contention this constant exists for has grown
+// with it. 45s, still comfortably short of a hung/genuinely-broken send.
+const SEND_WAIT_MS = 45_000;
+const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
+const BLOCKED_TASKS_READ_START_WAIT_MS = 10_000;
+/**
+ * Floor on how many times a wait actually looks, independent of the clock.
+ *
+ * The budget above is wall-clock, but what decides these waits is how many
+ * times the loop gets to observe. On a saturated worker a `setTimeout(10)` can
+ * return hundreds of milliseconds late, so the loop spends its whole 30s on a
+ * handful of observations and reports a timeout for work that was merely
+ * descheduled — the same case finishes in ~1.5s when run alone. Requiring a
+ * minimum number of looks makes the wait mean "I checked enough times", which
+ * is the actual intent. Costs ~2s extra on a genuinely absent send.
+ */
+const SEND_WAIT_MIN_POLLS = 200;
+
+/** True while either the clock or the observation floor still has budget left. */
+function waitBudgetRemains(start: number, maxMs: number, polls: number): boolean {
+  return Date.now() - start < maxMs || polls < SEND_WAIT_MIN_POLLS;
+}
+vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
+
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
   await mkdir(join(root, 'specs', 'demo'), { recursive: true });
   await writeFile(join(root, 'proposal.md'), '# Proposal\n', 'utf8');
-  await writeFile(join(root, 'tasks.md'), tasks, 'utf8');
+  // tasks.md MUST land atomically. `writeFile` truncates before it writes, and
+  // the orchestrator re-reads this file every 20ms in test mode, so a plain
+  // rewrite is observable as an empty file by a poll that lands inside that
+  // window. `readTaskStatsForRun` retries a THROWN read error but not a
+  // successful read of truncated content -- it reports `total: 0`, which
+  // terminalizes the run as needs_human/tasks_missing_checkboxes. The run is
+  // then over, so every later wait times out no matter how long its budget is.
+  // Measured ~8% truncated reads under contention; rename() is atomic, so a
+  // concurrent poll sees either the old content or the new, never neither.
+  const tasksTmp = join(root, `tasks.md.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  await writeFile(tasksTmp, tasks, 'utf8');
+  await rename(tasksTmp, join(root, 'tasks.md'));
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
-async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = 1000): Promise<Record<string, unknown>> {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
-    if (found) return found;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error('Expected websocket send was not observed');
+function describeOrchestratorActivity(): string {
+  // A bare "not observed" says nothing about what the run did instead, which is
+  // the one thing needed to tell a slow CI worker from a run that branched
+  // somewhere else and is now waiting for an event that will never arrive.
+  const sends = transportSendMock.mock.calls
+    .map((call) => String(call[0] ?? '').replace(/\s+/g, ' ').slice(0, 140))
+    .slice(-5);
+  const projections = serverLinkMock.send.mock.calls
+    .map((call) => call[0] as { type?: string; projection?: { status?: string; stage?: string; lastMessage?: string } })
+    .filter((msg) => !!msg?.projection)
+    .map((msg) => `${msg.type}:${msg.projection?.status ?? '-'}/${msg.projection?.stage ?? '-'}`)
+    .slice(-6);
+  const terminals = serverLinkMock.send.mock.calls
+    .map((call) => call[0] as { type?: string; projection?: { status?: string; terminalReason?: string; evidence?: Array<{ summary?: string }> } })
+    .filter((msg) => msg?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)
+    .slice(-3)
+    .map((msg) => `${msg.projection?.status ?? '-'}:${msg.projection?.terminalReason ?? '-'} evidence=${(msg.projection?.evidence ?? []).map((entry) => entry.summary ?? '').slice(-4).join(' | ')}`);
+  // The stage matters most when nothing was sent at all: the idle handler
+  // matches a run by stage, so "which stage was it in" separates a slow worker
+  // from an edge that matched no branch and was dropped.
+  const runs = describeOpenSpecAutoDeliverRunsForTests()
+    .map((run) => `${run.status}${run.hasActiveCommand ? '' : ' (no active command)'}`
+      + `${run.acceptanceAuditStage ? ` audit=${run.acceptanceAuditStage}` : ''}`
+      + `${run.awaitingDispatch ? ' awaiting-dispatch' : ''}`);
+  return `\nlast transport sends:\n  ${sends.join('\n  ') || '(none)'}`
+    + `\nlast projections: ${projections.join(', ') || '(none)'}`
+    + `\nterminal projections: ${terminals.join(' || ') || '(none)'}`
+    + `\nlive runs: ${runs.join(' | ') || '(none)'}`;
 }
 
-async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = 1000): Promise<string> {
+async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  const find = (): Record<string, unknown> | undefined =>
+    serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected transport send was not observed');
+  const found = find();
+  if (found) return found;
+  throw new Error(`Expected websocket send was not observed${describeOrchestratorActivity()}`);
+}
+
+async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
+  const start = Date.now();
+  const find = (): string | undefined =>
+    transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // The last timer can also resume after the deadline with the send already
+  // recorded, so look once more rather than discard it for crossing the line.
+  const found = find();
+  if (found) return found;
+  throw new Error(`Expected transport send was not observed${describeOrchestratorActivity()}`);
 }
 
 function transportSendCount(predicate: (text: string) => boolean): number {
   return transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).filter(predicate).length;
 }
 
-async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = 1000): Promise<void> {
+async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (transportSendCount(predicate) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected transport send count was not observed');
+  if (transportSendCount(predicate) >= count) return;
+  throw new Error(`Expected transport send count was not observed${describeOrchestratorActivity()}`);
 }
 
-async function waitForP2pStartCount(count: number, maxMs = 2500): Promise<void> {
+async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (startP2pRunMock.mock.calls.length >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (startP2pRunMock.mock.calls.length >= count) return;
   throw new Error(`expected >= ${count} P2P starts, saw ${startP2pRunMock.mock.calls.length}`);
 }
 
@@ -137,7 +272,7 @@ function implementationReminderCount(): number {
     .length;
 }
 
-async function waitForImplementationReminderCount(n: number, maxMs = 2500): Promise<void> {
+async function waitForImplementationReminderCount(n: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (implementationReminderCount() >= n) return;
@@ -159,6 +294,44 @@ async function writeLatestImplementationMarker(overrides: Record<string, unknown
   await mkdir(dirname(markerPath), { recursive: true });
   await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
   return true;
+}
+
+function truncateNextTasksRead(count = 1): void {
+  truncatedTasksReads.pending = count;
+}
+
+function blockNextTasksRead(): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let releaseRead!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const wait = new Promise<void>((resolve) => { releaseRead = resolve; });
+  blockedTasksReads.pending = 1;
+  blockedTasksReads.started = markStarted;
+  blockedTasksReads.wait = wait;
+  blockedTasksReads.release = releaseRead;
+  return { started, release: releaseRead };
+}
+
+async function waitForBlockedTasksReadStart(started: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    started,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error(
+        `openspec_auto_deliver_test_tasks_read_gate_not_reached${describeOrchestratorActivity()}`,
+      )), BLOCKED_TASKS_READ_START_WAIT_MS);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
+function resetBlockedTasksRead(): void {
+  blockedTasksReads.release?.();
+  blockedTasksReads.pending = 0;
+  blockedTasksReads.started = undefined;
+  blockedTasksReads.wait = undefined;
+  blockedTasksReads.release = undefined;
 }
 
 async function emitDeckDemoIdle(): Promise<void> {
@@ -273,7 +446,8 @@ function expectAuthoritativeResultSchemaHints(text: string): void {
   expect(text).toContain('Each evidence entry requires fields: source, summary; optional fields: command, exitCode');
   expect(text).toContain('Final acceptance audits must include repair_completion with fields');
   expect(text).toContain('evidence.source is informational only');
-  expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
+  expect(text).toContain('PASS must leave required_changes empty');
+  expect(text).toContain('PASS may leave the external / deployment-only / authorization-gated / explicitly-deferred tasks unchecked');
 }
 
 function expectFinalAcceptanceScoringDiscipline(text: string): void {
@@ -294,7 +468,11 @@ function expectFinalAcceptanceScoringDiscipline(text: string): void {
   // Anti-gaming guards retained on the other side.
   expect(text).toContain('do not exceed the repair scorecard full-score conditions, and do not restore points for claims you could not verify');
   expect(text).toContain('Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete');
-  expect(text).toContain('If any previous finding remains unresolved or only unverified, verdict must be REWORK');
+  expect(text).toContain('If any previous finding remains unresolved or only unverified');
+  expect(text).toContain('fixable or verifiable IN THIS REPOSITORY');
+  // Accepted external/deferred gates must not tank scores or force REWORK.
+  expect(text).toContain('are accepted deferrals, NOT defects');
+  expect(text).toContain('A run whose only remaining gaps are these accepted external gates should PASS');
   expect(text).toContain('Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS');
 }
 
@@ -380,12 +558,12 @@ async function startFinalAcceptanceAuditPrompt(requestId: string): Promise<strin
   await waitForTransportSend((text) =>
     text.includes('Audit findings to repair now:')
     && text.includes('Reason: implementation_audit_followup_repair'),
-    2500,
+    SEND_WAIT_MS,
   );
   await emitDeckDemoIdle();
   return waitForTransportSend((text) =>
     text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-    2500,
+    SEND_WAIT_MS,
   );
 }
 
@@ -393,12 +571,12 @@ async function completeSpecAuditDiscussionToImplementation(): Promise<void> {
   await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair the OpenSpec artifacts before implementation.');
   await waitForTransportSend((text) =>
     text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-    2500,
+    SEND_WAIT_MS,
   );
   await emitDeckDemoIdle();
   const specAcceptancePrompt = await waitForTransportSend((text) =>
     text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-    2500,
+    SEND_WAIT_MS,
   );
   await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
   await emitDeckDemoIdle();
@@ -417,13 +595,17 @@ async function startFastImplementationAudit(requestId: string): Promise<MockP2pR
   await waitForSend((msg) =>
     msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
     && msg.projection?.stage === 'implementation_audit_repair',
-    2500,
+    SEND_WAIT_MS,
   );
   return [...p2pRuns.values()].at(-1)!;
 }
 
 describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   beforeEach(async () => {
+    // Disarm the tasks.md read seam. A test that arms more truncations than it
+    // consumes would otherwise leak them into every later test in this file.
+    truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     extraTempDirs = [];
     await makeChange('demo-change');
@@ -439,10 +621,13 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     startP2pRunMock.mockImplementation(async (opts: { launchOrigin?: unknown; userText?: string; initiatorSession?: string; locale?: string }) => {
       const id = `p2p-${p2pRuns.size + 1}`;
       const contextFilePath = join(projectDir, '.imc', 'discussions', `${id}.md`);
+      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText, locale: opts.locale };
+      // Register synchronously, matching the real P2P lifecycle. If teardown
+      // clears the registry while the mocked filesystem work is pending, the
+      // old run must not be inserted into the next test after that clear.
+      p2pRuns.set(id, run);
       await mkdir(join(projectDir, '.imc', 'discussions'), { recursive: true });
       await writeFile(contextFilePath, '# mocked p2p\n', 'utf8');
-      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText, locale: opts.locale };
-      p2pRuns.set(id, run);
       return run;
     });
     getTransportRuntimeMock.mockReset();
@@ -452,7 +637,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
     ensureTransportRuntimeForPendingResendMock.mockClear();
     clearAllResend();
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
       projectName: 'demo',
@@ -479,7 +664,9 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   afterEach(async () => {
-    clearOpenSpecAutoDeliverRunsForTests();
+    truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
+    await clearOpenSpecAutoDeliverRunsForTests();
     clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
     await Promise.all(extraTempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
@@ -514,6 +701,34 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
     expect(startP2pRunMock).not.toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_demo_brain',
+    }));
+  });
+
+  it('launches the selected valid custom Team combo through the audit stage', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-custom-combo',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+      selectedTeamComboId: 'audit>plan',
+    }, serverLinkMock as never);
+
+    const ack = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    expect(ack.projection.selectedTeamComboId).toBe('audit>plan');
+    expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      modeOverride: 'audit>plan',
+      rounds: 1,
+      targets: [
+        { session: 'deck_sub_peer', mode: 'audit>plan' },
+        { session: 'deck_sub_worker', mode: 'audit>plan' },
+      ],
+      launchOrigin: expect.objectContaining({
+        autoDeliver: expect.objectContaining({
+          selectedTeamComboId: 'audit>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
+        }),
+      }),
     }));
   });
 
@@ -597,7 +812,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     const audit = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
     const p2pRun = [...p2pRuns.values()].at(-1)!;
     expect(audit.projection.materializedLimits.implementationAuditRepairRounds).toBe(1);
@@ -648,6 +863,9 @@ exec "${realGit}" "$@"
       expect(transportSendMock).toHaveBeenCalledWith(
         expect.stringContaining('OpenSpec Auto Deliver context for @openspec/changes/demo-change'),
         expect.stringContaining(':implementation:'),
+        undefined,
+        undefined,
+        { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM },
       );
     } finally {
       process.env.PATH = oldPath;
@@ -667,6 +885,12 @@ exec "${realGit}" "$@"
     getTransportRuntimeMock.mockImplementation(() => ({
       send: sendDuringIdleMock,
       settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+      }),
     }));
 
     await handleOpenSpecAutoDeliverCommand({
@@ -680,11 +904,171 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop',
-      2500,
+      SEND_WAIT_MS,
     );
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(sendDuringIdleMock).toHaveBeenCalledTimes(1);
     expect(String(sendDuringIdleMock.mock.calls[0]?.[0] ?? '')).toContain('Implementation prompt: 1/');
+  });
+
+  it('preempts a busy no-tool transport turn before sending an Auto Deliver prompt', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const settleBeforeSend = vi.fn(() => true);
+    const sendAfterSettle = vi.fn((text: string, commandId?: string) => {
+      transportSendMock(text, commandId);
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendAfterSettle,
+      settleActiveDispatchFromExternalCompletion: settleBeforeSend,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+        activeToolCount: 0,
+      }),
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-pre-send-control-preempts-busy-no-tool-turn',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    expect(settleBeforeSend).toHaveBeenCalledWith('openspec-auto-deliver-pre-send:implementation_task_loop');
+    expect(sendAfterSettle).toHaveBeenCalledTimes(1);
+    expect(settleBeforeSend.mock.invocationCallOrder[0]).toBeLessThan(sendAfterSettle.mock.invocationCallOrder[0]);
+    expect(String(sendAfterSettle.mock.calls[0]?.[0] ?? '')).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change');
+  });
+
+  it('stamps a sent Auto Deliver prompt as a system message, not the human input', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const timelineSpy = vi.spyOn(timelineEmitter, 'emit');
+    try {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-origin-stamp',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      await waitForSend((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        && msg.projection?.stage === 'implementation_task_loop',
+        SEND_WAIT_MS,
+      );
+      const commandId = String(transportSendMock.mock.calls.at(-1)?.[1] ?? '');
+      const promptEvent = timelineSpy.mock.calls.find(([session, type, payload]) =>
+        session === 'deck_demo_brain' && type === 'user.message'
+        && (payload as Record<string, unknown>).commandId === commandId);
+      expect(promptEvent?.[2]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
+      expect(classifyUserMessageOrigin(promptEvent?.[2] as Record<string, unknown>)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+    } finally {
+      timelineSpy.mockRestore();
+    }
+  });
+
+  it('does not preempt a busy transport turn while an active tool is running', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const settleBeforeSend = vi.fn(() => true);
+    const sendWithoutSettle = vi.fn((text: string, commandId?: string) => {
+      transportSendMock(text, commandId);
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendWithoutSettle,
+      settleActiveDispatchFromExternalCompletion: settleBeforeSend,
+      getDiagnosticSnapshot: () => ({
+        status: 'tool_running',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+        activeToolCount: 1,
+      }),
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-pre-send-control-preserves-active-tool',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    expect(settleBeforeSend).not.toHaveBeenCalled();
+    expect(sendWithoutSettle).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues a marker reminder and stale recovery when implementation stays busy without writing the marker', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let queuedReminder = false;
+    const cancelStaleActiveTurnWithPending = vi.fn(() => false);
+    const sendMock = vi.fn((text: string, commandId?: string) => {
+      if (text.includes('OpenSpec Auto Deliver implementation is not complete yet')) {
+        queuedReminder = true;
+        return 'queued' as const;
+      }
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: queuedReminder ? 1 : 0,
+        activeDispatchCount: 1,
+      }),
+      get pendingEntries() {
+        return queuedReminder
+          ? [{ clientMessageId: 'queued-marker', text: 'marker reminder' }]
+          : [];
+      },
+      cancelStaleActiveTurnWithPending,
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-busy-missing-marker-requeues',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    const reminderStart = Date.now();
+    while (sendMock.mock.calls.length < 2 && Date.now() - reminderStart < SEND_WAIT_MS) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(String(sendMock.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
+
+    // Not a one-second wall-clock cap: on a saturated runner the work is merely descheduled (see SEND_WAIT_MIN_POLLS above).
+    await vi.waitFor(() => expect(cancelStaleActiveTurnWithPending.mock.calls.length).toBeGreaterThan(0), { timeout: SEND_WAIT_MS, interval: 10 });
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'openspec-auto-deliver-implementation_task_loop',
+      staleMs: 40,
+    }));
   });
 
   it('keeps queued Auto Deliver prompts out of the committed timeline until transport drain', async () => {
@@ -702,7 +1086,15 @@ exec "${realGit}" "$@"
       pendingVersion: 0,
       send: vi.fn((text: string, commandId?: string) => {
         const clientMessageId = commandId ?? `queued-${queuedRuntime.pendingVersion + 1}`;
+        const committed = getTransportQueueStore().enqueue({
+          sessionName: 'deck_demo_brain',
+          clientMessageId,
+          commandId: clientMessageId,
+          text,
+          now: Date.now(),
+        });
         queuedRuntime.pendingVersion += 1;
+        queuedRuntime.pendingVersion = Math.max(queuedRuntime.pendingVersion, committed.pendingMessageVersion);
         queuedRuntime.pendingEntries = [{ clientMessageId, text }];
         return 'queued' as const;
       }),
@@ -723,11 +1115,13 @@ exec "${realGit}" "$@"
       await waitForSend((msg) =>
         msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
         && msg.projection?.stage === 'implementation_task_loop',
-        2500,
+        SEND_WAIT_MS,
       );
       expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
       const commandId = String(queuedRuntime.send.mock.calls[0]?.[1] ?? '');
       expect(commandId).toContain(':implementation:');
+      // The queued copy carries the daemon origin, so its drain row renders left.
+      expect(queuedRuntime.send.mock.calls[0]?.[4]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
       expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
         session === 'deck_demo_brain'
         && type === 'user.message'
@@ -736,13 +1130,23 @@ exec "${realGit}" "$@"
           || (payload as Record<string, unknown>).clientMessageId === commandId
         )
       )).toBe(false);
-      expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
+      const queuedStateCall = timelineSpy.mock.calls.find(([session, type, payload]) =>
         session === 'deck_demo_brain'
         && type === 'session.state'
         && (payload as Record<string, unknown>).state === 'queued'
         && typeof (payload as Record<string, unknown>).pendingMessageVersion === 'number'
         && Array.isArray((payload as Record<string, unknown>).pendingMessageEntries)
-      )).toBe(true);
+      );
+      expect(queuedStateCall).toBeTruthy();
+      const queuedPayload = queuedStateCall?.[2] as Record<string, unknown>;
+      expect(queuedPayload.pendingMessageEntries).toEqual([
+        expect.objectContaining({ clientMessageId: commandId }),
+      ]);
+      expect(queuedPayload.pendingMessageVersion).toBe(
+        getTransportQueueStore().readSnapshot('deck_demo_brain').pendingMessageVersion,
+      );
+      expect(queuedPayload.pendingMessages).toBeUndefined();
+      expect(queuedPayload.pendingCount).toBe(1);
 
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await new Promise((resolve) => setTimeout(resolve, 60));
@@ -753,15 +1157,71 @@ exec "${realGit}" "$@"
         clientMessageId: commandId,
       });
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-      const start = Date.now();
-      while (queuedRuntime.send.mock.calls.length < 2 && Date.now() - start < 1000) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      await vi.waitFor(() => expect(queuedRuntime.send.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: SEND_WAIT_MS, interval: 10 });
       expect(queuedRuntime.send).toHaveBeenCalledTimes(2);
       expect(String(queuedRuntime.send.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
     } finally {
       timelineSpy.mockRestore();
     }
+  });
+
+  it('forces a marker reminder when idle arrives after a queued implementation prompt loses its dispatch echo', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let queuedRuntime: {
+      providerSessionId: string;
+      pendingEntries: Array<{ clientMessageId: string; text: string }>;
+      send: ReturnType<typeof vi.fn>;
+      settleActiveDispatchFromExternalCompletion: ReturnType<typeof vi.fn>;
+    };
+    queuedRuntime = {
+      providerSessionId: 'provider-demo',
+      pendingEntries: [],
+      send: vi.fn((text: string, commandId?: string) => {
+        queuedRuntime.pendingEntries = [{ clientMessageId: commandId ?? 'queued-command', text }];
+        return 'queued' as const;
+      }),
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    };
+    getTransportRuntimeMock.mockImplementation(() => queuedRuntime);
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-idle-missing-marker-after-lost-echo',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const projection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
+    const run = getOpenSpecAutoDeliverRun(String(projection.projection?.runId ?? ''));
+    expect(run?.activeCommandId).toContain(':implementation:');
+    expect(run?.activeImplementationPromptAwaitingDispatch).toBe(true);
+
+    // Simulate the transport/runtime having drained or dropped the queued prompt
+    // without the timeline user.message echo that normally clears the awaiting
+    // dispatch flag. A real idle after this point must not require manual
+    // `continue`; it should force the marker reminder path.
+    queuedRuntime.pendingEntries = [];
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const start = Date.now();
+    while (queuedRuntime.send.mock.calls.length < 2 && Date.now() - start < SEND_WAIT_MS) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (queuedRuntime.send.mock.calls.length < 2) {
+      throw new Error(`marker reminder missing; awaiting=${String(run?.activeImplementationPromptAwaitingDispatch)} active=${String(run?.activeCommandId)} last=${String(run?.latestMessage)} sends=${queuedRuntime.send.mock.calls.length}`);
+    }
+    expect(queuedRuntime.send).toHaveBeenCalledTimes(2);
+    const markerReminder = String(queuedRuntime.send.mock.calls[1]?.[0] ?? '');
+    expect(markerReminder).toContain('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.');
+    expect(markerReminder).toContain('Reason: implementation_marker_missing');
+    expect(markerReminder).toContain('Implementation completion marker (required):');
+    expect(markerReminder).toContain('write this exact JSON marker to:');
   });
 
   it('records only final implementation assistant text as evidence before the audit prompt', async () => {
@@ -785,7 +1245,7 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
 
     const audit = [...p2pRuns.values()].at(-1)!;
@@ -878,7 +1338,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
       && msg.projection?.activeP2pRunId === 'p2p-1',
-      2500,
+      SEND_WAIT_MS,
     );
     const runId = activeAudit.projection.runId;
 
@@ -905,7 +1365,7 @@ exec "${realGit}" "$@"
     const continueAck = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.CONTINUE_ACK
       && msg.requestId === 'continue-1',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(continueAck.ok).toBe(true);
     expect(continueAck.projection.status).toBe('spec_audit_repair');
@@ -916,12 +1376,12 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
       && msg.projection?.activeP2pRunId === 'p2p-2',
-      2500,
+      SEND_WAIT_MS,
     );
     expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
-  it('keeps one implementation prompt active until tasks.md is fully checked', async () => {
+  it('keeps one implementation prompt active while tasks remain unchecked and no completed marker exists', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-loop',
@@ -934,13 +1394,24 @@ exec "${realGit}" "$@"
       text.includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     );
     expect(firstImplementationPrompt).toContain('Break the work into concrete sub-tasks');
+    expect(firstImplementationPrompt).toContain(SSH_TARGET_ROUTING_GUIDANCE);
+    expect(firstImplementationPrompt.split(SSH_TARGET_ROUTING_GUIDANCE)).toHaveLength(2);
     expect(firstImplementationPrompt).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change.');
     expect(firstImplementationPrompt).toContain(`Project root: ${projectDir}`);
     expect(firstImplementationPrompt).toContain(`Change root: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);
     expect(firstImplementationPrompt).toContain('Before inspecting, editing, validating, or committing anything, work from the project root above.');
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
+    expect(firstImplementationPrompt).toContain('Use all applicable testing tools and device environments in scope for this request');
+    expect(firstImplementationPrompt).toContain('explicitly supplied by the user in the current request');
+    expect(firstImplementationPrompt).toContain('do not ask for a second authorization');
+    expect(firstImplementationPrompt).toContain('When the user has not specified a target');
+    expect(firstImplementationPrompt).toContain('requires confirmation of the precise scope');
+    expect(firstImplementationPrompt).toContain('focused unit, integration, end-to-end, and real-device checks');
+    expect(firstImplementationPrompt).toContain('accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount');
+    expect(firstImplementationPrompt).toContain('MUST write the completed marker with the matching skippableTaskCount');
+    expect(firstImplementationPrompt).toContain('Do NOT write a failed marker for those tasks');
 
-    await emitDeckDemoIdle();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const reminderPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
       && text.includes('Reason: implementation_tasks_still_unchecked'),
@@ -1007,7 +1478,7 @@ exec "${realGit}" "$@"
       && text.includes(`Audit discussion file: ${discussion.contextFilePath}`)
       && text.includes('Reason: implementation_audit_followup_repair')
       && text.includes('This repair pass is required even when the implementation audit passed'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(repairPrompt).toContain('dispatch sub-agents with clear ownership');
@@ -1020,7 +1491,7 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
       && text.includes(`Previous audit discussion file: ${discussion.contextFilePath}`)
       && !text.includes('quick verification'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(acceptancePrompt).not.toContain('Changed files:');
     expect(acceptancePrompt).not.toContain('Diff stat:');
@@ -1029,7 +1500,14 @@ exec "${realGit}" "$@"
     expect(acceptancePrompt).toContain('cap implementation and risk at 7 and cap tests at 6');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
+    // A hardcoded 8000ms budget here (versus the SEND_WAIT_MS used by every
+    // other wait in this file) is exactly the class of flake CI hit: under
+    // full-suite/coverage load the terminal send can land after 8s even
+    // though it is genuinely on its way. Use the same generous budget.
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -1047,7 +1525,7 @@ exec "${realGit}" "$@"
     const implementationPrompt = await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(implementationPrompt).toContain('After you have completed implementation, tasks.md updates, and reasonable validation');
 
@@ -1058,11 +1536,12 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_marker_missing')
       && text.includes('finish the required code, test, and tasks.md work')
       && text.includes('Write the completed marker only after the implementation is genuinely finished and validated'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
-    expect(reminderPrompt).toContain('Run the appropriate validation for the files you touched.');
+    expect(reminderPrompt).toContain('Use all applicable testing tools and device environments in scope for this request');
+    expect(reminderPrompt).toContain('explicitly supplied by the user in the current request');
     expect(startP2pRunMock).not.toHaveBeenCalled();
 
     expect(await writeLatestImplementationMarker()).toBe(true);
@@ -1072,8 +1551,145 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
-  it('advances implementation from a valid completion marker without waiting for idle', async () => {
+  it('survives a single truncated tasks.md read instead of terminalizing a live run', async () => {
+    // An agent checking a task off rewrites tasks.md non-atomically, so the
+    // orchestrator's own 20ms poll can read it empty. `readTaskStatsForRun`
+    // retried a THROWN read error but not a successful read of truncated
+    // content: that returned `total: 0`, which terminalizes the run as
+    // needs_human/tasks_missing_checkboxes and ends it for good.
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-truncated-tasks-read',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
+    truncateNextTasksRead();
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForP2pStartCount(1);
+    const terminalized = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as { projection?: { status?: string; lastMessage?: string } })
+      .some((msg) => msg?.projection?.lastMessage === 'tasks_missing_checkboxes');
+    expect(terminalized).toBe(false);
+  });
+
+  it('still terminalizes when tasks.md stays empty past the read retry budget', async () => {
+    // The transient-read allowance must not become a blanket exemption: a
+    // tasks.md that is genuinely emptied still has to stop the run.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-persistently-empty-tasks',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
+    truncateNextTasksRead(50);
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) => (
+      (msg as { projection?: { lastMessage?: string } }).projection?.lastMessage === 'tasks_missing_checkboxes'
+    ), SEND_WAIT_MS);
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+  });
+
+  it('quiesces an in-flight implementation advance before resetting test fixtures', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-quiesce-implementation-advance',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+    // Arm the read gate before publishing the marker. The background 20ms
+    // marker poll and the explicit idle edge both consume that marker; arming
+    // after the write lets the poll win under CI contention, after which the
+    // idle edge no longer reads tasks.md and `gate.started` can never settle.
+    const gate = blockNextTasksRead();
+    let reset: Promise<void> | undefined;
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
+
+      let resetFinished = false;
+      reset = clearOpenSpecAutoDeliverRunsForTests().then(() => {
+        resetFinished = true;
+      });
+      // Give an incorrectly untracked reset a full event-loop turn to resolve.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const finishedBeforeAdvance = resetFinished;
+
+      gate.release();
+      await reset;
+      reset = undefined;
+      await waitForP2pStartCount(1);
+
+      expect(finishedBeforeAdvance).toBe(false);
+      expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
+    } finally {
+      // Never leave a deferred filesystem read parked when an assertion or
+      // diagnostic wait fails; otherwise afterEach would itself deadlock.
+      gate.release();
+      if (reset) await reset;
+    }
+  });
+
+  it('fails a stuck test-reset drain with a bounded, explicit error', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-bounded-reset-drain',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
+    const gate = blockNextTasksRead();
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
+      await expect(clearOpenSpecAutoDeliverRunsForTests({ drainTimeoutMs: 25 }))
+        .rejects.toThrow('openspec_auto_deliver_test_reset_drain_timeout');
+    } finally {
+      gate.release();
+    }
+    await clearOpenSpecAutoDeliverRunsForTests();
+  });
+
+  it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {
+    await makeChange('demo-change', '- [x] first\n- [ ] production deploy requires user authorization\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-marker-advances-without-idle',
@@ -1085,20 +1701,23 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
-    expect(await writeLatestImplementationMarker()).toBe(true);
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
 
     await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
     expect(transportSettleExternalMock).toHaveBeenCalledWith('openspec-auto-deliver-implementation-marker-completed');
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Reason: implementation_tasks_still_unchecked'),
+    )).toBe(false);
   });
 
-  it('continues implementation when the agent reports an incomplete failed marker', async () => {
-    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+  it('rejects a completed marker when unchecked tasks exceed its declared skip allowance', async () => {
+    await makeChange('demo-change', '- [x] first\n- [ ] external deploy\n- [ ] pending implementation\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-failed-implementation-marker-continues',
+      requestId: 'req-marker-skip-allowance-too-small',
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'fast',
@@ -1107,7 +1726,32 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
+    );
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+
+    const reminder = await waitForTransportSend((text) =>
+      text.includes('Reason: implementation_tasks_exceed_marker_skip_allowance:unchecked=2:allowed=1'),
+      SEND_WAIT_MS,
+    );
+    expect(reminder).toContain('A completed marker cannot bypass more unchecked tasks than it explicitly declares.');
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes as needs_human instead of re-prompting when the agent reports a failed marker', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-failed-implementation-marker-terminalizes',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
     );
 
     expect(await writeLatestImplementationMarker({
@@ -1116,27 +1760,17 @@ exec "${realGit}" "$@"
     })).toBe(true);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
-    const reminderPrompt = await waitForTransportSend((text) =>
-      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
-      && text.includes('Reason: implementation_marker_failed:remaining repair checklist gaps')
-      && text.includes('incomplete checklist work means continue implementing, not stop'),
-      2500,
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'needs_human'
+      && msg.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
+      SEND_WAIT_MS,
     );
-    expect(reminderPrompt).toContain('finish the required code, test, and tasks.md work');
-    expect(serverLinkMock.send.mock.calls.some((call) =>
-      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
-      && call[0]?.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
+    expect(terminal.projection.status).toBe('needs_human');
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Reason: implementation_marker_failed:remaining repair checklist gaps'),
     )).toBe(false);
-
-    expect(await writeLatestImplementationMarker()).toBe(true);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
-    );
-    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
   it('dispatches final acceptance scoring instead of stopping early when implementation prompt budget is spent', async () => {
@@ -1158,20 +1792,20 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('Implementation prompt: 1/1'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
 
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair before final scoring.');
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
       && text.includes('Previous audit discussion file:'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(transportSendMock.mock.calls.some((call) =>
       String(call[0] ?? '').includes('Audit findings to repair now:')
@@ -1185,7 +1819,11 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -1203,13 +1841,13 @@ exec "${realGit}" "$@"
     const launchAck = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
       && msg.requestId === 'req-missing-implementation-marker-contract',
-      2500,
+      SEND_WAIT_MS,
     );
     const runId = String(launchAck.projection.runId);
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     expect(dropOpenSpecAutoDeliverImplementationMarkerForTests(runId)).toBe(true);
@@ -1220,7 +1858,7 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_marker_contract_missing')
       && text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(reminderPrompt).not.toContain('Implementation completion marker: unavailable.');
     expect(serverLinkMock.send.mock.calls.some((call) =>
@@ -1234,7 +1872,7 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
@@ -1256,7 +1894,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     // Each idle without a marker (and without task progress) sends one reminder,
@@ -1267,12 +1905,59 @@ exec "${realGit}" "$@"
     }
 
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'needs_human',
+      SEND_WAIT_MS,
+    );
     expect(terminal?.projection.status).toBe('needs_human');
     expect(String((terminal?.projection as { terminalReason?: string })?.terminalReason ?? ''))
       .toContain('implementation_marker_reminders_exhausted');
     // No extra reminder beyond the cap was sent.
     expect(implementationReminderCount()).toBe(OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS);
+  });
+
+  it('does not exhaust the marker reminder cap while a slow session has not answered the implementation prompt yet', async () => {
+    // Regression (CI-only flake): the marker poll re-checked every poll interval
+    // and, once the first grace window had passed, nudged on EVERY poll. With
+    // tasks already fully checked there is no task progress left to reset the
+    // reminder counter, so a session that was merely slow to answer (a loaded
+    // CI worker) had the whole capped ladder spent on it within a few hundred
+    // milliseconds and the run terminalized as needs_human before it had said
+    // anything. Poll-driven nudges must cost a real quiet window each.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const launchAck = await (async () => {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-implementation-marker-poll-grace',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      return serverLinkMock.send.mock.calls
+        .map((call) => call[0])
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    })();
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Stall far longer than the entire poll-driven ladder used to survive, but
+    // without ever going idle: the run must still be waiting in implementation.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const run = getOpenSpecAutoDeliverRun(String(launchAck?.projection?.runId ?? ''));
+    expect(run?.status).toBe('implementation_task_loop');
+
+    // The late answer must still be accepted and advance the run.
+    await emitDeckDemoIdle();
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      SEND_WAIT_MS,
+    );
   });
 
   it('throttles bursty idle reminders to the minimum interval', async () => {
@@ -1290,7 +1975,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):')
       && text.includes('write this exact JSON marker to:'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     // First idle -> first reminder (no prior reminder, nothing to throttle).
@@ -1311,16 +1996,39 @@ exec "${realGit}" "$@"
     expect(implementationReminderCount()).toBe(2);
   });
 
-  it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
+  /**
+   * The implementation session's runtime as the orchestrator sees it once the
+   * 'commit&push' prompt has been handed over: busy (a turn is in flight) until
+   * the test says that turn is over. The default mock reports an idle runtime
+   * forever, which is not what a real runtime does after a send, and it is what
+   * let a stale idle edge be mistaken for the end of the commit&push turn.
+   */
+  function useRuntimeThatIsBusyWhileCommitPushTurnRuns(): { finishCommitPushTurn: () => void } {
+    let commitPushTurnInFlight = false;
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: (text: string, ...rest: unknown[]) => {
+        const result = (transportSendMock as unknown as (...args: unknown[]) => unknown)(text, ...rest);
+        if (text === 'commit&push') commitPushTurnInFlight = true;
+        return result;
+      },
+      get sending() { return commitPushTurnInFlight; },
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
+    return { finishCommitPushTurn: () => { commitPushTurnInFlight = false; } };
+  }
+
+  /** Drives an opted-in run up to the moment the daemon hands 'commit&push' to the implementation LLM. */
+  async function driveRunToCommitPushPrompt(requestId: string): Promise<{ remoteDir: string; finishCommitPushTurn: () => void }> {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await writeFile(join(projectDir, '.gitignore'), '.imc/\n', 'utf8');
     const remoteDir = await initializeGitWithRemote();
     await mkdir(join(projectDir, 'src'), { recursive: true });
     await writeFile(join(projectDir, 'src', 'preexisting.ts'), 'export const preexisting = true;\n', 'utf8');
+    const { finishCommitPushTurn } = useRuntimeThatIsBusyWhileCommitPushTurnRuns();
 
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-auto-commit',
+      requestId,
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'fast',
@@ -1332,32 +2040,54 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
 
     await completeLatestDiscussion();
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
       repairs_applied: [{ files: ['src/feature.ts'], reason: 'Implemented the product change.' }],
     });
+    // The acceptance audit turn's own idle edge. The daemon also polls for the
+    // audit result file, so it can dispatch 'commit&push' BEFORE or AFTER this
+    // edge is delivered -- on a slow runner the poll wins. Either order must
+    // reach the same state; the runtime mock above keeps the later-arriving edge
+    // from being taken for the end of the commit&push turn.
     await emitDeckDemoIdle();
-    const prompt = await waitForTransportSend((text) => text === 'commit&push', 2500);
+    const prompt = await waitForTransportSend((text) => text === 'commit&push', SEND_WAIT_MS);
     expect(prompt).toBe('commit&push');
-    const commitMessage = 'Implement delivered feature';
+    return { remoteDir, finishCommitPushTurn };
+  }
+
+  const commitFeature = async (message: string): Promise<void> => {
     await git(['add', '--', 'src/feature.ts']);
-    await git(['commit', '-m', commitMessage]);
+    await git(['commit', '-m', message]);
     await git(['push']);
+  };
+
+  it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
+    const { remoteDir, finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit');
+    const commitMessage = 'Implement delivered feature';
+    await commitFeature(commitMessage);
+    // The commit&push turn is over: only now does its idle edge mean "verify".
+    finishCommitPushTurn();
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
+    // verifyAutoCommitPushCompleted spawns several sequential real `git`
+    // subprocesses (rev-parse, diff, rev-list, log) before the terminal send,
+    // so wait for the send itself rather than assuming how long that takes.
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
 
@@ -1369,7 +2099,40 @@ exec "${realGit}" "$@"
       maxBuffer: 1024 * 1024,
     });
     expect(remoteLog.stdout?.toString?.() ?? '').toContain(commitMessage);
-  }, 15_000);
+  }, 60_000);
+
+  it('does not verify commit&push on an idle edge that arrives while the commit&push turn is still running', async () => {
+    const { finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit-stale-idle');
+    // Stale / duplicate idle edges (the acceptance turn's, a reconnect replay)
+    // while the implementation LLM is still working must not be taken for its
+    // completion: nothing is committed yet, so verifying now would wrongly end
+    // the run as incomplete.
+    await emitDeckDemoIdle();
+    await emitDeckDemoIdle();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(serverLinkMock.send.mock.calls.some((call) => (call[0] as { type?: string })?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+    expect(describeOpenSpecAutoDeliverRunsForTests().map((run) => run.status)).toEqual(['commit_push']);
+
+    await commitFeature('Implement delivered feature');
+    finishCommitPushTurn();
+    await emitDeckDemoIdle();
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.status).toBe('passed');
+  }, 60_000);
+
+  it('ends the run as needs_human when the commit&push turn finishes without committing the product files', async () => {
+    const { finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit-not-committed');
+    finishCommitPushTurn();
+    await emitDeckDemoIdle();
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'needs_human',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.terminalReason).toBe('auto_commit_push_incomplete:src/feature.ts');
+  }, 60_000);
 
   it('runs the Standard preset from spec audit through implementation audit PASS', async () => {
     await handleOpenSpecAutoDeliverCommand({
@@ -1386,13 +2149,13 @@ exec "${realGit}" "$@"
     const specRepairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
       && text.includes(`Spec audit discussion file: ${specDiscussion.contextFilePath}`),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(specRepairPrompt).toContain(formatOpenSpecPromptTemplate('audit_spec', '@openspec/changes/demo-change'));
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
     await emitDeckDemoIdle();
@@ -1400,7 +2163,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (msg.projection as { stage?: string; implementationPromptCount?: number }).stage === 'implementation_task_loop'
       && (msg.projection as { implementationPromptCount?: number }).implementationPromptCount === 1,
-      2500,
+      SEND_WAIT_MS,
     );
     expect(implementationPromptProjection.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
@@ -1413,7 +2176,7 @@ exec "${realGit}" "$@"
       text.includes('Audit findings to repair now:')
       && text.includes(`Audit discussion file: ${discussion.contextFilePath}`)
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(repairPrompt).toContain('dispatch sub-agents with clear ownership');
@@ -1423,12 +2186,16 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
     expect(terminal?.projection.auditBeforeRepair).toBeUndefined();
@@ -1516,6 +2283,35 @@ exec "${realGit}" "$@"
     expect(projection?.projection.activeP2pRunId).toBe('p2p-1');
   });
 
+  it('advances spec repair to final acceptance when the repair idle event is missed', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-repair-idle-miss',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'spec_audit_repair',
+      SEND_WAIT_MS,
+    );
+    const discussion = await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
+      && text.includes(`Spec audit discussion file: ${discussion.contextFilePath}`),
+      SEND_WAIT_MS,
+    );
+    expect(repairPrompt).toContain('Repair only the OpenSpec artifacts under this change');
+
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
+      SEND_WAIT_MS,
+    );
+    expect(acceptancePrompt).toContain('Write exactly one raw JSON object to the authoritative result file path above.');
+  });
+
   it('builds Team audit prompts from canonical OpenSpec templates and final acceptance prompts with authoritative metadata', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -1545,12 +2341,12 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(specAcceptancePrompt).toContain(`Authoritative result file:`);
     expect(specAcceptancePrompt).toContain('Required top-level fields:');
@@ -1578,13 +2374,13 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop',
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
 
     const implementationRun = [...p2pRuns.values()].at(-1)!;
@@ -1606,12 +2402,12 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const implementationAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     expectFinalAcceptanceScoringDiscipline(implementationAcceptancePrompt);
     expectTeamRepairScorecardLocation(implementationAcceptancePrompt, implementationRun.contextFilePath);
@@ -1654,12 +2450,12 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const failingAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await makeChange('demo-change', '- [ ] first\n- [x] second\n');
     await completeAcceptanceAuditFromPrompt(failingAcceptancePrompt);
@@ -1669,13 +2465,13 @@ exec "${realGit}" "$@"
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: audit_pass_with_unchecked_tasks')
       && text.includes('Do not write another audit report. Edit the product code, tests, and tasks.md now'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Previous implementation audit verdict: PASS');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && String(msg.projection?.lastMessage ?? '').includes('audit_pass_with_unchecked_tasks'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.implementationPromptCount).toBe(3);
@@ -1690,13 +2486,24 @@ exec "${realGit}" "$@"
       && text.includes('Previous audit verdict: PASS')
       && text.includes('final implementation acceptance audit')
       && !text.includes('quick verification'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect([...p2pRuns.values()]).toHaveLength(1);
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    const failedTerminal = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+        && msg.projection?.status === 'failed',
+      );
+    expect(failedTerminal).toBeUndefined();
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
@@ -1719,12 +2526,12 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nClarify acceptance criteria before final scoring.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       verdict: 'REWORK',
@@ -1743,14 +2550,14 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
       && text.includes('Reason: spec_audit_rework_requires_repair')
       && text.includes('clarify acceptance criteria'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Must-fix items flagged by the previous spec audit');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
       && String(msg.projection?.lastMessage ?? '').includes('spec_audit_rework_requires_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(gate.projection.latestVerdict).toBe('REWORK');
     expect(gate.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
@@ -1778,7 +2585,7 @@ exec "${realGit}" "$@"
     // The first repair prompt has no prior acceptance audit result yet → no must-fix list.
     const firstRepairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(firstRepairPrompt).not.toContain('Must-fix items flagged by the previous spec audit');
     expect(firstRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
@@ -1786,7 +2593,7 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     const flaggedChange = 'design.md:281 — remove the BigInt-vs-cap either/or and the owner-decision marker';
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
@@ -1808,12 +2615,12 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
       && String(msg.projection?.lastMessage ?? '').includes('spec_audit_rework_requires_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     const secondRepairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
       && text.includes('Must-fix items flagged by the previous spec audit'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(secondRepairPrompt).toContain(`- ${flaggedChange}`);
     expect(secondRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
@@ -1835,12 +2642,12 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair the artifact checklist before final scoring.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       verdict: 'REWORK',
@@ -1853,7 +2660,7 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
 
     const start = Date.now();
-    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+    while (Date.now() - start < SEND_WAIT_MS && [...p2pRuns.values()].length < 2) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect([...p2pRuns.values()]).toHaveLength(2);
@@ -1861,7 +2668,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
       && msg.projection?.specAuditRepairRound === 2,
-      2500,
+      SEND_WAIT_MS,
     );
     expect(projection.projection.specAuditRepairRound).toBe(2);
     expect(projection.projection.specAuditRound).toEqual({ current: 1, total: 2 });
@@ -1882,7 +2689,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
@@ -1909,12 +2716,12 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
@@ -1929,7 +2736,7 @@ exec "${realGit}" "$@"
     const implementationProjection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(implementationProjection.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
@@ -1953,12 +2760,12 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nScope remains externally blocked.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       verdict: 'BLOCKED',
@@ -1966,7 +2773,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('spec_audit_blocked');
     expect(terminal?.projection.latestVerdict).toBe('BLOCKED');
@@ -1994,7 +2801,7 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair')
       && text.includes('Audit discussion file:')
       && text.includes('Do not write another audit report'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('This repair pass is required even when the implementation audit passed');
     expect(repairPrompt).toContain(`Audit discussion file: ${firstAuditRun.contextFilePath}`);
@@ -2005,7 +2812,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop'
       && String(msg.projection?.lastMessage ?? '').includes('implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.latestVerdict).toBeUndefined();
@@ -2024,7 +2831,7 @@ exec "${realGit}" "$@"
       && text.includes('Previous audit discussion file:')
       && text.includes('Previous audit required_changes to verify:')
       && !text.includes('quick verification'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect([...p2pRuns.values()]).toHaveLength(1);
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
@@ -2032,7 +2839,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(terminal?.projection.auditBeforeRepair).toBeUndefined();
@@ -2064,13 +2871,13 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair')
       && text.includes('Audit discussion file:')
       && text.includes('Do not write another audit report'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('This repair pass is required even when the implementation audit passed');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && String(msg.projection?.lastMessage ?? '').includes('implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.implementationPromptCount).toBe(2);
@@ -2086,13 +2893,13 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
       && text.includes('Previous audit discussion file:')
       && !text.includes('quick verification'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect([...p2pRuns.values()]).toHaveLength(1);
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
@@ -2108,10 +2915,11 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(await writeLatestImplementationMarker()).toBe(true);
     transportSendMock.mockClear();
+    serverLinkMock.send.mockClear();
     getTransportRuntimeMock.mockImplementation(() => ({
       providerSessionId: null,
       send: transportSendMock,
@@ -2124,7 +2932,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair'
       && msg.projection?.lastMessage === 'post_repair_acceptance_audit_dispatched',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(projection.projection.status).toBe('implementation_audit_repair');
     expect(projection.projection.terminal).not.toBe(true);
@@ -2156,7 +2964,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(await writeLatestImplementationMarker()).toBe(true);
     transportSendMock.mockClear();
@@ -2199,13 +3007,11 @@ exec "${realGit}" "$@"
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
 
-    const start = Date.now();
-    while (cancelStaleActiveTurnWithPending.mock.calls.length === 0 && Date.now() - start < 1000) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // Not a one-second wall-clock cap: on a saturated runner the work is merely descheduled (see SEND_WAIT_MIN_POLLS above).
+    await vi.waitFor(() => expect(cancelStaleActiveTurnWithPending.mock.calls.length).toBeGreaterThan(0), { timeout: SEND_WAIT_MS, interval: 10 });
 
     expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
       reason: 'openspec-auto-deliver-implementation_audit_repair',
@@ -2229,7 +3035,7 @@ exec "${realGit}" "$@"
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && msg.projection?.status === 'passed',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(getResendEntries('deck_demo_brain')).toEqual([]);
@@ -2256,12 +3062,12 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
+      SEND_WAIT_MS,
     );
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair implementation before final scoring.');
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await mkdir(join(projectDir, 'src'), { recursive: true });
     await writeFile(join(projectDir, 'src', 'new-feature.ts'), 'export const added = true;\n', 'utf8');
@@ -2274,7 +3080,7 @@ exec "${realGit}" "$@"
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && msg.projection?.status === 'passed',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(transportSendCount((text) =>
@@ -2316,7 +3122,7 @@ exec "${realGit}" "$@"
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && msg.projection?.status === 'passed',
-      2500,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(removePendingMessage).toHaveBeenCalledWith(`${runId}:implementation:stale`);
@@ -2350,14 +3156,14 @@ exec "${realGit}" "$@"
       && text.includes('Reason: quality_gate_low_score:tasks=5,tests=5,risk=5')
       && text.includes(unresolved)
       && text.includes('Do not write another audit report. Edit the product code, tests, and tasks.md now'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
     expect(repairPrompt).toContain('Must-fix items flagged by the previous implementation audit');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && String(msg.projection?.lastMessage ?? '').includes('quality_gate_low_score:tasks=5,tests=5,risk=5'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.implementationPromptCount).toBe(3);
@@ -2369,10 +3175,159 @@ exec "${realGit}" "$@"
       text !== acceptancePrompt
       && text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
       && text.includes(unresolved),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(nextAcceptancePrompt).toContain('Previous audit verdict: REWORK');
     expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('continues implementation repair on fixable work even when external blocked_items are also listed', async () => {
+    // Regression: status="incomplete" (locally-fixable gaps) plus a non-empty
+    // blocked_items list (external deploy/CI/hardware) must NOT hard-stop as
+    // needs_human:repair_completion_blocked — the fixable work still earns a
+    // repair round; the external blockers are only surfaced to the human.
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-incomplete-with-external-blockers');
+    const unresolved = 'test/staging.test.ts:42 — add durable-step fault-injection coverage';
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: [unresolved],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: [unresolved],
+        blocked_items: [
+          '9.3 authorized commit/push/CI/production release',
+          '13.13 native Linux/Windows build + device evidence',
+        ],
+        summary: 'A locally-testable fault-injection gap remains; external release/hardware items are blocked.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tasks' || module === 'tests' || module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    // It dispatches another implementation repair round for the fixable gap...
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes(unresolved)
+      && text.includes('Do not write another audit report. Edit the product code, tests, and tasks.md now'),
+      SEND_WAIT_MS,
+    );
+    expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
+    // ...and lands in the implementation loop rather than terminalizing to human.
+    const gate = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && String(msg.projection?.lastMessage ?? '').includes('quality_gate_low_score:tasks=5,tests=5,risk=5'),
+      SEND_WAIT_MS,
+    );
+    expect(gate.projection.status).toBe('implementation_task_loop');
+    expect(String(gate.projection.lastMessage ?? '')).not.toContain('repair_completion_blocked');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('hands off to a human only when no fixable work remains and external blockers persist', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-truly-blocked');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['authorized production release still pending'],
+      repair_completion: repairCompletion({
+        status: 'blocked',
+        previous_items_complete: true,
+        completed_items: ['all in-repo repair items verified'],
+        incomplete_items: [],
+        blocked_items: ['9.3 authorized commit/push/CI/production release'],
+        summary: 'All in-repo repairs are complete; only an authorized external release remains.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tasks' || module === 'tests' || module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(String(terminal?.projection.terminalReason ?? '')).toContain('repair_completion_blocked');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('does not let an in-flight idle advance send into the next test after test cleanup', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-cleanup-in-flight-idle');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['authorized production release still pending'],
+      repair_completion: repairCompletion({
+        status: 'blocked',
+        previous_items_complete: true,
+        completed_items: ['all in-repo repair items verified'],
+        incomplete_items: [],
+        blocked_items: ['9.3 authorized commit/push/CI/production release'],
+        summary: 'All in-repo repairs are complete; only an authorized external release remains.',
+      }),
+    });
+
+    await emitDeckDemoIdle();
+    await clearOpenSpecAutoDeliverRunsForTests();
+    await rm(projectDir, { recursive: true, force: true });
+    serverLinkMock.send.mockClear();
+
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(serverLinkMock.send.mock.calls).toEqual([]);
+  });
+
+  it('delivers (passed) when the only unchecked tasks are accepted external/deferred gates', async () => {
+    // One in-repo task done + one external release gate deliberately left
+    // unchecked and declared skippable. External verification must not block
+    // delivery: the run should PASS with the external gate surfaced as an open
+    // follow-up (still unchecked, never auto-closed), not re-blocked at final
+    // acceptance as audit_pass_with_unchecked_tasks.
+    await makeChange('demo-change', '- [x] wire the feature end to end\n- [ ] production deploy requires user authorization\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-external-deferral-delivers',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    // Complete implementation with the one external task declared skippable.
+    await waitForTransportSend((text) => text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair', SEND_WAIT_MS);
+    await completeLatestDiscussion();
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'), SEND_WAIT_MS);
+
+    // Post-repair completion — external task still unchecked, still skippable=1
+    // (must NOT reset the accepted allowance to 0).
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'), SEND_WAIT_MS);
+
+    // PASS with the external task NOT reported as unchecked (accepted deferral).
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, { verdict: 'PASS', unchecked_tasks: [], required_changes: [] });
+    await emitDeckDemoIdle();
+
+    // Same hardcoded-8000ms-vs-SEND_WAIT_MS class as the other two terminal
+    // waits in this file; align it so this one doesn't flake the same way.
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', SEND_WAIT_MS);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('starts another Team implementation audit only after final acceptance says previous repairs are complete but still low scoring', async () => {
@@ -2394,7 +3349,7 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
 
     const start = Date.now();
-    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+    while (Date.now() - start < SEND_WAIT_MS && [...p2pRuns.values()].length < 2) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect([...p2pRuns.values()]).toHaveLength(2);
@@ -2402,7 +3357,7 @@ exec "${realGit}" "$@"
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair'
       && msg.projection?.implementationAuditRepairRound === 2,
-      2500,
+      SEND_WAIT_MS,
     );
     expect(projection.projection.implementationAuditRepairRound).toBe(2);
     expect(projection.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
@@ -2419,7 +3374,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).not.toContain('invalid_authoritative_result_path');
@@ -2432,7 +3387,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Do not perform a new audit. Only correct the authoritative JSON file');
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
@@ -2442,7 +3397,7 @@ exec "${realGit}" "$@"
       && msg.projection?.stage === 'implementation_audit_repair'
       && msg.projection?.implementationAuditRepairRound === 1
       && msg.projection?.lastMessage === 'post_repair_result_file_repair_prompt_dispatched',
-      2500,
+      SEND_WAIT_MS,
     );
 
     expect([...p2pRuns.values()]).toHaveLength(1);
@@ -2452,7 +3407,7 @@ exec "${realGit}" "$@"
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2464,7 +3419,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     const unresolved = 'test/live-context-ingestion.test.ts — prove retry-buffer ordering after schema-only JSON repair';
@@ -2491,10 +3446,51 @@ exec "${realGit}" "$@"
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: quality_gate_low_score:tests=5')
       && text.includes(unresolved),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
     expect(transportSendCount((text) => text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file'))).toBe(1);
+  });
+
+  it('consumes a valid final acceptance result file even while the transport runtime still reports busy', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-valid-result-file-while-runtime-busy');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+      }),
+    }));
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('consumes one final acceptance result only once when duplicate idle events race', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-duplicate-final-acceptance-idle');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.auditResults).toHaveLength(1);
+    expect(serverLinkMock.send.mock.calls.filter(([msg]) =>
+      (msg as Record<string, unknown>).type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL,
+    )).toHaveLength(1);
   });
 
   it('requests authoritative result file repair for verdict payload format errors', async () => {
@@ -2509,7 +3505,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: invalid_evidence_summary'),
-      2500,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');
@@ -2522,7 +3518,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2538,7 +3534,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_repair_completion'),
-      2500,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Final acceptance audits must include repair_completion with fields');
@@ -2549,7 +3545,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2567,19 +3563,19 @@ exec "${realGit}" "$@"
     await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final specification acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain('The top-level auto_deliver object must exactly equal this metadata object');
     expectAuthoritativeResultSchemaHints(repairPrompt);
@@ -2599,7 +3595,7 @@ exec "${realGit}" "$@"
 
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
     await completeSpecAuditDiscussionToImplementation();
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', SEND_WAIT_MS);
     await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
@@ -2607,19 +3603,19 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
-    const firstRepairPrompt = await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    const firstRepairPrompt = await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), SEND_WAIT_MS);
     const origin = parseAutoDeliverMetadataBlock(firstRepairPrompt);
     expect(firstRepairPrompt).toContain('Repair prompt attempt: 1/');
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     const secondRepairPrompt = transportSendMock.mock.calls
       .map((call) => String(call[0] ?? ''))
       .filter((text) => text.includes('Problem: missing_authoritative_json'))
@@ -2635,7 +3631,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2673,7 +3669,7 @@ exec "${realGit}" "$@"
       pendingMessageEntries: [],
       pendingMessageVersion: 1,
     });
-    const repairPrompt = await waitForTransportSend(missingPrompt, 2500);
+    const repairPrompt = await waitForTransportSend(missingPrompt, SEND_WAIT_MS);
     expect(repairPrompt).toContain('Repair prompt attempt: 1/');
 
     runtimeStatus = 'thinking';
@@ -2696,7 +3692,7 @@ exec "${realGit}" "$@"
       pendingMessageVersion: 2,
     });
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2709,7 +3705,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('implementation_audit_blocked');
     expect(terminal?.projection.latestVerdict).toBe('BLOCKED');
@@ -2731,7 +3727,10 @@ exec "${realGit}" "$@"
       },
     });
     await emitDeckDemoIdle();
-    let terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    let terminal = await waitForSend((msg) => (
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && (msg.projection as { terminalReason?: unknown } | undefined)?.terminalReason === 'audit_metadata_mismatch'
+    ), SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_metadata_mismatch');
     expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
@@ -2748,26 +3747,26 @@ exec "${realGit}" "$@"
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStale);
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStale);
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
     const missingPrompt = await startFinalAcceptanceAuditPrompt('req-multiple-json');
     const missingOrigin = parseAutoDeliverMetadataBlock(missingPrompt);
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), SEND_WAIT_MS);
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
     await writeFile(String(missingOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
       auto_deliver: missingOrigin,
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
@@ -2775,18 +3774,22 @@ exec "${realGit}" "$@"
     const malformedOrigin = parseAutoDeliverMetadataBlock(malformedPrompt);
     await writeFile(String(malformedOrigin.authoritativeResultPath), '{not json', 'utf8');
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), 2500);
+    await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), SEND_WAIT_MS);
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: malformed_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: malformed_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
     await writeFile(String(malformedOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
       auto_deliver: malformedOrigin,
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
-  }, 10_000);
+    // This test chains multiple SEND_WAIT_MS-budgeted waits plus a fixed
+    // settle sleep; a 10_000ms outer test timeout is narrower than a single
+    // one of those internal waits, let alone several in sequence. Match the
+    // generous outer budget used for the other real-verification test below.
+  }, 60_000);
 
   it('rejects authoritative result files that symlink outside .imc/discussions', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-result-symlink-escape');
@@ -2801,7 +3804,7 @@ exec "${realGit}" "$@"
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && msg.projection?.terminalReason === 'invalid_authoritative_result_path',
-    2500);
+    SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
@@ -2829,16 +3832,16 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
@@ -2858,10 +3861,10 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) =>
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && call[0]?.projection?.status === 'needs_human',
@@ -2871,7 +3874,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2894,7 +3897,7 @@ exec "${realGit}" "$@"
     await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
   });
 
@@ -2914,7 +3917,7 @@ exec "${realGit}" "$@"
     p2pRun.error = 'dispatch_failed: tmux send-keys failed: can\'t find pane: deck_demo_brain';
     await completeLatestAudit('failed');
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_p2p_failed');
     expect(terminal?.projection.evidence?.some((entry: { summary?: string }) => entry.summary?.includes('dispatch_failed'))).toBe(true);
@@ -2949,7 +3952,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     // And it does NOT hard-fail the delivery as audit_p2p_failed.
@@ -2982,7 +3985,7 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
 
     const auditP2pFailedTerminal = serverLinkMock.send.mock.calls
@@ -3151,12 +4154,12 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
-    await emitDeckDemoIdle();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
     const reminderPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
       && text.includes('Reason: implementation_tasks_still_unchecked'),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
@@ -3344,7 +4347,7 @@ exec "${realGit}" "$@"
       && msg.projection?.status === 'stopped'
       && msg.projection?.terminalReason === 'user_stopped'
       && msg.projection?.evidence?.some((entry: { summary?: string }) => entry.summary?.includes(expectedDiagnostic)),
-      2500,
+      SEND_WAIT_MS,
     );
     expect(diagnosticProjection.projection.generation).toBe(ack.projection.generation + 1);
     expect(diagnosticProjection.projection.terminalReason).toBe('user_stopped');
@@ -3379,16 +4382,16 @@ exec "${realGit}" "$@"
     await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
       && text.includes('Reason: implementation_audit_followup_repair'),
-      2500,
+      SEND_WAIT_MS,
     );
     await emitSessionIdle('deck_sub_worker');
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
-      2500,
+      SEND_WAIT_MS,
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitSessionIdle('deck_sub_worker');
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
     await handleOpenSpecAutoDeliverCommand({

@@ -7,19 +7,21 @@ describe('context-model-config', () => {
     vi.unstubAllEnvs();
   });
 
-  it('uses runtime config overrides ahead of defaults', () => {
+  it('preserves explicit manual codex-sdk models while coercing deprecated spark and auto mode to gpt-6-luna', () => {
     setContextModelRuntimeConfig({
+      modelSelectionMode: 'manual',
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
-      backupContextBackend: 'claude-code-sdk',
-      backupContextModel: 'haiku',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
     });
     expect(getContextModelConfig()).toEqual({
+      modelSelectionMode: 'manual',
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
       primaryContextPreset: undefined,
-      backupContextBackend: 'claude-code-sdk',
-      backupContextModel: 'haiku',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -30,30 +32,50 @@ describe('context-model-config', () => {
       },
       enablePersonalMemorySync: true,
     });
+
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.3-codex-spark',
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
+    });
+    expect(getContextModelConfig().primaryContextModel).toBe('gpt-6-luna');
+
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'auto',
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'gpt-5.6',
+    });
+    expect(getContextModelConfig().primaryContextModel).toBe('gpt-6-luna');
+    expect(getContextModelConfig().backupContextModel).toBe('gpt-6-luna');
   });
 
   it('does not let env vars override the synced runtime config', () => {
     vi.stubEnv('IMCODES_PRIMARY_CONTEXT_MODEL', 'env-model');
     setContextModelRuntimeConfig({
-      primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.4-mini',
+      primaryContextBackend: 'agy-sdk',
+      primaryContextModel: 'gemini-3.8-flash-low',
     });
-    expect(getContextModelConfig().primaryContextModel).toBe('gpt-5.4-mini');
-    expect(getContextModelConfig().primaryContextBackend).toBe('codex-sdk');
+    expect(getContextModelConfig().primaryContextModel).toBe('gemini-3.8-flash-low');
+    expect(getContextModelConfig().primaryContextBackend).toBe('agy-sdk');
   });
 
   it('fills the backup model from the selected backup backend when runtime config omits it', () => {
     setContextModelRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
-      backupContextBackend: 'qwen',
+      backupContextBackend: 'agy-sdk',
     });
     expect(getContextModelConfig()).toEqual({
+      modelSelectionMode: 'manual',
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       primaryContextPreset: undefined,
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen3-coder-plus',
+      backupContextBackend: 'agy-sdk',
+      backupContextModel: 'gemini-3.8-flash-low',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -64,6 +86,16 @@ describe('context-model-config', () => {
       },
       enablePersonalMemorySync: true,
     });
+  });
+
+  it('preserves explicit manual modelSelectionMode', () => {
+    setContextModelRuntimeConfig({
+      modelSelectionMode: 'manual',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'opus[1M]',
+    });
+    expect(getContextModelConfig().modelSelectionMode).toBe('manual');
+    expect(getContextModelConfig().primaryContextModel).toBe('opus[1M]');
   });
 
   it('keeps the synced personal memory cloud-sync flag', () => {
@@ -103,16 +135,17 @@ describe('context-model-config', () => {
     });
   });
 
-  it('keeps the synced qwen presets for primary and backup processing paths', () => {
+  it('keeps synced presets for primary and backup processing paths', () => {
     setContextModelRuntimeConfig({
-      primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen3-coder-plus',
-      primaryContextPreset: 'Qwen Team',
-      backupContextBackend: 'qwen',
-      backupContextModel: 'qwen3-coder-plus',
-      backupContextPreset: 'Qwen Backup',
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'haiku',
+      primaryContextPreset: 'Claude Team',
+      backupContextBackend: 'codex-sdk',
+      backupContextModel: 'MiniMax-M2.7',
+      backupContextPreset: 'Codex Backup',
     });
-    expect(getContextModelConfig().primaryContextPreset).toBe('Qwen Team');
-    expect(getContextModelConfig().backupContextPreset).toBe('Qwen Backup');
+    expect(getContextModelConfig().primaryContextPreset).toBe('Claude Team');
+    expect(getContextModelConfig().backupContextPreset).toBe('Codex Backup');
+    expect(getContextModelConfig().backupContextModel).toBe('MiniMax-M2.7');
   });
 });

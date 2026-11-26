@@ -7,38 +7,120 @@
  *
  * Heavy hljs/marked imports are mocked to prevent OOM in jsdom.
  */
+import { MINIMAL_DOCX_MIME, MINIMAL_DOCX_TEXT, buildMinimalDocx } from '../fixtures/minimal-docx.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const filePreviewPropsState = vi.hoisted(() => ({
+  current: null as null | {
+    content: string;
+    path: string;
+    allowedRootPath?: string;
+    onPathClick?: (path: string) => void;
+    onImagePreview?: (path: string) => Promise<{ dataUrl: string; alt?: string } | string>;
+  },
+}));
+
+const fileEditorPropsState = vi.hoisted(() => ({
+  toolbar: null as null | Record<string, unknown>,
+  content: null as null | Record<string, unknown>,
+}));
+
+const directFileTransferMocks = vi.hoisted(() => ({
+  FILE_DOWNLOAD_TRANSPORT_MODE: {
+    CONNECTING: 'connecting', DIRECT: 'direct', FALLING_BACK: 'falling_back', HTTP: 'http', BROWSER: 'browser',
+  },
+  downloadPreviewWithDirectFallback: vi.fn().mockResolvedValue(undefined),
+  prewarmDirectFileLease: vi.fn(() => undefined),
+  selectPreviewDownloadDestination: vi.fn().mockResolvedValue(null),
+  isDirectFileTransferStaleHandleError: vi.fn(() => false),
+  isFileUploadCanceled: vi.fn(() => false),
+}));
 
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
 // Vitest still resolves the module graph for dependency analysis — this mock
 // ensures the heavy module is replaced before evaluation.
 vi.mock('../../src/components/FileEditor.js', () => ({
-  FileEditor: () => null,
-  FileEditorContent: () => null,
+  FileEditor: (props: Record<string, unknown>) => {
+    fileEditorPropsState.toolbar = props;
+    return <div data-testid="mock-file-editor-toolbar" data-path={String(props.path ?? '')} />;
+  },
+  FileEditorContent: (props: Record<string, unknown>) => {
+    fileEditorPropsState.content = props;
+    return (
+      <div
+        data-testid="mock-file-editor-content"
+        data-path={String(props.path ?? '')}
+        data-mtime={String(props.mtime ?? '')}
+      >
+        {String(props.currentContent ?? props.content ?? '')}
+      </div>
+    );
+  },
 }));
 // Mock the lazy wrapper that imports FileEditor.
 vi.mock('../../src/components/file-editor-lazy.js', () => ({
-  FileEditor: () => null,
-  FileEditorContent: () => null,
+  FileEditor: (props: Record<string, unknown>) => {
+    fileEditorPropsState.toolbar = props;
+    return <div data-testid="mock-file-editor-toolbar" data-path={String(props.path ?? '')} />;
+  },
+  FileEditorContent: (props: Record<string, unknown>) => {
+    fileEditorPropsState.content = props;
+    return (
+      <div
+        data-testid="mock-file-editor-content"
+        data-path={String(props.path ?? '')}
+        data-mtime={String(props.mtime ?? '')}
+      >
+        {String(props.currentContent ?? props.content ?? '')}
+      </div>
+    );
+  },
 }));
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  default: (props: { content: string }) => <div data-testid="mock-file-preview">{props.content}</div>,
+  default: (props: NonNullable<typeof filePreviewPropsState.current>) => {
+    filePreviewPropsState.current = props;
+    return <div data-testid="mock-file-preview">{props.content}</div>;
+  },
 }));
 
-import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
+
+import { FileBrowser, CHANGES_RENDER_BATCH_SIZE, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import {
+  clearFileBrowserCache,
+  FILE_BROWSER_CACHE_MAX_ENTRIES,
+  getFileBrowserCache,
+  makeFileBrowserCacheKey,
+  setFileBrowserCache,
+} from '../../src/file-browser-cache.js';
+import { NodeGroupsNavContext } from '../../src/components/node-groups-nav.js';
+import * as api from '../../src/api.js';
+import { resolvePreviewPath } from '../../src/components/ChatView.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
+import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
+import {
+  __resetDownloadTransfersForTests,
+  getDownloadTransfers,
+  retryDownloadTransfer,
+} from '../../src/download-transfer-store.js';
 
 // Cleanup DOM/timers after each test
 afterEach(() => {
+  __resetDownloadTransfersForTests();
+  __resetFileBrowserSharedChangesForTests();
+  clearFileBrowserCache();
   vi.useRealTimers();
   cleanup();
 });
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
+const fileBrowserI18n = vi.hoisted(() => ({ freshTCalls: 0 }));
 vi.mock('react-i18next', () => {
   // t must be reference-stable — a new function ref each render causes
   // fetchPreview to be recreated, triggering infinite re-renders via
@@ -51,6 +133,9 @@ vi.mock('react-i18next', () => {
     'file_browser.show_hidden': 'Hidden',
     'file_browser.this_pc': 'This PC',
     'file_browser.home': 'Home',
+    'file_browser.desktop': 'Desktop',
+    'file_browser.downloads': 'Downloads',
+    'file_browser.documents': 'Documents',
     'file_browser.timeout': 'Request timed out',
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
@@ -70,6 +155,10 @@ vi.mock('react-i18next', () => {
     'chat.new_folder': 'New folder',
     'chat.new_folder_name': 'Folder name',
     'chat.create': 'Create',
+    'file_browser.refresh_changes': 'Refresh changes',
+    'file_browser.refreshing_changes': 'Refreshing changes…',
+    'file_browser.refresh_changes_success': 'Changes refreshed',
+    'file_browser.refresh_changes_failed': 'Refresh failed',
   };
   const t = (key: string, opts?: Record<string, unknown>) => {
     if (key === 'file_browser.insert') return `Insert ${opts?.count ?? 0}`;
@@ -77,7 +166,13 @@ vi.mock('react-i18next', () => {
     return map[key] ?? key;
   };
   const translation = { t };
-  return { useTranslation: () => translation };
+  return { useTranslation: () => {
+    if (fileBrowserI18n.freshTCalls > 0) {
+      fileBrowserI18n.freshTCalls -= 1;
+      return { t: (key: string, opts?: Record<string, unknown>) => t(key, opts) };
+    }
+    return translation;
+  } };
 });
 
 // ── WsClient factory ──────────────────────────────────────────────────────
@@ -161,8 +256,555 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockResolvedValue(undefined);
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValue(undefined);
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockReturnValue(false);
+    filePreviewPropsState.current = null;
+    fileBrowserI18n.freshTCalls = 0;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
+    __resetDownloadTransfersForTests();
+  });
+
+  it('prewarms only after a File Browser with a target daemon opens, and releases on close', () => {
+    const { ws } = makeWsFactory();
+    const release = vi.fn();
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValueOnce(release);
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    expect(directFileTransferMocks.prewarmDirectFileLease).toHaveBeenCalledWith(ws, 'srv-1');
+    view.unmount();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('does not create an inert direct-file lease without a selected daemon', () => {
+    const { ws } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    expect(directFileTransferMocks.prewarmDirectFileLease).not.toHaveBeenCalled();
+  });
+
+  it('reports embedded navigation and selection while the host owns the primary action', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onCurrentPathChange = vi.fn();
+    const onSelectedPathChange = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        hideFooter
+        hideBreadcrumbConfirm
+        onCurrentPathChange={onCurrentPathChange}
+        onSelectedPathChange={onSelectedPathChange}
+        onPreviewFile={() => {}}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(onCurrentPathChange).toHaveBeenCalledWith('/home/user');
+    act(() => respond([{ name: 'report.txt', isDir: false }], '/home/user'));
+    fireEvent.click(await view.findByText('report.txt'));
+    expect(onSelectedPathChange).toHaveBeenCalledWith('/home/user/report.txt', false);
+    expect(view.queryByRole('button', { name: 'Select' })).toBeNull();
+  });
+
+  it('starts preview download only from the clicked preview handle', async () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledWith(expect.objectContaining({
+      ws,
+      serverId: 'srv-1',
+      previewHandle: 'preview-handle',
+      suggestedName: 'report.pdf',
+      sessionName: 'deck_project_brain',
+      destination: null,
+    })));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.pdf');
+  });
+
+  it('guards against duplicate save picker dialogs while selectPreviewDownloadDestination is already open, then allows a subsequent download', async () => {
+    const { ws } = makeWsFactory();
+    let resolvePicker!: (dest: { handle: { createWritable: ReturnType<typeof vi.fn> } } | null) => void;
+    directFileTransferMocks.selectPreviewDownloadDestination
+      .mockImplementationOnce(() => new Promise((res) => { resolvePicker = res; }))
+      .mockResolvedValueOnce(null);
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const downloadBtn = view.getByRole('button', { name: 'upload.download_file' });
+    fireEvent.click(downloadBtn);
+    fireEvent.click(downloadBtn);
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(1);
+
+    resolvePicker(null);
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+
+    // After first picker finishes, clicking download for a subsequent file invokes the picker normally
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/next.pdf', content: 'preview 2', downloadId: 'preview-handle-2' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(2));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenNthCalledWith(2, 'next.pdf');
+  });
+
+  it('holds the re-entry guard through older-Electron download handoff after selectPreviewDownloadDestination resolves null, then unlocks', async () => {
+    const prevBridge = (window as unknown as { __IMCODES_PC_APP__?: unknown }).__IMCODES_PC_APP__;
+    (window as unknown as { __IMCODES_PC_APP__?: unknown }).__IMCODES_PC_APP__ = { isElectron: true };
+    try {
+      const { ws } = makeWsFactory();
+      let resolveFirstHandoff!: () => void;
+      directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
+      directFileTransferMocks.downloadPreviewWithDirectFallback
+        .mockImplementationOnce(() => new Promise<void>((res) => { resolveFirstHandoff = res; }))
+        .mockResolvedValueOnce(undefined);
+
+      const view = render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/home/user"
+          serverId="srv-1"
+          sessionName="deck_project_brain"
+          initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      const downloadBtn = view.getByRole('button', { name: 'upload.download_file' });
+      fireEvent.click(downloadBtn);
+      await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+      expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(1);
+
+      // Second click in a later tick while async handle/anchor handoff is still running must be ignored
+      await act(async () => {
+        await Promise.resolve();
+        fireEvent.click(downloadBtn);
+      });
+      expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(1);
+      expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1);
+
+      // Finish the first handoff; subsequent clicks unlock normally
+      await act(async () => {
+        resolveFirstHandoff();
+      });
+      await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(downloadBtn);
+      await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2));
+      expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(2);
+    } finally {
+      if (prevBridge === undefined) {
+        delete (window as unknown as { __IMCODES_PC_APP__?: unknown }).__IMCODES_PC_APP__;
+      } else {
+        (window as unknown as { __IMCODES_PC_APP__?: unknown }).__IMCODES_PC_APP__ = prevBridge;
+      }
+    }
+  });
+
+  it('does not let an earlier download finally clear another call’s active save picker lock', async () => {
+    const { ws } = makeWsFactory();
+    let resolveTransferA!: () => void;
+    let resolvePickerB!: (dest: { handle: { createWritable: ReturnType<typeof vi.fn> } } | null) => void;
+    directFileTransferMocks.selectPreviewDownloadDestination
+      .mockResolvedValueOnce({ handle: { createWritable: vi.fn() } })
+      .mockImplementationOnce(() => new Promise((res) => { resolvePickerB = res; }))
+      .mockResolvedValueOnce(null);
+    directFileTransferMocks.downloadPreviewWithDirectFallback
+      .mockImplementationOnce(() => new Promise<void>((res) => { resolveTransferA = res; }))
+      .mockResolvedValue(undefined);
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/a.txt', content: 'a', downloadId: 'handle-a' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    // 1. Start download A; picker resolves immediately and A's transfer remains pending
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+
+    // 2. Switch to file B while A is still transferring and open B's picker
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/b.txt', content: 'b', downloadId: 'handle-b' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(2));
+
+    // 3. Download A finishes while B's picker is still open: A's finally must NOT clear B's lock
+    await act(async () => {
+      resolveTransferA();
+    });
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination.mock.calls.map((c) => c[0])).toEqual(['a.txt', 'b.txt']);
+
+    // 4. Finish B's picker, then verify a subsequent file C can open its picker normally
+    await act(async () => {
+      resolvePickerB(null);
+    });
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2));
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/c.txt', content: 'c', downloadId: 'handle-c' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledTimes(3));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination.mock.calls.map((c) => c[0])).toEqual(['a.txt', 'b.txt', 'c.txt']);
+  });
+
+  it('keeps preview action buttons in a dedicated responsive container', () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/report.txt', content: 'preview' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const actions = view.container.querySelector('.fb-preview-actions');
+    expect(actions).not.toBeNull();
+    expect(actions?.querySelectorAll('.fb-diff-toggle').length).toBeGreaterThan(0);
+    expect(actions?.querySelector('.fb-close')).toBeNull();
+  });
+
+  it.each([320, 375, 390])('keeps preview actions usable at %dpx narrow widths', (width) => {
+    const styles = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
+    const narrowStyles = styles.slice(styles.indexOf('@media (max-width: 640px)'));
+    expect(narrowStyles).toContain('.fb-preview-header { flex-wrap: wrap;');
+    expect(narrowStyles).toContain('.fb-preview-actions { order: 3; flex: 1 1 100%; width: 100%;');
+    expect(styles).toContain('.fb-preview-actions .fb-diff-toggle { margin-left: 0; flex: 0 0 auto; min-height: 32px; white-space: nowrap; }');
+    expect(width).toBeGreaterThanOrEqual(320);
+  });
+
+  it('applies --sat safe-area top at most once across mobile fullscreen preview pane and header', () => {
+    const styles = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
+    expect(styles).not.toMatch(/\.fb-body-split\s+\.fb-preview\s*\{[^}]*--sat/);
+
+    const allPreviewSatLines = styles
+      .split('\n')
+      .filter((line) => line.includes('.fb-preview') && (line.includes('--sat') || line.includes('safe-area-inset-top')));
+    expect(allPreviewSatLines).toHaveLength(1);
+    expect(allPreviewSatLines[0]).toContain('.fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }');
+
+    const fixedPreviewIdx = styles.indexOf('.fb-body-split .fb-preview { position: fixed; inset: 0;');
+    expect(fixedPreviewIdx).toBeGreaterThan(-1);
+    const previewMediaIdx = styles.lastIndexOf('@media (max-width: 640px)', fixedPreviewIdx);
+    const previewMediaBlock = styles.slice(previewMediaIdx, styles.indexOf('\n}\n', fixedPreviewIdx) + 3);
+    expect(previewMediaBlock).toContain('.fb-preview-header { flex-wrap: wrap; align-items: center; }');
+    expect(previewMediaBlock).toContain('.fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }');
+  });
+
+  it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
+    const canceled = new DOMException('canceled', 'AbortError');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockRejectedValueOnce(canceled);
+    directFileTransferMocks.isFileUploadCanceled.mockImplementationOnce((error: unknown) => error === canceled);
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce());
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).not.toHaveBeenCalled();
+    expect(getDownloadTransfers()).toHaveLength(0);
+  });
+
+  it('keeps an active download in the page store after File Browser closes', async () => {
+    let finish!: () => void;
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce((options: {
+      onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
+    }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
+      options.onProgress?.({ loadedBytes: 256, totalBytes: 1_024 });
+      return new Promise<void>((resolve) => { finish = resolve; });
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/large.iso', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(getDownloadTransfers()[0]?.totalBytes).toBe(1_024));
+    view.unmount();
+    expect(getDownloadTransfers()[0]).toMatchObject({ name: 'large.iso', totalBytes: 1_024 });
+
+    finish();
+    await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('handed_off'));
+  });
+
+  it('marks a native HTTP download complete instead of handed off when no picker destination exists', async () => {
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce(async (options: {
+      onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
+    }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      options.onProgress?.({ loadedBytes: 0, totalBytes: 3 });
+      options.onProgress?.({ loadedBytes: 3, totalBytes: 3 });
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/mobile.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]).toMatchObject({
+      name: 'mobile.pdf',
+      route: 'http',
+      status: 'completed',
+      loadedBytes: 3,
+      totalBytes: 3,
+    }));
+  });
+
+  it('does not misreport downloaded mobile bytes as failed when they need a fresh save tap', async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce(async (options: {
+      onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
+      onSaveReady?: (action: () => Promise<void>) => void;
+    }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      options.onProgress?.({ loadedBytes: 3, totalBytes: 3 });
+      options.onSaveReady?.(save);
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/mobile.docx', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]).toMatchObject({
+      route: 'http',
+      status: 'ready_to_save',
+      loadedBytes: 3,
+      totalBytes: 3,
+    }));
+  });
+
+  it('retries a failed download with the same destination and a fresh signal', async () => {
+    const destination = { handle: { createWritable: vi.fn() } };
+    const failure = new Error('connection_failed');
+    const signals: AbortSignal[] = [];
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: { signal: AbortSignal }) => {
+      signals.push(options.signal);
+      if (signals.length === 1) throw failure;
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/retry.iso', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('failed'));
+    const transferId = getDownloadTransfers()[0]!.id;
+    await retryDownloadTransfer(transferId);
+
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2);
+    expect(signals).toHaveLength(2);
+    expect(signals[1]).not.toBe(signals[0]);
+    expect(getDownloadTransfers()).toHaveLength(1);
+    expect(getDownloadTransfers()[0]).toMatchObject({ id: transferId, status: 'completed' });
+  });
+
+  it('refreshes an expired direct preview handle exactly once and reuses the selected destination', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const destination = { handle: { createWritable: vi.fn() } };
+    const stale = new Error('preview_handle_invalid');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback
+      .mockRejectedValueOnce(stale)
+      .mockResolvedValueOnce(undefined);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockImplementation((error: unknown) => error === stale);
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'expired-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/report.pdf'));
+    act(() => sendMsg({
+      type: 'fs.read_response',
+      requestId: 'mock-read-id',
+      path: '/home/user/report.pdf',
+      status: 'ok',
+      content: 'refreshed preview',
+      downloadId: 'fresh-handle',
+    } as unknown as ServerMessage));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2));
+
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      previewHandle: 'fresh-handle',
+      destination,
+    }));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
+    expect(ws.fsReadFile).toHaveBeenCalledOnce();
+    expect(getDownloadTransfers()).toHaveLength(1);
+    expect(getDownloadTransfers()[0]).toMatchObject({ name: 'report.pdf', status: 'completed' });
+  });
+
+  it('does not download a refreshed handle after the selected preview changes', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const destination = { handle: { createWritable: vi.fn() } };
+    const stale = new Error('preview_handle_invalid');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockRejectedValueOnce(stale);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockImplementation((error: unknown) => error === stale);
+    const onConfirm = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'expired-handle' }}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/report.pdf'));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/other.pdf', content: 'other', downloadId: 'other-handle' }}
+        onConfirm={onConfirm}
+      />,
+    );
+    await waitFor(() => expect(filePreviewPropsState.current?.path).toBe('/home/user/other.pdf'));
+    act(() => sendMsg({
+      type: 'fs.read_response',
+      requestId: 'mock-read-id',
+      path: '/home/user/report.pdf',
+      status: 'ok',
+      content: 'refreshed preview',
+      downloadId: 'fresh-handle',
+    } as unknown as ServerMessage));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('canceled'));
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledOnce();
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
   });
 
   it('does not regress an existing preview back to loading for the same file', () => {
@@ -206,6 +848,30 @@ describe('FileBrowser', () => {
     expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
   });
 
+  describe('macOS Full Disk Access prompt names the identity that is actually missing', () => {
+    const open = (error: string) => {
+      const { ws, respondError } = makeWsFactory();
+      render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath={FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS} serverId="srv-1" quickAccess onConfirm={vi.fn()} />);
+      act(() => respondError(error));
+    };
+
+    it('shows the node text for the long-standing node-denied code', () => {
+      open(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED);
+      expect(screen.getByRole('alert').textContent).toContain('file_browser.macos_fda_prompt');
+      expect(screen.getByRole('alert').textContent).not.toContain('file_browser.macos_fda_prompt_app');
+    });
+
+    it('shows the app text when the aiDesk.to app (not the node) is the one macOS refused', () => {
+      open(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP);
+      expect(screen.getByRole('alert').textContent).toContain('file_browser.macos_fda_prompt_app');
+    });
+
+    it('shows no prompt for any other error', () => {
+      open('forbidden_path');
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  });
+
   it('renders modal overlay in modal layout', () => {
     const { ws } = makeWsFactory();
     render(<FileBrowser ws={ws} mode="dir-only" layout="modal" onConfirm={vi.fn()} onClose={vi.fn()} />);
@@ -247,6 +913,47 @@ describe('FileBrowser', () => {
     const nestedTree = Array.from(filesAndChanges!.children).find((child) => child.classList.contains('fb-tree'));
     expect(nestedTree).toBeTruthy();
     expect(nestedTree!.classList.contains('fb-tree-split')).toBe(false);
+  });
+
+  it('wires Markdown file links and inline image reads into the scoped file browser channel', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/docs"
+        changesRootPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/docs/README.md', content: '![Flow](./flow.png)' }}
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(filePreviewPropsState.current?.onImagePreview).toBeTypeOf('function'));
+    expect(filePreviewPropsState.current?.allowedRootPath).toBe('/home/user');
+    const imagePromise = filePreviewPropsState.current!.onImagePreview!('/home/user/docs/flow.png');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/docs/flow.png', 'deck_project_brain');
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/docs/flow.png',
+        status: 'ok',
+        encoding: 'base64',
+        mimeType: 'image/png',
+        content: 'cG5n',
+      });
+    });
+    await expect(imagePromise).resolves.toEqual({
+      dataUrl: 'data:image/png;base64,cG5n',
+      alt: 'flow.png',
+    });
+
+    filePreviewPropsState.current!.onPathClick?.('/home/user/GUIDE.md');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/GUIDE.md', 'deck_project_brain');
   });
 
   it('keeps the changes tree as a direct split child when preview is open', () => {
@@ -309,6 +1016,74 @@ describe('FileBrowser', () => {
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
     expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
+  });
+
+  it('scopes shared-session browsing and keeps viewer file management read-only', async () => {
+    const { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/project"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        readOnly
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user/project', true, false, {
+      sessionName: 'deck_project_brain',
+    });
+    expect(screen.queryByTitle('New file')).toBeNull();
+    expect(screen.queryByTitle('New folder')).toBeNull();
+
+    await act(async () => { respond([{ name: 'shared.png', isDir: false }], '/home/user/project'); });
+    const row = screen.getByText('shared.png').closest('.fb-node');
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    expect(screen.queryByText('Rename')).toBeNull();
+    expect(screen.queryByText('Delete')).toBeNull();
+    expect(fsMkdir).not.toHaveBeenCalled();
+    expect(fsWriteFile).not.toHaveBeenCalled();
+    expect(fsRename).not.toHaveBeenCalled();
+    expect(fsDelete).not.toHaveBeenCalled();
+  });
+
+  it('does not narrow ordinary owned-session browsing to the project root', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        sessionName="deck_owned_brain"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+    expect(fsListDir).not.toHaveBeenCalledWith('/home/user', true, false, expect.anything());
+  });
+
+  it('opens a shared file manager at the virtual session root when projectDir is hidden', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith(':session-root:', true, false, {
+      sessionName: 'deck_project_brain',
+    });
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -495,6 +1270,80 @@ describe('FileBrowser', () => {
     expect(getByTitle('forbidden_path')).toBeDefined();
   });
 
+  it('bounces back to the last good location when a quick-access sentinel fails to resolve', async () => {
+    // Reproduces the stuck-Desktop/Downloads-button bug: a controlled node
+    // that fails closed on an unresolvable well-known directory (e.g. no
+    // verifiable console user) used to leave the browser permanently showing
+    // an empty folder literally named after the raw sentinel, with no way
+    // to navigate away. jumpTo() optimistically shows the sentinel before
+    // the fetch resolves; on error the browser must revert instead of
+    // getting stuck.
+    const { ws, respond, respondError, fsListDir } = makeWsFactory();
+    const onCurrentPathChange = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="panel"
+        initialPath="/home/user"
+        quickAccess
+        onCurrentPathChange={onCurrentPathChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith('/home/user');
+
+    fsListDir.mockClear();
+    fireEvent.click(view.getByTitle('Downloads'));
+    expect(fsListDir).toHaveBeenCalledWith(FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, false, false);
+    // Optimistic placeholder is showing the raw, unresolved sentinel.
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith(FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS);
+
+    await act(async () => { respondError('directory_not_verifiable'); });
+
+    // Must have bounced back to the last known-good root, not stay stuck on
+    // the sentinel or show it as a real (empty) folder.
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith('/home/user');
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
+
+    // And the bounce-back fetch resolving normally clears the error and
+    // shows real content again.
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+    expect(await view.findByText('projects')).toBeDefined();
+  });
+
+  it('does not treat a failed nested-child fetch as a reason to leave the current root', async () => {
+    // Only a failure of the CURRENTLY DISPLAYED root should trigger a bounce
+    // back to the last good location. A child the user expanded deeper in
+    // the tree failing to load must not yank the whole browser back to root.
+    const { ws, respond, respondError, fsListDir } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="modal"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+
+    // Expand the child directory (its own fs.ls request); the response that
+    // eventually errors targets a *child* node, not the root.
+    await act(async () => { fireEvent.click(view.getByText('projects')); });
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user/projects', false, false);
+    fsListDir.mockClear();
+    await act(async () => { respondError('permission_denied'); });
+
+    // No bounce-back re-fetch of the root (or anywhere else) was triggered.
+    expect(fsListDir).not.toHaveBeenCalled();
+    expect(view.getByTitle('permission_denied')).toBeDefined();
+  });
+
   it('does not re-fetch already loaded directories', async () => {
     const { ws, respond, fsListDir } = makeWsFactory();
     const { getByText } = render(
@@ -556,6 +1405,198 @@ describe('FileBrowser', () => {
 
     expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
     expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
+  });
+
+  // tsk_5rf. 6a169ad3c moved Office previews onto the chunked download channel.
+  // This drives the REAL production branch end to end - click a .docx, receive
+  // the streamed fs.read_response, let FileBrowser build the authenticated URL,
+  // let the real OfficePreview fetch an ArrayBuffer and the real docx-preview
+  // parser render it - and asserts the actual Word text reaches the DOM.
+  // Asserting previewMode === 'stream' would have passed while users saw blank.
+  it('renders real Word text through the streamed office preview branch (tsk_5rf)', async () => {
+    const bytes = await buildMinimalDocx();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+      if (url.includes('/onlyoffice/config')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ enabled: false }),
+          text: async () => JSON.stringify({ enabled: false }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => bytes,
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'report.docx', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('report.docx')); });
+    await waitFor(() => expect(vi.mocked(ws.fsReadFile)).toHaveBeenCalledWith('/home/user/report.docx'));
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/report.docx',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: MINIMAL_DOCX_MIME,
+        size: bytes.byteLength,
+        downloadId: 'docx-handle',
+      } as unknown as ServerMessage);
+    });
+
+    await waitFor(() => expect(view.container.textContent).toContain(MINIMAL_DOCX_TEXT), { timeout: 5000 });
+
+    // Bytes came over the authenticated chunked URL, never back through the WS.
+    const downloadCall = fetchMock.mock.calls.find(([callUrl]) => {
+      const urlStr = typeof callUrl === 'string' ? callUrl : (callUrl as Request)?.url ?? '';
+      return urlStr.includes('/api/server/srv-1/uploads/docx-handle/download');
+    });
+    expect(downloadCall).toBeTruthy();
+    const [url, init] = downloadCall as [string, RequestInit | undefined];
+    expect(url).toContain('/api/server/srv-1/uploads/docx-handle/download');
+    expect(init?.credentials).toBe('include');
+  });
+
+  it('does not blank or leak when the office preview lacks a serverId (tsk_5rf)', async () => {
+    const bytes = await buildMinimalDocx();
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'report.docx', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('report.docx')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/report.docx',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: MINIMAL_DOCX_MIME,
+        downloadId: 'docx-handle',
+      } as unknown as ServerMessage);
+    });
+    // No daemon to build an authenticated URL against. The bug: both stream
+    // branches require serverId, so the response fell through to the text path,
+    // where `msg.content ?? ''` produced an EMPTY 'ok' preview - a silently
+    // blank pane with no explanation. Asserting only "no fetch / no text" would
+    // pass on exactly that blank, so assert the user is actually told.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(view.container.textContent).not.toContain(MINIMAL_DOCX_TEXT);
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+  });
+
+  it('never renders a non-image streamed file as an <img> (tsk_5rf)', async () => {
+    // The streamed fallback branch set status 'image' for ANY streamed response
+    // that carried a mimeType, without checking it was actually an image. A
+    // streamed binary would then be handed to <img src=...>, which renders as a
+    // broken/blank box - the same symptom class as the Word blank.
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'blob.bin', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('blob.bin')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/blob.bin',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'application/octet-stream',
+        downloadId: 'bin-handle',
+      } as unknown as ServerMessage);
+    });
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+    expect(view.container.querySelector('img')).toBeNull();
+  });
+
+  it('fails the streamed image preview explicitly when the URL errors (tsk_5rf R2)', async () => {
+    // A resolved URL is not a loaded image. A dead/expired download handle used
+    // to leave a broken <img> on screen with the preview still reporting image
+    // state; it must surface the preview error instead.
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'shot.png', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('shot.png')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/shot.png',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'image/png',
+        downloadId: 'png-handle',
+      } as unknown as ServerMessage);
+    });
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull());
+
+    await act(async () => {
+      fireEvent.error(view.container.querySelector('.fb-preview-image img') as HTMLImageElement);
+    });
+
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+    expect(view.container.querySelector('.fb-preview-image img')).toBeNull();
+  });
+
+  it('keeps the streamed image in loading until the real img load event (tsk_5rf R3)', async () => {
+    // A built URL is not a loaded image. R2 added onError here but still flipped
+    // straight to interactive image state on URL construction, so a slow or
+    // never-loading handle showed an empty image frame with no loading signal.
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'shot.png', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('shot.png')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/shot.png',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'image/png',
+        downloadId: 'png-handle',
+      } as unknown as ServerMessage);
+    });
+
+    // The <img> exists so the browser can fetch it, but the pane still reports loading.
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull());
+    expect(view.container.querySelector('.fb-preview-loading')).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.load(view.container.querySelector('.fb-preview-image img') as HTMLImageElement);
+    });
+
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-loading')).toBeNull());
+    expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull();
   });
 
   it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {
@@ -739,6 +1780,38 @@ describe('FileBrowser', () => {
     await waitFor(() => expect(getByText('Copied!')).toBeDefined());
   });
 
+  it('keeps desktop copy-path and select actions visible beside the current path', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const onConfirm = vi.fn();
+    const currentPath = '/home/user/projects';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { ws, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="panel" initialPath={currentPath} onConfirm={onConfirm} />,
+    );
+
+    await act(async () => {
+      respond([], currentPath);
+    });
+
+    const actions = container.querySelector('.fb-breadcrumb-actions') as HTMLElement;
+    const [copyButton, selectButton] = Array.from(actions.querySelectorAll<HTMLButtonElement>('button'));
+    expect(copyButton?.getAttribute('aria-label')).toBe('Copy path');
+    expect(selectButton?.getAttribute('aria-label')).toBe('Select');
+
+    await act(async () => {
+      copyButton?.click();
+      await Promise.resolve();
+    });
+    selectButton?.click();
+
+    expect(writeText).toHaveBeenCalledWith(currentPath);
+    expect(onConfirm).toHaveBeenCalledWith([currentPath]);
+  });
+
   it('deselects a path when clicked again in multi-select', async () => {
     const { ws, respond } = makeWsFactory();
     const { getByText } = render(
@@ -823,13 +1896,103 @@ describe('FileBrowser', () => {
 
     const row = screen.getByText('cache.log').closest('.fb-node');
     expect(row?.classList.contains('git-ignored')).toBe(true);
-    expect(document.querySelector('.git-badge-ignored')?.textContent).toBe('I');
+    const badge = document.querySelector('.git-badge-ignored');
+    expect(badge?.textContent).toBe('I');
+    expect(badge?.getAttribute('title')).toBe('file_browser.git_ignored');
   });
 
-  it('renames a file from the right-click menu', async () => {
+  it('propagates git-ignored to expanded ignored directory children, omits change dots, and excludes !! from Changes tab', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      respond(
+        [
+          { name: 'dist', isDir: true },
+          { name: 'src', isDir: true },
+        ],
+        '/home/user',
+      );
+    });
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [
+          { path: '/home/user/dist', code: '!!' },
+          { path: '/home/user/src/app.ts', code: 'M' },
+        ],
+      });
+    });
+
+    const distRow = screen.getByText('dist').closest('.fb-node')!;
+    expect(distRow.classList.contains('git-ignored')).toBe(true);
+    expect(distRow.querySelector('.fb-node-git-dot')).toBeNull();
+    expect(distRow.querySelector('.git-badge-ignored')?.getAttribute('title')).toBe('file_browser.git_ignored');
+
+    const srcRow = screen.getByText('src').closest('.fb-node')!;
+    expect(srcRow.classList.contains('git-ignored')).toBe(false);
+    expect(srcRow.querySelector('.fb-node-git-dot')).not.toBeNull();
+
+    // Expanding the ignored `dist` directory dims its children immediately and omits any change dot
+    await act(async () => {
+      fireEvent.click(distRow);
+    });
+    await act(async () => {
+      respond([{ name: 'bundle.js', isDir: false }], '/home/user/dist');
+    });
+    const childRow = screen.getByText('bundle.js').closest('.fb-node')!;
+    expect(childRow.classList.contains('git-ignored')).toBe(true);
+    expect(childRow.querySelector('.git-badge-ignored')?.textContent).toBe('I');
+
+    // Switching to Changes tab triggers sharedChanges (includeStats: true); `!!` must NOT appear in Changes
+    // and switching back to Files must preserve the `!!` annotation on `dist`.
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => {
+      fireEvent.click(changesTab);
+    });
+    const reqCalls = ws.fsGitStatus.mock.calls;
+    const changesReqIdx = reqCalls.findIndex((c: unknown[]) => Boolean((c[1] as { includeStats?: boolean } | undefined)?.includeStats));
+    expect(changesReqIdx).toBeGreaterThan(-1);
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [
+          { path: '/home/user/src/app.ts', code: 'M' },
+          { path: '/home/user/dist', code: '!!' },
+        ],
+        totalCount: 1,
+      });
+    });
+    expect(document.querySelector('.fb-changes-section')?.textContent).toContain('app.ts');
+    expect(document.querySelector('.fb-changes-section')?.textContent).not.toContain('dist');
+
+    const filesTab = document.querySelector('.fb-panel-tab:first-child') as HTMLElement;
+    await act(async () => {
+      fireEvent.click(filesTab);
+    });
+    expect(document.querySelector('.fb-node[data-path="/home/user/dist"]')?.classList.contains('git-ignored')).toBe(true);
+  });
+
+  it('renames a file inline from the right-click menu without window.prompt', async () => {
     const { ws, respond, fsRename } = makeWsFactory();
-    const originalPrompt = window.prompt;
-    window.prompt = vi.fn(() => 'renamed.ts');
+    const promptSpy = vi.spyOn(window, 'prompt').mockImplementation(() => null);
     try {
       render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
       await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
@@ -839,16 +2002,22 @@ describe('FileBrowser', () => {
       fireEvent.contextMenu(row!);
       fireEvent.click(screen.getByText('Rename'));
 
+      expect(promptSpy).not.toHaveBeenCalled();
+      const input = screen.getByTestId('fb-rename-input') as HTMLInputElement;
+      expect(input.selectionStart).toBe(0);
+      expect(input.selectionEnd).toBe(3); // pre-selects "foo" before ".ts"
+      fireEvent.input(input, { target: { value: 'renamed.ts' } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+
       expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts');
     } finally {
-      window.prompt = originalPrompt;
+      promptSpy.mockRestore();
     }
   });
 
-  it('passes the owning session when renaming from the right-click menu', async () => {
+  it('passes the owning session when renaming inline from the right-click menu', async () => {
     const { ws, respond, fsRename } = makeWsFactory();
-    const originalPrompt = window.prompt;
-    window.prompt = vi.fn(() => 'renamed.ts');
+    const promptSpy = vi.spyOn(window, 'prompt').mockImplementation(() => null);
     try {
       render(
         <FileBrowser
@@ -867,9 +2036,14 @@ describe('FileBrowser', () => {
       fireEvent.contextMenu(row!);
       fireEvent.click(screen.getByText('Rename'));
 
+      expect(promptSpy).not.toHaveBeenCalled();
+      const input = screen.getByTestId('fb-rename-input') as HTMLInputElement;
+      fireEvent.input(input, { target: { value: 'renamed.ts' } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+
       expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts', 'deck_proj_brain');
     } finally {
-      window.prompt = originalPrompt;
+      promptSpy.mockRestore();
     }
   });
 
@@ -1067,6 +2241,52 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
   });
 
+  it('shows loading, success, and failure feedback on the Changes refresh button', async () => {
+    vi.useFakeTimers();
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />,
+    );
+
+    const refresh = screen.getByTitle('Refreshing changes…') as HTMLButtonElement;
+    expect(refresh.disabled).toBe(true);
+    expect(refresh.classList.contains('is-refreshing')).toBe(true);
+    expect(refresh.textContent).toBe('↻');
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [],
+      });
+    });
+    expect(screen.getByTitle('Changes refreshed').classList.contains('is-success')).toBe(true);
+    expect(screen.getByTitle('Changes refreshed').textContent).toBe('✓');
+
+    await act(async () => { vi.advanceTimersByTime(1_500); });
+    const idleRefresh = screen.getByTitle('Refresh changes') as HTMLButtonElement;
+    expect(idleRefresh.disabled).toBe(false);
+
+    await act(async () => { fireEvent.click(idleRefresh); });
+    expect(screen.getByTitle('Refreshing changes…').classList.contains('is-refreshing')).toBe(true);
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'error',
+        error: 'git failed',
+      });
+    });
+    expect(screen.getByTitle('Refresh failed').classList.contains('is-error')).toBe(true);
+    expect(screen.getByTitle('Refresh failed').textContent).toBe('!');
+  });
+
   it('keeps the Changes list usable when stats are unavailable', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     render(
@@ -1155,6 +2375,34 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;\n-const x = 0;' });
     });
     expect(document.querySelector('.fb-diff-toggle')).not.toBeNull();
+  });
+
+  it('renders streamed audio previews with browser audio controls', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+      autoPreviewPath="/home/user/voice.mp3" serverId="srv-1" onConfirm={vi.fn()} />);
+
+    await act(async () => { respond([{ name: 'voice.mp3', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/voice.mp3',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'audio/mpeg',
+        downloadId: 'audio-handle',
+        size: 1024,
+      });
+    });
+
+    await waitFor(() => expect(document.querySelector('.fb-preview-audio audio')).not.toBeNull());
+
+    const audio = document.querySelector('.fb-preview-audio audio') as HTMLAudioElement | null;
+    expect(audio).not.toBeNull();
+    expect(audio?.getAttribute('controls')).not.toBeNull();
+    expect(audio?.getAttribute('src')).toContain('/api/server/srv-1/uploads/audio-handle/download');
+    expect(document.querySelector('.fb-preview-audio-name')?.textContent).toBe('voice.mp3');
   });
 
   it('defaults to diff mode when opening a file from the Changes tab', async () => {
@@ -1652,6 +2900,26 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
   });
 
+  it('keeps chat auto-preview bounded when i18n changes t identity', async () => {
+    const { ws, respond } = makeWsFactory();
+    fileBrowserI18n.freshTCalls = Number.POSITIVE_INFINITY;
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await waitFor(() => expect((ws.fsReadFile as any).mock.calls).toHaveLength(1));
+    expect(document.querySelector('.fb-preview-loading')).not.toBeNull();
+    fileBrowserI18n.freshTCalls = 0;
+  });
+
   it('dispatches at most one current read/diff cycle per visible target', async () => {
     const { ws, respond } = makeWsFactory();
     render(
@@ -1875,6 +3143,49 @@ describe('FileBrowser', () => {
     });
   });
 
+  it('does not issue a second read for equivalent hidden chat path aliases', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const aliasPath = resolvePreviewPath('./.hidden/../.config/settings.json', '/home/user');
+    const canonicalPath = resolvePreviewPath('./.config/settings.json', '/home/user');
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={aliasPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={canonicalPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: canonicalPath,
+        status: 'error',
+        error: 'not_found',
+      });
+    });
+
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
+    expect(aliasPath).toBe(canonicalPath);
+    expect(view.container.querySelector('.fb-preview-error')).not.toBeNull();
+  });
+
   it.each([
     FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
     FS_READ_ERROR_CODES.PREVIEW_WORKER_UNAVAILABLE,
@@ -1902,6 +3213,46 @@ describe('FileBrowser', () => {
     });
 
     expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+  });
+
+  it('retries a cached chat preview error once when the same path is opened again', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/missing.ts"
+        initialPreview={{ status: 'error', path: '/home/user/missing.ts', error: 'file_browser.preview_error' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    expect(view.container.querySelector('.fb-preview-loading')).not.toBeNull();
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/missing.ts',
+        status: 'error',
+        error: 'not_found',
+      });
+      // A diff response can arrive after the read failed. It must not revive
+      // the failed chat preview or overwrite its error state.
+      sendMsg({
+        type: 'fs.git_diff_response',
+        requestId: 'mock-git-diff-id',
+        path: '/home/user/missing.ts',
+        status: 'ok',
+        diff: '+late response',
+      });
+    });
+
+    expect(view.container.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
   });
 
   it('times out a missing preview read and allows same-file retry', async () => {
@@ -2286,5 +3637,1959 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, false));
     // ...and no "preview failed" error is rendered.
     expect(screen.queryByText('file_browser.preview_error')).toBeNull();
+  });
+
+  it('skips fsListDir while ws.connected is false and fetches once connected event arrives', async () => {
+    const { ws, fsListDir, sendMsg, respond } = makeWsFactory();
+    let isConnected = false;
+    Object.defineProperty(ws, 'connected', { get: () => isConnected });
+
+    await act(async () => {
+      render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/srv/alpha" onConfirm={vi.fn()} />);
+    });
+    expect(fsListDir).not.toHaveBeenCalled();
+
+    isConnected = true;
+    await act(async () => {
+      sendMsg({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as unknown as ServerMessage);
+    });
+    expect(fsListDir).toHaveBeenCalledWith('/srv/alpha', true, false);
+
+    await act(async () => {
+      respond([{ name: 'alpha_only.ts', isDir: false }]);
+    });
+    expect(screen.getByText('alpha_only.ts')).toBeTruthy();
+  });
+
+  it('opens real DocShareDialog from toolbar share button and routes Manage Node Groups to onOpenNodeGroups', async () => {
+    const listSpy = vi.spyOn(api, 'listDocumentShares').mockResolvedValue({ shares: [], groups: [] });
+    const onOpenNodeGroups = vi.fn();
+    try {
+      const { ws, respond } = makeWsFactory();
+      await act(async () => {
+        render(
+          <FileBrowser
+            ws={ws}
+            mode="file-multi"
+            layout="panel"
+            serverId="srv-1"
+            initialPath="/home/user"
+            onConfirm={vi.fn()}
+            onOpenNodeGroups={onOpenNodeGroups}
+          />,
+        );
+      });
+      await act(async () => {
+        respond([{ name: 'spec.docx', isDir: false }]);
+      });
+
+      fireEvent.click(screen.getByTestId('fb-toolbar-share-btn'));
+      expect(await screen.findByTestId('doc-share-dialog')).toBeTruthy();
+      expect(await screen.findByTestId('doc-share-no-groups-empty')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('doc-share-open-node-groups-btn'));
+      expect(onOpenNodeGroups).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(screen.queryByTestId('doc-share-dialog')).toBeNull());
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
+  it('inherits NodeGroupsNavContext into FileBrowser and DocShareDialog when onOpenNodeGroups prop is omitted', async () => {
+    const listSpy = vi.spyOn(api, 'listDocumentShares').mockResolvedValue({ shares: [], groups: [] });
+    const contextOpenNodeGroups = vi.fn();
+    try {
+      const { ws, respond } = makeWsFactory();
+      await act(async () => {
+        render(
+          <NodeGroupsNavContext.Provider value={contextOpenNodeGroups}>
+            <FileBrowser
+              ws={ws}
+              mode="file-multi"
+              layout="panel"
+              serverId="srv-1"
+              initialPath="/home/user"
+              onConfirm={vi.fn()}
+            />
+          </NodeGroupsNavContext.Provider>,
+        );
+      });
+      await act(async () => {
+        respond([{ name: 'spec.docx', isDir: false }]);
+      });
+
+      fireEvent.click(screen.getByTestId('fb-toolbar-share-btn'));
+      expect(await screen.findByTestId('doc-share-dialog')).toBeTruthy();
+      expect(await screen.findByTestId('doc-share-no-groups-empty')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('doc-share-open-node-groups-btn'));
+      expect(contextOpenNodeGroups).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(screen.queryByTestId('doc-share-dialog')).toBeNull());
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
+  it('does NOT auto-record pasted-text uploads or plain text/code/csv previews in recent documents, while recording non-temp Office/PDF and explicit ONLYOFFICE opens', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ item: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, sendMsg } = makeWsFactory();
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+    const onlyofficeConfigCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/onlyoffice/config'));
+
+    try {
+      // Negative controls: plain text/code/csv previews and pasted-text / .imcodes/uploads paths MUST NOT auto-record
+      const plainCases = [
+        { path: '/home/k/.imcodes/uploads/237d57beb/pasted-text-2026-11-13T14-12-56-645Z.txt', content: 'pasted text' },
+        { path: 'C:\\Users\\k\\.imcodes\\uploads\\237d57beb\\pasted-text-2026-11-13T14-12-56-645Z.txt', content: 'win pasted' },
+        { path: '/repo/notes.txt', content: 'plain notes' },
+        { path: '/repo/README.md', content: '# Hello World' },
+        { path: '/repo/package.json', content: '{"name":"demo"}' },
+        { path: '/repo/data.csv', content: 'a,b\n1,2' },
+        { path: '/repo/app.log', content: '[info] ok' },
+        { path: '/repo/index.ts', content: 'export const x = 1;' },
+      ];
+
+      for (const tc of plainCases) {
+        const rendered = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath={tc.path}
+            onConfirm={vi.fn()}
+          />,
+        );
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: tc.path,
+            status: 'ok',
+            content: tc.content,
+            encoding: 'utf8',
+          } as unknown as ServerMessage);
+        });
+        await new Promise((r) => setTimeout(r, 15));
+        expect(recentCalls(), `expected zero recent calls for plain preview ${tc.path}`).toHaveLength(0);
+        rendered.unmount();
+      }
+      fetchMock.mockClear();
+
+      // Failed read MUST NOT record
+      const errView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/missing.txt"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/missing.txt',
+          status: 'error',
+          error: 'not_found',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls()).toHaveLength(0);
+      errView.unmount();
+
+      // F1 counterexamples: .csv error fallback (e.g. PREVIEW_WORKER_TIMEOUT) and .csv stream preview
+      // MUST NOT auto-promote to OfficePreview or auto-record in Recent documents.
+      const csvErrView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/data.csv',
+          status: 'error',
+          error: FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls(), 'expected zero recent calls for .csv error fallback').toHaveLength(0);
+      expect(onlyofficeConfigCalls(), 'expected zero onlyoffice config calls for .csv error fallback').toHaveLength(0);
+      expect(csvErrView.container.querySelector('.fb-preview-error')).toBeTruthy();
+      csvErrView.unmount();
+
+      const csvStreamView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/stream-data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/stream-data.csv',
+          status: 'ok',
+          previewMode: 'stream',
+          downloadId: 'dl-csv-stream-1',
+          mimeType: 'text/csv',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls(), 'expected zero recent calls for .csv stream preview').toHaveLength(0);
+      expect(onlyofficeConfigCalls(), 'expected zero onlyoffice config calls for .csv stream preview').toHaveLength(0);
+      csvStreamView.unmount();
+
+      // Upload/temp Office/PDF paths under .imcodes/uploads (POSIX & Windows) MUST NOT auto-record
+      for (const uploadOfficePath of [
+        '/home/k/.imcodes/uploads/abc123/spec.docx',
+        'C:\\Users\\k\\.imcodes\\uploads\\abc123\\report.pdf',
+      ]) {
+        const upView = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath={uploadOfficePath}
+            onConfirm={vi.fn()}
+          />,
+        );
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: uploadOfficePath,
+            status: 'ok',
+            previewMode: 'stream',
+            downloadId: 'dl-up-1',
+            mimeType: uploadOfficePath.endsWith('.pdf')
+              ? 'application/pdf'
+              : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          } as unknown as ServerMessage);
+        });
+        await new Promise((r) => setTimeout(r, 15));
+        expect(recentCalls(), `expected zero recent calls for upload office path ${uploadOfficePath}`).toHaveLength(0);
+        upView.unmount();
+      }
+
+      // Positive control 1: non-upload Office/PDF file (status=office) DOES record
+      const pdfView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/report.pdf"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/report.pdf',
+          status: 'ok',
+          previewMode: 'stream',
+          downloadId: 'dl-pdf-1',
+          mimeType: 'application/pdf',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const pdfPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(pdfPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-rec',
+        filePath: '/repo/report.pdf',
+        mimeType: 'application/pdf',
+        title: 'report.pdf',
+      });
+      pdfView.unmount();
+      fetchMock.mockClear();
+
+      // Positive control 2: explicit ONLYOFFICE open on /repo/data.csv records AFTER clicking ONLYOFFICE button
+      const csvView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/data.csv',
+          status: 'ok',
+          content: 'a,b\n1,2',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls()).toHaveLength(0);
+
+      fireEvent.click(csvView.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const csvPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(csvPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-rec',
+        filePath: '/repo/data.csv',
+        mimeType: 'text/csv',
+        title: 'data.csv',
+      });
+      csvView.unmount();
+    } finally {
+      globalThis.ResizeObserver = prevResizeObserver;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never records .md when ONLYOFFICE is disabled or falls back locally, and records .md only when ONLYOFFICE DocEditor actually opens', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const origDocsApi = window.DocsAPI;
+    const { resetOnlyOfficePrewarm } = await import('../../src/onlyoffice-preload.js');
+    resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+
+    let nextDocEditor: unknown = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+    const originalAppend = document.head.appendChild.bind(document.head);
+    const appendSpy = vi.spyOn(document.head, 'appendChild').mockImplementation((node: Node) => {
+      const res = originalAppend(node);
+      const el = node as HTMLScriptElement;
+      if (el.tagName === 'SCRIPT' && el.dataset?.onlyofficeSrc) {
+        setTimeout(() => {
+          (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: nextDocEditor };
+          el.onload?.(new Event('load'));
+        }, 0);
+      }
+      return res;
+    });
+
+    let configScenario: 'disabled' | 'throw' | 'ok' = 'disabled';
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/onlyoffice/config')) {
+        if (configScenario === 'disabled') {
+          return new Response(JSON.stringify({
+            enabled: false,
+            fallbackReason: 'onlyoffice_disabled',
+            role: 'editor',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: true,
+            mode: 'view',
+            fileUrl: 'https://files.test/README.md',
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({
+          enabled: true,
+          role: 'editor',
+          allowDownload: true,
+          canManageShare: false,
+          isOwner: true,
+          mode: 'edit',
+          scriptUrl: 'https://onlyoffice.test/web-apps/apps/api/documents/api.js',
+          fileUrl: 'https://files.test/README.md',
+          config: {
+            documentType: 'word',
+            document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'md', key: 'k-md' },
+            editorConfig: { mode: 'edit' },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('https://files.test/README.md')) {
+        return new Response('# Markdown Body', { status: 200 });
+      }
+      return new Response(JSON.stringify({ item: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+    const { ws, sendMsg } = makeWsFactory();
+
+    try {
+      // Case 1: Opening README.md automatically invokes ONLYOFFICE; when ONLYOFFICE is disabled -> falls back locally, ZERO recent calls
+      configScenario = 'disabled';
+      const vDisabled = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(vDisabled.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+      vDisabled.unmount();
+
+      // Case 2: ONLYOFFICE enabled, but DocsAPI.DocEditor throws & falls back locally -> ZERO recent calls
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      configScenario = 'throw';
+      nextDocEditor = vi.fn().mockImplementation(() => {
+        throw new Error('DocEditor init failed');
+      });
+      const vThrow = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(vThrow.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+      vThrow.unmount();
+
+      // Case 3: ONLYOFFICE DocEditor constructs without ready -> onError + Use Local Preview -> ZERO recent calls; then Retry + real onDocumentReady -> records ONCE with openedWithOnlyOffice: true
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      configScenario = 'ok';
+      const capturedCfgs: Array<{ events?: { onDocumentReady?: () => void; onError?: (err?: unknown) => void } }> = [];
+      nextDocEditor = vi.fn().mockImplementation((_id: string, cfg: { events?: { onDocumentReady?: () => void; onError?: (err?: unknown) => void } }) => {
+        capturedCfgs.push(cfg);
+        return { destroyEditor: vi.fn() };
+      });
+      const vOk = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(capturedCfgs).toHaveLength(1));
+      // Constructor alone MUST NOT record
+      expect(recentCalls()).toHaveLength(0);
+      // Async error before ready + fallback to local preview MUST NOT record
+      capturedCfgs[0]?.events?.onError?.({ data: { errorCode: -4 } });
+      capturedCfgs[0]?.events?.onDocumentReady?.();
+      expect(recentCalls()).toHaveLength(0);
+      fireEvent.click(vOk.getByTestId('onlyoffice-fallback-btn'));
+      await waitFor(() => expect(vOk.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+
+      // Retry ONLYOFFICE and emit genuine onDocumentReady (twice -> deduplicated to 1 record call)
+      fireEvent.click(vOk.getByTestId('office-preview-retry-onlyoffice'));
+      await waitFor(() => expect(capturedCfgs).toHaveLength(2));
+      expect(recentCalls()).toHaveLength(0);
+      capturedCfgs[1]?.events?.onDocumentReady?.();
+      capturedCfgs[1]?.events?.onDocumentReady?.();
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const mdPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(mdPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-md',
+        filePath: '/repo/README.md',
+        mimeType: 'text/markdown',
+        title: 'README.md',
+        openMode: 'edit',
+        openedWithOnlyOffice: true,
+      });
+      vOk.unmount();
+    } finally {
+      appendSpy.mockRestore();
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      window.DocsAPI = origDocsApi;
+      globalThis.ResizeObserver = prevResizeObserver;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('creates typed *.md files via createSharedDocItem and opens .md in ONLYOFFICE when serverId is present, falling back to plain text without serverId', async () => {
+    const createSpy = vi.spyOn(api, 'createSharedDocItem').mockResolvedValue({ path: '/repo/notes.md', kind: 'file' });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/onlyoffice/config')) {
+        return new Response(JSON.stringify({
+          enabled: false,
+          fallbackReason: 'onlyoffice_disabled',
+          role: 'editor',
+          allowDownload: true,
+          canManageShare: false,
+          isOwner: true,
+          mode: 'view',
+          fileUrl: 'https://files.test/notes.md',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('https://files.test/notes.md')) {
+        return new Response('# Untitled Document\n\n', { status: 200 });
+      }
+      return new Response(JSON.stringify({ item: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    try {
+      const view = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md-create"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        respond([{ name: 'existing.txt', isDir: false }], '/repo');
+      });
+
+      fireEvent.click(view.getByLabelText('New file'));
+      const input = view.getByPlaceholderText('File name') as HTMLInputElement;
+      fireEvent.input(input, { target: { value: 'notes.md' } });
+      fireEvent.click(view.getByText('Create'));
+
+      await waitFor(() => {
+        expect(createSpy).toHaveBeenCalledWith('srv-md-create', {
+          parentDir: '/repo',
+          name: 'notes.md',
+          kind: 'file',
+        });
+      });
+      expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/notes.md');
+
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/notes.md',
+          status: 'ok',
+          content: '# Untitled Document\n\n',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(view.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/onlyoffice/config'))).toBe(true);
+      view.unmount();
+
+      // Without serverId, .md falls back cleanly to plain-text preview (no ONLYOFFICE config fetch).
+      fetchMock.mockClear();
+      const noServerView = render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/local.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/local.md',
+          status: 'ok',
+          content: '# Local Plain Text',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(noServerView.getByText('# Local Plain Text')).toBeTruthy());
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/onlyoffice/config'))).toBe(false);
+      noServerView.unmount();
+    } finally {
+      cleanup();
+      localStorage.clear();
+      createSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never records non-existent or failed .xlsx/.docx server_file previews into Cloud Docs Recent', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ item: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, sendMsg } = makeWsFactory();
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+
+    try {
+      const errorCases = [
+        { path: '/Users/k/Documents/clawd/芝加哥机房配件箱设备清单.xlsx', error: 'not_found' },
+        { path: '/Users/k/Documents/clawd/missing-dir/Report.docx', error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND },
+        { path: '/Users/k/Documents/clawd/no-dl.xlsx', error: FS_READ_ERROR_CODES.BINARY_FILE },
+      ];
+
+      for (const tc of errorCases) {
+        const view = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-missing-xlsx"
+            mode="file-single"
+            layout="panel"
+            initialPath="/Users/k/Documents/clawd"
+            autoPreviewPath={tc.path}
+            onConfirm={vi.fn()}
+          />,
+        );
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: tc.path,
+            status: 'error',
+            error: tc.error,
+          } as unknown as ServerMessage);
+        });
+        await waitFor(() => expect(view.container.querySelector('.fb-preview-error')).toBeTruthy());
+        expect(recentCalls(), `expected zero recent calls for failed office read (${tc.error})`).toHaveLength(0);
+        view.unmount();
+      }
+    } finally {
+      globalThis.ResizeObserver = prevResizeObserver;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('hides all Share controls when canShare=false and readOnly=false while keeping Download, Edit, Create, Rename, and Delete', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser
+        ws={ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/home/user"
+        canShare={false}
+        readOnly={false}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'notes.txt', isDir: false, downloadId: 'dl-notes' }], '/home/user');
+    });
+
+    // Toolbar create & upload remain available, toolbar share button hidden
+    expect(screen.queryByTestId('fb-toolbar-share-btn')).toBeNull();
+    expect(container.querySelector('.fb-create-file-btn')).toBeTruthy();
+    expect(container.querySelector('.fb-create-folder-btn')).toBeTruthy();
+
+    // Context menu shows Rename & Delete, omits Share
+    const fileItem = screen.getByText('notes.txt').closest('.fb-node') as HTMLElement;
+    fireEvent.contextMenu(fileItem);
+    expect(screen.getByText('Rename')).toBeTruthy();
+    expect(screen.getByText('Delete')).toBeTruthy();
+    expect(screen.queryByText('Share')).toBeNull();
+    expect(screen.queryByText('doc_share.share_btn')).toBeNull();
+
+    // Open preview -> Download, Edit, Copy path shown, fb-preview-share-btn hidden
+    fireEvent.click(fileItem);
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/notes.txt',
+        status: 'ok',
+        content: 'hello participant',
+        downloadId: 'dl-notes',
+      } as unknown as ServerMessage);
+    });
+    expect(screen.queryByTestId('fb-preview-share-btn')).toBeNull();
+    expect(screen.getByText('fileBrowser.edit')).toBeTruthy();
+    expect(screen.getByText('upload.download_file')).toBeTruthy();
+    expect(screen.getByTitle('/home/user/notes.txt')).toBeTruthy();
+  });
+
+  it('shows Download button on .zip/binary and ls-downloadId fallback previews, and scopes chatFileReference only when scopeToSessionRoot=true', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+
+    // 1. Server participant / owner (scopeToSessionRoot=false): does NOT pass sessionName; binary .zip with downloadId renders Download
+    const firstView = render(
+      <FileBrowser
+        ws={ws}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        scopeToSessionRoot={false}
+        canShare={false}
+        mode="file-single"
+        layout="panel"
+        initialPath="/outside"
+        autoPreviewPath="/outside/archive.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect((ws.fsReadFile as any)).toHaveBeenCalledWith('/outside/archive.zip');
+    await act(async () => {
+      respond([{ name: 'archive.zip', isDir: false, downloadId: 'dl-zip-1' }], '/outside');
+    });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/outside/archive.zip',
+        status: 'error',
+        error: FS_READ_ERROR_CODES.BINARY_FILE,
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('upload.download_file')).toBeTruthy();
+    firstView.unmount();
+
+    // 2. FORBIDDEN_PATH does NOT use ls downloadId fallback
+    const { ws: wsForbidden, respond: respondForbidden, sendMsg: sendForbidden } = makeWsFactory();
+    const forbiddenView = render(
+      <FileBrowser
+        ws={wsForbidden}
+        serverId="srv-1"
+        mode="file-single"
+        layout="panel"
+        initialPath="/outside"
+        autoPreviewPath="/outside/secret.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      respondForbidden([{ name: 'secret.zip', isDir: false, downloadId: 'dl-secret' }], '/outside');
+    });
+    await act(async () => {
+      sendForbidden({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/outside/secret.zip',
+        status: 'error',
+        error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+      } as unknown as ServerMessage);
+    });
+    expect(screen.queryByText('upload.download_file')).toBeNull();
+    forbiddenView.unmount();
+
+    // 3. Tab-share autoPreviewPath (scopeToSessionRoot=true) passes { chatFileReference: true }
+    const { ws: wsScoped } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={wsScoped}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        scopeToSessionRoot={true}
+        mode="file-single"
+        layout="panel"
+        initialPath=":session-root:"
+        autoPreviewPath="/tmp/shared-chat.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect((wsScoped.fsReadFile as any)).toHaveBeenCalledWith('/tmp/shared-chat.zip', 'deck_proj_brain', { chatFileReference: true });
+  });
+
+  it('renders changes in batches with load-more, shows exact totalCount and truncation notice, and resets on repo switch', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const files = Array.from({ length: CHANGES_RENDER_BATCH_SIZE + 25 }, (_, idx) => ({
+      path: `/home/repo-a/src/file-${String(idx).padStart(4, '0')}.ts`,
+      code: idx < 5 ? 'M' : '??',
+    }));
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/repo-a"
+        changesRootPath="/home/repo-a"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => { respond([], '/home/repo-a'); });
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/repo-a',
+        resolvedPath: '/home/repo-a',
+        status: 'ok',
+        files,
+        totalCount: 40824,
+        truncated: true,
+      } as ServerMessage);
+    });
+
+    // Exact totalCount shown in badge & truncation notice rendered
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('40824');
+    expect(screen.getByTestId('fb-changes-truncated-notice')).toBeTruthy();
+
+    // Only the first batch is rendered initially
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE);
+    const loadMoreBtn = screen.getByTestId('fb-changes-load-more');
+    expect(loadMoreBtn).toBeTruthy();
+
+    // Clicking Load more renders remaining entries in the fetched slice
+    await act(async () => { fireEvent.click(loadMoreBtn); });
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE + 25);
+    expect(screen.queryByTestId('fb-changes-load-more')).toBeNull();
+
+    // Switching changesRootPath resets the batch limit back to CHANGES_RENDER_BATCH_SIZE
+    const repoBFiles = Array.from({ length: CHANGES_RENDER_BATCH_SIZE + 10 }, (_, idx) => ({
+      path: `/home/repo-b/src/b-${String(idx).padStart(4, '0')}.ts`,
+      code: 'M',
+    }));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/repo-b"
+        changesRootPath="/home/repo-b"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/repo-b',
+        resolvedPath: '/home/repo-b',
+        status: 'ok',
+        files: repoBFiles,
+        totalCount: CHANGES_RENDER_BATCH_SIZE + 10,
+        truncated: false,
+      } as ServerMessage);
+    });
+
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE);
+    expect(screen.getByTestId('fb-changes-load-more')).toBeTruthy();
+    expect(screen.queryByTestId('fb-changes-truncated-notice')).toBeNull();
+  });
+});
+
+describe('FileBrowser — memory LRU cache, isolation, and expanded subtree preservation', () => {
+  function makeTrackedWs() {
+    const handlers = new Set<(msg: ServerMessage) => void>();
+    let seq = 0;
+    const reqByPath = new Map<string, string>();
+    const fsListDir = vi.fn((path: string) => {
+      const id = `ls-${++seq}`;
+      reqByPath.set(path, id);
+      return id;
+    });
+    const fsGitStatus = vi.fn((_path: string, _opts?: any) => `git-${++seq}`);
+    const ws = {
+      connected: true,
+      onMessage: vi.fn((cb: (msg: ServerMessage) => void) => {
+        handlers.add(cb);
+        return () => { handlers.delete(cb); };
+      }),
+      fsListDir,
+      fsGitStatus,
+      fsReadFile: vi.fn(() => `read-${++seq}`),
+      fsGitDiff: vi.fn(() => `diff-${++seq}`),
+      forgetOwnedDataRequest: vi.fn(),
+    } as unknown as WsClient;
+    const emit = (msg: ServerMessage) => {
+      for (const cb of [...handlers]) cb(msg);
+    };
+    return { ws, fsListDir, fsGitStatus, reqByPath, emit };
+  }
+
+  it('hydrates tree, expanded subdirs, modified badges, and changes immediately on remount and refreshes silently without collapsing', async () => {
+    const first = makeTrackedWs();
+    const { unmount } = render(
+      <FileBrowser
+        ws={first.ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      first.emit({
+        type: 'fs.ls_response',
+        requestId: first.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [
+          { name: 'src', isDir: true },
+          { name: 'README.md', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('src')).toBeTruthy();
+    expect(screen.getByText('README.md')).toBeTruthy();
+
+    // Expand src/
+    await act(async () => {
+      fireEvent.click(screen.getByText('src'));
+    });
+    await act(async () => {
+      first.emit({
+        type: 'fs.ls_response',
+        requestId: first.reqByPath.get('/srv/proj/src'),
+        path: '/srv/proj/src',
+        resolvedPath: '/srv/proj/src',
+        status: 'ok',
+        entries: [{ name: 'index.ts', isDir: false }],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('index.ts')).toBeTruthy();
+
+    // Switch to Changes tab briefly so git-status-store caches changes list & count, then switch back to Files
+    await act(async () => {
+      fireEvent.click(screen.getByText('file_browser.tab_changes'));
+    });
+    const sharedChangesReqId = first.fsGitStatus.mock.results[first.fsGitStatus.mock.results.length - 1]?.value;
+    await act(async () => {
+      first.emit({
+        type: 'fs.git_status_response',
+        requestId: sharedChangesReqId,
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        files: [{ path: '/srv/proj/src/index.ts', code: 'M' }],
+        totalCount: 1,
+        truncated: false,
+      } as unknown as ServerMessage);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('file_browser.tab_files'));
+    });
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('1');
+    unmount();
+
+    // Remount with a fresh WS for same serverId + path: renders immediately without waiting
+    const second = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={second.ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByText('src').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('index.ts')).toBeTruthy();
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('1');
+    // Background refresh requested for both root and expanded subdir
+    expect(second.fsListDir).toHaveBeenCalledWith('/srv/proj', true, false);
+    expect(second.fsListDir).toHaveBeenCalledWith('/srv/proj/src', true, false);
+
+    // Fresh root response arrives: must preserve expanded src/ children without collapsing!
+    await act(async () => {
+      second.emit({
+        type: 'fs.ls_response',
+        requestId: second.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [
+          { name: 'src', isDir: true },
+          { name: 'README.md', isDir: false },
+          { name: 'NEW_FILE.ts', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('NEW_FILE.ts')).toBeTruthy();
+    expect(screen.getByText('index.ts')).toBeTruthy();
+
+    // Strict isolation: different serverId with same initialPath sees empty initial tree
+    cleanup();
+    const otherServer = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={otherServer.ws}
+        serverId="srv-2"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('index.ts')).toBeNull();
+    expect(screen.queryByText('NEW_FILE.ts')).toBeNull();
+    expect(document.querySelector('.fb-panel-tab-badge')).toBeNull();
+  });
+
+  it('isolates tab-share caches by sessionName and evicts oldest LRU entry beyond capacity', async () => {
+    const shareA = makeTrackedWs();
+    const { unmount } = render(
+      <FileBrowser
+        ws={shareA.ws}
+        serverId="srv-1"
+        sessionName="sess-a"
+        scopeToSessionRoot
+        mode="file-multi"
+        layout="panel"
+        initialPath="__session_root__"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      shareA.emit({
+        type: 'fs.ls_response',
+        requestId: shareA.reqByPath.get('__session_root__'),
+        path: '__session_root__',
+        resolvedPath: '__session_root__',
+        status: 'ok',
+        entries: [{ name: 'share-a-secret.txt', isDir: false }],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('share-a-secret.txt')).toBeTruthy();
+    unmount();
+
+    // Different sessionName with same __session_root__ must NOT see sess-a cache
+    const shareB = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={shareB.ws}
+        serverId="srv-1"
+        sessionName="sess-b"
+        scopeToSessionRoot
+        mode="file-multi"
+        layout="panel"
+        initialPath="__session_root__"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('share-a-secret.txt')).toBeNull();
+
+    // Bounded LRU eviction beyond FILE_BROWSER_CACHE_MAX_ENTRIES (20)
+    for (let i = 0; i <= FILE_BROWSER_CACHE_MAX_ENTRIES; i++) {
+      const k = makeFileBrowserCacheKey({
+        serverId: 'srv-lru',
+        startPath: `/proj/${i}`,
+        includeFiles: true,
+        showHidden: true,
+      });
+      setFileBrowserCache(k, {
+        data: [{ id: `/proj/${i}`, name: `p${i}`, isDir: true, children: [] }],
+        currentLabel: `/proj/${i}`,
+        expandedPaths: [`/proj/${i}`],
+        modifiedFiles: [],
+        updatedAt: Date.now(),
+      });
+    }
+    expect(getFileBrowserCache(makeFileBrowserCacheKey({
+      serverId: 'srv-lru',
+      startPath: '/proj/0',
+      includeFiles: true,
+      showHidden: true,
+    }))).toBeNull();
+    expect(getFileBrowserCache(makeFileBrowserCacheKey({
+      serverId: 'srv-lru',
+      startPath: `/proj/${FILE_BROWSER_CACHE_MAX_ENTRIES}`,
+      includeFiles: true,
+      showHidden: true,
+    }))).not.toBeNull();
+  });
+
+  it('preserves expanded subdirectory .gitignore items when root status response arrives and cleans them when subpath status updates', async () => {
+    const tracked = makeTrackedWs();
+    const gitStatusReqByPath = new Map<string, string>();
+    tracked.fsGitStatus.mockImplementation((path: string) => {
+      const id = `git-req-${path}-${tracked.fsGitStatus.mock.calls.length}`;
+      gitStatusReqByPath.set(path, id);
+      return id;
+    });
+
+    render(
+      <FileBrowser
+        ws={tracked.ws}
+        serverId="srv-git-preserve-1"
+        mode="file-single"
+        layout="panel"
+        initialPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    // Initial root ls
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.ls_response',
+        requestId: tracked.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [
+          { name: 'sub', isDir: true },
+          { name: 'root.ts', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+
+    // Expand sub/
+    await act(async () => {
+      fireEvent.click(screen.getByText('sub'));
+    });
+
+    // Sub ls response
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.ls_response',
+        requestId: tracked.reqByPath.get('/srv/proj/sub'),
+        path: '/srv/proj/sub',
+        resolvedPath: '/srv/proj/sub',
+        status: 'ok',
+        entries: [
+          { name: 'ignored-dir', isDir: true },
+          { name: 'normal.ts', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+
+    // Git status response for /srv/proj/sub marks ignored-dir as '!!'
+    const subGitReqId = gitStatusReqByPath.get('/srv/proj/sub');
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.git_status_response',
+        requestId: subGitReqId,
+        path: '/srv/proj/sub',
+        resolvedPath: '/srv/proj/sub',
+        status: 'ok',
+        files: [{ path: '/srv/proj/sub/ignored-dir', code: '!!' }],
+      } as unknown as ServerMessage);
+    });
+
+    const ignoredNode = document.querySelector('[data-path="/srv/proj/sub/ignored-dir"]');
+    expect(ignoredNode).toBeTruthy();
+    expect(ignoredNode?.classList.contains('git-ignored')).toBe(true);
+    expect(ignoredNode?.querySelector('.fb-node-git-badge')?.textContent).toBe('I');
+
+    // Root status response arrives: contains root.ts modified, but does NOT contain sub/ignored-dir
+    const rootGitReqId = gitStatusReqByPath.get('/srv/proj');
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.git_status_response',
+        requestId: rootGitReqId,
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        files: [{ path: '/srv/proj/root.ts', code: 'M' }],
+      } as unknown as ServerMessage);
+    });
+
+    // Root file has M badge
+    const rootNode = document.querySelector('[data-path="/srv/proj/root.ts"]');
+    expect(rootNode?.querySelector('.fb-node-git-badge')?.textContent).toBe('M');
+
+    // Sub ignored-dir MUST still retain git-ignored class and I badge!
+    const preservedIgnoredNode = document.querySelector('[data-path="/srv/proj/sub/ignored-dir"]');
+    expect(preservedIgnoredNode?.classList.contains('git-ignored')).toBe(true);
+    expect(preservedIgnoredNode?.querySelector('.fb-node-git-badge')?.textContent).toBe('I');
+
+    // Click refresh button: both root and expanded sub/ should be re-fetched with fsGitStatus
+    const refreshBtn = screen.getByTitle('Refresh');
+    await act(async () => {
+      fireEvent.click(refreshBtn);
+    });
+
+    expect(tracked.fsListDir).toHaveBeenCalledWith('/srv/proj/sub', true, false);
+    const refreshedSubGitReqId = gitStatusReqByPath.get('/srv/proj/sub');
+
+    // When sub itself receives a new git status response omitting ignored-dir (unignored), it is removed
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.git_status_response',
+        requestId: refreshedSubGitReqId,
+        path: '/srv/proj/sub',
+        resolvedPath: '/srv/proj/sub',
+        status: 'ok',
+        files: [],
+      } as unknown as ServerMessage);
+    });
+
+    const unignoredNode = document.querySelector('[data-path="/srv/proj/sub/ignored-dir"]');
+    expect(unignoredNode?.classList.contains('git-ignored')).toBe(false);
+  });
+
+  it('refreshes git status of expanded subdirectories on WS reconnect and remount cache restore', async () => {
+    const tracked = makeTrackedWs();
+    const { unmount } = render(
+      <FileBrowser
+        ws={tracked.ws}
+        serverId="srv-git-restore-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    // Initial root ls
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.ls_response',
+        requestId: tracked.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [{ name: 'sub', isDir: true }],
+      } as unknown as ServerMessage);
+    });
+
+    // Expand sub/
+    await act(async () => {
+      fireEvent.click(screen.getByText('sub'));
+    });
+
+    await act(async () => {
+      tracked.emit({
+        type: 'fs.ls_response',
+        requestId: tracked.reqByPath.get('/srv/proj/sub'),
+        path: '/srv/proj/sub',
+        resolvedPath: '/srv/proj/sub',
+        status: 'ok',
+        entries: [{ name: 'ignored.log', isDir: false }],
+      } as unknown as ServerMessage);
+    });
+
+    tracked.fsGitStatus.mockClear();
+
+    // WS reconnect event
+    await act(async () => {
+      tracked.emit({
+        type: 'session.event',
+        event: 'connected',
+      } as unknown as ServerMessage);
+    });
+
+    // Verifies that fsGitStatus is called for expanded subdirectory /srv/proj/sub on reconnect
+    expect(tracked.fsGitStatus).toHaveBeenCalledWith('/srv/proj');
+    expect(tracked.fsGitStatus).toHaveBeenCalledWith('/srv/proj/sub');
+
+    unmount();
+
+    // Remount with fresh WS: verifies that fsGitStatus is called for expanded subdirectory on cache restore
+    const second = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={second.ws}
+        serverId="srv-git-restore-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(second.fsGitStatus).toHaveBeenCalledWith('/srv/proj');
+    expect(second.fsGitStatus).toHaveBeenCalledWith('/srv/proj/sub');
+  });
+});
+
+describe('FileBrowser — ONLYOFFICE ↔ native plain-text editor switching', () => {
+  function makeSwitchWs() {
+    const handlers = new Set<(msg: ServerMessage) => void>();
+    let seq = 0;
+    const readReqs: Array<{ id: string; path: string }> = [];
+    const fsListDir = vi.fn(() => `ls-${++seq}`);
+    const fsReadFile = vi.fn((path: string) => {
+      const id = `read-${++seq}`;
+      readReqs.push({ id, path });
+      return id;
+    });
+    const fsWriteFile = vi.fn((_path: string, _content: string, _opts?: { expectedMtime?: number }) => `write-${++seq}`);
+    const fsGitDiff = vi.fn(() => `diff-${++seq}`);
+    const fsGitStatus = vi.fn(() => `git-${++seq}`);
+    const ws = {
+      connected: true,
+      onMessage: vi.fn((cb: (msg: ServerMessage) => void) => {
+        handlers.add(cb);
+        return () => { handlers.delete(cb); };
+      }),
+      fsListDir,
+      fsReadFile,
+      fsWriteFile,
+      fsGitDiff,
+      fsGitStatus,
+      forgetOwnedDataRequest: vi.fn(),
+    } as unknown as WsClient;
+    const emit = (msg: ServerMessage) => {
+      for (const cb of [...handlers]) cb(msg);
+    };
+    return { ws, readReqs, fsReadFile, fsWriteFile, emit };
+  }
+
+  beforeEach(() => {
+    fileEditorPropsState.toolbar = null;
+    fileEditorPropsState.content = null;
+    filePreviewPropsState.current = null;
+    try { localStorage.removeItem('fb_prefer_editor'); } catch {}
+  });
+
+  it('switches .md in ONLYOFFICE to native FileEditor with fresh mtime, saves cleanly, and switches back to ONLYOFFICE', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/onlyoffice/config')) {
+        return new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    try {
+      const { ws, readReqs, fsReadFile, fsWriteFile, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-switch"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      // Initial open enters ONLYOFFICE preview
+      expect(readReqs.some((r) => r.path === '/repo/README.md')).toBe(true);
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Initial',
+          encoding: 'utf8',
+          mtime: 1000,
+        } as unknown as ServerMessage);
+      });
+
+      const switchBtn = await screen.findByTestId('fb-switch-native-editor-btn');
+      expect(switchBtn.textContent).toBe('file_browser.native_text_editor');
+
+      // Click switch -> re-reads fresh content & bypasses auto-ONLYOFFICE -> opens FileEditor
+      await act(async () => {
+        fireEvent.click(switchBtn);
+      });
+      expect(fsReadFile).toHaveBeenCalledTimes(2);
+      const secondReq = readReqs[1]!;
+      expect(secondReq.path).toBe('/repo/README.md');
+
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: secondReq.id,
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Edited in ONLYOFFICE',
+          encoding: 'utf8',
+          mtime: 2005,
+        } as unknown as ServerMessage);
+      });
+
+      const editorEl = await screen.findByTestId('mock-file-editor-content');
+      expect(editorEl.getAttribute('data-path')).toBe('/repo/README.md');
+      expect(editorEl.getAttribute('data-mtime')).toBe('2005');
+      expect(editorEl.textContent).toBe('# Edited in ONLYOFFICE');
+      expect(fileEditorPropsState.toolbar?.mtime).toBe(2005);
+
+      // Simulate edit + save + close returning to native FilePreviewPane, then switch back to ONLYOFFICE
+      await act(async () => {
+        (fileEditorPropsState.content?.onContentChange as (v: string) => void)('# Saved natively');
+      });
+      await act(async () => {
+        ws.fsWriteFile('/repo/README.md', '# Saved natively', { expectedMtime: 2005 });
+        (fileEditorPropsState.content?.onSaved as (mtime: number) => void)(2010);
+      });
+      await act(async () => {
+        (fileEditorPropsState.toolbar?.onClose as () => void)();
+      });
+      expect(fsWriteFile).toHaveBeenCalledWith('/repo/README.md', '# Saved natively', { expectedMtime: 2005 });
+      expect(screen.queryByTestId('mock-file-editor-content')).toBeNull();
+      expect(screen.getByTestId('mock-file-preview').textContent).toBe('# Saved natively');
+
+      const toOfficeBtn = screen.getByTestId('fb-open-csv-office-btn');
+      await act(async () => {
+        fireEvent.click(toOfficeBtn);
+      });
+      expect(await screen.findByTestId('fb-switch-native-editor-btn')).toBeTruthy();
+    } finally {
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('switches .csv/.txt opened in ONLYOFFICE back to native FileEditor cleanly', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+
+    try {
+      const { ws, readReqs, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-switch"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/notes.txt"
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/repo/notes.txt',
+          status: 'ok',
+          content: 'plain line 1',
+          encoding: 'utf8',
+          mtime: 100,
+        } as unknown as ServerMessage);
+      });
+
+      // Open in ONLYOFFICE via existing button
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fb-open-csv-office-btn'));
+      });
+      const switchBtn = await screen.findByTestId('fb-switch-native-editor-btn');
+
+      await act(async () => {
+        fireEvent.click(switchBtn);
+      });
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[1]!.id,
+          path: '/repo/notes.txt',
+          status: 'ok',
+          content: 'plain line 2',
+          encoding: 'utf8',
+          mtime: 150,
+        } as unknown as ServerMessage);
+      });
+
+      const editorEl = await screen.findByTestId('mock-file-editor-content');
+      expect(editorEl.getAttribute('data-path')).toBe('/repo/notes.txt');
+      expect(editorEl.textContent).toBe('plain line 2');
+    } finally {
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('opens native Markdown preview (never FileEditor) in readOnly mode', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+
+    try {
+      // Even if fb_prefer_editor was '1', readOnly must never open FileEditor
+      localStorage.setItem('fb_prefer_editor', '1');
+      const { ws, readReqs, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-switch"
+          readOnly
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Read Only Doc',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+
+      const switchBtn = await screen.findByTestId('fb-switch-native-editor-btn');
+      expect(switchBtn.textContent).toBe('file_browser.native_text_preview');
+
+      await act(async () => {
+        fireEvent.click(switchBtn);
+      });
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[1]!.id,
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Read Only Doc',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+
+      expect(screen.getByTestId('mock-file-preview').textContent).toBe('# Read Only Doc');
+      expect(screen.queryByTestId('mock-file-editor-content')).toBeNull();
+    } finally {
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('hides native switch button for binary Office files (.docx/.xlsx/.pptx/.pdf) and cross-server shared docs', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+    const listSharedSpy = vi.spyOn(api, 'listDocsSharedWithMe').mockResolvedValue({
+      shares: [
+        {
+          id: 'share-cross-md',
+          serverId: 'srv-remote',
+          targetPath: '/remote/shared.md',
+          targetKind: 'file',
+          role: 'editor',
+          label: 'shared.md',
+          createdAt: 1,
+        } as never,
+      ],
+    });
+
+    try {
+      for (const [filePath, mimeType] of [
+        ['/repo/spec.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+        ['/repo/sheet.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+        ['/repo/deck.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+        ['/repo/report.pdf', 'application/pdf'],
+      ] as const) {
+        const { ws } = makeSwitchWs();
+        const view = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-local"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            initialPreview={{ status: 'office', path: filePath, srcUrl: '', mimeType }}
+            autoPreviewPath={filePath}
+            onConfirm={vi.fn()}
+          />,
+        );
+        expect(view.queryByTestId('fb-switch-native-editor-btn')).toBeNull();
+        view.unmount();
+      }
+
+      // Cross-server shared .md doc must hide fb-switch-native-editor-btn and never call local fsReadFile
+      const { ws, fsReadFile } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-local"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fb-toolbar-shared-docs-btn'));
+      });
+      const sharedItem = await screen.findByTestId('shared-doc-item-share-cross-md');
+      await act(async () => {
+        fireEvent.click(sharedItem);
+      });
+      expect(screen.queryByTestId('fb-switch-native-editor-btn')).toBeNull();
+      expect(fsReadFile).not.toHaveBeenCalled();
+    } finally {
+      listSharedSpy.mockRestore();
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('handles streamed .md responses without content safely and ignores stale cycle responses', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+
+    try {
+      const { ws, readReqs, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-switch"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          initialPreview={{ status: 'office', path: '/repo/large.md', srcUrl: '', mimeType: 'text/markdown' }}
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      // Click native switch, then server responds with previewMode='stream' & no content
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fb-switch-native-editor-btn'));
+      });
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/repo/large.md',
+          status: 'ok',
+          previewMode: 'stream',
+          mimeType: 'text/markdown',
+          downloadId: 'dl-large-md',
+        } as unknown as ServerMessage);
+      });
+      expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+      expect(screen.queryByTestId('mock-file-editor-content')).toBeNull();
+      expect(screen.queryByTestId('fb-switch-native-editor-btn')).toBeNull();
+
+      // Stale cycle guard: switch back to office, trigger forceNativeText, then open another file before stale read completes
+      cleanup();
+      fileEditorPropsState.toolbar = null;
+      fileEditorPropsState.content = null;
+      const race = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={race.ws}
+          serverId="srv-switch"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        race.emit({
+          type: 'fs.ls_response',
+          requestId: race.ws.fsListDir.mock.results[0]?.value,
+          path: '/repo',
+          resolvedPath: '/repo',
+          status: 'ok',
+          entries: [
+            { name: 'notes.md', isDir: false },
+            { name: 'other.ts', isDir: false },
+          ],
+        } as unknown as ServerMessage);
+      });
+      await act(async () => { fireEvent.click(screen.getByText('notes.md')); });
+      await act(async () => {
+        race.emit({
+          type: 'fs.read_response',
+          requestId: race.readReqs[0]!.id,
+          path: '/repo/notes.md',
+          status: 'ok',
+          content: '# Notes',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+
+      // Trigger forceNativeText read for notes.md (req index 1), then immediately click other.ts (req index 2)
+      await act(async () => { fireEvent.click(await screen.findByTestId('fb-switch-native-editor-btn')); });
+      await act(async () => { fireEvent.click(screen.getByText('other.ts')); });
+      expect(race.readReqs[1]!.path).toBe('/repo/notes.md');
+      expect(race.readReqs[2]!.path).toBe('/repo/other.ts');
+
+      // Stale notes.md response must be ignored; other.ts resolves normally without isEditing=true
+      await act(async () => {
+        race.emit({
+          type: 'fs.read_response',
+          requestId: race.readReqs[1]!.id,
+          path: '/repo/notes.md',
+          status: 'ok',
+          content: '# Stale notes',
+          encoding: 'utf8',
+          mtime: 99,
+        } as unknown as ServerMessage);
+      });
+      await act(async () => {
+        race.emit({
+          type: 'fs.read_response',
+          requestId: race.readReqs[2]!.id,
+          path: '/repo/other.ts',
+          status: 'ok',
+          content: 'export const ok = true;',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      expect(screen.queryByTestId('mock-file-editor-content')).toBeNull();
+      expect(screen.getByTestId('mock-file-preview').textContent).toBe('export const ok = true;');
+    } finally {
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('opens streamed .md responses with inline content in native FileEditor and keeps mtime intact', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+
+    try {
+      const { ws, readReqs, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-switch"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          initialPreview={{ status: 'office', path: '/repo/stream-inline.md', srcUrl: '', mimeType: 'text/markdown' }}
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fb-switch-native-editor-btn'));
+      });
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/repo/stream-inline.md',
+          status: 'ok',
+          previewMode: 'stream',
+          mimeType: 'text/markdown',
+          downloadId: 'dl-stream-inline',
+          content: '# Streamed inline Markdown',
+          mtime: 4321,
+        } as unknown as ServerMessage);
+      });
+
+      const editorEl = await screen.findByTestId('mock-file-editor-content');
+      expect(editorEl.getAttribute('data-path')).toBe('/repo/stream-inline.md');
+      expect(editorEl.getAttribute('data-mtime')).toBe('4321');
+      expect(editorEl.textContent).toBe('# Streamed inline Markdown');
+      expect(fileEditorPropsState.toolbar?.mtime).toBe(4321);
+    } finally {
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
+  });
+
+  it('preserves viewer readOnly state when switching a same-server shared .md doc to native preview', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => (
+      new Response(JSON.stringify({ enabled: false, fallbackReason: 'onlyoffice_disabled' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ));
+    const listSharedSpy = vi.spyOn(api, 'listDocsSharedWithMe').mockResolvedValue({
+      shares: [
+        {
+          id: 'share-same-viewer-md',
+          serverId: 'srv-local',
+          targetPath: '/shared/viewer-doc.md',
+          targetKind: 'file',
+          role: 'viewer',
+          label: 'viewer-doc.md',
+          createdAt: 1,
+        } as never,
+      ],
+    });
+
+    try {
+      localStorage.setItem('fb_prefer_editor', '1');
+      const { ws, readReqs, fsReadFile, emit } = makeSwitchWs();
+      render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-local"
+          readOnly={false}
+          canShare
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          onConfirm={vi.fn()}
+        />,
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('fb-toolbar-shared-docs-btn'));
+      });
+      const sharedItem = await screen.findByTestId('shared-doc-item-share-same-viewer-md');
+      await act(async () => {
+        fireEvent.click(sharedItem);
+      });
+
+      const switchBtn = await screen.findByTestId('fb-switch-native-editor-btn');
+      expect(switchBtn.textContent).toBe('file_browser.native_text_preview');
+
+      await act(async () => {
+        fireEvent.click(switchBtn);
+      });
+      expect(fsReadFile).toHaveBeenCalledWith('/shared/viewer-doc.md');
+
+      await act(async () => {
+        emit({
+          type: 'fs.read_response',
+          requestId: readReqs[0]!.id,
+          path: '/shared/viewer-doc.md',
+          status: 'ok',
+          content: '# Shared Viewer Content',
+          encoding: 'utf8',
+          mtime: 777,
+        } as unknown as ServerMessage);
+      });
+
+      expect(screen.getByTestId('mock-file-preview').textContent).toBe('# Shared Viewer Content');
+      expect(screen.queryByTestId('mock-file-editor-content')).toBeNull();
+      expect(screen.queryByTestId('mock-file-editor-toolbar')).toBeNull();
+      expect(screen.queryByText('fileBrowser.edit')).toBeNull();
+      expect(screen.queryByTestId('fb-preview-share-btn')).toBeNull();
+    } finally {
+      listSharedSpy.mockRestore();
+      fetchSpy.mockRestore();
+      globalThis.ResizeObserver = prevResizeObserver;
+    }
   });
 });

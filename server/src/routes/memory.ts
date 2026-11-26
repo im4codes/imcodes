@@ -20,6 +20,7 @@ import { Hono } from 'hono';
 import { randomUUID } from 'node:crypto';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
@@ -167,7 +168,9 @@ async function withProjectionFallback(
 // projection arrived through a non-MCP code path).
 
 memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c);
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const projectionId = c.req.query('projectionId')?.trim();
   const projectId = cleanMemoryProjectId(c.req.query('projectId'));
   if (!projectionId) {
@@ -213,7 +216,6 @@ memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
 // awaits the keyed reply.
 
 memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
   const projectionId = c.req.query('projectionId')?.trim();
   const projectId = cleanMemoryProjectId(c.req.query('projectId'));
@@ -222,8 +224,17 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   if (!projectionId) return c.json({ error: 'projection_id_required' }, 400);
   if (!projectId) return c.json({ error: 'not_found' }, 404);
 
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
+
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!access.ok && !(authority.kind === 'participant_daemon' && access.reason === 'share-direct-surface-denied')) {
+    return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   const projectionRow = await loadAuthorizedProjectionSourceRow(c.env.DB, {
     projectionId,

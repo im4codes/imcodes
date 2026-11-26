@@ -4,7 +4,7 @@ import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import { CopilotSdkProvider } from '../../src/agent/providers/copilot-sdk.js';
 import { CursorHeadlessProvider } from '../../src/agent/providers/cursor-headless.js';
-import { GeminiSdkProvider } from '../../src/agent/providers/gemini-sdk.js';
+import { GrokSdkProvider } from '../../src/agent/providers/grok-sdk.js';
 import { KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
 import { QwenProvider } from '../../src/agent/providers/qwen.js';
 
@@ -32,7 +32,7 @@ describe('provider session diagnostics', () => {
       new CodexSdkProvider(),
       new ClaudeCodeSdkProvider(),
       new QwenProvider(),
-      new GeminiSdkProvider(),
+      new GrokSdkProvider(),
       new KimiSdkProvider(),
       new CopilotSdkProvider(),
       new CursorHeadlessProvider(),
@@ -167,8 +167,8 @@ describe('provider session diagnostics', () => {
   });
 
   it('exposes safe active-state diagnostics for ACP SDK sessions', () => {
-    const providers: Array<[GeminiSdkProvider | KimiSdkProvider, string]> = [
-      [new GeminiSdkProvider(), 'gemini-sdk'],
+    const providers: Array<[GrokSdkProvider | KimiSdkProvider, string]> = [
+      [new GrokSdkProvider(), 'grok-sdk'],
       [new KimiSdkProvider(), 'kimi-sdk'],
     ];
 

@@ -87,7 +87,7 @@ describe('postinstall sharp repair contracts', () => {
     expect(existsSync(join(pkgRoot, 'node_modules', 'sharp'))).toBe(false);
     expect(spawnSyncMock).toHaveBeenCalledWith(
       process.execPath,
-      [npmCli, 'install', '--no-save', '--ignore-scripts', 'sharp@0.34.5'],
+      [npmCli, 'install', '--no-save', '--ignore-scripts', 'sharp@0.35.5'],
       expect.objectContaining({
         cwd: pkgRoot,
         shell: false,
@@ -107,7 +107,7 @@ describe('postinstall sharp repair contracts', () => {
 
     expect(spawnSyncMock).toHaveBeenCalledWith(
       'C:\\nodejs\\npm.cmd',
-      ['install', '--no-save', '--ignore-scripts', 'sharp@0.34.5'],
+      ['install', '--no-save', '--ignore-scripts', 'sharp@0.35.5'],
       expect.objectContaining({ shell: true }),
     );
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining('sharp repair FAILED'));

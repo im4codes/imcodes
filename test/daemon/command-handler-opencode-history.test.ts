@@ -41,6 +41,11 @@ describe('command-handler OpenCode history fallback gating', () => {
     ])).toBe(3);
   });
 
+  it('treats a delegation reply as substantive replayable history', () => {
+    expect(hasSubstantiveTimelineHistory([{ type: 'delegation.reply' }])).toBe(true);
+    expect(countSubstantiveTimelineEvents([{ type: 'delegation.reply' }])).toBe(1);
+  });
+
 
   it('widens opencode synthesized history afterTs to recover late backfilled assistant messages', () => {
     expect(getOpenCodeSynthesizedAfterTs(undefined)).toBeUndefined();

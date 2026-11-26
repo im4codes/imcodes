@@ -1,14 +1,29 @@
 import type { TimelineEvent } from './types.js';
+import { TIMELINE_HISTORY_MIN_TEXT_FLOOR } from '../../../shared/timeline-history-limits.js';
 import {
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
+  TIMELINE_USER_DELETED_PAYLOAD_KEY,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
 } from '../../../shared/timeline-protocol.js';
+import {
+  usageContextWindowSourceRank,
+  type UsageContextWindowSource,
+} from '../../../shared/usage-context-window.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
+import { isPeerAuditVerdict } from '../../../shared/peer-audit.js';
+import { getTimelineSendId, TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX, TIMELINE_SEND_METADATA_FIELDS } from '../../../shared/timeline-send-identity.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
 
 function isStreaming(event: TimelineEvent): boolean {
   return event.payload.streaming === true;
+}
+
+/** True for the durable tombstone a user delete writes (see TIMELINE_USER_DELETED_PAYLOAD_KEY). */
+export function isUserDeletedTimelineEvent(event: TimelineEvent): boolean {
+  return event.payload?.[TIMELINE_USER_DELETED_PAYLOAD_KEY] === true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -22,6 +37,10 @@ function hasDetailRefs(value: unknown): boolean {
 function getCompletenessRank(event: TimelineEvent): number {
   const eventRecord = event as unknown as Record<string, unknown>;
   const payload = event.payload;
+  // Server summary-mode projections carry stripped payloads and must always
+  // rank below full or hydrated events so a summary frame can never downgrade
+  // a full event and a full event always upgrades a cached summary copy.
+  if (eventRecord.summary === true || eventRecord.detailAvailable === true) return 0;
   const completeness = payload.completeness ?? payload.timelineCompleteness ?? eventRecord.completeness ?? eventRecord.timelineCompleteness;
   if (completeness === 'hydrated') return 2;
   if (completeness === 'full') return 1;
@@ -52,26 +71,127 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
   return left > right ? 1 : -1;
 }
 
+function isAuthoritativeDelegationAuditVerdict(event: TimelineEvent): boolean {
+  return event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+    && event.source === 'daemon'
+    && event.confidence === 'high'
+    && isPeerAuditVerdict(event.payload.verdict);
+}
+
+const USAGE_SNAPSHOT_PAYLOAD_KEYS = [
+  'inputTokens',
+  'cacheTokens',
+  'outputTokens',
+  'costUsd',
+  'codexStatus',
+] as const;
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function canShareUsageContext(preferred: TimelineEvent, alternate: TimelineEvent): boolean {
+  const preferredModel = preferred.payload.model;
+  const alternateModel = alternate.payload.model;
+  return typeof preferredModel !== 'string'
+    || typeof alternateModel !== 'string'
+    || preferredModel === alternateModel;
+}
+
 /**
- * Resolve same-eventId conflicts deterministically.
+ * A stable usage event can be updated twice by a transport provider: once with
+ * the token snapshot and later with model/context metadata from the terminal
+ * completion. Timeline storage is keyed by eventId, so treating the latter as
+ * a full replacement would erase the token snapshot and make the UI show 0.
  *
- * Preference order:
- * 1. full events over preview events
- * 2. terminal/non-streaming over streaming
- * 3. newer epoch
- * 4. newer seq
- * 5. newer ts
- * 6. incoming as tie-breaker
+ * Carry forward occupancy/cost fields, plus a stronger authoritative context
+ * window for the same model. A terminal metadata frame may contain only a
+ * model-name inference; it must not replace a provider/preset window already
+ * reported for that exact usage event.
  */
-export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
-  const completenessCmp = compareCompleteness(existing, incoming);
-  if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
+function supplementUsageSnapshot(
+  preferred: TimelineEvent,
+  alternate: TimelineEvent,
+): TimelineEvent {
+  if (preferred.type !== 'usage.update' || alternate.type !== 'usage.update') return preferred;
+  let payload: TimelineEvent['payload'] | undefined;
+  for (const key of USAGE_SNAPSHOT_PAYLOAD_KEYS) {
+    if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
+    payload ??= { ...preferred.payload };
+    payload[key] = alternate.payload[key];
+  }
+  const preferredContextRank = usageContextWindowSourceRank(preferred.payload.contextWindowSource);
+  const alternateContextRank = usageContextWindowSourceRank(alternate.payload.contextWindowSource);
+  if (
+    alternateContextRank > preferredContextRank
+    && typeof alternate.payload.contextWindow === 'number'
+    && Number.isFinite(alternate.payload.contextWindow)
+    && alternate.payload.contextWindow > 0
+    && canShareUsageContext(preferred, alternate)
+  ) {
+    payload ??= { ...preferred.payload };
+    payload.contextWindow = alternate.payload.contextWindow;
+    payload.contextWindowSource = alternate.payload.contextWindowSource as UsageContextWindowSource;
+  }
+  return payload ? { ...preferred, payload } : preferred;
+}
+
+function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  // A user delete is final. It outranks streaming/terminal, completeness (a
+  // hydrated copy is "fuller" than the tombstone) and seq (a stream delta or
+  // stale cache row arriving later has a higher seq): otherwise the message
+  // reappears on that client and the delete looks like it did nothing.
+  const existingDeleted = isUserDeletedTimelineEvent(existing);
+  const incomingDeleted = isUserDeletedTimelineEvent(incoming);
+  if (existingDeleted !== incomingDeleted) return incomingDeleted ? incoming : existing;
 
   const existingStreaming = isStreaming(existing);
   const incomingStreaming = isStreaming(incoming);
+
+  // Lifecycle first: a terminal (non-streaming) version of an event always wins
+  // over a streaming one. The turn is over; nothing about the payload can
+  // outrank that. This used to sit BELOW completeness, so a hydrated streaming
+  // snapshot outranked the very event that settled it.
   if (existingStreaming !== incomingStreaming) {
     return incomingStreaming ? existing : incoming;
   }
+
+  // One exact supervised audit can first project as released free-form prose
+  // and later as its daemon-authenticated PASS/REWORK receipt under the SAME
+  // stable event id. A history preview of the exact receipt may be ranked as
+  // truncated, but its structured verdict/round authority must still replace
+  // the non-authoritative prose card. A later hydrated receipt will then win
+  // normally among two structured verdict generations.
+  const existingAuditVerdict = isAuthoritativeDelegationAuditVerdict(existing);
+  const incomingAuditVerdict = isAuthoritativeDelegationAuditVerdict(incoming);
+  if (existingAuditVerdict !== incomingAuditVerdict) {
+    return incomingAuditVerdict ? incoming : existing;
+  }
+
+  // Then freshness, but only while the message is still in flight.
+  //
+  // Completeness ranks a hydrated payload above a truncated one, which is right
+  // for a settled event: a later preview must not downgrade text already
+  // fetched in full. Mid-stream it is backwards. Hydration rebuilds the event
+  // as `{ ...existing, payload }`, so the hydrated copy inherits the seq of the
+  // snapshot it hydrated — an OLDER generation than the deltas still arriving.
+  // Ranking it first pinned that snapshot: every later delta for the same
+  // eventId lost the merge, `mergeTimelineEvents` reported no change, and the
+  // view froze until the terminal event replaced it, so the reply landed in one
+  // block. That reads as "streaming stopped working".
+  //
+  // Both sides streaming means both are generations of one in-flight message,
+  // so a higher seq is simply the longer text. Same-generation pairs have no
+  // freshness signal and fall through to completeness below.
+  if (existingStreaming && incomingStreaming) {
+    const streamingEpochCmp = compareNumbers(incoming.epoch, existing.epoch);
+    if (streamingEpochCmp !== 0) return streamingEpochCmp > 0 ? incoming : existing;
+    const streamingSeqCmp = compareNumbers(incoming.seq, existing.seq);
+    if (streamingSeqCmp !== 0) return streamingSeqCmp > 0 ? incoming : existing;
+  }
+
+  const completenessCmp = compareCompleteness(existing, incoming);
+  if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
 
   const epochCmp = compareNumbers(incoming.epoch, existing.epoch);
   if (epochCmp !== 0) return epochCmp > 0 ? incoming : existing;
@@ -85,29 +205,114 @@ export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineE
   return incoming;
 }
 
+/**
+ * Resolve same-eventId conflicts deterministically.
+ *
+ * Preference order:
+ * 1. terminal/non-streaming over streaming — the turn is settled, and nothing
+ *    about a payload outranks that
+ * 2. between two streaming generations of one message, newer epoch then seq —
+ *    freshness, because completeness there describes a stale snapshot
+ * 3. full events over preview events
+ * 4. newer epoch
+ * 5. newer seq
+ * 6. newer ts
+ * 7. incoming as tie-breaker
+ *
+ * Steps 1 and 2 used to sit below completeness. A hydrated payload inherits the
+ * seq of the snapshot it hydrated, so ranking completeness first pinned that
+ * snapshot ahead of every delta still arriving and the message stopped updating
+ * until its terminal event landed. Keep this list in step with the code — the
+ * previous version of this comment described the old order and would have
+ * talked the next reader into restoring it.
+ */
+/**
+ * Winner between two LAST-VALUE signals.
+ *
+ * `preferTimelineEvent` exists to merge revisions of ONE event (same eventId),
+ * where ranking a hydrated payload above a truncated one is right. Last-value
+ * signals are different: they compete across different eventIds and the whole
+ * contract is "the newest value is the current value". Reusing the same-eventId
+ * comparator let an OLDER hydrated row outrank the newer current one — and the
+ * drain deletes the row it just replayed, so that stale value became permanent.
+ *
+ * Freshness therefore decides first. Completeness is only a tiebreak once
+ * epoch, seq and ts are all equal, where there is no freshness signal left and
+ * the richer payload is the better of two equals.
+ */
+export function preferLastValueSignal(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const epochCmp = compareNumbers(incoming.epoch, existing.epoch);
+  if (epochCmp !== 0) return epochCmp > 0 ? incoming : existing;
+
+  const seqCmp = compareNumbers(incoming.seq, existing.seq);
+  if (seqCmp !== 0) return seqCmp > 0 ? incoming : existing;
+
+  const tsCmp = compareNumbers(incoming.ts, existing.ts);
+  if (tsCmp !== 0) return tsCmp > 0 ? incoming : existing;
+
+  return preferTimelineEvent(existing, incoming);
+}
+
+export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const preferred = choosePreferredTimelineEvent(existing, incoming);
+  const alternate = preferred === existing ? incoming : existing;
+  return supplementUsageSnapshot(preferred, alternate);
+}
+
 export function mergeTimelineEvents(
   existingEvents: TimelineEvent[],
   incomingEvents: TimelineEvent[],
   maxEvents = 300,
 ): TimelineEvent[] {
-  const incomingById = new Map<string, TimelineEvent>();
-  for (const event of incomingEvents) {
-    const prev = incomingById.get(event.eventId);
-    incomingById.set(event.eventId, prev ? preferTimelineEvent(prev, event) : event);
-  }
-
+  // A remote viewer has no optimistic row to reconcile. Primary timeline,
+  // fallback history and older cached projections can name ONE send with
+  // different eventIds. Index its explicit send identity alongside eventId;
+  // never infer identity from text/time or override intentional repeated sends.
+  // Fold in the same O(n+m) pass, retaining the ordered-base/two-pointer merge.
+  type Slot = { event: TimelineEvent };
+  const byId = new Map<string, Slot>();
+  const bySend = new Map<string, Slot>();
+  const baseSlots: Slot[] = [];
+  const newSlots: Slot[] = [];
   let changed = false;
-  const replaced = existingEvents.map((event) => {
-    const next = incomingById.get(event.eventId);
-    if (!next) return event;
-    incomingById.delete(event.eventId);
-    const preferred = preferTimelineEvent(event, next);
-    if (preferred !== event) changed = true;
-    return preferred;
-  });
+  const ingest = (event: TimelineEvent, existing: boolean): void => {
+    const sendId = event.type === 'user.message' && !event.eventId.startsWith(TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX)
+      ? getTimelineSendId(event.payload) : undefined;
+    const sendKey = sendId ? JSON.stringify([event.sessionId, sendId]) : undefined;
+    const slot = byId.get(event.eventId) ?? (sendKey ? bySend.get(sendKey) : undefined);
+    if (!slot) {
+      const created = { event };
+      (existing ? baseSlots : newSlots).push(created);
+      byId.set(event.eventId, created);
+      if (sendKey) bySend.set(sendKey, created);
+      if (!existing) changed = true;
+      return;
+    }
+    const previous = slot.event;
+    const preferred = preferTimelineEvent(previous, event);
+    // Projection previews may omit attribution/attachments. Carry missing
+    // fields only; the preferred authoritative values (including tombstones)
+    // still win. This is confined to a proven identical send.
+    let payload: TimelineEvent['payload'] | undefined;
+    if (sendKey) {
+      const alternate = preferred === previous ? event : previous;
+      for (const key of TIMELINE_SEND_METADATA_FIELDS) {
+        if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
+        payload ??= { ...preferred.payload };
+        payload[key] = alternate.payload[key];
+      }
+    }
+    slot.event = payload ? { ...preferred, payload } : preferred;
+    byId.set(event.eventId, slot);
+    if (sendKey) bySend.set(sendKey, slot);
+    if (existing || slot.event !== previous) changed = true;
+  };
+  for (const event of existingEvents) ingest(event, true);
+  for (const event of incomingEvents) ingest(event, false);
 
-  const newEvents = [...incomingById.values()].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
-  if (!changed && newEvents.length === 0) return existingEvents;
+  if (!changed) return existingEvents;
+  const replaced = baseSlots.map((slot) => slot.event);
+  const newEvents = newSlots.map((slot) => slot.event).sort((a, b) => a.ts - b.ts || a.seq - b.seq);
 
   const merged: TimelineEvent[] = [];
   let i = 0;
@@ -121,5 +326,92 @@ export function mergeTimelineEvents(
   while (i < replaced.length) merged.push(replaced[i++]!);
   while (j < newEvents.length) merged.push(newEvents[j++]!);
 
-  return merged.length > maxEvents ? merged.slice(merged.length - maxEvents) : merged;
+  const bounded = merged.length > maxEvents ? merged.slice(merged.length - maxEvents) : merged;
+
+  // Older web builds appended late realtime terminal events at the tail even
+  // when their stable timestamp belonged to an earlier turn. That bad order
+  // can survive in IndexedDB and be supplied back as `existingEvents`. The
+  // two-pointer merge assumes an ordered base, so detect (cheap O(n)) and heal
+  // only those legacy/out-of-order arrays. This also makes a same-eventId final
+  // replacement move back ahead of a post-Stop user message on reconnect.
+  for (let index = 1; index < bounded.length; index += 1) {
+    const previous = bounded[index - 1]!;
+    const current = bounded[index]!;
+    if (previous.ts > current.ts || (previous.ts === current.ts && previous.seq > current.seq)) {
+      return [...bounded].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
+    }
+  }
+
+  return bounded;
+}
+
+/**
+ * Merge a chat window with independent text/detail tails.
+ *
+ * A normal newest-N trim is unsafe for a tool-heavy turn: a burst of tool
+ * results can evict an older assistant/user message before the text-only
+ * history request is applied. Keep bounded text rows separately, then retain
+ * the requested detail window. The caller still controls both bounds, and the
+ * durable timeline remains authoritative outside them.
+ */
+export function mergeTimelineEventsWithTextPriority(
+  existingEvents: TimelineEvent[],
+  incomingEvents: TimelineEvent[],
+  maxDetailEvents = 300,
+  maxTextEvents = maxDetailEvents,
+  maxTotalEvents = Math.max(maxDetailEvents, maxTextEvents),
+): TimelineEvent[] {
+  const merged = mergeTimelineEvents(
+    existingEvents,
+    incomingEvents,
+    Math.max(maxDetailEvents, maxTextEvents, existingEvents.length + incomingEvents.length),
+  );
+  const textTypes = TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[];
+  // Text is the user-visible conversation and must win when the two class
+  // tails cannot fit in one window. Keep as much text as the total budget
+  // allows, then spend the remaining rows on the newest tool/state details.
+  // This preserves the independent class budget without allowing the final
+  // cache bound to chronologically trim the text tail away again.
+  const totalBudget = Math.max(0, maxTotalEvents);
+  const text = merged
+    .filter((event) => textTypes.includes(event.type))
+    .slice(-Math.min(maxTextEvents, totalBudget));
+  const detailBudget = Math.max(0, totalBudget - text.length);
+  const detail = merged
+    .filter((event) => !textTypes.includes(event.type))
+    .slice(-Math.min(maxDetailEvents, detailBudget));
+  // Interleaved history (for example, one text row every few tool rows)
+  // needs a contiguous tail: selecting each class independently would punch
+  // holes through the visible timeline. Grouped tool bursts still use the
+  // class-priority selection above, which keeps a contiguous text block from
+  // being displaced by detail rows.
+  let transitions = 0;
+  let previousIsText: boolean | undefined;
+  for (const event of merged) {
+    const currentIsText = textTypes.includes(event.type);
+    if (previousIsText !== undefined && currentIsText !== previousIsText) transitions += 1;
+    previousIsText = currentIsText;
+  }
+  if (merged.length > totalBudget && transitions > 2) {
+    const chronologicalTail = merged.slice(-totalBudget);
+    const floorTarget = Math.min(maxTextEvents, totalBudget, TIMELINE_HISTORY_MIN_TEXT_FLOOR);
+    if (floorTarget <= 0) return chronologicalTail;
+    const tailTextCount = chronologicalTail.filter((event) => textTypes.includes(event.type)).length;
+    if (tailTextCount >= floorTarget) return chronologicalTail;
+    const allText = merged.filter((event) => textTypes.includes(event.type));
+    if (allText.length <= tailTextCount) return chronologicalTail;
+    const reservedText = allText.slice(-floorTarget);
+    const reservedIds = new Set(reservedText.map((event) => event.eventId));
+    const nonReservedFromTail = chronologicalTail.filter((event) => !reservedIds.has(event.eventId));
+    const remainingBudget = Math.max(0, totalBudget - reservedText.length);
+    const keptTail = remainingBudget > 0
+      ? nonReservedFromTail.slice(Math.max(0, nonReservedFromTail.length - remainingBudget))
+      : [];
+    return [...reservedText, ...keptTail].sort((left, right) => left.ts - right.ts || left.seq - right.seq);
+  }
+  const retained = [...text, ...detail].sort((left, right) => left.ts - right.ts || left.seq - right.seq);
+  if (retained.length === merged.length && retained.every((event, index) => event === merged[index])) {
+    return merged;
+  }
+  return retained;
 }

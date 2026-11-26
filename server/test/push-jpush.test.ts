@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { sendJpush, JPUSH_API_URL } from '../src/routes/push.js';
+import { PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP } from '../../shared/push-notifications.js';
 
 function mockFetchOnce(status: number, body: unknown): void {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
@@ -78,6 +79,24 @@ describe('sendJpush', () => {
         },
         options: { time_to_live: 86400 },
       });
+    });
+
+    it('sets max priority 2 for remote desktop auto unlock security alert', async () => {
+      await sendJpush(
+        'reg_id_abc',
+        {
+          userId: 'u1',
+          title: '🚨 [最高安全警示] 远程桌面自动解锁',
+          body: '[🚨 最高安全警示] 检测到免密登录凭据已被自动使用',
+          type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+        },
+        'k',
+        's',
+      );
+
+      const init = vi.mocked(global.fetch).mock.calls[0][1]!;
+      const parsed = JSON.parse(init.body as string);
+      expect(parsed.notification.android.priority).toBe(2);
     });
 
     it('emits badge_set_num + badge_class when payload.badge is provided', async () => {

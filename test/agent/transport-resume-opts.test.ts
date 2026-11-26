@@ -1,6 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { buildTransportResumeLaunchOpts } from '../../src/agent/transport-resume-opts.js';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  buildTransportResumeLaunchOpts,
+  findLegacyProviderResumeId,
+  usesDirectoryScopedSessionListing,
+  usesProviderResumeId,
+} from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 function rec(overrides: Partial<SessionRecord>): SessionRecord {
   return {
@@ -18,6 +29,20 @@ function rec(overrides: Partial<SessionRecord>): SessionRecord {
 }
 
 describe('buildTransportResumeLaunchOpts', () => {
+  it('classifies Grok with the generic provider-resume family', () => {
+    expect(usesProviderResumeId('grok-sdk')).toBe(true);
+    expect(usesProviderResumeId(AGY_SDK_PROVIDER_ID)).toBe(true);
+    expect(usesProviderResumeId('kimi-sdk')).toBe(true);
+    expect(usesProviderResumeId(HERMES_AGENT_PROVIDER_ID)).toBe(true);
+    expect(usesProviderResumeId('opencode-sdk')).toBe(true);
+    expect(usesProviderResumeId('deepseek-harness')).toBe(true);
+    expect(usesProviderResumeId('pi')).toBe(true);
+    expect(usesProviderResumeId('muse-code-sdk')).toBe(true);
+    expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe(true);
+    expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.INTERNATIONAL)).toBe(true);
+    expect(usesProviderResumeId('gemini-sdk')).toBe(false);
+  });
+
   it('carries core identity (name/projectName/role/projectDir/agentType) from the record', () => {
     const opts = buildTransportResumeLaunchOpts(rec({ name: 'deck_sub_abc', projectName: 'p', role: 'w1', projectDir: '/x' }));
     expect(opts).toMatchObject({ name: 'deck_sub_abc', projectName: 'p', role: 'w1', projectDir: '/x', agentType: 'claude-code-sdk' });
@@ -33,10 +58,32 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'claude-code-sdk', codexSessionId: 'cx-1' })).codexSessionId).toBeUndefined();
   });
 
-  it('threads providerResumeId for cursor-headless / copilot-sdk / kimi-sdk', () => {
-    for (const agentType of ['cursor-headless', 'copilot-sdk', 'kimi-sdk'] as const) {
+  it('threads providerResumeId for directory-backed and durable transport providers', () => {
+    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk', AGY_SDK_PROVIDER_ID, 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, providerResumeId: 'pr-1' }))).toMatchObject({ providerResumeId: 'pr-1' });
     }
+  });
+
+  it('preserves third-party preset routing for DSH and Pi resumes', () => {
+    for (const agentType of ['deepseek-harness', 'pi'] as const) {
+      expect(buildTransportResumeLaunchOpts(rec({ agentType, ccPreset: 'MiniMax' })))
+        .toMatchObject({ ccPreset: 'MiniMax' });
+    }
+  });
+
+  it('does not thread unproven qoder-sdk durable resume identifiers', () => {
+    const opts = buildTransportResumeLaunchOpts(rec({
+      agentType: 'qoder-sdk',
+      providerSessionId: 'route-old',
+      providerResumeId: 'resume-old',
+      codexSessionId: 'codex-old',
+      ccSessionId: 'cc-old',
+    }));
+
+    expect(opts.providerResumeId).toBeUndefined();
+    expect(opts.bindExistingKey).toBeUndefined();
+    expect(opts.codexSessionId).toBeUndefined();
+    expect(opts.ccSessionId).toBeUndefined();
   });
 
   it('threads providerSessionId as bindExistingKey only for openclaw + qwen', () => {
@@ -48,5 +95,140 @@ describe('buildTransportResumeLaunchOpts', () => {
   it('preserves parentSession so a sub-session resumes attached to its parent', () => {
     expect(buildTransportResumeLaunchOpts(rec({ name: 'deck_sub_x', parentSession: 'deck_demo_brain' })))
       .toMatchObject({ parentSession: 'deck_demo_brain' });
+  });
+
+  it('preserves explicit user requestedModel for agy-sdk while leaving unset requestedModel undefined so strictModelSelection default fallback handles synthetic and live catalogs', () => {
+    expect(buildTransportResumeLaunchOpts(rec({
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerResumeId: 'agy-1',
+      requestedModel: undefined,
+      activeModel: 'gemini-4-carbon-medium',
+    })).requestedModel).toBeUndefined();
+
+    expect(buildTransportResumeLaunchOpts(rec({
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerResumeId: 'agy-2',
+      requestedModel: 'gemini-4-argon-high',
+    })).requestedModel).toBe('gemini-4-argon-high');
+
+    for (const agentType of ['kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk'] as const) {
+      expect(buildTransportResumeLaunchOpts(rec({
+        agentType,
+        providerResumeId: 'other-1',
+        requestedModel: undefined,
+      })).requestedModel).toBeUndefined();
+    }
+  });
+});
+
+describe('findLegacyProviderResumeId', () => {
+  it('prefers an exact persisted legacy id when it still exists remotely', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ providerSessionId: 'remote-exact', label: 'Monitor' }),
+      [
+        { key: 'remote-exact', displayName: 'Different title' },
+        { key: 'remote-other', displayName: 'Monitor' },
+      ],
+    )).toBe('remote-exact');
+  });
+
+  it('recovers one uniquely named legacy conversation', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'remote-monitor', displayName: 'Monitor' },
+        { key: 'remote-worker', displayName: 'Worker' },
+      ],
+    )).toBe('remote-monitor');
+  });
+
+  it('fails closed when multiple remote conversations share the legacy label', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'remote-monitor-1', displayName: 'Monitor' },
+        { key: 'remote-monitor-2', displayName: 'Monitor' },
+      ],
+    )).toBeUndefined();
+  });
+
+  it('accepts only sessions from the exact expected directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'project-a-monitor', displayName: 'Monitor', directory: '/srv/project-a' },
+        { key: 'project-b-monitor', displayName: 'Monitor', directory: '/srv/project-b' },
+      ],
+      '/srv/project-a/',
+    )).toBe('project-a-monitor');
+  });
+
+  it('treats symlinked and canonical forms of the same directory as identical', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-transport-resume-'));
+    const canonical = join(root, 'canonical');
+    const alias = join(root, 'alias');
+    try {
+      mkdirSync(canonical);
+      symlinkSync(canonical, alias, 'dir');
+      expect(findLegacyProviderResumeId(
+        rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+        [{ key: 'remote-monitor', displayName: 'Monitor', directory: realpathSync(canonical) }],
+        alias,
+      )).toBe('remote-monitor');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an exact legacy id when it belongs to another directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'remote-exact' }),
+      [
+        { key: 'remote-exact', displayName: 'Monitor', directory: '/srv/other' },
+      ],
+      '/srv/expected',
+    )).toBeUndefined();
+  });
+
+  it('fails closed when directory-scoped results omit directory metadata', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [{ key: 'remote-monitor', displayName: 'Monitor' }],
+      '/srv/expected',
+    )).toBeUndefined();
+  });
+
+  it('fails closed when a directory-scoped lookup has only a blank directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [{ key: 'remote-monitor', displayName: 'Monitor' }],
+      '   ',
+    )).toBeUndefined();
+  });
+
+  it('does not fall back to the store name when a user label exists', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: 'Renamed monitor', providerSessionId: 'local-route' }),
+      [{ key: 'stranger', displayName: 'deck_service_monitor' }],
+    )).toBeUndefined();
+  });
+
+  it('still uses the store name when no user label exists', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: undefined, providerSessionId: 'local-route' }),
+      [{ key: 'legacy', displayName: 'deck_service_monitor' }],
+    )).toBe('legacy');
+  });
+});
+
+describe('usesDirectoryScopedSessionListing', () => {
+  it('scopes every provider listing that exposes directory-aware sessions', () => {
+    expect(usesDirectoryScopedSessionListing('opencode-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('copilot-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('kimi-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing(HERMES_AGENT_PROVIDER_ID)).toBe(true);
+    expect(usesDirectoryScopedSessionListing('grok-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('cursor-headless')).toBe(false);
+    expect(usesDirectoryScopedSessionListing(AGY_SDK_PROVIDER_ID)).toBe(false);
   });
 });

@@ -4,14 +4,30 @@ import { useTranslation } from 'react-i18next';
 interface Props {
   x: number;
   y: number;
-  onRename: () => void;
-  onUpgrade: () => void;
+  pinned: boolean;
+  pushMuted?: boolean;
+  onTogglePin: () => void;
+  onTogglePushMute?: () => void;
+  onRename?: () => void;
+  onUpgrade?: () => void;
   onUpgradeAll?: () => void;
-  onDelete: () => void;
+  onDelete?: () => void;
   onClose: () => void;
 }
 
-export function ServerContextMenu({ x, y, onRename, onUpgrade, onUpgradeAll, onDelete, onClose }: Props) {
+export function ServerContextMenu({
+  x,
+  y,
+  pinned,
+  pushMuted = false,
+  onTogglePin,
+  onTogglePushMute,
+  onRename,
+  onUpgrade,
+  onUpgradeAll,
+  onDelete,
+  onClose,
+}: Props) {
   const { t } = useTranslation();
   const ref = useRef<HTMLDivElement>(null);
 
@@ -28,28 +44,61 @@ export function ServerContextMenu({ x, y, onRename, onUpgrade, onUpgradeAll, onD
     };
   }, [onClose]);
 
-  // Clamp menu to viewport
+  // Clamp menu to viewport (accounts for optional items)
+  const hasOwnerActionsBeforeDelete = Boolean(onTogglePushMute || onRename || onUpgrade || onUpgradeAll);
+  const estimatedWidth = onTogglePushMute ? 196 : 160;
+  const estimatedHeight =
+    40
+    + (onTogglePushMute ? 36 : 0)
+    + (onRename ? 36 : 0)
+    + (onUpgrade ? 36 : 0)
+    + (onUpgradeAll ? 36 : 0)
+    + (onDelete ? (hasOwnerActionsBeforeDelete ? 44 : 36) : 0);
   const style: Record<string, string | number> = { position: 'fixed', left: x, top: y };
-  if (x + 160 > window.innerWidth) style.left = window.innerWidth - 164;
-  if (y + 100 > window.innerHeight) style.top = y - 100;
+  if (x + estimatedWidth > window.innerWidth) style.left = Math.max(4, window.innerWidth - estimatedWidth - 4);
+  if (y + estimatedHeight > window.innerHeight) style.top = Math.max(4, y - estimatedHeight);
 
   return (
     <div ref={ref} class="server-ctx-menu" style={style}>
-      <button class="server-ctx-item" onClick={() => { onClose(); onRename(); }}>
-        {t('session.rename')}
+      <button
+        class="server-ctx-item"
+        data-testid="server-ctx-toggle-pin"
+        onClick={() => { onClose(); onTogglePin(); }}
+      >
+        {t(pinned ? 'server.unpin' : 'server.pin')}
       </button>
-      <button class="server-ctx-item" onClick={() => { onClose(); onUpgrade(); }}>
-        {t('server.upgrade_daemon')}
-      </button>
+      {onTogglePushMute && (
+        <button
+          class="server-ctx-item"
+          data-testid="server-ctx-toggle-push-mute"
+          onClick={() => { onClose(); onTogglePushMute(); }}
+        >
+          {t(pushMuted ? 'server.unmute_notifications' : 'server.mute_notifications')}
+        </button>
+      )}
+      {onRename && (
+        <button class="server-ctx-item" onClick={() => { onClose(); onRename(); }}>
+          {t('session.rename')}
+        </button>
+      )}
+      {onUpgrade && (
+        <button class="server-ctx-item" onClick={() => { onClose(); onUpgrade(); }}>
+          {t('server.upgrade_daemon')}
+        </button>
+      )}
       {onUpgradeAll && (
         <button class="server-ctx-item" onClick={() => { onClose(); onUpgradeAll(); }}>
           {t('server.upgrade_all')}
         </button>
       )}
-      <div class="menu-divider" />
-      <button class="server-ctx-item server-ctx-item-danger" onClick={() => { onClose(); onDelete(); }}>
-        {t('server.delete')}
-      </button>
+      {onDelete && (
+        <>
+          {hasOwnerActionsBeforeDelete && <div class="menu-divider" />}
+          <button class="server-ctx-item server-ctx-item-danger" onClick={() => { onClose(); onDelete(); }}>
+            {t('server.delete')}
+          </button>
+        </>
+      )}
     </div>
   );
 }

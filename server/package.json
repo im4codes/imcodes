@@ -11,31 +11,32 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:all": "npm test && npm run test:integration",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:legacy": "tsc6 --noEmit"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.1.0",
-    "@hono/node-server": "^1.13.0",
-    "@simplewebauthn/server": "^10.0.1",
+    "@hono/node-server": "^2.1.11",
+    "@huggingface/transformers": "^4.3.2",
+    "@simplewebauthn/server": "^14.1.0",
     "croner": "^10.0.1",
-    "hono": "^4.0.0",
-    "jose": "^6.2.1",
-    "node-cron": "^3.0.0",
-    "pg": "^8.13.0",
-    "proxy-addr": "^2.0.7",
-    "ws": "^8.18.0",
-    "zod": "^3.22.0"
+    "hono": "^4.13.20",
+    "jose": "^6.2.18",
+    "node-cron": "^4.6.0",
+    "pg": "^8.23.1",
+    "proxy-addr": "^2.0.8",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@testcontainers/postgresql": "^11.12.0",
     "@types/node": "^24.0.0",
-    "@types/node-cron": "^3.0.0",
     "@types/pg": "^8.11.0",
     "@types/proxy-addr": "^2.0.3",
     "@types/ws": "^8.5.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "testcontainers": "^11.12.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.3.0",
-    "vitest": "^1.0.0"
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^3.2.7"
   }
 }

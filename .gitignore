@@ -63,3 +63,13 @@ tmp/
 .imc/
 
 docs/
+dist-node-exe
+apps/pc-app/release/
+.pc-app-stage/
+
+# Chat-timeline performance harness: build output and Playwright run artifacts.
+web/dist-fixtures/
+web/test-results/
+web/playwright-report/
+
+deliverable/

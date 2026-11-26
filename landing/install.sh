@@ -110,7 +110,89 @@ probe() {  # open-internet check: exactly HTTP 204 within 3s (curl). Any other
 # or nothing if absent. Pure (no I/O) so it can be unit-tested directly —
 # see test/install/install-sh.test.ts.
 node_shasum_for() {
-  printf '%s\n' "$1" | awk -v f="$2" '$2==f {print $1; exit}'
+  # Read the complete manifest even after the first match. With `pipefail`, an
+  # early awk exit can close the pipe while printf is still writing a large
+  # SHASUMS body, turning a correct match into SIGPIPE (exit 141).
+  printf '%s\n' "$1" | awk -v f="$2" '!found && $2==f {print $1; found=1}'
+}
+
+r2_channel_for_channel() {
+  case "$1" in
+    dev) printf 'dev' ;;
+    latest) printf 'master' ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_daemon_r2_manifest() {
+  node -e '
+    const ch = process.argv[1];
+    let raw = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => { raw += d; });
+    process.stdin.on("end", () => {
+      try {
+        const m = JSON.parse(raw);
+        if (!m || typeof m !== "object") process.exit(1);
+        if (m.channel !== ch || m.filename !== "imcodes-latest.tgz") process.exit(1);
+        if (typeof m.version !== "string" || !m.version.trim()) process.exit(1);
+        if (typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(m.sha256)) process.exit(1);
+        if (typeof m.sizeBytes !== "number" || !Number.isSafeInteger(m.sizeBytes) || m.sizeBytes <= 0) process.exit(1);
+        process.stdout.write(`${m.version.trim()}\t${m.sha256.toLowerCase()}\t${m.sizeBytes}\n`);
+      } catch {
+        process.exit(1);
+      }
+    });
+  ' "$1"
+}
+
+try_install_from_r2() {
+  local ch="$1" npm_bin="$2" npm_reg="$3"
+  local r2_opt_out="${IMCODES_USE_R2:-${USE_R2_ARTIFACT:-}}"
+  if [ "$r2_opt_out" = "false" ] || [ "$r2_opt_out" = "0" ]; then
+    return 1
+  fi
+  local r2_channel
+  r2_channel=$(r2_channel_for_channel "$ch") || return 1
+  local r2_base="${IMCODES_R2_BASE_URL:-https://dl.im.codes}"
+  r2_base="${r2_base%/}"
+  case "$r2_base" in
+    https://*) ;;
+    *) return 1 ;;
+  esac
+
+  local manifest_url="$r2_base/$r2_channel/npm/latest.json"
+  local tgz_url="$r2_base/$r2_channel/npm/imcodes-latest.tgz"
+  local manifest_json parsed r2_ver expected_sha expected_size r2_tmp tgz_file actual_size
+
+  manifest_json=$(fetch_stdout "$manifest_url" 2>/dev/null) || return 1
+  parsed=$(printf '%s' "$manifest_json" | parse_daemon_r2_manifest "$r2_channel" 2>/dev/null) || return 1
+  IFS=$'\t' read -r r2_ver expected_sha expected_size <<< "$parsed"
+  [ -n "$r2_ver" ] && [ -n "$expected_sha" ] && [ -n "$expected_size" ] || return 1
+
+  r2_tmp="$(mktemp -d "${TMPDIR:-/tmp}/imcodes-r2-XXXXXX")" || return 1
+  tgz_file="$r2_tmp/imcodes-latest.tgz"
+  ok "downloading imcodes@$r2_ver from R2 ($r2_channel)..."
+  if ! fetch_file "$tgz_url" "$tgz_file"; then
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  actual_size=$(wc -c < "$tgz_file" 2>/dev/null | tr -d '[:space:]')
+  if [ "$actual_size" != "$expected_size" ]; then
+    echo "R2 size mismatch for imcodes-latest.tgz (expected $expected_size, got ${actual_size:-?})" >&2
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  if ! verify_sha256 "$tgz_file" "$expected_sha"; then
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  if ! "$npm_bin" install -g "$tgz_file" --no-fund --no-audit --registry "$npm_reg"; then
+    rm -rf "$r2_tmp"
+    return 1
+  fi
+  rm -rf "$r2_tmp"
+  return 0
 }
 
 # Test hook: when sourced with IMCODES_INSTALL_LIB=1 (unit tests), stop here so
@@ -260,9 +342,14 @@ else
   esac
 fi
 
-# ── Install the daemon (plain dist-tag; explicit --registry, no global config) ─
+# ── Install the daemon (R2 primary, npm fallback) ─────────────────────────────
 step "Installing imcodes@$CHANNEL ..."
-"$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit --registry "$NPM_REGISTRY"
+if try_install_from_r2 "$CHANNEL" "$NPM" "$NPM_REGISTRY"; then
+  :
+else
+  note "R2 install unavailable or failed — falling back to npm ($NPM_REGISTRY)..."
+  "$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit --registry "$NPM_REGISTRY"
+fi
 
 # ── Persist PATH to shell rc files (only when we added a dir) ──────────────────
 #    Written as a single managed block delimited by begin/end markers so a re-run

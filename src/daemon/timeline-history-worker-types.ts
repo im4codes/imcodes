@@ -25,10 +25,13 @@ export interface TimelineHistoryBuildJobInput {
   sessionName: string;
   limit: number;
   afterTs?: number;
+  afterSeq?: number;
+  epoch?: number;
   beforeTs?: number;
   maxResponseBytes?: number;
   contentTypes: TimelineEventType[];
   stateTypes: TimelineEventType[];
+  preserveTextFloor?: boolean;
 }
 
 export interface TimelineHistoryWorkerRequest extends TimelineHistoryBuildJobInput, TimelineHistoryWorkerIdentity {}
@@ -43,6 +46,7 @@ export interface TimelineHistoryWorkerSuccess extends TimelineHistoryWorkerIdent
   droppedEvents: number;
   truncatedEvents: number;
   hasMore?: boolean;
+  cursorFloorTs?: number;
   readMs: number;
   sanitizeMs: number;
 }

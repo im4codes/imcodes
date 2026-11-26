@@ -46,6 +46,8 @@ export interface FileEditorProps {
   onContentChange?: (content: string) => void;
   /** Dirty state driven by parent (FileEditorContent via FileBrowser) */
   isDirty?: boolean;
+  /** Session whose project directory scopes file writes. */
+  sessionName?: string;
 }
 
 /** Detect CodeMirror language extension from file path */
@@ -74,7 +76,12 @@ function getLanguageExtension(path: string) {
   }
 }
 
-export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp }: FileEditorProps) {
+function isFileTooLargeSaveError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE || message.includes('Message too large');
+}
+
+export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp, sessionName }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
   // Keep local mtime in sync when parent updates (e.g. after file reload or conflict resolution)
@@ -85,16 +92,38 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
   const [saveError, setSaveError] = useState<string | null>(null);
   const pendingWriteRef = useRef(new Map<string, string>());
   const timeoutRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const resetSavingAfterDelay = useCallback((status: 'error' | 'timeout') => {
+    setTimeout(() => setSaveStatus((s) => s === status ? 'idle' : s), status === 'timeout' ? 4000 : 3000);
+  }, []);
+  const clearPendingWrite = useCallback((requestId: string) => {
+    pendingWriteRef.current.delete(requestId);
+    const timer = timeoutRef.current.get(requestId);
+    if (timer) clearTimeout(timer);
+    timeoutRef.current.delete(requestId);
+  }, []);
+  const failPendingWrites = useCallback(() => {
+    if (pendingWriteRef.current.size === 0) return;
+    for (const requestId of pendingWriteRef.current.keys()) {
+      clearPendingWrite(requestId);
+    }
+    setSaveStatus('timeout');
+    setSaveError(t('fileBrowser.saveTimeout'));
+    resetSavingAfterDelay('timeout');
+  }, [clearPendingWrite, resetSavingAfterDelay, t]);
   // Listen for fs.write_response
   useEffect(() => {
     return onMessage((msg) => {
+      if (
+        msg.type === 'session.event'
+        && (msg as { event?: unknown }).event === 'disconnected'
+      ) {
+        failPendingWrites();
+        return;
+      }
       if (msg.type !== 'fs.write_response') return;
       const filePath = pendingWriteRef.current.get(msg.requestId);
       if (!filePath) return;
-      pendingWriteRef.current.delete(msg.requestId);
-      // Clear the timeout timer for this request
-      const timer = timeoutRef.current.get(msg.requestId);
-      if (timer) { clearTimeout(timer); timeoutRef.current.delete(msg.requestId); }
+      clearPendingWrite(msg.requestId);
 
       if (msg.status === 'ok') {
         setOriginalMtime(msg.mtime);
@@ -107,19 +136,42 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         if (msg.diskMtime) setOriginalMtime(msg.diskMtime);
         setSaveStatus('error');
         setSaveError(t('fileBrowser.conflictTitle', 'File changed on disk'));
-        setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
+        resetSavingAfterDelay('error');
       } else {
         setSaveStatus('error');
         setSaveError(msg.error === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
-        setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
+        resetSavingAfterDelay('error');
       }
     });
-  }, [onMessage, onSaved, t, ws, path, currentContent, content]);
+  }, [clearPendingWrite, failPendingWrites, onMessage, onSaved, resetSavingAfterDelay, t, ws, path, currentContent, content]);
+
+  useEffect(() => () => {
+    for (const timer of timeoutRef.current.values()) clearTimeout(timer);
+    timeoutRef.current.clear();
+    pendingWriteRef.current.clear();
+  }, []);
 
   const doSave = useCallback((forceWrite = false) => {
+    if (ws.connected === false) {
+      setSaveStatus('timeout');
+      setSaveError(t('fileBrowser.saveTimeout'));
+      resetSavingAfterDelay('timeout');
+      return;
+    }
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
+    let requestId: string;
+    try {
+      requestId = ws.fsWriteFile(path, currentContent ?? content, {
+        ...(forceWrite ? {} : { expectedMtime: originalMtime }),
+        ...(sessionName ? { sessionName } : {}),
+      });
+    } catch (error) {
+      setSaveStatus('error');
+      setSaveError(isFileTooLargeSaveError(error) ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
+      resetSavingAfterDelay('error');
+      return;
+    }
     pendingWriteRef.current.set(requestId, path);
     const tid = setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {
@@ -127,11 +179,11 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         timeoutRef.current.delete(requestId);
         setSaveStatus('timeout');
         setSaveError(t('fileBrowser.saveTimeout'));
-        setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
+        resetSavingAfterDelay('timeout');
       }
     }, 30_000);
     timeoutRef.current.set(requestId, tid);
-  }, [ws, path, originalMtime, t, currentContent, content]);
+  }, [ws, path, currentContent, content, originalMtime, t, resetSavingAfterDelay]);
 
   // Cmd+S / Ctrl+S
   useEffect(() => {
@@ -164,7 +216,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange, onSaved, onMtimeUpdate }: Omit<FileEditorProps, 'onClose'> & { onMtimeUpdate?: (mtime: number) => void }) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange, onSaved, onMtimeUpdate, sessionName }: Omit<FileEditorProps, 'onClose'> & { onMtimeUpdate?: (mtime: number) => void }) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
@@ -268,7 +320,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
             <div class="fb-conflict-actions">
               <button class="btn btn-primary" onClick={() => {
                 setConflictData(null);
-                const requestId = ws.fsWriteFile(path, currentContentRef.current);
+                const requestId = ws.fsWriteFile(path, currentContentRef.current, sessionName ? { sessionName } : undefined);
                 pendingWriteRef.current.set(requestId, path);
               }}>{t('fileBrowser.conflictKeepMine')}</button>
               <button class="btn btn-secondary" onClick={() => {
