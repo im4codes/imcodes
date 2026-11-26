@@ -952,6 +952,8 @@ export interface HookServerOptions {
     tool: MemoryMcpDaemonToolName,
     input?: unknown,
   ) => Promise<Record<string, unknown>>;
+  /** Test seam; production dynamically imports `./memory-mcp-http.js` on the first `/mcp` request. */
+  loadMemoryMcpHttp?: () => Promise<Pick<typeof import('./memory-mcp-http.js'), 'createMemoryMcpHttpHandler'>>;
   /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
   memoryMcpServerId?: string;
   /** Test seam; production is closeSessionOnBehalf (the daemon decides who may close what). */
@@ -986,19 +988,38 @@ export async function startHookServer(
   let memoryMcpHttp: MemoryMcpHttpHandler | null = null;
   let memoryMcpHttpPromise: Promise<MemoryMcpHttpHandler | null> | null = null;
   let memoryMcpHttpClosed = false;
+  let listenerBound = false;
+  let rebinding = false;
+
+  const isTerminalCloseOrClosed = (): boolean =>
+    memoryMcpHttpClosed
+    || intentionallyClosing.has(server)
+    || (listenerBound && !rebinding && !options.rebindOnListenerLoss && !server.listening);
 
   const getMemoryMcpHttpHandler = async (): Promise<MemoryMcpHttpHandler | null> => {
-    if (memoryMcpHttpClosed) return null;
+    if (isTerminalCloseOrClosed()) {
+      memoryMcpHttpClosed = true;
+      return null;
+    }
     if (memoryMcpHttp) return memoryMcpHttp;
     if (!memoryMcpHttpPromise) {
       memoryMcpHttpPromise = (async () => {
-        const { createMemoryMcpHttpHandler } = await import('./memory-mcp-http.js');
-        if (memoryMcpHttpClosed) return null;
+        const loader = options.loadMemoryMcpHttp ?? (() => import('./memory-mcp-http.js'));
+        const { createMemoryMcpHttpHandler } = await loader();
+        if (isTerminalCloseOrClosed()) {
+          memoryMcpHttpClosed = true;
+          return null;
+        }
         const handler = createMemoryMcpHttpHandler({
           port: () => boundPort,
           memoryMcpServerId: options.memoryMcpServerId,
           invokeMemoryMcpTool: options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool,
         });
+        if (isTerminalCloseOrClosed()) {
+          memoryMcpHttpClosed = true;
+          await handler.closeAll().catch(() => {});
+          return null;
+        }
         memoryMcpHttp = handler;
         return handler;
       })().catch((err) => {
@@ -1950,8 +1971,11 @@ export async function startHookServer(
   };
 
   serverCloseCleanups.set(server, () => closeMemoryMcpHttp());
-  server.once('close', () => {
+  server.on('close', () => {
     clearLiveHookServerPort(server);
+    if (!rebinding && (!options.rebindOnListenerLoss || intentionallyClosing.has(server))) {
+      void closeMemoryMcpHttp();
+    }
   });
 
   const rebindOnce = async (cause: string): Promise<number> => {
@@ -1981,7 +2005,6 @@ export async function startHookServer(
     return port;
   };
 
-  let rebinding = false;
   const handleUnexpectedLoss = (cause: string, err?: unknown): void => {
     if (intentionallyClosing.has(server) || rebinding) return;
     if (!options.rebindOnListenerLoss) return;
@@ -2043,6 +2066,7 @@ export async function startHookServer(
   };
 
   const port = await bindWithin(preferredPort);
+  listenerBound = true;
   if (port !== preferredPort) {
     logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port');
   } else {

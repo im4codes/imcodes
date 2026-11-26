@@ -1079,17 +1079,26 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
     srv.closeAllConnections?.();
   });
 
-  it('lazy-loads /mcp across concurrent first requests and handles close/rebind before any /mcp request', async () => {
-    const authorityHome1 = tempAuthorityHome();
-    const { server: idleServer } = await startHookServer(() => {}, {
-      authorityHome: authorityHome1,
-      bindListener: listenEphemeral,
-      rebindOnListenerLoss: true,
+  it('lazy-loads /mcp once under concurrency and cleans up on both closeHookServer and native server.close()', async () => {
+    const trackedReapTimers = new Set<ReturnType<typeof setInterval>>();
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((fn: TimerHandler, ms?: number, ...args: unknown[]) => {
+      const id = realSetInterval(fn, ms, ...args);
+      if (typeof fn === 'function' && fn.name === 'reapIdleEntries') {
+        trackedReapTimers.add(id);
+      }
+      return id;
+    }) as typeof setInterval);
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval').mockImplementation(((id?: ReturnType<typeof setInterval>) => {
+      if (id !== undefined) trackedReapTimers.delete(id);
+      return realClearInterval(id);
+    }) as typeof clearInterval);
+    cleanups.push(async () => {
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
     });
-    // Closing without ever receiving /mcp resolves cleanly and needs no HTTP MCP teardown.
-    await expect(closeHookServer(idleServer)).resolves.toBeUndefined();
 
-    const authorityHome2 = tempAuthorityHome();
     getSessionMock.mockImplementation((name: string) => ({
       name,
       state: 'idle',
@@ -1101,16 +1110,68 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
       hookCredential: `cred-${name}`,
     }));
 
-    const { server, port: port1 } = await startHookServer(() => {}, {
-      authorityHome: authorityHome2,
+    // 1. Unvisited close (both closeHookServer and direct native server.close()): 0 loader & 0 factory calls.
+    let unvisitedLoaderCalls = 0;
+    let unvisitedFactoryCalls = 0;
+    const unvisitedLoader = async () => {
+      unvisitedLoaderCalls += 1;
+      return {
+        createMemoryMcpHttpHandler: (opts: Parameters<typeof createMemoryMcpHttpHandler>[0]) => {
+          unvisitedFactoryCalls += 1;
+          return createMemoryMcpHttpHandler(opts);
+        },
+      };
+    };
+    const { server: idleViaHelper } = await startHookServer(() => {}, {
+      authorityHome: tempAuthorityHome(),
+      bindListener: listenEphemeral,
+      loadMemoryMcpHttp: unvisitedLoader,
+    });
+    await expect(closeHookServer(idleViaHelper)).resolves.toBeUndefined();
+
+    const { server: idleViaNativeClose } = await startHookServer(() => {}, {
+      authorityHome: tempAuthorityHome(),
+      bindListener: listenEphemeral,
+      loadMemoryMcpHttp: unvisitedLoader,
+    });
+    await new Promise<void>((resolve) => idleViaNativeClose.close(() => resolve()));
+    expect(unvisitedLoaderCalls).toBe(0);
+    expect(unvisitedFactoryCalls).toBe(0);
+    expect(trackedReapTimers.size).toBe(0);
+
+    // 2. Pre-/mcp rebind + concurrent first /mcp requests: deferred loader runs once and factory runs once.
+    let releaseDeferred!: () => void;
+    const deferredEntered = new Promise<void>((resolve) => {
+      // resolved as soon as loader starts
+      void resolve;
+    });
+    void deferredEntered;
+    let loaderCalls = 0;
+    let factoryCalls = 0;
+    let signalLoaderStarted!: () => void;
+    const loaderStarted = new Promise<void>((resolve) => { signalLoaderStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseDeferred = resolve; });
+
+    const { server: rebindServer, port: port1 } = await startHookServer(() => {}, {
+      authorityHome: tempAuthorityHome(),
       bindListener: listenEphemeral,
       rebindOnListenerLoss: true,
       invokeMemoryMcpTool: async (caller) => ({ status: 'ok', session: caller.sessionName }),
+      loadMemoryMcpHttp: async () => {
+        loaderCalls += 1;
+        signalLoaderStarted();
+        await gate;
+        return {
+          createMemoryMcpHttpHandler: (opts) => {
+            factoryCalls += 1;
+            return createMemoryMcpHttpHandler(opts);
+          },
+        };
+      },
     });
-    cleanups.push(() => closeHookServer(server).catch(() => {}));
+    cleanups.push(() => closeHookServer(rebindServer).catch(() => {}));
 
-    // Rebind BEFORE any /mcp request initializes the lazy handler.
-    server.emit('error', new Error('simulated pre-mcp listener loss'));
+    rebindServer.emit('error', new Error('simulated pre-mcp listener loss'));
     let port2: number | null = null;
     await vi.waitFor(() => {
       const current = getActiveHookServerPort();
@@ -1119,9 +1180,8 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
       port2 = current;
     }, { timeout: 3_000, interval: 25 });
 
-    // Concurrent first /mcp connections share the single lazy initialization and work on the rebound port.
-    const connectAndCall = async (sessionName: string) => {
-      const tr = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port2!}${MEMORY_MCP_HTTP_PATH}`), {
+    const connectAndCall = async (targetPort: number, sessionName: string) => {
+      const tr = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${targetPort}${MEMORY_MCP_HTTP_PATH}`), {
         requestInit: {
           headers: {
             [MEMORY_MCP_HTTP_HEADERS.SESSION]: sessionName,
@@ -1133,14 +1193,99 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
       const cl = new Client({ name: sessionName, version: '1' });
       cleanups.unshift(() => cl.close().catch(() => {}));
       await cl.connect(tr);
-      return cl.callTool({ name: 'search_memory', arguments: { query: 'lazy' } });
+      return {
+        client: cl,
+        transport: tr,
+        result: await cl.callTool({ name: 'search_memory', arguments: { query: 'lazy' } }),
+      };
     };
 
-    const [res1, res2] = await Promise.all([
-      connectAndCall('deck_lazy_1'),
-      connectAndCall('deck_lazy_2'),
-    ]);
-    expect(res1).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_1' } });
-    expect(res2).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_2' } });
+    const req1 = connectAndCall(port2!, 'deck_lazy_1');
+    const req2 = connectAndCall(port2!, 'deck_lazy_2');
+    await loaderStarted;
+    releaseDeferred();
+    const [res1, res2] = await Promise.all([req1, req2]);
+    expect(loaderCalls).toBe(1);
+    expect(factoryCalls).toBe(1);
+    expect(trackedReapTimers.size).toBe(1);
+    expect(res1.result).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_1' } });
+    expect(res2.result).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_2' } });
+    await res1.client.close().catch(() => {});
+    await res2.client.close().catch(() => {});
+    await closeHookServer(rebindServer);
+    expect(trackedReapTimers.size).toBe(0);
+
+    // 3. Mid-import native server.close(): factory is never invoked and zero timers leak.
+    let midImportStarted!: () => void;
+    const midImportAtGate = new Promise<void>((resolve) => { midImportStarted = resolve; });
+    let releaseMidImport!: () => void;
+    const midImportGate = new Promise<void>((resolve) => { releaseMidImport = resolve; });
+    let midFactoryCalls = 0;
+
+    const { server: midCloseServer, port: midPort } = await startHookServer(() => {}, {
+      authorityHome: tempAuthorityHome(),
+      bindListener: listenEphemeral,
+      loadMemoryMcpHttp: async () => {
+        midImportStarted();
+        await midImportGate;
+        return {
+          createMemoryMcpHttpHandler: (opts) => {
+            midFactoryCalls += 1;
+            return createMemoryMcpHttpHandler(opts);
+          },
+        };
+      },
+    });
+    cleanups.push(() => closeHookServer(midCloseServer).catch(() => {}));
+
+    const inFlightReq = rawHttpRequest({
+      port: midPort,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_mid_close',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-deck_mid_close',
+        [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-deck_mid_close',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'mid', version: '1' } },
+      }),
+    }).catch((err) => ({ status: 0, headers: {}, body: String(err) }));
+
+    await midImportAtGate;
+    const midClosed = new Promise<void>((resolve) => midCloseServer.close(() => resolve()));
+    expect(midCloseServer.listening).toBe(false);
+    releaseMidImport();
+    const midRes = await inFlightReq;
+    midCloseServer.closeAllConnections?.();
+    await midClosed;
+    expect([0, 503]).toContain(midRes.status);
+    expect(midFactoryCalls).toBe(0);
+    expect(trackedReapTimers.size).toBe(0);
+
+    // 4. Real un-seamed /mcp request followed by direct native server.close() (rebindOnListenerLoss omitted):
+    //    reapIdleEntries timer is created on first /mcp and cleared when server.close() completes.
+    const { server: nativeCloseServer, port: nativePort } = await startHookServer(() => {}, {
+      authorityHome: tempAuthorityHome(),
+      bindListener: listenEphemeral,
+      invokeMemoryMcpTool: async (caller) => ({ status: 'ok', session: caller.sessionName }),
+    });
+    cleanups.push(() => closeHookServer(nativeCloseServer).catch(() => {}));
+
+    const nativeConnected = await connectAndCall(nativePort, 'deck_native_close');
+    expect(nativeConnected.result).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_native_close' } });
+    expect(trackedReapTimers.size).toBe(1);
+
+    await nativeConnected.client.close();
+    await new Promise<void>((resolve) => {
+      nativeCloseServer.close(() => resolve());
+      nativeCloseServer.closeAllConnections?.();
+    });
+    expect(nativeCloseServer.listening).toBe(false);
+    expect(trackedReapTimers.size).toBe(0);
   });
 });
