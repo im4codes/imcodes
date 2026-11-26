@@ -9,7 +9,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
-import { readFileSync, realpathSync, symlinkSync, utimesSync } from 'node:fs';
+import fs, { readFileSync, realpathSync, symlinkSync, utimesSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
 import {
@@ -6782,22 +6782,54 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const state = (provider as any).sessions.get(id);
     const nativeId = state.acpSessionId as string;
 
-    // 1. Path extraction boundaries
+    // 1. Path extraction boundaries (POSIX & cross-platform win32 drive vs UNC/namespace)
     expect(extractAgyBackgroundTaskLogPath(
       `Tool is running as a background task with task id: ${nativeId}/t1\nTask logs are available at: file:///tmp/my%20tasks/task-1.log`,
+      'darwin',
     )).toBe('/tmp/my tasks/task-1.log');
     expect(extractAgyBackgroundTaskLogPath(
       `Tool is running as a background task with task id: ${nativeId}/t2\nTask logs are available at: /var/tmp/task-2.log`,
+      'darwin',
     )).toBe('/var/tmp/task-2.log');
+    expect(extractAgyBackgroundTaskLogPath(
+      'Task logs are available at: //fileserver/share/task.log',
+      'darwin',
+    )).toBeUndefined();
     expect(extractAgyBackgroundTaskLogPath(
       'Task logs are available at: https://example.com/task.log',
     )).toBeUndefined();
     expect(extractAgyBackgroundTaskLogPath(
       'Task logs are available at: file://remote-host/share/task.log',
     )).toBeUndefined();
-    expect(() => extractAgyBackgroundTaskLogPath(
-      `Tool is running as a background task with task id: ${nativeId}/t-win\nTask logs are available at: file:///C:/Users/tester/task-win.log`,
-    )).not.toThrow();
+    // Windows: accept explicit local drive roots (`C:\...`, `D:/...`, `file:///C:/...`), reject UNC / namespace / drive-less paths
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t-win-file\nTask logs are available at: file:///C:/Users/tester/task-win.log`,
+      'win32',
+    )).toBe('C:\\Users\\tester\\task-win.log');
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t-win-drive\nTask logs are available at: D:\\logs\\task-drive.log`,
+      'win32',
+    )).toBe('D:\\logs\\task-drive.log');
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t-win-fwd\nTask logs are available at: D:/logs/task-fwd.log`,
+      'win32',
+    )).toBe('D:/logs/task-fwd.log');
+    for (const uncOrNonLocal of [
+      '\\\\fileserver\\share\\task.log',
+      '//fileserver/share/task.log',
+      '\\\\?\\UNC\\fileserver\\share\\task.log',
+      '\\\\.\\pipe\\task.log',
+      '/drive-less/task.log',
+      'C:relative.log',
+      'file://fileserver/share/task.log',
+      'file:////fileserver/share/task.log',
+      'file://localhost/share/task.log',
+    ]) {
+      expect(extractAgyBackgroundTaskLogPath(
+        `Tool is running as a background task with task id: ${nativeId}/t-win-bad\nTask logs are available at: ${uncOrNonLocal}`,
+        'win32',
+      )).toBeUndefined();
+    }
     expect(extractAgyBackgroundTaskLogPath(
       `Tool is running as a background task with task id: ${nativeId}/t3\nLog output:\nTask logs are available at: /should/be/ignored.log`,
     )).toBeUndefined();
@@ -6812,11 +6844,14 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const secondLog = path.join(root, 'second-task.log');
     const missingLog = path.join(root, 'missing.log');
     const futureLog = path.join(root, 'future-skew.log');
+    const sameSizeFutureLog = path.join(root, 'same-size-future.log');
 
     await writeFile(liveLog, 'start\n');
     await writeFile(secondLog, 's2\n');
     await writeFile(futureLog, 'skewed\n');
+    await writeFile(sameSizeFutureLog, '00001\n');
     utimesSync(futureLog, new Date(baseTime + 86_400_000), new Date(baseTime + 86_400_000));
+    utimesSync(sameSizeFutureLog, new Date(baseTime + 86_400_000), new Date(baseTime + 86_400_000));
 
     // 2. Missing log path & corrupted future mtime never throw and do not fabricate future grace
     (provider as any).updateAgyBackgroundTasks(id, state, {
@@ -6831,25 +6866,68 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       toolInput: { CommandLine: 'future-cmd', WaitMsBeforeAsync: 500 },
       toolStatus: 'complete',
     });
-    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBeUndefined();
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-same-size-future\nTask logs are available at: ${pathToFileURL(sameSizeFutureLog).href}`,
+      toolName: 'run_command',
+      toolInput: { CommandLine: 'same-size-cmd', WaitMsBeforeAsync: 500 },
+      toolStatus: 'complete',
+    });
+    expect(provider.getActiveWorkSnapshot(id, { sampleBackgroundProgress: true })?.lastBackgroundProgressAt).toBeUndefined();
 
-    // 3. Live log file sets initial progress and advances lastBackgroundProgressAt when it grows at +25m
+    // 2b. A corrupted future mtime on initial observation must NOT pollute subsequent same-size valid writes!
+    const t10 = baseTime + 10 * 60_000;
+    nowSpy.mockReturnValue(t10);
+    await writeFile(sameSizeFutureLog, '00002\n');
+    utimesSync(sameSizeFutureLog, new Date(t10), new Date(t10));
+    const recoveredProgress = provider.getActiveWorkSnapshot(id, { sampleBackgroundProgress: true })?.lastBackgroundProgressAt;
+    expect(recoveredProgress).toBeGreaterThanOrEqual(t10 - 1_000);
+    expect(recoveredProgress).toBeLessThanOrEqual(t10);
+
+    // Clear future entries before testing liveLog timestamps cleanly
+    state.agyBackgroundTasks.delete(`${nativeId}/task-same-size-future`);
+    state.agyBackgroundTasks.delete(`${nativeId}/task-future`);
+    state.agyBackgroundTasks.delete(`${nativeId}/task-missing`);
+
+    // 3. Live log file sets initial progress on diagnostic sampling and zero fs.statSync during streaming deltas
+    nowSpy.mockReturnValue(baseTime);
     (provider as any).updateAgyBackgroundTasks(id, state, {
       text: `Tool is running as a background task with task id: ${nativeId}/task-live\nTask logs are available at: ${pathToFileURL(liveLog).href}`,
       toolName: 'run_command',
       toolInput: { CommandLine: 'npm run test:unit:macos', WaitMsBeforeAsync: 500 },
       toolStatus: 'complete',
     });
-    const initialSnap = provider.getActiveWorkSnapshot(id);
+    const statSpy = vi.spyOn(fs, 'statSync');
+    const initialSnap = provider.getActiveWorkSnapshot(id, { sampleBackgroundProgress: true });
+    expect(statSpy).toHaveBeenCalledTimes(1);
     expect(initialSnap?.lastBackgroundProgressAt).toBeLessThanOrEqual(baseTime);
     expect(initialSnap?.lastBackgroundProgressAt).toBeGreaterThanOrEqual(baseTime - 5_000);
     expect(runtime.getDiagnosticSnapshot(baseTime).lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
 
+    // During streamed token deltas (`onDelta` -> `hasActiveTurnWork()`) and normal status queries, ZERO statSync calls happen!
+    statSpy.mockClear();
+    state.promptInFlight = true;
+    for (let i = 0; i < 10; i += 1) {
+      (provider as any).handleAgentChunk(id, state, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `chunk-${i} ` },
+      });
+    }
+    expect(runtime.getStatus()).toBe('streaming');
+    const cachedSnap = provider.getActiveWorkSnapshot(id);
+    expect(cachedSnap?.lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
+    expect(statSpy).not.toHaveBeenCalled();
+    state.promptInFlight = false;
+
     const t25 = baseTime + 25 * 60_000;
     nowSpy.mockReturnValue(t25);
     await appendFile(liveLog, '653/1223 files passed\n');
-    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t25);
+    // Non-sampling snapshot does not hit fs; diagnostic snapshot samples and exposes fresh progress to both.
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
+    expect(statSpy).not.toHaveBeenCalled();
     expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(t25);
+    expect(statSpy).toHaveBeenCalledTimes(1);
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t25);
+    statSpy.mockRestore();
 
     // 4. Multiple concurrent tasks: task-live freezes, secondLog advances -> latest progress stays fresh;
     //    once all stop advancing, lastBackgroundProgressAt freezes at the last advance.
@@ -6860,20 +6938,20 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       toolStatus: 'complete',
     });
     // Baseline initial observation (matching periodic 30s health poll before next write).
-    provider.getActiveWorkSnapshot(id);
+    runtime.getDiagnosticSnapshot(t25);
     const t32 = baseTime + 32 * 60_000;
     nowSpy.mockReturnValue(t32);
     await appendFile(secondLog, 'still going\n');
-    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t32).lastBackgroundProgressAt).toBe(t32);
 
     const t55 = baseTime + 55 * 60_000;
     nowSpy.mockReturnValue(t55);
-    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t55).lastBackgroundProgressAt).toBe(t32);
 
     // 5. Deleting a log file never throws and leaves previous progress intact without advancing it.
     await unlink(secondLog);
     const t60 = baseTime + 60 * 60_000;
     nowSpy.mockReturnValue(t60);
-    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
+    expect(runtime.getDiagnosticSnapshot(t60).lastBackgroundProgressAt).toBe(t32);
   });
 });

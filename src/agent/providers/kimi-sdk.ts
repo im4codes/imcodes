@@ -60,7 +60,7 @@ const AGY_EMITTED_TEXT_STEP_LIMIT = 512;
 
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { realpathSync, statSync } from 'node:fs';
+import fs, { realpathSync, statSync } from 'node:fs';
 import { once } from 'node:events';
 import { homedir } from 'node:os';
 import { Readable, Writable } from 'node:stream';
@@ -101,6 +101,7 @@ import {
 } from '../../../shared/session-control-commands.js';
 import type {
   TransportProvider,
+  ProviderActiveWorkSnapshotOptions,
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
@@ -833,7 +834,7 @@ export class KimiSdkProvider implements TransportProvider {
     };
   }
 
-  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+  getActiveWorkSnapshot(sessionId: string, options?: ProviderActiveWorkSnapshotOptions): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
     const nowMs = Date.now();
@@ -859,7 +860,11 @@ export class KimiSdkProvider implements TransportProvider {
       : 0;
     const backgroundStatusCount = backgroundTaskCount + reactiveWorkCount;
     const lastBackgroundProgressAt = this.id === AGY_SDK_PROVIDER_ID && backgroundTaskCount > 0
-      ? resolveAgyBackgroundTasksProgressAt(state.agyBackgroundTasks, nowMs)
+      ? (
+          options?.sampleBackgroundProgress
+            ? resolveAgyBackgroundTasksProgressAt(state.agyBackgroundTasks, nowMs)
+            : readCachedAgyBackgroundTasksProgressAt(state.agyBackgroundTasks)
+        )
       : undefined;
     const acpActiveToolCount = [...state.toolCalls.values()]
       .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
@@ -5226,7 +5231,7 @@ interface AgyBackgroundTaskEntry {
   startedAtMs: number;
   toolId?: string;
   logPath?: string;
-  lastObservedMtimeMs?: number;
+  lastTrustedMtimeMs?: number;
   lastObservedSize?: number;
   lastProgressAtMs?: number;
 }
@@ -5573,11 +5578,26 @@ function extractAgyBackgroundTaskStartIds(text: string): string[] {
   return [match[1]];
 }
 
+export function isLocalAgyLogPath(candidate: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (!candidate) return false;
+  if (platform === 'win32') {
+    // Only local drive root paths (`C:\...` or `C:/...`). Rejects UNC shares
+    // (`\\server\share`, `//server/share`), namespace/device paths (`\\?\UNC\...`, `\\.\...`),
+    // drive-relative paths (`C:foo`), and drive-less root paths (`/foo`, `\foo`).
+    return /^[A-Za-z]:[\\/]/.test(candidate);
+  }
+  return candidate.startsWith('/') && !candidate.startsWith('//') && !candidate.startsWith('\\\\');
+}
+
 /**
  * Extracts a local filesystem log path from Antigravity background task start output
  * (`Task logs are available at: file:///...` or plain local absolute path).
+ * Remote hosts and Windows UNC/network paths are rejected without I/O.
  */
-export function extractAgyBackgroundTaskLogPath(text: string): string | undefined {
+export function extractAgyBackgroundTaskLogPath(
+  text: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
   const logStart = text.search(/(?:^|\n)\s*Log output:/i);
   const envelopeHead = logStart >= 0 ? text.slice(0, logStart) : text;
   if (AGY_SYNC_OUTPUT_ENVELOPE_RE.test(envelopeHead)) return undefined;
@@ -5590,8 +5610,8 @@ export function extractAgyBackgroundTaskLogPath(text: string): string | undefine
       if (parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost') {
         return undefined;
       }
-      const fsPath = fileURLToPath(parsed);
-      return fsPath || undefined;
+      const fsPath = fileURLToPath(parsed, { windows: platform === 'win32' });
+      return isLocalAgyLogPath(fsPath, platform) ? fsPath : undefined;
     } catch {
       return undefined;
     }
@@ -5599,37 +5619,62 @@ export function extractAgyBackgroundTaskLogPath(text: string): string | undefine
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
     return undefined;
   }
-  return path.isAbsolute(raw) ? raw : undefined;
+  return isLocalAgyLogPath(raw, platform) ? raw : undefined;
 }
 
 function refreshAgyBackgroundTaskProgress(entry: AgyBackgroundTaskEntry, nowMs: number): number | undefined {
   if (!entry.logPath) return entry.lastProgressAtMs;
   try {
-    const st = statSync(entry.logPath);
+    const st = fs.statSync(entry.logPath);
     if (!st.isFile()) return entry.lastProgressAtMs;
-    const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
+    const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : Number.NaN;
     const size = Number.isFinite(st.size) ? st.size : 0;
-    const withinFutureSkew = mtimeMs <= nowMs + AGY_BACKGROUND_CLOCK_SKEW_MS;
-    if (entry.lastObservedSize === undefined || entry.lastObservedMtimeMs === undefined) {
+    const mtimeTrusted = Number.isFinite(mtimeMs) && mtimeMs <= nowMs + AGY_BACKGROUND_CLOCK_SKEW_MS;
+
+    let sizeChanged = false;
+    if (entry.lastObservedSize === undefined) {
       entry.lastObservedSize = size;
-      entry.lastObservedMtimeMs = mtimeMs;
-      if (withinFutureSkew && mtimeMs >= entry.startedAtMs - 1_000) {
-        const clamped = Math.min(mtimeMs, nowMs);
-        entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, clamped);
+    } else if (size !== entry.lastObservedSize) {
+      entry.lastObservedSize = size;
+      sizeChanged = true;
+    }
+
+    let mtimeAdvanced = false;
+    if (mtimeTrusted) {
+      if (entry.lastTrustedMtimeMs === undefined) {
+        entry.lastTrustedMtimeMs = mtimeMs;
+        if (mtimeMs >= entry.startedAtMs - 1_000) {
+          entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, Math.min(mtimeMs, nowMs));
+        }
+      } else if (mtimeMs > entry.lastTrustedMtimeMs) {
+        entry.lastTrustedMtimeMs = mtimeMs;
+        mtimeAdvanced = true;
       }
-    } else {
-      const sizeChanged = size !== entry.lastObservedSize;
-      const mtimeAdvanced = withinFutureSkew && mtimeMs > entry.lastObservedMtimeMs;
-      if (sizeChanged || mtimeAdvanced) {
-        entry.lastObservedSize = size;
-        entry.lastObservedMtimeMs = mtimeMs;
-        entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, nowMs);
-      }
+    }
+
+    if (sizeChanged || mtimeAdvanced) {
+      entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, nowMs);
     }
   } catch {
     // Missing, deleted, or unreadable log paths gracefully produce no live progress.
   }
   return entry.lastProgressAtMs;
+}
+
+function readCachedAgyBackgroundTasksProgressAt(
+  tasks: Map<string, AgyBackgroundTaskEntry> | undefined,
+): number | undefined {
+  if (!tasks || tasks.size === 0) return undefined;
+  let latestProgressAt: number | undefined;
+  let checked = 0;
+  for (const entry of tasks.values()) {
+    if (checked >= AGY_BACKGROUND_TASK_MAX_ACTIVE) break;
+    checked += 1;
+    if (entry.lastProgressAtMs !== undefined && (latestProgressAt === undefined || entry.lastProgressAtMs > latestProgressAt)) {
+      latestProgressAt = entry.lastProgressAtMs;
+    }
+  }
+  return latestProgressAt;
 }
 
 function resolveAgyBackgroundTasksProgressAt(

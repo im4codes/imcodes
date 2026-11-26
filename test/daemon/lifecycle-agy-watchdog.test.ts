@@ -51,7 +51,11 @@ vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
   getTransportRuntime: () => runtimeRef.current,
 }));
 
-const { recoverAgyStalledSession, shouldRunGenericSilentActiveTurnRecovery } = await import('../../src/daemon/lifecycle.js');
+const {
+  recoverAgyStalledSession,
+  runSessionWatchdogRecoverySweep,
+  shouldRunGenericSilentActiveTurnRecovery,
+} = await import('../../src/daemon/lifecycle.js');
 const { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } = await import('../../shared/chat-message-origin.js');
 
 const SESSION = 'deck_agy_watchdog_brain';
@@ -412,7 +416,83 @@ describe('agy stale active-turn watchdog', () => {
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'kimi-sdk' }, t0 + 10 * 60_000)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'codex-sdk', providerId: 'codex-sdk' }, false)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk', providerId: 'claude-code-sdk' }, false)).toBe(true);
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'agy-sdk', providerId: 'agy-sdk' }, false)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'agy-sdk', providerId: 'agy-sdk' }, true)).toBe(false);
+  });
+
+  it('health poll sweep prevents generic silent-turn fallback from bypassing AGY 30m env override or live background progress, while recovering frozen AGY and generic providers', async () => {
+    const t0 = 1_700_450_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    vi.stubEnv('IMCODES_AGY_STALE_ACTIVE_TURN_MS', String(30 * 60_000));
+
+    expect(runtime.send('long task without open tools', 'cmd-health-sweep')).toBe('sent');
+    await waitForSendCount(mock.provider.send, 1);
+    await flushDispatch();
+    expect(runtime.getDiagnosticSnapshot(t0).activeToolCount).toBe(0);
+
+    // 1) Custom 30m threshold: at 25m silent with zero open tools, neither AGY nor generic settle cancels the turn.
+    const t25 = t0 + 25 * 60_000;
+    nowSpy.mockReturnValue(t25);
+    const customSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      t25,
+    );
+    expect(customSweep).toMatchObject({ agyRecovered: false, genericRecovered: false });
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    // 2) Live background progress (1s ago) past 25m with activeToolCount === 0: health poll leaves it running untouched.
+    vi.unstubAllEnvs();
+    mock.setBackgroundWorkCount(1);
+    mock.setBackgroundProgressAt(t25 - 1_000);
+    const liveBgSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      t25,
+    );
+    expect(liveBgSweep).toMatchObject({ agyRecovered: false, genericRecovered: false });
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    // 3) Once background progress freezes for 20m, AGY watchdog recovers (not generic fallback).
+    const tFrozen = t25 - 1_000 + 20 * 60_000;
+    nowSpy.mockReturnValue(tFrozen);
+    const frozenSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      tFrozen,
+    );
+    expect(frozenSweep).toMatchObject({ agyRecovered: true, genericRecovered: false });
+    expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    });
+
+    // 4) Non-AGY generic transport (claude-code-sdk) still uses generic silent-turn recovery at 12m.
+    mock.setBackgroundWorkCount(0);
+    mock.setBackgroundProgressAt(undefined);
+    const genericCancel = vi.fn(async () => undefined);
+    const genericSend = vi.fn(async () => {});
+    const genericProvider = {
+      ...mock.provider,
+      id: 'claude-code-sdk',
+      cancel: genericCancel,
+      send: genericSend,
+      getActiveWorkSnapshot: () => null,
+    };
+    const genericRuntime = new TransportSessionRuntime(genericProvider, `${config.sessionKey}_claude`);
+    await genericRuntime.initialize({ sessionKey: `${config.sessionKey}_claude` });
+    runtimeRef.current = genericRuntime;
+    nowSpy.mockReturnValue(t0);
+    expect(genericRuntime.send('claude silent', 'cmd-claude')).toBe('sent');
+    await waitForSendCount(genericSend, 1);
+    await flushDispatch();
+    const tClaude13 = t0 + 13 * 60_000;
+    nowSpy.mockReturnValue(tClaude13);
+    const claudeSweep = await runSessionWatchdogRecoverySweep(
+      { name: `${config.sessionKey}_claude`, agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', state: 'running' },
+      tClaude13,
+    );
+    expect(claudeSweep).toMatchObject({ agyRecovered: false, genericRecovered: true });
+    expect(genericCancel).toHaveBeenCalledWith('agy-sess-1', expect.objectContaining({
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    }));
+    await genericRuntime.kill().catch(() => {});
   });
 
   it('protects running tools and phantom background work against unacknowledged steering timeout below 20m and enforces the 20m ceiling', async () => {

@@ -15,7 +15,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderActiveWorkSnapshotOptions, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import { shouldRetryProviderErrorWithBackoff } from '../../shared/provider-error-classifier.js';
 import { CAPACITY_RETRY_LOG_EVERY_ATTEMPTS, CAPACITY_RETRY_SUCCESS_AFTER_MS, capacityRetryDelayMs } from '../../shared/capacity-retry.js';
@@ -1608,7 +1608,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }, 'Transport provider diagnostics read failed');
       }
     }
-    const activitySnapshot = this.getActivitySnapshot();
+    const activitySnapshot = this.getActivitySnapshot({ sampleBackgroundProgress: true });
     const oldestUnacked = this._unacknowledgedActiveAppends[0]?.appendedAt ?? null;
     return {
       status: this._status,
@@ -2546,10 +2546,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       || this._openTools.size > 0;
   }
 
-  private getProviderActiveWorkSnapshot(): ProviderActiveWorkSnapshot | null {
+  private getProviderActiveWorkSnapshot(options?: ProviderActiveWorkSnapshotOptions): ProviderActiveWorkSnapshot | null {
     if (!this._providerSessionId || !this.provider.getActiveWorkSnapshot) return null;
     try {
-      return this.provider.getActiveWorkSnapshot(this._providerSessionId);
+      return this.provider.getActiveWorkSnapshot(this._providerSessionId, options);
     } catch (err) {
       logger.warn(
         { err, sessionKey: this.sessionKey, providerSessionId: this._providerSessionId, provider: this.provider.id },
@@ -2685,7 +2685,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     return closed;
   }
 
-  private getActivitySnapshot(): {
+  private getActivitySnapshot(options?: ProviderActiveWorkSnapshotOptions): {
     blockingWorkCount: number;
     backgroundWorkCount: number;
     backgroundKeepsSessionRunning: boolean;
@@ -2712,7 +2712,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const openToolCount = this._openTools.size;
     add('open_tool_call', openToolCount);
 
-    const providerSnapshot = this.getProviderActiveWorkSnapshot();
+    const providerSnapshot = this.getProviderActiveWorkSnapshot(options);
     if (providerSnapshot) {
       const expectedGeneration = this._activityGeneration > 0
         ? this.currentActivityGeneration()
