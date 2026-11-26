@@ -6,6 +6,7 @@ import {
   HOOK_SESSION_CREDENTIAL_ERROR,
   HOOK_SESSION_CREDENTIAL_HEADER,
 } from '../../shared/hook-session-credential.js';
+import { HOOK_AUTHORITY_ERROR } from '../../shared/hook-authority.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID, normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
@@ -447,7 +448,25 @@ export function createMemoryMcpHttpHandler(options: MemoryMcpHttpHandlerOptions)
       }
 
       const boundSessionName = session.name;
+      const boundInstanceId = sessionInstanceId;
+      const boundHookCredential = hookCredential;
       const boundRequestedServerId = requestedServerId;
+      const verifyBoundConnection = (): SessionRecord | null => {
+        if (entry.closed || closingAll) return null;
+        const current = getSession(boundSessionName);
+        if (
+          !current
+          || current.state === 'stopped'
+          || current.incognito === true
+          || current.sessionInstanceId?.trim() !== boundInstanceId
+          || !current.hookCredential?.trim()
+          || !sameHookCredential(current.hookCredential.trim(), boundHookCredential)
+        ) {
+          void closeEntry(entry);
+          return null;
+        }
+        return current;
+      };
       const resourceOwner: SessionResourceOwner | null = session.runtimeEpoch
         ? {
             sessionName: session.name,
@@ -477,8 +496,8 @@ export function createMemoryMcpHttpHandler(options: MemoryMcpHttpHandlerOptions)
       });
 
       const invokeInProcess = async (toolName: MemoryMcpDaemonToolName, input?: unknown): Promise<Record<string, unknown>> => {
-        const current = getSession(boundSessionName);
-        if (!current || current.state === 'stopped' || current.incognito === true) {
+        const current = verifyBoundConnection();
+        if (!current) {
           throw new Error('daemon_memory_worker_identity_unavailable');
         }
         const latestCtx = resolveSessionMcpCallerContext({
@@ -505,23 +524,47 @@ export function createMemoryMcpHttpHandler(options: MemoryMcpHttpHandlerOptions)
         callerCtx.caller,
         {
           invokeDaemonMemoryTool: invokeInProcess,
-          participantTurnRequired: async () => Boolean(readSenderParticipantTurn(boundSessionName)),
+          participantTurnRequired: async () => {
+            const current = verifyBoundConnection();
+            if (!current) throw new Error('daemon_memory_worker_identity_unavailable');
+            return Boolean(readSenderParticipantTurn(current.name));
+          },
           pairTitleTurn: () => resolveTaskPairTitleTurn({
             sessionName: boundSessionName,
-            postAuthorityHook: async () => ({
-              participantTurn: Boolean(readSenderParticipantTurn(boundSessionName)),
-            }),
+            postAuthorityHook: async () => {
+              const current = verifyBoundConnection();
+              if (!current) throw new Error('daemon_memory_worker_identity_unavailable');
+              return {
+                participantTurn: Boolean(readSenderParticipantTurn(current.name)),
+              };
+            },
           }),
         },
         resourceOwner,
         {
-          hookCredential: () => getSession(boundSessionName)?.hookCredential ?? hookCredential,
-          resolveHookPort: async () => options.port() || hookPort,
-          resolveHookAuthority: async () => ({
-            ok: true,
-            port: options.port() || hookPort,
-            owner: null,
-          }),
+          hookCredential: () => {
+            const current = verifyBoundConnection();
+            if (!current) throw new Error('daemon_memory_worker_identity_unavailable');
+            return boundHookCredential;
+          },
+          resolveHookPort: async () => {
+            if (!verifyBoundConnection()) throw new Error('daemon_memory_worker_identity_unavailable');
+            return options.port() || hookPort;
+          },
+          resolveHookAuthority: async () => {
+            if (!verifyBoundConnection()) {
+              return {
+                ok: false,
+                reason: HOOK_AUTHORITY_ERROR.hookUnavailable,
+                detail: 'bound HTTP MCP session is no longer active',
+              };
+            }
+            return {
+              ok: true,
+              port: options.port() || hookPort,
+              owner: null,
+            };
+          },
         },
       );
 

@@ -55,15 +55,23 @@ const BACKEND_FATAL_ERROR_CODE = -32004;
 const MAX_QUEUED_REQUESTS = 64;
 const RESTART_DELAYS_MS = [250, 1_000, 3_000, 5_000] as const;
 
+interface DiscoveryCallMeta {
+  query: string;
+  hadFallback: boolean;
+  activatesSelection: boolean;
+}
+
 interface QueuedMessage {
   message: JsonRpcMessage;
   timer: ReturnType<typeof setTimeout> | null;
+  discovery?: DiscoveryCallMeta;
 }
 
 interface InFlightRequest {
   id: JsonRpcId;
   generation: number;
   timer: ReturnType<typeof setTimeout>;
+  discovery?: DiscoveryCallMeta;
 }
 
 function testOnlyDuration(name: string, fallback: number): number {
@@ -148,7 +156,6 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let lastPublishedDiscoveryQuery: string | null = null;
   const queued: QueuedMessage[] = [];
   const inFlight = new Map<string, InFlightRequest>();
-  const pendingDiscoveryCalls = new Map<string, { query: string; hadFallback: boolean }>();
   const idleTerminatingChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   const inFlightRequestTimeoutMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS',
@@ -268,11 +275,31 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     return request;
   };
 
+  const extractDiscoveryCallMeta = (message: JsonRpcMessage): DiscoveryCallMeta | undefined => {
+    if (message.method !== 'tools/call') return undefined;
+    const params = message.params;
+    const name = params && typeof params === 'object' && typeof (params as { name?: unknown }).name === 'string'
+      ? (params as { name: string }).name.trim().toLowerCase()
+      : '';
+    if (name !== 'mcp_tool_search' || !params || typeof params !== 'object') return undefined;
+    const rawArgs = (params as { arguments?: unknown }).arguments;
+    if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) return undefined;
+    const typedArgs = rawArgs as { query?: unknown; activate?: unknown; fallbackCall?: unknown };
+    const query = typeof typedArgs.query === 'string' ? typedArgs.query.trim() : '';
+    if (!query || typedArgs.activate === false) return undefined;
+    return {
+      query,
+      hadFallback: Boolean(typedArgs.fallbackCall && typeof typedArgs.fallbackCall === 'object'),
+      activatesSelection: true,
+    };
+  };
+
   const trackInFlight = (
     id: JsonRpcId,
     message: JsonRpcMessage,
     child: ChildProcessWithoutNullStreams,
     currentGeneration: number,
+    discovery?: DiscoveryCallMeta,
   ) => {
     clearIdleTimer();
     const key = idKey(id);
@@ -287,14 +314,13 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       const request = inFlight.get(key);
       if (!request || request.generation !== currentGeneration) return;
       inFlight.delete(key);
-      pendingDiscoveryCalls.delete(key);
       writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_request_timeout'));
       notifyWarning('backend request timed out; restarting it without replaying the request');
       if (backend === child) terminateBackend(child);
       armIdleTimerIfIdle();
     }, timeoutMs);
     timer.unref?.();
-    inFlight.set(key, { id, generation: currentGeneration, timer });
+    inFlight.set(key, { id, generation: currentGeneration, timer, ...(discovery ? { discovery } : {}) });
   };
 
   const flushQueued = () => {
@@ -305,13 +331,13 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       if (item.timer) clearTimeout(item.timer);
       const id = requestId(item.message);
       const child = backend;
-      if (id !== undefined && child) trackInFlight(id, item.message, child, generation);
+      if (id !== undefined && child) trackInFlight(id, item.message, child, generation, item.discovery);
       sendBackend(item.message);
     }
     armIdleTimerIfIdle();
   };
 
-  const enqueue = (message: JsonRpcMessage) => {
+  const enqueue = (message: JsonRpcMessage, discovery?: DiscoveryCallMeta) => {
     const id = requestId(message);
     if (backendFatalError) {
       if (id !== undefined) writeMessage(errorResponse(id, BACKEND_FATAL_ERROR_CODE, backendFatalError));
@@ -322,12 +348,11 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       return;
     }
     clearIdleTimer();
-    const item: QueuedMessage = { message, timer: null };
+    const item: QueuedMessage = { message, timer: null, ...(discovery ? { discovery } : {}) };
     if (id !== undefined) {
       item.timer = setTimeout(() => {
         const index = queued.indexOf(item);
         if (index >= 0) queued.splice(index, 1);
-        pendingDiscoveryCalls.delete(idKey(id));
         writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_unavailable'));
         armIdleTimerIfIdle();
       }, QUEUED_REQUEST_TIMEOUT_MS);
@@ -451,25 +476,46 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       const id = requestId(message);
       if (id !== undefined) {
         const key = idKey(id);
-        const discovery = pendingDiscoveryCalls.get(key);
-        pendingDiscoveryCalls.delete(key);
-        if (!clearInFlight(key)) {
+        const settledRequest = clearInFlight(key);
+        if (!settledRequest) {
           // The request already timed out (or belongs to a retired generation).
           // Never emit a second terminal response after the timeout.
           return;
         }
-        if (discovery && !message.error) {
-          const resultObj = message.result;
-          const isErr = Boolean(resultObj && typeof resultObj === 'object' && (resultObj as { isError?: unknown }).isError === true);
-          if (!isErr && resultObj && typeof resultObj === 'object') {
-            const sc = (resultObj as { structuredContent?: unknown }).structuredContent as Record<string, unknown> | undefined;
-            const publishedGroups = Array.isArray(sc?.publishedGroups) ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0) : [];
-            const publishedTools = Array.isArray(sc?.published) ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0) : [];
-            if (publishedGroups.length > 0) {
-              lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
-            } else if (publishedTools.length > 0) {
-              lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
+        const discovery = settledRequest.discovery;
+        if (!message.error && message.result && typeof message.result === 'object') {
+          const resultObj = message.result as Record<string, unknown>;
+          const meta = resultObj._meta && typeof resultObj._meta === 'object' && !Array.isArray(resultObj._meta)
+            ? (resultObj._meta as Record<string, unknown>)
+            : undefined;
+          const hasAuthoritativeMeta = Boolean(meta && Object.prototype.hasOwnProperty.call(meta, 'imcodesPublishedQuery'));
+          if (hasAuthoritativeMeta && meta) {
+            const rawPublished = meta.imcodesPublishedQuery;
+            lastPublishedDiscoveryQuery = typeof rawPublished === 'string' && rawPublished.trim().length > 0
+              ? rawPublished.trim()
+              : null;
+            delete meta.imcodesPublishedQuery;
+            if (Object.keys(meta).length === 0) {
+              delete resultObj._meta;
+            }
+          } else if (discovery?.activatesSelection) {
+            const sc = resultObj.structuredContent as Record<string, unknown> | undefined;
+            if (sc && (Array.isArray(sc.publishedGroups) || Array.isArray(sc.published))) {
+              const publishedGroups = Array.isArray(sc.publishedGroups)
+                ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0)
+                : [];
+              const publishedTools = Array.isArray(sc.published)
+                ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+                : [];
+              if (publishedGroups.length > 0) {
+                lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
+              } else if (publishedTools.length > 0) {
+                lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
+              } else {
+                lastPublishedDiscoveryQuery = null;
+              }
             } else if (discovery.hadFallback) {
+              // Target tool ran after query publication (including business-error results).
               lastPublishedDiscoveryQuery = discovery.query;
             }
           }
@@ -517,7 +563,6 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
       for (const request of inFlight.values()) {
         clearTimeout(request.timer);
-        pendingDiscoveryCalls.delete(idKey(request.id));
         writeMessage(errorResponse(
           request.id,
           deterministicFailure ? BACKEND_FATAL_ERROR_CODE : -32003,
@@ -660,19 +705,6 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         } });
         return;
       }
-      if (name === 'mcp_tool_search' && params && typeof params === 'object') {
-        const rawArgs = (params as { arguments?: unknown }).arguments;
-        if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
-          const typedArgs = rawArgs as { query?: unknown; activate?: unknown; fallbackCall?: unknown };
-          const query = typeof typedArgs.query === 'string' ? typedArgs.query.trim() : '';
-          if (query && typedArgs.activate !== false) {
-            pendingDiscoveryCalls.set(idKey(id), {
-              query,
-              hadFallback: Boolean(typedArgs.fallbackCall && typeof typedArgs.fallbackCall === 'object'),
-            });
-          }
-        }
-      }
     }
     if (message.method === 'tools/list' && id !== undefined) {
       // Before hydration this is the immutable generated catalog and therefore
@@ -695,14 +727,15 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       writeMessage(errorResponse(id, -32601, 'Method not found'));
       return;
     }
+    const discoveryMeta = extractDiscoveryCallMeta(message);
     clearIdleTimer();
     const child = backend;
     if (backendReady && child && sendBackend(message)) {
-      if (id !== undefined) trackInFlight(id, message, child, generation);
+      if (id !== undefined) trackInFlight(id, message, child, generation, discoveryMeta);
       else armIdleTimerIfIdle();
       return;
     }
-    enqueue(message);
+    enqueue(message, discoveryMeta);
     ensureBackendStarted();
   });
   input.on('close', () => {

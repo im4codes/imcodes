@@ -920,7 +920,7 @@ export function mergeDefaultToolDeps(
             // Dedicated path: an older daemon answers 404 and the command is
             // refused, never delivered wrapped through the ordinary `/send`.
             try {
-              const response = await postHookSend(port, body, SEND_COMMAND_HOOK_PATH, undefined, undefined, false, resolveBridgeEnv());
+              const response = await postHookSend(port, body, SEND_COMMAND_HOOK_PATH, caller.sessionName ?? undefined, undefined, false, resolveBridgeEnv());
               return response.queued === true ? 'queued' : 'sent';
             } catch (err) {
               if (err instanceof Error && /status 404\b/.test(err.message)) {
@@ -929,7 +929,7 @@ export function mergeDefaultToolDeps(
               throw err;
             }
           }
-          const response = await postHookSend(port, body, '/send', undefined, undefined, false, resolveBridgeEnv());
+          const response = await postHookSend(port, body, '/send', caller.sessionName ?? undefined, undefined, false, resolveBridgeEnv());
           return response.queued === true ? 'queued' : 'sent';
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise
@@ -944,7 +944,7 @@ export function mergeDefaultToolDeps(
           const res = await postHookSend(port, {
             from: caller.sessionName,
             to: target.name,
-          }, '/stop', undefined, undefined, false, resolveBridgeEnv());
+          }, '/stop', caller.sessionName, undefined, false, resolveBridgeEnv());
           return (res as { stopped?: boolean }).stopped !== false;
         }),
     },

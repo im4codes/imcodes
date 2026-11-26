@@ -254,10 +254,27 @@ export function registerMcpToolDiscovery(
       }
     }
 
+    const publishedSelectionQuery = exactGroup && publishedNames.length > 0
+      ? `${MCP_TOOL_GROUP_QUERY_PREFIX}${exactGroup.id}`
+      : (exactToolName ?? null);
+    const attachPublishedMeta = <T extends { [key: string]: unknown }>(payload: T): T => {
+      if (!shouldPublish || staticFullCatalog) return payload;
+      const existingMeta = payload._meta && typeof payload._meta === 'object' && !Array.isArray(payload._meta)
+        ? (payload._meta as Record<string, unknown>)
+        : {};
+      return {
+        ...payload,
+        _meta: {
+          ...existingMeta,
+          imcodesPublishedQuery: publishedSelectionQuery,
+        },
+      };
+    };
+
     if (fallbackCall) {
       const fallbackName = typeof fallbackCall.name === 'string' ? fallbackCall.name.trim() : '';
       if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(fallbackName.toLowerCase())) {
-        return discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE);
+        return attachPublishedMeta(discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE));
       }
       const fallbackArguments = fallbackCall.arguments === undefined
         ? {}
@@ -274,10 +291,10 @@ export function registerMcpToolDiscovery(
         || typeof fallbackArguments !== 'object'
         || fallbackArguments === null
         || Array.isArray(fallbackArguments)) {
-        return discoveryError('fallbackCall requires one exact registered tool query with activation enabled');
+        return attachPublishedMeta(discoveryError('fallbackCall requires one exact registered tool query with activation enabled'));
       }
       logger.info({ wrapper: MCP_TOOL_DISCOVERY_NAME, target: fallbackName }, 'MCP exact fallback invocation');
-      return invokeFallbackTool(exactTool, fallbackArguments as Record<string, unknown>, extra);
+      return attachPublishedMeta(await invokeFallbackTool(exactTool, fallbackArguments as Record<string, unknown>, extra));
     }
 
     const result = {
@@ -326,6 +343,6 @@ export function registerMcpToolDiscovery(
       published: shouldPublish ? publishedNames : [],
       catalogGeneration,
     };
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] };
+    return attachPublishedMeta({ structuredContent: result, content: [{ type: 'text' as const, text: JSON.stringify(result) }] });
   });
 }

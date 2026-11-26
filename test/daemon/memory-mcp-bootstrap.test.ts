@@ -600,4 +600,94 @@ describe('memory MCP lightweight bootstrap', () => {
       structuredContent: { status: 'ok', enabled: true },
     });
   }, 20_000);
+
+  it('tracks real-backend empty clear and fallbackCall business-error publication transitions across idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+      IMCODES_DAEMON_USER_ID: 'user-real',
+      IMCODES_DAEMON_NAMESPACE: JSON.stringify({ scope: 'personal', userId: 'user-real', projectId: 'github.com/acme/realproj' }),
+      IMCODES_DAEMON_SERVER_ID: 'srv-real',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_real_w1',
+      IMCODES_DAEMON_PROJECT_NAME: 'realproj',
+      IMCODES_DAEMON_PROJECT_ROOT: '/tmp/realproj',
+    });
+    await client.connect(transport);
+
+    // 1. Publish pair_list first.
+    await expect(client.callTool({ name: 'mcp_tool_search', arguments: { query: 'pair_list' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', published: ['pair_list'] } });
+    await waitFor(async () => ((await client.listTools()).tools.some((t) => t.name === 'pair_list') ? true : undefined), 8_000);
+
+    // 2. Replacing via fallbackCall where target tool returns a business error (no daemon hook port -> status: 'error')
+    //    still updates the backend's published selection to session_identity_get.
+    const fallbackErrRes = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'session_identity_get', fallbackCall: { name: 'session_identity_get', arguments: {} } },
+    });
+    expect(fallbackErrRes).toMatchObject({ structuredContent: { status: 'error' } });
+
+    // 3. Reap idle generation 1, then trigger generation 2; backend should publish session_identity_get, NOT stale pair_list.
+    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await client.callTool({ name: 'session_identity_get', arguments: {} });
+    const gen2Tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(gen2Tools).toContain('session_identity_get');
+    expect(gen2Tools).not.toContain('pair_list');
+
+    // 4. An ordinary unmatched search with activate=true clears the published tail on backend.
+    await expect(client.callTool({ name: 'mcp_tool_search', arguments: { query: 'totally_missing_tool_xyz_123' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', published: [] } });
+
+    // Reap generation 2, respawn generation 3, confirm cleared tail stays empty (session_identity_get NOT resurrected).
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.split('"idle_timeout"').length >= 3 ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await client.callTool({ name: 'memory_injection_get', arguments: {} }).catch(() => {});
+    const gen3Tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(gen3Tools).not.toContain('session_identity_get');
+  }, 30_000);
+
+  it('bounds discovery metadata cleanly on queue-full and deterministic caller-env failures', async () => {
+    const { child, messages } = rawBootstrap({
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_CALLER_ENV_ERROR: 'deterministic bad env',
+      IMCODES_MEMORY_MCP_TEST_DELAY_MS: '500',
+    });
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'bound-test', version: '1' } },
+    })}\n`);
+    await waitFor(() => messages.find((m) => m.id === 1));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+
+    // Burst 80 activating mcp_tool_search calls (> MAX_QUEUED_REQUESTS=64) while backend startup fails deterministically.
+    for (let i = 100; i < 180; i += 1) {
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: '2.0', id: i, method: 'tools/call',
+        params: { name: 'mcp_tool_search', arguments: { query: `tool_${i}` } },
+      })}\n`);
+    }
+
+    await waitFor(() => (messages.filter((m) => typeof m.id === 'number' && m.id >= 100).length === 80 ? true : undefined), 10_000);
+    const replies = messages.filter((m) => typeof m.id === 'number' && m.id >= 100);
+    const queueFullCount = replies.filter((m) => (m.error as { code?: number; message?: string } | undefined)?.message === 'memory_mcp_backend_queue_full').length;
+    const fatalCount = replies.filter((m) => (m.error as { code?: number; message?: string } | undefined)?.code === -32004).length;
+    expect(queueFullCount).toBe(16);
+    expect(fatalCount).toBe(64);
+
+    // Further calls after deterministic failure fail immediately and never replay prior discovery queries.
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 999, method: 'tools/call',
+      params: { name: 'mcp_tool_search', arguments: { query: 'post_fatal' } },
+    })}\n`);
+    const lateReply = await waitFor(() => messages.find((m) => m.id === 999));
+    expect(lateReply).toMatchObject({ error: { code: -32004 } });
+  }, 15_000);
 });

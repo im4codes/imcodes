@@ -3345,6 +3345,74 @@ describe('CodexSdkProvider', () => {
     }
   });
 
+  it('keeps pending /mcp port migration when another thread on the shared channel is busy and migrates safely once idle', async () => {
+    hookPortMock.port = 52301;
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'c1-busy-A',
+        cwd: '/tmp/project',
+        resumeId: 'thread-busy-A',
+        sessionName: 'deck_busy_w1',
+        sessionInstanceId: 'inst-busy-a',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-busy-a' },
+      });
+      await provider.createSession({
+        sessionKey: 'c1-busy-B',
+        cwd: '/tmp/project',
+        resumeId: 'thread-busy-B',
+        sessionName: 'deck_busy_w2',
+        sessionInstanceId: 'inst-busy-b',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-busy-b' },
+      });
+
+      const flush = () => new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+      // Warm up B and leave it idle; start A and keep A actively busy on child 1.
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const });
+      const child1 = childProcessMock.children[0]!;
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-1', status: 'completed' } } });
+      await flush();
+
+      await provider.send('c1-busy-A', { ...brainPayload('c1-busy-A'), sessionRole: 'w1' as const });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      // Rebind hook server while A is actively running a turn.
+      hookPortMock.port = 52302;
+
+      // Sending a turn on B while A is busy MUST NOT interrupt A or kill child 1,
+      // and MUST NOT falsely mark loadedMcpConfigJson as migrated on child 1.
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const, userMessage: 'during-busy', assembledMessage: 'during-busy' });
+      expect(childProcessMock.children).toHaveLength(1);
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-2', status: 'completed' } } });
+      await flush();
+
+      // Finish A uninterrupted on child 1.
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-A', turn: { id: 'turn-3', status: 'completed' } } });
+      await flush();
+
+      // Now channel is idle: next turn on B MUST detect pending port change and restart app-server to child 2!
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const, userMessage: 'after-idle-b', assembledMessage: 'after-idle-b' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const child2 = childProcessMock.children[1]!;
+      const resumedB = child2.requests.find((r) => r.method === 'thread/resume');
+      expect(resumedB?.params?.threadId).toBe('thread-busy-B');
+      expect(resumedB?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52302/mcp');
+      child2.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-4', status: 'completed' } } });
+      await flush();
+
+      // Subsequent turn on A resumes directly onto child 2 (no extra child 3 spawn) with port 52302.
+      await provider.send('c1-busy-A', { ...brainPayload('c1-busy-A'), sessionRole: 'w1' as const, userMessage: 'after-idle-a', assembledMessage: 'after-idle-a' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const resumeCalls2 = child2.requests.filter((r) => r.method === 'thread/resume');
+      expect(resumeCalls2).toHaveLength(2);
+      expect(resumeCalls2[1]?.params?.threadId).toBe('thread-busy-A');
+      expect(resumeCalls2[1]?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52302/mcp');
+    } finally {
+      hookPortMock.port = null;
+    }
+  });
+
   // E: model-agnostic matrix.
   //
   // Model naming, stated exactly:

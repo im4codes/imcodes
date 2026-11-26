@@ -1154,6 +1154,7 @@ interface CodexSdkSessionState {
   sourceConfig?: SessionConfig;
   mcpConfig?: Record<string, unknown>;
   loadedMcpConfigJson?: string;
+  loadedChannelChild?: ChildProcessWithoutNullStreams | null;
   /** Custom model provider (third-party / OpenAI-compatible endpoint) */
   customModelProvider?: CodexModelProviderConfig;
   /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
@@ -3896,7 +3897,9 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private hasMcpConfigChangedSinceLoad(state: CodexSdkSessionState): boolean {
-    if (state.incognito || !state.threadId || !state.loaded || state.loadedMcpConfigJson === undefined) return false;
+    if (state.incognito || !state.threadId || state.loadedMcpConfigJson === undefined) return false;
+    const channel = this.getChannelForSession(state);
+    if (!channel.child || (state.loadedChannelChild && state.loadedChannelChild !== channel.child)) return false;
     const currentJson = JSON.stringify(this.resolveLatestMcpConfig(state)?.mcp_servers ?? null);
     return currentJson !== state.loadedMcpConfigJson;
   }
@@ -3908,8 +3911,8 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.incognito) return;
     if (!this.hasMcpConfigChangedSinceLoad(state)) return;
     const channel = this.getChannelForSession(state);
-    state.loaded = false;
     if (channel.kind === 'normal' && channel.child && this.getActiveWorkSessionIds(sessionId, channel).length === 0) {
+      state.loaded = false;
       logger.info({ provider: this.id, sessionId, threadId: state.threadId },
         'Codex IM.codes MCP transport configuration changed; restarting idle app-server so thread reloads updated endpoint');
       await this.restartAppServerPreservingSessions('mcp-config-changed', sessionId, channel);
@@ -4820,8 +4823,9 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.incognito && !state.ephemeral) {
       this.markThreadResident(channel, resumedId);
     }
-    if (!state.incognito) {
+    if (!state.incognito && (!state.loadedChannelChild || state.loadedChannelChild !== channel.child)) {
       state.loadedMcpConfigJson = JSON.stringify((threadConfigParams.config as Record<string, unknown> | undefined)?.mcp_servers ?? null);
+      state.loadedChannelChild = channel.child;
     }
     channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
@@ -4890,6 +4894,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (!state.incognito) {
         state.loadedMcpConfigJson = JSON.stringify((threadConfigParams.config as Record<string, unknown> | undefined)?.mcp_servers ?? null);
+        state.loadedChannelChild = channel.child;
       }
       channel.threadToSession.set(threadId, sessionId);
       if (!state.incognito || state.model) {

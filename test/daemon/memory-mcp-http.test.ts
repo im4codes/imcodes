@@ -482,6 +482,251 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
       structuredContent: { status: 'ok', sessionName: 'deck_real_w1', currentModel: 'gpt-5' },
     });
     expect(listSessionModels).toHaveBeenCalledWith('deck_real_w1');
+
+    // send_stop over live /mcp -> mergeDefaultToolDeps -> POST /stop must authenticate via hookCredential (no 403).
+    const siblingSession = {
+      ...liveSession,
+      name: 'deck_real_w2',
+      sessionInstanceId: 'inst-real-2',
+      hookCredential: 'cred-real-2',
+    };
+    listSessionsMock.mockReturnValue([liveSession, siblingSession]);
+    getSessionMock.mockImplementation((name: string) => (
+      name === 'deck_real_w1' ? liveSession : name === 'deck_real_w2' ? siblingSession : undefined
+    ));
+    const stopRes = await client.callTool({ name: 'send_stop', arguments: { target: 'deck_real_w2' } });
+    expect(JSON.stringify(stopRes)).not.toContain('hook_session_credential_invalid');
+  });
+
+  it('forwards bound senderSessionName and hookCredential on /stop, /send, and /send-command in mergeDefaultToolDeps', async () => {
+    const seen: Array<{ url: string; sessionHeader?: string; credHeader?: string; from?: string }> = [];
+    const stubServer = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const parsed = body ? JSON.parse(body) as Record<string, unknown> : {};
+        seen.push({
+          url: req.url ?? '',
+          sessionHeader: req.headers['x-imcodes-session'] as string | undefined,
+          credHeader: req.headers[HOOK_SESSION_CREDENTIAL_HEADER] as string | undefined,
+          from: typeof parsed.from === 'string' ? parsed.from : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, stopped: true, queued: false }));
+      });
+    });
+    await listenEphemeral(stubServer);
+    const stubPort = (stubServer.address() as { port: number }).port;
+    cleanups.push(async () => {
+      await new Promise<void>((resolve) => stubServer.close(() => resolve()));
+    });
+
+    const { mergeDefaultToolDeps } = await import('../../src/daemon/memory-mcp-server.js');
+    const caller = {
+      userId: 'user-loop',
+      namespace: { scope: 'personal' as const, userId: 'user-loop', projectId: 'github.com/acme/loop' },
+      sessionName: 'deck_loop_w1',
+      projectName: 'loop',
+      projectRoot: '/tmp/loop',
+      serverId: 'srv-loop',
+      providerId: 'codex-sdk',
+      transport: 'stdio' as const,
+    };
+    const deps = mergeDefaultToolDeps(caller, {}, { sessionName: 'deck_loop_w1', sessionInstanceId: 'inst-loop', runtimeEpoch: 'epoch-loop' }, {
+      resolveHookPort: async () => stubPort,
+      hookCredential: 'cred-loop-secret',
+    });
+
+    const target = {
+      name: 'deck_loop_w2',
+      projectName: 'loop',
+      projectDir: '/tmp/loop',
+      agentType: 'codex-sdk' as const,
+      role: 'w1' as const,
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    await expect(deps.sendDeps!.dispatchMessage!(target, 'hi sibling', { messageId: 'm1' })).resolves.toBe('sent');
+    await expect(deps.sendDeps!.dispatchMessage!(target, '/status', { messageId: 'm2', command: true })).resolves.toBe('sent');
+    await expect(deps.sendDeps!.cancelSession!(target)).resolves.toBe(true);
+
+    expect(seen).toEqual([
+      { url: '/send', sessionHeader: 'deck_loop_w1', credHeader: 'cred-loop-secret', from: 'deck_loop_w1' },
+      { url: '/send-command', sessionHeader: 'deck_loop_w1', credHeader: 'cred-loop-secret', from: 'deck_loop_w1' },
+      { url: '/stop', sessionHeader: 'deck_loop_w1', credHeader: 'cred-loop-secret', from: 'deck_loop_w1' },
+    ]);
+  });
+
+  it('closes connection and blocks tool execution and loopback forwarding when same-named session is replaced mid-request', async () => {
+    const authorityHome = tempAuthorityHome();
+    let currentSession: Record<string, unknown> = {
+      name: 'deck_swap_w1',
+      projectName: 'swap',
+      projectDir: '/tmp/swap',
+      agentType: 'codex-sdk',
+      providerId: 'codex-sdk',
+      state: 'idle',
+      sessionInstanceId: 'inst-swap-old',
+      runtimeEpoch: 'epoch-swap-old',
+      hookCredential: 'cred-swap-old',
+      contextNamespace: { scope: 'user_private', userId: 'user-old' },
+    };
+    getSessionMock.mockImplementation((name: string) => (name === 'deck_swap_w1' ? currentSession : undefined));
+    listSessionsMock.mockImplementation(() => [currentSession]);
+
+    const invokedCallers: Array<{ sessionName: string | null; userId: string }> = [];
+    const listSessionModels = vi.fn(async () => ({
+      ok: true as const, sessionName: 'deck_swap_w1', agentType: 'codex-sdk', currentModel: 'gpt-5', models: ['gpt-5'], acceptsAnyModel: false,
+    }));
+    const { server, port } = await startHookServer(() => {}, {
+      authorityHome,
+      bindListener: listenEphemeral,
+      listSessionModels,
+      switchSessionModel: vi.fn(),
+      invokeMemoryMcpTool: async (caller) => {
+        invokedCallers.push({ sessionName: caller.sessionName, userId: caller.userId });
+        return { status: 'ok', user: caller.userId };
+      },
+    });
+    cleanups.push(() => closeHookServer(server).catch(() => {}));
+
+    const client = new Client({ name: 'swap-client', version: '1' });
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}${MEMORY_MCP_HTTP_PATH}`), {
+      requestInit: {
+        headers: {
+          [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+          [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-old',
+          [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-old',
+        },
+      },
+    });
+    cleanups.unshift(() => client.close().catch(() => {}));
+    await client.connect(transport);
+    const sid = transport.sessionId!;
+
+    // Helper: send POST whose headers validate against inst-old, then swap session before body completes.
+    const postAfterSwap = async (toolName: string, args: Record<string, unknown>, reqId: number) => {
+      const payload = JSON.stringify({
+        jsonrpc: '2.0',
+        id: reqId,
+        method: 'tools/call',
+        params: { name: toolName, arguments: args },
+      });
+      const splitAt = Math.floor(payload.length / 2);
+      return new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request({
+          agent: false,
+          hostname: '127.0.0.1',
+          port,
+          path: MEMORY_MCP_HTTP_PATH,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'Content-Length': String(Buffer.byteLength(payload)),
+            [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+            [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-old',
+            [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-old',
+            'mcp-session-id': sid,
+          },
+        }, (res) => {
+          let body = '';
+          res.on('data', (chunk) => { body += chunk; });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+        });
+        req.on('error', reject);
+        req.write(payload.slice(0, splitAt));
+        setTimeout(() => {
+          currentSession = {
+            ...currentSession,
+            sessionInstanceId: 'inst-swap-new',
+            runtimeEpoch: 'epoch-swap-new',
+            hookCredential: 'cred-swap-new',
+            contextNamespace: { scope: 'user_private', userId: 'user-new' },
+          };
+          req.end(payload.slice(splitAt));
+        }, 25);
+      });
+    };
+
+    // Mid-POST replacement before search_memory tool execution runs: must close connection & never invoke replacement identity!
+    const swapRes1 = await postAfterSwap('search_memory', { query: 'hi' }, 50);
+    expect(swapRes1.body).not.toContain('user-new');
+    expect(swapRes1.body === '' || swapRes1.body.includes('daemon_memory_worker_identity_unavailable')).toBe(true);
+    expect(invokedCallers).toHaveLength(0);
+    expect(listSessionModels).not.toHaveBeenCalled();
+
+    // Old mcp-session-id was closed cleanly by verifyBoundConnection; follow-up even with old session is 404.
+    const followUp = await rawHttpRequest({
+      port, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-new',
+        [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-new',
+        'mcp-session-id': sid,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 51, method: 'tools/list', params: {} }),
+    });
+    expect(followUp.status).toBe(404);
+
+    // Repeat the same mid-POST replacement specifically against loopback-forwarded tool `session_model`.
+    const client2 = new Client({ name: 'swap-client-2', version: '1' });
+    const transport2 = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}${MEMORY_MCP_HTTP_PATH}`), {
+      requestInit: {
+        headers: {
+          [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+          [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-new',
+          [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-new',
+        },
+      },
+    });
+    cleanups.unshift(() => client2.close().catch(() => {}));
+    await client2.connect(transport2);
+    const sid2 = transport2.sessionId!;
+    const modelPayload = JSON.stringify({
+      jsonrpc: '2.0', id: 52, method: 'tools/call', params: { name: 'session_model', arguments: {} },
+    });
+    const split2 = Math.floor(modelPayload.length / 2);
+    const swapRes2 = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request({
+        agent: false,
+        hostname: '127.0.0.1',
+        port,
+        path: MEMORY_MCP_HTTP_PATH,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Content-Length': String(Buffer.byteLength(modelPayload)),
+          [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+          [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-new',
+          [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-new',
+          'mcp-session-id': sid2,
+        },
+      }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on('error', reject);
+      req.write(modelPayload.slice(0, split2));
+      setTimeout(() => {
+        currentSession = {
+          ...currentSession,
+          sessionInstanceId: 'inst-swap-v3',
+          runtimeEpoch: 'epoch-swap-v3',
+          hookCredential: 'cred-swap-v3',
+        };
+        req.end(modelPayload.slice(split2));
+      }, 25);
+    });
+    expect(swapRes2.body === '' || swapRes2.body.includes('daemon_memory_worker_identity_unavailable')).toBe(true);
+    expect(listSessionModels).not.toHaveBeenCalled();
   });
 
   it('evicts idle HTTP MCP sessions via TTL sweep', async () => {
