@@ -5427,17 +5427,13 @@ function buildProcessedSearchWhere(
   if (!appendProcessedNamespaceGroupSql(conditions, params, filters.namespaceFilters)) {
     return { empty: true };
   }
-  if (filters.rowUserId !== undefined) {
-    if (hasFilterValue(filters.rowUserId)) {
-      if (filters.rowIncludeLegacyPersonalOwner) {
-        conditions.push("(user_id = ? OR (scope = 'personal' AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)))");
-        params.push(filters.rowUserId, LEGACY_DAEMON_LOCAL_USER_ID);
-      } else {
-        conditions.push('user_id = ?');
-        params.push(filters.rowUserId);
-      }
+  if (filters.rowUserId) {
+    if (filters.rowIncludeLegacyPersonalOwner) {
+      conditions.push("(user_id = ? OR (scope = 'personal' AND (user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)))");
+      params.push(filters.rowUserId, LEGACY_DAEMON_LOCAL_USER_ID);
     } else {
-      conditions.push("user_id = '__imcodes_empty_user_filter_never_matches__'");
+      conditions.push('user_id = ?');
+      params.push(filters.rowUserId);
     }
   }
   if (filters.projectionClass) {

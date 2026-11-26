@@ -403,6 +403,23 @@ describe('bounded observation recall and semantic parity', () => {
     expect(authOwnerFiltered.items.map((i) => i.id)).toEqual([wsProjOwner1.id]);
     expect(authOwnerFiltered.stats.matchedRecords).toBe(1);
 
+    // Empty string userId behaves like omitted userId (truthiness parity with matchesNamespace)
+    const authEmptyUser = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [wsNs, orgNs],
+      userId: '',
+      limit: 10,
+    });
+    expect(authEmptyUser.items).toHaveLength(2);
+    expect(authEmptyUser.stats.matchedRecords).toBe(2);
+
+    const authOtherUser = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [wsNs, orgNs],
+      userId: 'other-owner',
+      limit: 10,
+    });
+    expect(authOtherUser.items).toEqual([]);
+    expect(authOtherUser.stats.matchedRecords).toBe(0);
+
     const authUnfiltered = searchLocalMemoryAuthorized({
       authorizedNamespaces: [wsNs, orgNs],
       limit: 10,
