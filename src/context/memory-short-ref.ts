@@ -613,6 +613,7 @@ function flushPendingStoreRows(): void {
   const generation = shortRefStateGeneration;
   const batch = [...pendingStoreRows.entries()].slice(0, SHORT_REF_STORE_BATCH_SIZE);
   let succeeded = false;
+  let paused = false;
   let operation!: Promise<void>;
   const client = getContextStoreClient();
   operation = (async () => {
@@ -628,6 +629,16 @@ function flushPendingStoreRows(): void {
       }
       await waitForProductionWorkerReady(client);
     }
+    if (!isMemoryDaemonEnabled()) {
+      paused = true;
+      if (!recoveryJournalActive) {
+        const recovery = persistRecoveryJournal();
+        if (!recovery.durable && recovery.error) {
+          reportShortRefFailure('persist_recovery', recovery.error, { rows: batch.length });
+        }
+      }
+      return;
+    }
     await client.run(
       'upsertMemoryShortRefs',
       [batch.map(([, row]) => row)],
@@ -635,7 +646,7 @@ function flushPendingStoreRows(): void {
     );
   })()
     .then(() => {
-      if (generation !== shortRefStateGeneration) return;
+      if (generation !== shortRefStateGeneration || paused) return;
       succeeded = true;
       storeRetryAttempt = 0;
       for (const [key, row] of batch) {
@@ -651,6 +662,16 @@ function flushPendingStoreRows(): void {
     })
     .catch((error: unknown) => {
       if (generation !== shortRefStateGeneration) return;
+      if (!isMemoryDaemonEnabled()) {
+        paused = true;
+        if (!recoveryJournalActive) {
+          const recovery = persistRecoveryJournal();
+          if (!recovery.durable && recovery.error) {
+            reportShortRefFailure('persist_recovery', recovery.error, { rows: batch.length });
+          }
+        }
+        return;
+      }
       storeRetryAttempt += 1;
       // Keep the exact failed rows queued. Before returning to the event loop,
       // checkpoint them outside the worker-owned SQLite connection so a daemon
@@ -671,6 +692,7 @@ function flushPendingStoreRows(): void {
     .finally(() => {
       if (generation !== shortRefStateGeneration || storeFlushPromise !== operation) return;
       storeFlushPromise = null;
+      if (paused || !isMemoryDaemonEnabled()) return;
       if (pendingStoreRows.size === 0) {
         clearRecoveredStoreHealth();
       } else if (succeeded) {
@@ -682,6 +704,16 @@ function flushPendingStoreRows(): void {
       }
     });
   storeFlushPromise = operation;
+}
+
+/**
+ * Resume flushing any short refs queued or paused while daemon memory was
+ * disabled. Safe to call from normal periodic polling or on-demand resolution.
+ */
+export function flushPendingMemoryShortRefsIfEnabled(): void {
+  if (isMemoryDaemonEnabled() && pendingStoreRows.size > 0) {
+    flushPendingStoreRows();
+  }
 }
 
 /**
@@ -1039,6 +1071,7 @@ export async function resolveMemoryShortRefCandidatesWithStore(
   ref: string,
   namespace: ContextNamespace,
 ): Promise<MemoryShortRefEntry[]> {
+  flushPendingMemoryShortRefsIfEnabled();
   const candidates = resolveMemoryShortRefCandidates(ref, namespace);
   if (candidates.length > 0) return candidates;
   await hydrateMemoryShortRefFromStore(ref);
@@ -1054,6 +1087,7 @@ export async function resolveMemoryShortRefWithStore(
   ref: string,
   namespace?: ContextNamespace,
 ): Promise<MemoryShortRefEntry | undefined> {
+  flushPendingMemoryShortRefsIfEnabled();
   const resolved = resolveMemoryShortRef(ref, namespace);
   if (resolved) return resolved;
   await hydrateMemoryShortRefFromStore(ref);

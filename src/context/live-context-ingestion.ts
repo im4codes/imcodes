@@ -17,6 +17,7 @@ import { createConcurrencyGate } from '../util/concurrency.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
+import { flushPendingMemoryShortRefsIfEnabled } from './memory-short-ref.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 const INGEST_RETRY_BUFFER_MAX_EVENTS = 256;
@@ -223,6 +224,7 @@ export class LiveContextIngestion {
 
   async flushDueTargets(now = Date.now()): Promise<void> {
     if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
+    flushPendingMemoryShortRefsIfEnabled();
     for (const job of await this.coordinator.scheduleDueTargets(now)) {
       if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
       await this.coordinator.materializeTarget(job.target, job.trigger, now);

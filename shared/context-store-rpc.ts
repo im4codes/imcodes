@@ -93,6 +93,7 @@ export const CONTEXT_STORE_L1_OPS = [
   'recordContextEvent',
   'enqueueContextJob',
   'claimContextJob',
+  'releaseClaimedContextJob',
   'updateContextJob',
   'deleteStagedEventsByIds',
   'deleteTentativeProjections',

@@ -190,6 +190,7 @@ export class MaterializationCoordinator {
   private readonly _selfLearningEnabled?: boolean | (() => boolean);
   private readonly _resolveUsageContext?: MaterializationCoordinatorOptions['resolveUsageContext'];
   private readonly skillReviewEvidenceByTarget = new Map<string, SkillReviewTriggerEvidence>();
+  private readonly pausedClaimedJobIds = new Set<string>();
 
   get modelConfig(): ContextModelConfig {
     return this.explicitModelConfigOverride ?? getContextModelConfig();
@@ -326,7 +327,28 @@ export class MaterializationCoordinator {
     return this._commitMaterialization(input);
   }
 
+  private pauseClaimedMaterializationJob(jobId: string): MaterializationResult {
+    this.pausedClaimedJobIds.add(jobId);
+    return { replicationQueued: false, disabled: true };
+  }
+
+  private async releasePausedClaimedJobs(now = Date.now()): Promise<void> {
+    if (this.pausedClaimedJobIds.size === 0 || !isMemoryDaemonEnabled()) return;
+    const client = getContextStoreClient();
+    for (const jobId of [...this.pausedClaimedJobIds]) {
+      if (!isMemoryDaemonEnabled()) return;
+      try {
+        await client.run<boolean>('releaseClaimedContextJob', [jobId, now]);
+        this.pausedClaimedJobIds.delete(jobId);
+      } catch {
+        // Retain un-released job IDs so the next enabled pass can retry safely.
+      }
+    }
+  }
+
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
+    await this.releasePausedClaimedJobs(now);
     if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const memoryConfig = this.configForTarget(target);
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
@@ -339,7 +361,6 @@ export class MaterializationCoordinator {
     );
     if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const claimed = await client.run<boolean>('claimContextJob', [job.id, now]);
-    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     if (!claimed) {
       // Another overlapping poll pass already owns this exact job. Returning
       // before the staged-event read is essential: compressor inputs capture
@@ -347,12 +368,13 @@ export class MaterializationCoordinator {
       // prevent the same batch from being processed repeatedly.
       return { replicationQueued: false };
     }
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     // Heavy reads run in the worker when warm (staged events can be large), off
     // the daemon main thread; in-process fallback when not ready.
     const allEvents = await client.run<LocalContextEvent[]>(
       'listContextEvents', [target],
     );
-    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     // Only memory-eligible events are used for summary generation.
     // Streaming deltas, tool calls/results, and system events are excluded.
     const events = allEvents.filter((e) => {
@@ -368,6 +390,7 @@ export class MaterializationCoordinator {
 
     if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
       await this._archiveEventsForMaterialization(allEvents, now);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
       await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
       await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
       await client.run<void>('clearDirtyTarget', [target]);
@@ -385,7 +408,7 @@ export class MaterializationCoordinator {
     const previousProjections = await client.run<ProcessedContextProjection[]>(
       'listProcessedProjections', [target.namespace, 'recent_summary', { excludeArchived: true, limit: 1 } satisfies ListProcessedProjectionsOptions],
     );
-    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -402,7 +425,7 @@ export class MaterializationCoordinator {
     let compression: CompressionResult;
     try {
       const pinnedNotes = await collectPinnedNotesForNamespace(target.namespace);
-      if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
       compression = await compressFn({
         events,
         previousSummary: undefined,
@@ -427,6 +450,7 @@ export class MaterializationCoordinator {
         } : {}),
       });
     } catch (error) {
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
       if (error instanceof CompressionAdmissionClosedError) {
         await client.run<void>('updateContextJob', [job.id, 'materialization_failed', { now,
           error: `compression_admission_closed: ${error.reason} — kept raw events for retry`,
@@ -440,27 +464,29 @@ export class MaterializationCoordinator {
         // answer it. Now we record an SQLite row so the metric is queryable
         // — but we explicitly do NOT emit a timeline event (would be chat
         // noise: "nothing happened, but here's an event saying so").
-        try {
-          await client.run<void>('recordCompressionRun', [{
-            backend: 'none',
-            model: '',
-            usedBackup: false,
-            fromSdk: false,
-            namespaceKey: serializeContextNamespace(target.namespace),
-            targetKind: target.kind,
-            sessionName: target.sessionName ?? null,
-            trigger,
-            mode: 'auto',
-            eventCount: events.length,
-            inputTokens: 0,
-            outputTokens: 0,
-            targetTokens: 0,
-            durationMs: 0,
-            outcome: 'admission_closed',
-            errorCode: error.reason,
-            errorMessage: null,
-          }]);
-        } catch { /* never escape */ }
+        if (isMemoryDaemonEnabled()) {
+          try {
+            await client.run<void>('recordCompressionRun', [{
+              backend: 'none',
+              model: '',
+              usedBackup: false,
+              fromSdk: false,
+              namespaceKey: serializeContextNamespace(target.namespace),
+              targetKind: target.kind,
+              sessionName: target.sessionName ?? null,
+              trigger,
+              mode: 'auto',
+              eventCount: events.length,
+              inputTokens: 0,
+              outputTokens: 0,
+              targetTokens: 0,
+              durationMs: 0,
+              outcome: 'admission_closed',
+              errorCode: error.reason,
+              errorMessage: null,
+            }]);
+          } catch { /* never escape */ }
+        }
         return {
           replicationQueued: false,
         };
@@ -482,6 +508,8 @@ export class MaterializationCoordinator {
         errorMessage: errMsg.slice(0, 500),
       };
     }
+
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
 
     // Persist a row in context_compression_runs so operators can query
     // model/token costs later. Best-effort — recording failures must never
@@ -522,6 +550,7 @@ export class MaterializationCoordinator {
         // Telemetry must never escape — recordCompressionRun already swallows
         // its own errors, but defense-in-depth.
       }
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     }
 
     // Emit a `memory.compression` timeline event so the user can see in chat
@@ -562,7 +591,9 @@ export class MaterializationCoordinator {
     // fallback branch below owns that case; we don't treat it as noise.
     if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
       await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
       await this._archiveEventsForMaterialization(allEvents, now);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
       await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
       await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
       await client.run<void>('clearDirtyTarget', [target]);
@@ -596,6 +627,7 @@ export class MaterializationCoordinator {
     // the user intent: "a period of backend downtime means a gap in memory,
     // not a scar."
     const priorFailures = await client.run<number>('countConsecutiveFailedJobs', [target]);
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     const sdkFailed = !compression.fromSdk;
 
     if (sdkFailed) {
@@ -612,6 +644,7 @@ export class MaterializationCoordinator {
       // scrubbed here — the new design never writes tentatives, so the only
       // tentative rows that can exist are pre-migration leftovers.
       await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
 
       if (retryBudgetExhausted) {
         // Abandon batch: delete staged events, clear dirty target so we
@@ -619,6 +652,7 @@ export class MaterializationCoordinator {
         // 'completed' (not 'materialization_failed') so the next fresh
         // batch starts with a clean failure counter.
         await this._archiveEventsForMaterialization(allEvents, now);
+        if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
         await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
         await client.run<void>('updateContextJob', [job.id, 'completed', { now,
@@ -647,6 +681,7 @@ export class MaterializationCoordinator {
     // tentative rows that might have been left behind by prior code.
     if (priorFailures > 0) {
       await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
     }
 
     // Build the summary projection input (written atomically below).
@@ -690,6 +725,7 @@ export class MaterializationCoordinator {
     const replicationState = await client.run<ContextReplicationState | undefined>(
       'getReplicationState', [target.namespace],
     );
+    if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
 
     // Atomic commit bundle: archive events + write summary (+ durable) + set
     // replication + delete staged + complete job + clear dirty in ONE SQLite
@@ -751,6 +787,8 @@ export class MaterializationCoordinator {
   }
 
   async scheduleDueTargets(now = Date.now()): Promise<ContextJobRecord[]> {
+    if (!isMemoryDaemonEnabled()) return [];
+    await this.releasePausedClaimedJobs(now);
     if (!isMemoryDaemonEnabled()) return [];
     const client = getContextStoreClient();
     // Best-effort archive prune (a prune failure must never block scheduling).

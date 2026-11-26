@@ -3730,6 +3730,24 @@ export function claimContextJob(jobId: string, now = Date.now()): boolean {
 }
 
 /**
+ * Atomically return a running job claimed by this coordinator back to `pending`
+ * (for example, when memory was disabled mid-materialization and is later
+ * re-enabled). Never touches completed/failed rows.
+ */
+export function releaseClaimedContextJob(jobId: string, now = Date.now()): boolean {
+  clearPanelReadCache();
+  const database = ensureDb();
+  const result = database.prepare(`
+    UPDATE context_jobs
+    SET status = 'pending',
+        updated_at = ?,
+        error = NULL
+    WHERE id = ? AND status = 'running'
+  `).run(now, jobId) as { changes?: number };
+  return (result.changes ?? 0) === 1;
+}
+
+/**
  * Transaction-free body of {@link updateContextJob}: updates a context job row
  * directly on `database` with NO ensureDb. This function does not itself open a
  * transaction (the public wrapper did not either).

@@ -15,6 +15,7 @@ import {
 import {
   loadMemoryShortRefsFromStore,
   makeMemoryShortRef,
+  registerMemoryShortRefs,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
   resolveMemoryShortRefCandidatesWithStore,
@@ -23,7 +24,10 @@ import {
 import { selectStartupObservationItems } from '../../src/context/startup-memory.js';
 import { getContextStoreClient, resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import {
+  claimContextJob,
+  enqueueContextJob,
   listContextEvents,
+  listDirtyTargets,
   listMemoryShortRefsByRef,
   listProcessedProjections,
   recordContextEvent,
@@ -33,7 +37,7 @@ import {
   upsertMemoryShortRefs,
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
-import { setMemoryDaemonEnabled } from '../../src/store/memory-daemon-switch.js';
+import { isMemoryDaemonEnabled, setMemoryDaemonEnabled } from '../../src/store/memory-daemon-switch.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('daemon-wide memory disable gate', () => {
@@ -396,5 +400,173 @@ describe('daemon-wide memory disable gate', () => {
     // Journal entries flush back to SQLite and the owned recovery journal is atomically removed.
     await expect.poll(() => listMemoryShortRefsByRef(ref)).toHaveLength(1);
     await expect.poll(() => existsSync(recoveryPath)).toBe(false);
+  });
+
+  it('releases paused running jobs back to pending on re-enable and pauses post-compressor RPCs without splitting staged rows', async () => {
+    setMemoryDaemonEnabled(true);
+    const client = getContextStoreClient();
+
+    // Seed an unrelated active running job for a different target — must NOT be reset by our coordinator.
+    const otherTarget = { ...target, sessionName: 'deck_repo_unrelated' };
+    const otherJob = enqueueContextJob(otherTarget, 'materialize_session', 'manual', 1_000);
+    expect(claimContextJob(otherJob.id, 1_001)).toBe(true);
+
+    let compressorCalls = 0;
+    let resolveDeferredCompression!: () => void;
+    let waitInCompressor = false;
+    const coordinator = new MaterializationCoordinator({
+      memoryConfig: {
+        enabled: true,
+        autoTriggerTokens: 1,
+        minEventCount: 1,
+        idleMs: 1,
+        scheduleMs: 1,
+        maxBatchTokens: 1000,
+        batchTargetTokens: 500,
+        manualCompactTargetTokens: 500,
+        masterIdleHours: 1,
+        archiveRetentionDays: 30,
+        extraRedactPatterns: [],
+      },
+      compressor: async () => {
+        compressorCalls += 1;
+        if (waitInCompressor) {
+          await new Promise<void>((resolve) => {
+            resolveDeferredCompression = resolve;
+          });
+        }
+        return {
+          summary: '## Recent Summary\nRecovered after mid-compression disable.',
+          model: 'test-model',
+          backend: 'test-backend',
+          usedBackup: false,
+          fromSdk: true,
+          inputTokens: 10,
+          outputTokens: 12,
+          targetTokens: 100,
+          durationMs: 5,
+        };
+      },
+    });
+
+    await coordinator.ingestEvent({
+      id: 'ev-claim-pause-1',
+      target,
+      eventType: 'assistant.text',
+      content: 'Work that should materialize cleanly once re-enabled',
+      createdAt: 2_000,
+    });
+
+    // Case A: Claim wins in real SQLite, then switch turns off immediately before listContextEvents runs.
+    const origRun = client.run.bind(client);
+    const postPauseOps: string[] = [];
+    let flipOnClaim = true;
+    const runSpy = vi.spyOn(client, 'run').mockImplementation(async (op, args, opts) => {
+      if (!isMemoryDaemonEnabled() && op !== 'releaseClaimedContextJob') {
+        postPauseOps.push(op);
+      }
+      const res = await origRun(op, args, opts);
+      if (flipOnClaim && op === 'claimContextJob' && res === true) {
+        flipOnClaim = false;
+        setMemoryDaemonEnabled(false);
+      }
+      return res;
+    });
+
+    const resA = await coordinator.materializeTarget(target, 'manual', 2_100);
+    expect(resA).toEqual({ replicationQueued: false, disabled: true });
+    expect(postPauseOps).toEqual([]);
+    expect(compressorCalls).toBe(0);
+    expect(listContextEvents(target)).toHaveLength(1);
+    expect(listProcessedProjections(target.namespace)).toHaveLength(0);
+
+    // Case B: Re-enable on the SAME coordinator -> claim succeeds cleanly (job returned to pending), then disable INSIDE deferred compressor!
+    setMemoryDaemonEnabled(true);
+    waitInCompressor = true;
+    const matPromiseB = coordinator.materializeTarget(target, 'manual', 2_200);
+    await vi.waitFor(() => expect(compressorCalls).toBe(1));
+    postPauseOps.length = 0;
+    setMemoryDaemonEnabled(false);
+    resolveDeferredCompression();
+    const resB = await matPromiseB;
+    expect(resB).toEqual({ replicationQueued: false, disabled: true });
+    // After compressor settles while disabled: ZERO recordCompressionRun / countConsecutiveFailedJobs / commitMaterialization / updateContextJob RPCs.
+    expect(postPauseOps).toEqual([]);
+    expect(listContextEvents(target)).toHaveLength(1);
+    expect(listProcessedProjections(target.namespace)).toHaveLength(0);
+
+    // Case C: Re-enable again without recreating coordinator -> releases claimed job back to pending and finishes the batch!
+    runSpy.mockRestore();
+    waitInCompressor = false;
+    setMemoryDaemonEnabled(true);
+    const due = await coordinator.scheduleDueTargets(2_300);
+    expect(due.length).toBeGreaterThanOrEqual(1);
+    const finalRes = await coordinator.materializeTarget(target, 'manual', 2_300);
+    expect(finalRes.disabled).toBeUndefined();
+    expect(listContextEvents(target)).toHaveLength(0);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(0);
+    expect(listProcessedProjections(target.namespace)).toHaveLength(1);
+    expect(listProcessedProjections(target.namespace)[0]?.summary).toContain('Recovered after mid-compression disable.');
+    // Unrelated job owned by another session remains untouched ('running', so another claim returns false).
+    expect(claimContextJob(otherJob.id, 2_400)).toBe(false);
+  });
+
+  it('pauses short-ref flush after waitForProductionWorkerReady when disabled mid-wait and resumes via normal polling on re-enable', async () => {
+    setMemoryDaemonEnabled(true);
+    const recoveryPath = join(tempDir, 'memory-short-refs.pending.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = recoveryPath;
+
+    const client = getContextStoreClient();
+    const origRun = client.run.bind(client);
+    const isOwnerSpy = vi.spyOn(client, 'isProductionOwner', 'get').mockReturnValue(true);
+    const isReadySpy = vi.spyOn(client, 'isReady', 'get').mockReturnValue(false);
+    let resolveWorkerReady!: () => void;
+    const whenReadySpy = vi.spyOn(client, 'whenReady').mockImplementation(
+      () => new Promise<void>((resolve) => {
+        resolveWorkerReady = resolve;
+      }),
+    );
+    const opsDuringDisable: string[] = [];
+    const runSpy = vi.spyOn(client, 'run').mockImplementation(async (op, args, opts) => {
+      opsDuringDisable.push(op);
+      return origRun(op, args, opts);
+    });
+
+    const shortRefNs = { scope: 'personal' as const, userId: 'user-1', projectId: 'repo-1' };
+    const [ref] = registerMemoryShortRefs([
+      { kind: 'projection', id: 'deferred-shortref-id', namespace: shortRefNs },
+    ]);
+    expect(ref).toBeTruthy();
+
+    // Journal was persisted while waiting for worker ready; flip switch off before worker becomes ready.
+    await vi.waitFor(() => expect(existsSync(recoveryPath)).toBe(true));
+    setMemoryDaemonEnabled(false);
+    resolveWorkerReady();
+    // Allow microtasks / flushPendingStoreRows async chain to settle.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    // Must NOT have called upsertMemoryShortRefs and must preserve recovery journal + SQLite empty.
+    expect(opsDuringDisable).toEqual([]);
+    expect(existsSync(recoveryPath)).toBe(true);
+    expect(listMemoryShortRefsByRef(ref!)).toHaveLength(0);
+
+    // Re-enable at runtime and let worker be ready; normal periodic poll (flushDueTargets) resumes the paused flush.
+    isReadySpy.mockReturnValue(true);
+    isOwnerSpy.mockReturnValue(true);
+    whenReadySpy.mockResolvedValue();
+    runSpy.mockRestore();
+    setMemoryDaemonEnabled(true);
+
+    const ingestion = new LiveContextIngestion({
+      sessionLookup: () => undefined,
+      resolveBootstrap: async () => ({ namespace: shortRefNs, diagnostics: [] }),
+    });
+    try {
+      await ingestion.flushDueTargets();
+      await expect.poll(() => listMemoryShortRefsByRef(ref!)).toHaveLength(1);
+      await expect.poll(() => existsSync(recoveryPath)).toBe(false);
+    } finally {
+      ingestion.dispose();
+    }
   });
 });
