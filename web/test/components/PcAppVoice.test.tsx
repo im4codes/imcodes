@@ -537,9 +537,10 @@ describe('PC App inline voice dictation and quick permission grant', () => {
     const fake = createFakePcAppBridge({ getSpeechModelStatus });
     (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
 
-    // Start with hidden pre-existing HUD root (as left after an earlier dictation).
+    // Start with hidden pre-existing HUD root (as left after an earlier dictation, matching voice-hud.ts aria-hidden=true).
     const hudRoot = document.createElement('div');
     hudRoot.id = 'imcodes-voice-hud-root';
+    hudRoot.setAttribute('aria-hidden', 'true');
     hudRoot.setAttribute('data-mode', 'hidden');
     hudRoot.style.display = 'none';
     const hudLabel = document.createElement('span');
@@ -573,14 +574,21 @@ describe('PC App inline voice dictation and quick permission grant', () => {
 
       const controlsWrapper = container.querySelector('.controls-wrapper') as HTMLElement;
       const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+      const getAccessibleVoiceStatuses = () =>
+        screen.getAllByRole('status').filter((el) => (
+          el.textContent?.includes('Qwen3-ASR') || el.textContent?.includes('voice.loading_model')
+        ));
 
       fireEvent.click(micBtn);
       // Before HUD transitions from hidden -> visible, chip renders only inside the out-of-flow fallback overlay.
       const fallbackChip = await screen.findByTestId('inline-voice-service-chip');
       expect(controlsWrapper.contains(fallbackChip)).toBe(true);
       expect(hudRoot.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+      expect(screen.queryByTestId('voice-hud-sr-status')).toBeNull();
+      expect(getAccessibleVoiceStatuses().map((el) => el.textContent)).toEqual(['Qwen3-ASR 1.7B']);
 
-      // Transition HUD to loading mode -> duplicate voice-model-loading-chip is suppressed, service chip moves into HUD.
+      // Transition HUD to loading mode -> duplicate voice-model-loading-chip is suppressed, service chip moves into HUD,
+      // and non-hidden accessible role="status" preserves both model label and loading status despite aria-hidden="true" on HUD.
       fake.emit({ type: 'loading', variant: '1.7b' });
       hudRoot.setAttribute('data-mode', 'loading');
       hudRoot.style.display = 'flex';
@@ -592,9 +600,14 @@ describe('PC App inline voice dictation and quick permission grant', () => {
         expect(hudChip?.textContent).toContain('Qwen3-ASR 1.7B');
         expect(controlsWrapper.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
         expect(screen.queryByTestId('voice-model-loading-chip')).toBeNull();
+        const accessibleStatuses = getAccessibleVoiceStatuses();
+        expect(accessibleStatuses).toHaveLength(1);
+        expect(accessibleStatuses[0]?.getAttribute('aria-live')).toBe('polite');
+        expect(accessibleStatuses[0]?.textContent).toContain('Qwen3-ASR 1.7B');
+        expect(accessibleStatuses[0]?.textContent).toContain('voice.loading_model');
       });
 
-      // Transition HUD to listening -> chip remains inline on the same row as label + waveform bars.
+      // Transition HUD to listening -> chip remains inline in HUD; accessible role="status" exposes model name cleanly.
       fake.emit({ type: 'start' });
       hudRoot.setAttribute('data-mode', 'listening');
       hudLabel.textContent = '请说话';
@@ -604,29 +617,42 @@ describe('PC App inline voice dictation and quick permission grant', () => {
         expect(hudRoot.contains(hudLabel)).toBe(true);
         expect(hudRoot.contains(hudBars)).toBe(true);
         expect(controlsWrapper.querySelector('.voice-inline-chips')).toBeNull();
+        const accessibleStatuses = getAccessibleVoiceStatuses();
+        expect(accessibleStatuses).toHaveLength(1);
+        expect(accessibleStatuses[0]?.textContent).toBe('Qwen3-ASR 1.7B');
       });
 
-      // Hide HUD -> chip falls back out of HUD without leaving orphan DOM inside #imcodes-voice-hud-root.
+      // Hide HUD -> chip falls back out of HUD; sr-status clears so fallback status is never duplicated.
       hudRoot.setAttribute('data-mode', 'hidden');
       hudRoot.style.display = 'none';
       await waitFor(() => {
         expect(hudRoot.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
         expect(controlsWrapper.querySelector('[data-testid="inline-voice-service-chip"]')).not.toBeNull();
+        expect(screen.queryByTestId('voice-hud-sr-status')).toBeNull();
+        expect(getAccessibleVoiceStatuses()).toHaveLength(1);
       });
 
-      // Dynamically recreate HUD while listening -> chip portals back in, then cleans up completely on unmount.
+      // Dynamically recreate HUD while listening -> chip portals back in, then stopping voice clears accessible status completely.
       hudRoot.remove();
       const recreatedHud = document.createElement('div');
       recreatedHud.id = 'imcodes-voice-hud-root';
+      recreatedHud.setAttribute('aria-hidden', 'true');
       recreatedHud.setAttribute('data-mode', 'listening');
       recreatedHud.style.display = 'flex';
       document.body.appendChild(recreatedHud);
       await waitFor(() => {
         expect(recreatedHud.querySelector('[data-testid="inline-voice-service-chip"]')).not.toBeNull();
+        expect(getAccessibleVoiceStatuses().map((el) => el.textContent)).toEqual(['Qwen3-ASR 1.7B']);
+      });
+
+      fireEvent.click(micBtn);
+      await waitFor(() => {
+        expect(recreatedHud.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+        expect(screen.queryByTestId('voice-hud-sr-status')).toBeNull();
+        expect(getAccessibleVoiceStatuses()).toHaveLength(0);
       });
 
       unmount();
-      expect(recreatedHud.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
     } finally {
       document.getElementById('imcodes-voice-hud-root')?.remove();
     }

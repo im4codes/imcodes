@@ -10792,8 +10792,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div
             data-testid="inline-voice-service-chip"
             class="voice-active-service-chip"
-            role="status"
-            aria-live="polite"
+            role={voiceHudMount ? undefined : 'status'}
+            aria-live={voiceHudMount ? undefined : 'polite'}
             title={inlineVoiceServiceLabel}
           >
             <span class="voice-active-service-dot" aria-hidden="true" />
@@ -10802,9 +10802,30 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         ) : null;
         const showLoadingChip = voiceModelLoading && voiceHudMount?.mode !== 'loading';
         const showFallbackOverlay = (!voiceHudMount && Boolean(serviceChip)) || showLoadingChip;
+        // `#imcodes-voice-hud-root` carries `aria-hidden="true"` in PC App, so keep an
+        // accessible zero-height status inside `.controls-wrapper` whenever the model
+        // badge is portaled into the HUD or the HUD suppresses the visual loading chip.
+        const srStatusParts: string[] = [];
+        if (voiceHudMount && inlineVoiceActive && inlineVoiceServiceLabel) {
+          srStatusParts.push(inlineVoiceServiceLabel);
+        }
+        if (voiceModelLoading && !showLoadingChip) {
+          srStatusParts.push(t('voice.loading_model'));
+        }
         return (
           <>
             {voiceHudMount && serviceChip && createPortal(serviceChip, voiceHudMount.root)}
+            {srStatusParts.length > 0 && (
+              <div
+                data-testid="voice-hud-sr-status"
+                class="voice-sr-status"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {srStatusParts.join(' · ')}
+              </div>
+            )}
             {showFallbackOverlay && (
               <div class="voice-inline-chips">
                 {!voiceHudMount && serviceChip}

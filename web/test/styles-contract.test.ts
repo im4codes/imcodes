@@ -2177,6 +2177,12 @@ describe('styles.css regression contracts', () => {
     const hudChipRule = cssWithoutComments.match(/#imcodes-voice-hud-root\s+\.voice-active-service-chip[^{]*\{[^}]*\}/)?.[0] ?? '';
     expect(hudChipRule).toMatch(/pointer-events:\s*none/);
     expect(hudChipRule).toMatch(/max-width:/);
+    const srStatusRule = cssWithoutComments.match(/\.voice-sr-status\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(srStatusRule).toMatch(/position:\s*absolute/);
+    expect(srStatusRule).toMatch(/width:\s*1px/);
+    expect(srStatusRule).toMatch(/height:\s*1px/);
+    expect(srStatusRule).toMatch(/overflow:\s*hidden/);
+    expect(srStatusRule).toMatch(/pointer-events:\s*none/);
     const localesDir = resolve(__dirname, '../src/i18n/locales');
     const enVoice = JSON.parse(readFileSync(join(localesDir, 'en.json'), 'utf8')).voice as Record<string, string>;
     expect(enVoice.engine_web).toBeTruthy();

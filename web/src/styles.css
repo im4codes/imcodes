@@ -3225,6 +3225,19 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 11px;
   pointer-events: none;
 }
+.voice-sr-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  pointer-events: none;
+}
 .voice-active-service-chip {
   display: inline-flex;
   align-items: center;
