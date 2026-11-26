@@ -364,7 +364,8 @@
       "message_send_failed": "⚠️ メッセージを送信できませんでした。",
       "compact_failed": "⚠️ 会話を圧縮できませんでした。",
       "session_inline_error": "⚠️ セッションでエラーが発生しました。",
-      "turn_stopped_for_queue": "⚠️ 前のターンを停止しました。キュー内のメッセージを送信しています"
+      "turn_stopped_for_queue": "⚠️ 前のターンを停止しました。キュー内のメッセージを送信しています",
+      "welcome_opencode_free_model": "無料スターターモデル（{{model}}、サードパーティ提供、入力がモデル改善に利用される場合があります）を使用中です。機密コードの入力は避け、下部の切り替えから自分の SDK／モデルへいつでも変更できます。"
     },
     "execution_status": {
       "waiting": "待機中",

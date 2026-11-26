@@ -364,7 +364,8 @@
       "message_send_failed": "⚠️ Sending the message failed.",
       "compact_failed": "⚠️ Compacting the conversation failed.",
       "session_inline_error": "⚠️ The session reported an error.",
-      "turn_stopped_for_queue": "⚠️ Stopped previous turn — sending queued message(s)"
+      "turn_stopped_for_queue": "⚠️ Stopped previous turn — sending queued message(s)",
+      "welcome_opencode_free_model": "Using free starter model ({{model}}, third-party service; inputs may be used to improve models) — avoid sensitive code, or switch to your own SDK/model below anytime."
     },
     "execution_status": {
       "waiting": "Waiting",

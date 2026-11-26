@@ -364,7 +364,8 @@
       "message_send_failed": "⚠️ 訊息傳送失敗。",
       "compact_failed": "⚠️ 壓縮對話失敗。",
       "session_inline_error": "⚠️ 工作階段回報錯誤。",
-      "turn_stopped_for_queue": "⚠️ 已停止上一輪，正在傳送佇列訊息"
+      "turn_stopped_for_queue": "⚠️ 已停止上一輪，正在傳送佇列訊息",
+      "welcome_opencode_free_model": "目前使用免費體驗模型（{{model}}，由第三方提供，輸入可能用於模型改進），請勿貼上敏感程式碼；可隨時在底部切換自己的模型。"
     },
     "execution_status": {
       "waiting": "等待中",
