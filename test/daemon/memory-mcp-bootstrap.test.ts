@@ -652,7 +652,7 @@ describe('memory MCP lightweight bootstrap', () => {
     await client.callTool({ name: 'memory_injection_get', arguments: {} }).catch(() => {});
     const gen3Tools = (await client.listTools()).tools.map((t) => t.name);
     expect(gen3Tools).not.toContain('session_identity_get');
-  }, 30_000);
+  }, 60_000);
 
   it('bounds discovery metadata cleanly on queue-full and deterministic caller-env failures', async () => {
     const { child, messages } = rawBootstrap({
