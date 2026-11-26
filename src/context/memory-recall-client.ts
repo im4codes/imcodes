@@ -81,7 +81,7 @@ export async function searchLocalMemorySemanticViaWorker(
   // Hop 1: embed the query on the main thread (existing embedding worker).
   const { generateEmbedding } = await import('./embedding.js');
   const queryEmbedding = await generateEmbedding(query.query);
-  if (!queryEmbedding) return null; // model unavailable → fall back
+  if (!queryEmbedding || !isMemoryDaemonEnabled()) return null; // model unavailable or memory disabled -> fall back
 
   // Resolve main-thread-only inputs and pass them as cloneable RPC args.
   const namespace = query.namespace;
@@ -235,7 +235,7 @@ export async function searchLocalMemorySemanticFrontOfTurn(
   if (!isMemoryDaemonEnabled()) return emptyMemorySearchResult();
   const viaWorker = await searchLocalMemorySemanticViaWorker(query);
   if (viaWorker) return viaWorker;
-  if (getContextStoreClient().isProductionOwner) return emptyMemorySearchResult();
+  if (!isMemoryDaemonEnabled() || getContextStoreClient().isProductionOwner) return emptyMemorySearchResult();
   return searchLocalMemorySemantic(query);
 }
 
@@ -251,6 +251,6 @@ export async function selectStartupMemoryForBootstrap(
   if (!isMemoryDaemonEnabled()) return [];
   const viaWorker = await selectStartupMemoryViaWorker(namespace, options);
   if (viaWorker) return viaWorker;
-  if (getContextStoreClient().isProductionOwner) return [];
+  if (!isMemoryDaemonEnabled() || getContextStoreClient().isProductionOwner) return [];
   return selectStartupMemoryItems(namespace, options);
 }

@@ -41,6 +41,7 @@ const SHORT_REF_SCHEMA_VERSION = 2;
 const entriesByRef = new Map<string, MemoryShortRefEntry[]>();
 const persistedRefHydrations = new Map<string, Promise<number>>();
 let persistedLoaded = false;
+let recoveryJournalReplayed = false;
 let shortRefHealth: MemoryShortRefHealth | undefined;
 
 interface MemoryShortRefStoreRow extends Record<string, unknown> {
@@ -605,8 +606,8 @@ async function waitForProductionWorkerReady(client: ReturnType<typeof getContext
 }
 
 function flushPendingStoreRows(): void {
-  if (storeFlushPromise || storeRetryTimer || pendingStoreRows.size === 0) {
-    clearRecoveredStoreHealth();
+  if (!isMemoryDaemonEnabled() || storeFlushPromise || storeRetryTimer || pendingStoreRows.size === 0) {
+    if (pendingStoreRows.size === 0) clearRecoveredStoreHealth();
     return;
   }
   const generation = shortRefStateGeneration;
@@ -799,6 +800,16 @@ function mergePersistedShortRefRows(
   return { loaded, discarded };
 }
 
+function replayPendingRecoveryJournal(flushImmediately: boolean): { count: number; loaded: number } {
+  recoveryJournalReplayed = true;
+  const recovered = loadRecoveryJournal();
+  const recoveredMerged = mergePersistedShortRefRows(recovered.map(({ ref, entry }) => toStoreRow(ref, entry)));
+  reportDiscardedShortRefRows('recovery_file', recoveredMerged.discarded);
+  if (recoveredMerged.loaded > 0) pruneShortRefs();
+  if (flushImmediately && recovered.length > 0) flushPendingStoreRows();
+  return { count: recovered.length, loaded: recoveredMerged.loaded };
+}
+
 /**
  * Warm the in-memory index from the context store once at daemon startup.
  *
@@ -811,9 +822,7 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
   // Load the emergency journal before touching the worker. Even if the worker
   // is still unavailable after a daemon restart, refs protected during the
   // prior self-heal window are immediately resolvable from this local index.
-  const recovered = loadRecoveryJournal();
-  const recoveredMerged = mergePersistedShortRefRows(recovered.map(({ ref, entry }) => toStoreRow(ref, entry)));
-  reportDiscardedShortRefRows('recovery_file', recoveredMerged.discarded);
+  const recovered = replayPendingRecoveryJournal(false);
   try {
     const rows = await getContextStoreClient()
       .run<Array<Record<string, unknown>>>(
@@ -826,12 +835,12 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // the same as a failed load — report instead of returning a 0 that reads
       // as "nothing stored".
       reportShortRefFailure('warm_load', new Error('listMemoryShortRefs returned a non-array response'));
-      if (recovered.length > 0) flushPendingStoreRows();
+      if (recovered.count > 0) flushPendingStoreRows();
       pruneShortRefs();
-      return recoveredMerged.loaded;
+      return recovered.loaded;
     }
     const merged = mergePersistedShortRefRows(rows);
-    let loaded = merged.loaded + recoveredMerged.loaded;
+    let loaded = merged.loaded + recovered.loaded;
     // A well-formed array of malformed rows loads nothing and leaves every
     // earlier handle unresolvable — indistinguishable from an empty store
     // unless the discards are reported.
@@ -841,7 +850,7 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     const legacy = importLegacyShortRefFile();
     if (legacy.length > 0) persistShortRefs(legacy);
     loaded += legacy.length;
-    if (recovered.length > 0) flushPendingStoreRows();
+    if (recovered.count > 0) flushPendingStoreRows();
     pruneShortRefs();
     persistedLoaded = true;
     return loaded;
@@ -850,8 +859,8 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     // unresolvable for the life of the process — report rather than return a
     // zero that is indistinguishable from "nothing stored".
     reportShortRefFailure('warm_load', error);
-    if (recovered.length > 0) flushPendingStoreRows();
-    return recoveredMerged.loaded;
+    if (recovered.count > 0) flushPendingStoreRows();
+    return recovered.loaded;
   }
 }
 
@@ -979,7 +988,7 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
  * rescanning the bounded warm-load window on every miss.
  */
 async function hydrateMemoryShortRefFromStore(ref: string): Promise<number> {
-  if (shortRefStorePath()) return 0;
+  if (shortRefStorePath() || !isMemoryDaemonEnabled()) return 0;
   const normalizedRef = normalizeRef(ref);
   if (!normalizedRef) return 0;
   const existing = persistedRefHydrations.get(normalizedRef);
@@ -992,7 +1001,7 @@ async function hydrateMemoryShortRefFromStore(ref: string): Promise<number> {
         reportShortRefFailure('hydrate_ref', new Error('listMemoryShortRefsByRef returned a non-array response'), {
           ref: normalizedRef,
         });
-        return 0;
+        return !recoveryJournalReplayed ? replayPendingRecoveryJournal(true).loaded : 0;
       }
       // This ref is being actively redeemed. Promote hydrated rows in the
       // process-local LRU before pruning so an old persisted handle cannot be
@@ -1000,10 +1009,15 @@ async function hydrateMemoryShortRefFromStore(ref: string): Promise<number> {
       const merged = mergePersistedShortRefRows(rows, { touchLastSeenAt: true });
       reportDiscardedShortRefRows('hydrate_ref', merged.discarded);
       pruneShortRefs();
+      // If startup skipped warm-load because daemon memory was disabled, replay
+      // any pending emergency journal on the first DB miss after re-enable.
+      if (merged.loaded === 0 && !recoveryJournalReplayed) {
+        return replayPendingRecoveryJournal(true).loaded;
+      }
       return merged.loaded;
     } catch (error) {
       reportShortRefFailure('hydrate_ref', error, { ref: normalizedRef });
-      return 0;
+      return !recoveryJournalReplayed ? replayPendingRecoveryJournal(false).loaded : 0;
     }
   })();
   persistedRefHydrations.set(normalizedRef, hydration);
@@ -1069,11 +1083,13 @@ export function resetMemoryShortRefsForTests(): void {
   persistedRefHydrations.clear();
   shortRefHealth = undefined;
   persistedLoaded = true;
+  recoveryJournalReplayed = false;
 }
 
 export function reloadMemoryShortRefsForTests(): void {
   entriesByRef.clear();
   persistedRefHydrations.clear();
   persistedLoaded = false;
+  recoveryJournalReplayed = false;
   ensurePersistedLoaded();
 }

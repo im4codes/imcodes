@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { generateEmbedding } from '../../src/context/embedding.js';
 import { searchLocalMemory } from '../../src/context/memory-recall-core.js';
@@ -11,11 +12,19 @@ import {
   selectStartupMemoryForBootstrap,
   selectStartupMemoryViaWorker,
 } from '../../src/context/memory-recall-client.js';
-import { loadMemoryShortRefsFromStore, makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
+import {
+  loadMemoryShortRefsFromStore,
+  makeMemoryShortRef,
+  resetMemoryShortRefsForTests,
+  resolveMemoryShortRef,
+  resolveMemoryShortRefCandidatesWithStore,
+  resolveMemoryShortRefWithStore,
+} from '../../src/context/memory-short-ref.js';
 import { selectStartupObservationItems } from '../../src/context/startup-memory.js';
 import { getContextStoreClient, resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import {
   listContextEvents,
+  listMemoryShortRefsByRef,
   listProcessedProjections,
   recordContextEvent,
   recordTurnUsage,
@@ -43,6 +52,7 @@ describe('daemon-wide memory disable gate', () => {
     resetContextStoreClientForTests();
     setMemoryDaemonEnabled(true);
     delete process.env.IMCODES_MEMORY_DAEMON_SWITCH_PATH;
+    delete process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
     resetContextStoreForTests();
     await cleanupIsolatedSharedContextDb(tempDir);
   });
@@ -231,5 +241,160 @@ describe('daemon-wide memory disable gate', () => {
     expect(dirtyAfter).toHaveLength(1);
     expect(await (ingestion as unknown as { hasAnyActivity: (t: typeof target) => Promise<boolean> }).hasAnyActivity(target)).toBe(true);
     ingestion.dispose();
+  });
+
+  it('aborts in-flight multi-await background flows with zero subsequent RPCs when disabled mid-flight', async () => {
+    const client = getContextStoreClient();
+    const ops: string[] = [];
+
+    // 1. selectStartupObservationItems: listContextNamespaces flips switch -> listStartupContextObservations must NOT run.
+    setMemoryDaemonEnabled(true);
+    let resolveNamespaces!: (rows: Array<Record<string, unknown>>) => void;
+    const runMock = vi.spyOn(client, 'run').mockImplementation((op) => {
+      ops.push(op);
+      if (op === 'listContextNamespaces') {
+        return new Promise((resolve) => {
+          resolveNamespaces = (rows) => resolve(rows as never);
+        }) as never;
+      }
+      throw new Error(`unexpected subsequent RPC: ${op}`);
+    });
+    const obsPromise = selectStartupObservationItems({ ...target.namespace, userId: 'user-1' });
+    await Promise.resolve();
+    setMemoryDaemonEnabled(false);
+    resolveNamespaces([{
+      id: 'ns-1',
+      scope: 'personal',
+      projectId: 'repo',
+      userId: 'user-1',
+    }]);
+    expect(await obsPromise).toEqual([]);
+    expect(ops).toEqual(['listContextNamespaces']);
+
+    // 2. MaterializationCoordinator.ingestEvent: ingestContextEvent flips switch -> enqueueContextJob must NOT run.
+    ops.length = 0;
+    runMock.mockReset();
+    setMemoryDaemonEnabled(true);
+    const coordinator = new MaterializationCoordinator({
+      memoryConfig: {
+        enabled: true,
+        autoTriggerTokens: 1,
+        minEventCount: 1,
+        idleMs: 1,
+        scheduleMs: 1,
+        maxBatchTokens: 1000,
+        batchTargetTokens: 500,
+        manualCompactTargetTokens: 500,
+        masterIdleHours: 1,
+        archiveRetentionDays: 30,
+        extraRedactPatterns: [],
+      },
+    });
+    runMock.mockImplementation(async (op) => {
+      ops.push(op);
+      if (op === 'ingestContextEvent') {
+        setMemoryDaemonEnabled(false);
+        return {
+          event: { id: 'ev-mid', target, eventType: 'assistant.text', content: 'hi', createdAt: 1000 },
+          dirtyTarget: { target, eventCount: 5, oldestEventAt: 900, newestEventAt: 1000 },
+          stagedTokenUpperBound: 500,
+        } as never;
+      }
+      throw new Error(`unexpected RPC after disable: ${op}`);
+    });
+    const ingestRes = await coordinator.ingestEvent({
+      id: 'ev-mid',
+      target,
+      eventType: 'assistant.text',
+      content: 'hi',
+      createdAt: 1000,
+    });
+    expect(ingestRes).toEqual({
+      event: expect.objectContaining({ id: 'ev-mid' }),
+    });
+    expect(ops).toEqual(['ingestContextEvent']);
+
+    // 3. scheduleDueTargets + selectTrigger: estimateStagedTokenUpperBound flips switch -> getLatestRecentSummaryUpdatedAtForTarget & enqueueContextJob must NOT run; second target must NOT run.
+    ops.length = 0;
+    runMock.mockReset();
+    setMemoryDaemonEnabled(true);
+    const target2 = { ...target, sessionName: 'deck_repo_other' };
+    runMock.mockImplementation(async (op) => {
+      ops.push(op);
+      if (op === 'pruneArchiveIfDue') return { deleted: 0, skipped: true } as never;
+      if (op === 'listDirtyTargets') {
+        return [
+          { target, eventCount: 3, oldestEventAt: 100, newestEventAt: 200 },
+          { target: target2, eventCount: 4, oldestEventAt: 100, newestEventAt: 200 },
+        ] as never;
+      }
+      if (op === 'estimateStagedTokenUpperBound') {
+        setMemoryDaemonEnabled(false);
+        return 500 as never;
+      }
+      throw new Error(`unexpected RPC after disable in scheduleDueTargets: ${op}`);
+    });
+    expect(await coordinator.scheduleDueTargets(5_000)).toEqual([]);
+    expect(ops).toEqual(['pruneArchiveIfDue', 'listDirtyTargets', 'estimateStagedTokenUpperBound']);
+
+    // 4. LiveContextIngestion.hasAnyActivity: getLatestRecentSummaryUpdatedAtForTarget flips switch -> listContextEvents & listArchivedEventsForTarget must NOT run.
+    ops.length = 0;
+    runMock.mockReset();
+    setMemoryDaemonEnabled(true);
+    const ingestion = new LiveContextIngestion({
+      sessionLookup: () => undefined,
+      resolveBootstrap: async () => ({ namespace: target.namespace, diagnostics: [] }),
+    });
+    runMock.mockImplementation(async (op) => {
+      ops.push(op);
+      if (op === 'listDirtyTargets') return [] as never;
+      if (op === 'getLatestRecentSummaryUpdatedAtForTarget') {
+        setMemoryDaemonEnabled(false);
+        return undefined as never;
+      }
+      throw new Error(`unexpected RPC after disable in hasAnyActivity: ${op}`);
+    });
+    expect(await (ingestion as unknown as { hasAnyActivity: (t: typeof target) => Promise<boolean> }).hasAnyActivity(target)).toBe(false);
+    expect(ops).toEqual(['listDirtyTargets', 'getLatestRecentSummaryUpdatedAtForTarget']);
+    ingestion.dispose();
+  });
+
+  it('recovers journal-only short refs on demand via async resolver after disabled startup + runtime re-enable', async () => {
+    const recoveryPath = join(tempDir, 'memory-short-refs.pending.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = recoveryPath;
+    const shortRefNs = { scope: 'personal' as const, userId: 'user-1', projectId: 'repo-1' };
+    const id = 'durable-during-worker-self-heal';
+    const ref = makeMemoryShortRef('projection', id);
+    writeFileSync(recoveryPath, JSON.stringify({
+      schemaVersion: 2,
+      rows: [{
+        ref,
+        kind: 'projection',
+        id,
+        namespaceKey: JSON.stringify([shortRefNs.scope, shortRefNs.userId, shortRefNs.projectId, '', '']),
+        namespaceJson: JSON.stringify(shortRefNs),
+        lastSeenAt: Date.now(),
+      }],
+    }), { encoding: 'utf8', mode: 0o600 });
+
+    // 1. Daemon starts with memory disabled -> startup warm-load short-circuits without RPCs or deleting journal.
+    const client = getContextStoreClient();
+    const runSpy = vi.spyOn(client, 'run');
+    expect(await loadMemoryShortRefsFromStore()).toBe(0);
+    expect(await resolveMemoryShortRefWithStore(ref, shortRefNs)).toBeUndefined();
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(existsSync(recoveryPath)).toBe(true);
+
+    // 2. Flip switch back to enabled at runtime WITHOUT calling loadMemoryShortRefsFromStore again.
+    setMemoryDaemonEnabled(true);
+    const resolved = await resolveMemoryShortRefWithStore(ref, shortRefNs);
+    expect(resolved).toMatchObject({ kind: 'projection', id });
+    expect(await resolveMemoryShortRefCandidatesWithStore(ref, shortRefNs)).toEqual([
+      expect.objectContaining({ kind: 'projection', id }),
+    ]);
+
+    // Journal entries flush back to SQLite and the owned recovery journal is atomically removed.
+    await expect.poll(() => listMemoryShortRefsByRef(ref)).toHaveLength(1);
+    await expect.poll(() => existsSync(recoveryPath)).toBe(false);
   });
 });

@@ -178,17 +178,19 @@ export class LiveContextIngestion {
       try {
         action = await this.prepareTimelineAction(event);
       } catch (error) {
+        if (!isMemoryDaemonEnabled()) return;
         this.enqueuePrepareRetryableEvent(event, error, { scheduleMarkdownIngest: true });
         return;
       }
 
-      if (action.kind === 'noop') return;
+      if (action.kind === 'noop' || !isMemoryDaemonEnabled()) return;
       if (action.kind === 'toolEvidence') {
         await this.executeTimelineAction(action);
         return;
       }
 
       const preFlush = await this.flushRetryBuffer(event.sessionId);
+      if (!isMemoryDaemonEnabled()) return;
       if (preFlush.status === 'blocked') {
         this.enqueueRetryableAction(action, preFlush.error);
         return;
@@ -199,6 +201,7 @@ export class LiveContextIngestion {
         this.enqueueRetryableAction(action, error);
         return;
       }
+      if (!isMemoryDaemonEnabled()) return;
       await this.flushRetryBuffer(event.sessionId);
     });
   }
@@ -221,8 +224,10 @@ export class LiveContextIngestion {
   async flushDueTargets(now = Date.now()): Promise<void> {
     if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
     for (const job of await this.coordinator.scheduleDueTargets(now)) {
+      if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
+    if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
     await this.coordinator.materializeDueMasterSummaries(now);
   }
 
@@ -237,6 +242,7 @@ export class LiveContextIngestion {
     if (!isMemoryDaemonEnabled()) return;
     const sessionIds = [...this.retryBuffer.keys()];
     await Promise.all(sessionIds.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
+      if (!isMemoryDaemonEnabled()) return;
       await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId, { forceDue: options.forceDue }));
     })));
   }
@@ -257,6 +263,7 @@ export class LiveContextIngestion {
       throw error;
     }
     const target = toSessionTarget(session.name, bootstrap);
+    if (!isMemoryDaemonEnabled()) return;
     try {
       if (await this.hasAnyActivity(target)) return;
     } catch (error) {
@@ -266,10 +273,12 @@ export class LiveContextIngestion {
       }
       throw error;
     }
+    if (!isMemoryDaemonEnabled()) return;
 
     let lastTs = Date.now();
     let staged = 0;
     for (let index = 0; index < backfillEvents.length; index += 1) {
+      if (!isMemoryDaemonEnabled()) return;
       const event = backfillEvents[index];
       if (this.shouldIngestTimelineEvent && !this.shouldIngestTimelineEvent(event, session)) continue;
       const mapped = mapTimelineEvent(event);
@@ -288,7 +297,10 @@ export class LiveContextIngestion {
       }
     }
     if (staged > 0) {
-      if (isLiveContextMaterializationAdmissionOpen() && await this.coordinator.canMaterializeTarget(target, lastTs)) {
+      if (isLiveContextMaterializationAdmissionOpen()
+        && isMemoryDaemonEnabled()
+        && await this.coordinator.canMaterializeTarget(target, lastTs)
+        && isMemoryDaemonEnabled()) {
         await this.coordinator.materializeTarget(target, 'recovery', lastTs);
       }
     }
@@ -327,6 +339,7 @@ export class LiveContextIngestion {
   }
 
   private async executeTimelineAction(action: PreparedTimelineAction): Promise<void> {
+    if (!isMemoryDaemonEnabled()) return;
     switch (action.kind) {
       case 'noop':
         return;
@@ -335,8 +348,11 @@ export class LiveContextIngestion {
       const state = typeof event.payload.state === 'string' ? event.payload.state : '';
       if (state === 'idle'
         && isLiveContextMaterializationAdmissionOpen()
+        && isMemoryDaemonEnabled()
         && await this.hasDirtyTarget(target)
-        && await this.coordinator.canMaterializeTarget(target, event.ts)) {
+        && isMemoryDaemonEnabled()
+        && await this.coordinator.canMaterializeTarget(target, event.ts)
+        && isMemoryDaemonEnabled()) {
         await this.coordinator.materializeTarget(target, 'idle', event.ts);
       }
       return;
@@ -352,7 +368,7 @@ export class LiveContextIngestion {
         const preparedAction = await this.prepareTimelineAction(action.event, {
           scheduleMarkdownIngest: action.scheduleMarkdownIngest,
         });
-        if (preparedAction.kind === 'prepare') return;
+        if (preparedAction.kind === 'prepare' || !isMemoryDaemonEnabled()) return;
         await this.executeTimelineAction(preparedAction);
         return;
       }
@@ -360,7 +376,9 @@ export class LiveContextIngestion {
     const result = await this.processPreparedTimelineIngest(action.prepared);
     if (result.trigger === 'threshold'
       && isLiveContextMaterializationAdmissionOpen()
-      && await this.coordinator.canMaterializeTarget(action.prepared.target, action.prepared.event.ts)) {
+      && isMemoryDaemonEnabled()
+      && await this.coordinator.canMaterializeTarget(action.prepared.target, action.prepared.event.ts)
+      && isMemoryDaemonEnabled()) {
       await this.coordinator.materializeTarget(action.prepared.target, 'threshold', action.prepared.event.ts);
     }
         return;
@@ -478,10 +496,15 @@ export class LiveContextIngestion {
     sessionId: string,
     options: { forceDue?: boolean } = {},
   ): Promise<FlushRetryBufferResult> {
-    if (!isMemoryDaemonEnabled()) return { status: 'drained' };
     const queue = this.retryBuffer.get(sessionId);
     if (!queue || queue.length === 0) return { status: 'drained' };
+    // Preserve buffered entries across a disabled window without launching RPCs or tight timers.
+    if (!isMemoryDaemonEnabled()) return { status: 'blocked', error: queue[0]!.lastError };
     while (queue.length > 0) {
+      if (!isMemoryDaemonEnabled()) {
+        this.retryBuffer.set(sessionId, queue);
+        return { status: 'blocked', error: queue[0]!.lastError };
+      }
       const entry = queue.shift()!;
       const now = Date.now();
       if (!options.forceDue && entry.nextAttemptAt > now) {
@@ -596,11 +619,14 @@ export class LiveContextIngestion {
   private async hasAnyActivity(target: ContextTargetRef): Promise<boolean> {
     if (!isMemoryDaemonEnabled()) return false;
     if (await this.hasDirtyTarget(target)) return true;
+    if (!isMemoryDaemonEnabled()) return false;
     // Target-specific activity gate: avoid suppressing backfill for one
     // session just because another target in the same namespace has summaries.
     const client = getContextStoreClient();
     if (await client.run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [target]) !== undefined) return true;
+    if (!isMemoryDaemonEnabled()) return false;
     if ((await client.run<LocalContextEvent[]>('listContextEvents', [target])).length > 0) return true;
+    if (!isMemoryDaemonEnabled()) return false;
     return (await client.run<LocalContextEvent[]>('listArchivedEventsForTarget', [target, 0, 1])).length > 0;
   }
 }

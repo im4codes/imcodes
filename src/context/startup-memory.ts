@@ -341,6 +341,7 @@ export async function selectStartupObservationItems(
     if (client.isProductionOwner) return [];
     throw error;
   }
+  if (!isMemoryDaemonEnabled()) return [];
   const allowedRows = new Map(
     namespaceRows
       .filter((row) => canUseObservationForStartup(row, namespace))

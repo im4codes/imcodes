@@ -57,8 +57,23 @@ import {
   getRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
 
+function buildDisabledIngestResult(
+  input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>,
+  eligible: boolean,
+  recordedEvent?: LocalContextEvent,
+): { event: LocalContextEvent; filtered?: boolean } {
+  const event: LocalContextEvent = recordedEvent ?? {
+    id: input.id ?? randomUUID(),
+    target: input.target,
+    eventType: input.eventType,
+    content: input.content,
+    metadata: input.metadata,
+    createdAt: input.createdAt ?? Date.now(),
+  };
+  return eligible ? { event } : { event, filtered: true };
+}
+
 /** Archive-write override hook. The injected test form is synchronous; the
- *  default coordinator implementation routes through the async client and may
  *  return a Promise — callers `await` the result so both shapes are safe. */
 type ArchiveEventsForMaterializationFn = (events: LocalContextEvent[], archivedAt?: number) => void | Promise<void>;
 /** Atomic materialization commit override hook (sync injected form, async
@@ -232,17 +247,7 @@ export class MaterializationCoordinator {
     // Only memory-eligible events (assistant.text) count toward materialization
     // triggers; streaming deltas / tool calls / system events are excluded.
     const eligible = isMemoryEligibleEvent(input.eventType);
-    if (!isMemoryDaemonEnabled()) {
-      const event: LocalContextEvent = {
-        id: input.id ?? randomUUID(),
-        target: input.target,
-        eventType: input.eventType,
-        content: input.content,
-        metadata: input.metadata,
-        createdAt: input.createdAt ?? Date.now(),
-      };
-      return eligible ? { event } : { event, filtered: true };
-    }
+    if (!isMemoryDaemonEnabled()) return buildDisabledIngestResult(input, eligible);
     const client = getContextStoreClient();
     // ONE aggregate RPC: always record to staging, and (for eligible events) read
     // the dirty target + staged-token upper bound + latest recent-summary
@@ -253,6 +258,7 @@ export class MaterializationCoordinator {
       'ingestContextEvent', [input, eligible],
     );
     const event = agg.event;
+    if (!isMemoryDaemonEnabled()) return buildDisabledIngestResult(input, eligible, event);
     if (!eligible) return { event, filtered: true };
     if (!agg.dirtyTarget) return { event };
     // The trigger DECISION uses in-memory threshold/rate-limit state, so it stays
@@ -264,7 +270,7 @@ export class MaterializationCoordinator {
       agg.stagedTokenUpperBound,
       agg.latestSummaryUpdatedAt,
     );
-    if (!trigger) return { event };
+    if (!trigger || !isMemoryDaemonEnabled()) return { event };
     const jobType = input.target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     const queuedJob = await client.run<ContextJobRecord>(
       'enqueueContextJob', [input.target, jobType, trigger, event.createdAt],
@@ -331,7 +337,9 @@ export class MaterializationCoordinator {
     const job = await client.run<ContextJobRecord>(
       'enqueueContextJob', [target, jobType, trigger, now],
     );
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const claimed = await client.run<boolean>('claimContextJob', [job.id, now]);
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     if (!claimed) {
       // Another overlapping poll pass already owns this exact job. Returning
       // before the staged-event read is essential: compressor inputs capture
@@ -344,6 +352,7 @@ export class MaterializationCoordinator {
     const allEvents = await client.run<LocalContextEvent[]>(
       'listContextEvents', [target],
     );
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     // Only memory-eligible events are used for summary generation.
     // Streaming deltas, tool calls/results, and system events are excluded.
     const events = allEvents.filter((e) => {
@@ -376,6 +385,7 @@ export class MaterializationCoordinator {
     const previousProjections = await client.run<ProcessedContextProjection[]>(
       'listProcessedProjections', [target.namespace, 'recent_summary', { excludeArchived: true, limit: 1 } satisfies ListProcessedProjectionsOptions],
     );
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -392,6 +402,7 @@ export class MaterializationCoordinator {
     let compression: CompressionResult;
     try {
       const pinnedNotes = await collectPinnedNotesForNamespace(target.namespace);
+      if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
       compression = await compressFn({
         events,
         previousSummary: undefined,
@@ -751,10 +762,12 @@ export class MaterializationCoordinator {
     } catch {
       // ignore — best-effort
     }
+    if (!isMemoryDaemonEnabled()) return [];
     const queued: ContextJobRecord[] = [];
     for (const target of await client.run<ContextDirtyTarget[]>('listDirtyTargets', [undefined])) {
+      if (!isMemoryDaemonEnabled()) return queued;
       const trigger = await this.selectTrigger(target, now);
-      if (!trigger) continue;
+      if (!trigger || !isMemoryDaemonEnabled()) continue;
       const jobType = target.target.kind === 'project' ? 'materialize_project' : 'materialize_session';
       queued.push(await client.run<ContextJobRecord>('enqueueContextJob', [target.target, jobType, trigger, now]));
     }
@@ -770,9 +783,11 @@ export class MaterializationCoordinator {
     const client = getContextStoreClient();
     const due: ProcessedContextProjection[] = [];
     for (const item of await client.run<LatestRecentSummarySession[]>('listLatestRecentSummarySessions', [1000])) {
+      if (!isMemoryDaemonEnabled()) return due;
       const itemMemoryConfig = this.resolveMemoryConfig(item.namespace);
       const idleMs = Math.max(0, itemMemoryConfig.masterIdleHours) * 60 * 60 * 1000;
       const lastMasterUpdatedAt = await client.run<number | undefined>('getLatestMasterSummaryUpdatedAt', [item.sessionName, item.namespace]);
+      if (!isMemoryDaemonEnabled()) return due;
       if (lastMasterUpdatedAt !== undefined && lastMasterUpdatedAt >= item.updatedAt) continue;
       if (idleMs > 0 && now - item.updatedAt < idleMs) continue;
       const projection = await materializeMasterSummary(item.sessionName, item.namespace, now, itemMemoryConfig);
@@ -885,12 +900,15 @@ export class MaterializationCoordinator {
   private async selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): Promise<ContextJobTrigger | undefined> {
     if (!isMemoryDaemonEnabled()) return undefined;
     const client = getContextStoreClient();
+    const stagedTokenUpperBound = await client.run<number>('estimateStagedTokenUpperBound', [dirtyTarget.target]);
+    if (!isMemoryDaemonEnabled()) return undefined;
+    const latestSummaryUpdatedAt = await client.run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [dirtyTarget.target]);
     return this.decideTrigger(
       dirtyTarget,
       now,
       this.thresholdsForTarget(dirtyTarget.target),
-      await client.run<number>('estimateStagedTokenUpperBound', [dirtyTarget.target]),
-      await client.run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [dirtyTarget.target]),
+      stagedTokenUpperBound,
+      latestSummaryUpdatedAt,
     );
   }
 
@@ -973,14 +991,17 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
   if (!isMemoryDaemonEnabled()) return undefined;
   const client = getContextStoreClient();
   const resolvedNamespace = namespace ?? await findNamespaceForSessionSummaries(sessionName);
-  if (!resolvedNamespace) return undefined;
+  if (!resolvedNamespace || !isMemoryDaemonEnabled()) return undefined;
   const effectiveMemoryConfig = memoryConfig ?? resolveMemoryConfigForNamespace(resolvedNamespace);
 
   const previousMaster = await findLatestMasterSummary(sessionName, resolvedNamespace);
+  if (!isMemoryDaemonEnabled()) return undefined;
   const since = previousMaster?.updatedAt ?? 0;
   const batchSummaries = await queryBatchSummariesForMaster(sessionName, resolvedNamespace, since);
+  if (!isMemoryDaemonEnabled()) return undefined;
   const target: ContextTargetRef = { namespace: resolvedNamespace, kind: 'session', sessionName };
   const archiveEvents = (await client.run<LocalContextEvent[]>('listArchivedEventsForTarget', [target, since, 200])).filter(isHighSignalMasterEvent);
+  if (!isMemoryDaemonEnabled()) return undefined;
   if (batchSummaries.length === 0 && archiveEvents.length === 0) return previousMaster;
 
   const sourceEventIds = mergeMasterSourceIds(previousMaster?.sourceEventIds ?? [], [
