@@ -2,31 +2,28 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
+**自托管、源码可用、零厂商绑定的 AI Force 工作台：跨厂商 Task Pairs 与执行池、内网穿透受控节点与 Computer Use、内置 4K 远程桌面、云文档 + ONLYOFFICE，以及团队共享。**
 
-**给 AI agent 的 IM。AI 远程桌面、共享记忆、OpenSpec 自动交付、托管 MCP 工具、受监督执行，以及跨模型审计。**
-
-> 三个臭皮匠，顶个诸葛亮。<br>
-> 三个诸葛亮，谈笑定阴阳。<br>
+> 别再只和一个 AI 对话，指挥一整支 AI Force。<br>
+> 一座工作台，调遣所有模型与机器。<br>
 > — IM.codes
 
-IM.codes 不只连接 AI agent 的 coding session，也把 agent 连接到真正执行工作的电脑。把支持的机器注册成受限的**被控节点（Controlled Nodes）**，一个 AI 或一组 AI 就能通过有作用域的命令、文件传输和 Computer Use 直接操作一台或多台电脑；需要人工查看或接管时，具备条件的 Windows 节点还可以直接从桌面浏览器或手机打开远程桌面。
+IM.codes 把 AI Agent、远程电脑与团队文档统一到同一座实时工作台。**自托管、源码可用（[BSL 1.1](../LICENSE) —— 个人与 `<= 5` 用户且 `<= 50` 人团队免费使用）、零厂商绑定** —— 记忆、代码、文档与工具都在自己手里，任何模型与供应商随时自由切换（[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent)、GitHub Copilot、Cursor、OpenCode 等）。
 
-在机器控制之外，IM.codes 还为 coding agent 提供跨 provider 共享的记忆层和托管 MCP 工具面，把已完成工作沉淀成可复用上下文，贯通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等。终端、文件与 Git 视图、localhost 预览、通知、多 agent 工作流、OpenSpec 自动交付、Auto supervision 和跨模型 Team 审计，让人和 AI 的工作保持可见、可控、可衔接。
+> **说明：** 本文件是简体中文翻译版。**英文 README（`../README.md`）是规范版本。** 若内容存在差异，以英文版为准。
 
-> **说明：** 本文件是中文翻译版。**英文 README（`../README.md`）是规范版本。** 若内容存在差异，以英文版为准。
+## 核心支柱总览
 
-支持多个 agent 通过 CLI 和 SDK 两种方式接入。
+| 核心支柱 | 解决什么问题 |
+|---|---|
+| **Task Pairs 与跨厂商执行池（Pair）** | 旗舰 Brain 拆解需求为依赖 Brief 与编号清单，从跨厂商执行池调度隔离的 `Executor × Auditor` 配对（原生 Split View），消除单模型盲点，跨供应商分散使用量、遇限额按执行池配置切换，通过结构化 `PASS` / `REWORK` 收敛。 |
+| **受控节点与 AI Computer Use（OCU）** | 无需公网 IP、VPN 或端口映射，把内网 Linux、Windows、macOS 机器接入为 AI 可操作节点；支持有作用域的 `exec_remote`、直连/中继文件传输及 `computer_use_call` 类型化 GUI/CDP 浏览器自动化（`^^(nodeId)`）。 |
+| **内置 4K 远程桌面（远桌）** | 直接内置于 IM.codes，在许可范围内使用无需额外购买第三方远程桌面服务。浏览器或手机随时连接 Windows、macOS、Linux 桌面，支持 4 分屏多机桌面墙，人类始终拥有最终控制权。 |
+| **云文档与协同编辑（ONLYOFFICE）** | 内置云文档 + ONLYOFFICE + DocBuilder。统一存放规范、Runbook 与 AI Skills，用 `&` 选择器直接注入对话，协同创建、转换、编辑与分享 DOCX/XLSX/PPTX/Markdown。 |
+| **团队共享与精细权限控制** | 按人或分组共享受控节点、实时会话/子会话与云文档（`viewer` 或 `participant`），支持一键撤销；私有分组可将个人与家庭设备彻底隔离。 |
+| **三屏协同与 iPhone Duo** | 桌面、平板、**iPhone Duo / 折叠屏双屏**、手机与 Apple Watch 无缝衔接，标签与面板跨端同步。 |
 
-## 被控节点：AI 远程桌面
-
-无需把每台电脑都配置成完整的 IM.codes source server，就能把支持的机器接入为 AI 可操作的被控节点。
-
-- **一个 AI，控制多台电脑。** 注册多台机器，让一个 agent 或一组 agent 直接操作这些电脑完成工作。
-- **执行真实电脑操作。** 运行有作用域的命令、传输单个文件，并通过类型化 Computer Use 工具操作桌面应用。
-- **需要人工时随时远程接管。** 从浏览器或手机打开具备条件的 Windows 节点，直接查看画面或进行远程控制。
-- **权限明确，随时可撤销。** 每台节点使用独立凭证，不混入普通 server/session 列表，所有者可以关闭执行权限或直接撤销节点。
-
-## 截图
+## 截图展示
 
 ### 桌面端
 
@@ -35,6 +32,9 @@ IM.codes 不只连接 AI agent 的 coding session，也把 agent 连接到真正
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="../landing/imcodes0.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="../landing/imcodes1.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="../landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-nodes.png"><img src="../landing/imcodes-nodes.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-clouddocs.png"><img src="../landing/imcodes-clouddocs.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="../landing/imcodes3.png" width="24%" /></a>
 </p>
 
 ### iPad / 平板
@@ -44,18 +44,25 @@ IM.codes 不只连接 AI agent 的 coding session，也把 agent 连接到真正
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="../landing/imcodes-ipad3.png" width="48%" /></a>
 </p>
 
-### 手机
+### iPhone Duo / 折叠屏
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo1.png"><img src="../landing/imcodes-duo1.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo2.png"><img src="../landing/imcodes-duo2.png" width="48%" /></a>
+</p>
+
+### 手机端
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="../landing/imcodes-m1.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="../landing/imcodes-m2.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="../landing/imcodes-m3.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="../landing/imcodes-m4.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
 </p>
 
 ### Apple Watch
@@ -66,8 +73,39 @@ IM.codes 不只连接 AI agent 的 coding session，也把 agent 连接到真正
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="../landing/imcodes-watch2.png" width="31%" /></a>
 </p>
 
-
 手表支持会话快速查看、未读计数、推送通知，以及直接在手腕上快速回复。
+
+## Task Pairs 与跨厂商执行池
+
+不再把希望寄托在单一对话窗口的单模型输出，而是像工程团队一样调度一整支 AI Force。
+
+- **Brain 拆解与依赖管理。** 旗舰 Brain 将需求拆解为带依赖关系的 Brief 与编号 `[ ][ ]` 清单（`pair_create`、`pair_task_update`），在隔离的 git worktree 或任务目录中并发推进。
+- **跨厂商执行池。** 在 Claude Code、Codex、Antigravity CLI、Qwen 等之间混编旗舰与次主力模型，交叉补齐单模型盲点，，并跨供应商分散使用量、遇限额按执行池配置切换。
+- **原生 Split View（Executor × Auditor）。** 左侧实现、右侧审计实时同屏可见，配合实时清单勾选与结构化 `PASS` / `REWORK` 收敛（`pair_verdict`）。
+- **Global Task Mode 与零绑定。** 跨服务器编排多阶段任务流水线，随时自由切换模型与供应商。
+
+## 受控节点与内置 4K 远程桌面
+
+把内网 Linux、Windows 和 macOS 电脑变成 AI 可直接操作、人类随时可接管的节点——无需公网 IP、VPN 或端口映射。
+
+- **一支 AI Force，掌控多台机器。** 输入 `^`（或 `^^(nodeId)`）即可在对话中指定目标机器，执行有作用域的 `exec_remote` 命令、直连/中继传输文件，并通过 `computer_use_call` 与 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)（Leo, MIT）操作桌面软件或 CDP 浏览器。
+- **内置 4K 远程桌面。** 从浏览器或手机直接打开 Windows、macOS、Linux 远程桌面，支持触控手势、虚拟鼠标与画质切换。
+- **四分屏多机桌面墙。** 同屏监看与接管多达四台主机画面，关键时刻人类始终握有最高控制权。
+- **权限隔离，随时撤销。** 每台节点使用独立凭证，不混入普通会话列表，权限可一键关闭或撤销。
+
+## 云文档与协同编辑
+
+用内置云文档（ONLYOFFICE + DocBuilder）把项目规范、Runbook、架构说明和 AI Skills 与代码管理在一起。
+
+- **`&` 选择器一键注入对话。** 在输入框输入 `&` 即可选择并注入任何云文档，SDK Agent 也能通过托管 `cloud_docs` MCP 工具列表、读取、编辑、转换与分享文档。
+- **ONLYOFFICE + DocBuilder。** 在线协同编辑 DOCX、XLSX、PPTX 与 Markdown，支持格式转换与团队权限共享。
+
+## 团队共享与协作空间
+
+按人或分组精细分享受控节点、实时会话、子会话与云文档，同时守住基础设施控制权。
+
+- **分级角色。** `viewer` 适合只读旁观与审阅；`participant` 可向覆盖会话发送 prompt 或操作授权节点，消息自动标注真人 actor。
+- **一键撤销与私有分组。** 随时降级或撤销权限，并通过私有分组将个人与家庭电脑与团队工作空间彻底隔离。
 
 ## 下载
 
@@ -183,7 +221,7 @@ IM.codes 可用你自己的 supervisor 提示词对支持的 agent session 做�
 
 单模型输出不应被盲目信任。团队讨论让多个 agent——跨不同 provider 和思维风格——在写代码之前就对同一代码库进行协作分析。每轮遵循可自定义的多阶段流程，每个 agent 读取所有前序贡献并在此基础上输出。不同模型捕获不同类别的问题：一个发现竞态条件，另一个指出遗漏的 migration，第三个质疑 API 设计。这种跨 provider 交叉审查能在实现前发现单个模型常漏掉的问题，减少返工。
 
-内置模式包括 `audit`（结构化 audit → review → plan 流水线）、`review`、`discuss` 和 `brainstorm`，也可以自定义阶段序列。侧边栏中的环形进度条会显示 round / hop 完成情况。支持 Claude Code、Codex、Gemini CLI 和 Qwen，也兼容带 sandbox 的 agent。通过 `@@all(config)` 或 UI 配置参与者、轮次、模式和团队设置。
+内置模式包括 `audit`（结构化 audit → review → plan 流水线）、`review`、`discuss` 和 `brainstorm`，也可以自定义阶段序列。侧边栏中的环形进度条会显示 round / hop 完成情况。支持 Claude Code、Codex、Antigravity CLI 和 Qwen，也兼容带 sandbox 的 agent。通过 `@@all(config)` 或 UI 配置参与者、轮次、模式和团队设置。
 
 ### 流式 Transport Agents
 
@@ -279,7 +317,7 @@ daemon 可以通过 npm 自升级。也可以从 Web UI 为单台设备或全部
 - 不是另一个 AI IDE
 - 不是聊天壳子
 - 不只是远程终端客户端
-- 不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品
+- 不是 Claude Code、Codex、Antigravity CLI、OpenClaw 或 Qwen 的替代品
 - 它是围绕这些工具的消息与控制层
 
 ## 架构
@@ -291,7 +329,7 @@ Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
         ↓ tmux / transport / managed MCP
-AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
+AI Agents (Claude Code / Codex / Antigravity CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
@@ -437,11 +475,11 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - **Windows（实验性）**：通过 ConPTY 原生支持（Windows 10+ 内置）。运行 `irm https://im.codes/install.ps1 | iex`（兜底 `npm install -g imcodes`）即可，不需要额外软件。WSL 也可用。
 - Node.js >= 22
 - 终端复用器：[tmux](https://github.com/tmux/tmux)（Linux/macOS）。Windows 使用 ConPTY（自动检测，系统内置）。
-- 至少安装一个 AI coding agent：[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com) 或 [Qwen](https://github.com/QwenLM/qwen-agent)
+- 至少安装一个 AI coding agent：[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com) 或 [Qwen](https://github.com/QwenLM/qwen-agent)
 
 ## 关于
 
-这是一个个人项目。我自己几乎没写代码——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 构建完成，[Codex](https://github.com/openai/codex) 和 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 也提供了大量贡献。
+这是一个个人项目。我自己几乎没写代码——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 构建完成，[Codex](https://github.com/openai/codex) 和 Antigravity CLI 也提供了大量贡献。
 
 ## 免责声明
 

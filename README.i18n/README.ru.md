@@ -2,28 +2,26 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**IM для агентов. Удалённый рабочий стол с ИИ, общая память, OpenSpec Auto Deliver, управляемые MCP-инструменты, контролируемое выполнение и кросс-модельный аудит.**
+**Self-hosted AI Force workbench с доступным исходным кодом и без vendor lock-in: кросс-вендорные Task Pairs и Execution Pool, управляемые узлы за NAT и Computer Use, встроенный 4K Remote Desktop, Cloud Docs + ONLYOFFICE и командный доступ.**
 
-> Two heads are better than one.<br>
-> But minds in concert don't answer fate, they author it.<br>
+> Хватит общаться с одним ИИ. Командуйте AI Force.<br>
+> Один workbench — каждая модель и каждая машина под вашим управлением.<br>
 > — IM.codes
 
-IM.codes связывает AI-агентов не только с coding sessions, но и с компьютерами, на которых выполняется работа. Зарегистрируйте поддерживаемые машины как ограниченные **управляемые узлы (Controlled Nodes)**, и авторизованный агент сможет напрямую работать на одном или нескольких компьютерах с помощью команд с ограниченной областью, передачи файлов и типизированного Computer Use. Когда человеку нужно увидеть экран или вмешаться, совместимые Windows-узлы также предоставляют удалённый рабочий стол из браузера или с телефона.
-
-Помимо управления машинами, IM.codes даёт coding agents единый слой памяти и управляемую MCP-поверхность поверх разных провайдеров. Завершённая работа превращается в переиспользуемый контекст для Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen и других. Терминал, файлы и Git, localhost preview, уведомления, multi-agent workflows, OpenSpec Auto Deliver, Auto supervision и Team-аудит сохраняют работу людей и агентов видимой и связанной.
+IM.codes объединяет ваших ИИ-агентов, удалённые компьютеры и документацию команды в одном workbench реального времени. **Self-hosted, с доступным исходным кодом ([BSL 1.1](../LICENSE) — бесплатно для личного использования и малых команд `<= 5` пользователей и `<= 50` человек), и без vendor lock-in** — память, код, документы и инструменты остаются в вашей инфраструктуре, а любую модель или провайдера ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode и др.) можно свободно заменить в любой момент.
 
 > Это перевод. **Каноническая версия — английский README (`../README.md`).** Если есть расхождения, ориентируйтесь на английский вариант.
 
-Несколько агентов теперь поддерживают два способа интеграции: CLI и SDK.
+## Ключевые опоры
 
-## Управляемые узлы: удалённый рабочий стол с ИИ
-
-Превратите поддерживаемые компьютеры в управляемые AI-узлы, не настраивая каждую машину как полноценный IM.codes source server.
-
-- **Один AI — несколько компьютеров.** Зарегистрируйте несколько машин и поручите одному агенту или команде агентов напрямую управлять ими для выполнения работы.
-- **Реальные действия на компьютере.** Выполняйте команды с ограниченной областью, передавайте отдельные файлы и управляйте desktop-приложениями через типизированный Computer Use.
-- **Удалённый рабочий стол для человека.** Откройте совместимый Windows-узел в браузере или на телефоне, чтобы увидеть экран или перехватить управление.
-- **Ограниченный и отзывной доступ.** У каждого узла независимые учётные данные; он не попадает в обычные списки server/session, а владелец может отключить или отозвать выполнение.
+| Опора | Что даёт |
+|---|---|
+| **Task Pairs и Execution Pool (`Pair`)** | Флагманский Brain декомпозирует задачи на зависимые Brief и чеклисты, запуская изолированные пары `Executor × Auditor` в нативном Split View, закрывая слепые зоны одной модели , распределяя нагрузку между провайдерами и переключаясь по настройкам Execution Pool при лимитах со сходимостью `PASS` / `REWORK`. |
+| **Управляемые узлы и AI Computer Use (`OCU`)** | Превращает машины Linux, Windows и macOS за NAT в управляемые ИИ-узлы без белого IP, VPN и проброса портов. Ограниченный `exec_remote`, прямая/relay передача файлов и GUI/CDP-автоматизация через `computer_use_call` (`^^(nodeId)`). |
+| **Встроенный 4K Remote Desktop** | Встроен прямо в IM.codes без отдельной платы за удалённый рабочий стол в рамках вашей лицензии IM.codes. Подключайтесь к рабочим столам Windows, macOS и Linux из браузера или телефона в 4K, следите за 4 машинами на Стене экранов и сохраняйте контроль человека. |
+| **Cloud Docs и совместное редактирование (`ONLYOFFICE`)** | Встроенные Cloud Docs + ONLYOFFICE + DocBuilder. Храните спеки, runbooks и AI Skills, вставляйте любой документ через `&` в чат и совместно создавайте, конвертируйте и редактируйте DOCX/XLSX/PPTX/Markdown. |
+| **Командный доступ и контроль прав** | Делитесь Управляемыми узлами, живыми сессиями/под-сессиями и Cloud Docs по пользователям или группам (`viewer` или `participant`) с отзывом в один клик; приватные группы изолируют личные и домашние машины. |
+| **3 экрана и iPhone Duo** | Бесшовная синхронизация между десктопом, планшетом, **iPhone Duo / складными экранами**, смартфоном и Apple Watch. |
 
 ## Скриншоты
 
@@ -34,6 +32,9 @@ IM.codes связывает AI-агентов не только с coding sessio
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="../landing/imcodes0.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="../landing/imcodes1.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="../landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-nodes.png"><img src="../landing/imcodes-nodes.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-clouddocs.png"><img src="../landing/imcodes-clouddocs.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="../landing/imcodes3.png" width="24%" /></a>
 </p>
 
 ### iPad / Планшет
@@ -43,18 +44,25 @@ IM.codes связывает AI-агентов не только с coding sessio
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="../landing/imcodes-ipad3.png" width="48%" /></a>
 </p>
 
+### iPhone Duo / Складной экран
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo1.png"><img src="../landing/imcodes-duo1.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo2.png"><img src="../landing/imcodes-duo2.png" width="48%" /></a>
+</p>
+
 ### Мобильный
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="../landing/imcodes-m1.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="../landing/imcodes-m2.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="../landing/imcodes-m3.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="../landing/imcodes-m4.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
 </p>
 
 ### Apple Watch
@@ -65,7 +73,33 @@ IM.codes связывает AI-агентов не только с coding sessio
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="../landing/imcodes-watch2.png" width="31%" /></a>
 </p>
 
-Поддержка часов включает быстрый просмотр сессий, счётчики непрочитанных сообщений, push‑уведомления и быстрые ответы с запястья.
+Поддержка часов включает быстрый просмотр сессий, счётчики непрочитанных сообщений, push-уведомления и быстрые ответы с запястья.
+
+## Task Pairs и кросс-вендорный Execution Pool
+
+Управляйте несколькими моделями ИИ как дисциплинированной инженерной командой, а не одним чатом с одной моделью.
+
+- **Декомпозиция Brain и зависимости.** Флагманский Brain разбивает цели на зависимые Brief и нумерованные чеклисты (`pair_create`, `pair_task_update`) в изолированных worktree или рабочих директориях.
+- **Кросс-вендорный Execution Pool.** Комбинируйте флагманские и вторичные модели Claude Code, Codex, Antigravity CLI, Qwen и других, закрывая слепые зоны , распределяя нагрузку между провайдерами и переключаясь по настройкам Execution Pool при срабатывании лимитов.
+- **Нативный Split View (`Executor × Auditor`).** Реализация и независимый аудит рядом в реальном времени со структурированной сходимостью `PASS` / `REWORK`.
+- **Global Task Mode без vendor lock-in.** Оркестрируйте многоэтапные процессы на любых серверах и меняйте провайдеров когда угодно.
+
+## Управляемые узлы и встроенный 4K Remote Desktop
+
+Машины Linux, Windows и macOS за NAT превращаются в узлы для ИИ и удалённые рабочие столы без белого IP, VPN и проброса портов.
+
+- **Одна AI Force — парк машин.** Введите `^` (или `^^(nodeId)`), чтобы выполнять `exec_remote`, передавать файлы или автоматизировать GUI и CDP-браузер через `computer_use_call` и [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) (Leo, MIT).
+- **Встроенный 4K Remote Desktop.** Работайте с Windows, macOS и Linux из браузера или телефона (сенсорная навигация, виртуальная мышь).
+- **Стена из 4 экранов.** Наблюдайте до 4 хостов одновременно, сохраняя полный человеческий контроль.
+- **Независимые учётные данные и отзыв в один клик.**
+
+## Cloud Docs и совместное редактирование
+
+Встроенные Cloud Docs (ONLYOFFICE + DocBuilder) держат спецификации, runbooks и AI Skills рядом с кодом: вставляйте документы в чат через `&` или управляйте ими через MCP-инструмент `cloud_docs` (DOCX/XLSX/PPTX/Markdown).
+
+## Командный доступ и совместные пространства
+
+Делитесь Управляемыми узлами, живыми сессиями, под-сессиями и Cloud Docs с ролями `viewer` и `participant`, отзывайте доступ в один клик и изолируйте домашние машины через приватные группы.
 
 ## Загрузка
 
@@ -174,7 +208,7 @@ IM.codes может вести поддерживаемые agent session ход
 ### Кросс-модельный аудит и Team обсуждения
 Выходу одной модели нельзя доверять слепо. Team обсуждения позволяют нескольким агентам — от разных провайдеров и с разными стилями мышления — совместно анализировать одну кодовую базу ещё до написания кода. Каждый раунд следует настраиваемому многоэтапному пайплайну, где каждый агент читает все предыдущие вклады. Разные модели находят разные типы проблем. Такая перекрёстная проверка ещё до реализации выявляет проблемы, которые одна модель часто пропускает, и сокращает переделки.
 
-Встроенные режимы: `audit` (структурированный пайплайн audit → review → plan), `review`, `discuss` и `brainstorm` — или определите собственную последовательность фаз. Работает с Claude Code, Codex, Gemini CLI и Qwen.
+Встроенные режимы: `audit` (структурированный пайплайн audit → review → plan), `review`, `discuss` и `brainstorm` — или определите собственную последовательность фаз. Работает с Claude Code, Codex, Antigravity CLI и Qwen.
 
 ### Потоковые transport‑агенты
 OpenClaw и Qwen работают через структурированный transport‑stream вместо terminal scraping.
@@ -251,7 +285,7 @@ Daemon может обновляться через npm, в том числе п
 - Это не ещё один AI IDE
 - Это не просто чат‑обёртка
 - Это не просто клиент удалённого терминала
-- Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen
+- Это не замена Claude Code, Codex, Antigravity CLI, OpenClaw или Qwen
 - Это слой управления и обмена сообщениями вокруг них
 
 ## Архитектура
@@ -263,7 +297,7 @@ Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
         ↓ tmux / transport / managed MCP
-AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
+AI Agents (Claude Code / Codex / Antigravity CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
@@ -368,11 +402,11 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Windows (экспериментально) через ConPTY
 - Node.js >= 22
 - tmux на Linux/macOS
-- как минимум один AI coding agent: Claude Code, Codex, Gemini CLI, OpenClaw или Qwen
+- как минимум один AI coding agent: Claude Code, Codex, Antigravity CLI, OpenClaw или Qwen
 
 ## О проекте
 
-Это личный проект. Я почти не писал код сам: он почти полностью создан [Claude Code](https://github.com/anthropics/claude-code), со значительным вкладом [Codex](https://github.com/openai/codex) и [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+Это личный проект. Я почти не писал код сам: он почти полностью создан [Claude Code](https://github.com/anthropics/claude-code), со значительным вкладом [Codex](https://github.com/openai/codex) и Antigravity CLI.
 
 ## Дисклеймер
 

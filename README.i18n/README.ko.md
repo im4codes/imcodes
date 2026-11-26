@@ -2,29 +2,26 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**에이전트를 위한 IM. AI 원격 데스크톱, 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독 실행, 교차 모델 감사.**
+**셀프 호스팅 · 소스 공개 · 벤더 종속 없는 AI Force 워크벤치: 크로스 벤더 Task Pairs & Execution Pool, NAT 뒤 제어 노드 & Computer Use, 내장 4K 원격 데스크톱, Cloud Docs + ONLYOFFICE, 팀 공유.**
 
-<!-- TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」 -->
-> 백지장도 맞들면 낫다.<br>
-> 허나 세 명의 제갈량, 담소 속에 천하를 정한다.<br>
+> 단 하나의 AI와 대화하지 마세요. AI Force를 지휘하세요.<br>
+> 하나의 워크벤치에서 모든 모델과 머신을 지휘합니다.<br>
 > — IM.codes
 
-IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되는 컴퓨터에도 연결합니다. 지원되는 머신을 제한된 **제어 노드(Controlled Nodes)** 로 등록하면 권한 있는 agent가 범위 지정 명령, 파일 전송, 타입 지정 Computer Use로 한 대 또는 여러 대의 컴퓨터를 직접 조작할 수 있습니다. 사람이 화면을 보거나 인계받아야 할 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격 데스크톱으로 열 수 있습니다.
-
-머신 제어와 함께 IM.codes는 provider를 가로지르는 공유 메모리 레이어와 관리형 MCP tool surface를 coding agent에 제공합니다. 완료된 작업을 Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등에서 재사용 가능한 컨텍스트로 활용합니다. 터미널, 파일과 Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, OpenSpec Auto Deliver, Auto supervision, Team 감사가 사람과 agent의 작업을 계속 보이고 연결된 상태로 유지합니다.
+IM.codes는 AI 에이전트, 원격 머신, 팀 문서를 하나의 실시간 워크벤치로 통합합니다. **셀프 호스팅, 소스 공개([BSL 1.1](../LICENSE) — 개인 및 활성 사용자 5명 이하·전체 인원 50명 이하 소규모 팀 무료), 벤더 종속 없음** — 메모리, 코드, 문서, 도구는 모두 내 인프라에 남으며 어떤 AI 모델이나 공급자([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode 등)든 자유롭게 전환할 수 있습니다.
 
 > 이 문서는 번역본입니다. **기준 문서는 영어 README(`../README.md`)입니다.** 차이가 있으면 영어판을 우선합니다.
 
-여러 에이전트가 CLI와 SDK 두 방식 모두로 연결될 수 있습니다.
+## 핵심 기능 한눈에 보기
 
-## 제어 노드: AI 원격 데스크톱
-
-각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 제어 노드로 등록합니다.
-
-- **하나의 AI로 여러 컴퓨터.** 여러 머신을 등록하고 한 agent 또는 agent 팀이 해당 컴퓨터를 직접 조작해 작업을 수행할 수 있습니다.
-- **실제 컴퓨터 작업.** 범위 지정 명령 실행, 개별 파일 전송, 타입 지정 Computer Use를 통한 데스크톱 앱 조작을 지원합니다.
-- **필요할 때 사람이 원격 인계.** 지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 화면을 보거나 직접 제어할 수 있습니다.
-- **제한되고 철회 가능한 권한.** 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리되며, 소유자가 실행 권한을 끄거나 노드를 철회할 수 있습니다.
+| 핵심 축 | 제공 가치 |
+|---|---|
+| **Task Pairs & 크로스 벤더 Execution Pool (`Pair`)** | 플래그십 Brain이 요구사항을 의존 Brief와 체크리스트로 분해하고 네이티브 Split View에서 격리된 `Executor × Auditor` 페어를 배치합니다. 단일 모델의 맹점을 보완하고 공급자 간 사용량을 분산하며 한도 도달 시 실행 풀 설정에 따라 전환해 구조화된 `PASS` / `REWORK`로 수렴합니다. |
+| **제어 노드 & AI Computer Use (`OCU`)** | 공인 IP, VPN, 포트 포워딩 없이 NAT 뒤 Linux / Windows / macOS 머신을 AI 조작 노드로 연결합니다. 범위 지정 `exec_remote`, 직접/릴레이 파일 전송, `computer_use_call` 기반 GUI·CDP 브라우저 자동화(`^^(nodeId)`)를 지원합니다. |
+| **내장 4K 원격 데스크톱** | 별도 원격 데스크톱 추가 요금 없이 기본 내장됩니다. 브라우저나 휴대폰에서 Windows / macOS / Linux 데스크톱을 4K로 제어하고, 4타일 Desktop Wall로 여러 호스트를 동시에 모니터링하며 최종 제어권은 항상 사람이 유지합니다. |
+| **Cloud Docs & 협업 편집 (`ONLYOFFICE`)** | ONLYOFFICE와 DocBuilder를 통합한 Cloud Docs를 내장합니다. 사양서, 런북, AI Skills를 보관하고 `&` 피커로 채팅에 즉시 주입하며 DOCX/XLSX/PPTX/Markdown을 공동 편집·변환·공유합니다. |
+| **팀 공유 & 접근 제어** | 제어 노드, 라이브 세션/서브 세션, Cloud Docs를 사용자·그룹 단위로 공유(`viewer` 또는 `participant`)하고 원클릭으로 회수합니다. 프라이빗 그룹으로 개인·가정용 머신을 깔끔하게 격리합니다. |
+| **3화면 연동 & iPhone Duo** | 데스크톱, 태블릿, **iPhone Duo / 폴더블 듀얼 스크린**, 모바일, Apple Watch 간 탭과 패널이 매끄럽게 동기화됩니다. |
 
 ## 스크린샷
 
@@ -35,6 +32,9 @@ IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되�
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="../landing/imcodes0.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="../landing/imcodes1.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="../landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-nodes.png"><img src="../landing/imcodes-nodes.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-clouddocs.png"><img src="../landing/imcodes-clouddocs.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="../landing/imcodes3.png" width="24%" /></a>
 </p>
 
 ### iPad / 태블릿
@@ -44,18 +44,25 @@ IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되�
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="../landing/imcodes-ipad3.png" width="48%" /></a>
 </p>
 
+### iPhone Duo / 폴더블
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo1.png"><img src="../landing/imcodes-duo1.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo2.png"><img src="../landing/imcodes-duo2.png" width="48%" /></a>
+</p>
+
 ### 모바일
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="../landing/imcodes-m1.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="../landing/imcodes-m2.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="../landing/imcodes-m3.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="../landing/imcodes-m4.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
 </p>
 
 ### Apple Watch
@@ -67,6 +74,35 @@ IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되�
 </p>
 
 Apple Watch에서는 세션 빠른 확인, 읽지 않음 개수, 푸시 알림, 빠른 답장을 지원합니다.
+
+## Task Pairs & 크로스 벤더 Execution Pool
+
+단일 채팅 창에서 하나의 모델에 의존하지 않고, 체계적인 엔지니어링 팀처럼 여러 AI 모델을 지휘합니다.
+
+- **Brain 분해 및 의존성 관리.** 플래그십 Brain이 요구사항을 의존 Brief와 번호 매겨진 체크리스트(`pair_create`, `pair_task_update`)로 분해해 격리된 worktree 또는 작업 디렉터리에서 실행합니다.
+- **크로스 벤더 Execution Pool.** Claude Code, Codex, Antigravity CLI, Qwen 등의 플래그십·보조 티어를 혼합해 단일 모델의 맹점을 보완하고 공급자 간 사용량을 분산하며 한도 도달 시 설정된 Execution Pool 구성에 따라 전환합니다.
+- **네이티브 Split View(`Executor × Auditor`).** 구현과 독립 감사를 나란히 보며 실시간 체크리스트 갱신과 구조화된 `PASS` / `REWORK`로 수렴합니다.
+- **Global Task Mode & 무종속.** 서버를 넘나드는 다단계 파이프라인을 조율하고 모델과 공급자를 자유롭게 교체하세요.
+
+## 제어 노드 & 내장 4K 원격 데스크톱
+
+공인 IP, VPN, 포트 포워딩 없이 NAT 뒤 Linux / Windows / macOS를 AI 제어 노드이자 사람용 원격 데스크톱으로 연결합니다.
+
+- **하나의 AI Force, 여러 머신.** 대화에서 `^`(또는 `^^(nodeId)`)로 대상 머신을 지정해 `exec_remote` 명령, 파일 전송, `computer_use_call` + [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)(Leo, MIT) 기반 GUI·CDP 브라우저 자동화를 실행합니다.
+- **내장 4K 원격 데스크톱.** 브라우저나 휴대폰에서 Windows / macOS / Linux 데스크톱을 4K로 바로 제어합니다.
+- **4타일 멀티 호스트 Desktop Wall.** 최대 4대 호스트를 한 화면에 띄워 모니터링하며 최종 제어권은 항상 사람이 가집니다.
+- **독립 자격 증명 & 즉시 철회.** 노드별 독립 자격 증명으로 일반 세션 목록과 분리되며 클릭 한 번으로 권한을 철회할 수 있습니다.
+
+## Cloud Docs & 협업 편집
+
+ONLYOFFICE와 DocBuilder가 내장된 Cloud Docs로 사양서, 런북, 아키텍처 문서, AI Skills를 코드와 함께 관리하세요.
+
+- **`&` 피커로 채팅 즉시 주입.** `&`를 입력해 문서를 첨부하거나 `cloud_docs` MCP 도구로 조회·생성·편집·변환·공유를 수행합니다.
+- **ONLYOFFICE + DocBuilder.** DOCX / XLSX / PPTX / Markdown의 공동 편집과 포맷 변환을 지원합니다.
+
+## 팀 공유 & 접근 제어
+
+제어 노드, 라이브 세션, 서브 세션, Cloud Docs를 사용자 또는 그룹별로 공유하고 원클릭으로 권한을 낮추거나 철회할 수 있으며, 프라이빗 그룹으로 개인·가정용 머신을 안전하게 분리합니다.
 
 ## 다운로드
 
@@ -175,7 +211,7 @@ Live session을 다른 사람에게 공유해 pair programming을 하거나, vie
 ### 크로스 모델 감사와 Team 토론
 단일 모델의 출력을 맹목적으로 신뢰해서는 안 됩니다. Team 토론은 서로 다른 프로바이더와 사고 방식을 가진 여러 agent가 코드 작성 전에 동일한 코드베이스에서 협력 분석을 수행합니다. 각 라운드는 커스터마이징 가능한 멀티 페이즈 파이프라인을 따르며, 각 agent는 이전 기여를 모두 읽은 후 출력합니다. 서로 다른 모델이 서로 다른 유형의 문제를 발견합니다. 이 크로스 프로바이더 교차 검토로 구현 전에 단일 모델이 자주 놓치는 문제를 찾아내어 재작업을 줄일 수 있습니다.
 
-내장 모드는 `audit`(구조화된 audit → review → plan 파이프라인), `review`, `discuss`, `brainstorm`이며, 사용자 정의 페이즈 구성도 가능합니다. Claude Code, Codex, Gemini CLI, Qwen에서 작동합니다.
+내장 모드는 `audit`(구조화된 audit → review → plan 파이프라인), `review`, `discuss`, `brainstorm`이며, 사용자 정의 페이즈 구성도 가능합니다. Claude Code, Codex, Antigravity CLI, Qwen에서 작동합니다.
 
 ### 스트리밍 Transport Agents
 OpenClaw, Qwen 같은 transport agent에 대해 네이티브 스트리밍을 제공합니다.
@@ -252,7 +288,7 @@ daemon은 npm으로 자체 업그레이드할 수 있고, 웹에서도 트리거
 - 또 다른 AI IDE가 아님
 - 단순 채팅 래퍼가 아님
 - 단순 원격 터미널 클라이언트가 아님
-- Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아님
+- Claude Code, Codex, Antigravity CLI, OpenClaw, Qwen의 대체품이 아님
 - 그 위에 놓이는 메시징 / 제어 레이어임
 
 ## 아키텍처
@@ -264,7 +300,7 @@ Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
         ↓ tmux / transport / managed MCP
-AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
+AI Agents (Claude Code / Codex / Antigravity CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
@@ -369,11 +405,11 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Windows (실험적, ConPTY 사용)
 - Node.js >= 22
 - Linux / macOS에서는 tmux
-- Claude Code, Codex, Gemini CLI, OpenClaw, Qwen 중 하나
+- Claude Code, Codex, Antigravity CLI, OpenClaw, Qwen 중 하나
 
 ## 프로젝트 정보
 
-개인 프로젝트입니다. 제가 직접 작성한 코드는 거의 없으며, 대부분 [Claude Code](https://github.com/anthropics/claude-code)가 만들고 [Codex](https://github.com/openai/codex)와 [Gemini CLI](https://github.com/google-gemini/gemini-cli)도 중요한 기여를 했습니다.
+개인 프로젝트입니다. 제가 직접 작성한 코드는 거의 없으며, 대부분 [Claude Code](https://github.com/anthropics/claude-code)가 만들고 [Codex](https://github.com/openai/codex)와 Antigravity CLI도 중요한 기여를 했습니다.
 
 ## 고지 사항
 
