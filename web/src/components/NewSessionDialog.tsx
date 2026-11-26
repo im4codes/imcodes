@@ -15,6 +15,7 @@ import {
   SESSION_AGENT_GROUP_LABEL_KEYS,
 } from "./session-agent-options.js";
 import { SdkModeRecommendation } from "./SdkModeRecommendation.js";
+import { IncognitoCreateOption } from "./IncognitoCreateOption.js";
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -2058,15 +2059,12 @@ export function NewSessionDialog({
 
         </div>
 
-        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
-          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
-            <input type="checkbox" checked={incognito} disabled={!canIncognito}
-              onChange={event => setIncognito(event.currentTarget.checked)} />
-            <span>🕶️ {t('session.incognito')}</span>
-          </label>
-          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
-          {(!canIncognito || (incognito && !supportsSessionIncognito(agentType))) && <p role="status">{t('session.incognito_unsupported')}</p>}
-        </div>
+        <IncognitoCreateOption
+          incognito={incognito}
+          canIncognito={canIncognito}
+          agentType={agentType}
+          onChange={setIncognito}
+        />
 
         <div
           class="dialog-footer"

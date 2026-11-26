@@ -2294,4 +2294,14 @@ describe('styles.css regression contracts', () => {
     const addBtnRule = extractDirectStyleRule(topLevelCss, /(?:^|\n)\.session-tree-add-btn\s*/) ?? '';
     expect(addBtnRule).toMatch(/touch-action:\s*manipulation/);
   });
+
+  it('keeps incognito create option compact and preserves active and launch styles', () => {
+    expect(css).toMatch(/\.incognito-create-option\s*\{[^}]*padding:\s*6px\s+16px;/s);
+    expect(css).toMatch(/\.incognito-create-option-row\s*\{[^}]*display:\s*flex;\s*align-items:\s*center;/s);
+    expect(css).toMatch(/\.incognito-toggle-btn\s*\{[^}]*padding:\s*3px\s+8px;[^}]*font-size:\s*11px;/s);
+    expect(css).toMatch(/\.incognito-toggle-btn\.is-active\s*\{/);
+    expect(css).toMatch(/\.incognito-help-toggle\s*\{/);
+    expect(css).toMatch(/\.incognito-help-body\s*\{/);
+    expect(css).toMatch(/\.btn-primary\.incognito-launch-btn\s*\{/);
+  });
 });
