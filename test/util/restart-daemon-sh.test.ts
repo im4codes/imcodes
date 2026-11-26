@@ -25,14 +25,18 @@ describe('scripts/restart-daemon.sh', () => {
   const text = readScript();
 
   it('builds, links, verifies the linked manifest, then dispatches restart', () => {
-    const installIdx = text.indexOf('npm install');
+    const ciIdx = text.indexOf('npm ci');
+    const hashFileIdx = text.indexOf('.restart-daemon-lock.sha256');
+    const fallbackInstallIdx = text.indexOf('npm install');
     const buildIdx = text.indexOf('npm run build');
     const linkIdx = text.indexOf('npm link --force');
     const verifyIdx = text.indexOf('Build manifest verified');
     const dispatchIdx = text.indexOf('Detaching restart; logs:');
 
-    expect(installIdx).toBeGreaterThanOrEqual(0);
-    expect(buildIdx).toBeGreaterThan(installIdx);
+    expect(ciIdx).toBeGreaterThanOrEqual(0);
+    expect(hashFileIdx).toBeGreaterThanOrEqual(0);
+    expect(fallbackInstallIdx).toBeGreaterThan(ciIdx);
+    expect(buildIdx).toBeGreaterThan(fallbackInstallIdx);
     expect(linkIdx).toBeGreaterThan(buildIdx);
     expect(verifyIdx).toBeGreaterThan(linkIdx);
     expect(dispatchIdx).toBeGreaterThan(verifyIdx);
@@ -198,5 +202,89 @@ describe.skipIf(process.platform !== 'linux')('isolated Linux restart dispatch',
     await runManagerJob(fixed);
     expect(read(fixed.log)).toContain('(status=0)');
     expect(read(fixed.calls)).toContain('systemctl --user restart imcodes');
+  });
+});
+
+describe('lockfile-safe dependency installation across runs', () => {
+  const fixtures: string[] = [];
+
+  afterEach(() => {
+    for (const dir of fixtures.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeLockFixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-restart-lock-test-'));
+    fixtures.push(dir);
+    const root = join(dir, 'repo');
+    const bin = join(dir, 'bin');
+    const home = join(dir, 'home');
+    const temp = join(dir, 'tmp');
+    for (const path of [join(root, 'scripts'), bin, home, temp]) mkdirSync(path, { recursive: true });
+    const script = join(root, 'scripts/restart-daemon.sh');
+    writeFileSync(script, readScript());
+    const calls = join(dir, 'calls');
+    const writeBin = (name: string, body: string) => writeFileSync(join(bin, name), body, { mode: 0o755 });
+    for (const name of ['bash', 'dirname', 'date', 'tee', 'cat', 'mkdir']) {
+      const target = [`/bin/${name}`, `/usr/bin/${name}`].find((p) => existsSync(p));
+      if (!target) throw new Error(`missing system utility ${name}`);
+      symlinkSync(target, join(bin, name));
+    }
+    writeBin('uname', '#!/bin/bash\necho Linux\n');
+    writeBin('systemd-run', '#!/bin/bash\nexit 0\n');
+    // Stub npm so we can observe exact subcommands without mutating package-lock.json or touching network.
+    writeBin('npm', '#!/bin/bash\nprintf "npm %s\\n" "$*" >>"$CALLS"\nif [[ "${1:-}" == "ci" ]]; then mkdir -p node_modules; fi\n');
+    // Pass `node -e` through to real Node (for hash fallback), while stubbing stdin manifest verification.
+    writeBin('node', `#!${process.execPath}\n` + `
+      const { spawnSync } = require('child_process');
+      if (process.argv.includes('-e')) {
+        const res = spawnSync(process.execPath, process.argv.slice(2), { stdio: 'inherit' });
+        process.exit(res.status ?? 1);
+      }
+      process.stdin.resume();
+    `);
+    const env = { HOME: home, TMPDIR: temp, PATH: bin, CALLS: calls };
+    return { root, script, calls, env };
+  }
+
+  const read = (path: string) => existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const run = (f: ReturnType<typeof makeLockFixture>) => execAsync('/bin/bash', [f.script], { env: f.env, timeout: 5000 });
+
+  it('uses npm ci on clean checkout, skips on unchanged lockfile, re-runs on lockfile change, and preserves package-lock.json bytes', async () => {
+    const f = makeLockFixture();
+    const lockPath = join(f.root, 'package-lock.json');
+    const hashFile = join(f.root, 'node_modules/.restart-daemon-lock.sha256');
+    const lockV1 = Buffer.from('{\n  "name": "imcodes",\n  "lockfileVersion": 3,\n  "packages": {}\n}\n');
+    writeFileSync(lockPath, lockV1);
+
+    // 1) Clean checkout (no node_modules): runs npm ci, never npm install, writes hash, preserves lockfile bytes.
+    await run(f);
+    expect(read(f.calls)).toBe('npm ci\nnpm run build\nnpm link --force\n');
+    expect(readFileSync(lockPath).equals(lockV1)).toBe(true);
+    const firstHash = read(hashFile).trim();
+    expect(firstHash).toMatch(/^[0-9a-f]{64}$/);
+
+    // 2) Second run with unchanged package-lock.json: skips both npm ci and npm install.
+    writeFileSync(f.calls, '');
+    const res2 = await run(f);
+    expect(res2.stdout).toContain('skipping npm ci');
+    expect(read(f.calls)).toBe('npm run build\nnpm link --force\n');
+    expect(readFileSync(lockPath).equals(lockV1)).toBe(true);
+
+    // 3) package-lock.json changes: runs npm ci again (never npm install) and updates hash.
+    const lockV2 = Buffer.from('{\n  "name": "imcodes",\n  "lockfileVersion": 3,\n  "packages": {"a": {}}\n}\n');
+    writeFileSync(lockPath, lockV2);
+    writeFileSync(f.calls, '');
+    await run(f);
+    expect(read(f.calls)).toBe('npm ci\nnpm run build\nnpm link --force\n');
+    expect(readFileSync(lockPath).equals(lockV2)).toBe(true);
+    const secondHash = read(hashFile).trim();
+    expect(secondHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(secondHash).not.toBe(firstHash);
+  });
+
+  it('falls back to npm install only when package-lock.json does not exist', async () => {
+    const f = makeLockFixture();
+    await run(f);
+    expect(read(f.calls)).toBe('npm install\nnpm run build\nnpm link --force\n');
   });
 });

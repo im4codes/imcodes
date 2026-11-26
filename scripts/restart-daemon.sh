@@ -13,7 +13,27 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
-npm install
+if [[ -f package-lock.json ]]; then
+  LOCK_HASH_FILE="node_modules/.restart-daemon-lock.sha256"
+  if command -v sha256sum >/dev/null 2>&1; then
+    LOCK_HASH="$(sha256sum package-lock.json)"
+    LOCK_HASH="${LOCK_HASH%% *}"
+  elif command -v shasum >/dev/null 2>&1; then
+    LOCK_HASH="$(shasum -a 256 package-lock.json)"
+    LOCK_HASH="${LOCK_HASH%% *}"
+  else
+    LOCK_HASH="$(node -e "const c=require('node:crypto'),f=require('node:fs');process.stdout.write(c.createHash('sha256').update(f.readFileSync('package-lock.json')).digest('hex'))")"
+  fi
+  if [[ -d node_modules && -f "$LOCK_HASH_FILE" ]] && [[ "$(cat "$LOCK_HASH_FILE" 2>/dev/null || true)" == "$LOCK_HASH" ]]; then
+    echo "Dependencies unchanged (package-lock.json matches); skipping npm ci."
+  else
+    npm ci
+    mkdir -p node_modules
+    printf '%s\n' "$LOCK_HASH" >"$LOCK_HASH_FILE"
+  fi
+else
+  npm install
+fi
 npm run build
 npm link --force
 

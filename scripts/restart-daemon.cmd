@@ -40,6 +40,26 @@ setlocal EnableDelayedExpansion
 
 cd /d "%~dp0\.."
 
+if not exist "package-lock.json" goto :install_fallback
+set "LOCK_HASH="
+for /f "usebackq delims=" %%H in (`node -p "require('node:crypto').createHash('sha256').update(require('node:fs').readFileSync('package-lock.json')).digest('hex')"`) do set "LOCK_HASH=%%H"
+set "PREV_HASH="
+if exist "node_modules\.restart-daemon-lock.sha256" set /p PREV_HASH=<"node_modules\.restart-daemon-lock.sha256"
+if exist "node_modules" if defined LOCK_HASH if "!PREV_HASH!"=="!LOCK_HASH!" (
+  echo [restart-daemon] dependencies unchanged; skipping npm ci
+  goto :after_install
+)
+echo [restart-daemon] npm ci
+call npm ci
+if errorlevel 1 (
+  echo [restart-daemon] npm ci FAILED
+  exit /b 1
+)
+if not exist "node_modules" mkdir "node_modules" >nul 2>&1
+if defined LOCK_HASH > "node_modules\.restart-daemon-lock.sha256" echo !LOCK_HASH!
+goto :after_install
+
+:install_fallback
 echo [restart-daemon] npm install
 call npm install
 if errorlevel 1 (
@@ -47,6 +67,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
+:after_install
 echo [restart-daemon] npm run build
 call npm run build
 if errorlevel 1 (

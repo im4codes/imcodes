@@ -155,31 +155,37 @@ describe('scripts/restart-daemon.cmd', () => {
     expect(text).toMatch(/, 0, False/); // hidden + no-wait
   });
 
-  it('runs `npm install` and `npm run build` and `npm link --force` BEFORE dispatching restart', () => {
+  it('uses lockfile-safe `npm ci` (with hash skip) when package-lock.json exists before build/link/dispatch', () => {
     // The pre-build steps must succeed before the detached restart spawns.
     // Otherwise the new daemon launches with stale or broken artifacts.
-    const installIdx = text.indexOf('call npm install');
+    const lockGuardIdx = text.indexOf('if not exist "package-lock.json" goto :install_fallback');
+    const hashFileIdx = text.indexOf('node_modules\\.restart-daemon-lock.sha256');
+    const ciIdx = text.indexOf('call npm ci');
+    const fallbackIdx = text.indexOf('\n:install_fallback');
+    const fallbackInstallIdx = text.indexOf('call npm install', fallbackIdx);
     const buildIdx = text.indexOf('call npm run build');
     const linkIdx = text.indexOf('call npm link --force');
     const dispatchIdx = text.indexOf('start "" /b wscript');
-    expect(installIdx).toBeGreaterThan(-1);
-    expect(buildIdx).toBeGreaterThan(-1);
-    expect(linkIdx).toBeGreaterThan(-1);
-    expect(dispatchIdx).toBeGreaterThan(-1);
-    expect(installIdx).toBeLessThan(buildIdx);
-    expect(buildIdx).toBeLessThan(linkIdx);
-    expect(linkIdx).toBeLessThan(dispatchIdx);
+    expect(lockGuardIdx).toBeGreaterThan(-1);
+    expect(hashFileIdx).toBeGreaterThan(lockGuardIdx);
+    expect(ciIdx).toBeGreaterThan(hashFileIdx);
+    expect(fallbackIdx).toBeGreaterThan(ciIdx);
+    expect(fallbackInstallIdx).toBeGreaterThan(fallbackIdx);
+    expect(buildIdx).toBeGreaterThan(fallbackInstallIdx);
+    expect(linkIdx).toBeGreaterThan(buildIdx);
+    expect(dispatchIdx).toBeGreaterThan(linkIdx);
   });
 
   it('aborts with non-zero exit when any pre-build step fails', () => {
     // Each pre-build step must check errorlevel and bail.  Otherwise a
     // failing build silently dispatches a stale restart.
+    expect(text).toMatch(/npm ci FAILED/);
     expect(text).toMatch(/npm install FAILED/);
     expect(text).toMatch(/build FAILED/);
     expect(text).toMatch(/npm link FAILED/);
     // Each failure path must `exit /b 1`
     const failExitCount = (text.match(/exit \/b 1/g) ?? []).length;
-    expect(failExitCount).toBeGreaterThanOrEqual(3);
+    expect(failExitCount).toBeGreaterThanOrEqual(4);
   });
 
   it('uses a per-run randomized tmp dir so concurrent restarts do not trample each other', () => {
