@@ -2300,9 +2300,8 @@ const HEALTH_POLL_MS = 30_000;
 const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
 const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
-const DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
-const AGY_STALE_ACTIVE_APPEND_RECOVER_AFTER_MS = DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS;
-const AGY_STALE_ACTIVE_WORK_CEILING_MS = 15 * 60_000;
+const DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
+const AGY_STALE_ACTIVE_WORK_CEILING_MS = 20 * 60_000;
 const AGY_STALE_RETRY_COOLDOWN_MS = 60_000;
 const AGY_STALE_MAX_RETRY_ATTEMPTS = 3;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
@@ -2797,18 +2796,35 @@ export async function recoverAgyStalledSession(
   const unackedAgeMs = unackedCount > 0 && oldestUnackedAt !== null
     ? Math.max(0, nowMs - oldestUnackedAt)
     : 0;
-  const appendTimedOut = unackedCount > 0 && unackedAgeMs >= AGY_STALE_ACTIVE_APPEND_RECOVER_AFTER_MS;
+  const appendTimedOut = unackedCount > 0 && unackedAgeMs >= staleMs;
   const silenceTimedOut = providerSilenceMs >= staleMs;
   if (!appendTimedOut && !silenceTimedOut) return false;
 
-  // Running tools and active background work protect against both the normal 6m
-  // silence threshold and unacknowledged active appends up to the bounded 15m
+  // Running tools and active background work protect against both the normal 12m
+  // silence threshold and unacknowledged active appends up to the bounded 20m
   // ceiling (preventing phantom tool / leaked background stalls from hanging forever).
+  // When an active background task reports live progress (`lastBackgroundProgressAt`),
+  // measure silence from that latest progress so long-running live commands (e.g.
+  // 25m+ test suites) keep running uninterrupted while still recovering if they hang.
   const activeWorkCeilingMs = Math.max(staleMs, AGY_STALE_ACTIVE_WORK_CEILING_MS);
+  const backgroundProgressAt = diagnostic.lastBackgroundProgressAt ?? null;
+  const hasLiveBackgroundProgress = (diagnostic.backgroundWorkCount ?? 0) > 0
+    && typeof backgroundProgressAt === 'number'
+    && Number.isFinite(backgroundProgressAt);
+  const backgroundSilenceMs = hasLiveBackgroundProgress
+    ? Math.max(0, nowMs - backgroundProgressAt)
+    : null;
+  const effectiveSilenceMs = backgroundSilenceMs !== null
+    ? Math.min(providerSilenceMs, backgroundSilenceMs)
+    : providerSilenceMs;
   if (
     (diagnostic.activeToolCount > 0 || (diagnostic.backgroundWorkCount ?? 0) > 0)
-    && providerSilenceMs < activeWorkCeilingMs
-    && (!appendTimedOut || unackedAgeMs < activeWorkCeilingMs)
+    && effectiveSilenceMs < activeWorkCeilingMs
+    && (
+      !appendTimedOut
+      || unackedAgeMs < activeWorkCeilingMs
+      || (backgroundSilenceMs !== null && backgroundSilenceMs < activeWorkCeilingMs)
+    )
   ) {
     return false;
   }
@@ -2830,7 +2846,7 @@ export async function recoverAgyStalledSession(
   recordAgyGenerationAttempt(generationKey, attemptState);
 
   const replayedEntries = runtime.requeueUnacknowledgedActiveAppendsFront?.() ?? [];
-  const effectiveWaitMs = appendTimedOut ? unackedAgeMs : providerSilenceMs;
+  const effectiveWaitMs = appendTimedOut && backgroundSilenceMs === null ? unackedAgeMs : effectiveSilenceMs;
   const minutes = Math.max(1, Math.round(effectiveWaitMs / 60_000));
 
   logger.warn(
@@ -2839,7 +2855,10 @@ export async function recoverAgyStalledSession(
       generationKey,
       attempt: attemptState.attempts,
       providerSilenceMs,
+      backgroundSilenceMs,
+      effectiveSilenceMs,
       staleMs,
+      activeWorkCeilingMs,
       unackedCount,
       unackedAgeMs,
       replayedCount: replayedEntries.length,

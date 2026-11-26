@@ -110,6 +110,13 @@ export interface ProviderActiveWorkSnapshot {
    *   (used by AG SDK native background commands / timers / reactive turns).
    */
   backgroundSessionStatus?: 'idle' | 'running';
+  /**
+   * Latest epoch-ms timestamp of observed live progress across active background
+   * tasks (e.g. local background log file mtime/size advances). Allows watchdogs
+   * to keep genuinely running multi-minute background jobs alive without masking
+   * frozen/phantom background entries.
+   */
+  lastBackgroundProgressAt?: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Runtime-minted generation. Required for a clear snapshot to prove clean idle. */

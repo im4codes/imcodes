@@ -66,7 +66,7 @@ import { homedir } from 'node:os';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   ndJsonStream,
   RequestError,
@@ -836,13 +836,14 @@ export class KimiSdkProvider implements TransportProvider {
   getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    const nowMs = Date.now();
     if (
       this.id === AGY_SDK_PROVIDER_ID
       && state.agyReactive
       && !state.promptInFlight
     ) {
       const reactiveActivityAt = state.agyReactiveLastActivityAt ?? state.agyReactiveSinceMs ?? state.lastActivityAt ?? 0;
-      if (Date.now() - reactiveActivityAt >= AGY_STALE_REACTIVE_SILENCE_MS) {
+      if (nowMs - reactiveActivityAt >= AGY_STALE_REACTIVE_SILENCE_MS) {
         setAgyReactive(state, false);
         this.syncAgyStatusAfterTurn(sessionId, state);
         this.scheduleDeferredSharedRecycleIfDrained();
@@ -857,6 +858,9 @@ export class KimiSdkProvider implements TransportProvider {
       ? 1
       : 0;
     const backgroundStatusCount = backgroundTaskCount + reactiveWorkCount;
+    const lastBackgroundProgressAt = this.id === AGY_SDK_PROVIDER_ID && backgroundTaskCount > 0
+      ? resolveAgyBackgroundTasksProgressAt(state.agyBackgroundTasks, nowMs)
+      : undefined;
     const acpActiveToolCount = [...state.toolCalls.values()]
       .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
     const hasNativeRunningTool = this.id === AGY_SDK_PROVIDER_ID
@@ -878,11 +882,12 @@ export class KimiSdkProvider implements TransportProvider {
       ...(this.id === AGY_SDK_PROVIDER_ID ? {
         backgroundWorkCount: backgroundStatusCount,
         ...(backgroundStatusCount > 0 ? { backgroundSessionStatus: 'running' as const } : {}),
+        ...(lastBackgroundProgressAt !== undefined ? { lastBackgroundProgressAt } : {}),
       } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.acpSessionId ?? null,
-      updatedAt: Date.now(),
+      updatedAt: nowMs,
     };
   }
 
@@ -1326,8 +1331,15 @@ export class KimiSdkProvider implements TransportProvider {
         && opts.toolStatus !== 'error'
         && isEligibleAgyBackgroundStartTool(opts.toolName, opts.toolInput)
       ) {
+        const logPath = extractAgyBackgroundTaskLogPath(text);
         for (const id of extractAgyBackgroundTaskStartIds(text)) {
-          if (tasks.has(id)) continue;
+          const existing = tasks.get(id);
+          if (existing) {
+            if (!existing.logPath && logPath) {
+              existing.logPath = logPath;
+            }
+            continue;
+          }
           while (tasks.size >= AGY_BACKGROUND_TASK_MAX_ACTIVE) {
             const oldestKey = tasks.keys().next().value;
             if (oldestKey === undefined) break;
@@ -1346,6 +1358,7 @@ export class KimiSdkProvider implements TransportProvider {
             description: extractAgyBackgroundTaskDescription(text, opts),
             startedAtMs: Date.now(),
             ...(opts.toolId ? { toolId: opts.toolId } : {}),
+            ...(logPath ? { logPath } : {}),
           };
           tasks.set(id, entry);
           this.emitAgyBackgroundTaskEvent(
@@ -5212,11 +5225,17 @@ interface AgyBackgroundTaskEntry {
   description: string;
   startedAtMs: number;
   toolId?: string;
+  logPath?: string;
+  lastObservedMtimeMs?: number;
+  lastObservedSize?: number;
+  lastProgressAtMs?: number;
 }
 
 const AGY_BACKGROUND_TASK_MAX_ACTIVE = 256;
+const AGY_BACKGROUND_CLOCK_SKEW_MS = 60_000;
 const AGY_BACKGROUND_TASKS_RESTART_RE = /All your subagents and background tasks have been stopped(?:\s+due to ([^.\n]+))?\.?/i;
 const AGY_BACKGROUND_TASK_START_RE = /^\s*Tool is running as a background task with task id:\s*([A-Za-z0-9._:/-]+)/i;
+const AGY_BACKGROUND_TASK_LOG_PATH_RE = /(?:^|\n)\s*Task logs are available at:\s*([^\r\n]+)/i;
 const AGY_SYNC_OUTPUT_ENVELOPE_RE = /(?:^|\n)\s*(?:Created At:|Completed At:|The tool's output was truncated\b|Command exited with code\s+-?\d+\b|Command output:)/i;
 const AGY_BACKGROUND_SPAWNING_TOOLS = new Set(['runcommand', 'schedule', 'runworkflow']);
 const AGY_BACKGROUND_TASK_DESCRIPTION_RE = /(?:^|\n)\s*Task Description:\s*(.+)/i;
@@ -5552,6 +5571,83 @@ function extractAgyBackgroundTaskStartIds(text: string): string[] {
   const envelopeHead = logStart >= 0 ? text.slice(0, logStart) : text;
   if (AGY_SYNC_OUTPUT_ENVELOPE_RE.test(envelopeHead)) return [];
   return [match[1]];
+}
+
+/**
+ * Extracts a local filesystem log path from Antigravity background task start output
+ * (`Task logs are available at: file:///...` or plain local absolute path).
+ */
+export function extractAgyBackgroundTaskLogPath(text: string): string | undefined {
+  const logStart = text.search(/(?:^|\n)\s*Log output:/i);
+  const envelopeHead = logStart >= 0 ? text.slice(0, logStart) : text;
+  if (AGY_SYNC_OUTPUT_ENVELOPE_RE.test(envelopeHead)) return undefined;
+  const match = AGY_BACKGROUND_TASK_LOG_PATH_RE.exec(envelopeHead);
+  const raw = match?.[1]?.trim();
+  if (!raw) return undefined;
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost') {
+        return undefined;
+      }
+      const fsPath = fileURLToPath(parsed);
+      return fsPath || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    return undefined;
+  }
+  return path.isAbsolute(raw) ? raw : undefined;
+}
+
+function refreshAgyBackgroundTaskProgress(entry: AgyBackgroundTaskEntry, nowMs: number): number | undefined {
+  if (!entry.logPath) return entry.lastProgressAtMs;
+  try {
+    const st = statSync(entry.logPath);
+    if (!st.isFile()) return entry.lastProgressAtMs;
+    const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
+    const size = Number.isFinite(st.size) ? st.size : 0;
+    const withinFutureSkew = mtimeMs <= nowMs + AGY_BACKGROUND_CLOCK_SKEW_MS;
+    if (entry.lastObservedSize === undefined || entry.lastObservedMtimeMs === undefined) {
+      entry.lastObservedSize = size;
+      entry.lastObservedMtimeMs = mtimeMs;
+      if (withinFutureSkew && mtimeMs >= entry.startedAtMs - 1_000) {
+        const clamped = Math.min(mtimeMs, nowMs);
+        entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, clamped);
+      }
+    } else {
+      const sizeChanged = size !== entry.lastObservedSize;
+      const mtimeAdvanced = withinFutureSkew && mtimeMs > entry.lastObservedMtimeMs;
+      if (sizeChanged || mtimeAdvanced) {
+        entry.lastObservedSize = size;
+        entry.lastObservedMtimeMs = mtimeMs;
+        entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, nowMs);
+      }
+    }
+  } catch {
+    // Missing, deleted, or unreadable log paths gracefully produce no live progress.
+  }
+  return entry.lastProgressAtMs;
+}
+
+function resolveAgyBackgroundTasksProgressAt(
+  tasks: Map<string, AgyBackgroundTaskEntry> | undefined,
+  nowMs: number,
+): number | undefined {
+  if (!tasks || tasks.size === 0) return undefined;
+  let latestProgressAt: number | undefined;
+  let checked = 0;
+  for (const entry of tasks.values()) {
+    if (checked >= AGY_BACKGROUND_TASK_MAX_ACTIVE) break;
+    checked += 1;
+    const progressAt = refreshAgyBackgroundTaskProgress(entry, nowMs);
+    if (progressAt !== undefined && (latestProgressAt === undefined || progressAt > latestProgressAt)) {
+      latestProgressAt = progressAt;
+    }
+  }
+  return latestProgressAt;
 }
 
 function resolveAgyBackgroundSystemTerminalStatus(text: string): SdkSubagentNormalizedStatus {

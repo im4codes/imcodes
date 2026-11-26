@@ -9,7 +9,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
-import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { readFileSync, realpathSync, symlinkSync, utimesSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
 import {
@@ -27,7 +27,7 @@ import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-sdk.js';
-import { KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
+import { extractAgyBackgroundTaskLogPath, KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
@@ -6774,5 +6774,106 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     } finally {
       await rm(holdFile, { force: true }).catch(() => {});
     }
+  });
+
+  it('extracts background task log paths safely and tracks live log progress for getActiveWorkSnapshot & TransportSessionRuntime', async () => {
+    const { provider, root } = await setup();
+    const id = await provider.createSession({ sessionKey: 'agy-bg-log-progress' });
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+
+    // 1. Path extraction boundaries
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t1\nTask logs are available at: file:///tmp/my%20tasks/task-1.log`,
+    )).toBe('/tmp/my tasks/task-1.log');
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t2\nTask logs are available at: /var/tmp/task-2.log`,
+    )).toBe('/var/tmp/task-2.log');
+    expect(extractAgyBackgroundTaskLogPath(
+      'Task logs are available at: https://example.com/task.log',
+    )).toBeUndefined();
+    expect(extractAgyBackgroundTaskLogPath(
+      'Task logs are available at: file://remote-host/share/task.log',
+    )).toBeUndefined();
+    expect(() => extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t-win\nTask logs are available at: file:///C:/Users/tester/task-win.log`,
+    )).not.toThrow();
+    expect(extractAgyBackgroundTaskLogPath(
+      `Tool is running as a background task with task id: ${nativeId}/t3\nLog output:\nTask logs are available at: /should/be/ignored.log`,
+    )).toBeUndefined();
+
+    const runtime = new TransportSessionRuntime(provider, 'deck_agy_bg_log_progress');
+    await runtime.initialize({ sessionKey: 'deck_agy_bg_log_progress' });
+    (runtime as any)._providerSessionId = id;
+
+    const baseTime = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(baseTime);
+    const liveLog = path.join(root, 'live-vitest.log');
+    const secondLog = path.join(root, 'second-task.log');
+    const missingLog = path.join(root, 'missing.log');
+    const futureLog = path.join(root, 'future-skew.log');
+
+    await writeFile(liveLog, 'start\n');
+    await writeFile(secondLog, 's2\n');
+    await writeFile(futureLog, 'skewed\n');
+    utimesSync(futureLog, new Date(baseTime + 86_400_000), new Date(baseTime + 86_400_000));
+
+    // 2. Missing log path & corrupted future mtime never throw and do not fabricate future grace
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-missing\nTask logs are available at: ${pathToFileURL(missingLog).href}`,
+      toolName: 'run_command',
+      toolInput: { CommandLine: 'missing-cmd', WaitMsBeforeAsync: 500 },
+      toolStatus: 'complete',
+    });
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-future\nTask logs are available at: ${pathToFileURL(futureLog).href}`,
+      toolName: 'run_command',
+      toolInput: { CommandLine: 'future-cmd', WaitMsBeforeAsync: 500 },
+      toolStatus: 'complete',
+    });
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBeUndefined();
+
+    // 3. Live log file sets initial progress and advances lastBackgroundProgressAt when it grows at +25m
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-live\nTask logs are available at: ${pathToFileURL(liveLog).href}`,
+      toolName: 'run_command',
+      toolInput: { CommandLine: 'npm run test:unit:macos', WaitMsBeforeAsync: 500 },
+      toolStatus: 'complete',
+    });
+    const initialSnap = provider.getActiveWorkSnapshot(id);
+    expect(initialSnap?.lastBackgroundProgressAt).toBeLessThanOrEqual(baseTime);
+    expect(initialSnap?.lastBackgroundProgressAt).toBeGreaterThanOrEqual(baseTime - 5_000);
+    expect(runtime.getDiagnosticSnapshot(baseTime).lastBackgroundProgressAt).toBe(initialSnap?.lastBackgroundProgressAt);
+
+    const t25 = baseTime + 25 * 60_000;
+    nowSpy.mockReturnValue(t25);
+    await appendFile(liveLog, '653/1223 files passed\n');
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t25);
+    expect(runtime.getDiagnosticSnapshot(t25).lastBackgroundProgressAt).toBe(t25);
+
+    // 4. Multiple concurrent tasks: task-live freezes, secondLog advances -> latest progress stays fresh;
+    //    once all stop advancing, lastBackgroundProgressAt freezes at the last advance.
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-second\nTask logs are available at: ${pathToFileURL(secondLog).href}`,
+      toolName: 'run_command',
+      toolInput: { CommandLine: 'npm run lint', WaitMsBeforeAsync: 500 },
+      toolStatus: 'complete',
+    });
+    // Baseline initial observation (matching periodic 30s health poll before next write).
+    provider.getActiveWorkSnapshot(id);
+    const t32 = baseTime + 32 * 60_000;
+    nowSpy.mockReturnValue(t32);
+    await appendFile(secondLog, 'still going\n');
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
+
+    const t55 = baseTime + 55 * 60_000;
+    nowSpy.mockReturnValue(t55);
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
+
+    // 5. Deleting a log file never throws and leaves previous progress intact without advancing it.
+    await unlink(secondLog);
+    const t60 = baseTime + 60 * 60_000;
+    nowSpy.mockReturnValue(t60);
+    expect(provider.getActiveWorkSnapshot(id)?.lastBackgroundProgressAt).toBe(t32);
   });
 });

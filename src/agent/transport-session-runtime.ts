@@ -392,6 +392,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   blockingWorkCount: number;
   backgroundWorkCount: number;
   backgroundKeepsSessionRunning?: boolean;
+  lastBackgroundProgressAt?: number | null;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Present for the whole episode (from the first capacity failure until the turn goes through, STOP, or a permanent error). */
@@ -1632,6 +1633,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       blockingWorkCount: activitySnapshot.blockingWorkCount,
       backgroundWorkCount: activitySnapshot.backgroundWorkCount,
       ...(activitySnapshot.backgroundKeepsSessionRunning ? { backgroundKeepsSessionRunning: true } : {}),
+      ...(activitySnapshot.lastBackgroundProgressAt !== null ? { lastBackgroundProgressAt: activitySnapshot.lastBackgroundProgressAt } : {}),
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
       ...(this._capacityRetryStartedAt > 0
@@ -2687,6 +2689,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     blockingWorkCount: number;
     backgroundWorkCount: number;
     backgroundKeepsSessionRunning: boolean;
+    lastBackgroundProgressAt: number | null;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
     providerSnapshot: ProviderActiveWorkSnapshot | null;
@@ -2695,6 +2698,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     let blockingWorkCount = 0;
     let backgroundWorkCount = 0;
     let backgroundKeepsSessionRunning = false;
+    let lastBackgroundProgressAt: number | null = null;
     const add = (reason: SessionActivityBusyReason, count = 1) => {
       if (count <= 0) return;
       blockingWorkCount += count;
@@ -2725,6 +2729,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           const providerWork = this.providerWorkBreakdown(providerSnapshot);
           backgroundWorkCount = providerWork.backgroundWorkCount;
           backgroundKeepsSessionRunning = backgroundWorkCount > 0 && providerSnapshot.backgroundSessionStatus === 'running';
+          if (
+            backgroundWorkCount > 0
+            && typeof providerSnapshot.lastBackgroundProgressAt === 'number'
+            && Number.isFinite(providerSnapshot.lastBackgroundProgressAt)
+          ) {
+            lastBackgroundProgressAt = providerSnapshot.lastBackgroundProgressAt;
+          }
           const turnWork = providerWork.turnWorkCount;
           if (turnWork > 0 || providerWork.reportedBackgroundWorkCount === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
@@ -2742,6 +2753,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       blockingWorkCount,
       backgroundWorkCount,
       backgroundKeepsSessionRunning,
+      lastBackgroundProgressAt,
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
