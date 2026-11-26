@@ -611,8 +611,26 @@ exit 0
       );
       expect(roOut).toContain('WARNING: could not persist OpenCode PATH');
       expect(roOut).toContain('imcodes installed  2026.11.9999');
-      expect(roOut).toContain('OpenCode CLI: ready');
+      expect(roOut).toContain('OpenCode CLI: installed; add its bin directory to PATH for shells whose startup file could not be updated');
+      expect(roOut).not.toContain('OpenCode CLI: ready');
       expect(execFileSync('cat', [roProfile], { encoding: 'utf8' })).toBe(roContent);
+
+      // Fresh shell sourcing read-only .profile finds imcodes ONLY (not opencode) until applying the printed export command
+      const roFreshBefore = execFileSync(
+        'bash',
+        ['-c', `PATH="/usr/bin:/bin"; source "${roProfile}"; echo "IM=$(command -v imcodes 2>/dev/null || echo none) OC=$(command -v opencode 2>/dev/null || echo none)"`],
+        { ...EXEC_OPTS, env: { HOME: roHome, PATH: '/usr/bin:/bin' } },
+      ).trim();
+      expect(roFreshBefore).toBe(`IM=${join(roBin, 'imcodes')} OC=none`);
+
+      const exportMatch = roOut.match(/export PATH='([^']+)':"\$PATH"/);
+      expect(exportMatch?.[1]).toBe(join(roHome, '.opencode', 'bin'));
+      const roFreshAfter = execFileSync(
+        'bash',
+        ['-c', `PATH="/usr/bin:/bin"; source "${roProfile}"; ${exportMatch![0]}; echo "IM=$(command -v imcodes) OC=$(command -v opencode)"`],
+        { ...EXEC_OPTS, env: { HOME: roHome, PATH: '/usr/bin:/bin' } },
+      ).trim();
+      expect(roFreshAfter).toBe(`IM=${join(roBin, 'imcodes')} OC=${join(roHome, '.opencode', 'bin', 'opencode')}`);
 
       // 3) Missing `opencode` invokes npm with mirror registry & handles spaces in HOME / npm_bin
       const okLog = join(ocRoot, 'ok-npm.log');

@@ -515,13 +515,17 @@ fi
 # Dedicated best-effort block for OpenCode CLI PATH so it never clobbers the main
 # `# >>> IM.codes installer >>>` block on re-installs and never aborts install on
 # read-only rc files.
+openCodePathPersistFailed=0
+esc_oc_path=""
 if [ -n "$OPENCODE_PATH_DIR" ]; then
   oc_begin="# >>> IM.codes OpenCode CLI >>>"
   oc_end="# <<< IM.codes OpenCode CLI <<<"
+  esc_oc_path=$(printf '%s' "$OPENCODE_PATH_DIR" | sed "s/'/'\\\\''/g")
   for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
     if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
       if ! ( upsert_rc_path_block "$rc" "$OPENCODE_PATH_DIR" "$oc_begin" "$oc_end" ) 2>/dev/null; then
-        note "WARNING: could not persist OpenCode PATH in $rc (non-blocking) — add manually: export PATH=\"$OPENCODE_PATH_DIR:\$PATH\""
+        openCodePathPersistFailed=1
+        note "WARNING: could not persist OpenCode PATH in $rc (non-blocking) — add manually: export PATH='$esc_oc_path':\"\$PATH\""
       fi
     fi
   done
@@ -532,7 +536,12 @@ installed="$(imcodes --version 2>/dev/null || true)"
 printf "\n  ${G}imcodes installed  %s${N}\n" "$installed"
 case "$OPENCODE_STATUS" in
   installed|existing)
-    ok "OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" ;;
+    if [ "$openCodePathPersistFailed" = "1" ]; then
+      note "OpenCode CLI: installed; add its bin directory to PATH for shells whose startup file could not be updated:"
+      note "  export PATH='$esc_oc_path':\"\$PATH\""
+    else
+      ok "OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)"
+    fi ;;
   skipped)
     note "OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" ;;
   unverified)
