@@ -1159,7 +1159,7 @@ interface CodexSdkSessionState {
   customModelProvider?: CodexModelProviderConfig;
   /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
   imcodesMcpRecoveryRequired: boolean;
-  imcodesMcpRecoveryPromise?: Promise<void>;
+  imcodesMcpRecoveryPromise?: Promise<number | undefined>;
   model?: string;
   effort?: TransportEffortLevel;
   /**
@@ -3352,7 +3352,7 @@ export class CodexSdkProvider implements TransportProvider {
       } else if (!this.config || !channel.child) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
       }
-      const initialGeneration = channel.generation;
+      let initialGeneration = channel.generation;
       this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
 
       if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
@@ -3383,10 +3383,14 @@ export class CodexSdkProvider implements TransportProvider {
       state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
       state.authRecoveryReplayUnsafe = false;
       let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
-      if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+      if (state.imcodesMcpRecoveryPromise) {
+        const recoveredGeneration = await state.imcodesMcpRecoveryPromise;
+        if (recoveredGeneration !== undefined) initialGeneration = recoveredGeneration;
+      }
       this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
       if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
-        await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+        const recoveredGeneration = await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+        if (recoveredGeneration !== undefined) initialGeneration = recoveredGeneration;
         this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
       }
       for (;;) {
@@ -3830,9 +3834,9 @@ export class CodexSdkProvider implements TransportProvider {
   private async healImcodesMcpIfTransportDead(
     sessionId: string,
     state: CodexSdkSessionState,
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     const threadId = state.threadId;
-    if (!threadId) return;
+    if (!threadId) return undefined;
     try {
       await this.request(CODEX_MCP_RPC_METHOD.TOOL_CALL, {
         threadId,
@@ -3840,17 +3844,18 @@ export class CodexSdkProvider implements TransportProvider {
         tool: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
         arguments: {},
       }, CODEX_IM_MCP_PROBE_TIMEOUT_MS);
-      return;
+      return undefined;
     } catch (error) {
-      if (!isClosedMcpTransportMessage(error instanceof Error ? error.message : String(error))) return;
+      if (!isClosedMcpTransportMessage(error instanceof Error ? error.message : String(error))) return undefined;
     }
     logger.warn({ provider: this.id, sessionId, threadId },
       'Codex IM.codes MCP transport is closed on this thread; reloading before the turn');
     try {
-      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-probe-transport-closed');
+      return await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-probe-transport-closed');
     } catch (error) {
       logger.warn({ provider: this.id, sessionId, threadId, err: error },
         'Codex IM.codes MCP reload did not restore the thread; the turn proceeds and the next turn retries');
+      return undefined;
     }
   }
 
@@ -3907,33 +3912,37 @@ export class CodexSdkProvider implements TransportProvider {
   private async reconcileMcpTransportConfig(
     sessionId: string,
     state: CodexSdkSessionState,
-  ): Promise<void> {
-    if (state.incognito) return;
-    if (!this.hasMcpConfigChangedSinceLoad(state)) return;
+  ): Promise<number | undefined> {
+    if (state.incognito) return undefined;
+    if (!this.hasMcpConfigChangedSinceLoad(state)) return undefined;
     const channel = this.getChannelForSession(state);
     if (channel.kind === 'normal' && channel.child && this.getActiveWorkSessionIds(sessionId, channel).length === 0) {
       state.loaded = false;
       logger.info({ provider: this.id, sessionId, threadId: state.threadId },
         'Codex IM.codes MCP transport configuration changed; restarting idle app-server so thread reloads updated endpoint');
       await this.restartAppServerPreservingSessions('mcp-config-changed', sessionId, channel);
+      return channel.generation;
     }
+    return undefined;
   }
 
   private recoverImcodesMcpAfterObservedClosure(
     sessionId: string,
     state: CodexSdkSessionState,
     reason: string,
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     state.imcodesMcpRecoveryRequired = true;
     if (state.imcodesMcpRecoveryPromise) return state.imcodesMcpRecoveryPromise;
     const threadId = state.threadId;
     if (!threadId) return Promise.reject(new ImcodesDelegationUnavailableError());
     const channel = this.getChannelForSession(state);
-    const recovery = (async () => {
+    const recovery = (async (): Promise<number | undefined> => {
+      let restartedGeneration: number | undefined;
       const configChanged = this.hasMcpConfigChangedSinceLoad(state);
       const canRestartChannel = channel.kind === 'normal' && this.getActiveWorkSessionIds(sessionId, channel).length === 0;
       const restartAndResume = async () => {
         await this.restartAppServerPreservingSessions(reason, sessionId, channel);
+        restartedGeneration = channel.generation;
         const baseInstructions = await resolveBaseInstructionsOverride(state.model);
         await this.resumeThread(sessionId, state, baseInstructions);
       };
@@ -3954,6 +3963,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (this.sessions.get(sessionId) === state && state.threadId === threadId) {
         state.imcodesMcpRecoveryRequired = false;
       }
+      return restartedGeneration;
     })().finally(() => {
       if (state.imcodesMcpRecoveryPromise === recovery) state.imcodesMcpRecoveryPromise = undefined;
     });
@@ -4328,7 +4338,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.turnDelegationDispatches = [];
     state.pendingAgentMessageQuestions = undefined;
     const channel = this.getChannelForSession(state);
-    const channelGeneration = channel.generation;
+    let channelGeneration = channel.generation;
     this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
@@ -4353,7 +4363,8 @@ export class CodexSdkProvider implements TransportProvider {
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
       if (!state.incognito) {
-        await this.reconcileMcpTransportConfig(sessionId, state);
+        const reconciledGeneration = await this.reconcileMcpTransportConfig(sessionId, state);
+        if (reconciledGeneration !== undefined) channelGeneration = reconciledGeneration;
       }
       const reusesExistingThread = Boolean(state.threadId);
       await this.ensureThreadLoaded(sessionId, state, payload);
@@ -4362,7 +4373,8 @@ export class CodexSdkProvider implements TransportProvider {
       // gone (a resume of a loaded thread never respawns it). A thread started
       // just now spawned a fresh server and has nothing to heal.
       if (!state.incognito && reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
-        await this.healImcodesMcpIfTransportDead(sessionId, state);
+        const healedGeneration = await this.healImcodesMcpIfTransportDead(sessionId, state);
+        if (healedGeneration !== undefined) channelGeneration = healedGeneration;
       }
       this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
       // A Brain must not begin a turn unless IM delegation is authoritatively

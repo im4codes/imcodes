@@ -312,6 +312,8 @@ describe('production parent-identity injection', () => {
     expect(getCodexAppServerArgs({ httpPort: 51999 })).toEqual([
       '-c',
       'features.default_mode_request_user_input=true',
+      '-c',
+      'thread_unload_delay_secs=0',
       'app-server',
     ]);
 
