@@ -1152,6 +1152,26 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
+        let shareSessionEpoch = shareTicket.sva ?? 0;
+        try {
+          const shareUserAccess = await loadUserAccess(env.DB, shareTicket.sub);
+          const shareUserDecision = evaluateUserAccess(shareUserAccess);
+          const epochStale = shareUserAccess !== null && shareUserAccess.sessionsValidAfter > 0 && (
+            typeof shareTicket.sva === 'number'
+              ? shareUserAccess.sessionsValidAfter > shareTicket.sva
+              : shareTicket.issuedAt < shareUserAccess.sessionsValidAfter
+          );
+          if (!shareUserDecision.ok || epochStale) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          shareSessionEpoch = shareUserAccess?.sessionsValidAfter ?? shareSessionEpoch;
+        } catch {
+          socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+          socket.destroy();
+          return;
+        }
         const coverage = await resolveShareCoverageFromDb({
           db: env.DB,
           serverId,
@@ -1176,6 +1196,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
             target: shareTicket.target,
             snapshot: coverage,
             isMobile,
+            sessionEpoch: shareSessionEpoch,
           });
         });
         return;
@@ -1544,7 +1565,7 @@ async function main() {
 
   setupWebSocketUpgrade(httpServer as unknown as import('node:http').Server, env);
   // Every replica closes the live connections of accounts that were disabled (on any replica) within a few seconds.
-  const stopAccountWatch = startAccountConnectionWatch(db);
+  const stopAccountWatch = startAccountConnectionWatch(db, undefined, env);
 
   // Graceful shutdown — terminate the embedding worker so it doesn't keep
   // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).

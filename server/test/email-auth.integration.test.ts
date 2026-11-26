@@ -12,12 +12,21 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createServer, type Server as HttpServer } from 'node:http';
+import { WebSocket } from 'ws';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { buildApp } from '../src/index.js';
-import { hashPassword, randomHex, sha256Hex, verifyJwt } from '../src/security/crypto.js';
+import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
+import { hashPassword, randomHex, sha256Hex, signJwt, verifyJwt } from '../src/security/crypto.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { closeConnectionsOfInactiveUsers } from '../src/ws/account-watch.js';
+import {
+  consumeEmailVerificationCode,
+  emailOtpAdvisoryKey,
+  getDbClockMs,
+  hashEmailOtp,
+  issueEmailVerificationCode,
+} from '../src/services/email-auth.js';
 import type { Env } from '../src/env.js';
 import { AUTH_ERROR_CODES } from '../../shared/auth-error-codes.js';
 import { ACCOUNT_WS_CLOSE_CODE } from '../../shared/user-status.js';
@@ -332,7 +341,11 @@ describe('Email Auth PostgreSQL Integration', () => {
     }, noCredsEnv)).status).toBe(200);
 
     // Unknown email vs known email with rejecting provider during password_reset send-code:
-    fetchHandler = async () => new Response('SES outage', { status: 500 });
+    let failedProviderCalls = 0;
+    fetchHandler = async () => {
+      failedProviderCalls += 1;
+      return new Response('SES outage', { status: 500 });
+    };
     const unknownSend = await app.request('/api/auth/email/send-code', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'nobody@example.com', purpose: 'password_reset' }),
@@ -353,6 +366,9 @@ describe('Email Auth PostgreSQL Integration', () => {
       body: JSON.stringify({ email: 'bob@example.com', purpose: 'password_reset' }),
     }, env);
     expect(cooldownCheck.status).toBe(429);
+
+    // Wait for background rejecting delivery attempt to complete before restoring working provider
+    await vi.waitFor(() => expect(failedProviderCalls).toBe(1));
 
     // Advance cooldown, restore working provider, send real reset OTP
     await db.execute("UPDATE email_verification_codes SET created_at = created_at - 70000 WHERE purpose = 'password_reset'");
@@ -394,7 +410,7 @@ describe('Email Auth PostgreSQL Integration', () => {
 
     // Replica B browser socket is evicted by account-watch tick (`closeConnectionsOfInactiveUsers`), keeping daemon alive
     expect(browserOldB.closed).toBeNull();
-    const watchRes = await closeConnectionsOfInactiveUsers(db, [bridgeB]);
+    const watchRes = await closeConnectionsOfInactiveUsers(db, [bridgeB], { emailAuthEnabled: true });
     expect(watchRes.browserSockets).toBe(1);
     expect(watchRes.daemons).toBe(0);
     expect(browserOldB.closed).toEqual({ code: ACCOUNT_WS_CLOSE_CODE, reason: 'session_revoked' });
@@ -420,11 +436,352 @@ describe('Email Auth PostgreSQL Integration', () => {
 
     const browserNew = new FakeSocket();
     bridgeA.handleBrowserConnection(browserNew as never, userId, db, false, false, newSva);
-    await closeConnectionsOfInactiveUsers(db, [bridgeA]);
+    await closeConnectionsOfInactiveUsers(db, [bridgeA], { emailAuthEnabled: true });
     expect(browserNew.closed).toBeNull();
 
     // Cleanup fake daemonWs reference so bridge doesn't linger
     (bridgeA as unknown as { daemonWs: unknown; authenticated: boolean }).daemonWs = null;
     (bridgeA as unknown as { authenticated: boolean }).authenticated = false;
+  });
+
+  it('samples PostgreSQL clock_timestamp() AFTER acquiring locks (cooldown & TTL expiry under lock wait)', async () => {
+    const email = 'clock-lock@example.com';
+    const advKey = emailOtpAdvisoryKey('register', email);
+    const seededCode = '246810';
+    let releaseLock!: () => void;
+    const lockGate = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    // Seed an active OTP that expires 180ms from DB clock_timestamp()
+    const seedNow = await db.transaction(async (tx) => getDbClockMs(tx));
+    await db.execute(
+      `INSERT INTO email_verification_codes
+        (id, email, user_id, purpose, code_hash, attempts, max_attempts, expires_at, consumed_at, created_at)
+       VALUES ($1, $2, NULL, 'register', $3, 0, 5, $4, NULL, $5)`,
+      [randomHex(16), email, hashEmailOtp(JWT_KEY, 'register', email, seededCode), seedNow + 180, seedNow - 70_000],
+    );
+
+    // Hold advisory lock across the TTL expiry boundary while consumer starts BEFORE expiry and waits on lock
+    const holder = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [advKey]);
+      await lockGate;
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    // Consumer enters BEFORE TTL expired; it blocks on pg_advisory_xact_lock until after TTL elapses
+    const consumerPromise = db.transaction((tx) =>
+      consumeEmailVerificationCode(tx, JWT_KEY, {
+        email,
+        purpose: 'register',
+        code: seededCode,
+      }),
+    );
+
+    // Wait past expiry (+240ms) before releasing lock; consumer must sample PG clock_timestamp() AFTER lock and fail expired!
+    await new Promise((r) => setTimeout(r, 240));
+    releaseLock();
+    await holder;
+    const consumed = await consumerPromise;
+    expect(consumed).toEqual({ ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_EXPIRED });
+
+    // Ordered lock wait for cooldown: an earlier-starting waiter blocked behind an active issuer uses post-lock clock_timestamp() and hits cooldown!
+    let releaseIssueLock!: () => void;
+    const issueLockGate = new Promise<void>((resolve) => {
+      releaseIssueLock = resolve;
+    });
+    const cooldownEmail = 'clock-cooldown@example.com';
+    const cooldownAdvKey = emailOtpAdvisoryKey('register', cooldownEmail);
+    const issueHolder = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [cooldownAdvKey]);
+      await issueLockGate;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Both start while locked; first to take lock wins, second hits cooldown using post-lock DB clock
+    const env = makeEnv();
+    const w1 = issueEmailVerificationCode(db, env, { email: cooldownEmail, purpose: 'register' });
+    const w2 = issueEmailVerificationCode(db, env, { email: cooldownEmail, purpose: 'register' });
+    await new Promise((r) => setTimeout(r, 40));
+    releaseIssueLock();
+    await issueHolder;
+    const [o1, o2] = await Promise.all([w1, w2]);
+    const okCount = [o1, o2].filter((o) => o.ok).length;
+    const rateLimitedCount = [o1, o2].filter((o) => !o.ok && o.error === AUTH_ERROR_CODES.EMAIL_CODE_RATE_LIMITED).length;
+    expect(okCount).toBe(1);
+    expect(rateLimitedCount).toBe(1);
+  });
+
+  it('classifies username collisions containing "email" as USERNAME_TAKEN (constraint-only) with rollback', async () => {
+    const env = makeEnv();
+    const app = buildApp(env);
+
+    await app.request('/api/auth/email/send-code', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'first-emailname@example.com', purpose: 'register' }),
+    }, env);
+    await app.request('/api/auth/email/send-code', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'second-emailname@example.com', purpose: 'register' }),
+    }, env);
+    const otp1 = sentOtps[0].otp!;
+    const otp2 = sentOtps[1].otp!;
+
+    // Pre-insert user with username containing "email"
+    await app.request('/api/auth/password/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'myemailuser', password: 'Password1!', email: 'first-emailname@example.com', emailCode: otp1 }),
+    }, env);
+
+    // Concurrent/subsequent attempt hitting PG `users_username_key` returns USERNAME_TAKEN (not EMAIL_TAKEN) and leaves OTP unconsumed
+    const conflictRes = await app.request('/api/auth/password/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'myemailuser', password: 'Password1!', email: 'second-emailname@example.com', emailCode: otp2 }),
+    }, env);
+    expect(conflictRes.status).toBe(409);
+    expect((await conflictRes.json()).error).toBe(AUTH_ERROR_CODES.USERNAME_TAKEN);
+    const unconsumed = await db.queryOne<{ consumed_at: number | null }>(
+      'SELECT consumed_at FROM email_verification_codes WHERE LOWER(email) = $1 AND purpose = $2',
+      ['second-emailname@example.com', 'register'],
+    );
+    expect(unconsumed?.consumed_at).toBeNull();
+  });
+
+  it('decouples password_reset confirmation from locked users rows and prevents superseded tasks from overwriting newer codes', async () => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const userId = randomHex(16);
+    await db.execute(
+      'INSERT INTO users (id, username, password_hash, display_name, email, email_verified_at, status, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [userId, 'lockedbob', await hashPassword('OldPass1!'), 'Locked Bob', 'lockedbob@example.com', Date.now(), 'active', Date.now()],
+    );
+
+    // Hold a row-level FOR UPDATE lock on Bob's `users` row (simulating active login/refresh tx)
+    let releaseUserLock!: () => void;
+    const userLockGate = new Promise<void>((resolve) => {
+      releaseUserLock = resolve;
+    });
+    const userLocker = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+      await userLockGate;
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    // Public reset send-code MUST return 200 immediately WITHOUT waiting on the users row lock!
+    const t0 = Date.now();
+    const resetConfirm = await Promise.race([
+      app.request('/api/auth/email/send-code', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'lockedbob@example.com', purpose: 'password_reset' }),
+      }, env),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('reset send-code blocked on users row lock')), 500)),
+    ]);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(resetConfirm.status).toBe(200);
+    expect(await resetConfirm.json()).toEqual({ ok: true });
+    expect(sentOtps).toHaveLength(0);
+
+    // Cooldown takes effect immediately even while user row is still locked
+    const immediateRetry = await app.request('/api/auth/email/send-code', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'lockedbob@example.com', purpose: 'password_reset' }),
+    }, env);
+    expect(immediateRetry.status).toBe(429);
+
+    // Release user row lock -> background task wakes, activates OTP, and sends email
+    releaseUserLock();
+    await userLocker;
+    await vi.waitFor(() => expect(sentOtps).toHaveLength(1));
+
+    // Supersession guard: if a stale task waits on users FOR UPDATE across a newer issuance, the old task does NOT overwrite or invalidate the new code
+    let releaseSlowUserLock!: () => void;
+    const slowLockGate = new Promise<void>((resolve) => {
+      releaseSlowUserLock = resolve;
+    });
+    const slowLocker = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+      await slowLockGate;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    await db.execute("UPDATE email_verification_codes SET created_at = created_at - 70000 WHERE purpose = 'password_reset'");
+
+    const firstIssue = await issueEmailVerificationCode(db, env, {
+      email: 'lockedbob@example.com',
+      purpose: 'password_reset',
+      lookupResetTarget: true,
+      asyncDelivery: true,
+    });
+    expect(firstIssue.ok).toBe(true);
+
+    // Move first issue's created_at back so a second issuance is allowed and supersedes the stalled first background task
+    await db.execute("UPDATE email_verification_codes SET created_at = created_at - 70000 WHERE purpose = 'password_reset'");
+    const secondIssue = await issueEmailVerificationCode(db, env, {
+      email: 'lockedbob@example.com',
+      purpose: 'password_reset',
+      lookupResetTarget: true,
+      asyncDelivery: true,
+    });
+    expect(secondIssue.ok).toBe(true);
+
+    releaseSlowUserLock();
+    await slowLocker;
+    await Promise.all([
+      firstIssue.ok ? firstIssue.deliveryPromise : Promise.resolve(),
+      secondIssue.ok ? secondIssue.deliveryPromise : Promise.resolve(),
+    ]);
+
+    // Only the superseding (second) issuance delivered an email; first aborted cleanly without overwriting
+    expect(sentOtps).toHaveLength(2);
+    const activeResetOtp = sentOtps[1].otp!;
+    const resetFinal = await app.request('/api/auth/password/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'lockedbob@example.com', code: activeResetOtp, newPassword: 'SupersedePass2!' }),
+    }, env);
+    expect(resetFinal.status).toBe(200);
+  });
+
+  it('stamps sva on share WS tickets, preserves active post-reset share sockets across watcher ticks, and preserves legacy password/change behavior when disabled', async () => {
+    const env = makeEnv();
+    const app = buildApp(env);
+
+    const ownerId = randomHex(16);
+    const shareUserId = randomHex(16);
+    const serverId = randomHex(16);
+    const initialValidAfter = Date.now() - 10_000;
+    await db.execute(
+      'INSERT INTO users (id, username, password_hash, display_name, status, sessions_valid_after, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [ownerId, 'shareowner', await hashPassword('OwnerPass1!'), 'Owner', 'active', 0, Date.now()],
+    );
+    await db.execute(
+      'INSERT INTO users (id, username, password_hash, display_name, email, email_verified_at, status, sessions_valid_after, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+      [shareUserId, 'sharee', await hashPassword('SharePass1!'), 'Sharee', 'sharee@example.com', Date.now(), 'active', initialValidAfter, Date.now()],
+    );
+    await db.execute(
+      'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [serverId, ownerId, 'srv-share', sha256Hex('share-daemon-tok'), 'online', Date.now(), 'full'],
+    );
+    await db.execute(
+      'INSERT INTO server_shares (id, server_id, target_user_id, created_by, role, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [randomHex(16), serverId, shareUserId, ownerId, 'participant', Date.now(), Date.now()],
+    );
+
+    const shareLogin = await (await app.request('/api/auth/password/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'sharee@example.com', password: 'SharePass1!' }),
+    }, env)).json() as { accessToken: string };
+
+    // Mint share ticket for user who ALREADY has sessions_valid_after > 0
+    const shareTicketRes = await app.request('/api/shares/ws-ticket', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${shareLogin.accessToken}` },
+      body: JSON.stringify({ target: { kind: 'server', serverId } }),
+    }, env);
+    expect(shareTicketRes.status).toBe(200);
+    const { ticket: freshShareTicket, claims } = await shareTicketRes.json() as { ticket: string; claims: { sva?: number } };
+    expect(claims.sva).toBe(initialValidAfter);
+
+    // Boot real HTTP + WS upgrade server
+    const httpServer: HttpServer = createServer();
+    setupWebSocketUpgrade(httpServer, env);
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+    const port = (httpServer.address() as { port: number }).port;
+
+    const connectWs = (ticket: string) => new Promise<{ status?: number; ws?: WebSocket }>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/server/${serverId}/ws?ticket=${encodeURIComponent(ticket)}`, {
+        headers: { Origin: ORIGIN },
+      });
+      ws.once('open', () => resolve({ ws }));
+      ws.once('unexpected-response', (_req, res) => resolve({ status: res.statusCode }));
+    });
+
+    try {
+      // 1. Fresh share ticket connects cleanly and survives account-watch ticks!
+      const freshConn = await connectWs(freshShareTicket);
+      expect(freshConn.ws).toBeDefined();
+      const bridge = WsBridge.get(serverId);
+      const watchKeep = await closeConnectionsOfInactiveUsers(db, [bridge], { emailAuthEnabled: true });
+      expect(watchKeep.browserSockets).toBe(0);
+      expect(freshConn.ws!.readyState).toBe(WebSocket.OPEN);
+
+      // 2. Stale share tickets (sva=0 OR legacy ticket without sva minted before initialValidAfter) are refused with 401
+      const staleSvaTicket = signJwt({
+        type: 'share-ws-ticket',
+        sub: shareUserId,
+        jti: randomHex(16),
+        serverId,
+        target: { kind: 'server', serverId },
+        snapshot: (claims as unknown as { snapshot: unknown }).snapshot,
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + 30_000,
+        sva: 0,
+      }, JWT_KEY, 30);
+      const staleRes = await connectWs(staleSvaTicket);
+      expect(staleRes.status).toBe(401);
+
+      const legacyPreResetTicket = signJwt({
+        type: 'share-ws-ticket',
+        sub: shareUserId,
+        jti: randomHex(16),
+        serverId,
+        target: { kind: 'server', serverId },
+        snapshot: (claims as unknown as { snapshot: unknown }).snapshot,
+        issuedAt: initialValidAfter - 1000,
+        expiresAt: Date.now() + 30_000,
+      }, JWT_KEY, 30);
+      const legacyRes = await connectWs(legacyPreResetTicket);
+      expect(legacyRes.status).toBe(401);
+
+      // 3. When EMAIL_AUTH_ENABLED=false, legacy password/change + account-watch MUST NOT evict existing sockets
+      const disabledEnv = makeEnv({ EMAIL_AUTH_ENABLED: 'false' });
+      const disabledApp = buildApp(disabledEnv);
+      const ownerLogin = await (await disabledApp.request('/api/auth/password/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'shareowner', password: 'OwnerPass1!' }),
+      }, disabledEnv)).json() as { accessToken: string };
+      const ownerSocket = new FakeSocket();
+      const daemonWs = new FakeSocket();
+      (bridge as unknown as { daemonWs: unknown; authenticated: boolean; daemonOwnerUserId: string }).daemonWs = daemonWs;
+      (bridge as unknown as { authenticated: boolean }).authenticated = true;
+      (bridge as unknown as { daemonOwnerUserId: string }).daemonOwnerUserId = ownerId;
+      bridge.handleBrowserConnection(ownerSocket as never, ownerId, db, false, false, 0);
+
+      const legacyPwChange = await disabledApp.request('/api/auth/password/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerLogin.accessToken}` },
+        body: JSON.stringify({ oldPassword: 'OwnerPass1!', newPassword: 'OwnerPass2!' }),
+      }, disabledEnv);
+      expect(legacyPwChange.status).toBe(200);
+      expect(ownerSocket.closed).toBeNull();
+
+      const disabledWatch = await closeConnectionsOfInactiveUsers(db, [bridge], { emailAuthEnabled: false });
+      expect(disabledWatch.browserSockets).toBe(0);
+      expect(ownerSocket.closed).toBeNull();
+      expect(daemonWs.closed).toBeNull();
+
+      // 4. Now password reset on sharee DOES evict sharee's pre-reset share socket, while preserving daemon
+      await app.request('/api/auth/email/send-code', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sharee@example.com', purpose: 'password_reset' }),
+      }, env);
+      await vi.waitFor(() => expect(sentOtps.length).toBeGreaterThanOrEqual(1));
+      const resetCode = sentOtps[sentOtps.length - 1].otp!;
+
+      const closePromise = new Promise<{ code: number; reason: string }>((resolve) => {
+        freshConn.ws!.once('close', (code, reason) => resolve({ code, reason: reason.toString() }));
+      });
+      const resetSharee = await app.request('/api/auth/password/reset', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sharee@example.com', code: resetCode, newPassword: 'ShareNewPass2!' }),
+      }, env);
+      expect(resetSharee.status).toBe(200);
+      const closedFrame = await closePromise;
+      expect(closedFrame.code).toBe(ACCOUNT_WS_CLOSE_CODE);
+      expect(daemonWs.closed).toBeNull();
+
+      (bridge as unknown as { daemonWs: unknown; authenticated: boolean }).daemonWs = null;
+      (bridge as unknown as { authenticated: boolean }).authenticated = false;
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
   });
 });

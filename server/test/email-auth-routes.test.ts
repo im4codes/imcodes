@@ -79,6 +79,9 @@ function makeEmailAuthMemDb() {
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
         const s = getS();
         const q = normalize(sql);
+        if (q.includes('clock_timestamp()')) {
+          return { now_ms: Date.now() } as T;
+        }
         if (q.includes('pg_advisory_xact_lock')) {
           return { pg_advisory_xact_lock: '' } as T;
         }
@@ -230,6 +233,24 @@ function makeEmailAuthMemDb() {
           const u = s.users.get(String(params[1]));
           if (!u) return { changes: 0 };
           u.status = params[0] as MemUser['status'];
+          return { changes: 1 };
+        }
+        if (q.startsWith('update email_verification_codes set consumed_at = $1 where lower(email) = $2 and purpose = $3 and id != $4 and consumed_at is null')) {
+          let changes = 0;
+          for (const c of s.codes.values()) {
+            if (c.email.toLowerCase() === String(params[1]).toLowerCase() && c.purpose === params[2] && c.id !== String(params[3]) && c.consumed_at === null) {
+              c.consumed_at = Number(params[0]);
+              changes += 1;
+            }
+          }
+          return { changes };
+        }
+        if (q.startsWith('update email_verification_codes set user_id = $1, code_hash = $2, consumed_at = null where id = $3')) {
+          const c = s.codes.get(String(params[2]));
+          if (!c) return { changes: 0 };
+          c.user_id = params[0] ? String(params[0]) : null;
+          c.code_hash = String(params[1]);
+          c.consumed_at = null;
           return { changes: 1 };
         }
         if (q.startsWith('update email_verification_codes set consumed_at = $1 where lower(email) = $2 and purpose = $3 and consumed_at is null')) {

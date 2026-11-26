@@ -7302,6 +7302,7 @@ export class WsBridge {
       target: ShareTarget;
       snapshot: EffectiveCoverage;
       isMobile?: boolean;
+      sessionEpoch?: number;
     },
   ): void {
     const effectiveTarget = options.snapshot.serverParticipantAuthority === true
@@ -7321,7 +7322,7 @@ export class WsBridge {
       coveredProjectDirs,
     });
     this.syncShareSweepRegistration();
-    this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
+    this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false, false, options.sessionEpoch ?? 0);
     void this.refreshShareActorDisplayName(ws);
     void this.refreshShareCoveredSessions(ws);
   }

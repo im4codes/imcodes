@@ -90,6 +90,7 @@ export interface ShareScopedTicketClaims {
   snapshot: ShareAuthorizationSnapshot;
   issuedAt: number;
   expiresAt: number;
+  sva?: number;
 }
 
 export interface SharedActorEnvelope {

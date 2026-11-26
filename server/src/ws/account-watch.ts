@@ -8,6 +8,7 @@
  * statement per pod, none when nobody is connected, whatever the number of connections.
  */
 import type { Database } from '../db/client.js';
+import { isEmailAuthEnabled, type EnvConfig } from '../env.js';
 import { ACCOUNT_CONNECTION_WATCH_INTERVAL_MS, USER_STATUS, userStatusDenialCode } from '../../../shared/user-status.js';
 import { findInactiveUsers, loadUserSessionValidAfters } from '../security/user-status.js';
 import logger from '../util/logger.js';
@@ -42,10 +43,11 @@ export function evictStaleUserBrowserSockets(
   return closed;
 }
 
-/** Close the live connections of every connected user whose account is not active, and stale browser sockets after session-ending events. Idempotent. */
+/** Close the live connections of every connected user whose account is not active, and stale browser sockets when email auth is enabled. Idempotent. */
 export async function closeConnectionsOfInactiveUsers(
   db: Database,
   bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
+  options?: { emailAuthEnabled?: boolean },
 ): Promise<AccountWatchResult> {
   const all = [...bridges];
   const live = new Set<string>();
@@ -67,18 +69,21 @@ export async function closeConnectionsOfInactiveUsers(
     logger.warn({ ...result }, 'closed live connections of accounts that may no longer act');
   }
 
-  const activeLiveIds = liveIds.filter((id) => !inactive.has(id));
-  const sessionValidAfters = await loadUserSessionValidAfters(db, activeLiveIds);
-  if (sessionValidAfters.size > 0) {
-    let evicted = 0;
-    evicted += globalTaskHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
-    evicted += remoteVoiceHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
-    for (const bridge of all) {
-      evicted += bridge.closeBrowserSocketsForSessionReset(sessionValidAfters);
-    }
-    if (evicted > 0) {
-      result.browserSockets += evicted;
-      logger.warn({ evictedBrowserSockets: evicted }, 'closed stale browser connections after session epoch advance');
+  const shouldEvictSessionReset = options?.emailAuthEnabled ?? isEmailAuthEnabled(process.env);
+  if (shouldEvictSessionReset) {
+    const activeLiveIds = liveIds.filter((id) => !inactive.has(id));
+    const sessionValidAfters = await loadUserSessionValidAfters(db, activeLiveIds);
+    if (sessionValidAfters.size > 0) {
+      let evicted = 0;
+      evicted += globalTaskHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      evicted += remoteVoiceHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      for (const bridge of all) {
+        evicted += bridge.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      }
+      if (evicted > 0) {
+        result.browserSockets += evicted;
+        logger.warn({ evictedBrowserSockets: evicted }, 'closed stale browser connections after session epoch advance');
+      }
     }
   }
   return result;
@@ -88,12 +93,14 @@ export async function closeConnectionsOfInactiveUsers(
 export function startAccountConnectionWatch(
   db: Database,
   intervalMs: number = ACCOUNT_CONNECTION_WATCH_INTERVAL_MS,
+  env: Partial<EnvConfig> = process.env,
 ): () => void {
   let running = false;
+  const emailAuthEnabled = isEmailAuthEnabled(env);
   const timer = setInterval(() => {
     if (running) return;
     running = true;
-    closeConnectionsOfInactiveUsers(db)
+    closeConnectionsOfInactiveUsers(db, undefined, { emailAuthEnabled })
       .catch((err) => logger.warn({ err }, 'account connection watch failed (retried next tick)'))
       .finally(() => { running = false; });
   }, intervalMs);

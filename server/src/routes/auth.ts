@@ -33,6 +33,7 @@ import { EMAIL_AUTH_PURPOSE } from '../../../shared/email-auth.js';
 import { EmailServiceError } from '../services/email.js';
 import {
   consumeEmailVerificationCode,
+  getDbClockMs,
   isValidEmail,
   isValidEmailOtp,
   issueEmailVerificationCode,
@@ -125,23 +126,11 @@ function mapPgUniqueConstraintError(err: unknown): (typeof AUTH_ERROR_CODES)[key
   if (!err || typeof err !== 'object' || !('code' in err) || (err as { code?: unknown }).code !== '23505') {
     return null;
   }
-  const constraint = 'constraint' in err && typeof err.constraint === 'string' ? err.constraint.toLowerCase() : '';
-  const detail = 'detail' in err && typeof err.detail === 'string' ? err.detail.toLowerCase() : '';
-  const message = 'message' in err && typeof err.message === 'string' ? err.message.toLowerCase() : '';
-  if (
-    constraint === 'idx_users_email_lower'
-    || constraint.includes('email')
-    || detail.includes('email')
-    || message.includes('idx_users_email_lower')
-  ) {
+  const constraint = 'constraint' in err && typeof err.constraint === 'string' ? err.constraint : '';
+  if (constraint === 'idx_users_email_lower') {
     return AUTH_ERROR_CODES.EMAIL_TAKEN;
   }
-  if (
-    constraint === 'users_username_key'
-    || constraint.includes('username')
-    || detail.includes('(username)')
-    || message.includes('users_username_key')
-  ) {
+  if (constraint === 'users_username_key') {
     return AUTH_ERROR_CODES.USERNAME_TAKEN;
   }
   return null;
@@ -960,13 +949,11 @@ authRoutes.post('/email/bind', async (c) => {
         return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
       }
 
-      const txNow = Date.now();
       const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
         email: normalizedEmail,
         purpose: EMAIL_AUTH_PURPOSE.BIND_EMAIL,
         code,
         userId,
-        now: txNow,
       });
       if (!consumed.ok) {
         return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
@@ -974,7 +961,7 @@ authRoutes.post('/email/bind', async (c) => {
 
       await tx.execute(
         'UPDATE users SET email = $1, email_verified_at = $2 WHERE id = $3',
-        [normalizedEmail, txNow, userId],
+        [normalizedEmail, consumed.now, userId],
       );
       return { ok: true as const };
     });
@@ -1082,17 +1069,16 @@ authRoutes.post('/password/register', async (c) => {
           return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
         }
 
-        const txNow = Date.now();
         const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
           email: normalizedEmail,
           purpose: EMAIL_AUTH_PURPOSE.REGISTER,
           code: normalizedEmailCode,
-          now: txNow,
         });
         if (!consumed.ok) {
           return { ok: false as const, status: 400 as const, error: consumed.error };
         }
 
+        const txNow = consumed.now;
         await tx.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, txNow]);
         await tx.execute(
           'UPDATE users SET username = $1, password_hash = $2, display_name = $3, email = $4, email_verified_at = $5 WHERE id = $6',
@@ -1402,18 +1388,17 @@ authRoutes.post('/password/reset', async (c) => {
       };
     }
 
-    const txNow = Date.now();
     const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
       email: normalizedEmail,
       purpose: EMAIL_AUTH_PURPOSE.PASSWORD_RESET,
       code,
       userId: lockedUser.id,
-      now: txNow,
     });
     if (!consumed.ok) {
       return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
     }
 
+    const txNow = consumed.now;
     const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
     const newValidAfter = nextSessionValidAfter(prevValidAfter, txNow);
 
@@ -1486,6 +1471,7 @@ authRoutes.post('/password/change', async (c) => {
     oldPasswordVerified = true;
   }
 
+  const emailAuthEnabled = isEmailAuthEnabled(c.env);
   const newHash = await hashPassword(newPassword);
   const hadSessionCookie = !c.req.header('Authorization') && !!getCookie(c, COOKIE_SESSION);
 
@@ -1516,15 +1502,16 @@ authRoutes.post('/password/change', async (c) => {
       };
     }
 
-    const txRequiresEmailCode = isEmailAuthEnabled(c.env)
+    const txRequiresEmailCode = emailAuthEnabled
       && !lockedUser.password_must_change
       && Boolean(lockedUser.email && lockedUser.email_verified_at);
 
-    const txNow = Date.now();
+    let txNow: number;
     if (!txRequiresEmailCode) {
       if (!oldPasswordVerified) {
         return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.INVALID_BODY };
       }
+      txNow = await getDbClockMs(tx);
     } else {
       if (!isValidEmailOtp(emailCode)) {
         return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED };
@@ -1534,11 +1521,11 @@ authRoutes.post('/password/change', async (c) => {
         purpose: EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE,
         code: emailCode.trim(),
         userId,
-        now: txNow,
       });
       if (!consumed.ok) {
         return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
       }
+      txNow = consumed.now;
     }
 
     const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
@@ -1573,7 +1560,9 @@ authRoutes.post('/password/change', async (c) => {
     return c.json({ error: changeTx.error }, changeTx.status);
   }
 
-  evictStaleUserBrowserSockets(userId, changeTx.newValidAfter);
+  if (emailAuthEnabled) {
+    evictStaleUserBrowserSockets(userId, changeTx.newValidAfter);
+  }
 
   if (changeTx.accessToken && changeTx.refreshRaw) {
     const isSecure = c.env.NODE_ENV === 'production';

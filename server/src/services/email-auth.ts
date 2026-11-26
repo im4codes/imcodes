@@ -41,11 +41,23 @@ export type IssueEmailCodeResult =
   | { ok: false; status: 400 | 401 | 403 | 409 | 429; error: AuthErrorCode; retryAfterMs?: number };
 
 export type ConsumeEmailCodeResult =
-  | { ok: true; codeId: string }
+  | { ok: true; codeId: string; now: number }
   | { ok: false; error: AuthErrorCode };
 
 export function emailOtpAdvisoryKey(purpose: EmailAuthPurpose, normalizedEmail: string): string {
   return `email-otp:${purpose}:${normalizedEmail}`;
+}
+
+/**
+ * Sample PostgreSQL's live wall clock (`clock_timestamp()`) INSIDE an already-locked transaction so
+ * lock waiters never evaluate TTL or cooldown using pre-lock application clocks or `BEGIN` transaction time.
+ */
+export async function getDbClockMs(tx: Database, overrideNow?: number): Promise<number> {
+  if (overrideNow !== undefined) return overrideNow;
+  const row = await tx.queryOne<{ now_ms: string | number }>(
+    'SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now_ms',
+  );
+  return row && row.now_ms !== undefined && row.now_ms !== null ? Number(row.now_ms) : Date.now();
 }
 
 export function hashEmailOtp(
@@ -104,14 +116,19 @@ export function buildVerificationEmail(
 /**
  * Issue and send a single-use 6-digit verification code (stored hashed, never plaintext).
  *
- * Canonical lock order inside the single issuing transaction:
- *   1. Target `users` row (`FOR UPDATE`, when an existing user is involved)
- *   2. `pg_advisory_xact_lock('email-otp:' || purpose || ':' || normalizedEmail)`
- *   3. `email_verification_codes` cooldown check, prior-code invalidation, and insert
+ * Timing invariant: all cooldown, TTL, and `created_at`/`expires_at` timestamps are sampled from
+ * PostgreSQL `clock_timestamp()` AFTER acquiring the relevant row/advisory locks inside the transaction.
  *
- * For `asyncDelivery` (`password_reset`), known-verified-active users and unknown/inactive emails
- * follow the exact same cooldown/lockout gate and response shape; provider delivery runs detached
- * outside the transaction so provider latency or failures never create enumeration side-channels.
+ * Canonical lock order inside any transaction touching `users`:
+ *   1. Target `users` row (`FOR UPDATE`)
+ *   2. `pg_advisory_xact_lock('email-otp:' || purpose || ':' || normalizedEmail)`
+ *   3. `email_verification_codes`
+ *
+ * Public `password_reset` confirmation (`asyncDelivery: true`) writes its cooldown record using ONLY
+ * locks (2) and (3) with ZERO dependency on `users` row locks so active login/refresh transactions on
+ * known accounts never delay or stall the public confirmation response. Target account lookup, OTP
+ * activation, and email delivery happen asynchronously afterwards, guarding against supersession by
+ * newer requests before sending.
  */
 export async function issueEmailVerificationCode(
   db: Database,
@@ -131,7 +148,6 @@ export async function issueEmailVerificationCode(
   const explicitEmail = typeof opts.email === 'string' && opts.email.trim()
     ? normalizeEmail(opts.email)
     : '';
-  const now = opts.now ?? Date.now();
   const codeId = randomHex(16);
   const generatedCode = generateEmailOtpCode();
 
@@ -147,6 +163,130 @@ export async function issueEmailVerificationCode(
     }
   }
 
+  // Path A: Public `password_reset` confirmation (completely decoupled from `users` locks)
+  if (opts.purpose === EMAIL_AUTH_PURPOSE.PASSWORD_RESET && opts.asyncDelivery) {
+    if (!explicitEmail || !isValidEmail(explicitEmail)) {
+      return { ok: false, status: 400, error: AUTH_ERROR_CODES.INVALID_EMAIL };
+    }
+    const targetEmail = explicitEmail;
+
+    type ResetStageOutcome =
+      | { ok: true; expiresAt: number }
+      | { ok: false; status: 429; error: AuthErrorCode; retryAfterMs: number };
+
+    const stageOutcome: ResetStageOutcome = await db.transaction(async (tx): Promise<ResetStageOutcome> => {
+      await tx.queryOne(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [emailOtpAdvisoryKey(opts.purpose, targetEmail)],
+      );
+      const txNow = await getDbClockMs(tx, opts.now);
+
+      const recent = await tx.queryOne<Pick<EmailVerificationCodeRow, 'created_at'>>(
+        'SELECT created_at FROM email_verification_codes WHERE LOWER(email) = $1 AND purpose = $2 ORDER BY created_at DESC LIMIT 1',
+        [targetEmail, opts.purpose],
+      );
+      if (recent) {
+        const elapsed = txNow - Number(recent.created_at);
+        if (elapsed < EMAIL_OTP_RESEND_COOLDOWN_MS) {
+          return {
+            ok: false,
+            status: 429,
+            error: AUTH_ERROR_CODES.EMAIL_CODE_RATE_LIMITED,
+            retryAfterMs: Math.max(1, EMAIL_OTP_RESEND_COOLDOWN_MS - Math.max(0, elapsed)),
+          };
+        }
+      }
+
+      const expiresAt = txNow + EMAIL_OTP_TTL_MS;
+      // Record unified pre-consumed cooldown row first; background worker binds user + activates hash if eligible.
+      await tx.execute(
+        `INSERT INTO email_verification_codes
+          (id, email, user_id, purpose, code_hash, attempts, max_attempts, expires_at, consumed_at, created_at)
+         VALUES ($1, $2, NULL, $3, $4, 0, $5, $6, $7, $8)`,
+        [
+          codeId,
+          targetEmail,
+          opts.purpose,
+          randomHex(32),
+          EMAIL_OTP_MAX_ATTEMPTS,
+          expiresAt,
+          txNow,
+          txNow,
+        ],
+      );
+      return { ok: true, expiresAt };
+    });
+
+    if (!stageOutcome.ok) {
+      if (opts.lockoutIdentity) {
+        const lockRes = await recordAuthFailure(db, opts.lockoutIdentity, 'email_send_rate_limited');
+        if (lockRes.locked) {
+          return {
+            ok: false,
+            status: 429,
+            error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+            retryAfterMs: lockRes.lockedUntil ? Math.max(0, lockRes.lockedUntil - Date.now()) : stageOutcome.retryAfterMs,
+          };
+        }
+      }
+      return stageOutcome;
+    }
+
+    const deliveryPromise = Promise.resolve()
+      .then(async () => {
+        if (opts.suppressSendForAntiEnumeration) return;
+        const activated = await db.transaction(async (tx): Promise<boolean> => {
+          const lockedTarget = await tx.queryOne<{ id: string; status: string }>(
+            'SELECT id, status FROM users WHERE LOWER(email) = $1 AND email_verified_at IS NOT NULL FOR UPDATE',
+            [targetEmail],
+          );
+          if (!lockedTarget || !isUserStatusActive(lockedTarget.status)) {
+            return false;
+          }
+
+          await tx.queryOne(
+            'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [emailOtpAdvisoryKey(opts.purpose, targetEmail)],
+          );
+          const bgNow = await getDbClockMs(tx, opts.now);
+
+          const latest = await tx.queryOne<{ id: string; expires_at: string | number }>(
+            'SELECT id, expires_at FROM email_verification_codes WHERE LOWER(email) = $1 AND purpose = $2 ORDER BY created_at DESC LIMIT 1',
+            [targetEmail, opts.purpose],
+          );
+          if (!latest || latest.id !== codeId || bgNow > Number(latest.expires_at)) {
+            return false;
+          }
+
+          const codeHash = hashEmailOtp(env.JWT_SIGNING_KEY, opts.purpose, targetEmail, generatedCode);
+          await tx.execute(
+            'UPDATE email_verification_codes SET consumed_at = $1 WHERE LOWER(email) = $2 AND purpose = $3 AND id != $4 AND consumed_at IS NULL',
+            [bgNow, targetEmail, opts.purpose, codeId],
+          );
+          const upd = await tx.execute(
+            'UPDATE email_verification_codes SET user_id = $1, code_hash = $2, consumed_at = NULL WHERE id = $3',
+            [lockedTarget.id, codeHash, codeId],
+          );
+          return upd.changes === 1;
+        });
+
+        if (!activated) return;
+        const emailContent = buildVerificationEmail(opts.purpose, generatedCode, opts.lang ?? 'en');
+        await sendEmail(env, {
+          to: targetEmail,
+          subject: emailContent.subject,
+          text: emailContent.text,
+          html: emailContent.html,
+        });
+      })
+      .catch((err) => {
+        logger.warn({ err, purpose: opts.purpose }, 'Background email verification dispatch failed');
+      });
+
+    return { ok: true, deliveryPromise };
+  }
+
+  // Path B: Authenticated / registration OTP issuance
   type TxOutcome =
     | { ok: true; suppressed: boolean; targetEmail: string }
     | {
@@ -232,6 +372,7 @@ export async function issueEmailVerificationCode(
       'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
       [emailOtpAdvisoryKey(opts.purpose, targetEmail)],
     );
+    const txNow = await getDbClockMs(tx, opts.now);
 
     if (opts.purpose === EMAIL_AUTH_PURPOSE.REGISTER) {
       const existingEmailUser = await tx.queryOne<{ id: string }>(
@@ -248,13 +389,13 @@ export async function issueEmailVerificationCode(
       [targetEmail, opts.purpose],
     );
     if (recent) {
-      const elapsed = now - Number(recent.created_at);
-      if (elapsed >= 0 && elapsed < EMAIL_OTP_RESEND_COOLDOWN_MS) {
+      const elapsed = txNow - Number(recent.created_at);
+      if (elapsed < EMAIL_OTP_RESEND_COOLDOWN_MS) {
         return {
           ok: false,
           status: 429,
           error: AUTH_ERROR_CODES.EMAIL_CODE_RATE_LIMITED,
-          retryAfterMs: EMAIL_OTP_RESEND_COOLDOWN_MS - elapsed,
+          retryAfterMs: Math.max(1, EMAIL_OTP_RESEND_COOLDOWN_MS - Math.max(0, elapsed)),
           recordRateLimit: true,
         };
       }
@@ -271,9 +412,9 @@ export async function issueEmailVerificationCode(
           opts.purpose,
           randomHex(32),
           EMAIL_OTP_MAX_ATTEMPTS,
-          now + EMAIL_OTP_TTL_MS,
-          now,
-          now,
+          txNow + EMAIL_OTP_TTL_MS,
+          txNow,
+          txNow,
         ],
       );
       return { ok: true, suppressed: true, targetEmail };
@@ -282,7 +423,7 @@ export async function issueEmailVerificationCode(
     const codeHash = hashEmailOtp(env.JWT_SIGNING_KEY, opts.purpose, targetEmail, generatedCode);
     await tx.execute(
       'UPDATE email_verification_codes SET consumed_at = $1 WHERE LOWER(email) = $2 AND purpose = $3 AND consumed_at IS NULL',
-      [now, targetEmail, opts.purpose],
+      [txNow, targetEmail, opts.purpose],
     );
     await tx.execute(
       `INSERT INTO email_verification_codes
@@ -295,8 +436,8 @@ export async function issueEmailVerificationCode(
         opts.purpose,
         codeHash,
         EMAIL_OTP_MAX_ATTEMPTS,
-        now + EMAIL_OTP_TTL_MS,
-        now,
+        txNow + EMAIL_OTP_TTL_MS,
+        txNow,
       ],
     );
     return { ok: true, suppressed: false, targetEmail };
@@ -327,25 +468,6 @@ export async function issueEmailVerificationCode(
   }
 
   const emailContent = buildVerificationEmail(opts.purpose, generatedCode, opts.lang ?? 'en');
-  if (opts.asyncDelivery) {
-    // Dispatch asynchronously for anti-enumeration endpoints (`password_reset`) so unknown/known/slow/failed
-    // provider deliveries have identical external latency, response, and cooldown behavior.
-    const deliveryPromise = Promise.resolve()
-      .then(() =>
-        sendEmail(env, {
-          to: txOutcome.targetEmail,
-          subject: emailContent.subject,
-          text: emailContent.text,
-          html: emailContent.html,
-        }),
-      )
-      .then(() => undefined)
-      .catch((err) => {
-        logger.warn({ err, purpose: opts.purpose }, 'Background email verification dispatch failed');
-      });
-    return { ok: true, deliveryPromise };
-  }
-
   try {
     await sendEmail(env, {
       to: txOutcome.targetEmail,
@@ -354,7 +476,7 @@ export async function issueEmailVerificationCode(
       html: emailContent.html,
     });
   } catch (err) {
-    // Roll back un-delivered OTP for authenticated/non-enumeration flows so transport errors don't trap the user in a 60s cooldown.
+    // Roll back un-delivered OTP for authenticated/registration flows so transport errors don't trap the user in a 60s cooldown.
     await db.execute('DELETE FROM email_verification_codes WHERE id = $1', [codeId]).catch((cleanupErr) => {
       logger.warn({ err: cleanupErr, codeId }, 'Failed to remove undelivered email verification code');
     });
@@ -366,7 +488,8 @@ export async function issueEmailVerificationCode(
 
 /**
  * Verify and atomically consume the latest unconsumed OTP inside an open DB transaction.
- * Serializes per `(purpose, normalizedEmail)` via `pg_advisory_xact_lock` before locking the OTP row.
+ * Serializes per `(purpose, normalizedEmail)` via `pg_advisory_xact_lock`, locks the row `FOR UPDATE`,
+ * and samples PostgreSQL `clock_timestamp()` AFTER locking so lock wait across TTL boundaries never accepts stale OTPs.
  */
 export async function consumeEmailVerificationCode(
   tx: Database,
@@ -380,7 +503,6 @@ export async function consumeEmailVerificationCode(
   },
 ): Promise<ConsumeEmailCodeResult> {
   const normalizedEmail = normalizeEmail(opts.email);
-  const now = opts.now ?? Date.now();
   if (!isValidEmailOtp(opts.code)) {
     return { ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
   }
@@ -399,14 +521,16 @@ export async function consumeEmailVerificationCode(
      FOR UPDATE`,
     [normalizedEmail, opts.purpose],
   );
+  const txNow = await getDbClockMs(tx, opts.now);
+
   if (!row) {
     return { ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
   }
   if (opts.userId !== undefined && opts.userId !== null && row.user_id !== opts.userId) {
     return { ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
   }
-  if (now > Number(row.expires_at)) {
-    await tx.execute('UPDATE email_verification_codes SET consumed_at = $1 WHERE id = $2', [now, row.id]);
+  if (txNow > Number(row.expires_at)) {
+    await tx.execute('UPDATE email_verification_codes SET consumed_at = $1 WHERE id = $2', [txNow, row.id]);
     return { ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_EXPIRED };
   }
 
@@ -421,7 +545,7 @@ export async function consumeEmailVerificationCode(
     if (nextAttempts >= maxAttempts) {
       await tx.execute(
         'UPDATE email_verification_codes SET attempts = $1, consumed_at = $2 WHERE id = $3',
-        [nextAttempts, now, row.id],
+        [nextAttempts, txNow, row.id],
       );
     } else {
       await tx.execute(
@@ -434,11 +558,11 @@ export async function consumeEmailVerificationCode(
 
   const updated = await tx.execute(
     'UPDATE email_verification_codes SET consumed_at = $1 WHERE id = $2 AND consumed_at IS NULL',
-    [now, row.id],
+    [txNow, row.id],
   );
   if (updated.changes !== 1) {
     return { ok: false, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
   }
 
-  return { ok: true, codeId: row.id };
+  return { ok: true, codeId: row.id, now: txNow };
 }
