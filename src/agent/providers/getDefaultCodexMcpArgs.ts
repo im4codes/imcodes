@@ -227,6 +227,8 @@ export function findEnabledImcodesMcpKeysFromConfig(mcpServers: unknown): string
  * injected at the process boundary, and disables any user/workspace-configured
  * `imcodes-memory` server keys so global `~/.codex/config.toml` cannot leak in.
  */
+export const CODEX_THREAD_UNLOAD_DELAY_CONFIG = 'thread_unload_delay_secs=0';
+
 export function getCodexIncognitoAppServerArgs(disabledMcpServers: readonly string[] = []): string[] {
   const seen = new Set<string>();
   const disableArgs: string[] = [];
@@ -235,7 +237,14 @@ export function getCodexIncognitoAppServerArgs(disabledMcpServers: readonly stri
     seen.add(name);
     disableArgs.push('-c', `mcp_servers.${formatTomlKeySegment(name)}.enabled=false`);
   }
-  return [...disableArgs, '-c', CODEX_DEFAULT_USER_INPUT_CONFIG, 'app-server'];
+  return [
+    ...disableArgs,
+    '-c',
+    CODEX_DEFAULT_USER_INPUT_CONFIG,
+    '-c',
+    CODEX_THREAD_UNLOAD_DELAY_CONFIG,
+    'app-server',
+  ];
 }
 
 export function getDefaultCodexMcpArgs(): string[] {
@@ -268,5 +277,12 @@ export function getDefaultCodexMcpArgs(): string[] {
 export function getCodexAppServerArgs(): string[] {
   // Native questions are otherwise Plan-only. Enable the actual Codex tool in
   // Default mode too; do not invent or override its provider-owned schema.
-  return [...getDefaultCodexMcpArgs(), '-c', CODEX_DEFAULT_USER_INPUT_CONFIG, 'app-server'];
+  return [
+    ...getDefaultCodexMcpArgs(),
+    '-c',
+    CODEX_DEFAULT_USER_INPUT_CONFIG,
+    '-c',
+    CODEX_THREAD_UNLOAD_DELAY_CONFIG,
+    'app-server',
+  ];
 }

@@ -603,6 +603,8 @@ args = ["--stdio"]
       'mcp_servers."imcodes.mem".enabled=false',
       '-c',
       'features.default_mode_request_user_input=true',
+      '-c',
+      'thread_unload_delay_secs=0',
       'app-server',
     ]);
 

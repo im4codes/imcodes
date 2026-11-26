@@ -16,9 +16,20 @@ const appServer = vi.hoisted(() => {
   let threadCounter = 0;
   let turnCounter = 0;
   let unsubscribeHandler:
+    | ((params: Record<string, any> | undefined, record: FakeChild, id: number) => 'auto' | 'delayed-unload' | 'defer' | { error: string })
+    | undefined;
+  let resumeHandler:
     | ((params: Record<string, any> | undefined, record: FakeChild, id: number) => 'auto' | 'defer' | { error: string })
     | undefined;
   const deferredUnsubscribes: Array<() => void> = [];
+  const deferredResumes: Array<() => void> = [];
+
+  const emitUnloadComplete = (record: FakeChild, threadId: string): void => {
+    if (!threadId) return;
+    record.residentThreads.delete(threadId);
+    record.emits({ method: 'thread/status/changed', params: { threadId, status: { type: 'notLoaded' } } });
+    record.emits({ method: 'thread/closed', params: { threadId } });
+  };
 
   const spawn = vi.fn(() => {
     const stdout = new PassThrough();
@@ -50,8 +61,20 @@ const appServer = vi.hoisted(() => {
             });
           } else if (message.method === 'thread/resume') {
             const threadId = String(message.params?.threadId ?? 'thread-1');
-            record.residentThreads.add(threadId);
-            record.emits({ id, result: { thread: { id: threadId } } });
+            const action = resumeHandler?.(message.params, record, id) ?? 'auto';
+            if (action === 'defer') {
+              deferredResumes.push(() => {
+                record.residentThreads.add(threadId);
+                record.emits({ id, result: { thread: { id: threadId } } });
+              });
+            } else if (typeof action === 'object' && 'error' in action) {
+              record.emits({ id, error: { code: -32000, message: action.error } });
+            } else {
+              record.residentThreads.add(threadId);
+              record.emits({ id, result: { thread: { id: threadId } } });
+            }
+          } else if (message.method === 'thread/loaded/list') {
+            record.emits({ id, result: { data: [...record.residentThreads], nextCursor: null } });
           } else if (message.method === 'turn/start') {
             turnCounter += 1;
             record.emits({
@@ -73,13 +96,15 @@ const appServer = vi.hoisted(() => {
             const action = unsubscribeHandler?.(message.params, record, id) ?? 'auto';
             if (action === 'defer') {
               deferredUnsubscribes.push(() => {
-                if (threadId) record.residentThreads.delete(threadId);
+                emitUnloadComplete(record, threadId);
                 record.emits({ id, result: { status: 'unsubscribed' } });
               });
+            } else if (action === 'delayed-unload') {
+              record.emits({ id, result: { status: 'unsubscribed' } });
             } else if (typeof action === 'object' && 'error' in action) {
               record.emits({ id, error: { code: -32000, message: action.error } });
             } else {
-              if (threadId) record.residentThreads.delete(threadId);
+              emitUnloadComplete(record, threadId);
               record.emits({ id, result: { status: 'unsubscribed' } });
             }
           }
@@ -117,17 +142,24 @@ const appServer = vi.hoisted(() => {
   return {
     children,
     deferredUnsubscribes,
+    deferredResumes,
+    emitUnloadComplete,
     spawn,
     execFile,
     setUnsubscribeHandler: (fn: typeof unsubscribeHandler) => {
       unsubscribeHandler = fn;
     },
+    setResumeHandler: (fn: typeof resumeHandler) => {
+      resumeHandler = fn;
+    },
     reset: () => {
       children.length = 0;
       deferredUnsubscribes.length = 0;
+      deferredResumes.length = 0;
       threadCounter = 0;
       turnCounter = 0;
       unsubscribeHandler = undefined;
+      resumeHandler = undefined;
     },
   };
 });
@@ -641,6 +673,201 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
     expect(getSessionState(provider, 's-err')?.loaded).toBe(false);
     expect(getSessionState(provider, 's-timeout')?.loaded).toBe(false);
     expect(child.residentThreads.size).toBe(0);
+
+    await provider.disconnect();
+  });
+
+  it('never unsubscribes a shared durable threadId when a delayed stale resumeThread or ending owner finishes after a successor takes over', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    // Case 1: old state starts resumeThread('thread-shared') which stalls on wire;
+    // session rebind/successor starts on same threadId and completes first.
+    await provider.createSession({ sessionKey: 's-shared', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-shared' });
+    let resumeCount = 0;
+    appServer.setResumeHandler(() => {
+      resumeCount += 1;
+      return resumeCount === 1 ? 'defer' : 'auto';
+    });
+    const staleSend = provider.send('s-shared', 'old-request');
+    await waitForCondition(() => appServer.deferredResumes.length === 1);
+
+    // Rebind the session route (or create a successor sharing thread-shared) and let successor resume & run first.
+    await provider.createSession({ sessionKey: 's-shared-2', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-shared' });
+    await provider.createSession({ sessionKey: 's-shared', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-shared' });
+    const completed: string[] = [];
+    provider.onComplete((sid, msg) => completed.push(`${sid}:${msg.content}`));
+
+    const successorSend = provider.send('s-shared', 'new-request');
+    await waitForCondition(() => Boolean(getSessionState(provider, 's-shared')?.runningTurnId));
+    const successorState = getSessionState(provider, 's-shared')!;
+    const successorTurnId = successorState.runningTurnId!;
+
+    // Now delayed old resumeThread finishes: stale branch MUST NOT send thread/unsubscribe for thread-shared.
+    appServer.deferredResumes.shift()!();
+    await staleSend;
+    await successorSend;
+    await flushIo();
+
+    expect(child.requests.filter((r) => r.method === 'thread/unsubscribe')).toHaveLength(0);
+    expect(child.residentThreads.has('thread-shared')).toBe(true);
+    expect(successorState.loaded).toBe(true);
+
+    // Notifications still route to successor on thread-shared.
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-shared', turnId: successorTurnId, itemId: 'msg-s', delta: 'still-subscribed' },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-shared', turn: { id: successorTurnId, status: 'completed', error: null } },
+    });
+    await waitForCondition(() => completed.length === 1);
+    expect(completed).toEqual(['s-shared:still-subscribed']);
+
+    // Case 2: endSession on one owner of thread-shared must NOT unsubscribe while s-shared-2 still owns thread-shared.
+    await provider.endSession('s-shared');
+    expect(child.requests.filter((r) => r.method === 'thread/unsubscribe')).toHaveLength(0);
+    expect(child.residentThreads.has('thread-shared')).toBe(true);
+
+    // Once the final active owner ends, thread-shared IS unsubscribed cleanly.
+    await provider.endSession('s-shared-2');
+    expect(child.requests.filter((r) => r.method === 'thread/unsubscribe')).toHaveLength(1);
+    expect(child.residentThreads.size).toBe(0);
+
+    await provider.disconnect();
+  });
+
+  it('preserves channel residency and pending unsubscribe serialization across createSession rebinds', async () => {
+    const provider = new CodexSdkProvider({
+      maxLoadedThreads: 1,
+      idleThreadEvictMs: 1_000,
+      idleSweepIntervalMs: 60_000,
+    });
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    await provider.createSession({ sessionKey: 's-rebind', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-rebind', 'init');
+
+    appServer.setUnsubscribeHandler(() => 'defer');
+    await vi.advanceTimersByTimeAsync(1_000);
+    const sweepPromise = provider.sweepIdleThreads('periodic-idle-sweep');
+    await waitForCondition(() => appServer.deferredUnsubscribes.length === 1);
+
+    // Rebind the session route with the same threadId while thread/unsubscribe is in flight.
+    await provider.createSession({ sessionKey: 's-rebind', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-1' });
+
+    const sendPromise = provider.send('s-rebind', 'after-rebind');
+    await flushIo();
+    // Must still serialize behind the pre-rebind thread/unsubscribe before sending thread/resume.
+    expect(child.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(0);
+
+    appServer.deferredUnsubscribes.shift()!();
+    await sweepPromise;
+    await sendPromise;
+
+    const order = child.requests
+      .filter((r) => r.method === 'thread/unsubscribe' || r.method === 'thread/resume' || r.method === 'turn/start')
+      .map((r) => r.method);
+    expect(order.slice(-3)).toEqual(['thread/unsubscribe', 'thread/resume', 'turn/start']);
+
+    // Finish turn and advance idle window again: residency must still be tracked so sweep can evict cleanly.
+    const state = getSessionState(provider, 's-rebind')!;
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: state.threadId, turnId: state.runningTurnId, itemId: 'msg-rebind', delta: 'ok' },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: state.threadId, turn: { id: state.runningTurnId, status: 'completed', error: null } },
+    });
+    await waitForCondition(() => !getSessionState(provider, 's-rebind')?.runningTurnId);
+    await flushIo();
+
+    appServer.setUnsubscribeHandler(undefined);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(1);
+    expect(child.residentThreads.size).toBe(0);
+
+    await provider.disconnect();
+  });
+
+  it('keeps delayed-unload threads counted against LRU and confirmedEvicted=0 until thread/closed or thread/loaded/list confirms unload', async () => {
+    const provider = new CodexSdkProvider({
+      maxLoadedThreads: 2,
+      idleThreadEvictMs: 1_000,
+      idleSweepIntervalMs: 60_000,
+    });
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    await provider.createSession({ sessionKey: 'd1', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 'd1', 'm1');
+    await vi.advanceTimersByTimeAsync(100);
+
+    // Server returns { status: 'unsubscribed' } WITHOUT unloading physically yet (thread remains in thread/loaded/list).
+    appServer.setUnsubscribeHandler(() => 'delayed-unload');
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(0);
+    expect(child.residentThreads.has('thread-1')).toBe(true);
+
+    // Load 2 more sessions (total 3 resident including delayed-unload thread-1 > cap 2).
+    // Once unload completes normally on retry, LRU sweep confirms eviction and enforces cap <= 2.
+    await provider.createSession({ sessionKey: 'd2', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 'd2', 'm2');
+    await vi.advanceTimersByTimeAsync(100);
+    appServer.setUnsubscribeHandler(undefined);
+    await provider.createSession({ sessionKey: 'd3', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 'd3', 'm3');
+    await flushIo();
+
+    expect(child.residentThreads.has('thread-1')).toBe(false);
+    expect(child.residentThreads.size).toBeLessThanOrEqual(2);
+
+    await provider.disconnect();
+  });
+
+  it('retries thread/resume boundedly when app-server reports thread is closing and preserves durable threadId', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    await provider.createSession({ sessionKey: 's-closing', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-closing-7' });
+
+    let attempts = 0;
+    appServer.setResumeHandler(() => {
+      attempts += 1;
+      if (attempts === 1) return { error: 'thread thread-closing-7 is closing' };
+      return 'auto';
+    });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    const sendPromise = provider.send('s-closing', 'hello-closing');
+    await waitForCondition(() => attempts === 1);
+
+    // Emit thread/closed -> retry wakes immediately and succeeds on the SAME durable threadId (never spawns thread/start).
+    appServer.emitUnloadComplete(child, 'thread-closing-7');
+    await sendPromise;
+
+    expect(attempts).toBe(2);
+    expect(child.requests.filter((r) => r.method === 'thread/start')).toHaveLength(0);
+    expect(child.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(2);
+    const state = getSessionState(provider, 's-closing')!;
+    expect(state.threadId).toBe('thread-closing-7');
+
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-closing-7', turnId: state.runningTurnId, itemId: 'msg-c', delta: 'resumed-ok' },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-closing-7', turn: { id: state.runningTurnId, status: 'completed', error: null } },
+    });
+    await waitForCondition(() => completed.length === 1);
+    expect(completed).toEqual(['resumed-ok']);
 
     await provider.disconnect();
   });
