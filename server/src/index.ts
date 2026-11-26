@@ -941,7 +941,7 @@ async function authenticateUserWsTicketUpgrade(
   url: URL,
   env: Env,
   expectedTicketType: string,
-): Promise<string | null> {
+): Promise<{ userId: string; sessionsValidAfter: number } | null> {
   const origin = req.headers['origin'] ?? '';
   if (!validateOrigin(origin, env)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -966,6 +966,7 @@ async function authenticateUserWsTicketUpgrade(
     socket.destroy();
     return null;
   }
+  let sessionsValidAfter = 0;
   try {
     const access = await loadUserAccess(env.DB, payload.sub);
     const decision = evaluateUserAccess(
@@ -978,12 +979,13 @@ async function authenticateUserWsTicketUpgrade(
       socket.destroy();
       return null;
     }
+    sessionsValidAfter = access?.sessionsValidAfter ?? 0;
   } catch {
     socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
     socket.destroy();
     return null;
   }
-  return payload.sub;
+  return { userId: payload.sub, sessionsValidAfter };
 }
 
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
@@ -1006,19 +1008,19 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     }
 
     if (url.pathname === GLOBAL_TASK_WS_PATH) {
-      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, GLOBAL_TASK_WS_TICKET_TYPE);
-      if (!userId) return;
+      const wsAuth = await authenticateUserWsTicketUpgrade(req, socket, url, env, GLOBAL_TASK_WS_TICKET_TYPE);
+      if (!wsAuth) return;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        void globalTaskHub.handleConnection(ws, userId, env.DB);
+        void globalTaskHub.handleConnection(ws, wsAuth.userId, env.DB, wsAuth.sessionsValidAfter);
       });
       return;
     }
 
     if (url.pathname === REMOTE_VOICE_WS_PATH) {
-      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, REMOTE_VOICE_WS_TICKET_TYPE);
-      if (!userId) return;
+      const wsAuth = await authenticateUserWsTicketUpgrade(req, socket, url, env, REMOTE_VOICE_WS_TICKET_TYPE);
+      if (!wsAuth) return;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        remoteVoiceHub.handleConnection(ws, userId, env.DB, env);
+        remoteVoiceHub.handleConnection(ws, wsAuth.userId, env.DB, env, wsAuth.sessionsValidAfter);
       });
       return;
     }
@@ -1188,6 +1190,22 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
       }
 
+      let sessionsValidAfter = 0;
+      try {
+        const access = await loadUserAccess(env.DB, payload.sub as string);
+        const decision = evaluateUserAccess(
+          access,
+          typeof payload.iat === 'number' ? payload.iat : undefined,
+        );
+        const epochStale = typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
+        if (!decision.ok || epochStale) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
+        }
+        sessionsValidAfter = access?.sessionsValidAfter ?? 0;
+      } catch {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); socket.destroy(); return;
+      }
+
       let websocketAccess: Awaited<ReturnType<typeof resolveServerWebSocketAccess>>;
       try {
         websocketAccess = await resolveServerWebSocketAccess(env.DB, serverId, payload.sub as string);
@@ -1204,6 +1222,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           env.DB,
           isMobile,
           websocketAccess?.kind === 'controlled',
+          sessionsValidAfter,
         );
       });
     }

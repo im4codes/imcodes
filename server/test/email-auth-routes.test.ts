@@ -3,13 +3,16 @@
  * email-verified password change, and forgot-password reset routes.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { hashPassword } from '../src/security/crypto.js';
+import { WsBridge } from '../src/ws/bridge.js';
 import { AUTH_ERROR_CODES } from '../../shared/auth-error-codes.js';
+import { ACCOUNT_WS_CLOSE_CODE } from '../../shared/user-status.js';
 import { COOKIE_CSRF, HEADER_CSRF } from '../../shared/cookie-names.js';
 
 interface MemUser {
@@ -76,6 +79,9 @@ function makeEmailAuthMemDb() {
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
         const s = getS();
         const q = normalize(sql);
+        if (q.includes('pg_advisory_xact_lock')) {
+          return { pg_advisory_xact_lock: '' } as T;
+        }
         if (q.includes('from users where id = $1')) {
           return (s.users.get(String(params[0])) ?? null) as T | null;
         }
@@ -689,6 +695,40 @@ describe('email auth routes', () => {
     }, env);
     expect(pwChangeOk.status).toBe(200);
 
+    // Re-binding a verified email is refused (both send-code and /email/bind)
+    const rebindSend = await app.request('/api/auth/email/send-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.apiKey}` },
+      body: JSON.stringify({ email: 'another@example.com', purpose: 'bind_email' }),
+    }, env);
+    expect(rebindSend.status).toBe(409);
+    expect((await rebindSend.json()).error).toBe(AUTH_ERROR_CODES.EMAIL_ALREADY_VERIFIED);
+
+    const rebindSubmit = await app.request('/api/auth/email/bind', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.apiKey}` },
+      body: JSON.stringify({ email: 'another@example.com', code: '123456' }),
+    }, env);
+    expect(rebindSubmit.status).toBe(409);
+    expect((await rebindSubmit.json()).error).toBe(AUTH_ERROR_CODES.EMAIL_ALREADY_VERIFIED);
+
+    // Attach pre-reset WsBridge browser + daemon sockets to verify eviction preserves daemon
+    const bridge = WsBridge.get('srv-unit-test');
+    class MiniSocket extends EventEmitter {
+      readyState = 1;
+      closed: { code?: number; reason?: string } | null = null;
+      sent: unknown[] = [];
+      send(data: unknown) { this.sent.push(data); }
+      close(code?: number, reason?: string) { this.closed = { code, reason }; this.readyState = 3; this.emit('close', code, reason); }
+      ping() {}
+    }
+    const oldBrowser = new MiniSocket();
+    const daemonWs = new MiniSocket();
+    (bridge as unknown as { daemonWs: unknown; authenticated: boolean; daemonOwnerUserId: string }).daemonWs = daemonWs;
+    (bridge as unknown as { authenticated: boolean }).authenticated = true;
+    (bridge as unknown as { daemonOwnerUserId: string }).daemonOwnerUserId = 'u-legacy';
+    bridge.handleBrowserConnection(oldBrowser as never, 'u-legacy', mem.db, false, false, 0);
+
     // Forgot-password reset on legacy@example.com revokes active refresh tokens and sets new password
     const resetSend = await app.request('/api/auth/email/send-code', {
       method: 'POST',
@@ -696,7 +736,23 @@ describe('email auth routes', () => {
       body: JSON.stringify({ email: 'legacy@example.com', purpose: 'password_reset' }),
     }, env);
     expect(resetSend.status).toBe(200);
+    await vi.waitFor(() => expect(sentEmails).toHaveLength(3));
     const resetOtp = sentEmails[2].otp!;
+
+    // Wrong user ownership on reset OTP is rejected cleanly
+    mem.getState().codes.forEach((c) => {
+      if (c.purpose === 'password_reset' && c.consumed_at === null) c.user_id = 'different-user';
+    });
+    const wrongOwnerTry = await app.request('/api/auth/password/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'legacy@example.com', code: resetOtp, newPassword: 'ResetPass3!' }),
+    }, env);
+    expect(wrongOwnerTry.status).toBe(400);
+    expect((await wrongOwnerTry.json()).error).toBe(AUTH_ERROR_CODES.EMAIL_CODE_INVALID);
+    mem.getState().codes.forEach((c) => {
+      if (c.purpose === 'password_reset' && c.consumed_at === null) c.user_id = 'u-legacy';
+    });
 
     // Expired OTP is rejected with EMAIL_CODE_EXPIRED
     const liveResetRow = [...mem.getState().codes.values()].find((c) => c.purpose === 'password_reset' && c.consumed_at === null)!;
@@ -723,6 +779,7 @@ describe('email auth routes', () => {
       body: JSON.stringify({ email: 'legacy@example.com', purpose: 'password_reset' }),
     }, env);
     expect(resetSend2.status).toBe(200);
+    await vi.waitFor(() => expect(sentEmails).toHaveLength(4));
     const resetOtp2 = sentEmails[3].otp!;
 
     const resetOk = await app.request('/api/auth/password/reset', {
@@ -731,10 +788,34 @@ describe('email auth routes', () => {
       body: JSON.stringify({ email: 'legacy@example.com', code: resetOtp2, newPassword: 'ResetPass3!' }),
     }, env);
     expect(resetOk.status).toBe(200);
+    expect(oldBrowser.closed).toEqual({ code: ACCOUNT_WS_CLOSE_CODE, reason: 'session_revoked' });
+    expect(daemonWs.closed).toBeNull();
+    (bridge as unknown as { daemonWs: unknown; authenticated: boolean }).daemonWs = null;
+    (bridge as unknown as { authenticated: boolean }).authenticated = false;
     expect(mem.getState().users.get('u-legacy')!.sessions_valid_after).toBeGreaterThan(0);
     for (const rt of mem.getState().refreshTokens.values()) {
       expect(rt.used_at).not.toBeNull();
     }
+
+    // Verified-email login is denied unless EMAIL_AUTH_ENABLED=true AND provider configured (username still works)
+    const emailLoginOff = await buildApp(makeEnv(mem.db, { EMAIL_AUTH_ENABLED: 'false' })).request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'legacy@example.com', password: 'ResetPass3!' }),
+    }, makeEnv(mem.db, { EMAIL_AUTH_ENABLED: 'false' }));
+    expect(emailLoginOff.status).toBe(401);
+
+    const noCredsEnv = makeEnv(mem.db, { EMAIL_AUTH_ENABLED: 'true', EMAIL_PROVIDER: '', AWS_SES_ACCESS_KEY_ID: '', AWS_SES_SECRET_ACCESS_KEY: '' });
+    expect((await buildApp(noCredsEnv).request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'legacy@example.com', password: 'ResetPass3!' }),
+    }, noCredsEnv)).status).toBe(401);
+    expect((await buildApp(noCredsEnv).request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'legacy', password: 'ResetPass3!' }),
+    }, noCredsEnv)).status).toBe(200);
 
     const oldPwLogin = await app.request('/api/auth/password/login', {
       method: 'POST',
@@ -749,6 +830,43 @@ describe('email auth routes', () => {
       body: JSON.stringify({ username: 'legacy@example.com', password: 'ResetPass3!' }),
     }, env);
     expect(newPwLogin.status).toBe(200);
+  });
+
+  it('keeps password_reset send-code response & cooldown identical on provider errors and maps 23505 unique constraints cleanly', async () => {
+    const env = makeEnv(mem.db);
+    const app = buildApp(env);
+
+    mem.getState().users.set('u-err', {
+      id: 'u-err',
+      created_at: Date.now(),
+      username: 'erruser',
+      password_hash: await hashPassword('Password1!'),
+      display_name: 'Err User',
+      email: 'err@example.com',
+      email_verified_at: Date.now(),
+      password_must_change: false,
+      is_admin: false,
+      status: 'active',
+      sessions_valid_after: 0,
+    });
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('SES error', { status: 500 })));
+    const knownErrRes = await app.request('/api/auth/email/send-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'err@example.com', purpose: 'password_reset' }),
+    }, env);
+    expect(knownErrRes.status).toBe(200);
+    expect(await knownErrRes.json()).toEqual({ ok: true });
+
+    // Cooldown still persisted even when background provider delivery rejected
+    const knownCooldown = await app.request('/api/auth/email/send-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'err@example.com', purpose: 'password_reset' }),
+    }, env);
+    expect(knownCooldown.status).toBe(429);
+    expect((await knownCooldown.json()).error).toBe(AUTH_ERROR_CODES.EMAIL_CODE_RATE_LIMITED);
   });
 
   it('includes valid idempotent PostgreSQL DDL in migration 115_user_email_auth.sql', () => {

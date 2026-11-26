@@ -371,6 +371,7 @@ describe('SettingsPage', () => {
       expect(screen.getByText('settings.email_bound_success')).toBeDefined();
       expect(screen.getByText('alice@example.com')).toBeDefined();
     });
+    expect(screen.queryByRole('button', { name: 'settings.change_email_btn' })).toBeNull();
 
     // Now Change Password displays verification code input and passes 3rd emailCode argument
     fireEvent.input(screen.getByPlaceholderText('settings.old_password'), { target: { value: 'OldPass1!' } });

@@ -325,7 +325,6 @@ export function SettingsPage({
   const [emailAuthEnabled, setEmailAuthEnabled] = useState(emailAuthEnabledProp === true);
   const [boundEmail, setBoundEmail] = useState<string | null>(userEmailProp ?? null);
   const [boundEmailVerified, setBoundEmailVerified] = useState(emailVerifiedProp === true);
-  const [editingEmail, setEditingEmail] = useState(false);
   const [bindEmailInput, setBindEmailInput] = useState('');
   const [bindEmailCode, setBindEmailCode] = useState('');
   const [bindEmailSending, setBindEmailSending] = useState(false);
@@ -739,7 +738,6 @@ export function SettingsPage({
       setBoundEmailVerified(Boolean(res.email_verified));
       setBindEmailInput('');
       setBindEmailCode('');
-      setEditingEmail(false);
       setBindEmailMsg({ type: 'ok', text: t('settings.email_bound_success') });
     } catch (err) {
       setBindEmailMsg({ type: 'err', text: settingsAuthErrorMessage(err, 'settings.email_code_invalid') });
@@ -2037,7 +2035,7 @@ export function SettingsPage({
                   <h2 class="settings-card-heading">
                     {t('settings.email_title')}
                   </h2>
-                  {boundEmail && boundEmailVerified && !editingEmail ? (
+                  {boundEmail && boundEmailVerified ? (
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
                         <span style={{ color: '#e2e8f0', fontSize: '14px', overflowWrap: 'anywhere' }}>{boundEmail}</span>
@@ -2055,18 +2053,6 @@ export function SettingsPage({
                           {t('settings.email_verified_badge')}
                         </span>
                       </div>
-                      <button
-                        type="button"
-                        class="settings-btn-secondary"
-                        onClick={() => {
-                          setEditingEmail(true);
-                          setBindEmailMsg(null);
-                          setBindEmailInput('');
-                          setBindEmailCode('');
-                        }}
-                      >
-                        {t('settings.change_email_btn')}
-                      </button>
                     </div>
                   ) : (
                     <>
@@ -2113,18 +2099,6 @@ export function SettingsPage({
                         >
                           {bindEmailSaving ? t('common.loading') : t('settings.bind_email_btn')}
                         </button>
-                        {editingEmail && (
-                          <button
-                            type="button"
-                            class="settings-btn-secondary"
-                            onClick={() => {
-                              setEditingEmail(false);
-                              setBindEmailMsg(null);
-                            }}
-                          >
-                            {t('common.cancel')}
-                          </button>
-                        )}
                       </div>
                     </>
                   )}

@@ -2328,6 +2328,7 @@
     "email_code_expired": "驗證碼已過期，請重新發送。",
     "email_code_rate_limited": "操作過於頻繁，請於 {{seconds}} 秒後再試。",
     "email_not_verified": "請先綁定並驗證電子郵件。",
+    "email_already_verified": "此帳戶已綁定並驗證電子郵件。",
     "email_send_failed": "發送驗證郵件失敗。",
     "privacy_policy": "隱私權政策",
     "terms_of_service": "服務條款",

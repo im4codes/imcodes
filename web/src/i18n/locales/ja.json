@@ -2327,6 +2327,7 @@
     "email_code_expired": "確認コードの有効期限が切れました。再送信してください。",
     "email_code_rate_limited": "次のコードをリクエストするまで {{seconds}} 秒お待ちください。",
     "email_not_verified": "先にメールアドレスを連携・認証してください。",
+    "email_already_verified": "このアカウントには既に認証済みメールアドレスが登録されています。",
     "email_send_failed": "確認メールの送信に失敗しました。",
     "privacy_policy": "プライバシーポリシー",
     "terms_of_service": "利用規約",

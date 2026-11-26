@@ -2327,6 +2327,7 @@
     "email_code_expired": "인증 코드가 만료되었습니다. 새 코드를 요청하세요.",
     "email_code_rate_limited": "새 코드를 요청하려면 {{seconds}}초 기다리세요.",
     "email_not_verified": "먼저 이메일 주소를 연동하고 인증하세요.",
+    "email_already_verified": "이 계정에는 이미 인증된 이메일 주소가 등록되어 있습니다.",
     "email_send_failed": "인증 이메일 전송에 실패했습니다.",
     "privacy_policy": "개인정보 처리방침",
     "terms_of_service": "이용약관",

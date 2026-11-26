@@ -9,7 +9,7 @@
  */
 import type { Database } from '../db/client.js';
 import { ACCOUNT_CONNECTION_WATCH_INTERVAL_MS, USER_STATUS, userStatusDenialCode } from '../../../shared/user-status.js';
-import { findInactiveUsers } from '../security/user-status.js';
+import { findInactiveUsers, loadUserSessionValidAfters } from '../security/user-status.js';
 import logger from '../util/logger.js';
 import { WsBridge } from './bridge.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
@@ -21,7 +21,28 @@ export interface AccountWatchResult {
   daemons: number;
 }
 
-/** Close the live connections of every connected user whose account is not active. Idempotent; safe to call from the disable route. */
+/**
+ * Immediately close live browser sockets for a user whose session epoch advanced (e.g. password reset/change),
+ * while preserving independent daemon connections. Other replicas learn on the next `closeConnectionsOfInactiveUsers` tick.
+ */
+export function evictStaleUserBrowserSockets(
+  userId: string,
+  sessionsValidAfter: number,
+  bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
+  reason = 'session_revoked',
+): number {
+  if (!userId || sessionsValidAfter <= 0) return 0;
+  const epochMap = new Map([[userId, sessionsValidAfter]]);
+  let closed = 0;
+  closed += globalTaskHub.closeBrowserSocketsForSessionReset(epochMap, reason);
+  closed += remoteVoiceHub.closeBrowserSocketsForSessionReset(epochMap, reason);
+  for (const bridge of bridges) {
+    closed += bridge.closeBrowserSocketsForSessionReset(epochMap, reason);
+  }
+  return closed;
+}
+
+/** Close the live connections of every connected user whose account is not active, and stale browser sockets after session-ending events. Idempotent. */
 export async function closeConnectionsOfInactiveUsers(
   db: Database,
   bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
@@ -32,17 +53,34 @@ export async function closeConnectionsOfInactiveUsers(
   globalTaskHub.collectLiveUserIds(live);
   remoteVoiceHub.collectLiveUserIds(live);
   if (live.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
-  const inactive = await findInactiveUsers(db, [...live]);
-  if (inactive.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
+  const liveIds = [...live];
+  const inactive = await findInactiveUsers(db, liveIds);
   const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
-  result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
-  result.browserSockets += remoteVoiceHub.closeInactiveUserSockets(inactive);
-  for (const bridge of all) {
-    const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
-    result.browserSockets += closed.browserSockets;
-    if (closed.daemon) result.daemons += 1;
+  if (inactive.size > 0) {
+    result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
+    result.browserSockets += remoteVoiceHub.closeInactiveUserSockets(inactive);
+    for (const bridge of all) {
+      const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
+      result.browserSockets += closed.browserSockets;
+      if (closed.daemon) result.daemons += 1;
+    }
+    logger.warn({ ...result }, 'closed live connections of accounts that may no longer act');
   }
-  logger.warn({ ...result }, 'closed live connections of accounts that may no longer act');
+
+  const activeLiveIds = liveIds.filter((id) => !inactive.has(id));
+  const sessionValidAfters = await loadUserSessionValidAfters(db, activeLiveIds);
+  if (sessionValidAfters.size > 0) {
+    let evicted = 0;
+    evicted += globalTaskHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+    evicted += remoteVoiceHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+    for (const bridge of all) {
+      evicted += bridge.closeBrowserSocketsForSessionReset(sessionValidAfters);
+    }
+    if (evicted > 0) {
+      result.browserSockets += evicted;
+      logger.warn({ evictedBrowserSockets: evicted }, 'closed stale browser connections after session epoch advance');
+    }
+  }
   return result;
 }
 

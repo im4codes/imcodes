@@ -27,6 +27,7 @@ interface ClientSubscription {
   ws: WebSocket;
   userId: string;
   db: Database;
+  sessionEpoch: number;
   serverIds: Set<string>;
   mutedServerIds: Set<string>;
 }
@@ -191,12 +192,13 @@ export class GlobalTaskHub {
     this.reconnectTimer.unref?.();
   }
 
-  async handleConnection(ws: WebSocket, userId: string, db: Database): Promise<void> {
+  async handleConnection(ws: WebSocket, userId: string, db: Database, sessionEpoch = 0): Promise<void> {
     if (!this.db) this.db = db;
     const sub: ClientSubscription = {
       ws,
       userId,
       db,
+      sessionEpoch,
       serverIds: new Set<string>(),
       mutedServerIds: new Set<string>(),
     };
@@ -287,6 +289,23 @@ export class GlobalTaskHub {
       this.clients.delete(ws);
       closed += 1;
       try { ws.close(1008, 'account_inactive'); } catch { /* ignore */ }
+    }
+    return closed;
+  }
+
+  /**
+   * Close Global Task Mode sockets minted before `userValidAfter.get(userId)` (e.g. password reset/change).
+   */
+  closeBrowserSocketsForSessionReset(userValidAfter: ReadonlyMap<string, number>, reason = 'session_revoked'): number {
+    if (userValidAfter.size === 0) return 0;
+    let closed = 0;
+    for (const [ws, sub] of [...this.clients]) {
+      const minValidAfter = userValidAfter.get(sub.userId);
+      if (minValidAfter === undefined || minValidAfter <= 0) continue;
+      if (sub.sessionEpoch >= minValidAfter) continue;
+      this.clients.delete(ws);
+      closed += 1;
+      try { ws.close(4003, reason); } catch { /* ignore */ }
     }
     return closed;
   }

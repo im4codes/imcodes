@@ -20,6 +20,7 @@ export const AUTH_ERROR_CODES = {
   EMAIL_CODE_EXPIRED: 'email_code_expired',
   EMAIL_CODE_RATE_LIMITED: 'email_code_rate_limited',
   EMAIL_NOT_VERIFIED: 'email_not_verified',
+  EMAIL_ALREADY_VERIFIED: 'email_already_verified',
 } as const;
 
 export type AuthErrorCode = (typeof AUTH_ERROR_CODES)[keyof typeof AUTH_ERROR_CODES];

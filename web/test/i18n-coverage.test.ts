@@ -1285,6 +1285,7 @@ describe('generic i18n coverage guard', () => {
       'settings.email_code_expired',
       'settings.email_code_rate_limited',
       'settings.email_not_verified',
+      'settings.email_already_verified',
       'settings.email_send_failed',
     ];
     for (const locale of SUPPORTED_LOCALES) {

@@ -21,8 +21,9 @@ import {
   DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
   parseDesktopSetupCallbackUrl,
 } from '../../../shared/desktop-setup-auth.js';
-import { alignedSessionIssuedAt, isUserActive, nextSessionValidAfter } from '../security/user-status.js';
+import { alignedSessionIssuedAt, evaluateUserAccess, isUserActive, loadUserAccess, nextSessionValidAfter } from '../security/user-status.js';
 import { isUserStatusActive } from '../../../shared/user-status.js';
+import { evictStaleUserBrowserSockets } from '../ws/account-watch.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
@@ -118,6 +119,32 @@ function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
     status: user.status,
     has_password: !!user.password_hash,
   };
+}
+
+function mapPgUniqueConstraintError(err: unknown): (typeof AUTH_ERROR_CODES)[keyof typeof AUTH_ERROR_CODES] | null {
+  if (!err || typeof err !== 'object' || !('code' in err) || (err as { code?: unknown }).code !== '23505') {
+    return null;
+  }
+  const constraint = 'constraint' in err && typeof err.constraint === 'string' ? err.constraint.toLowerCase() : '';
+  const detail = 'detail' in err && typeof err.detail === 'string' ? err.detail.toLowerCase() : '';
+  const message = 'message' in err && typeof err.message === 'string' ? err.message.toLowerCase() : '';
+  if (
+    constraint === 'idx_users_email_lower'
+    || constraint.includes('email')
+    || detail.includes('email')
+    || message.includes('idx_users_email_lower')
+  ) {
+    return AUTH_ERROR_CODES.EMAIL_TAKEN;
+  }
+  if (
+    constraint === 'users_username_key'
+    || constraint.includes('username')
+    || detail.includes('(username)')
+    || message.includes('users_username_key')
+  ) {
+    return AUTH_ERROR_CODES.USERNAME_TAKEN;
+  }
+  return null;
 }
 
 function getAuthRequestMetadata(c: AnyAuthContext): AuthRequestMetadata {
@@ -410,20 +437,34 @@ authRoutes.delete('/user/me/keys/:keyId', async (c) => {
 const wsTicketSchema = z.object({ serverId: z.string() });
 
 authRoutes.post('/ws-ticket', async (c) => {
-  const userId = await resolveUserId(c);
+  const resolution = await resolveAuthOutcome(c);
+  const userId = resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
   const body = await c.req.json().catch(() => null);
   const parsed = wsTicketSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
+  const userAccess = await loadUserAccess(c.env.DB, userId);
+  const accessDecision = evaluateUserAccess(userAccess, resolution.auth?.issuedAt);
+  if (!accessDecision.ok) return c.json({ error: accessDecision.code }, 403);
+
   // Check server access
   const access = await resolveServerWebSocketAccess(c.env.DB, parsed.data.serverId, userId);
   if (!access) return c.json({ error: 'forbidden' }, 403);
 
+  const nowMs = Date.now();
+  const validAfter = userAccess?.sessionsValidAfter ?? 0;
   const jti = randomHex(16);
   const ticket = signJwt(
-    { sub: userId, type: 'ws-ticket', sid: parsed.data.serverId, jti },
+    {
+      sub: userId,
+      type: 'ws-ticket',
+      sid: parsed.data.serverId,
+      jti,
+      iat: alignedSessionIssuedAt(validAfter, nowMs),
+      sva: validAfter,
+    },
     c.env.JWT_SIGNING_KEY,
     15, // 15 seconds
   );
@@ -794,32 +835,18 @@ authRoutes.post('/email/send-code', async (c) => {
     }
     const authedUserId = await resolveUserId(c);
     if (!authedUserId) return c.json({ error: 'unauthorized' }, 401);
-    const user = await getUserById(c.env.DB, authedUserId);
-    if (!user) return c.json({ error: 'unauthorized' }, 401);
-    if (!isUserStatusActive(user.status)) {
-      return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
-    }
 
     userId = authedUserId;
     if (purpose === EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE) {
-      if (!user.email || !user.email_verified_at) {
-        return c.json({ error: AUTH_ERROR_CODES.EMAIL_NOT_VERIFIED }, 400);
+      if (parsed.data.email !== undefined && !isValidEmail(parsed.data.email)) {
+        return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
       }
-      if (parsed.data.email !== undefined) {
-        if (!isValidEmail(parsed.data.email) || normalizeEmail(parsed.data.email) !== normalizeEmail(user.email)) {
-          return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
-        }
-      }
-      targetEmail = normalizeEmail(user.email);
+      targetEmail = parsed.data.email !== undefined ? normalizeEmail(parsed.data.email) : '';
     } else {
       if (!isValidEmail(parsed.data.email)) {
         return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
       }
       targetEmail = normalizeEmail(parsed.data.email);
-      const existing = await getUserByEmail(c.env.DB, targetEmail);
-      if (existing && existing.id !== authedUserId) {
-        return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
-      }
     }
     lockoutIdentity = `email-send:${purpose}:${authedUserId}`;
   } else {
@@ -832,39 +859,30 @@ authRoutes.post('/email/send-code', async (c) => {
       if (regEnabled === 'false') {
         return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
       }
-      const existing = await getUserByEmail(c.env.DB, targetEmail);
-      if (existing) {
-        return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
-      }
-    } else {
-      const existing = await getUserByVerifiedEmail(c.env.DB, targetEmail);
-      if (!existing || !isUserStatusActive(existing.status)) {
-        suppressSendForAntiEnumeration = true;
-      } else {
-        userId = existing.id;
-      }
     }
     lockoutIdentity = `email-send:${purpose}:${targetEmail}`;
   }
 
-  const lockout = await checkAuthLockout(c.env.DB, lockoutIdentity);
-  if (lockout.locked) {
-    return c.json({
-      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
-      retryAfterMs: lockout.lockedUntil ? lockout.lockedUntil - Date.now() : 0,
-    }, 429);
-  }
+  const isResetPurpose = purpose === EMAIL_AUTH_PURPOSE.PASSWORD_RESET;
 
   try {
     const issued = await issueEmailVerificationCode(c.env.DB, c.env, {
-      email: targetEmail,
+      email: targetEmail || undefined,
       purpose,
       userId,
       lang,
       suppressSendForAntiEnumeration,
+      lookupResetTarget: isResetPurpose,
+      asyncDelivery: isResetPurpose,
+      lockoutIdentity,
     });
     if (!issued.ok) {
-      return c.json({ error: issued.error, retryAfterMs: issued.retryAfterMs }, 429);
+      return c.json(
+        issued.retryAfterMs !== undefined
+          ? { error: issued.error, retryAfterMs: issued.retryAfterMs }
+          : { error: issued.error },
+        issued.status,
+      );
     }
   } catch (err) {
     if (err instanceof EmailServiceError) {
@@ -882,7 +900,7 @@ const bindEmailSchema = z.object({
   code: z.string(),
 });
 
-// POST /api/auth/email/bind — bind or replace verified email for logged-in user
+// POST /api/auth/email/bind — initial verified-email binding for pre-email accounts
 authRoutes.post('/email/bind', async (c) => {
   if (!isEmailAuthEnabled(c.env)) {
     return c.json({ error: AUTH_ERROR_CODES.EMAIL_AUTH_DISABLED }, 403);
@@ -912,47 +930,61 @@ authRoutes.post('/email/bind', async (c) => {
   const normalizedEmail = normalizeEmail(parsed.data.email);
   const code = parsed.data.code.trim();
 
-  const bindTx = await withTransaction(c.env.DB, async (tx) => {
-    const lockedUser = await tx.queryOne<{ id: string; status: string }>(
-      'SELECT id, status FROM users WHERE id = $1 FOR UPDATE',
-      [userId],
-    );
-    if (!lockedUser) {
-      return { ok: false as const, status: 404 as const, error: 'not_found' };
-    }
-    if (!isUserStatusActive(lockedUser.status)) {
-      return {
-        ok: false as const,
-        status: 403 as const,
-        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
-      };
-    }
-    const existing = await tx.queryOne<{ id: string }>(
-      'SELECT id FROM users WHERE LOWER(email) = $1',
-      [normalizedEmail],
-    );
-    if (existing && existing.id !== userId) {
-      return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
-    }
+  let bindTx:
+    | { ok: true }
+    | { ok: false; status: 400 | 403 | 404 | 409; error: string; recordFailure?: boolean };
+  try {
+    bindTx = await withTransaction(c.env.DB, async (tx) => {
+      const lockedUser = await tx.queryOne<{ id: string; status: string; email_verified_at: string | number | null }>(
+        'SELECT id, status, email_verified_at FROM users WHERE id = $1 FOR UPDATE',
+        [userId],
+      );
+      if (!lockedUser) {
+        return { ok: false as const, status: 404 as const, error: 'not_found' };
+      }
+      if (!isUserStatusActive(lockedUser.status)) {
+        return {
+          ok: false as const,
+          status: 403 as const,
+          error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+        };
+      }
+      if (lockedUser.email_verified_at) {
+        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_ALREADY_VERIFIED };
+      }
+      const existing = await tx.queryOne<{ id: string }>(
+        'SELECT id FROM users WHERE LOWER(email) = $1',
+        [normalizedEmail],
+      );
+      if (existing && existing.id !== userId) {
+        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
+      }
 
-    const txNow = Date.now();
-    const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
-      email: normalizedEmail,
-      purpose: EMAIL_AUTH_PURPOSE.BIND_EMAIL,
-      code,
-      userId,
-      now: txNow,
+      const txNow = Date.now();
+      const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+        email: normalizedEmail,
+        purpose: EMAIL_AUTH_PURPOSE.BIND_EMAIL,
+        code,
+        userId,
+        now: txNow,
+      });
+      if (!consumed.ok) {
+        return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
+      }
+
+      await tx.execute(
+        'UPDATE users SET email = $1, email_verified_at = $2 WHERE id = $3',
+        [normalizedEmail, txNow, userId],
+      );
+      return { ok: true as const };
     });
-    if (!consumed.ok) {
-      return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
+  } catch (err) {
+    const conflict = mapPgUniqueConstraintError(err);
+    if (conflict === AUTH_ERROR_CODES.EMAIL_TAKEN) {
+      return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
     }
-
-    await tx.execute(
-      'UPDATE users SET email = $1, email_verified_at = $2 WHERE id = $3',
-      [normalizedEmail, txNow, userId],
-    );
-    return { ok: true as const };
-  });
+    throw err;
+  }
 
   if (!bindTx.ok) {
     if ('recordFailure' in bindTx && bindTx.recordFailure) {
@@ -1018,7 +1050,7 @@ authRoutes.post('/password/register', async (c) => {
     normalizedEmailCode = emailCode.trim();
   }
 
-  // Check username availability
+  // Fast pre-check before scrypt hashing; unique constraints under PG transaction remain authoritative on races.
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser) {
     return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
@@ -1038,50 +1070,69 @@ authRoutes.post('/password/register', async (c) => {
   const effectiveDisplayName = displayName?.trim() || normalizedUsername;
 
   if (emailAuthEnabled && normalizedEmail && normalizedEmailCode) {
-    const regTx = await withTransaction(c.env.DB, async (tx) => {
-      const txExistingUsername = await getUserByUsername(tx, normalizedUsername);
-      if (txExistingUsername) {
-        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.USERNAME_TAKEN };
-      }
-      const txExistingEmail = await getUserByEmail(tx, normalizedEmail);
-      if (txExistingEmail) {
-        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
-      }
+    let regTx: { ok: true } | { ok: false; status: 400 | 409; error: string };
+    try {
+      regTx = await withTransaction(c.env.DB, async (tx) => {
+        const txExistingUsername = await getUserByUsername(tx, normalizedUsername);
+        if (txExistingUsername) {
+          return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.USERNAME_TAKEN };
+        }
+        const txExistingEmail = await getUserByEmail(tx, normalizedEmail);
+        if (txExistingEmail) {
+          return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
+        }
 
-      const txNow = Date.now();
-      const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
-        email: normalizedEmail,
-        purpose: EMAIL_AUTH_PURPOSE.REGISTER,
-        code: normalizedEmailCode,
-        now: txNow,
+        const txNow = Date.now();
+        const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+          email: normalizedEmail,
+          purpose: EMAIL_AUTH_PURPOSE.REGISTER,
+          code: normalizedEmailCode,
+          now: txNow,
+        });
+        if (!consumed.ok) {
+          return { ok: false as const, status: 400 as const, error: consumed.error };
+        }
+
+        await tx.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, txNow]);
+        await tx.execute(
+          'UPDATE users SET username = $1, password_hash = $2, display_name = $3, email = $4, email_verified_at = $5 WHERE id = $6',
+          [normalizedUsername, passwordHash, effectiveDisplayName, normalizedEmail, txNow, userId],
+        );
+        if (isPending) {
+          await tx.execute('UPDATE users SET status = $1 WHERE id = $2', ['pending', userId]);
+        }
+        return { ok: true as const };
       });
-      if (!consumed.ok) {
-        return { ok: false as const, status: 400 as const, error: consumed.error };
+    } catch (err) {
+      const conflict = mapPgUniqueConstraintError(err);
+      if (conflict) {
+        return c.json({ error: conflict }, 409);
       }
-
-      await tx.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, txNow]);
-      await tx.execute(
-        'UPDATE users SET username = $1, password_hash = $2, display_name = $3, email = $4, email_verified_at = $5 WHERE id = $6',
-        [normalizedUsername, passwordHash, effectiveDisplayName, normalizedEmail, txNow, userId],
-      );
-      if (isPending) {
-        await tx.execute('UPDATE users SET status = $1 WHERE id = $2', ['pending', userId]);
-      }
-      return { ok: true as const };
-    });
+      throw err;
+    }
 
     if (!regTx.ok) {
       return c.json({ error: regTx.error }, regTx.status);
     }
   } else {
     // Legacy flow when EMAIL_AUTH_ENABLED is off
-    await createUser(c.env.DB, userId);
-    await c.env.DB.execute(
-      'UPDATE users SET username = $1, password_hash = $2, display_name = $3 WHERE id = $4',
-      [normalizedUsername, passwordHash, effectiveDisplayName, userId],
-    );
-    if (isPending) {
-      await updateUserStatus(c.env.DB, userId, 'pending');
+    try {
+      await withTransaction(c.env.DB, async (tx) => {
+        await tx.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, now]);
+        await tx.execute(
+          'UPDATE users SET username = $1, password_hash = $2, display_name = $3 WHERE id = $4',
+          [normalizedUsername, passwordHash, effectiveDisplayName, userId],
+        );
+        if (isPending) {
+          await tx.execute('UPDATE users SET status = $1 WHERE id = $2', ['pending', userId]);
+        }
+      });
+    } catch (err) {
+      const conflict = mapPgUniqueConstraintError(err);
+      if (conflict) {
+        return c.json({ error: conflict }, 409);
+      }
+      throw err;
     }
   }
 
@@ -1157,7 +1208,7 @@ authRoutes.post('/password/login', async (c) => {
     return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  const user = normalizedUsername.includes('@')
+  const user = isEmailAuthEnabled(c.env) && normalizedUsername.includes('@')
     ? await getUserByVerifiedEmail(c.env.DB, normalizedUsername)
     : await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
@@ -1336,23 +1387,12 @@ authRoutes.post('/password/reset', async (c) => {
 
   const newHash = await hashPassword(parsed.data.newPassword);
   const resetTx = await withTransaction(c.env.DB, async (tx) => {
-    const txNow = Date.now();
-    const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
-      email: normalizedEmail,
-      purpose: EMAIL_AUTH_PURPOSE.PASSWORD_RESET,
-      code,
-      now: txNow,
-    });
-    if (!consumed.ok) {
-      return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
-    }
-
     const lockedUser = await tx.queryOne<{ id: string; status: string; sessions_valid_after: string | number }>(
       'SELECT id, status, sessions_valid_after FROM users WHERE LOWER(email) = $1 AND email_verified_at IS NOT NULL FOR UPDATE',
       [normalizedEmail],
     );
     if (!lockedUser) {
-      return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
+      return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID, recordFailure: true };
     }
     if (!isUserStatusActive(lockedUser.status)) {
       return {
@@ -1360,6 +1400,18 @@ authRoutes.post('/password/reset', async (c) => {
         status: 403 as const,
         error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
       };
+    }
+
+    const txNow = Date.now();
+    const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+      email: normalizedEmail,
+      purpose: EMAIL_AUTH_PURPOSE.PASSWORD_RESET,
+      code,
+      userId: lockedUser.id,
+      now: txNow,
+    });
+    if (!consumed.ok) {
+      return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
     }
 
     const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
@@ -1374,7 +1426,7 @@ authRoutes.post('/password/reset', async (c) => {
       [txNow, lockedUser.id],
     );
 
-    return { ok: true as const, userId: lockedUser.id };
+    return { ok: true as const, userId: lockedUser.id, newValidAfter };
   });
 
   if (!resetTx.ok) {
@@ -1384,6 +1436,7 @@ authRoutes.post('/password/reset', async (c) => {
     return c.json({ error: resetTx.error }, resetTx.status);
   }
 
+  evictStaleUserBrowserSockets(resetTx.userId, resetTx.newValidAfter);
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId: resetTx.userId, action: 'auth.password_reset', ip }, c.env.DB);
   return c.json({ ok: true });
@@ -1423,30 +1476,14 @@ authRoutes.post('/password/change', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);
 
-  const requiresEmailCode = isEmailAuthEnabled(c.env)
-    && !user.password_must_change
-    && Boolean(user.email && user.email_verified_at);
-
-  if (!requiresEmailCode) {
-    if (typeof oldPassword !== 'string' || oldPassword.length === 0) {
-      return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
-    }
+  let oldPasswordVerified = false;
+  if (typeof oldPassword === 'string' && oldPassword.length > 0) {
     const valid = await verifyPassword(oldPassword, user.password_hash);
     if (!valid) {
       await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
       return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
     }
-  } else {
-    if (!isValidEmailOtp(emailCode)) {
-      return c.json({ error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED }, 400);
-    }
-    if (typeof oldPassword === 'string' && oldPassword.length > 0) {
-      const valid = await verifyPassword(oldPassword, user.password_hash);
-      if (!valid) {
-        await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
-        return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
-      }
-    }
+    oldPasswordVerified = true;
   }
 
   const newHash = await hashPassword(newPassword);
@@ -1479,15 +1516,23 @@ authRoutes.post('/password/change', async (c) => {
       };
     }
 
+    const txRequiresEmailCode = isEmailAuthEnabled(c.env)
+      && !lockedUser.password_must_change
+      && Boolean(lockedUser.email && lockedUser.email_verified_at);
+
     const txNow = Date.now();
-    if (requiresEmailCode) {
-      if (!lockedUser.email || !lockedUser.email_verified_at) {
-        return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_NOT_VERIFIED };
+    if (!txRequiresEmailCode) {
+      if (!oldPasswordVerified) {
+        return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.INVALID_BODY };
+      }
+    } else {
+      if (!isValidEmailOtp(emailCode)) {
+        return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED };
       }
       const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
-        email: lockedUser.email,
+        email: lockedUser.email!,
         purpose: EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE,
-        code: emailCode!.trim(),
+        code: emailCode.trim(),
         userId,
         now: txNow,
       });
@@ -1516,9 +1561,9 @@ authRoutes.post('/password/change', async (c) => {
         'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
         [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
       );
-      return { ok: true as const, accessToken, refreshRaw };
+      return { ok: true as const, accessToken, refreshRaw, newValidAfter };
     }
-    return { ok: true as const, accessToken: null, refreshRaw: null };
+    return { ok: true as const, accessToken: null, refreshRaw: null, newValidAfter };
   });
 
   if (!changeTx.ok) {
@@ -1527,6 +1572,8 @@ authRoutes.post('/password/change', async (c) => {
     }
     return c.json({ error: changeTx.error }, changeTx.status);
   }
+
+  evictStaleUserBrowserSockets(userId, changeTx.newValidAfter);
 
   if (changeTx.accessToken && changeTx.refreshRaw) {
     const isSecure = c.env.NODE_ENV === 'production';

@@ -90,6 +90,8 @@ export function mapEmailAuthErrorCode(
     }
     case AUTH_ERROR_CODES.EMAIL_NOT_VERIFIED:
       return t(`${prefix}.email_not_verified`);
+    case AUTH_ERROR_CODES.EMAIL_ALREADY_VERIFIED:
+      return t('settings.email_already_verified');
     case 'email_send_failed':
       return t(`${prefix}.email_send_failed`);
     default:

@@ -102,6 +102,31 @@ export async function findInactiveUsers(db: Database, userIds: readonly string[]
   return new Set(unique.filter((id) => !active.has(id)));
 }
 
+/** Load `sessions_valid_after` epochs (> 0) for active connected users across all replicas. */
+export async function loadUserSessionValidAfters(
+  db: Database,
+  userIds: readonly string[],
+): Promise<Map<string, number>> {
+  const unique = [...new Set(userIds)];
+  if (unique.length === 0) return new Map();
+  try {
+    const rows = await db.query<{ id: string; sessions_valid_after: string | number | null }>(
+      `SELECT u.id, u.sessions_valid_after
+         FROM users u
+        WHERE u.id = ANY($1::text[]) AND ${ACTIVE_USER_SQL} AND u.sessions_valid_after > 0`,
+      [unique],
+    );
+    const out = new Map<string, number>();
+    for (const row of rows) {
+      const validAfter = Number(row.sessions_valid_after ?? 0) || 0;
+      if (row.id && validAfter > 0) out.set(row.id, validAfter);
+    }
+    return out;
+  } catch {
+    return new Map();
+  }
+}
+
 /**
  * A user acting on a server: BOTH the actor and the server's owner must be active. The actor because a disabled user operates nothing;
  * the owner because a server acts as its owner (its daemon is refused when the owner is disabled), so anything shared out of it stops

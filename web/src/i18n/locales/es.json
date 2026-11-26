@@ -2328,6 +2328,7 @@
     "email_code_expired": "El código de verificación expiró. Solicita uno nuevo.",
     "email_code_rate_limited": "Espera {{seconds}} s antes de solicitar otro código.",
     "email_not_verified": "Primero vincula y verifica un correo electrónico.",
+    "email_already_verified": "Esta cuenta ya tiene un correo verificado.",
     "email_send_failed": "Error al enviar el correo de verificación.",
     "privacy_policy": "Política de privacidad",
     "terms_of_service": "Términos de servicio",
