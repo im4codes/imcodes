@@ -27,6 +27,10 @@ if [[ -f package-lock.json ]]; then
   if [[ -d node_modules && -f "$LOCK_HASH_FILE" ]] && [[ "$(cat "$LOCK_HASH_FILE" 2>/dev/null || true)" == "$LOCK_HASH" ]]; then
     echo "Dependencies unchanged (package-lock.json matches); skipping npm ci."
   else
+    if [[ -L node_modules ]]; then
+      rm -f node_modules
+      mkdir -p node_modules
+    fi
     npm ci
     mkdir -p node_modules
     printf '%s\n' "$LOCK_HASH" >"$LOCK_HASH_FILE"

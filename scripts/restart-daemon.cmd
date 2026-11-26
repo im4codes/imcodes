@@ -49,6 +49,16 @@ if exist "node_modules" if defined LOCK_HASH if "!PREV_HASH!"=="!LOCK_HASH!" (
   echo [restart-daemon] dependencies unchanged; skipping npm ci
   goto :after_install
 )
+node -e "const fs=require('node:fs');try{if(fs.lstatSync('node_modules').isSymbolicLink())process.exit(0)}catch{}process.exit(1)"
+if not errorlevel 1 (
+  echo [restart-daemon] unlinking shared node_modules link before npm ci
+  rmdir "node_modules"
+  if errorlevel 1 (
+    echo [restart-daemon] failed to unlink node_modules link
+    exit /b 1
+  )
+  mkdir "node_modules" >nul 2>&1
+)
 echo [restart-daemon] npm ci
 call npm ci
 if errorlevel 1 (

@@ -176,6 +176,18 @@ describe('scripts/restart-daemon.cmd', () => {
     expect(dispatchIdx).toBeGreaterThan(linkIdx);
   });
 
+  it('unlinks symlink/junction node_modules non-recursively before running `npm ci`', () => {
+    const lstatIdx = text.indexOf("fs.lstatSync('node_modules').isSymbolicLink()");
+    const rmdirIdx = text.indexOf('rmdir "node_modules"');
+    const ciIdx = text.indexOf('call npm ci');
+    expect(lstatIdx).toBeGreaterThan(-1);
+    expect(rmdirIdx).toBeGreaterThan(lstatIdx);
+    expect(ciIdx).toBeGreaterThan(rmdirIdx);
+    // Must NEVER use /S or /Q with rmdir on node_modules so linked targets cannot be wiped.
+    expect(text).not.toMatch(/rmdir\s+\/[sq]\b.*node_modules/i);
+    expect(text).not.toMatch(/rmdir\b.*node_modules.*\/[sq]\b/i);
+  });
+
   it('aborts with non-zero exit when any pre-build step fails', () => {
     // Each pre-build step must check errorlevel and bail.  Otherwise a
     // failing build silently dispatches a stale restart.

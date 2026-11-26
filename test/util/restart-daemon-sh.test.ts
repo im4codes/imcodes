@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
@@ -205,7 +205,7 @@ describe.skipIf(process.platform !== 'linux')('isolated Linux restart dispatch',
   });
 });
 
-describe('lockfile-safe dependency installation across runs', () => {
+describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')('lockfile-safe dependency installation across runs', () => {
   const fixtures: string[] = [];
 
   afterEach(() => {
@@ -224,15 +224,15 @@ describe('lockfile-safe dependency installation across runs', () => {
     writeFileSync(script, readScript());
     const calls = join(dir, 'calls');
     const writeBin = (name: string, body: string) => writeFileSync(join(bin, name), body, { mode: 0o755 });
-    for (const name of ['bash', 'dirname', 'date', 'tee', 'cat', 'mkdir']) {
+    for (const name of ['bash', 'dirname', 'date', 'tee', 'cat', 'mkdir', 'rm']) {
       const target = [`/bin/${name}`, `/usr/bin/${name}`].find((p) => existsSync(p));
       if (!target) throw new Error(`missing system utility ${name}`);
       symlinkSync(target, join(bin, name));
     }
     writeBin('uname', '#!/bin/bash\necho Linux\n');
     writeBin('systemd-run', '#!/bin/bash\nexit 0\n');
-    // Stub npm so we can observe exact subcommands without mutating package-lock.json or touching network.
-    writeBin('npm', '#!/bin/bash\nprintf "npm %s\\n" "$*" >>"$CALLS"\nif [[ "${1:-}" == "ci" ]]; then mkdir -p node_modules; fi\n');
+    // Stub npm so `npm ci` clears existing node_modules/* (matching real npm ci behavior) without touching network.
+    writeBin('npm', '#!/bin/bash\nprintf "npm %s\\n" "$*" >>"$CALLS"\nif [[ "${1:-}" == "ci" ]]; then\n  mkdir -p node_modules\n  rm -rf node_modules/* node_modules/.[!.]*\n  echo local >node_modules/local-install.txt\nfi\n');
     // Pass `node -e` through to real Node (for hash fallback), while stubbing stdin manifest verification.
     writeBin('node', `#!${process.execPath}\n` + `
       const { spawnSync } = require('child_process');
@@ -286,5 +286,31 @@ describe('lockfile-safe dependency installation across runs', () => {
     const f = makeLockFixture();
     await run(f);
     expect(read(f.calls)).toBe('npm install\nnpm run build\nnpm link --force\n');
+  });
+
+  it('unlinks symlinked node_modules before npm ci so external target sentinels and lockfile stay intact', async () => {
+    const f = makeLockFixture();
+    const externalDir = join(f.root, '..', 'external-main-node-modules');
+    const externalSentinel = join(externalDir, 'sentinel.txt');
+    const lockPath = join(f.root, 'package-lock.json');
+    const localModules = join(f.root, 'node_modules');
+    const lockBytes = Buffer.from('{\n  "name": "imcodes",\n  "lockfileVersion": 3,\n  "packages": {"a": {}}\n}\n');
+
+    mkdirSync(externalDir, { recursive: true });
+    writeFileSync(externalSentinel, 'keep-external-target');
+    writeFileSync(join(externalDir, '.restart-daemon-lock.sha256'), 'stale-hash\n');
+    writeFileSync(lockPath, lockBytes);
+    symlinkSync(externalDir, localModules, 'dir');
+
+    await run(f);
+
+    expect(read(f.calls)).toBe('npm ci\nnpm run build\nnpm link --force\n');
+    expect(readFileSync(externalSentinel, 'utf8')).toBe('keep-external-target');
+    expect(readFileSync(join(externalDir, '.restart-daemon-lock.sha256'), 'utf8')).toBe('stale-hash\n');
+    expect(existsSync(join(externalDir, 'local-install.txt'))).toBe(false);
+    expect(lstatSync(localModules).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(localModules, 'local-install.txt'), 'utf8')).toBe('local\n');
+    expect(read(join(localModules, '.restart-daemon-lock.sha256')).trim()).toMatch(/^[0-9a-f]{64}$/);
+    expect(readFileSync(lockPath).equals(lockBytes)).toBe(true);
   });
 });
