@@ -244,4 +244,105 @@ describe('bounded observation recall and semantic parity', () => {
     expect(authRes.items.map((i) => i.id)).toEqual([targetObs.id]);
     expect(elapsedMs).toBeLessThan(200);
   }, 30_000);
+
+  it('matches ASCII queries against Unicode case-folded source text (Kelvin sign Kelvin) in observations and projections', () => {
+    const ns: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/unicode', userId: 'user-u' };
+    const nsRow = ensureContextNamespace(ns, 100);
+    const obs = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-kelvin',
+      content: { text: '\u212aelvin temperature threshold' },
+      now: 100,
+    });
+    const proj = writeProcessedProjection({
+      namespace: ns,
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-kelvin'],
+      summary: '\u212aelvin summary note',
+      content: { text: '\u212aelvin summary note' },
+      createdAt: 100,
+      updatedAt: 100,
+    });
+
+    const obsOnly = searchLocalMemory({ namespace: ns, query: 'kelvin', limit: 10 });
+    expect(obsOnly.items.map((i) => i.id)).toEqual([obs.id, proj.id]);
+    expect(obsOnly.stats.matchedRecords).toBe(2);
+
+    const auth = searchLocalMemoryAuthorized({ authorizedNamespaces: [ns], query: 'kelvin', limit: 10 });
+    expect(auth.items.map((i) => i.id)).toEqual([obs.id, proj.id]);
+    expect(auth.stats.matchedRecords).toBe(2);
+  });
+
+  it('finds sparse matches behind >200 newer non-matching rows and keeps matchedRecords invariant across pagination & >10k deep offsets', () => {
+    const ns: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/sparse', userId: 'user-s' };
+    const nsRow = ensureContextNamespace(ns, 100);
+
+    // Older sparse hit (Café)
+    const oldCafe = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-old-cafe',
+      content: { text: 'old Café endpoint note' },
+      now: 1_000,
+    });
+
+    // 205 newer non-matching rows + 70 matching 'paginated-hit' rows (and >10,000 total rows for deep offset)
+    const database = new DatabaseSync(join(tempDir, 'context.sqlite'));
+    database.exec('BEGIN');
+    const insert = database.prepare(`
+      INSERT INTO context_observations (
+        id, namespace_id, scope, class, origin, fingerprint, content_json, text_hash,
+        source_event_ids_json, projection_id, state, confidence, created_at, updated_at, promoted_at
+      ) VALUES (?, ?, 'personal', 'note', 'user_note', ?, ?, ?, '["evt-deep"]', NULL, 'active', NULL, ?, ?, NULL)
+    `);
+    for (let i = 0; i < 10_020; i++) {
+      const ts = 2_000 + i;
+      const text = i < 70 ? `paginated-hit item ${i}` : `unrelated noise entry ${i}`;
+      insert.run(
+        `deep-obs-${i}`,
+        nsRow.id,
+        `fp-deep-${i}`,
+        JSON.stringify({ text }),
+        `hash-deep-${i}`,
+        ts,
+        ts,
+      );
+    }
+    database.exec('COMMIT');
+    database.close();
+
+    // 1. Sparse hit behind >200 (actually 10,020) newer non-matching rows with limit=1
+    const sparse = searchLocalMemory({ namespace: ns, query: 'café', limit: 1 });
+    expect(sparse.items.map((i) => i.id)).toEqual([oldCafe.id]);
+    expect(sparse.stats.matchedRecords).toBe(1);
+
+    // 2. matchedRecords invariant across offset=0 vs offset=60 on authorized search (deduped)
+    const page0 = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [ns, ns],
+      query: 'paginated-hit',
+      offset: 0,
+      limit: 10,
+    });
+    const page60 = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [ns],
+      query: 'paginated-hit',
+      offset: 60,
+      limit: 10,
+    });
+    expect(page0.items).toHaveLength(10);
+    expect(page60.items).toHaveLength(10);
+    expect(page0.stats.matchedRecords).toBe(70);
+    expect(page60.stats.matchedRecords).toBe(70);
+
+    // 3. Deep pagination past 10,000 (> old 10,000 hard cap)
+    const deep = searchLocalMemory({ namespace: ns, offset: 10_005, limit: 10 });
+    expect(deep.items).toHaveLength(10);
+    expect(deep.stats.matchedRecords).toBe(10_021);
+  });
 });

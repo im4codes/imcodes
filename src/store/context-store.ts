@@ -56,6 +56,7 @@ import {
   isObservationState,
   normalizeObservationText,
   normalizeObservationSourceIds,
+  observationSearchHaystack,
   type ContextObservationInput,
   type ObservationClass,
   type ObservationState,
@@ -869,8 +870,47 @@ function ensureDb(): DatabaseSyncInstance {
   if (!db.prepare('SELECT 1 FROM context_processed_local LIMIT 1').get()) {
     for (const ddl of SUMMARY_LOOKUP_INDEX_DDL) db.exec(ddl);
   }
+  registerSearchFunctions(db);
   scheduleArchiveBackfillIfNeeded(db, dbPath);
   return db;
+}
+
+function registerSearchFunctions(database: DatabaseSyncInstance): void {
+  if (typeof database.function !== 'function') return;
+  database.function(
+    'imcodes_obs_matches_query',
+    { deterministic: true },
+    (obsClass: unknown, contentJson: unknown, sourceIdsJson: unknown, queryText: unknown) => {
+      const query = typeof queryText === 'string' ? queryText : '';
+      if (!query.trim()) return 1;
+      const haystack = observationSearchHaystack({
+        observationClass: typeof obsClass === 'string' ? obsClass : '',
+        content: parseJson<Record<string, unknown>>(contentJson, {}),
+        sourceEventIds: parseJson<string[]>(sourceIdsJson, []),
+      });
+      return memoryTextMatchesQuery(haystack, query) ? 1 : 0;
+    },
+  );
+  database.function(
+    'imcodes_proj_matches_query',
+    { deterministic: true },
+    (summary: unknown, contentJson: unknown, projClass: unknown, sourceIdsJson: unknown, queryText: unknown) => {
+      const query = typeof queryText === 'string' ? queryText : '';
+      if (!query.trim()) return 1;
+      const content = projectionSemanticContent(parseJson<Record<string, unknown>>(contentJson, {}));
+      const contentRecord = content && typeof content === 'object' && !Array.isArray(content)
+        ? content as Record<string, unknown>
+        : undefined;
+      const sourceIds = parseJson<string[]>(sourceIdsJson, []);
+      const haystack = [
+        typeof summary === 'string' ? summary : '',
+        contentRecord ? JSON.stringify(contentRecord) : undefined,
+        typeof projClass === 'string' ? projClass : undefined,
+        ...sourceIds,
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0).join(' ').toLowerCase();
+      return memoryTextMatchesQuery(haystack, query) ? 1 : 0;
+    },
+  );
 }
 
 /** Expressions the summary-lookup indexes are built on. The lookup queries MUST
@@ -1177,7 +1217,7 @@ function upsertContextObservationForDb(database: DatabaseSyncInstance, input: Co
     JSON.stringify(contentForDb),
     textHash,
     JSON.stringify(mergedSourceIds),
-    normalizeOptional(input.projectionId) ?? normalizeOptional(prior?.projection_id ?? undefined) ?? null,
+    input.projectionId ?? prior?.projection_id ?? null,
     state,
     input.confidence ?? null,
     prior?.created_at ?? now,
@@ -4209,37 +4249,7 @@ export function writeContextObservation(input: ContextObservationInput): Context
   }
 }
 
-const SAFE_OBSERVATION_LIKE_TOKEN_RE = /^[\x20-\x7e\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef]+$/;
-
-function escapeLikePattern(token: string): string {
-  return token.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-}
-
-/** Strict superset SQL text prefilter for observation search.
- * Matches every token from `memoryTextMatchesQuery` tokenization across
- * `content_json`, `class`, and `source_event_ids_json`. Skips tokens containing
- * non-ASCII cased characters (where SQLite ASCII-only LIKE differs from JS
- * `.toLowerCase()`) so zero valid matches can be dropped before JS `matchesQuery`. */
-function appendObservationTextSearchSql(
-  conditions: string[],
-  params: Array<string | number>,
-  query: string | undefined,
-): void {
-  const normalized = query?.trim().toLowerCase() ?? '';
-  if (!normalized) return;
-  const terms = normalized
-    .split(/[\s\p{P}]+/u)
-    .map((term) => term.trim())
-    .filter((term) => term.length > 0 && SAFE_OBSERVATION_LIKE_TOKEN_RE.test(term))
-    .slice(0, 16);
-  for (const term of terms) {
-    const pattern = `%${escapeLikePattern(term)}%`;
-    conditions.push("(content_json LIKE ? ESCAPE '\\' OR class LIKE ? ESCAPE '\\' OR source_event_ids_json LIKE ? ESCAPE '\\')");
-    params.push(pattern, pattern, pattern);
-  }
-}
-
-export function listContextObservations(filters: {
+export interface ContextObservationQueryFilters {
   namespaceId?: string;
   namespaceIds?: readonly string[];
   scope?: MemoryScope;
@@ -4251,7 +4261,13 @@ export function listContextObservations(filters: {
   before?: number;
   query?: string;
   limit?: number;
-} = {}): ContextObservationRow[] {
+  offset?: number;
+}
+
+function buildObservationQueryWhere(
+  database: DatabaseSyncInstance,
+  filters: ContextObservationQueryFilters,
+): { empty: true } | { empty: false; where: string; params: Array<string | number>; jsTextFilter?: string } {
   const namespaceIds = filters.namespaceIds === undefined
     ? undefined
     : [...new Set(filters.namespaceIds.filter((id) => typeof id === 'string' && id.length > 0))];
@@ -4260,21 +4276,14 @@ export function listContextObservations(filters: {
     : typeof filters.state === 'string'
       ? [filters.state]
       : [...new Set(filters.state)];
-  const limit = filters.limit === undefined
-    ? undefined
-    : Number.isFinite(filters.limit)
-      ? Math.max(0, Math.min(10_000, Math.floor(filters.limit)))
-      : 0;
   if (
     namespaceIds?.length === 0
     || states?.length === 0
-    || limit === 0
     || (filters.withoutProjection && filters.projectionId)
   ) {
-    return [];
+    return { empty: true };
   }
 
-  const database = ensureDb();
   const conditions: string[] = [];
   const params: Array<string | number> = [];
   if (filters.namespaceId) {
@@ -4311,18 +4320,164 @@ export function listContextObservations(filters: {
     conditions.push('created_at <= ?');
     params.push(filters.before);
   }
-  appendObservationTextSearchSql(conditions, params, filters.query);
+  const trimmedQuery = filters.query?.trim();
+  let jsTextFilter: string | undefined;
+  if (trimmedQuery) {
+    if (typeof database.function === 'function') {
+      conditions.push('imcodes_obs_matches_query(class, content_json, source_event_ids_json, ?) = 1');
+      params.push(trimmedQuery);
+    } else {
+      jsTextFilter = trimmedQuery;
+    }
+  }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const limitSql = limit === undefined ? '' : 'LIMIT ?';
-  if (limit !== undefined) params.push(limit);
-  const rows = database.prepare(`
-    SELECT *
-      FROM context_observations
-      ${where}
-     ORDER BY updated_at DESC, id ASC
-     ${limitSql}
-  `).all(...params) as Array<Record<string, unknown>>;
-  return rows.map(observationRowFromDb);
+  return { empty: false, where, params, jsTextFilter };
+}
+
+function observationMatchesJsTextFilter(row: ContextObservationRow, query: string): boolean {
+  const haystack = observationSearchHaystack({
+    observationClass: row.class,
+    content: row.content,
+    sourceEventIds: row.sourceEventIds,
+  });
+  return memoryTextMatchesQuery(haystack, query);
+}
+
+export function listContextObservations(filters: ContextObservationQueryFilters = {}): ContextObservationRow[] {
+  const limit = filters.limit === undefined
+    ? undefined
+    : Number.isFinite(filters.limit)
+      ? Math.max(0, Math.floor(filters.limit))
+      : 0;
+  if (limit === 0) return [];
+  const offset = filters.offset !== undefined && Number.isFinite(filters.offset)
+    ? Math.max(0, Math.floor(filters.offset))
+    : 0;
+
+  const database = ensureDb();
+  const built = buildObservationQueryWhere(database, filters);
+  if (built.empty) return [];
+
+  if (!built.jsTextFilter) {
+    const queryParams = [...built.params];
+    let paginationSql = '';
+    if (limit !== undefined) {
+      paginationSql = offset > 0 ? 'LIMIT ? OFFSET ?' : 'LIMIT ?';
+      queryParams.push(limit);
+      if (offset > 0) queryParams.push(offset);
+    } else if (offset > 0) {
+      paginationSql = 'LIMIT -1 OFFSET ?';
+      queryParams.push(offset);
+    }
+    const rows = database.prepare(`
+      SELECT *
+        FROM context_observations
+        ${built.where}
+       ORDER BY updated_at DESC, id ASC
+       ${paginationSql}
+    `).all(...queryParams) as Array<Record<string, unknown>>;
+    return rows.map(observationRowFromDb);
+  }
+
+  // Fallback for runtimes without DatabaseSync.prototype.function(): scan in keyset batches.
+  const matched: ContextObservationRow[] = [];
+  let cursorUpdatedAt: number | undefined;
+  let cursorId: string | undefined;
+  let skipped = 0;
+  const batchSize = 256;
+  for (;;) {
+    const batchConditions = built.where ? [built.where.slice('WHERE '.length)] : [];
+    const batchParams = [...built.params];
+    if (cursorUpdatedAt !== undefined && cursorId !== undefined) {
+      batchConditions.push('(updated_at < ? OR (updated_at = ? AND id > ?))');
+      batchParams.push(cursorUpdatedAt, cursorUpdatedAt, cursorId);
+    }
+    const batchWhere = batchConditions.length > 0 ? `WHERE ${batchConditions.join(' AND ')}` : '';
+    const batch = database.prepare(`
+      SELECT *
+        FROM context_observations
+        ${batchWhere}
+       ORDER BY updated_at DESC, id ASC
+       LIMIT ?
+    `).all(...batchParams, batchSize) as Array<Record<string, unknown>>;
+    if (batch.length === 0) break;
+    for (const raw of batch) {
+      const obs = observationRowFromDb(raw);
+      if (observationMatchesJsTextFilter(obs, built.jsTextFilter)) {
+        if (skipped < offset) {
+          skipped++;
+        } else {
+          matched.push(obs);
+          if (limit !== undefined && matched.length >= limit) return matched;
+        }
+      }
+    }
+    const last = batch[batch.length - 1]!;
+    cursorUpdatedAt = Number(last.updated_at);
+    cursorId = String(last.id);
+    if (batch.length < batchSize) break;
+  }
+  return matched;
+}
+
+export function countContextObservationsByNamespace(
+  filters: Omit<ContextObservationQueryFilters, 'limit' | 'offset'> = {},
+): { total: number; countsByNamespace: Map<string, number> } {
+  const countsByNamespace = new Map<string, number>();
+  const database = ensureDb();
+  const built = buildObservationQueryWhere(database, filters);
+  if (built.empty) return { total: 0, countsByNamespace };
+
+  if (!built.jsTextFilter) {
+    const rows = database.prepare(`
+      SELECT namespace_id, COUNT(*) AS count
+        FROM context_observations
+        ${built.where}
+       GROUP BY namespace_id
+    `).all(...built.params) as Array<{ namespace_id: string; count: number }>;
+    let total = 0;
+    for (const row of rows) {
+      const count = Number(row.count) || 0;
+      if (count <= 0) continue;
+      countsByNamespace.set(String(row.namespace_id), count);
+      total += count;
+    }
+    return { total, countsByNamespace };
+  }
+
+  let total = 0;
+  let cursorUpdatedAt: number | undefined;
+  let cursorId: string | undefined;
+  const batchSize = 256;
+  for (;;) {
+    const batchConditions = built.where ? [built.where.slice('WHERE '.length)] : [];
+    const batchParams = [...built.params];
+    if (cursorUpdatedAt !== undefined && cursorId !== undefined) {
+      batchConditions.push('(updated_at < ? OR (updated_at = ? AND id > ?))');
+      batchParams.push(cursorUpdatedAt, cursorUpdatedAt, cursorId);
+    }
+    const batchWhere = batchConditions.length > 0 ? `WHERE ${batchConditions.join(' AND ')}` : '';
+    const batch = database.prepare(`
+      SELECT *
+        FROM context_observations
+        ${batchWhere}
+       ORDER BY updated_at DESC, id ASC
+       LIMIT ?
+    `).all(...batchParams, batchSize) as Array<Record<string, unknown>>;
+    if (batch.length === 0) break;
+    for (const raw of batch) {
+      const obs = observationRowFromDb(raw);
+      if (observationMatchesJsTextFilter(obs, built.jsTextFilter)) {
+        countsByNamespace.set(obs.namespaceId, (countsByNamespace.get(obs.namespaceId) ?? 0) + 1);
+        total++;
+      }
+    }
+    const last = batch[batch.length - 1]!;
+    cursorUpdatedAt = Number(last.updated_at);
+    cursorId = String(last.id);
+    if (batch.length < batchSize) break;
+  }
+  return { total, countsByNamespace };
 }
 
 export function listStartupContextObservations(namespaceIds: readonly string[], limit: number): ContextObservationRow[] {
@@ -5161,6 +5316,267 @@ export interface ProcessedProjectionStats {
   pendingJobCount: number;
 }
 
+function projectionFromPanelRow(row: Record<string, unknown>): ProcessedContextProjection {
+  return {
+    id: String(row.id),
+    namespace: parseNamespaceKey(String(row.namespace_key)),
+    class: String(row.class) as ProcessedContextClass,
+    origin: isMemoryOrigin(row.origin) ? row.origin : undefined,
+    sourceEventIds: parseJson<string[]>(row.source_event_ids_json, []),
+    summary: String(row.summary),
+    content: parseJson<Record<string, unknown>>(row.content_json, {}),
+    contentHash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : undefined,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
+    lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
+    status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
+  };
+}
+
+export interface ProcessedProjectionNamespaceFilter {
+  scope?: ContextScope | MemoryScope;
+  enterpriseId?: string;
+  workspaceId?: string;
+  userId?: string;
+  projectId?: string;
+  includeLegacyPersonalOwner?: boolean;
+  exactEmptyFields?: boolean;
+}
+
+export interface ProcessedProjectionSearchFilters {
+  namespaceFilters: readonly ProcessedProjectionNamespaceFilter[];
+  projectionClass?: ProcessedContextClass;
+  includeArchived?: boolean;
+  after?: number;
+  before?: number;
+  query?: string;
+  limit?: number;
+  offset?: number;
+}
+
+function appendExactEmptyFieldFilterSql(
+  conditions: string[],
+  params: (string | number)[],
+  column: string,
+  value: string | undefined,
+): void {
+  if (hasFilterValue(value)) {
+    conditions.push(`${column} = ?`);
+    params.push(value);
+  } else {
+    conditions.push(`(${column} IS NULL OR TRIM(${column}) = '')`);
+  }
+}
+
+function appendProcessedNamespaceGroupSql(
+  conditions: string[],
+  params: (string | number)[],
+  namespaceFilters: readonly ProcessedProjectionNamespaceFilter[],
+): boolean {
+  if (namespaceFilters.length === 0) return false;
+  const branches: string[] = [];
+  for (const filter of namespaceFilters) {
+    const branchConds: string[] = [];
+    if (filter.exactEmptyFields) {
+      if (filter.projectId === undefined) {
+        branchConds.push('1 = 0');
+      } else {
+        if (hasFilterValue(filter.scope)) {
+          branchConds.push('scope = ?');
+          params.push(filter.scope);
+        }
+        appendExactEmptyFieldFilterSql(branchConds, params, 'enterprise_id', filter.enterpriseId);
+        appendExactEmptyFieldFilterSql(branchConds, params, 'workspace_id', filter.workspaceId);
+        appendExactEmptyFieldFilterSql(branchConds, params, 'project_id', filter.projectId);
+        if (hasFilterValue(filter.userId)) {
+          if (filter.includeLegacyPersonalOwner && filter.scope === 'personal') {
+            branchConds.push("(user_id = ? OR user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)");
+            params.push(filter.userId, LEGACY_DAEMON_LOCAL_USER_ID);
+          } else {
+            branchConds.push('user_id = ?');
+            params.push(filter.userId);
+          }
+        } else if (filter.includeLegacyPersonalOwner && filter.scope === 'personal') {
+          branchConds.push("(user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)");
+          params.push(LEGACY_DAEMON_LOCAL_USER_ID);
+        } else {
+          branchConds.push("(user_id IS NULL OR TRIM(user_id) = '')");
+        }
+      }
+    } else {
+      appendNamespaceFilterSql(branchConds, params, filter);
+    }
+    branches.push(branchConds.length > 0 ? `(${branchConds.join(' AND ')})` : '1 = 1');
+  }
+  conditions.push(`(${branches.join(' OR ')})`);
+  return true;
+}
+
+function buildProcessedSearchWhere(
+  database: DatabaseSyncInstance,
+  filters: ProcessedProjectionSearchFilters,
+): { empty: true } | { empty: false; where: string; params: Array<string | number>; jsTextFilter?: string } {
+  const conditions: string[] = [];
+  const params: Array<string | number> = [];
+  if (!filters.includeArchived) {
+    conditions.push("status = 'active'");
+  }
+  if (!appendProcessedNamespaceGroupSql(conditions, params, filters.namespaceFilters)) {
+    return { empty: true };
+  }
+  if (filters.projectionClass) {
+    conditions.push('class = ?');
+    params.push(filters.projectionClass);
+  }
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
+  if (typeof filters.after === 'number' && Number.isFinite(filters.after)) {
+    conditions.push('created_at >= ?');
+    params.push(filters.after);
+  }
+  if (typeof filters.before === 'number' && Number.isFinite(filters.before)) {
+    conditions.push('created_at <= ?');
+    params.push(filters.before);
+  }
+  const trimmedQuery = filters.query?.trim();
+  let jsTextFilter: string | undefined;
+  if (trimmedQuery) {
+    if (typeof database.function === 'function') {
+      conditions.push('imcodes_proj_matches_query(summary, content_json, class, source_event_ids_json, ?) = 1');
+      params.push(trimmedQuery);
+    } else {
+      jsTextFilter = trimmedQuery;
+    }
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  return { empty: false, where, params, jsTextFilter };
+}
+
+function projectionMatchesJsTextFilter(projection: ProcessedContextProjection, query: string): boolean {
+  const content = projectionSemanticContent(projection.content);
+  const contentRecord = content && typeof content === 'object' && !Array.isArray(content)
+    ? content as Record<string, unknown>
+    : undefined;
+  const haystack = [
+    projection.summary,
+    contentRecord ? JSON.stringify(contentRecord) : undefined,
+    projection.class,
+    ...projection.sourceEventIds,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0).join(' ').toLowerCase();
+  return memoryTextMatchesQuery(haystack, query);
+}
+
+export function countProcessedProjectionsForSearch(
+  filters: Omit<ProcessedProjectionSearchFilters, 'limit' | 'offset'>,
+): {
+  total: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectIds: Set<string>;
+} {
+  const projectIds = new Set<string>();
+  const database = ensureDb();
+  const built = buildProcessedSearchWhere(database, filters);
+  if (built.empty) {
+    return { total: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectIds };
+  }
+
+  if (!built.jsTextFilter) {
+    const rows = database.prepare(`
+      SELECT COALESCE(project_id, '') AS project_id, class, COUNT(*) AS count
+        FROM context_processed_local
+        ${built.where}
+       GROUP BY COALESCE(project_id, ''), class
+    `).all(...built.params) as Array<{ project_id: string; class: string; count: number }>;
+    let total = 0;
+    let recentSummaryCount = 0;
+    let durableCandidateCount = 0;
+    for (const row of rows) {
+      const count = Number(row.count) || 0;
+      if (count <= 0) continue;
+      total += count;
+      if (row.class === 'recent_summary') recentSummaryCount += count;
+      if (row.class === 'durable_memory_candidate') durableCandidateCount += count;
+      projectIds.add(String(row.project_id ?? ''));
+    }
+    return { total, recentSummaryCount, durableCandidateCount, projectIds };
+  }
+
+  const rows = database.prepare(`
+    SELECT id, namespace_key, class, origin, source_event_ids_json,
+           summary, content_json, content_hash, created_at, updated_at, hit_count,
+           last_used_at, status
+      FROM context_processed_local
+      ${built.where}
+  `).all(...built.params) as Array<Record<string, unknown>>;
+  let total = 0;
+  let recentSummaryCount = 0;
+  let durableCandidateCount = 0;
+  for (const raw of rows) {
+    const projection = projectionFromPanelRow(raw);
+    if (!projectionMatchesJsTextFilter(projection, built.jsTextFilter)) continue;
+    total++;
+    if (projection.class === 'recent_summary') recentSummaryCount++;
+    if (projection.class === 'durable_memory_candidate') durableCandidateCount++;
+    projectIds.add(projection.namespace.projectId ?? '');
+  }
+  return { total, recentSummaryCount, durableCandidateCount, projectIds };
+}
+
+export function listProcessedProjectionsForSearch(
+  filters: ProcessedProjectionSearchFilters,
+): ProcessedContextProjection[] {
+  const limit = filters.limit === undefined
+    ? undefined
+    : Number.isFinite(filters.limit)
+      ? Math.max(0, Math.floor(filters.limit))
+      : 0;
+  if (limit === 0) return [];
+  const offset = filters.offset !== undefined && Number.isFinite(filters.offset)
+    ? Math.max(0, Math.floor(filters.offset))
+    : 0;
+
+  const database = ensureDb();
+  const built = buildProcessedSearchWhere(database, filters);
+  if (built.empty) return [];
+
+  if (!built.jsTextFilter) {
+    const queryParams = [...built.params];
+    let paginationSql = '';
+    if (limit !== undefined) {
+      paginationSql = offset > 0 ? 'LIMIT ? OFFSET ?' : 'LIMIT ?';
+      queryParams.push(limit);
+      if (offset > 0) queryParams.push(offset);
+    } else if (offset > 0) {
+      paginationSql = 'LIMIT -1 OFFSET ?';
+      queryParams.push(offset);
+    }
+    const rows = database.prepare(`
+      SELECT id, namespace_key, class, origin, source_event_ids_json,
+             summary, content_json, content_hash, created_at, updated_at, hit_count,
+             last_used_at, status
+        FROM context_processed_local
+        ${built.where}
+       ORDER BY CASE WHEN class = 'durable_memory_candidate' THEN 0 ELSE 1 END ASC, updated_at DESC
+       ${paginationSql}
+    `).all(...queryParams) as Array<Record<string, unknown>>;
+    return rows.map(projectionFromPanelRow);
+  }
+
+  const rows = database.prepare(`
+    SELECT id, namespace_key, class, origin, source_event_ids_json,
+           summary, content_json, content_hash, created_at, updated_at, hit_count,
+           last_used_at, status
+      FROM context_processed_local
+      ${built.where}
+     ORDER BY CASE WHEN class = 'durable_memory_candidate' THEN 0 ELSE 1 END ASC, updated_at DESC
+  `).all(...built.params) as Array<Record<string, unknown>>;
+  const matched = rows
+    .map(projectionFromPanelRow)
+    .filter((projection) => projectionMatchesJsTextFilter(projection, built.jsTextFilter!));
+  return limit === undefined ? matched.slice(offset) : matched.slice(offset, offset + limit);
+}
+
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
   const cached = panelCacheGet<ProcessedContextProjection[]>('records', filters);
   if (cached) return cached;
@@ -5210,24 +5626,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
   const rows = database.prepare(sql).all(...params, candidateLimit) as Array<Record<string, unknown>>;
 
   const filtered = rows
-    .map((row) => {
-      const namespace = parseNamespaceKey(String(row.namespace_key));
-      return {
-        id: String(row.id),
-        namespace,
-        class: String(row.class) as ProcessedContextClass,
-        origin: isMemoryOrigin(row.origin) ? row.origin : undefined,
-        sourceEventIds: parseJson<string[]>(row.source_event_ids_json, []),
-        summary: String(row.summary),
-        content: parseJson<Record<string, unknown>>(row.content_json, {}),
-        contentHash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : undefined,
-        createdAt: Number(row.created_at),
-        updatedAt: Number(row.updated_at),
-        hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
-        lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
-        status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
-      } satisfies ProcessedContextProjection;
-    })
+    .map(projectionFromPanelRow)
     .filter((projection) => !normalizedQuery || memoryTextMatchesQuery(
       `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`,
       normalizedQuery,

@@ -20,6 +20,7 @@ import {
   itemNamespace,
   searchLocalMemory,
   searchLocalMemoryAuthorized,
+  searchLocalMemoryCandidates,
   type AuthorizedMemorySearchQuery,
   type MemorySearchQuery,
   type MemorySearchResult,
@@ -65,7 +66,7 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
   }
   // First, get candidates with relaxed text match (or no query filter for broader recall)
   const broadQuery = { ...query, query: undefined, limit: Math.max((query.limit ?? 5) * 4, 40) };
-  const candidates = searchLocalMemory(broadQuery);
+  const candidates = searchLocalMemoryCandidates(broadQuery);
   if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
 
   try {

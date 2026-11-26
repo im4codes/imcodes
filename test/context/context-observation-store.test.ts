@@ -471,4 +471,34 @@ describe('post-1.1 context namespace and observation store', () => {
     expect(planDetails).toContain('idx_context_observations_namespace_state_projection_updated');
     expect(planDetails).not.toMatch(/\bSCAN context_observations\b/);
   });
+
+  it('allows explicit empty projectionId to clear a prior non-empty projectionId on upsert', () => {
+    const nsRow = ensureContextNamespace(namespace, 100);
+    const linked = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-clear-proj',
+      content: { text: 'observation initially linked then unlinked' },
+      projectionId: 'proj-initial-1',
+      now: 100,
+    });
+    expect(listContextObservations({ projectionId: 'proj-initial-1' }).map((r) => r.id)).toEqual([linked.id]);
+    expect(listContextObservations({ namespaceIds: [nsRow.id], withoutProjection: true })).toEqual([]);
+
+    const unlinked = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-clear-proj',
+      content: { text: 'observation initially linked then unlinked' },
+      projectionId: '',
+      now: 200,
+    });
+    expect(unlinked.id).toBe(linked.id);
+    expect(listContextObservations({ projectionId: 'proj-initial-1' })).toEqual([]);
+    expect(listContextObservations({ namespaceIds: [nsRow.id], withoutProjection: true }).map((r) => r.id)).toEqual([linked.id]);
+  });
 });

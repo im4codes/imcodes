@@ -19,6 +19,7 @@
  */
 import {
   searchLocalMemory,
+  searchLocalMemoryCandidates,
   rerankCandidatesBySemantic,
   isTrivialRecallQuery,
   computeStats,
@@ -85,7 +86,7 @@ export async function searchLocalMemorySemanticBounded(
     query: undefined,
     limit: Math.max((query.limit ?? 5) * 4, 40),
   };
-  const candidates = searchLocalMemory(broadQuery);
+  const candidates = searchLocalMemoryCandidates(broadQuery);
   if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
 
   const processedIds = candidates.items.filter((i) => i.type === 'processed').map((i) => i.id);
