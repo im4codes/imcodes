@@ -49,7 +49,8 @@ const DB_FILE = 'session-identities.sqlite';
 const WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const WAL_TRUNCATE_RETRY_COOLDOWN_MS = 250;
-const WAL_TRUNCATE_MAX_TIMER_ATTEMPTS = 8;
+const WAL_TRUNCATE_INITIAL_DELAY_MS = 150;
+const WAL_TRUNCATE_STEADY_INTERVAL_MS = 5_000;
 
 interface DiskProfile extends Omit<SessionIdentityProfile, 'content'> {
   content: string;
@@ -129,6 +130,12 @@ function clearWalMaintenanceTimer(): void {
     clearTimeout(walTruncateRetryTimer);
     walTruncateRetryTimer = null;
   }
+}
+
+function clearWalMaintenanceState(): void {
+  pendingWalTruncatePath = null;
+  walTruncateTimerAttempts = 0;
+  clearWalMaintenanceTimer();
 }
 
 function isLegacyJsonMigrated(db: DatabaseSyncInstance): boolean {
@@ -267,9 +274,12 @@ function runWalCheckpoint(
 
 function scheduleWalTruncateMaintenance(dbPath: string): void {
   if (dbPath === ':memory:' || walTruncateRetryTimer) return;
-  if (walTruncateTimerAttempts >= WAL_TRUNCATE_MAX_TIMER_ATTEMPTS) return;
-  const delayMs = Math.min(2000, 150 * Math.pow(2, walTruncateTimerAttempts));
-  walTruncateTimerAttempts += 1;
+  // Back off up to a low-frequency steady-state interval without ever permanently stopping while bloated WAL remains.
+  const delayMs = Math.min(
+    WAL_TRUNCATE_STEADY_INTERVAL_MS,
+    WAL_TRUNCATE_INITIAL_DELAY_MS * Math.pow(2, walTruncateTimerAttempts),
+  );
+  walTruncateTimerAttempts = Math.min(10, walTruncateTimerAttempts + 1);
   walTruncateRetryTimer = setTimeout(() => {
     walTruncateRetryTimer = null;
     if (!activeDb || activeDbPath !== dbPath || pendingWalTruncatePath !== dbPath) return;
@@ -283,9 +293,7 @@ function tryBoundedWalTruncate(db: DatabaseSyncInstance, dbPath: string, forceNo
   const walBytes = walFileSizeBytes(dbPath);
   if (walBytes <= WAL_SIZE_LIMIT_BYTES) {
     if (pendingWalTruncatePath === dbPath) {
-      pendingWalTruncatePath = null;
-      walTruncateTimerAttempts = 0;
-      clearWalMaintenanceTimer();
+      clearWalMaintenanceState();
     }
     return;
   }
@@ -301,9 +309,7 @@ function tryBoundedWalTruncate(db: DatabaseSyncInstance, dbPath: string, forceNo
   const result = runWalCheckpoint(db, 'TRUNCATE');
   const remainingBytes = walFileSizeBytes(dbPath);
   if (result.busy === 0 && remainingBytes <= WAL_SIZE_LIMIT_BYTES) {
-    pendingWalTruncatePath = null;
-    walTruncateTimerAttempts = 0;
-    clearWalMaintenanceTimer();
+    clearWalMaintenanceState();
     readStats.walCheckpoints += 1;
     return;
   }
@@ -324,9 +330,7 @@ function checkpointWal(db: DatabaseSyncInstance, dbPath: string, reason: 'startu
   }
   const result = runWalCheckpoint(db, 'PASSIVE');
   if (result.busy === 0 && pendingWalTruncatePath === dbPath && walFileSizeBytes(dbPath) <= WAL_SIZE_LIMIT_BYTES) {
-    pendingWalTruncatePath = null;
-    walTruncateTimerAttempts = 0;
-    clearWalMaintenanceTimer();
+    clearWalMaintenanceState();
   }
   readStats.walCheckpoints += 1;
 }
@@ -335,8 +339,7 @@ function getDb(): DatabaseSyncInstance {
   const dbPath = localSessionIdentityDbPath();
   if (activeDb && activeDbPath === dbPath) {
     if (dbPath !== ':memory:' && !existsSync(dbPath)) {
-      clearWalMaintenanceTimer();
-      pendingWalTruncatePath = null;
+      clearWalMaintenanceState();
       try { activeDb.close(); } catch { /* ignore */ }
       activeDb = null;
     } else {
@@ -348,9 +351,7 @@ function getDb(): DatabaseSyncInstance {
   }
 
   if (activeDb) {
-    clearWalMaintenanceTimer();
-    pendingWalTruncatePath = null;
-    walTruncateTimerAttempts = 0;
+    clearWalMaintenanceState();
     try { activeDb.close(); } catch { /* ignore */ }
     activeDb = null;
   }
@@ -690,10 +691,8 @@ export function identityStoreReadStatsForTests(): {
 }
 
 export function resetIdentityStoreCacheForTests(): void {
-  clearWalMaintenanceTimer();
-  pendingWalTruncatePath = null;
+  clearWalMaintenanceState();
   lastWalTruncateAttemptAt = 0;
-  walTruncateTimerAttempts = 0;
   if (activeDb) {
     try { activeDb.close(); } catch { /* ignore */ }
     activeDb = null;

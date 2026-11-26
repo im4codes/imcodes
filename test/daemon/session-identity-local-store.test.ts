@@ -28,6 +28,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   resetIdentityStoreCacheForTests();
   vi.unstubAllEnvs();
   await rm(home, { recursive: true, force: true });
@@ -287,6 +288,57 @@ describe('daemon-local session identity store', () => {
       expect(w2.revision).toBe(3);
       expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'after-truncate-2', revision: 3 });
     } finally {
+      try { pinReader.close(); } catch { /* ignore */ }
+    }
+  });
+
+  it('continues steady low-frequency background WAL truncate after initial backoff window and shrinks once unlocked during idle', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await mkdir(home, { recursive: true });
+
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'seed', source: 'web' });
+    resetIdentityStoreCacheForTests();
+
+    const dbPath = localSessionIdentityDbPath();
+    const pinReader = new DatabaseSync(dbPath);
+    pinReader.exec('BEGIN; SELECT count(*) FROM session_identity_profiles;');
+
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;');
+    const bigText = 'Q'.repeat(400_000);
+    const stmt = rawDb.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES ('session', ?, ?, 'h', 1, 1000, 'mcp', NULL)
+    `);
+    for (let i = 0; i < 28; i += 1) {
+      stmt.run(`long-lock-${i}`, bigText);
+    }
+    rawDb.close();
+
+    const walPath = `${dbPath}-wal`;
+    expect(statSync(walPath).size).toBeGreaterThan(8 * 1024 * 1024);
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      expect(await getLocalSessionIdentityProfile('session', 'long-lock-2')).toMatchObject({ content: bigText });
+      expect(statSync(walPath).size).toBeGreaterThan(8 * 1024 * 1024);
+
+      // Hold the read lock past the entire prior 8-attempt exponential window (~12.7s) -> 30s idle.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(statSync(walPath).size).toBeGreaterThan(8 * 1024 * 1024);
+      expect(vi.getTimerCount()).toBe(1);
+
+      // Release the read snapshot after the backoff ceiling was reached, calling NO further store APIs.
+      pinReader.exec('ROLLBACK');
+      await vi.advanceTimersByTimeAsync(5_500);
+
+      const finalWalBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+      expect(finalWalBytes).toBeLessThan(1024 * 1024);
+      // Maintenance stops scheduling once the WAL shrinks below threshold.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
       try { pinReader.close(); } catch { /* ignore */ }
     }
   });
