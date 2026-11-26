@@ -15,15 +15,30 @@ export type EmailServiceErrorCode =
   | 'email_provider_not_configured'
   | 'email_send_failed';
 
+export type EmailFailureCategory =
+  | 'timeout'
+  | 'network_error'
+  | 'http_error'
+  | 'invalid_response'
+  | 'api_error'
+  | 'missing_receipt';
+
 export class EmailServiceError extends Error {
   readonly code: EmailServiceErrorCode;
   readonly statusCode?: number;
+  readonly category?: EmailFailureCategory;
 
-  constructor(code: EmailServiceErrorCode, message: string, statusCode?: number) {
+  constructor(
+    code: EmailServiceErrorCode,
+    message: string,
+    statusCode?: number,
+    category?: EmailFailureCategory,
+  ) {
     super(message);
     this.name = 'EmailServiceError';
     this.code = code;
     this.statusCode = statusCode;
+    this.category = category;
   }
 }
 
@@ -35,8 +50,9 @@ export interface EmailMessage {
   /**
    * Optional reply-to email address.
    * - Amazon SES v2 sets `ReplyToAddresses` to this exact address.
-   * - Alibaba Cloud DirectMail `SingleSendMail` treats `ReplyToAddress` as a boolean toggle (`true`
-   *   selects the verified reply-to address configured in the DirectMail console; cannot override per email).
+   * - Alibaba Cloud DirectMail `SingleSendMail`: this service passes only the boolean
+   *   `ReplyToAddress=true` switch, using the verified reply-to address configured in the
+   *   DirectMail console (`ReplyAddress` is not set by this implementation).
    */
   replyTo?: string;
 }
@@ -112,44 +128,74 @@ const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 const SINGLE_EMAIL_RE = /^[^\s@,;<>()[\]\\"]+@[^\s@,;<>()[\]\\"]+\.[^\s@,;<>()[\]\\"]{2,}$/;
 const SAFE_REGION_RE = /^[a-z0-9-]+$/;
 
-function nonEmpty(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
+function hasNonEmptyConfig(value: string | undefined): boolean {
+  return typeof value === 'string' && !CONTROL_CHAR_RE.test(value) && value.trim().length > 0;
+}
+
+/** Reject control characters in raw config strings before trimming whitespace. */
+function cleanConfigValue(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
+    throw new EmailServiceError('email_invalid_input', `Invalid ${field}`);
+  }
+  if (CONTROL_CHAR_RE.test(raw)) {
+    throw new EmailServiceError('email_invalid_input', `Invalid characters in ${field}`);
+  }
+  const trimmed = raw.trim();
   return trimmed ? trimmed : undefined;
 }
 
-function getAwsSesConfig(env: Partial<EnvConfig>): AwsSesConfig | null {
-  const accessKeyId = nonEmpty(env.AWS_SES_ACCESS_KEY_ID);
-  const secretAccessKey = nonEmpty(env.AWS_SES_SECRET_ACCESS_KEY);
-  const from = nonEmpty(env.AWS_SES_FROM);
+function getAwsSesConfigForStatus(env: Partial<EnvConfig>): boolean {
+  return (
+    hasNonEmptyConfig(env.AWS_SES_ACCESS_KEY_ID) &&
+    hasNonEmptyConfig(env.AWS_SES_SECRET_ACCESS_KEY) &&
+    hasNonEmptyConfig(env.AWS_SES_FROM)
+  );
+}
+
+function getAliyunDmConfigForStatus(env: Partial<EnvConfig>): boolean {
+  return (
+    hasNonEmptyConfig(env.ALIYUN_DM_ACCESS_KEY_ID) &&
+    hasNonEmptyConfig(env.ALIYUN_DM_ACCESS_KEY_SECRET) &&
+    hasNonEmptyConfig(env.ALIYUN_DM_FROM)
+  );
+}
+
+function parseAwsSesConfig(env: Partial<EnvConfig>): AwsSesConfig | null {
+  if (!getAwsSesConfigForStatus(env)) return null;
+  const accessKeyId = cleanConfigValue(env.AWS_SES_ACCESS_KEY_ID, 'AWS_SES_ACCESS_KEY_ID');
+  const secretAccessKey = cleanConfigValue(env.AWS_SES_SECRET_ACCESS_KEY, 'AWS_SES_SECRET_ACCESS_KEY');
+  const from = cleanConfigValue(env.AWS_SES_FROM, 'AWS_SES_FROM');
   if (!accessKeyId || !secretAccessKey || !from) return null;
   return {
     accessKeyId,
     secretAccessKey,
-    region: nonEmpty(env.AWS_SES_REGION) ?? DEFAULT_AWS_SES_REGION,
+    region: cleanConfigValue(env.AWS_SES_REGION, 'AWS_SES_REGION') ?? DEFAULT_AWS_SES_REGION,
     from,
-    endpoint: nonEmpty(env.AWS_SES_ENDPOINT),
+    endpoint: cleanConfigValue(env.AWS_SES_ENDPOINT, 'AWS_SES_ENDPOINT'),
   };
 }
 
-function getAliyunDmConfig(env: Partial<EnvConfig>): AliyunDmConfig | null {
-  const accessKeyId = nonEmpty(env.ALIYUN_DM_ACCESS_KEY_ID);
-  const accessKeySecret = nonEmpty(env.ALIYUN_DM_ACCESS_KEY_SECRET);
-  const from = nonEmpty(env.ALIYUN_DM_FROM);
+function parseAliyunDmConfig(env: Partial<EnvConfig>): AliyunDmConfig | null {
+  if (!getAliyunDmConfigForStatus(env)) return null;
+  const accessKeyId = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_ID, 'ALIYUN_DM_ACCESS_KEY_ID');
+  const accessKeySecret = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_SECRET, 'ALIYUN_DM_ACCESS_KEY_SECRET');
+  const from = cleanConfigValue(env.ALIYUN_DM_FROM, 'ALIYUN_DM_FROM');
   if (!accessKeyId || !accessKeySecret || !from) return null;
   return {
     accessKeyId,
     accessKeySecret,
-    region: nonEmpty(env.ALIYUN_DM_REGION) ?? DEFAULT_ALIYUN_DM_REGION,
+    region: cleanConfigValue(env.ALIYUN_DM_REGION, 'ALIYUN_DM_REGION') ?? DEFAULT_ALIYUN_DM_REGION,
     from,
-    fromAlias: nonEmpty(env.ALIYUN_DM_FROM_ALIAS),
-    endpoint: nonEmpty(env.ALIYUN_DM_ENDPOINT),
+    fromAlias: cleanConfigValue(env.ALIYUN_DM_FROM_ALIAS, 'ALIYUN_DM_FROM_ALIAS'),
+    endpoint: cleanConfigValue(env.ALIYUN_DM_ENDPOINT, 'ALIYUN_DM_ENDPOINT'),
   };
 }
 
 /** Non-secret email provider availability summary. */
 export function getEmailConfigStatus(env: Partial<EnvConfig>): EmailConfigStatus {
-  const awsSes = getAwsSesConfig(env) !== null;
-  const aliyunDm = getAliyunDmConfig(env) !== null;
+  const awsSes = getAwsSesConfigForStatus(env);
+  const aliyunDm = getAliyunDmConfigForStatus(env);
   return {
     configured: awsSes || aliyunDm,
     providers: { awsSes, aliyunDm },
@@ -158,7 +204,7 @@ export function getEmailConfigStatus(env: Partial<EnvConfig>): EmailConfigStatus
 
 /** Resolve active China-mailbox domains used for automatic Aliyun DirectMail routing. */
 export function resolveEmailCnDomains(env: Partial<EnvConfig>): Set<string> {
-  const custom = nonEmpty(env.EMAIL_CN_DOMAINS);
+  const custom = cleanConfigValue(env.EMAIL_CN_DOMAINS, 'EMAIL_CN_DOMAINS');
   if (!custom) return new Set(DEFAULT_EMAIL_CN_DOMAINS);
   const domains = custom
     .split(',')
@@ -189,6 +235,39 @@ function validateEmailAddress(raw: unknown, field: string): string {
   return trimmed;
 }
 
+function resolveReplyTo(messageReplyTo: unknown, envReplyTo: unknown): string | undefined {
+  if (messageReplyTo !== undefined) {
+    if (typeof messageReplyTo !== 'string') {
+      throw new EmailServiceError('email_invalid_input', 'Invalid replyTo email address');
+    }
+    if (CONTROL_CHAR_RE.test(messageReplyTo)) {
+      throw new EmailServiceError('email_invalid_input', 'Invalid characters in replyTo email address');
+    }
+    const trimmed = messageReplyTo.trim();
+    if (trimmed.length === 0) {
+      if (messageReplyTo.length > 0) {
+        throw new EmailServiceError('email_invalid_input', 'Invalid replyTo email address');
+      }
+      return undefined;
+    }
+    return validateEmailAddress(messageReplyTo, 'replyTo');
+  }
+
+  if (envReplyTo !== undefined) {
+    if (typeof envReplyTo !== 'string') {
+      throw new EmailServiceError('email_invalid_input', 'Invalid EMAIL_REPLY_TO');
+    }
+    if (CONTROL_CHAR_RE.test(envReplyTo)) {
+      throw new EmailServiceError('email_invalid_input', 'Invalid characters in EMAIL_REPLY_TO');
+    }
+    const trimmed = envReplyTo.trim();
+    if (!trimmed) return undefined;
+    return validateEmailAddress(envReplyTo, 'EMAIL_REPLY_TO');
+  }
+
+  return undefined;
+}
+
 function validateFromAddress(raw: string, field: string): string {
   if (CONTROL_CHAR_RE.test(raw)) {
     throw new EmailServiceError('email_invalid_input', `Invalid characters in ${field}`);
@@ -210,16 +289,13 @@ function validateSubject(raw: unknown): string {
   return trimmed;
 }
 
-function sanitizeSecrets(raw: string, secrets: Array<string | undefined>): string {
-  let out = raw.replace(/[\r\n]+/g, ' ').trim();
-  for (const secret of secrets) {
-    if (secret && secret.length >= 4) {
-      out = out.split(secret).join('[REDACTED]');
-    }
-  }
-  out = out.replace(/Signature=[^&\s]+/gi, 'Signature=[REDACTED]');
-  out = out.replace(/Authorization:\s*[^\s,;]+(?:\s+[^\r\n]+)?/gi, 'Authorization: [REDACTED]');
-  return out.slice(0, 240);
+function formatSendFailureMessage(
+  provider: EmailProvider,
+  category: EmailFailureCategory,
+  statusCode?: number,
+): string {
+  const statusPart = statusCode !== undefined ? `, status ${statusCode}` : '';
+  return `Email provider ${provider} failed (${category}${statusPart})`;
 }
 
 function sha256Hex(value: string): string {
@@ -235,6 +311,42 @@ function percentEncode(value: string): string {
     /[!'()*]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
   );
+}
+
+/** Execute a POST request with a single timeout covering headers AND full body read. */
+async function postWithBoundedResponse(
+  fetchFn: typeof fetch,
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number,
+  provider: EmailProvider,
+): Promise<{ status: number; ok: boolean; text: string }> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const timeoutErr = new Error('request_timeout');
+      timeoutErr.name = 'TimeoutError';
+      controller.abort(timeoutErr);
+      reject(timeoutErr);
+    }, timeoutMs);
+  });
+
+  try {
+    const response = await Promise.race([
+      fetchFn(url, { method: 'POST', headers, body, signal: controller.signal }),
+      timeoutPromise,
+    ]);
+    const text = await Promise.race([response.text(), timeoutPromise]);
+    return { status: response.status, ok: response.ok, text };
+  } catch (err) {
+    const isTimeout = controller.signal.aborted || (err instanceof Error && err.name === 'TimeoutError');
+    const category: EmailFailureCategory = isTimeout ? 'timeout' : 'network_error';
+    throw new EmailServiceError('email_send_failed', formatSendFailureMessage(provider, category), undefined, category);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function buildAwsEndpointUrl(config: AwsSesConfig): URL {
@@ -257,7 +369,6 @@ async function sendViaAwsSes(
   config: AwsSesConfig,
   params: { to: string; subject: string; text?: string; html?: string; replyTo?: string },
   opts: Required<Pick<EmailSendOptions, 'fetch' | 'now' | 'timeoutMs'>>,
-  secrets: Array<string | undefined>,
 ): Promise<EmailSendResult> {
   const from = validateFromAddress(config.from, 'AWS_SES_FROM');
   const url = buildAwsEndpointUrl(config);
@@ -304,43 +415,60 @@ async function sendViaAwsSes(
   const authorization =
     `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-  let response: Response;
-  try {
-    response = await opts.fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        host: url.host,
-        'x-amz-date': amzDate,
-        'x-amz-content-sha256': payloadHash,
-        authorization,
-      },
-      body: bodyJson,
-      signal: AbortSignal.timeout(opts.timeoutMs),
-    });
-  } catch (err) {
-    const reason = sanitizeSecrets(err instanceof Error ? err.message : String(err), secrets);
-    throw new EmailServiceError('email_send_failed', `AWS SES request failed: ${reason || 'network error'}`);
-  }
+  const res = await postWithBoundedResponse(
+    opts.fetch,
+    url.toString(),
+    {
+      'content-type': 'application/json',
+      host: url.host,
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': payloadHash,
+      authorization,
+    },
+    bodyJson,
+    opts.timeoutMs,
+    'aws_ses',
+  );
 
-  const responseText = await response.text().catch(() => '');
-  if (!response.ok) {
-    const safeDetail = sanitizeSecrets(responseText, secrets);
+  if (!res.ok) {
     throw new EmailServiceError(
       'email_send_failed',
-      `AWS SES failed with status ${response.status}${safeDetail ? `: ${safeDetail}` : ''}`,
-      response.status,
+      formatSendFailureMessage('aws_ses', 'http_error', res.status),
+      res.status,
+      'http_error',
     );
   }
 
-  let messageId = 'unknown';
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(responseText) as { MessageId?: string };
-    if (typeof parsed.MessageId === 'string' && parsed.MessageId) {
-      messageId = parsed.MessageId;
-    }
+    parsed = JSON.parse(res.text);
   } catch {
-    // Some relays or mocks may omit JSON body on 200 OK
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aws_ses', 'invalid_response', res.status),
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aws_ses', 'invalid_response', res.status),
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  const rawId = (parsed as { MessageId?: unknown }).MessageId;
+  const messageId = typeof rawId === 'string' ? rawId.trim() : '';
+  if (!messageId) {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aws_ses', 'missing_receipt', res.status),
+      res.status,
+      'missing_receipt',
+    );
   }
 
   return { provider: 'aws_ses', messageId, fallbackUsed: false };
@@ -362,7 +490,6 @@ async function sendViaAliyunDm(
   config: AliyunDmConfig,
   params: { to: string; subject: string; text?: string; html?: string; replyTo?: string },
   opts: Required<Pick<EmailSendOptions, 'fetch' | 'now' | 'nonce' | 'timeoutMs'>>,
-  secrets: Array<string | undefined>,
 ): Promise<EmailSendResult> {
   const from = validateEmailAddress(config.from, 'ALIYUN_DM_FROM');
   const url = buildAliyunEndpointUrl(config);
@@ -385,9 +512,6 @@ async function sendViaAliyunDm(
     SignatureNonce: signatureNonce,
   };
   if (config.fromAlias) {
-    if (CONTROL_CHAR_RE.test(config.fromAlias)) {
-      throw new EmailServiceError('email_invalid_input', 'Invalid characters in ALIYUN_DM_FROM_ALIAS');
-    }
     rpcParams.FromAlias = config.fromAlias;
   }
   if (params.html) rpcParams.HtmlBody = params.html;
@@ -403,40 +527,67 @@ async function sendViaAliyunDm(
     .digest('base64');
   const body = `${canonicalQuery}&Signature=${percentEncode(signature)}`;
 
-  let response: Response;
-  try {
-    response = await opts.fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded; charset=utf-8',
-      },
-      body,
-      signal: AbortSignal.timeout(opts.timeoutMs),
-    });
-  } catch (err) {
-    const reason = sanitizeSecrets(err instanceof Error ? err.message : String(err), secrets);
-    throw new EmailServiceError('email_send_failed', `Aliyun DirectMail request failed: ${reason || 'network error'}`);
-  }
+  const res = await postWithBoundedResponse(
+    opts.fetch,
+    url.toString(),
+    { 'content-type': 'application/x-www-form-urlencoded; charset=utf-8' },
+    body,
+    opts.timeoutMs,
+    'aliyun_dm',
+  );
 
-  const responseText = await response.text().catch(() => '');
-  let parsed: { EnvId?: string; RequestId?: string; Code?: string; Message?: string } | null = null;
-  try {
-    parsed = JSON.parse(responseText) as { EnvId?: string; RequestId?: string; Code?: string; Message?: string };
-  } catch {
-    parsed = null;
-  }
-
-  if (!response.ok || (parsed && typeof parsed.Code === 'string' && parsed.Code.length > 0)) {
-    const safeDetail = sanitizeSecrets(parsed?.Message ?? responseText, secrets);
-    const codeSuffix = parsed?.Code ? ` (${sanitizeSecrets(parsed.Code, secrets)})` : '';
+  if (!res.ok) {
     throw new EmailServiceError(
       'email_send_failed',
-      `Aliyun DirectMail failed with status ${response.status}${codeSuffix}${safeDetail ? `: ${safeDetail}` : ''}`,
-      response.status,
+      formatSendFailureMessage('aliyun_dm', 'http_error', res.status),
+      res.status,
+      'http_error',
     );
   }
 
-  const messageId = parsed?.EnvId || parsed?.RequestId || 'unknown';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.text);
+  } catch {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aliyun_dm', 'invalid_response', res.status),
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aliyun_dm', 'invalid_response', res.status),
+      res.status,
+      'invalid_response',
+    );
+  }
+
+  const obj = parsed as { EnvId?: unknown; RequestId?: unknown; Code?: unknown };
+  if (typeof obj.Code === 'string' && obj.Code.trim().length > 0) {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aliyun_dm', 'api_error', res.status),
+      res.status,
+      'api_error',
+    );
+  }
+
+  const envId = typeof obj.EnvId === 'string' ? obj.EnvId.trim() : '';
+  const requestId = typeof obj.RequestId === 'string' ? obj.RequestId.trim() : '';
+  const messageId = envId || requestId;
+  if (!messageId) {
+    throw new EmailServiceError(
+      'email_send_failed',
+      formatSendFailureMessage('aliyun_dm', 'missing_receipt', res.status),
+      res.status,
+      'missing_receipt',
+    );
+  }
+
   return { provider: 'aliyun_dm', messageId, fallbackUsed: false };
 }
 
@@ -457,17 +608,10 @@ export async function sendEmail(
   if (!text && !html) {
     throw new EmailServiceError('email_invalid_input', 'Email text or html body is required');
   }
-  const rawReplyTo = nonEmpty(message.replyTo) ?? nonEmpty(env.EMAIL_REPLY_TO);
-  const replyTo = rawReplyTo !== undefined ? validateEmailAddress(rawReplyTo, 'replyTo') : undefined;
+  const replyTo = resolveReplyTo(message.replyTo, env.EMAIL_REPLY_TO);
 
-  const awsConfig = getAwsSesConfig(env);
-  const aliyunConfig = getAliyunDmConfig(env);
-  const secrets = [
-    awsConfig?.accessKeyId,
-    awsConfig?.secretAccessKey,
-    aliyunConfig?.accessKeyId,
-    aliyunConfig?.accessKeySecret,
-  ];
+  const awsConfig = parseAwsSesConfig(env);
+  const aliyunConfig = parseAliyunDmConfig(env);
 
   const runtimeOpts = {
     fetch: options?.fetch ?? globalThis.fetch,
@@ -501,9 +645,9 @@ export async function sendEmail(
 
   const dispatch = async (provider: EmailProvider): Promise<EmailSendResult> => {
     if (provider === 'aws_ses') {
-      return sendViaAwsSes(awsConfig!, { to, subject, text, html, replyTo }, runtimeOpts, secrets);
+      return sendViaAwsSes(awsConfig!, { to, subject, text, html, replyTo }, runtimeOpts);
     }
-    return sendViaAliyunDm(aliyunConfig!, { to, subject, text, html, replyTo }, runtimeOpts, secrets);
+    return sendViaAliyunDm(aliyunConfig!, { to, subject, text, html, replyTo }, runtimeOpts);
   };
 
   try {
@@ -516,12 +660,15 @@ export async function sendEmail(
       throw primaryErr;
     }
     const domain = to.slice(to.lastIndexOf('@') + 1).toLowerCase();
+    const pCat = primaryErr instanceof EmailServiceError ? primaryErr.category : 'unknown';
+    const pStatus = primaryErr instanceof EmailServiceError ? primaryErr.statusCode : undefined;
     logger.warn(
       {
         primary,
         fallback,
         recipientDomain: domain,
-        error: primaryErr instanceof Error ? sanitizeSecrets(primaryErr.message, secrets) : 'unknown_error',
+        category: pCat,
+        ...(pStatus !== undefined ? { statusCode: pStatus } : {}),
       },
       'Primary email provider failed; retrying on fallback provider',
     );
@@ -529,12 +676,13 @@ export async function sendEmail(
       const res = await dispatch(fallback);
       return { ...res, fallbackUsed: true };
     } catch (fallbackErr) {
-      const pMsg = primaryErr instanceof Error ? sanitizeSecrets(primaryErr.message, secrets) : 'failed';
-      const fMsg = fallbackErr instanceof Error ? sanitizeSecrets(fallbackErr.message, secrets) : 'failed';
+      const fCat = fallbackErr instanceof EmailServiceError ? fallbackErr.category : 'unknown';
+      const fStatus = fallbackErr instanceof EmailServiceError ? fallbackErr.statusCode : undefined;
       throw new EmailServiceError(
         'email_send_failed',
-        `Both ${primary} and fallback ${fallback} failed (${pMsg}; ${fMsg})`,
-        fallbackErr instanceof EmailServiceError ? fallbackErr.statusCode : undefined,
+        `Email send failed on ${primary} (${pCat ?? 'error'}${pStatus !== undefined ? `:${pStatus}` : ''}) and fallback ${fallback} (${fCat ?? 'error'}${fStatus !== undefined ? `:${fStatus}` : ''})`,
+        fStatus,
+        fCat === 'unknown' ? undefined : fCat,
       );
     }
   }

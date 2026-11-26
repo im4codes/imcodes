@@ -76,7 +76,7 @@ export interface EnvConfig {
   ALIYUN_DM_ENDPOINT?: string;
 
   EMAIL_CN_DOMAINS?: string;
-  /** On SES sets ReplyToAddresses; on DirectMail enables ReplyToAddress=true using the console-configured address. */
+  /** On SES sets ReplyToAddresses; on DirectMail enables ReplyToAddress=true using the console-configured address (ReplyAddress not set). */
   EMAIL_REPLY_TO?: string;
 
   // Server URL (used to build webhook URLs)

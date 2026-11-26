@@ -305,16 +305,24 @@ describe('dual-channel routing, single-provider operation, and cross-channel fal
     ).rejects.toMatchObject({ code: 'email_provider_not_configured' });
   });
 
-  it('falls back once on primary failure and redacts all credentials when both fail', async () => {
-    const env: Partial<EnvConfig> = { ...baseAwsEnv(), ...baseAliyunEnv() };
+  it('falls back once on primary failure and never leaks encoded secrets, auth headers, or upstream body sentinels', async () => {
+    const awsSecret = 'aws+secret/key=special!';
+    const aliyunSecret = 'aliyun+secret/key=special!';
+    const env: Partial<EnvConfig> = {
+      ...baseAwsEnv({ AWS_SES_SECRET_ACCESS_KEY: awsSecret }),
+      ...baseAliyunEnv({ ALIYUN_DM_ACCESS_KEY_SECRET: aliyunSecret }),
+    };
     const warnSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // Primary fails (500), fallback succeeds
+    // Primary fails (500 with encoded secret + sentinel), fallback succeeds
     let call = 0;
     const fetchFallbackOk = vi.fn<typeof fetch>(async () => {
       call++;
       if (call === 1) {
-        return new Response(`denied with secret ${env.ALIYUN_DM_ACCESS_KEY_SECRET}`, { status: 500 });
+        return new Response(
+          `SENTINEL_PRIMARY_BODY ${encodeURIComponent(aliyunSecret)} Authorization: Bearer leaked`,
+          { status: 500 },
+        );
       }
       return new Response(JSON.stringify({ MessageId: 'ses-fallback-ok' }), { status: 200 });
     });
@@ -322,14 +330,21 @@ describe('dual-channel routing, single-provider operation, and cross-channel fal
     const okRes = await sendEmail(env, { to: 'user@qq.com', subject: 'Hi', text: 'Body' }, { fetch: fetchFallbackOk });
     expect(okRes).toEqual({ provider: 'aws_ses', messageId: 'ses-fallback-ok', fallbackUsed: true });
     expect(fetchFallbackOk).toHaveBeenCalledTimes(2);
-    expect(warnSpy.mock.calls.flat().join(' ')).not.toContain(env.ALIYUN_DM_ACCESS_KEY_SECRET!);
+    const loggedText = warnSpy.mock.calls.flat().join(' ');
+    expect(loggedText).not.toContain(aliyunSecret);
+    expect(loggedText).not.toContain(encodeURIComponent(aliyunSecret));
+    expect(loggedText).not.toContain('SENTINEL_PRIMARY_BODY');
+    expect(loggedText).not.toContain('Authorization:');
 
-    // Both fail (network throw + 502) -> throws email_send_failed without leaking either secret
+    // Both fail (network throw + 502 with URL-encoded/JSON-escaped secret & sentinel)
     const fetchBothFail = vi.fn<typeof fetch>(async (url) => {
       if (String(url).includes('aliyuncs.com')) {
-        throw new Error(`socket err key=${env.ALIYUN_DM_ACCESS_KEY_SECRET} Signature=abc123`);
+        throw new Error(`SENTINEL_NET_ERR ${encodeURIComponent(aliyunSecret)} Signature=abc123`);
       }
-      return new Response(`bad ${env.AWS_SES_SECRET_ACCESS_KEY} Authorization: AWS4-HMAC-SHA256 ...`, { status: 502 });
+      return new Response(
+        JSON.stringify({ sentinel: 'SENTINEL_AWS_502', raw: awsSecret, encoded: encodeURIComponent(awsSecret) }),
+        { status: 502 },
+      );
     });
 
     let caught: unknown;
@@ -339,27 +354,117 @@ describe('dual-channel routing, single-provider operation, and cross-channel fal
       caught = err;
     }
     expect(caught).toBeInstanceOf(EmailServiceError);
-    expect((caught as EmailServiceError).code).toBe('email_send_failed');
-    expect((caught as Error).message).not.toContain(env.AWS_SES_SECRET_ACCESS_KEY!);
-    expect((caught as Error).message).not.toContain(env.ALIYUN_DM_ACCESS_KEY_SECRET!);
-    expect((caught as Error).message).not.toContain('Signature=abc123');
+    const err = caught as EmailServiceError & { cause?: unknown };
+    expect(err.code).toBe('email_send_failed');
+    expect(err.cause).toBeUndefined();
+    for (const forbidden of [
+      awsSecret,
+      encodeURIComponent(awsSecret),
+      aliyunSecret,
+      encodeURIComponent(aliyunSecret),
+      'SENTINEL_NET_ERR',
+      'SENTINEL_AWS_502',
+      'Signature=abc123',
+      'Authorization:',
+    ]) {
+      expect(err.message).not.toContain(forbidden);
+      expect(warnSpy.mock.calls.flat().join(' ')).not.toContain(forbidden);
+    }
 
     warnSpy.mockRestore();
+  });
+
+  it('treats body read timeouts and malformed/empty-receipt 2xx responses as send failures and triggers fallback in auto mode', async () => {
+    const dualEnv: Partial<EnvConfig> = { ...baseAwsEnv(), ...baseAliyunEnv() };
+
+    // 1. Both providers reject 200 HTML proxy page, {}, whitespace/non-string IDs, and API error Code
+    const badAwsBodies = [
+      '<html><body>200 OK Proxy Error</body></html>',
+      '{}',
+      JSON.stringify({ MessageId: '   ' }),
+      JSON.stringify({ MessageId: 12345 }),
+    ];
+    for (const body of badAwsBodies) {
+      const fetchMock = vi.fn<typeof fetch>(async () => new Response(body, { status: 200 }));
+      await expect(
+        sendEmail(dualEnv, { to: 'u@gmail.com', subject: 'Hi', text: 'Body' }, { provider: 'aws_ses', fetch: fetchMock }),
+      ).rejects.toMatchObject({ code: 'email_send_failed' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+
+    const badAliyunBodies = [
+      '<html><body>200 OK Proxy Error</body></html>',
+      '{}',
+      JSON.stringify({ EnvId: '   ', RequestId: null }),
+      JSON.stringify({ Code: 'InvalidMailAddress.NotFound', EnvId: 'ignored' }),
+    ];
+    for (const body of badAliyunBodies) {
+      const fetchMock = vi.fn<typeof fetch>(async () => new Response(body, { status: 200 }));
+      await expect(
+        sendEmail(dualEnv, { to: 'u@qq.com', subject: 'Hi', text: 'Body' }, { provider: 'aliyun_dm', fetch: fetchMock }),
+      ).rejects.toMatchObject({ code: 'email_send_failed' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+
+    // 2. Headers arrive 200 OK, but response.text() hangs past timeoutMs -> fails in explicit mode, falls back in auto mode
+    const hangingResponse = (): Response =>
+      ({
+        ok: true,
+        status: 200,
+        text: () => new Promise<string>(() => {}),
+      }) as unknown as Response;
+
+    const hangExplicitFetch = vi.fn<typeof fetch>(async () => hangingResponse());
+    await expect(
+      sendEmail(dualEnv, { to: 'u@gmail.com', subject: 'Hi', text: 'Body' }, {
+        provider: 'aws_ses',
+        timeoutMs: 20,
+        fetch: hangExplicitFetch,
+      }),
+    ).rejects.toMatchObject({ code: 'email_send_failed', category: 'timeout' });
+    expect(hangExplicitFetch).toHaveBeenCalledTimes(1);
+
+    let autoCall = 0;
+    const hangThenRecoverFetch = vi.fn<typeof fetch>(async () => {
+      autoCall++;
+      if (autoCall === 1) return hangingResponse();
+      return new Response(JSON.stringify({ MessageId: 'ses-after-dm-body-timeout' }), { status: 200 });
+    });
+    const recovered = await sendEmail(
+      dualEnv,
+      { to: 'u@qq.com', subject: 'Hi', text: 'Body' },
+      { timeoutMs: 20, fetch: hangThenRecoverFetch },
+    );
+    expect(recovered).toEqual({
+      provider: 'aws_ses',
+      messageId: 'ses-after-dm-body-timeout',
+      fallbackUsed: true,
+    });
+    expect(hangThenRecoverFetch).toHaveBeenCalledTimes(2);
   });
 });
 
 describe('email input validation and header injection protection', () => {
-  it('rejects CRLF, NUL, multi-recipient lists, and empty bodies before calling fetch', async () => {
+  it('rejects leading/trailing CRLF, NUL, multi-recipient lists, replyTo injection, and empty bodies before calling fetch', async () => {
     const fetchMock = vi.fn<typeof fetch>();
-    const env = baseAwsEnv();
+    const env = baseAwsEnv({ EMAIL_REPLY_TO: 'safe@im.codes' });
 
     const badPayloads = [
+      { to: 'a@b.com\r\n', subject: 'Hi', text: 'Body' },
+      { to: '  \ra@b.com', subject: 'Hi', text: 'Body' },
+      { to: 'a@b.com\n  ', subject: 'Hi', text: 'Body' },
+      { to: 'a@b.com\0', subject: 'Hi', text: 'Body' },
       { to: 'a@b.com\r\nBcc: evil@x.com', subject: 'Hi', text: 'Body' },
       { to: 'a@b.com,c@d.com', subject: 'Hi', text: 'Body' },
       { to: 'Name <a@b.com>', subject: 'Hi', text: 'Body' },
+      { to: 'a@b.com', subject: 'Hello\r\n', text: 'Body' },
+      { to: 'a@b.com', subject: '\nHello', text: 'Body' },
       { to: 'a@b.com', subject: 'Hello\nBcc: evil@x.com', text: 'Body' },
       { to: 'a@b.com', subject: 'Hello\0', text: 'Body' },
       { to: 'a@b.com', subject: 'Hi', text: '   ', html: '' },
+      { to: 'a@b.com', subject: 'Hi', text: 'Body', replyTo: 'r@b.com\r\n' },
+      { to: 'a@b.com', subject: 'Hi', text: 'Body', replyTo: '\r\n' },
+      { to: 'a@b.com', subject: 'Hi', text: 'Body', replyTo: '  \0r@b.com  ' },
       { to: 'a@b.com', subject: 'Hi', text: 'Body', replyTo: 'r@b.com\r\nX: y' },
     ];
 
@@ -368,7 +473,25 @@ describe('email input validation and header injection protection', () => {
         code: 'email_invalid_input',
       });
     }
+    await expect(
+      sendEmail(
+        baseAwsEnv({ EMAIL_REPLY_TO: 'reply@im.codes\r\n' }),
+        { to: 'a@b.com', subject: 'Hi', text: 'Body' },
+        { fetch: fetchMock },
+      ),
+    ).rejects.toMatchObject({ code: 'email_invalid_input' });
     expect(fetchMock).not.toHaveBeenCalled();
+
+    // Ordinary surrounding spaces remain supported cleanly
+    const okFetch = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ MessageId: 'space-trim-ok' }), { status: 200 }),
+    );
+    const trimmedRes = await sendEmail(
+      env,
+      { to: '  a@gmail.com  ', subject: '  Hello  ', text: 'Body', replyTo: '  r@im.codes  ' },
+      { fetch: okFetch },
+    );
+    expect(trimmedRes).toEqual({ provider: 'aws_ses', messageId: 'space-trim-ok', fallbackUsed: false });
 
     await expect(sendEmail({}, { to: 'a@b.com', subject: 'Hi', text: 'Body' }, { fetch: fetchMock })).rejects.toMatchObject({
       code: 'email_not_configured',
@@ -508,6 +631,18 @@ describe('admin email endpoints', () => {
     });
     expect(badRes.status).toBe(400);
 
+    // Trailing CRLF / leading NUL on valid-looking email must still reject 400 without calling fetch
+    for (const badTo of ['recipient@qq.com\r\n', '\nrecipient@qq.com', 'recipient@qq.com\0']) {
+      const trailingBadRes = await cfg.app.request('/api/admin/email/test', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: badTo }),
+      });
+      expect(trailingBadRes.status).toBe(400);
+      expect((await trailingBadRes.json()).error).toBe('email_invalid_input');
+    }
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+
     const okRes = await cfg.app.request('/api/admin/email/test', {
       method: 'POST',
       headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
@@ -543,11 +678,16 @@ describe('admin email endpoints', () => {
     expect(prov503.status).toBe(503);
     expect((await prov503.json()).error).toBe('email_provider_not_configured');
 
-    // Upstream failure -> 502 without leaking secret
+    // Upstream failure -> 502 without leaking raw or encoded secrets or body sentinels
+    const trickySecret = 'aws+secret/key=special!';
+    const trickyAws = buildAdminTestApp({
+      user: { id: 'u-admin', is_admin: true, status: 'active' },
+      envOverrides: baseAwsEnv({ AWS_SES_SECRET_ACCESS_KEY: trickySecret }),
+    });
     globalThis.fetch = vi.fn<typeof fetch>(async () =>
-      new Response('upstream error aws-secret-key-do-not-leak', { status: 500 }),
+      new Response(`SENTINEL_ADMIN_502 ${trickySecret} ${encodeURIComponent(trickySecret)}`, { status: 500 }),
     );
-    const fail502 = await awsOnly.app.request('/api/admin/email/test', {
+    const fail502 = await trickyAws.app.request('/api/admin/email/test', {
       method: 'POST',
       headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ to: 'recipient@gmail.com' }),
@@ -555,6 +695,8 @@ describe('admin email endpoints', () => {
     expect(fail502.status).toBe(502);
     const failJson = await fail502.json();
     expect(failJson.error).toBe('email_send_failed');
-    expect(failJson.message).not.toContain('aws-secret-key-do-not-leak');
+    expect(failJson.message).not.toContain(trickySecret);
+    expect(failJson.message).not.toContain(encodeURIComponent(trickySecret));
+    expect(failJson.message).not.toContain('SENTINEL_ADMIN_502');
   });
 });

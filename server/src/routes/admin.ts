@@ -142,7 +142,8 @@ adminRoutes.put('/settings', async (c) => {
 // ── Email status & test send ──────────────────────────────────────────────
 
 const emailTestSchema = z.object({
-  to: z.string().trim().min(1),
+  // Preserve raw string (no .trim()) so sendEmail detects leading/trailing CR/LF/NUL injection before normalizing.
+  to: z.string().min(1),
   subject: z.string().optional(),
   text: z.string().optional(),
   html: z.string().optional(),
@@ -178,8 +179,9 @@ adminRoutes.post('/email/test', async (c) => {
       },
       provider && provider !== 'auto' ? { provider } : undefined,
     );
-    const at = to.lastIndexOf('@');
-    const recipientDomain = at === -1 ? 'unknown' : to.slice(at + 1).toLowerCase();
+    const trimmedTo = to.trim();
+    const at = trimmedTo.lastIndexOf('@');
+    const recipientDomain = at === -1 ? 'unknown' : trimmedTo.slice(at + 1).toLowerCase();
     const ip = c.get('clientIp' as never) as string ?? 'unknown';
     await logAudit(
       {
