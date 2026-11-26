@@ -1,14 +1,14 @@
 {
   "manifestVersion": 2,
   "repository": "im4codes/imcodes",
-  "releaseTag": "libwebrtc-sdk-windows-x64-e5ff661fe607564f-65d5ab61719ea2b3",
+  "releaseTag": "libwebrtc-sdk-windows-x64-e5ff661fe607564f-2bfec49815aabae4",
   "assetName": "imcodes-libwebrtc-sdk-windows-x64.zip",
-  "sha256": "65d5ab61719ea2b32da25345feabe077489fb7febd05e355eeca09be672cf9f1",
+  "sha256": "2bfec49815aabae41ae9ae6c312f732cd8168a04ad83f267ac693dc75d631ecb",
   "sourceSha256": "e5ff661fe607564f23ef019cb011a1f33351304896723467fb860033f7316f0c",
-  "sourceCommit": "d03e2f7d8b6dfa4e7e4cefa91c67999a5deae44c",
+  "sourceCommit": "d8fcd95f44b070c4a61bef776fc1ad44420428fe",
   "libwebrtcRevision": "f20ebb8adbf4fa781830e4384c61f732bd28a217",
   "depotToolsRevision": "a1bda5b6167435ad0666191f0353f242104f5845",
-  "sdkManifestSha256": "b8aacac0e41266766bd51f54587ea13467b41f289170c5804ec9ef4671729032",
+  "sdkManifestSha256": "15c564b94fa7c95073c500b0a6b645e136fca143246e09790d83ddea41a4a0af",
   "toolchain": {
     "msvc": "14.44.35207",
     "windowsSdk": "10.0.26100.0",
