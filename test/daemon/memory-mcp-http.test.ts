@@ -727,6 +727,108 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
     });
     expect(swapRes2.body === '' || swapRes2.body.includes('daemon_memory_worker_identity_unavailable')).toBe(true);
     expect(listSessionModels).not.toHaveBeenCalled();
+
+    // Repeat mid-POST replacement against direct registered tool `session_runtime_identity_get`
+    // and against `mcp_tool_search` `fallbackCall`, verifying replacement `inst-swap-v4` is never leaked.
+    const connectNextSwap = async (tag: string) => {
+      const cl = new Client({ name: `swap-client-${tag}`, version: '1' });
+      const tr = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}${MEMORY_MCP_HTTP_PATH}`), {
+        requestInit: {
+          headers: {
+            [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+            [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: String(currentSession.sessionInstanceId),
+            [HOOK_SESSION_CREDENTIAL_HEADER]: String(currentSession.hookCredential),
+          },
+        },
+      });
+      cleanups.unshift(() => cl.close().catch(() => {}));
+      await cl.connect(tr);
+      return { cl, tr };
+    };
+    const sendSwapPost = async (
+      sidTarget: string,
+      instHeader: string,
+      credHeader: string,
+      reqId: number,
+      params: Record<string, unknown>,
+      nextInst: string,
+      nextCred: string,
+    ) => {
+      const payload = JSON.stringify({ jsonrpc: '2.0', id: reqId, method: 'tools/call', params });
+      const split = Math.floor(payload.length / 2);
+      return new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request({
+          agent: false,
+          hostname: '127.0.0.1',
+          port,
+          path: MEMORY_MCP_HTTP_PATH,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'Content-Length': String(Buffer.byteLength(payload)),
+            [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+            [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: instHeader,
+            [HOOK_SESSION_CREDENTIAL_HEADER]: credHeader,
+            'mcp-session-id': sidTarget,
+          },
+        }, (res) => {
+          let body = '';
+          res.on('data', (chunk) => { body += chunk; });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+        });
+        req.on('error', reject);
+        req.write(payload.slice(0, split));
+        setTimeout(() => {
+          currentSession = {
+            ...currentSession,
+            sessionInstanceId: nextInst,
+            runtimeEpoch: `epoch-${nextInst}`,
+            hookCredential: nextCred,
+          };
+          req.end(payload.slice(split));
+        }, 25);
+      });
+    };
+
+    const s3 = await connectNextSwap('direct');
+    const directRes = await sendSwapPost(
+      s3.tr.sessionId!,
+      'inst-swap-v3',
+      'cred-swap-v3',
+      53,
+      { name: 'session_runtime_identity_get', arguments: {} },
+      'inst-swap-v4',
+      'cred-swap-v4',
+    );
+    expect(directRes.body).not.toContain('inst-swap-v4');
+    expect(directRes.body === '' || directRes.body.includes('daemon_memory_worker_identity_unavailable')).toBe(true);
+    const directFollowUp = await rawHttpRequest({
+      port, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION]: 'deck_swap_w1',
+        [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: 'inst-swap-v4',
+        [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-swap-v4',
+        'mcp-session-id': s3.tr.sessionId!,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 54, method: 'tools/list', params: {} }),
+    });
+    expect(directFollowUp.status).toBe(404);
+
+    const s4 = await connectNextSwap('fallback');
+    const fallbackRes = await sendSwapPost(
+      s4.tr.sessionId!,
+      'inst-swap-v4',
+      'cred-swap-v4',
+      55,
+      { name: 'mcp_tool_search', arguments: { query: 'session_runtime_identity_get', fallbackCall: { name: 'session_runtime_identity_get', arguments: {} } } },
+      'inst-swap-v5',
+      'cred-swap-v5',
+    );
+    expect(fallbackRes.body).not.toContain('inst-swap-v5');
+    expect(fallbackRes.body === '' || fallbackRes.body.includes('daemon_memory_worker_identity_unavailable')).toBe(true);
   });
 
   it('evicts idle HTTP MCP sessions via TTL sweep', async () => {

@@ -153,6 +153,7 @@ export function registerMcpToolDiscovery(
   // per-connection schema publication starts hidden.
   for (const [name, tool] of tools) tool.enabled = staticFullCatalog || isDefaultActiveMcpTool(name);
   let catalogGeneration = 1;
+  let publicationSeq = 0;
 
   return server.registerTool(MCP_TOOL_DISCOVERY_NAME, {
     // This is the sole model-visible copy of the lazy-routing hint. Publishing
@@ -246,6 +247,7 @@ export function registerMcpToolDiscovery(
           tool.enabled = shouldBeEnabled;
         }
       }
+      publicationSeq += 1;
       // Always re-emit for a non-empty legitimate selection. A host may have
       // missed the previous notification even though the service was already
       // active and the server-side publication state is unchanged.
@@ -258,6 +260,7 @@ export function registerMcpToolDiscovery(
     const publishedSelectionQuery = exactGroup && publishedNames.length > 0
       ? `${MCP_TOOL_GROUP_QUERY_PREFIX}${exactGroup.id}`
       : (exactToolName ?? null);
+    const committedPublicationSeq = shouldPublish && !staticFullCatalog ? publicationSeq : null;
     const attachPublishedMeta = <T extends { [key: string]: unknown }>(payload: T): T => {
       if (!shouldPublish || staticFullCatalog || process.env[IMCODES_MEMORY_MCP_BACKEND_ENV] !== '1') {
         return payload;
@@ -270,6 +273,7 @@ export function registerMcpToolDiscovery(
         _meta: {
           ...existingMeta,
           imcodesPublishedQuery: publishedSelectionQuery,
+          imcodesPublishedSeq: committedPublicationSeq,
         },
       };
     };

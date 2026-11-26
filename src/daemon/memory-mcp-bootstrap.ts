@@ -59,6 +59,7 @@ interface DiscoveryCallMeta {
   query: string;
   hadFallback: boolean;
   activatesSelection: boolean;
+  seq?: number;
 }
 
 interface QueuedMessage {
@@ -154,6 +155,8 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let shuttingDown = false;
   let clientInitialized = false;
   let lastPublishedDiscoveryQuery: string | null = null;
+  let lastAppliedPublishedSeq = 0;
+  let generationDiscoverySeq = 0;
   const queued: QueuedMessage[] = [];
   const inFlight = new Map<string, InFlightRequest>();
   const idleTerminatingChildren = new WeakSet<ChildProcessWithoutNullStreams>();
@@ -320,7 +323,15 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       armIdleTimerIfIdle();
     }, timeoutMs);
     timer.unref?.();
-    inFlight.set(key, { id, generation: currentGeneration, timer, ...(discovery ? { discovery } : {}) });
+    const trackedDiscovery = discovery
+      ? { ...discovery, seq: ++generationDiscoverySeq }
+      : undefined;
+    inFlight.set(key, {
+      id,
+      generation: currentGeneration,
+      timer,
+      ...(trackedDiscovery ? { discovery: trackedDiscovery } : {}),
+    });
   };
 
   const flushQueued = () => {
@@ -380,6 +391,8 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const startBackend = () => {
     if (shuttingDown || backend) return;
     generation += 1;
+    generationDiscoverySeq = 0;
+    lastAppliedPublishedSeq = 0;
     const currentGeneration = generation;
     const command = backendCommand();
     const child = spawn(command.command, command.args, {
@@ -483,7 +496,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
           return;
         }
         const discovery = settledRequest.discovery;
-        if (!message.error && message.result && typeof message.result === 'object') {
+        if (settledRequest.generation === generation && !message.error && message.result && typeof message.result === 'object') {
           const resultObj = message.result as Record<string, unknown>;
           const meta = resultObj._meta && typeof resultObj._meta === 'object' && !Array.isArray(resultObj._meta)
             ? (resultObj._meta as Record<string, unknown>)
@@ -491,32 +504,42 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
           const hasAuthoritativeMeta = Boolean(meta && Object.prototype.hasOwnProperty.call(meta, 'imcodesPublishedQuery'));
           if (hasAuthoritativeMeta && meta) {
             const rawPublished = meta.imcodesPublishedQuery;
-            lastPublishedDiscoveryQuery = typeof rawPublished === 'string' && rawPublished.trim().length > 0
-              ? rawPublished.trim()
-              : null;
+            const rawSeq = meta.imcodesPublishedSeq;
+            const seq = typeof rawSeq === 'number' && Number.isSafeInteger(rawSeq) ? rawSeq : discovery?.seq;
+            if (seq === undefined || seq > lastAppliedPublishedSeq) {
+              lastPublishedDiscoveryQuery = typeof rawPublished === 'string' && rawPublished.trim().length > 0
+                ? rawPublished.trim()
+                : null;
+              if (seq !== undefined) lastAppliedPublishedSeq = seq;
+            }
             delete meta.imcodesPublishedQuery;
+            delete meta.imcodesPublishedSeq;
             if (Object.keys(meta).length === 0) {
               delete resultObj._meta;
             }
           } else if (discovery?.activatesSelection) {
-            const sc = resultObj.structuredContent as Record<string, unknown> | undefined;
-            if (sc && (Array.isArray(sc.publishedGroups) || Array.isArray(sc.published))) {
-              const publishedGroups = Array.isArray(sc.publishedGroups)
-                ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0)
-                : [];
-              const publishedTools = Array.isArray(sc.published)
-                ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
-                : [];
-              if (publishedGroups.length > 0) {
-                lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
-              } else if (publishedTools.length > 0) {
-                lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
-              } else {
-                lastPublishedDiscoveryQuery = null;
+            const seq = discovery.seq;
+            if (seq === undefined || seq > lastAppliedPublishedSeq) {
+              const sc = resultObj.structuredContent as Record<string, unknown> | undefined;
+              if (sc && (Array.isArray(sc.publishedGroups) || Array.isArray(sc.published))) {
+                const publishedGroups = Array.isArray(sc.publishedGroups)
+                  ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0)
+                  : [];
+                const publishedTools = Array.isArray(sc.published)
+                  ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+                  : [];
+                if (publishedGroups.length > 0) {
+                  lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
+                } else if (publishedTools.length > 0) {
+                  lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
+                } else {
+                  lastPublishedDiscoveryQuery = null;
+                }
+              } else if (discovery.hadFallback) {
+                // Target tool ran after query publication (including business-error results).
+                lastPublishedDiscoveryQuery = discovery.query;
               }
-            } else if (discovery.hadFallback) {
-              // Target tool ran after query publication (including business-error results).
-              lastPublishedDiscoveryQuery = discovery.query;
+              if (seq !== undefined) lastAppliedPublishedSeq = seq;
             }
           }
         }

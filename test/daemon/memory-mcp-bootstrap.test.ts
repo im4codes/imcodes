@@ -690,4 +690,80 @@ describe('memory MCP lightweight bootstrap', () => {
     const lateReply = await waitFor(() => messages.find((m) => m.id === 999));
     expect(lateReply).toMatchObject({ error: { code: -32004 } });
   }, 15_000);
+
+  it('tracks committed publication order across slow overlapping fallbackCall and later selection/clear across idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-seq-overlap-'));
+    const startLog = join(dir, 'starts.log');
+    const callLog = join(dir, 'calls.log');
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_DYNAMIC_CATALOG: '1',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_CALL_LOG: callLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+    });
+    await client.connect(transport);
+
+    // 1. Start slow fallbackCall A (commits fixture_echo first at seq=1, delays 300ms before returning).
+    const slowA = client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'slow-fallback', delayMs: 300 } },
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+
+    // 2. While slowA is awaiting its fallback, commit fixture_other at seq=2 (returns first!).
+    const fastB = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'fixture_other' },
+    });
+    expect(fastB).toMatchObject({ structuredContent: { published: ['fixture_other'] } });
+    // Even though slowA finishes LAST, its seq=1 MUST NOT overwrite fastB seq=2!
+    const slowARes = await slowA;
+    expect(slowARes).toMatchObject({ structuredContent: { published: ['fixture_echo'], fallbackExecuted: true } });
+
+    // Reap gen 1, wake gen 2 -> must replay fixture_other (seq=2), NOT stale fixture_echo (seq=1),
+    // and never replay slow-fallback!
+    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await expect(client.callTool({ name: 'fixture_other', arguments: { value: 'after-switch' } }))
+      .resolves.toMatchObject({ structuredContent: { echoed: 'after-switch' } });
+    expect((await client.listTools()).tools.map((t) => t.name)).toContain('fixture_other');
+    expect((await client.listTools()).tools.map((t) => t.name)).not.toContain('fixture_echo');
+
+    // Repeat overlap with slowA (seq=2 in gen 2) followed by unmatched empty clear (seq=3 in gen 2).
+    const slowA2 = client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'slow-fallback-2', delayMs: 300 } },
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+    const fastClear = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'missing_clear_xyz' },
+    });
+    expect(fastClear).toMatchObject({ structuredContent: { published: [] } });
+    await slowA2;
+
+    // Reap gen 2, wake gen 3 -> cleared state stays empty; fixture_echo is NOT resurrected!
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.split('"idle_timeout"').length >= 3 ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'should-fail' } })).rejects.toThrow();
+    expect((await client.listTools()).tools.map((t) => t.name)).toEqual(['mcp_tool_search']);
+
+    const calls = (await readFile(callLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { name: string; arguments: Record<string, unknown> });
+    const replaySearches = calls.filter((c) => c.name === 'mcp_tool_search' && c.arguments.activate === true);
+    expect(replaySearches).toEqual([{ name: 'mcp_tool_search', arguments: { query: 'fixture_other', activate: true } }]);
+    expect(calls.filter((c) => (c.arguments as { fallbackCall?: unknown }).fallbackCall)).toHaveLength(2);
+  }, 25_000);
 });

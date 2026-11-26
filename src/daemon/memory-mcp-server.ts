@@ -124,6 +124,7 @@ export interface MemoryMcpServerCatalogOptions {
   daemonAdmissionEnabled?: boolean;
   daemonAdmissionOwner?: SessionResourceOwner | null;
   withheldTools?: readonly string[];
+  verifyDispatchIdentity?: () => void | Promise<void>;
 }
 
 /** Narrow daemon-bridge seams used to make transient hook outages deterministic in tests. */
@@ -428,6 +429,25 @@ function installParticipantTurnGate(server: McpServer, participantTurnRequired: 
   }) as typeof server.registerTool;
 }
 
+function installDispatchIdentityGate(
+  server: McpServer,
+  verifyDispatchIdentity: (() => void | Promise<void>) | undefined,
+): void {
+  if (!verifyDispatchIdentity) return;
+  const original = server.registerTool.bind(server);
+  server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
+    const gated = async (...args: unknown[]) => {
+      await verifyDispatchIdentity();
+      return callback(...args);
+    };
+    return original(
+      name,
+      config as Parameters<typeof original>[1],
+      gated as Parameters<typeof original>[2],
+    );
+  }) as typeof server.registerTool;
+}
+
 type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
 
 export function createMemoryMcpServer(
@@ -454,6 +474,7 @@ export function createMemoryMcpServer(
       catalogOptions.daemonAdmissionOwner ?? null,
     );
   }
+  installDispatchIdentityGate(server, catalogOptions.verifyDispatchIdentity);
   installParticipantTurnGate(server, toolDeps.participantTurnRequired);
   const registered = new Map([
     ...registerMemoryMcpTools(server, caller, toolDeps),

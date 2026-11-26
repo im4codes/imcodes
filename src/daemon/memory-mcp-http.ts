@@ -573,7 +573,14 @@ export function createMemoryMcpHttpHandler(options: MemoryMcpHttpHandlerOptions)
         deps,
         undefined,
         createSupervisionMcpToolDeps(),
-        { toolCatalogMode },
+        {
+          toolCatalogMode,
+          verifyDispatchIdentity: () => {
+            if (!verifyBoundConnection()) {
+              throw new Error('daemon_memory_worker_identity_unavailable');
+            }
+          },
+        },
       );
 
       entry.server = server;

@@ -15,19 +15,24 @@ const replyLog = process.env.IMCODES_MEMORY_MCP_TEST_REPLY_LOG;
 const callLog = process.env.IMCODES_MEMORY_MCP_TEST_CALL_LOG;
 const dynamicCatalog = process.env.IMCODES_MEMORY_MCP_TEST_DYNAMIC_CATALOG === '1';
 let readyCrashScheduled = false;
-let dynamicPublished = false;
+let dynamicPublishedTool = null;
+let dynamicPublicationSeq = 0;
 
 if (process.env.IMCODES_MEMORY_MCP_TEST_IGNORE_SIGTERM === '1') {
   process.on('SIGTERM', () => {});
 }
 
-const baseTools = [
-  {
-    name: 'fixture_echo',
-    description: 'Fixture tool.',
-    inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
-  },
-];
+const echoTool = {
+  name: 'fixture_echo',
+  description: 'Fixture tool.',
+  inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+};
+const otherTool = {
+  name: 'fixture_other',
+  description: 'Second dynamic fixture tool.',
+  inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+};
+const baseTools = [echoTool];
 const searchTool = {
   name: 'mcp_tool_search',
   description: 'Search/publish hidden fixture tools.',
@@ -69,7 +74,11 @@ lines.on('line', (line) => {
   }
   if (message.method === 'tools/list') {
     const tools = dynamicCatalog
-      ? (dynamicPublished ? [searchTool, ...baseTools] : [searchTool])
+      ? (dynamicPublishedTool === 'fixture_echo'
+          ? [searchTool, echoTool]
+          : dynamicPublishedTool === 'fixture_other'
+            ? [searchTool, otherTool]
+            : [searchTool])
       : baseTools;
     process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools } })}\n`);
     if (!readyCrashScheduled && Number.isSafeInteger(crashAfterReadyMs) && crashAfterReadyMs > 0) {
@@ -86,25 +95,36 @@ lines.on('line', (line) => {
       const query = String(message.params?.arguments?.query ?? '');
       const activate = message.params?.arguments?.activate !== false;
       const fallbackCall = message.params?.arguments?.fallbackCall;
-      if (query === 'fixture_echo' && activate) {
-        dynamicPublished = true;
-        process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`);
+      if (activate) {
+        dynamicPublishedTool = (query === 'fixture_echo' || query === 'fixture_other') ? query : null;
+        dynamicPublicationSeq += 1;
+        if (dynamicPublishedTool) {
+          process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`);
+        }
       }
-      process.stdout.write(`${JSON.stringify({
-        jsonrpc: '2.0',
-        id: message.id,
-        result: {
-          content: [{ type: 'text', text: JSON.stringify({ published: dynamicPublished ? ['fixture_echo'] : [], fallbackExecuted: Boolean(fallbackCall) }) }],
-          structuredContent: { published: dynamicPublished ? ['fixture_echo'] : [], fallbackExecuted: Boolean(fallbackCall) },
-        },
-      })}\n`);
+      const committedTool = dynamicPublishedTool;
+      const committedSeq = dynamicPublicationSeq;
+      const sendSearchReply = () => {
+        process.stdout.write(`${JSON.stringify({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify({ published: committedTool ? [committedTool] : [], fallbackExecuted: Boolean(fallbackCall) }) }],
+            structuredContent: { published: committedTool ? [committedTool] : [], fallbackExecuted: Boolean(fallbackCall) },
+            ...(activate ? { _meta: { imcodesPublishedQuery: committedTool, imcodesPublishedSeq: committedSeq } } : {}),
+          },
+        })}\n`);
+      };
+      const fbDelayMs = Number(fallbackCall?.arguments?.delayMs ?? 0);
+      if (Number.isSafeInteger(fbDelayMs) && fbDelayMs > 0) setTimeout(sendSearchReply, fbDelayMs);
+      else sendSearchReply();
       return;
     }
-    if (dynamicCatalog && message.params?.name === 'fixture_echo' && !dynamicPublished) {
+    if (dynamicCatalog && (message.params?.name === 'fixture_echo' || message.params?.name === 'fixture_other') && dynamicPublishedTool !== message.params?.name) {
       process.stdout.write(`${JSON.stringify({
         jsonrpc: '2.0',
         id: message.id,
-        error: { code: -32601, message: 'Unknown tool: fixture_echo' },
+        error: { code: -32601, message: `Unknown tool: ${message.params?.name}` },
       })}\n`);
       return;
     }
