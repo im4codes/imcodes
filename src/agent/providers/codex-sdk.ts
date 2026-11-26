@@ -7670,14 +7670,15 @@ export class CodexSdkProvider implements TransportProvider {
       if (!startedWithChild && channel.child) {
         generation = channel.generation;
       }
-      this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
+      const requireChild = startedWithChild || Boolean(channel.child);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, generation, requireChild);
       if (!state.threadId) throw new Error('codex_service_tier_no_thread');
       try {
         await this.requestOnChannel(channel, 'thread/settings/update', {
           threadId: state.threadId,
           serviceTier: tier,
         });
-        if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
+        if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation, requireChild)) {
           throw new Error('codex_service_tier_session_closed');
         }
         this.adoptServiceTier(sessionId, state, tier);
@@ -7948,11 +7949,12 @@ export class CodexSdkProvider implements TransportProvider {
     state: CodexSdkSessionState,
     expectedChannel?: CodexAppServerChannel,
     expectedGeneration?: number,
+    requireChild = true,
   ): boolean {
     if (state.ending || this.sessions.get(sessionId) !== state) return false;
     const channel = this.getChannelForSession(state);
     if (expectedChannel && channel !== expectedChannel) return false;
-    if (!channel.child) return false;
+    if (requireChild && !channel.child) return false;
     if (expectedGeneration !== undefined && channel.generation !== expectedGeneration) return false;
     return true;
   }
@@ -7962,11 +7964,16 @@ export class CodexSdkProvider implements TransportProvider {
     state: CodexSdkSessionState,
     expectedChannel: CodexAppServerChannel,
     expectedGeneration: number,
+    requireChild = true,
   ): void {
     if (state.ending || this.sessions.get(sessionId) !== state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
     }
-    if (this.getChannelForSession(state) !== expectedChannel || !expectedChannel.child || expectedGeneration !== expectedChannel.generation) {
+    if (
+      this.getChannelForSession(state) !== expectedChannel
+      || (requireChild && !expectedChannel.child)
+      || expectedGeneration !== expectedChannel.generation
+    ) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server restarted during session operation', true);
     }
   }

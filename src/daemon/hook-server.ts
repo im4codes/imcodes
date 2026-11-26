@@ -85,14 +85,14 @@ import {
   type MemoryMcpDaemonToolName,
 } from '../../shared/memory-mcp-daemon-rpc.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import type { MemoryMcpHttpHandler } from './memory-mcp-http.js';
 import {
-  MEMORY_MCP_HTTP_PATH,
-  createMemoryMcpHttpHandler,
   resolveSessionMcpCallerContext,
   scopeMemoryCallerForParticipantTurn,
   validCapabilityNamespace,
-} from './memory-mcp-http.js';
+} from './memory-mcp-caller-context.js';
 import {
+  MEMORY_MCP_HTTP_PATH,
   clearLiveHookServerPort,
   getActiveHookServerPort,
   setLiveHookServerPort,
@@ -983,11 +983,54 @@ export async function startHookServer(
   // identity on the instance so one server can never advertise another
   // server's port when starts overlap.
   let boundPort = preferredPort;
-  const memoryMcpHttp = createMemoryMcpHttpHandler({
-    port: () => boundPort,
-    memoryMcpServerId: options.memoryMcpServerId,
-    invokeMemoryMcpTool: options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool,
-  });
+  let memoryMcpHttp: MemoryMcpHttpHandler | null = null;
+  let memoryMcpHttpPromise: Promise<MemoryMcpHttpHandler | null> | null = null;
+  let memoryMcpHttpClosed = false;
+
+  const getMemoryMcpHttpHandler = async (): Promise<MemoryMcpHttpHandler | null> => {
+    if (memoryMcpHttpClosed) return null;
+    if (memoryMcpHttp) return memoryMcpHttp;
+    if (!memoryMcpHttpPromise) {
+      memoryMcpHttpPromise = (async () => {
+        const { createMemoryMcpHttpHandler } = await import('./memory-mcp-http.js');
+        if (memoryMcpHttpClosed) return null;
+        const handler = createMemoryMcpHttpHandler({
+          port: () => boundPort,
+          memoryMcpServerId: options.memoryMcpServerId,
+          invokeMemoryMcpTool: options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool,
+        });
+        memoryMcpHttp = handler;
+        return handler;
+      })().catch((err) => {
+        memoryMcpHttpPromise = null;
+        throw err;
+      });
+    }
+    return await memoryMcpHttpPromise;
+  };
+
+  const resetMemoryMcpHttpSessions = async (): Promise<void> => {
+    if (memoryMcpHttp) {
+      await memoryMcpHttp.resetSessions().catch(() => {});
+      return;
+    }
+    if (memoryMcpHttpPromise) {
+      const handler = await memoryMcpHttpPromise.catch(() => null);
+      await handler?.resetSessions().catch(() => {});
+    }
+  };
+
+  const closeMemoryMcpHttp = async (): Promise<void> => {
+    memoryMcpHttpClosed = true;
+    if (memoryMcpHttp) {
+      await memoryMcpHttp.closeAll().catch(() => {});
+      return;
+    }
+    if (memoryMcpHttpPromise) {
+      const handler = await memoryMcpHttpPromise.catch(() => null);
+      await handler?.closeAll().catch(() => {});
+    }
+  };
 
   const server = http.createServer(async (req, res) => {
     const urlPath = (req.url ?? '').split('?', 1)[0];
@@ -1024,7 +1067,28 @@ export async function startHookServer(
     if (rejectUnverifiedClaim(Array.isArray(claimedHeader) ? claimedHeader[0] : claimedHeader)) return;
 
     if (isMemoryMcpHttp) {
-      await memoryMcpHttp.handleRequest(req, res);
+      let handler: MemoryMcpHttpHandler | null;
+      try {
+        handler = await getMemoryMcpHttpHandler();
+      } catch (error) {
+        if (!res.headersSent) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: 'memory_mcp_http_unavailable',
+            message: error instanceof Error ? error.message : String(error),
+          }));
+        }
+        return;
+      }
+      if (!handler) {
+        if (!res.headersSent) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'memory_mcp_http_shutting_down' }));
+        }
+        return;
+      }
+      await handler.handleRequest(req, res);
       return;
     }
 
@@ -1877,7 +1941,7 @@ export async function startHookServer(
    *  `rebinding`, so the `'close'` this emits is ignored. */
   const releaseListener = async (): Promise<void> => {
     clearLiveHookServerPort(server);
-    await memoryMcpHttp.resetSessions().catch(() => {});
+    await resetMemoryMcpHttpSessions().catch(() => {});
     server.closeAllConnections?.();
     if (!server.listening) return;
     await new Promise<void>((resolve) => {
@@ -1885,7 +1949,7 @@ export async function startHookServer(
     });
   };
 
-  serverCloseCleanups.set(server, () => memoryMcpHttp.closeAll());
+  serverCloseCleanups.set(server, () => closeMemoryMcpHttp());
   server.once('close', () => {
     clearLiveHookServerPort(server);
   });
@@ -1937,7 +2001,7 @@ export async function startHookServer(
               // "after exhaustion nothing is serving", so enforce it here too
               // rather than relying on every failure path remembering.
               await releaseListener();
-              await memoryMcpHttp.closeAll().catch(() => {});
+              await closeMemoryMcpHttp().catch(() => {});
               logger.error(
                 { err: rebindError, cause, attempts: attempt, listening: server.listening },
                 'Hook server: rebind failed; hook endpoint is down',

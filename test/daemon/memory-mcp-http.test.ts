@@ -1078,4 +1078,69 @@ describe('memory MCP Streamable HTTP endpoint (/mcp)', () => {
     expect([0, 503]).toContain(raceStatus);
     srv.closeAllConnections?.();
   });
+
+  it('lazy-loads /mcp across concurrent first requests and handles close/rebind before any /mcp request', async () => {
+    const authorityHome1 = tempAuthorityHome();
+    const { server: idleServer } = await startHookServer(() => {}, {
+      authorityHome: authorityHome1,
+      bindListener: listenEphemeral,
+      rebindOnListenerLoss: true,
+    });
+    // Closing without ever receiving /mcp resolves cleanly and needs no HTTP MCP teardown.
+    await expect(closeHookServer(idleServer)).resolves.toBeUndefined();
+
+    const authorityHome2 = tempAuthorityHome();
+    getSessionMock.mockImplementation((name: string) => ({
+      name,
+      state: 'idle',
+      projectName: 'lazy-rebind',
+      projectDir: '/tmp/lazy-rebind',
+      agentType: 'codex-sdk',
+      sessionInstanceId: `inst-${name}`,
+      runtimeEpoch: `epoch-${name}`,
+      hookCredential: `cred-${name}`,
+    }));
+
+    const { server, port: port1 } = await startHookServer(() => {}, {
+      authorityHome: authorityHome2,
+      bindListener: listenEphemeral,
+      rebindOnListenerLoss: true,
+      invokeMemoryMcpTool: async (caller) => ({ status: 'ok', session: caller.sessionName }),
+    });
+    cleanups.push(() => closeHookServer(server).catch(() => {}));
+
+    // Rebind BEFORE any /mcp request initializes the lazy handler.
+    server.emit('error', new Error('simulated pre-mcp listener loss'));
+    let port2: number | null = null;
+    await vi.waitFor(() => {
+      const current = getActiveHookServerPort();
+      expect(current).not.toBeNull();
+      expect(current).not.toBe(port1);
+      port2 = current;
+    }, { timeout: 3_000, interval: 25 });
+
+    // Concurrent first /mcp connections share the single lazy initialization and work on the rebound port.
+    const connectAndCall = async (sessionName: string) => {
+      const tr = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port2!}${MEMORY_MCP_HTTP_PATH}`), {
+        requestInit: {
+          headers: {
+            [MEMORY_MCP_HTTP_HEADERS.SESSION]: sessionName,
+            [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: `inst-${sessionName}`,
+            [HOOK_SESSION_CREDENTIAL_HEADER]: `cred-${sessionName}`,
+          },
+        },
+      });
+      const cl = new Client({ name: sessionName, version: '1' });
+      cleanups.unshift(() => cl.close().catch(() => {}));
+      await cl.connect(tr);
+      return cl.callTool({ name: 'search_memory', arguments: { query: 'lazy' } });
+    };
+
+    const [res1, res2] = await Promise.all([
+      connectAndCall('deck_lazy_1'),
+      connectAndCall('deck_lazy_2'),
+    ]);
+    expect(res1).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_1' } });
+    expect(res2).toMatchObject({ structuredContent: { status: 'ok', session: 'deck_lazy_2' } });
+  });
 });
