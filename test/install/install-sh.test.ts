@@ -451,22 +451,23 @@ exit 0
       expect(pathExistOut).toContain('1.19.6');
       expect(existsSync(skipNpmMarker)).toBe(false);
 
-      // 2b) Existing `~/.opencode/bin/opencode` (NOT initially on PATH) skips npm AND exposes dir on running PATH + PATH_DIR
+      // 2b) Existing `~/.opencode/bin/opencode` (NOT initially on PATH) skips npm AND exposes dir on running PATH + OPENCODE_PATH_DIR (without overwriting PATH_DIR)
       const dotOcHome = join(ocRoot, 'dot-oc-home');
       mkdirSync(join(dotOcHome, '.opencode', 'bin'), { recursive: true });
       writeFileSync(join(dotOcHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.18.0"\n', { mode: 0o755 });
       const dotExistOut = sourced(
-        `PATH_DIR="/tmp/existing-node-bin"; try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; RESOLVED="$(command -v opencode 2>/dev/null || true)"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$RESOLVED PATH_DIR=$PATH_DIR"`,
+        `PATH_DIR="/tmp/existing-node-bin"; try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; RESOLVED="$(command -v opencode 2>/dev/null || true)"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$RESOLVED PATH_DIR=$PATH_DIR OPENCODE_PATH_DIR=$OPENCODE_PATH_DIR"`,
         { HOME: dotOcHome, PATH: `${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
       );
       expect(dotExistOut).toContain('STATUS=existing');
       expect(dotExistOut).toContain('1.18.0');
       expect(dotExistOut).toContain(`RESOLVED=${join(dotOcHome, '.opencode', 'bin', 'opencode')}`);
-      expect(dotExistOut).toContain(`PATH_DIR=/tmp/existing-node-bin:${join(dotOcHome, '.opencode', 'bin')}`);
+      expect(dotExistOut).toContain('PATH_DIR=/tmp/existing-node-bin');
+      expect(dotExistOut).toContain(`OPENCODE_PATH_DIR=${join(dotOcHome, '.opencode', 'bin')}`);
       expect(existsSync(skipNpmMarker)).toBe(false);
 
       // 2c) Full E2E with existing `~/.opencode/bin/opencode` (not on PATH) + non-writable global npm root:
-      // ~/.profile must persist BOTH npm-global/bin AND ~/.opencode/bin so a reopened shell finds BOTH `imcodes` and `opencode`
+      // ~/.profile must persist BOTH `# >>> IM.codes installer >>>` (npm-global/bin) AND `# >>> IM.codes OpenCode CLI >>>` (~/.opencode/bin)
       const dotE2eRoot = mkdtempSync(join(dir, 'dot-oc-e2e-'));
       const dotE2eHome = join(dotE2eRoot, 'home');
       const dotE2ePrefix = join(dotE2eRoot, 'install-root', 'npm-global');
@@ -506,7 +507,9 @@ exit 0
       );
       expect(dotE2eOut).toContain('OpenCode CLI: ready');
       const profileSrc = execFileSync('cat', [join(dotE2eHome, '.profile')], { encoding: 'utf8' });
+      expect(profileSrc).toContain('# >>> IM.codes installer >>>');
       expect(profileSrc).toContain(`${dotE2ePrefix}/bin`);
+      expect(profileSrc).toContain('# >>> IM.codes OpenCode CLI >>>');
       expect(profileSrc).toContain(`${dotE2eHome}/.opencode/bin`);
       const freshShellOut = execFileSync(
         'bash',
@@ -515,6 +518,101 @@ exit 0
       ).trim();
       expect(freshShellOut).toContain(`IM=${join(dotE2ePrefix, 'bin', 'imcodes')}`);
       expect(freshShellOut).toContain(`OC=${join(dotE2eHome, '.opencode', 'bin', 'opencode')}`);
+
+      // 2d) Re-install counterexample: existing .profile holds `# >>> IM.codes installer >>>` with old imcodes/npm bin already sourced on PATH
+      // (so PATH_DIR=""), plus newly discovered ~/.opencode/bin/opencode -> must KEEP `# >>> IM.codes installer >>>` untouched and add `# >>> IM.codes OpenCode CLI >>>`.
+      const reinstRoot = mkdtempSync(join(dir, 'reinst-'));
+      const reinstHome = join(reinstRoot, 'home');
+      const reinstOldBin = join(reinstRoot, 'old-imcodes-bin');
+      const reinstGlobalRoot = join(reinstRoot, 'writable-global-root');
+      const reinstProfile = join(reinstHome, '.profile');
+      mkdirSync(join(reinstHome, '.opencode', 'bin'), { recursive: true });
+      mkdirSync(reinstOldBin, { recursive: true });
+      mkdirSync(reinstGlobalRoot, { recursive: true });
+      writeFileSync(join(reinstHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.19.6"\n', { mode: 0o755 });
+      writeFileSync(join(reinstOldBin, 'imcodes'), '#!/usr/bin/env bash\necho "2026.11.9999"\n', { mode: 0o755 });
+      writeFileSync(
+        join(reinstOldBin, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "root" ]; then echo "${reinstGlobalRoot}"; exit 0; fi
+if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const initialProfile = [
+        '# user line before',
+        '# >>> IM.codes installer >>>',
+        `export PATH='${reinstOldBin}':"$PATH"`,
+        '# <<< IM.codes installer <<<',
+        '',
+      ].join('\n');
+      writeFileSync(reinstProfile, initialProfile);
+      const reinstOut = execFileSync(
+        'bash',
+        ['-c', `PATH="${cleanPath}"; source "${reinstProfile}"; bash "${SCRIPT}" --channel latest --source direct --install-root "${join(reinstRoot, 'ir')}"`],
+        {
+          ...EXEC_OPTS,
+          env: {
+            PATH: cleanPath,
+            HOME: reinstHome,
+            TMPDIR: reinstRoot,
+            IMCODES_USE_R2: 'false',
+          },
+        },
+      );
+      expect(reinstOut).toContain('OpenCode CLI: ready');
+      const reinstProfileAfter = execFileSync('cat', [reinstProfile], { encoding: 'utf8' });
+      expect(reinstProfileAfter).toContain(`export PATH='${reinstOldBin}':"$PATH"`);
+      expect(reinstProfileAfter).toContain('# >>> IM.codes OpenCode CLI >>>');
+      expect(reinstProfileAfter).toContain(`${reinstHome}/.opencode/bin`);
+      const reinstFreshShell = execFileSync(
+        'bash',
+        ['-c', `PATH="/usr/bin:/bin"; source "${reinstProfile}"; echo "IM=$(command -v imcodes) OC=$(command -v opencode)"`],
+        { ...EXEC_OPTS, env: { HOME: reinstHome, PATH: '/usr/bin:/bin' } },
+      ).trim();
+      expect(reinstFreshShell).toContain(`IM=${join(reinstOldBin, 'imcodes')}`);
+      expect(reinstFreshShell).toContain(`OC=${join(reinstHome, '.opencode', 'bin', 'opencode')}`);
+
+      // 2e) Read-only ~/.profile counterexample: optional OpenCode PATH persistence failure MUST remain non-blocking (exit 0 + Done printed + file untouched)
+      const roRoot = mkdtempSync(join(dir, 'ro-profile-'));
+      const roHome = join(roRoot, 'home');
+      const roBin = join(roRoot, 'old-bin');
+      const roGlobalRoot = join(roRoot, 'writable-root');
+      const roProfile = join(roHome, '.profile');
+      mkdirSync(join(roHome, '.opencode', 'bin'), { recursive: true });
+      mkdirSync(roBin, { recursive: true });
+      mkdirSync(roGlobalRoot, { recursive: true });
+      writeFileSync(join(roHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.19.6"\n', { mode: 0o755 });
+      writeFileSync(join(roBin, 'imcodes'), '#!/usr/bin/env bash\necho "2026.11.9999"\n', { mode: 0o755 });
+      writeFileSync(
+        join(roBin, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "root" ]; then echo "${roGlobalRoot}"; exit 0; fi
+if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const roContent = `# existing readonly profile\n# >>> IM.codes installer >>>\nexport PATH='${roBin}':"$PATH"\n# <<< IM.codes installer <<<\n`;
+      writeFileSync(roProfile, roContent, { mode: 0o444 });
+      const roOut = execFileSync(
+        'bash',
+        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', join(roRoot, 'ir')],
+        {
+          ...EXEC_OPTS,
+          env: {
+            PATH: `${roBin}:${cleanPath}`,
+            HOME: roHome,
+            TMPDIR: roRoot,
+            IMCODES_USE_R2: 'false',
+          },
+        },
+      );
+      expect(roOut).toContain('WARNING: could not persist OpenCode PATH');
+      expect(roOut).toContain('imcodes installed  2026.11.9999');
+      expect(roOut).toContain('OpenCode CLI: ready');
+      expect(execFileSync('cat', [roProfile], { encoding: 'utf8' })).toBe(roContent);
 
       // 3) Missing `opencode` invokes npm with mirror registry & handles spaces in HOME / npm_bin
       const okLog = join(ocRoot, 'ok-npm.log');
@@ -556,12 +654,12 @@ chmod +x "${prefGlobal}/bin/opencode"
         { mode: 0o755 },
       );
       const prefOut = sourced(
-        `PATH_DIR=""; try_install_opencode_cli "${join(prefBinOnly, 'npm')}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$(command -v opencode) PATH_DIR=$PATH_DIR"`,
+        `PATH_DIR=""; OPENCODE_PATH_DIR=""; try_install_opencode_cli "${join(prefBinOnly, 'npm')}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$(command -v opencode) OPENCODE_PATH_DIR=$OPENCODE_PATH_DIR"`,
         { HOME: skipHome, PATH: `${prefBinOnly}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
       );
       expect(prefOut).toContain('STATUS=installed');
       expect(prefOut).toContain(`RESOLVED=${join(prefGlobal, 'bin', 'opencode')}`);
-      expect(prefOut).toContain(`PATH_DIR=${join(prefGlobal, 'bin')}`);
+      expect(prefOut).toContain(`OPENCODE_PATH_DIR=${join(prefGlobal, 'bin')}`);
 
       // 3c) Counterexample: npm exits 0 WITHOUT creating an opencode binary on PATH or prefix/bin -> must NOT report ready!
       const fakeOkDir = join(ocRoot, 'fake-ok-bin');

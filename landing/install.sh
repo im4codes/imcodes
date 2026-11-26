@@ -229,21 +229,56 @@ opencode_is_installed() {
   opencode_bin_path >/dev/null 2>&1
 }
 
-add_managed_path_dir() {
-  local d="${1:-}"
+OPENCODE_PATH_DIR="${OPENCODE_PATH_DIR:-}"
+_add_path_var() {
+  local var_name="$1" d="${2:-}" cur=""
   [ -n "$d" ] || return 0
   case ":${PATH:-}:" in
     *":$d:"*) ;;
     *) export PATH="$d${PATH:+:$PATH}" ;;
   esac
-  if [ -z "${PATH_DIR:-}" ]; then
-    PATH_DIR="$d"
+  eval "cur=\"\${$var_name:-}\""
+  if [ -z "$cur" ]; then
+    eval "$var_name=\"\$d\""
   else
-    case ":$PATH_DIR:" in
+    case ":$cur:" in
       *":$d:"*) ;;
-      *) PATH_DIR="${PATH_DIR}:$d" ;;
+      *) eval "$var_name=\"\${cur}:\$d\"" ;;
     esac
   fi
+}
+
+add_managed_path_dir() {
+  _add_path_var PATH_DIR "${1:-}"
+}
+
+add_opencode_path_dir() {
+  _add_path_var OPENCODE_PATH_DIR "${1:-}"
+}
+
+upsert_rc_path_block() {
+  local rc="$1" path_val="$2" begin="$3" end="$4" esc_path block tmp_rc=""
+  esc_path=$(printf '%s' "$path_val" | sed "s/'/'\\\\''/g")
+  block=$(printf '%s\nexport PATH='\''%s'\'':"$PATH"\n%s' "$begin" "$esc_path" "$end")
+  if [ -f "$rc" ] && grep -qF "$begin" "$rc" 2>/dev/null; then
+    tmp_rc="$(mktemp)" || return 1
+    if ! awk -v b="$begin" -v e="$end" '
+      $0==b {skip=1}
+      skip==0 {print}
+      $0==e {skip=0}
+    ' "$rc" > "$tmp_rc"; then
+      rm -f "$tmp_rc"
+      return 1
+    fi
+    if ! ( printf '\n%s\n' "$block" >> "$tmp_rc" && cat "$tmp_rc" > "$rc" ); then
+      rm -f "$tmp_rc"
+      return 1
+    fi
+    rm -f "$tmp_rc"
+  else
+    printf '\n%s\n' "$block" >> "$rc" || return 1
+  fi
+  return 0
 }
 
 OPENCODE_STATUS=""
@@ -264,7 +299,7 @@ try_install_opencode_cli() {
   fi
 
   if [ -n "${HOME:-}" ] && [ -x "$HOME/.opencode/bin/opencode" ]; then
-    add_managed_path_dir "$HOME/.opencode/bin"
+    add_opencode_path_dir "$HOME/.opencode/bin"
     if have opencode; then
       oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
       ok "found opencode${oc_ver:+ $oc_ver} ($HOME/.opencode/bin/opencode, added to PATH) — keeping existing install"
@@ -282,7 +317,7 @@ try_install_opencode_cli() {
       local oc_prefix=""
       oc_prefix=$("$npm_bin" prefix -g 2>/dev/null | head -n1 || true)
       if [ -n "$oc_prefix" ] && [ -x "$oc_prefix/bin/opencode" ]; then
-        add_managed_path_dir "$oc_prefix/bin"
+        add_opencode_path_dir "$oc_prefix/bin"
       fi
     fi
     if have opencode; then
@@ -467,27 +502,26 @@ try_install_opencode_cli "$NPM" "$NPM_REGISTRY"
 if [ -n "$PATH_DIR" ]; then
   begin="# >>> IM.codes installer >>>"
   end="# <<< IM.codes installer <<<"
-  # Escape any single quote in the path using the '\'' idiom, then emit
-  #   export PATH='<path>':"$PATH"
-  esc_path=$(printf '%s' "$PATH_DIR" | sed "s/'/'\\\\''/g")
-  block=$(printf '%s\nexport PATH='\''%s'\'':"$PATH"\n%s' "$begin" "$esc_path" "$end")
   for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
     # Only update files that already exist, except .profile (the POSIX login
     # default) which we may create. Avoids leaving empty rc files for shells the
     # user doesn't use.
     if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
-      if [ -f "$rc" ] && grep -qF "$begin" "$rc" 2>/dev/null; then
-        tmp_rc="$(mktemp)"
-        awk -v b="$begin" -v e="$end" '
-          $0==b {skip=1}
-          skip==0 {print}
-          $0==e {skip=0}
-        ' "$rc" > "$tmp_rc"
-        printf '\n%s\n' "$block" >> "$tmp_rc"
-        cat "$tmp_rc" > "$rc"
-        rm -f "$tmp_rc"
-      else
-        printf '\n%s\n' "$block" >> "$rc"
+      upsert_rc_path_block "$rc" "$PATH_DIR" "$begin" "$end"
+    fi
+  done
+fi
+
+# Dedicated best-effort block for OpenCode CLI PATH so it never clobbers the main
+# `# >>> IM.codes installer >>>` block on re-installs and never aborts install on
+# read-only rc files.
+if [ -n "$OPENCODE_PATH_DIR" ]; then
+  oc_begin="# >>> IM.codes OpenCode CLI >>>"
+  oc_end="# <<< IM.codes OpenCode CLI <<<"
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
+    if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
+      if ! ( upsert_rc_path_block "$rc" "$OPENCODE_PATH_DIR" "$oc_begin" "$oc_end" ) 2>/dev/null; then
+        note "WARNING: could not persist OpenCode PATH in $rc (non-blocking) — add manually: export PATH=\"$OPENCODE_PATH_DIR:\$PATH\""
       fi
     fi
   done
@@ -508,7 +542,10 @@ case "$OPENCODE_STATUS" in
 esac
 echo ""
 echo "  Next steps:"
-[ -n "$PATH_DIR" ] && echo "    1) Restart your shell  (or: export PATH=\"$PATH_DIR:\$PATH\")"
+hint_path=""
+[ -n "$PATH_DIR" ] && hint_path="$PATH_DIR"
+[ -n "$OPENCODE_PATH_DIR" ] && hint_path="${hint_path:+$hint_path:}$OPENCODE_PATH_DIR"
+[ -n "$hint_path" ] && echo "    1) Restart your shell  (or: export PATH=\"$hint_path:\$PATH\")"
 echo "    2) imcodes bind     # connect this machine to your IM.codes server"
 echo "    3) imcodes          # start the daemon (it keeps itself up to date)"
 echo ""
