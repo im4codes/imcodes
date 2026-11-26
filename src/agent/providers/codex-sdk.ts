@@ -1166,6 +1166,10 @@ interface CodexSdkSessionState {
   /** The fence of a `thread/start` in flight (no thread id yet). */
   pendingThreadFence?: NativeAgentFence;
   loaded: boolean;
+  /** App-server channel generation + threadId currently resident/subscribed in child memory. */
+  residentGeneration?: number;
+  residentThreadId?: string;
+  ending?: boolean;
   lastActivityAt: number;
   sendInFlightCount: number;
   threadLoadInFlightCount: number;
@@ -1185,6 +1189,8 @@ interface CodexSdkSessionState {
   currentMessageId: string | null;
   currentText: string;
   pendingAgentMessageQuestions?: { id: string; questions: NormalizedCodexAsyncQuestion[] };
+  /** Id of an async agentMessage question card already published after turn completion. */
+  publishedAsyncQuestionId?: string;
   activeItemIds: Set<string>;
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
@@ -3038,6 +3044,9 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: incognito ? undefined : (effectiveConfig.resumeId ?? existing?.threadId),
       ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
+      residentGeneration: undefined,
+      residentThreadId: undefined,
+      ending: false,
       lastActivityAt: now,
       sendInFlightCount: 0,
       threadLoadInFlightCount: 0,
@@ -3055,6 +3064,7 @@ export class CodexSdkProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       pendingAgentMessageQuestions: undefined,
+      publishedAsyncQuestionId: undefined,
       activeItemIds: new Set(),
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
@@ -3107,8 +3117,12 @@ export class CodexSdkProvider implements TransportProvider {
 
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state) return;
+    if (!state || state.ending) return;
+    // Mark ending synchronously before any await so concurrent sends and
+    // in-flight ensureThreadLoaded calls see the closed state immediately.
+    state.ending = true;
     state.pendingAgentMessageQuestions = undefined;
+    state.publishedAsyncQuestionId = undefined;
     this.questions.release(sessionId);
     this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
@@ -3116,17 +3130,31 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);
     this.clearChildSubagentRolloutPollTimer(state);
     const channel = this.getChannelForSession(state);
+    const endGeneration = channel.generation;
+    const knownThreadIds = new Set<string>();
+    if (state.threadId) knownThreadIds.add(state.threadId);
+    if (state.residentThreadId) knownThreadIds.add(state.residentThreadId);
     if (state.threadUnsubscribePromise) {
       await state.threadUnsubscribePromise.catch(() => {});
     }
-    if (state.threadId) {
-      if (state.loaded) {
-        await this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
-      }
-      channel.threadToSession.delete(state.threadId);
+    const residentThreadId = this.getResidentThreadId(channel, state);
+    const unsubThreadId = residentThreadId ?? (state.loaded && channel.generation === endGeneration ? state.threadId : undefined);
+    if (unsubThreadId) {
+      await this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: unsubThreadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
     }
     state.loaded = false;
-    if (this.sessions.get(sessionId) === state) {
+    state.residentGeneration = undefined;
+    state.residentThreadId = undefined;
+    const currentSessionState = this.sessions.get(sessionId);
+    const canClearSessionMapping = currentSessionState === undefined || currentSessionState === state;
+    if (canClearSessionMapping) {
+      for (const tid of knownThreadIds) {
+        if (channel.threadToSession.get(tid) === sessionId) {
+          channel.threadToSession.delete(tid);
+        }
+      }
+    }
+    if (currentSessionState === state) {
       this.sessions.delete(sessionId);
     }
     this.maybeRunDeferredAuthRefresh(channel, 'end-session');
@@ -3219,7 +3247,7 @@ export class CodexSdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
     const state = this.sessions.get(sessionId);
-    if (!state) {
+    if (!state || state.ending) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
     const channel = this.getChannelForSession(state);
@@ -3231,15 +3259,22 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async sendWithPrivacy(sessionId: string, state: CodexSdkSessionState, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
+    if (state.ending || this.sessions.get(sessionId) !== state) {
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
+    }
     if (state.runningTurnId || state.runningCompact || state.turnStartInFlight || state.authRecoveryPending) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
     state.sendInFlightCount += 1;
+    state.publishedAsyncQuestionId = undefined;
     this.touchSessionActivity(state);
     try {
       const channel = this.getChannelForSession(state);
       if (channel.child) {
         await this.refreshAppServerForLatestAuth('send', channel);
+      }
+      if (state.ending || this.sessions.get(sessionId) !== state) {
+        throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
       }
       if (channel.kind === 'incognito') {
         if (!this.config) {
@@ -3251,6 +3286,8 @@ export class CodexSdkProvider implements TransportProvider {
       } else if (!this.config || !channel.child) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
       }
+      const initialGeneration = channel.generation;
+      this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
 
       if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'abandoned', 'generation_rollover');
@@ -3281,8 +3318,10 @@ export class CodexSdkProvider implements TransportProvider {
       state.authRecoveryReplayUnsafe = false;
       let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
       if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+      this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
       if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
         await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+        this.assertSessionStateActiveForSend(sessionId, state, channel, initialGeneration);
       }
       for (;;) {
         try {
@@ -3409,6 +3448,7 @@ export class CodexSdkProvider implements TransportProvider {
     // carries the request across those async boundaries so startTurn() issues
     // turn/interrupt as soon as Codex exposes the id.
     state.cancelled = true;
+    state.publishedAsyncQuestionId = undefined;
     this.questions.release(sessionId);
     this.clearActiveTurnLease(state);
     if (!state.threadId) return;
@@ -3518,6 +3558,9 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearStatus(sessionId, state);
     this.rememberTerminatedActiveTurn(state);
     state.loaded = false;
+    state.residentGeneration = undefined;
+    state.residentThreadId = undefined;
+    state.publishedAsyncQuestionId = undefined;
     state.threadUnsubscribePromise = undefined;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
@@ -4162,6 +4205,9 @@ export class CodexSdkProvider implements TransportProvider {
     // zero-dispatch-B regressions actually hold.
     state.turnDelegationDispatches = [];
     state.pendingAgentMessageQuestions = undefined;
+    const channel = this.getChannelForSession(state);
+    const channelGeneration = channel.generation;
+    this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       if (
@@ -4186,12 +4232,14 @@ export class CodexSdkProvider implements TransportProvider {
       );
       const reusesExistingThread = Boolean(state.threadId);
       await this.ensureThreadLoaded(sessionId, state, payload);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
       // An existing thread may be bound to an IM MCP process that is already
       // gone (a resume of a loaded thread never respawns it). A thread started
       // just now spawned a fresh server and has nothing to heal.
       if (!state.incognito && reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
         await this.healImcodesMcpIfTransportDead(sessionId, state);
       }
+      this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
       // A Brain must not begin a turn unless IM delegation is authoritatively
       // usable: with native multi-agent removed at process start there is no
       // fallback, so starting anyway would strand the user's delegation. The
@@ -4200,7 +4248,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (!state.incognito && payload.sessionRole === 'brain' && state.threadId) {
         await this.assertImcodesDelegationReady(state.threadId);
       }
+      this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
       await this.prepareGeneratedImageTracking(sessionId, state);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? getProviderSessionSystemTextSpanned(payload) : undefined);
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
@@ -4271,6 +4321,19 @@ export class CodexSdkProvider implements TransportProvider {
         state.turnStartInFlight = false;
         throw err;
       }
+      if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, channelGeneration)) {
+        this.clearActiveTurnLease(state);
+        state.runningTurnId = undefined;
+        state.turnStartInFlight = false;
+        this.clearActiveItemEvidence(state);
+        this.clearRawChecklistPollTimer(state);
+        this.clearPendingSessionSystemTextUpdate(state);
+        if (state.ending) throw err;
+        const normalized = this.normalizeError(err);
+        this.clearCodexAuthRecoveryState(state);
+        this.emitError(sessionId, normalized);
+        return;
+      }
       const authReplaySafe = this.isCodexAuthReplaySafe(state);
       this.rememberTerminatedTurn(state, state.runningTurnId);
       this.clearActiveTurnLease(state);
@@ -4326,6 +4389,8 @@ export class CodexSdkProvider implements TransportProvider {
         if (conflictedThreadId) this.getChannelForSession(state).threadToSession.delete(conflictedThreadId);
         state.threadId = undefined;
         state.loaded = false;
+        state.residentGeneration = undefined;
+        state.residentThreadId = undefined;
         state.currentText = '';
         state.currentMessageId = null;
         logger.warn(
@@ -4404,8 +4469,11 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async startCompact(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
+    const channel = this.getChannelForSession(state);
+    const generation = channel.generation;
     try {
       await this.ensureThreadLoaded(sessionId, state, payload);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
       this.clearPendingSessionSystemTextUpdate(state);
       this.clearActiveTurnLease(state);
       state.runningCompact = true;
@@ -4418,7 +4486,7 @@ export class CodexSdkProvider implements TransportProvider {
         label: 'Compacting context...',
       });
       this.armCompactHardTimeout(sessionId, state);
-      const result = await this.requestOnChannel(this.getChannelForSession(state), 'thread/compact/start', {
+      const result = await this.requestOnChannel(channel, 'thread/compact/start', {
         threadId: state.threadId,
       }, COMPACT_START_ACCEPT_TIMEOUT_MS);
       // Some Codex app-server builds accept `thread/compact/start` as a
@@ -4440,13 +4508,28 @@ export class CodexSdkProvider implements TransportProvider {
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;
+      if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
+        throw err;
+      }
       this.emitError(sessionId, this.normalizeError(err));
     }
   }
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
+    if (state.ending || this.sessions.get(sessionId) !== state) {
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
+    }
+    const channel = this.getChannelForSession(state);
+    let expectedGeneration = channel.generation;
+    const hasInitialChild = Boolean(channel.child);
     if (state.threadUnsubscribePromise) {
       await state.threadUnsubscribePromise.catch(() => {});
+      if (state.ending || this.sessions.get(sessionId) !== state) {
+        throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
+      }
+      if (hasInitialChild) {
+        this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
+      }
     }
     if (state.threadId && state.loaded) {
       this.touchSessionActivity(state);
@@ -4460,7 +4543,9 @@ export class CodexSdkProvider implements TransportProvider {
     try {
       if (state.incognito && !this.incognitoChannel.child?.stdin.writable) {
         await this.ensureIncognitoChannelStarted();
+        expectedGeneration = channel.generation;
       }
+      this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
 
       // Always send `baseInstructions`. Catalog models get codex's full
       // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
@@ -4469,14 +4554,16 @@ export class CodexSdkProvider implements TransportProvider {
       // rejects with `{"type":"invalid_request_error","message":"Instructions
       // are required"}`.
       const resolvedBaseInstructions = await resolveBaseInstructionsOverride(state.model);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
       const baseInstructions = payload
         ? appendImcodesBaseInstructions(resolvedBaseInstructions, payload)
         : resolvedBaseInstructions;
       const sessionSystemText = payload ? getProviderSystemTextParts(payload).sessionSystemText : undefined;
       const finalizeLoaded = (): void => {
+        this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
         state.lastInjectedSessionSystemText = sessionSystemText;
         this.touchSessionActivity(state);
-        void this.evictIdleThreadsForChannel(this.getChannelForSession(state), 'lru-cap', sessionId);
+        void this.evictIdleThreadsForChannel(channel, 'lru-cap', sessionId);
       };
 
       if (state.threadId) {
@@ -4485,6 +4572,7 @@ export class CodexSdkProvider implements TransportProvider {
           finalizeLoaded();
           return;
         } catch (err) {
+          this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
           if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
 
           // A never-materialized thread names no rollout file, so there is no
@@ -4494,12 +4582,14 @@ export class CodexSdkProvider implements TransportProvider {
             logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
             return false;
           });
+          this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
           if (repaired) {
             try {
               await this.resumeThread(sessionId, state, baseInstructions);
               finalizeLoaded();
               return;
             } catch (retryErr) {
+              this.assertSessionStateActiveForSend(sessionId, state, channel, expectedGeneration);
               logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
             }
           }
@@ -4511,9 +4601,13 @@ export class CodexSdkProvider implements TransportProvider {
               ? 'Codex SDK stored thread has no rollout; starting replacement thread'
               : 'Codex SDK stored thread history is unreadable; starting replacement thread',
           );
-          if (oldThreadId) this.getChannelForSession(state).threadToSession.delete(oldThreadId);
+          if (oldThreadId && channel.threadToSession.get(oldThreadId) === sessionId) {
+            channel.threadToSession.delete(oldThreadId);
+          }
           state.threadId = undefined;
           state.loaded = false;
+          state.residentGeneration = undefined;
+          state.residentThreadId = undefined;
         }
       }
 
@@ -4535,6 +4629,8 @@ export class CodexSdkProvider implements TransportProvider {
     // means supplying it on resume is the only way to repair them
     // mid-flight.
     const channel = this.getChannelForSession(state);
+    const generation = channel.generation;
+    this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
     const threadConfigParams = this.sessionThreadConfigParams(state, false);
     const result = await this.requestOnChannel(channel, 'thread/resume', {
       threadId: state.threadId,
@@ -4544,6 +4640,13 @@ export class CodexSdkProvider implements TransportProvider {
       baseInstructions,
     });
     const resumedId = result?.thread?.id ?? state.threadId;
+    if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
+      if (channel.child && channel.generation === generation && resumedId) {
+        void this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: resumedId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
+      }
+      this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
+      return;
+    }
     // One line per resume, so "was the identity re-sent after compaction?"
     // is answerable from the log on any machine.
     logger.info({
@@ -4554,6 +4657,8 @@ export class CodexSdkProvider implements TransportProvider {
     }, 'codex-sdk: thread resumed with baseInstructions');
     state.threadId = resumedId;
     state.loaded = true;
+    state.residentGeneration = generation;
+    state.residentThreadId = resumedId;
     channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
   }
@@ -4566,9 +4671,12 @@ export class CodexSdkProvider implements TransportProvider {
     const fence = fenceOf(fenced);
     state.pendingThreadFence = fence;
     const channel = this.getChannelForSession(state);
+    const generation = channel.generation;
+    this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
     let threadConfigParams = this.sessionThreadConfigParams(state, fenced);
     if (state.incognito) {
       const cwdEnabledKeys = await this.readIncognitoEnabledImcodesMcpKeys(channel, state.cwd);
+      this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
       if (cwdEnabledKeys.length > 0) {
         const existingCfg = isRecord(threadConfigParams.config) ? { ...threadConfigParams.config } : {};
         const disableMap: Record<string, { enabled: false }> = {};
@@ -4599,9 +4707,18 @@ export class CodexSdkProvider implements TransportProvider {
       if (!threadId) {
         throw new Error('Codex app-server did not return a thread id');
       }
+      if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
+        if (!state.incognito && channel.child && channel.generation === generation) {
+          void this.requestOnChannel(channel, 'thread/unsubscribe', { threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
+        }
+        this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
+        return;
+      }
       state.threadId = threadId;
       state.nativeAgentFence = { threadId, fence };
       state.loaded = true;
+      state.residentGeneration = generation;
+      state.residentThreadId = threadId;
       channel.threadToSession.set(threadId, sessionId);
       if (!state.incognito || state.model) {
         this.emitSessionInfo(sessionId, {
@@ -6252,10 +6369,20 @@ export class CodexSdkProvider implements TransportProvider {
           : {}),
       },
     };
+    const hasPendingAsyncQuestions = Boolean(
+      pendingAgentMessageQuestions
+      && pendingAgentMessageQuestions.questions.length > 0
+      && !state.cancelled
+      && !state.ending
+      && this.sessions.get(sessionId) === state,
+    );
+    if (hasPendingAsyncQuestions && pendingAgentMessageQuestions) {
+      state.publishedAsyncQuestionId = pendingAgentMessageQuestions.id;
+    }
     this.emitComplete(sessionId, completed);
     // Emit async agentMessage questions AFTER onComplete so final assistant.text
     // precedes ask.question in the timeline (required by findTrailingAskQuestion).
-    if (pendingAgentMessageQuestions && pendingAgentMessageQuestions.questions.length > 0 && !state.cancelled) {
+    if (hasPendingAsyncQuestions && pendingAgentMessageQuestions) {
       this.emitToolCall(sessionId, {
         id: pendingAgentMessageQuestions.id,
         name: INTERACTIVE_QUESTION_TOOL_NAME,
@@ -7318,24 +7445,36 @@ export class CodexSdkProvider implements TransportProvider {
    */
   async setServiceTier(sessionId: string, tier: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state) throw new Error('codex_service_tier_unknown_session');
+    if (!state || state.ending) throw new Error('codex_service_tier_unknown_session');
+    const channel = this.getChannelForSession(state);
+    const startedWithChild = Boolean(channel.child);
+    let generation = channel.generation;
     const wasLoaded = Boolean(state.threadId && state.loaded);
     state.sendInFlightCount += 1;
     this.touchSessionActivity(state);
     try {
       await this.ensureThreadLoaded(sessionId, state);
+      if (!startedWithChild && channel.child) {
+        generation = channel.generation;
+      }
+      this.assertSessionStateActiveForSend(sessionId, state, channel, generation);
       if (!state.threadId) throw new Error('codex_service_tier_no_thread');
       try {
-        await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
+        await this.requestOnChannel(channel, 'thread/settings/update', {
           threadId: state.threadId,
           serviceTier: tier,
         });
+        if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
+          throw new Error('codex_service_tier_session_closed');
+        }
         this.adoptServiceTier(sessionId, state, tier);
       } finally {
         if (!wasLoaded && !state.incognito && !state.lastInjectedSessionSystemText) {
           // `ensureThreadLoaded` ran without a payload (`baseInstructions` had no
           // IM.codes tail/sessionSystemText). Mark unloaded so the next `send()`
           // re-establishes full `baseInstructions` via `thread/resume`.
+          // Keep `residentGeneration`/`residentThreadId` intact: the thread IS still
+          // subscribed in the app-server until explicitly unsubscribed or evicted.
           state.loaded = false;
         }
       }
@@ -7348,8 +7487,48 @@ export class CodexSdkProvider implements TransportProvider {
     state.lastActivityAt = now;
   }
 
-  private isThreadEligibleForIdleEviction(sessionId: string, state: CodexSdkSessionState): boolean {
-    if (!state.loaded || !state.threadId) return false;
+  private getResidentThreadId(channel: CodexAppServerChannel, state: CodexSdkSessionState): string | null {
+    if (!channel.child || state.residentGeneration !== channel.generation) return null;
+    const threadId = state.residentThreadId ?? state.threadId;
+    return threadId || null;
+  }
+
+  private isSessionStateActiveOnChannel(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    expectedChannel?: CodexAppServerChannel,
+    expectedGeneration?: number,
+  ): boolean {
+    if (state.ending || this.sessions.get(sessionId) !== state) return false;
+    const channel = this.getChannelForSession(state);
+    if (expectedChannel && channel !== expectedChannel) return false;
+    if (!channel.child) return false;
+    if (expectedGeneration !== undefined && channel.generation !== expectedGeneration) return false;
+    return true;
+  }
+
+  private assertSessionStateActiveForSend(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    expectedChannel: CodexAppServerChannel,
+    expectedGeneration: number,
+  ): void {
+    if (state.ending || this.sessions.get(sessionId) !== state) {
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Codex SDK session closed: ${sessionId}`, false);
+    }
+    if (this.getChannelForSession(state) !== expectedChannel || !expectedChannel.child || expectedChannel.generation !== expectedGeneration) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server restarted during session operation', true);
+    }
+  }
+
+  private isCodexThreadNotResidentError(err: unknown): boolean {
+    const message = errorMessage(err);
+    return /thread not found|unknown thread|not loaded|not subscribed|already unsubscribed/i.test(message);
+  }
+
+  private isThreadEligibleForIdleEviction(channel: CodexAppServerChannel, sessionId: string, state: CodexSdkSessionState): boolean {
+    if (state.ending || this.sessions.get(sessionId) !== state) return false;
+    if (!this.getResidentThreadId(channel, state)) return false;
     if (state.ephemeral || state.incognito) return false;
     if (state.threadUnsubscribePromise || state.threadLoadInFlightCount > 0 || state.sendInFlightCount > 0) {
       return false;
@@ -7381,6 +7560,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
     if (
       state.pendingAgentMessageQuestions
+      || state.publishedAsyncQuestionId
       || this.questions.has(sessionId)
       || this.questionInputs.has(sessionId)
     ) {
@@ -7408,7 +7588,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.idleSweepTimer = null;
   }
 
-  /** Evict idle durable threads on both channels; returns number of threads unsubscribed. */
+  /** Evict idle durable threads on both channels; returns number of confirmed unsubscribed threads. */
   async sweepIdleThreads(reason: 'periodic-idle-sweep' | 'lru-cap' = 'periodic-idle-sweep'): Promise<number> {
     const counts = await Promise.all([
       this.evictIdleThreadsForChannel(this.normalChannel, reason),
@@ -7423,19 +7603,20 @@ export class CodexSdkProvider implements TransportProvider {
     excludeSessionId?: string,
   ): Promise<number> {
     if (!this.config || !channel.child?.stdin.writable) return 0;
+    const generation = channel.generation;
     const channelSessions = this.getSessionsForChannel(channel);
-    const loadedSessions = channelSessions.filter(([, state]) => state.loaded && Boolean(state.threadId));
-    if (loadedSessions.length === 0) return 0;
+    const residentSessions = channelSessions.filter(([, state]) => Boolean(this.getResidentThreadId(channel, state)));
+    if (residentSessions.length === 0) return 0;
 
     const now = Date.now();
     const targets: Array<[string, CodexSdkSessionState]> = [];
     const selectedIds = new Set<string>();
 
     if (reason === 'periodic-idle-sweep') {
-      for (const entry of loadedSessions) {
+      for (const entry of residentSessions) {
         const [sessionId, state] = entry;
         if (sessionId === excludeSessionId) continue;
-        if (!this.isThreadEligibleForIdleEviction(sessionId, state)) continue;
+        if (!this.isThreadEligibleForIdleEviction(channel, sessionId, state)) continue;
         if (now - state.lastActivityAt >= this.idleThreadEvictMs) {
           targets.push(entry);
           selectedIds.add(sessionId);
@@ -7443,14 +7624,16 @@ export class CodexSdkProvider implements TransportProvider {
       }
     }
 
-    const remainingLoadedCount = loadedSessions.length - targets.length;
-    const lruExcess = remainingLoadedCount - this.maxLoadedThreads;
+    const activeResidentCount = residentSessions.filter(([sessionId, state]) => (
+      !state.threadUnsubscribePromise && !selectedIds.has(sessionId)
+    )).length;
+    const lruExcess = activeResidentCount - this.maxLoadedThreads;
     if (lruExcess > 0) {
-      const lruCandidates = loadedSessions
+      const lruCandidates = residentSessions
         .filter(([sessionId, state]) => (
           sessionId !== excludeSessionId
           && !selectedIds.has(sessionId)
-          && this.isThreadEligibleForIdleEviction(sessionId, state)
+          && this.isThreadEligibleForIdleEviction(channel, sessionId, state)
         ))
         .sort((a, b) => a[1].lastActivityAt - b[1].lastActivityAt);
       for (const entry of lruCandidates.slice(0, lruExcess)) {
@@ -7461,13 +7644,25 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (targets.length === 0) return 0;
 
+    let confirmedEvictedCount = 0;
     const evictPromises: Array<Promise<void>> = [];
     for (const [sessionId, state] of targets) {
-      const threadId = state.threadId;
-      if (!threadId || !this.isThreadEligibleForIdleEviction(sessionId, state)) continue;
-      // Mark unloaded synchronously before yielding to the RPC so concurrent sends await
-      // this unsubscribe before calling thread/resume, and concurrent sweeps do not double-evict.
+      const threadId = this.getResidentThreadId(channel, state);
+      if (!threadId || !this.isThreadEligibleForIdleEviction(channel, sessionId, state)) continue;
+      // Clear config-ready flag before yielding so any concurrent send that awaits
+      // this unsubscribe re-hydrates via thread/resume instead of assuming warm config.
+      // Keep residentGeneration/residentThreadId intact until unsubscribe confirms removal
+      // so transient failures/timeouts remain eligible for future sweeps and LRU counts.
       state.loaded = false;
+      const clearResidency = (): void => {
+        if (state.residentGeneration === generation && state.residentThreadId === threadId && state.threadLoadInFlightCount === 0) {
+          state.residentGeneration = undefined;
+          state.residentThreadId = undefined;
+        }
+        if (state.threadLoadInFlightCount === 0 && !state.runningTurnId && !state.turnStartInFlight) {
+          state.loaded = false;
+        }
+      };
       const unsubscribePromise = this.requestOnChannel(
         channel,
         'thread/unsubscribe',
@@ -7475,15 +7670,23 @@ export class CodexSdkProvider implements TransportProvider {
         CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS,
       )
         .then(() => {
+          clearResidency();
+          confirmedEvictedCount += 1;
           logger.debug(
             { provider: this.id, channel: channel.kind, sessionId, threadId, reason },
             'codex-sdk: evicted idle loaded thread',
           );
         })
         .catch((err) => {
+          if (this.isCodexThreadNotResidentError(err)) {
+            clearResidency();
+            confirmedEvictedCount += 1;
+          } else if (state.threadLoadInFlightCount === 0 && !state.runningTurnId && !state.turnStartInFlight) {
+            state.loaded = false;
+          }
           logger.debug(
             { provider: this.id, channel: channel.kind, sessionId, threadId, reason, err },
-            'codex-sdk: idle thread/unsubscribe failed or timed out; thread remains unloaded',
+            'codex-sdk: idle thread/unsubscribe failed or timed out; thread residency preserved on transient failure',
           );
         })
         .finally(() => {
@@ -7496,7 +7699,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     await Promise.allSettled(evictPromises);
-    return evictPromises.length;
+    return confirmedEvictedCount;
   }
 
   private runWithPrivacy<T>(sessionId: string, state: CodexSdkSessionState | undefined, fn: () => T): T {

@@ -7,6 +7,7 @@ const realSetTimeout = setTimeout;
 interface FakeChild {
   child: EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: Writable; killed: boolean; kill: () => boolean };
   requests: Array<{ id?: number; method?: string; params?: Record<string, any> }>;
+  residentThreads: Set<string>;
   emits: (message: Record<string, unknown>) => void;
 }
 
@@ -38,6 +39,7 @@ const appServer = vi.hoisted(() => {
             threadCounter += 1;
             const threadId = `thread-${threadCounter}`;
             const ephemeral = message.params?.ephemeral === true;
+            record.residentThreads.add(threadId);
             record.emits({
               id,
               result: { thread: { id: threadId, ephemeral, path: ephemeral ? null : `/tmp/${threadId}.jsonl` } },
@@ -48,6 +50,7 @@ const appServer = vi.hoisted(() => {
             });
           } else if (message.method === 'thread/resume') {
             const threadId = String(message.params?.threadId ?? 'thread-1');
+            record.residentThreads.add(threadId);
             record.emits({ id, result: { thread: { id: threadId } } });
           } else if (message.method === 'turn/start') {
             turnCounter += 1;
@@ -66,14 +69,17 @@ const appServer = vi.hoisted(() => {
           } else if (message.method === 'turn/interrupt' || message.method === 'thread/settings/update') {
             record.emits({ id, result: {} });
           } else if (message.method === 'thread/unsubscribe') {
+            const threadId = typeof message.params?.threadId === 'string' ? message.params.threadId : '';
             const action = unsubscribeHandler?.(message.params, record, id) ?? 'auto';
             if (action === 'defer') {
               deferredUnsubscribes.push(() => {
+                if (threadId) record.residentThreads.delete(threadId);
                 record.emits({ id, result: { status: 'unsubscribed' } });
               });
             } else if (typeof action === 'object' && 'error' in action) {
               record.emits({ id, error: { code: -32000, message: action.error } });
             } else {
+              if (threadId) record.residentThreads.delete(threadId);
               record.emits({ id, result: { status: 'unsubscribed' } });
             }
           }
@@ -91,6 +97,7 @@ const appServer = vi.hoisted(() => {
     record = {
       child,
       requests: [],
+      residentThreads: new Set<string>(),
       emits: (message) => {
         stdout.write(`${JSON.stringify(message)}\n`);
       },
@@ -142,7 +149,7 @@ import {
   CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS,
   CodexSdkProvider,
 } from '../../src/agent/providers/codex-sdk.js';
-import { CODEX_USER_INPUT_METHOD } from '../../shared/codex-user-input.js';
+import { CODEX_USER_INPUT_METHOD, INTERACTIVE_QUESTION_TOOL_NAME } from '../../shared/codex-user-input.js';
 
 interface InternalSessionStateView {
   loaded: boolean;
@@ -357,13 +364,38 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
     });
     await flushIo();
 
-    // Even if active turn flags were cleared while pendingAgentMessageQuestions remained, still exempt.
+    // Async agentMessage questions emitted through REAL app-server events (item/completed + turn/completed)
+    // MUST remain exempt after turn completion until answered / superseded by the next user turn.
+    const emittedQuestionCards: Array<{ sessionId: string; id: string; name: string }> = [];
+    provider.onToolCall((sid, tool) => {
+      if (tool.name === INTERACTIVE_QUESTION_TOOL_NAME) {
+        emittedQuestionCards.push({ sessionId: sid, id: tool.id, name: tool.name });
+      }
+    });
     await provider.createSession({ sessionKey: 's-async-q', cwd: '/tmp/p', agentId: 'gpt-5.4' });
-    await runCompleteTurn(provider, normalChild, 's-async-q', 'qturn');
-    (getSessionState(provider, 's-async-q') as { pendingAgentMessageQuestions?: unknown }).pendingAgentMessageQuestions = {
-      id: 'async-q-1',
-      questions: [{ id: 'q1', header: 'Q', question: 'Confirm?' }],
-    };
+    await provider.send('s-async-q', 'ask-async');
+    const asyncState = getSessionState(provider, 's-async-q')!;
+    const asyncTurnId = asyncState.runningTurnId!;
+    normalChild.emits({
+      method: 'item/completed',
+      params: {
+        threadId: asyncState.threadId,
+        turnId: asyncTurnId,
+        item: {
+          type: 'agentMessage',
+          id: 'msg-async-q',
+          text: 'Choose an option',
+          questions: [{ title: 'Confirm?', options: ['Proceed', 'Cancel'] }],
+        },
+      },
+    });
+    normalChild.emits({
+      method: 'turn/completed',
+      params: { threadId: asyncState.threadId, turn: { id: asyncTurnId, status: 'completed', error: null } },
+    });
+    await waitForCondition(() => !getSessionState(provider, 's-async-q')?.runningTurnId);
+    await flushIo();
+    expect(emittedQuestionCards.some((c) => c.sessionId === 's-async-q')).toBe(true);
 
     // Ephemeral / incognito session -> MUST NEVER be evicted (cannot thread/resume).
     await provider.createSession({ sessionKey: 's-incog', cwd: '/tmp/p', agentId: 'gpt-5.4', incognito: true });
@@ -385,12 +417,71 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
 
     expect(evictedThreadIds).toEqual([getSessionState(provider, 's-idle')?.threadId]);
     expect(getSessionState(provider, 's-idle')?.loaded).toBe(false);
+    expect(normalChild.residentThreads.has(getSessionState(provider, 's-idle')!.threadId!)).toBe(false);
     expect(getSessionState(provider, 's-active')?.loaded).toBe(true);
     expect(getSessionState(provider, 's-compact')?.loaded).toBe(true);
     expect(getSessionState(provider, 's-question')?.loaded).toBe(true);
     expect(getSessionState(provider, 's-async-q')?.loaded).toBe(true);
+    expect(normalChild.residentThreads.has(getSessionState(provider, 's-async-q')!.threadId!)).toBe(true);
     expect(getSessionState(provider, 's-incog')?.loaded).toBe(true);
     expect(getSessionState(provider, 's-ephem-flag')?.loaded).toBe(true);
+
+    // Answering / starting the next user turn on s-async-q clears the pending async question so it becomes evictable when idle.
+    await runCompleteTurn(provider, normalChild, 's-async-q', 'Proceed');
+    await vi.advanceTimersByTimeAsync(1_500);
+    await flushIo();
+    expect(getSessionState(provider, 's-async-q')?.loaded).toBe(false);
+    expect(normalChild.residentThreads.has(getSessionState(provider, 's-async-q')!.threadId!)).toBe(false);
+
+    await provider.disconnect();
+  });
+
+  it('tracks actual channel residency across loaded=false config invalidations and retries transient thread/unsubscribe failures', async () => {
+    const provider = new CodexSdkProvider({
+      maxLoadedThreads: 2,
+      idleThreadEvictMs: 1_000,
+      idleSweepIntervalMs: 60_000,
+    });
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    // 1. Model change (`setSessionAgentId`), system text refresh (`refreshSessionSystemText`), and cold `setServiceTier`
+    // all set `state.loaded = false` WITHOUT unsubscribing from app-server. Residency MUST remain tracked for LRU & sweep.
+    await provider.createSession({ sessionKey: 's-cfg-model', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-cfg-model', 't1');
+    provider.setSessionAgentId('s-cfg-model', 'gpt-5.4-mini');
+    expect(getSessionState(provider, 's-cfg-model')?.loaded).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await provider.createSession({ sessionKey: 's-cfg-sys', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-cfg-sys', 't2');
+    provider.refreshSessionSystemText('s-cfg-sys');
+    expect(getSessionState(provider, 's-cfg-sys')?.loaded).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await provider.createSession({ sessionKey: 's-cold-tier', cwd: '/tmp/p', agentId: 'gpt-5.4', resumeId: 'thread-cold-99' });
+    await provider.setServiceTier('s-cold-tier', 'fast');
+    expect(getSessionState(provider, 's-cold-tier')?.loaded).toBe(false);
+    await flushIo();
+
+    // Cold setServiceTier loaded a 3rd resident thread while s-cfg-model & s-cfg-sys stayed resident with loaded=false (> cap 2).
+    // Oldest resident (`s-cfg-model`, thread-1) MUST be LRU-evicted despite loaded=false.
+    expect(child.residentThreads.has('thread-1')).toBe(false);
+    expect(child.residentThreads.has('thread-2')).toBe(true);
+    expect(child.residentThreads.has('thread-cold-99')).toBe(true);
+    expect(child.residentThreads.size).toBe(2);
+
+    // 2. Transient unsubscribe failure MUST return 0 confirmed evictions and retry cleanly on the next sweep.
+    let failUnsub = true;
+    appServer.setUnsubscribeHandler(() => (failUnsub ? { error: 'internal busy' } : 'auto'));
+    await vi.advanceTimersByTimeAsync(1_100);
+    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(0);
+    expect(child.residentThreads.has('thread-2')).toBe(true);
+    expect(child.residentThreads.has('thread-cold-99')).toBe(true);
+
+    failUnsub = false;
+    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(2);
+    expect(child.residentThreads.size).toBe(0);
 
     await provider.disconnect();
   });
@@ -454,6 +545,65 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
     await provider.disconnect();
   });
 
+  it('rejects concurrent send cleanly without orphan thread/resume or turn/start when endSession runs during in-flight thread/unsubscribe', async () => {
+    const provider = new CodexSdkProvider({
+      idleThreadEvictMs: 1_000,
+      idleSweepIntervalMs: 60_000,
+    });
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+
+    await provider.createSession({ sessionKey: 's-end-race', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-end-race', 'first');
+
+    appServer.setUnsubscribeHandler(() => 'defer');
+    await vi.advanceTimersByTimeAsync(1_000);
+    const sweepPromise = provider.sweepIdleThreads('periodic-idle-sweep');
+    await waitForCondition(() => appServer.deferredUnsubscribes.length === 1);
+
+    // Begin endSession while thread/unsubscribe is still pending on the wire.
+    const endPromise = provider.endSession('s-end-race');
+    await flushIo();
+
+    // Concurrent send arrives before endSession finishes awaiting threadUnsubscribePromise.
+    const rejectedSend = provider.send('s-end-race', 'too-late');
+
+    appServer.deferredUnsubscribes.shift()!();
+    await sweepPromise;
+    await endPromise;
+
+    await expect(rejectedSend).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
+    expect(child.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(0);
+    expect(child.requests.filter((r) => r.method === 'turn/start')).toHaveLength(1);
+    expect(child.residentThreads.size).toBe(0);
+
+    // Case 2: send enters ensureThreadLoaded & awaits threadUnsubscribePromise BEFORE endSession runs.
+    appServer.setUnsubscribeHandler(undefined);
+    await provider.createSession({ sessionKey: 's-end-race-2', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-end-race-2', 'first-2');
+
+    appServer.setUnsubscribeHandler(() => 'defer');
+    await vi.advanceTimersByTimeAsync(1_000);
+    const sweepPromise2 = provider.sweepIdleThreads('periodic-idle-sweep');
+    await waitForCondition(() => appServer.deferredUnsubscribes.length === 1);
+
+    const inflightSend = provider.send('s-end-race-2', 'caught-waiting');
+    await flushIo();
+    const endPromise2 = provider.endSession('s-end-race-2');
+    await flushIo();
+
+    appServer.deferredUnsubscribes.shift()!();
+    await sweepPromise2;
+    await endPromise2;
+
+    await expect(inflightSend).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
+    expect(child.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(0);
+    expect(child.requests.filter((r) => r.method === 'turn/start')).toHaveLength(2);
+    expect(child.residentThreads.size).toBe(0);
+
+    await provider.disconnect();
+  });
+
   it('tolerates thread/unsubscribe RPC errors and timeouts without unhandled rejections and keeps later sweeps & resumes healthy', async () => {
     const provider = new CodexSdkProvider({
       idleThreadEvictMs: 1_000,
@@ -475,19 +625,22 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     const sweepPromise = provider.sweepIdleThreads('periodic-idle-sweep');
     await vi.advanceTimersByTimeAsync(CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS + 100);
-    await expect(sweepPromise).resolves.toBe(2);
+    // thread-1 returned "thread not found" (confirmed non-resident = 1); thread-2 timed out (transient = stays resident, not counted).
+    await expect(sweepPromise).resolves.toBe(1);
 
     expect(getSessionState(provider, 's-err')?.loaded).toBe(false);
     expect(getSessionState(provider, 's-timeout')?.loaded).toBe(false);
 
-    // Subsequent send on previously errored session resumes cleanly and later sweep still works.
+    // Subsequent send on previously gone session resumes cleanly, and next sweep retries & confirms thread-2 removal too.
     appServer.setUnsubscribeHandler(undefined);
     await runCompleteTurn(provider, child, 's-err', 'recovered');
     expect(getSessionState(provider, 's-err')?.loaded).toBe(true);
 
     await vi.advanceTimersByTimeAsync(1_000);
-    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(1);
+    await expect(provider.sweepIdleThreads('periodic-idle-sweep')).resolves.toBe(2);
     expect(getSessionState(provider, 's-err')?.loaded).toBe(false);
+    expect(getSessionState(provider, 's-timeout')?.loaded).toBe(false);
+    expect(child.residentThreads.size).toBe(0);
 
     await provider.disconnect();
   });
