@@ -35,6 +35,7 @@ import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { projectionOwnerCache } from '../daemon/memory-projection-owner-cache.js';
 import { matchesContextConsumerNamespace } from '../../shared/actionable-consumer-scope.js';
 import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -207,7 +208,10 @@ async function buildBootstrapResult(
   // managedSkillsOnly path also serves a namespace that has auto-injection of
   // recent history/related memory turned off via `memory_injection_set` —
   // managed Skills are a different, still-wanted concept and stay injected.
-  const memoryInjectionEnabled = await isMemoryInjectionEnabled(namespace).catch(() => true);
+  const daemonMemoryEnabled = isMemoryDaemonEnabled();
+  const memoryInjectionEnabled = daemonMemoryEnabled
+    ? await isMemoryInjectionEnabled(namespace).catch(() => true)
+    : false;
   const startupMemory = (skipStartupMemory || !memoryInjectionEnabled)
     ? await buildTransportStartupMemory(namespace, {
         projectDir, sessionId, providerId, serverId, trustedOwnerId,
@@ -216,12 +220,16 @@ async function buildBootstrapResult(
     : await buildTransportStartupMemoryForBootstrap(namespace, projectDir, sessionId, providerId, serverId, trustedOwnerId);
   let localProcessedFreshness: ContextFreshness | undefined;
   const diagnostics = [...(extras.diagnostics ?? [])];
-  try {
-    localProcessedFreshness = await getContextStoreClient().run<ContextFreshness>(
-      'getLocalProcessedFreshness', [namespace],
-    );
-  } catch {
-    diagnostics.push('local-processed-freshness:unavailable');
+  if (daemonMemoryEnabled) {
+    try {
+      localProcessedFreshness = await getContextStoreClient().run<ContextFreshness>(
+        'getLocalProcessedFreshness', [namespace],
+      );
+    } catch {
+      diagnostics.push('local-processed-freshness:unavailable');
+    }
+  } else {
+    diagnostics.push('daemon-memory:disabled');
   }
   return {
     namespace,
@@ -279,6 +287,7 @@ export async function buildTransportStartupMemory(
     // dispatch fallback that runs when the bootstrap produced nothing. With
     // injection turned off for the project only managed Skills may survive.
     const managedSkillsOnly = options.managedSkillsOnly === true
+      || !isMemoryDaemonEnabled()
       || !(await isMemoryInjectionEnabled(namespace).catch(() => true));
     const remoteItems = managedSkillsOnly ? [] : (options.remoteItems ?? []).filter((item) => (
       matchesContextConsumerNamespace({

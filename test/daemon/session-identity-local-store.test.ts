@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFile, rm, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync, mkdtempSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   getLocalSessionIdentityProfile,
+  identityStoreReadStatsForTests,
   listLocalSessionIdentityProfiles,
   localSessionIdentityDbPath,
   localSessionIdentityStorePath,
@@ -14,6 +16,9 @@ import {
   removeSessionIdentitiesForSession,
   resetIdentityStoreCacheForTests,
 } from '../../src/daemon/session-identity-local-store.js';
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 const home = mkdtempSync(join(tmpdir(), 'imcodes-identity-local-store-'));
 
@@ -41,8 +46,9 @@ describe('daemon-local session identity store', () => {
     expect(existsSync(localSessionIdentityDbPath())).toBe(true);
 
     expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'local identity', revision: 1 });
-    expect(JSON.parse(await readFile(localSessionIdentityStorePath(), 'utf8')).profiles['user\0'].content)
-      .toBe('local identity');
+    expect(existsSync(localSessionIdentityStorePath())).toBe(false);
+    resetIdentityStoreCacheForTests();
+    expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'local identity', revision: 1 });
   });
 
   it.each(['project', 'session'] as const)('persists and reopens 500k code points for %s without accepting one more', async (scope) => {
@@ -146,5 +152,90 @@ describe('daemon-local session identity store', () => {
     expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'legacy-user', revision: 3 });
     expect(await getLocalSessionIdentityProfile('project', 'my-repo')).toMatchObject({ content: 'legacy-project', revision: 2 });
     expect(existsSync(localSessionIdentityDbPath())).toBe(true);
+  });
+
+  it('stops rewriting legacy JSON after migration, serves single-key gets without full-table scans, and keeps WAL bounded', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await mkdir(home, { recursive: true });
+    const legacyPath = join(home, 'session-identities.json');
+    const legacyRaw = JSON.stringify({
+      version: 1,
+      profiles: {
+        'user\0': { scope: 'user', scopeKey: '', content: 'seed-user', contentHash: 'h0', revision: 1, updatedAt: 100, source: 'web' },
+      },
+      migratedAt: 1000,
+    });
+    await writeFile(legacyPath, legacyRaw);
+    const beforeStat = await stat(legacyPath);
+
+    // First read migrates legacy JSON once.
+    expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'seed-user', revision: 1 });
+    const statsBeforeGets = identityStoreReadStatsForTests();
+    expect(statsBeforeGets.loads).toBe(1);
+
+    // Subsequent writes + single-key reads do not rewrite legacy JSON and do not full-scan the table.
+    const largePayload = 'X'.repeat(350_000);
+    for (let i = 0; i < 35; i += 1) {
+      await putLocalSessionIdentityProfile({
+        scope: 'session',
+        scopeKey: `srv-1:sess-${i % 8}`,
+        content: `${i}:${largePayload}`,
+        source: 'mcp',
+      });
+    }
+    const readOne = await getLocalSessionIdentityProfile('session', 'srv-1:sess-3');
+    expect(readOne?.revision).toBeGreaterThanOrEqual(4);
+
+    const statsAfter = identityStoreReadStatsForTests();
+    expect(statsAfter.listScans).toBe(0);
+    expect(statsAfter.pkReads).toBe(2);
+    expect(statsAfter.walCheckpoints).toBeGreaterThan(0);
+
+    const afterStat = await stat(legacyPath);
+    expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
+    expect(await readFile(legacyPath, 'utf8')).toBe(legacyRaw);
+
+    const walPath = `${localSessionIdentityDbPath()}-wal`;
+    const walBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+    // Cumulative writes exceeded 12 MB; bounded WAL limit (8 MB) + checkpoint keeps WAL small.
+    expect(walBytes).toBeLessThanOrEqual(8 * 1024 * 1024 + 512 * 1024);
+  });
+
+  it('truncates pre-existing bloated historical WAL on startup open', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await mkdir(home, { recursive: true });
+
+    // Seed a valid store, then append >9 MB of uncheckpointed WAL frames from a raw connection.
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'seed', source: 'web' });
+    resetIdentityStoreCacheForTests();
+
+    const dbPath = localSessionIdentityDbPath();
+    // Hold an open read transaction while writing from a second connection so SQLite retains the >8 MB WAL on close.
+    const pinReader = new DatabaseSync(dbPath);
+    pinReader.exec('BEGIN; SELECT count(*) FROM session_identity_profiles;');
+
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;');
+    const bigText = 'W'.repeat(400_000);
+    const stmt = rawDb.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES ('session', ?, ?, 'h', 1, 1000, 'mcp', NULL)
+    `);
+    for (let i = 0; i < 28; i += 1) {
+      stmt.run(`bloat-${i}`, bigText);
+    }
+    rawDb.close();
+    pinReader.exec('ROLLBACK');
+
+    const walPath = `${dbPath}-wal`;
+    const bloatedWalBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+    expect(bloatedWalBytes).toBeGreaterThan(8 * 1024 * 1024);
+
+    // Opening via the store runs startup checkpoint(TRUNCATE) and shrinks the WAL.
+    expect(await getLocalSessionIdentityProfile('session', 'bloat-5')).toMatchObject({ content: bigText });
+    pinReader.close();
+    const shrunkWalBytes = existsSync(walPath) ? statSync(walPath).size : 0;
+    expect(shrunkWalBytes).toBeLessThan(1024 * 1024);
   });
 });

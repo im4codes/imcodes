@@ -6,7 +6,10 @@ import { MCP_TOOL_CATALOG_MODES } from '../../shared/mcp-tool-discovery.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { setMemoryDaemonEnabled } from '../../src/store/memory-daemon-switch.js';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
@@ -9033,6 +9036,77 @@ ${PREFERENCE_CONTEXT_END}`;
       }, { timeout: 5000 });
       await waitForProviderSendCount(mock.provider, 3);
       expect((mock.provider.send.mock.calls[2]?.[1] as { assembledMessage?: string })?.assembledMessage).toBe('queued-after-timeout');
+    });
+
+    it('short-circuits recall and memoryInjectionEnabled when daemon memory is disabled and recovers when re-enabled', async () => {
+      const switchDir = await mkdtemp(join(tmpdir(), 'imcodes-mem-switch-'));
+      const switchPath = join(switchDir, 'memory-daemon-switch.json');
+      vi.stubEnv('IMCODES_MEMORY_DAEMON_SWITCH_PATH', switchPath);
+
+      const localMock = makeMockProvider();
+      const localRuntime = new TransportSessionRuntime(localMock.provider, 'deck_memory_switch_brain');
+      try {
+        setMemoryDaemonEnabled(false);
+        searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([
+          makeSearchItem({ summary: 'Should be skipped while memory daemon is off', relevanceScore: 0.95 }),
+        ]));
+        collectRecentSummarySyncCandidatesMock.mockResolvedValue([
+          makeSummarySyncCandidate('sum-off', 'Recent summary that must not run while memory is off'),
+        ]);
+
+        localRuntime.setContextBootstrapResolver(async () => ({
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+          diagnostics: ['daemon-memory:disabled'],
+        }));
+        await localRuntime.initialize({ ...defaultConfig, sessionKey: 'deck_memory_switch_brain' });
+
+        memoryInjectionEnabledMock.mockClear();
+        searchLocalMemorySemanticMock.mockClear();
+        collectRecentSummarySyncCandidatesMock.mockClear();
+
+        expect(localRuntime.send('Please investigate the timeout in recall path', 'turn-mem-off')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 1);
+        expect(memoryInjectionEnabledMock).not.toHaveBeenCalled();
+        expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+        expect(collectRecentSummarySyncCandidatesMock).not.toHaveBeenCalled();
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.not.objectContaining({
+          memoryRecall: expect.anything(),
+        }));
+
+        localMock.fireComplete('sess-1');
+        await flushDispatch();
+
+        // Direct internal recall invocation also short-circuits cleanly without invoking RPCs.
+        const directRecall = await (
+          localRuntime as unknown as {
+            buildTransportMessageRecallResult: (
+              message: string,
+              authoritySource: 'processed_local',
+            ) => Promise<{ artifact: unknown }>;
+          }
+        ).buildTransportMessageRecallResult('Direct recall call while disabled', 'processed_local');
+        expect(directRecall).toEqual({ artifact: null });
+        expect(memoryInjectionEnabledMock).not.toHaveBeenCalled();
+        expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+        expect(collectRecentSummarySyncCandidatesMock).not.toHaveBeenCalled();
+
+        // Flip switch back to enabled -> next turn immediately restores recall without restart.
+        setMemoryDaemonEnabled(true);
+        expect(localRuntime.send('Now recall memory after re-enabling daemon switch', 'turn-mem-on')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 2);
+        expect(memoryInjectionEnabledMock).toHaveBeenCalled();
+        expect(searchLocalMemorySemanticMock).toHaveBeenCalled();
+        expect(collectRecentSummarySyncCandidatesMock).toHaveBeenCalled();
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+          memoryRecall: expect.objectContaining({
+            injectedText: expect.stringContaining('Should be skipped while memory daemon is off'),
+          }),
+        }));
+      } finally {
+        vi.unstubAllEnvs();
+        await localRuntime.kill().catch(() => {});
+        await rm(switchDir, { recursive: true, force: true });
+      }
     });
   });
 });

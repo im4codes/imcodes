@@ -11,20 +11,28 @@
  * The assertions below are structural (how many times the file was read), never timing or heap-size thresholds.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import {
   getLocalSessionIdentityProfile,
   identityStoreReadStatsForTests,
   isSessionIdentityMigrated,
   listLocalSessionIdentityProfiles,
+  localSessionIdentityDbPath,
   localSessionIdentityStorePath,
   putLocalSessionIdentityProfile,
   removeLocalSessionIdentityProfile,
   resetIdentityStoreCacheForTests,
 } from '../../src/daemon/session-identity-local-store.js';
 import { collectMemoryProbes } from '../../src/daemon/memory-probes.js';
+
+const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 let home: string;
 
@@ -63,11 +71,11 @@ describe('identity store: concurrent readers share one read of the file', () => 
     expect(identityStoreReadStatsForTests().loads).toBe(1);
   });
 
-  it('later reads of an unchanged file are served from the parsed store without touching the content again', async () => {
+  it('later reads query SQLite directly by primary key without re-reading legacy JSON', async () => {
     await writeProductionShapedStore(8, 1_000);
     await getLocalSessionIdentityProfile('session', 'srv:s1');
     for (let round = 0; round < 5; round += 1) await getLocalSessionIdentityProfile('session', 'srv:s2');
-    expect(identityStoreReadStatsForTests()).toMatchObject({ loads: 1, cacheHits: 5 });
+    expect(identityStoreReadStatsForTests()).toMatchObject({ loads: 1, pkReads: 6, listScans: 0 });
   });
 
   it('returns copies: a caller editing its profile cannot change what the next reader sees', async () => {
@@ -77,19 +85,33 @@ describe('identity store: concurrent readers share one read of the file', () => 
     expect((await getLocalSessionIdentityProfile('session', 'srv:s0'))!.content).not.toBe('tampered');
   });
 
-  it('a file replaced from outside is noticed on the next read', async () => {
+  it('ignores external changes to legacy JSON once migrated while seeing direct SQLite writes immediately', async () => {
     await writeProductionShapedStore(3, 100);
     expect(await listLocalSessionIdentityProfiles()).toHaveLength(3);
     const file = join(home, 'session-identities.json');
     const prevStat = await stat(file);
     await writeProductionShapedStore(5, 100);
-    // Force an identical mtime (same millisecond & inode) to ensure size/stat-signature changes still reload.
+    // Force an identical mtime (same millisecond & inode) — SQLite remains authoritative and never wipes & reimports legacy JSON.
     await utimes(file, prevStat.atime, prevStat.mtime);
-    expect(await listLocalSessionIdentityProfiles()).toHaveLength(5);
+    expect(await listLocalSessionIdentityProfiles()).toHaveLength(3);
+
+    // An independent SQLite writer's update is visible on the very next single-key get.
+    const externalDb = new DatabaseSync(localSessionIdentityDbPath());
+    externalDb.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES ('session', 'srv:external', 'from-external-writer', 'hx', 7, 9999, 'mcp', NULL)
+    `).run();
+    externalDb.close();
+    expect(await getLocalSessionIdentityProfile('session', 'srv:external')).toMatchObject({
+      content: 'from-external-writer',
+      revision: 7,
+    });
   });
 
-  it('a write is visible to the very next read even when a read of the older file is still in flight', async () => {
+  it('a write is visible to the very next read without rewriting legacy JSON even when list reads run concurrently', async () => {
     await writeProductionShapedStore(50, 50_000);
+    const jsonStatBefore = await stat(localSessionIdentityStorePath());
     const staleReaders = Array.from({ length: 30 }, () => listLocalSessionIdentityProfiles());
     const written = putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo', content: 'after', source: 'mcp' });
     const second = putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-2', content: 'after-2', source: 'mcp' });
@@ -100,21 +122,26 @@ describe('identity store: concurrent readers share one read of the file', () => 
     expect(await getLocalSessionIdentityProfile('project', 'repo-2')).toMatchObject({ content: 'after-2' });
     await removeLocalSessionIdentityProfile('project', 'repo');
     expect(await listLocalSessionIdentityProfiles()).toHaveLength(51);
-    // And it is on disk, not only in the cache.
-    expect(Object.keys(JSON.parse(await readFile(localSessionIdentityStorePath(), 'utf8')).profiles)).toHaveLength(51);
+
+    // Legacy JSON stays untouched (zero full-file rewrite amplification); SQLite persists all 51 across cache reset.
+    expect((await stat(localSessionIdentityStorePath())).mtimeMs).toBe(jsonStatBefore.mtimeMs);
+    expect(Object.keys(JSON.parse(await readFile(localSessionIdentityStorePath(), 'utf8')).profiles)).toHaveLength(50);
+    resetIdentityStoreCacheForTests();
+    expect(await listLocalSessionIdentityProfiles()).toHaveLength(51);
   });
 
-  it('a missing file reads as empty, and a file that is not JSON reads as empty and is replaced by the next write', async () => {
+  it('a missing file reads as empty, and a file that is not JSON reads as empty and heals cleanly in SQLite', async () => {
     expect(await listLocalSessionIdentityProfiles()).toEqual([]);
     expect(await isSessionIdentityMigrated()).toBe(false);
     await mkdir(home, { recursive: true });
     await writeFile(join(home, 'session-identities.json'), '{ not json');
+    resetIdentityStoreCacheForTests();
     expect(await listLocalSessionIdentityProfiles()).toEqual([]);
     await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'healed', source: 'web' });
     expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'healed' });
   });
 
-  it.skipIf(process.getuid?.() === 0)('a store that cannot be READ is never overwritten by a write built on "empty"', async () => {
+  it.skipIf(process.getuid?.() === 0)('a legacy store that cannot be READ never marks migration complete or loses unmigrated data', async () => {
     await writeProductionShapedStore(4, 100);
     const file = join(home, 'session-identities.json');
     const before = await readFile(file, 'utf8');
@@ -125,11 +152,51 @@ describe('identity store: concurrent readers share one read of the file', () => 
     expect(await listLocalSessionIdentityProfiles()).toHaveLength(4);
   });
 
-  it('reports its read counters (numbers only) to the memory guard diagnostic', async () => {
+  it('reports its read counters (numbers only) to the memory guard diagnostic with zero cached table bytes', async () => {
     await writeProductionShapedStore(2, 100);
     await listLocalSessionIdentityProfiles();
     const probe = collectMemoryProbes()['identityStore'];
-    expect(probe).toMatchObject({ loads: 1, inFlightLoads: 0 });
-    expect(probe!['cachedBytes']).toBeGreaterThan(0);
+    expect(probe).toMatchObject({ loads: 1, listScans: 1, cachedBytes: 0 });
+  });
+
+  it('supports concurrent multi-process SQLite writes without SQLITE_BUSY loss or revision regression', async () => {
+    await mkdir(home, { recursive: true });
+    await putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'shared-race', content: 'seed', source: 'mcp' });
+
+    const tsxBin = join(process.cwd(), 'node_modules', '.bin', 'tsx');
+    const storeModuleUrl = new URL('../../src/daemon/session-identity-local-store.ts', import.meta.url).href;
+    const workerScript = `
+      const { putLocalSessionIdentityProfile } = await import(${JSON.stringify(storeModuleUrl)});
+      const workerId = process.argv[1];
+      await putLocalSessionIdentityProfile({
+        scope: 'session',
+        scopeKey: 'proc:' + workerId,
+        content: 'owned-by-' + workerId,
+        source: 'mcp',
+      });
+      await putLocalSessionIdentityProfile({
+        scope: 'project',
+        scopeKey: 'shared-race',
+        content: 'updated-by-' + workerId,
+        source: 'mcp',
+      });
+    `;
+
+    await Promise.all(
+      ['w1', 'w2', 'w3', 'w4'].map((workerId) =>
+        execFileAsync(tsxBin, ['--input-type=module', '-e', workerScript, workerId], {
+          env: { ...process.env, IMCODES_HOME: home },
+        }),
+      ),
+    );
+
+    const shared = await getLocalSessionIdentityProfile('project', 'shared-race');
+    expect(shared?.revision).toBe(5);
+    for (const workerId of ['w1', 'w2', 'w3', 'w4']) {
+      expect(await getLocalSessionIdentityProfile('session', `proc:${workerId}`)).toMatchObject({
+        content: `owned-by-${workerId}`,
+        revision: 1,
+      });
+    }
   });
 });

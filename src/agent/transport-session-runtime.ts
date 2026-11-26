@@ -104,6 +104,7 @@ import {
 } from '../context/summary-sync.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { CROSS_VENDOR_HANDOFF_DEFAULTS, type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
@@ -5082,13 +5083,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
       const suppressMemoryContext = this.incognito || suppressTurnContext || isPrivateControlDispatch;
+      const daemonMemoryEnabled = isMemoryDaemonEnabled();
       // The toggle is re-read here, not only at bootstrap: a session whose
       // first-turn memory was assembled before injection was turned off must
       // still honor the switch without a restart. Managed Skills stay.
       const startupInjectionDisabled = !suppressMemoryContext
         && !this._startupMemoryInjected
         && !!this._contextNamespace
-        && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true));
+        && (!daemonMemoryEnabled || !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true)));
       const startupMemory = suppressMemoryContext ? null : startupInjectionDisabled
         ? (await buildTransportStartupMemory(this._contextNamespace!, {
           projectDir: this._projectDir,
@@ -6322,6 +6324,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           sourceKind: 'local_processed',
         }),
       };
+    }
+    if (!isMemoryDaemonEnabled()) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: daemon memory disabled');
+      return { artifact: null };
     }
     if (this._contextNamespace && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true))) {
       return { artifact: null };
