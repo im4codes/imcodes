@@ -699,4 +699,135 @@ describe('admin email endpoints', () => {
     expect(failJson.message).not.toContain(encodeURIComponent(trickySecret));
     expect(failJson.message).not.toContain('SENTINEL_ADMIN_502');
   });
+
+  it('isolates corrupt optional provider config across status, explicit test send, and auto routing', async () => {
+    const adminJwt = signJwt({ sub: 'u-admin', type: 'web' }, JWT_KEY, 3600);
+
+    // Case A: Healthy AWS SES + DirectMail with trailing CRLF alias
+    const awsHealthyEnv = {
+      ...baseAwsEnv(),
+      ...baseAliyunEnv({ ALIYUN_DM_FROM_ALIAS: 'IM.codes\r\n' }),
+    };
+    const appAwsHealthy = buildAdminTestApp({
+      user: { id: 'u-admin', is_admin: true, status: 'active' },
+      envOverrides: awsHealthyEnv,
+    });
+    const stA = await appAwsHealthy.app.request('/api/admin/email/status', {
+      headers: { Authorization: `Bearer ${adminJwt}` },
+    });
+    expect(stA.status).toBe(200);
+    expect(await stA.json()).toEqual({
+      configured: true,
+      providers: { awsSes: true, aliyunDm: false },
+    });
+
+    const fetchMockA = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ MessageId: 'aws-isolated-1' }), { status: 200 }),
+    );
+    globalThis.fetch = fetchMockA;
+
+    // Explicit healthy aws_ses -> 1 request, 200
+    const resAExplicit = await appAwsHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@qq.com', provider: 'aws_ses' }),
+    });
+    expect(resAExplicit.status).toBe(200);
+    expect((await resAExplicit.json()).provider).toBe('aws_ses');
+    expect(fetchMockA).toHaveBeenCalledTimes(1);
+
+    // Auto routing -> routes directly to healthy aws_ses (1 request)
+    const resAAuto = await appAwsHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@qq.com' }),
+    });
+    expect(resAAuto.status).toBe(200);
+    expect((await resAAuto.json()).provider).toBe('aws_ses');
+    expect(fetchMockA).toHaveBeenCalledTimes(2);
+
+    // Explicit broken aliyun_dm -> 503 with 0 additional fetch calls
+    const resABad = await appAwsHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@qq.com', provider: 'aliyun_dm' }),
+    });
+    expect(resABad.status).toBe(503);
+    expect((await resABad.json()).error).toBe('email_provider_not_configured');
+    expect(fetchMockA).toHaveBeenCalledTimes(2);
+
+    // Case B: Symmetric — Healthy DirectMail + AWS SES with trailing LF endpoint
+    const dmHealthyEnv = {
+      ...baseAwsEnv({ AWS_SES_ENDPOINT: 'https://email.us-east-1.amazonaws.com\n' }),
+      ...baseAliyunEnv(),
+    };
+    const appDmHealthy = buildAdminTestApp({
+      user: { id: 'u-admin', is_admin: true, status: 'active' },
+      envOverrides: dmHealthyEnv,
+    });
+    const stB = await appDmHealthy.app.request('/api/admin/email/status', {
+      headers: { Authorization: `Bearer ${adminJwt}` },
+    });
+    expect(stB.status).toBe(200);
+    expect(await stB.json()).toEqual({
+      configured: true,
+      providers: { awsSes: false, aliyunDm: true },
+    });
+
+    const fetchMockB = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ EnvId: 'dm-isolated-1' }), { status: 200 }),
+    );
+    globalThis.fetch = fetchMockB;
+
+    // Explicit healthy aliyun_dm -> 1 request, 200
+    const resBExplicit = await appDmHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@gmail.com', provider: 'aliyun_dm' }),
+    });
+    expect(resBExplicit.status).toBe(200);
+    expect((await resBExplicit.json()).provider).toBe('aliyun_dm');
+    expect(fetchMockB).toHaveBeenCalledTimes(1);
+
+    // Auto routing -> routes directly to healthy aliyun_dm (1 request)
+    const resBAuto = await appDmHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@gmail.com' }),
+    });
+    expect(resBAuto.status).toBe(200);
+    expect((await resBAuto.json()).provider).toBe('aliyun_dm');
+    expect(fetchMockB).toHaveBeenCalledTimes(2);
+
+    // Explicit broken aws_ses -> 503 with 0 additional fetch calls
+    const resBBad = await appDmHealthy.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@gmail.com', provider: 'aws_ses' }),
+    });
+    expect(resBBad.status).toBe(503);
+    expect((await resBBad.json()).error).toBe('email_provider_not_configured');
+    expect(fetchMockB).toHaveBeenCalledTimes(2);
+
+    // Case C: Both corrupt -> status false, auto mode returns 503 with 0 fetch calls
+    const appBothBad = buildAdminTestApp({
+      user: { id: 'u-admin', is_admin: true, status: 'active' },
+      envOverrides: {
+        ...baseAwsEnv({ AWS_SES_ENDPOINT: 'https://email.us-east-1.amazonaws.com\n' }),
+        ...baseAliyunEnv({ ALIYUN_DM_FROM_ALIAS: 'IM.codes\r\n' }),
+      },
+    });
+    expect(getEmailConfigStatus({
+      ...baseAwsEnv({ AWS_SES_ENDPOINT: 'https://email.us-east-1.amazonaws.com\n' }),
+      ...baseAliyunEnv({ ALIYUN_DM_FROM_ALIAS: 'IM.codes\r\n' }),
+    })).toEqual({ configured: false, providers: { awsSes: false, aliyunDm: false } });
+    const resBothBad = await appBothBad.app.request('/api/admin/email/test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'user@gmail.com' }),
+    });
+    expect(resBothBad.status).toBe(503);
+    expect((await resBothBad.json()).error).toBe('email_not_configured');
+    expect(fetchMockB).toHaveBeenCalledTimes(2);
+  });
 });

@@ -84,7 +84,7 @@ interface AwsSesConfig {
   secretAccessKey: string;
   region: string;
   from: string;
-  endpoint?: string;
+  endpointUrl: URL;
 }
 
 interface AliyunDmConfig {
@@ -93,7 +93,7 @@ interface AliyunDmConfig {
   region: string;
   from: string;
   fromAlias?: string;
-  endpoint?: string;
+  endpointUrl: URL;
 }
 
 export const DEFAULT_EMAIL_CN_DOMAINS: readonly string[] = [
@@ -128,10 +128,6 @@ const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 const SINGLE_EMAIL_RE = /^[^\s@,;<>()[\]\\"]+@[^\s@,;<>()[\]\\"]+\.[^\s@,;<>()[\]\\"]{2,}$/;
 const SAFE_REGION_RE = /^[a-z0-9-]+$/;
 
-function hasNonEmptyConfig(value: string | undefined): boolean {
-  return typeof value === 'string' && !CONTROL_CHAR_RE.test(value) && value.trim().length > 0;
-}
-
 /** Reject control characters in raw config strings before trimming whitespace. */
 function cleanConfigValue(raw: unknown, field: string): string | undefined {
   if (raw === undefined) return undefined;
@@ -145,57 +141,67 @@ function cleanConfigValue(raw: unknown, field: string): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function getAwsSesConfigForStatus(env: Partial<EnvConfig>): boolean {
-  return (
-    hasNonEmptyConfig(env.AWS_SES_ACCESS_KEY_ID) &&
-    hasNonEmptyConfig(env.AWS_SES_SECRET_ACCESS_KEY) &&
-    hasNonEmptyConfig(env.AWS_SES_FROM)
-  );
+function parseHttpUrl(rawUrl: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  return url;
 }
 
-function getAliyunDmConfigForStatus(env: Partial<EnvConfig>): boolean {
-  return (
-    hasNonEmptyConfig(env.ALIYUN_DM_ACCESS_KEY_ID) &&
-    hasNonEmptyConfig(env.ALIYUN_DM_ACCESS_KEY_SECRET) &&
-    hasNonEmptyConfig(env.ALIYUN_DM_FROM)
-  );
+function tryParseAwsSesConfig(env: Partial<EnvConfig>): AwsSesConfig | null {
+  try {
+    const accessKeyId = cleanConfigValue(env.AWS_SES_ACCESS_KEY_ID, 'AWS_SES_ACCESS_KEY_ID');
+    const secretAccessKey = cleanConfigValue(env.AWS_SES_SECRET_ACCESS_KEY, 'AWS_SES_SECRET_ACCESS_KEY');
+    const from = cleanConfigValue(env.AWS_SES_FROM, 'AWS_SES_FROM');
+    if (!accessKeyId || !secretAccessKey || !from) return null;
+
+    const region = cleanConfigValue(env.AWS_SES_REGION, 'AWS_SES_REGION') ?? DEFAULT_AWS_SES_REGION;
+    if (!SAFE_REGION_RE.test(region)) return null;
+
+    const endpoint = cleanConfigValue(env.AWS_SES_ENDPOINT, 'AWS_SES_ENDPOINT');
+    const endpointUrl = parseHttpUrl(endpoint ?? `https://email.${region}.amazonaws.com`);
+    if (!endpointUrl) return null;
+
+    const prefix = endpointUrl.pathname.replace(/\/+$/, '');
+    endpointUrl.pathname = `${prefix}/v2/email/outbound-emails`;
+
+    return { accessKeyId, secretAccessKey, region, from, endpointUrl };
+  } catch {
+    return null;
+  }
 }
 
-function parseAwsSesConfig(env: Partial<EnvConfig>): AwsSesConfig | null {
-  if (!getAwsSesConfigForStatus(env)) return null;
-  const accessKeyId = cleanConfigValue(env.AWS_SES_ACCESS_KEY_ID, 'AWS_SES_ACCESS_KEY_ID');
-  const secretAccessKey = cleanConfigValue(env.AWS_SES_SECRET_ACCESS_KEY, 'AWS_SES_SECRET_ACCESS_KEY');
-  const from = cleanConfigValue(env.AWS_SES_FROM, 'AWS_SES_FROM');
-  if (!accessKeyId || !secretAccessKey || !from) return null;
-  return {
-    accessKeyId,
-    secretAccessKey,
-    region: cleanConfigValue(env.AWS_SES_REGION, 'AWS_SES_REGION') ?? DEFAULT_AWS_SES_REGION,
-    from,
-    endpoint: cleanConfigValue(env.AWS_SES_ENDPOINT, 'AWS_SES_ENDPOINT'),
-  };
-}
+function tryParseAliyunDmConfig(env: Partial<EnvConfig>): AliyunDmConfig | null {
+  try {
+    const accessKeyId = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_ID, 'ALIYUN_DM_ACCESS_KEY_ID');
+    const accessKeySecret = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_SECRET, 'ALIYUN_DM_ACCESS_KEY_SECRET');
+    const rawFrom = cleanConfigValue(env.ALIYUN_DM_FROM, 'ALIYUN_DM_FROM');
+    if (!accessKeyId || !accessKeySecret || !rawFrom) return null;
+    const from = validateEmailAddress(rawFrom, 'ALIYUN_DM_FROM');
 
-function parseAliyunDmConfig(env: Partial<EnvConfig>): AliyunDmConfig | null {
-  if (!getAliyunDmConfigForStatus(env)) return null;
-  const accessKeyId = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_ID, 'ALIYUN_DM_ACCESS_KEY_ID');
-  const accessKeySecret = cleanConfigValue(env.ALIYUN_DM_ACCESS_KEY_SECRET, 'ALIYUN_DM_ACCESS_KEY_SECRET');
-  const from = cleanConfigValue(env.ALIYUN_DM_FROM, 'ALIYUN_DM_FROM');
-  if (!accessKeyId || !accessKeySecret || !from) return null;
-  return {
-    accessKeyId,
-    accessKeySecret,
-    region: cleanConfigValue(env.ALIYUN_DM_REGION, 'ALIYUN_DM_REGION') ?? DEFAULT_ALIYUN_DM_REGION,
-    from,
-    fromAlias: cleanConfigValue(env.ALIYUN_DM_FROM_ALIAS, 'ALIYUN_DM_FROM_ALIAS'),
-    endpoint: cleanConfigValue(env.ALIYUN_DM_ENDPOINT, 'ALIYUN_DM_ENDPOINT'),
-  };
+    const region = cleanConfigValue(env.ALIYUN_DM_REGION, 'ALIYUN_DM_REGION') ?? DEFAULT_ALIYUN_DM_REGION;
+    if (!SAFE_REGION_RE.test(region)) return null;
+
+    const fromAlias = cleanConfigValue(env.ALIYUN_DM_FROM_ALIAS, 'ALIYUN_DM_FROM_ALIAS');
+    const endpoint = cleanConfigValue(env.ALIYUN_DM_ENDPOINT, 'ALIYUN_DM_ENDPOINT');
+    const rawEndpoint = endpoint ?? ALIYUN_DM_ENDPOINTS[region] ?? `https://dm.${region}.aliyuncs.com/`;
+    const endpointUrl = parseHttpUrl(rawEndpoint);
+    if (!endpointUrl) return null;
+
+    return { accessKeyId, accessKeySecret, region, from, fromAlias, endpointUrl };
+  } catch {
+    return null;
+  }
 }
 
 /** Non-secret email provider availability summary. */
 export function getEmailConfigStatus(env: Partial<EnvConfig>): EmailConfigStatus {
-  const awsSes = getAwsSesConfigForStatus(env);
-  const aliyunDm = getAliyunDmConfigForStatus(env);
+  const awsSes = tryParseAwsSesConfig(env) !== null;
+  const aliyunDm = tryParseAliyunDmConfig(env) !== null;
   return {
     configured: awsSes || aliyunDm,
     providers: { awsSes, aliyunDm },
@@ -266,13 +272,6 @@ function resolveReplyTo(messageReplyTo: unknown, envReplyTo: unknown): string | 
   }
 
   return undefined;
-}
-
-function validateFromAddress(raw: string, field: string): string {
-  if (CONTROL_CHAR_RE.test(raw)) {
-    throw new EmailServiceError('email_invalid_input', `Invalid characters in ${field}`);
-  }
-  return raw.trim();
 }
 
 function validateSubject(raw: unknown): string {
@@ -349,34 +348,17 @@ async function postWithBoundedResponse(
   }
 }
 
-function buildAwsEndpointUrl(config: AwsSesConfig): URL {
-  if (!SAFE_REGION_RE.test(config.region)) {
-    throw new EmailServiceError('email_invalid_input', 'Invalid AWS_SES_REGION');
-  }
-  const base = config.endpoint ?? `https://email.${config.region}.amazonaws.com`;
-  let url: URL;
-  try {
-    url = new URL(base);
-  } catch {
-    throw new EmailServiceError('email_invalid_input', 'Invalid AWS_SES_ENDPOINT');
-  }
-  const prefix = url.pathname.replace(/\/+$/, '');
-  url.pathname = `${prefix}/v2/email/outbound-emails`;
-  return url;
-}
-
 async function sendViaAwsSes(
   config: AwsSesConfig,
   params: { to: string; subject: string; text?: string; html?: string; replyTo?: string },
   opts: Required<Pick<EmailSendOptions, 'fetch' | 'now' | 'timeoutMs'>>,
 ): Promise<EmailSendResult> {
-  const from = validateFromAddress(config.from, 'AWS_SES_FROM');
-  const url = buildAwsEndpointUrl(config);
+  const url = config.endpointUrl;
   const amzDate = new Date(opts.now()).toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = amzDate.slice(0, 8);
 
   const bodyObj = {
-    FromEmailAddress: from,
+    FromEmailAddress: config.from,
     Destination: { ToAddresses: [params.to] },
     ...(params.replyTo ? { ReplyToAddresses: [params.replyTo] } : {}),
     Content: {
@@ -474,31 +456,18 @@ async function sendViaAwsSes(
   return { provider: 'aws_ses', messageId, fallbackUsed: false };
 }
 
-function buildAliyunEndpointUrl(config: AliyunDmConfig): URL {
-  if (!SAFE_REGION_RE.test(config.region)) {
-    throw new EmailServiceError('email_invalid_input', 'Invalid ALIYUN_DM_REGION');
-  }
-  const rawEndpoint = config.endpoint ?? ALIYUN_DM_ENDPOINTS[config.region] ?? `https://dm.${config.region}.aliyuncs.com/`;
-  try {
-    return new URL(rawEndpoint);
-  } catch {
-    throw new EmailServiceError('email_invalid_input', 'Invalid ALIYUN_DM_ENDPOINT');
-  }
-}
-
 async function sendViaAliyunDm(
   config: AliyunDmConfig,
   params: { to: string; subject: string; text?: string; html?: string; replyTo?: string },
   opts: Required<Pick<EmailSendOptions, 'fetch' | 'now' | 'nonce' | 'timeoutMs'>>,
 ): Promise<EmailSendResult> {
-  const from = validateEmailAddress(config.from, 'ALIYUN_DM_FROM');
-  const url = buildAliyunEndpointUrl(config);
+  const url = config.endpointUrl;
   const timestamp = new Date(opts.now()).toISOString().replace(/\.\d{3}Z$/, 'Z');
   const signatureNonce = opts.nonce();
 
   const rpcParams: Record<string, string> = {
     Action: 'SingleSendMail',
-    AccountName: from,
+    AccountName: config.from,
     AddressType: '1',
     ReplyToAddress: params.replyTo ? 'true' : 'false',
     ToAddress: params.to,
@@ -610,8 +579,8 @@ export async function sendEmail(
   }
   const replyTo = resolveReplyTo(message.replyTo, env.EMAIL_REPLY_TO);
 
-  const awsConfig = parseAwsSesConfig(env);
-  const aliyunConfig = parseAliyunDmConfig(env);
+  const awsConfig = tryParseAwsSesConfig(env);
+  const aliyunConfig = tryParseAliyunDmConfig(env);
 
   const runtimeOpts = {
     fetch: options?.fetch ?? globalThis.fetch,
