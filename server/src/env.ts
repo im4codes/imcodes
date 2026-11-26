@@ -1,4 +1,5 @@
 import type { Database } from './db/client.js';
+import { getEmailConfigStatus } from './services/email.js';
 
 /** Environment config loaded from process.env (no DB, that's injected at runtime). */
 export interface EnvConfig {
@@ -157,6 +158,8 @@ export interface EnvConfig {
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
   DEFAULT_ADMIN_PASSWORD?: string;
+  /** Deployment toggle for email-verified registration, password change, and forgot-password reset ('true' to enable). */
+  EMAIL_AUTH_ENABLED?: string;
 
   // Landing page
   /** Host that serves the landing page instead of the app (e.g. im.codes). */
@@ -241,6 +244,7 @@ export function loadEnv(): EnvConfig {
     ALIYUN_DM_ENDPOINT: process.env.ALIYUN_DM_ENDPOINT,
     EMAIL_CN_DOMAINS: process.env.EMAIL_CN_DOMAINS,
     EMAIL_REPLY_TO: process.env.EMAIL_REPLY_TO,
+    EMAIL_AUTH_ENABLED: process.env.EMAIL_AUTH_ENABLED,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
@@ -278,4 +282,12 @@ export function loadEnv(): EnvConfig {
     NODE_ENV: process.env.NODE_ENV,
     ENVIRONMENT: process.env.ENVIRONMENT,
   };
+}
+
+/**
+ * True only when both the deployment opt-in (`EMAIL_AUTH_ENABLED=true`) AND at least
+ * one transactional email provider is validly configured.
+ */
+export function isEmailAuthEnabled(env: Partial<EnvConfig>): boolean {
+  return env.EMAIL_AUTH_ENABLED?.trim().toLowerCase() === 'true' && getEmailConfigStatus(env).configured;
 }

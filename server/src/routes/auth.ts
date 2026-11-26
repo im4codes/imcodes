@@ -1,8 +1,18 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
+import { isEmailAuthEnabled } from '../env.js';
 import type { Database } from '../db/client.js';
-import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus, withTransaction } from '../db/queries.js';
+import {
+  createUser,
+  getUserByEmail,
+  getUserById,
+  getUserByUsername,
+  getUserByVerifiedEmail,
+  getSetting,
+  updateUserStatus,
+  withTransaction,
+} from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkAuthLockout, rateLimiter, recordAuthFailure } from '../security/lockout.js';
 import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
@@ -14,8 +24,20 @@ import {
 import { alignedSessionIssuedAt, isUserActive, nextSessionValidAfter } from '../security/user-status.js';
 import { isUserStatusActive } from '../../../shared/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
-import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
+import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
+import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
+import { EMAIL_AUTH_PURPOSE } from '../../../shared/email-auth.js';
+import { EmailServiceError } from '../services/email.js';
+import {
+  consumeEmailVerificationCode,
+  isValidEmail,
+  isValidEmailOtp,
+  issueEmailVerificationCode,
+  normalizeEmail,
+  resolveEmailLanguage,
+} from '../services/email-auth.js';
 import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
@@ -90,6 +112,8 @@ function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
     id: user.id,
     username: user.username,
     display_name: user.display_name,
+    email: user.email ?? null,
+    email_verified: Boolean(user.email_verified_at),
     is_admin: user.is_admin,
     status: user.status,
     has_password: !!user.password_hash,
@@ -700,9 +724,11 @@ authRoutes.delete('/user/me', async (c) => {
   await db.execute('DELETE FROM idempotency_records WHERE user_id = $1', [userId]);
   // 15. Team memberships (not owned teams — those are separate)
   await db.execute('DELETE FROM team_members WHERE user_id = $1', [userId]);
-  // 16. Audit log entries (keep? delete for GDPR compliance)
+  // 16. Email verification codes
+  await db.execute('DELETE FROM email_verification_codes WHERE user_id = $1', [userId]);
+  // 17. Audit log entries (keep? delete for GDPR compliance)
   await db.execute('DELETE FROM audit_log WHERE user_id = $1', [userId]);
-  // 17. Delete user
+  // 18. Delete user
   await db.execute('DELETE FROM users WHERE id = $1', [userId]);
 
   // Clear session cookies
@@ -716,16 +742,237 @@ authRoutes.delete('/user/me', async (c) => {
   return c.json({ ok: true });
 });
 
-// ── Password auth ─────────────────────────────────────────────────────────
+// ── Email verification & password auth ────────────────────────────────────
 
-import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
-import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
+// GET /api/auth/email/config — expose only non-secret deployment toggle
+authRoutes.get('/email/config', (c) => {
+  return c.json({ emailAuthEnabled: isEmailAuthEnabled(c.env) });
+});
 
-// POST /api/auth/password/register — create a new user with username + password
+const sendEmailCodeSchema = z.object({
+  email: z.string().optional(),
+  purpose: z.enum([
+    EMAIL_AUTH_PURPOSE.REGISTER,
+    EMAIL_AUTH_PURPOSE.PASSWORD_RESET,
+    EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE,
+    EMAIL_AUTH_PURPOSE.BIND_EMAIL,
+  ]),
+  lang: z.string().max(16).optional(),
+});
+
+// POST /api/auth/email/send-code — send a single-use 6-digit verification OTP
+authRoutes.post('/email/send-code', async (c) => {
+  if (!isEmailAuthEnabled(c.env)) {
+    return c.json({ error: AUTH_ERROR_CODES.EMAIL_AUTH_DISABLED }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = sendEmailCodeSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
+
+  const { purpose, lang: bodyLang } = parsed.data;
+  const lang = resolveEmailLanguage(bodyLang, c.req.header('Accept-Language'));
+
+  const requiresCookieCsrfCheck = (): boolean => {
+    const authHeader = c.req.header('Authorization');
+    if (authHeader?.startsWith('Bearer ')) return false;
+    const sessionCookie = getCookie(c, COOKIE_SESSION);
+    if (!sessionCookie) return false;
+    const csrfCookie = getCookie(c, COOKIE_CSRF);
+    const csrfHeader = c.req.header(HEADER_CSRF);
+    return !csrfCookie || !csrfHeader || csrfCookie !== csrfHeader;
+  };
+
+  let targetEmail: string;
+  let userId: string | null = null;
+  let suppressSendForAntiEnumeration = false;
+  let lockoutIdentity: string;
+
+  if (purpose === EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE || purpose === EMAIL_AUTH_PURPOSE.BIND_EMAIL) {
+    if (requiresCookieCsrfCheck()) {
+      return c.json({ error: 'csrf_rejected', reason: 'token_mismatch' }, 403);
+    }
+    const authedUserId = await resolveUserId(c);
+    if (!authedUserId) return c.json({ error: 'unauthorized' }, 401);
+    const user = await getUserById(c.env.DB, authedUserId);
+    if (!user) return c.json({ error: 'unauthorized' }, 401);
+    if (!isUserStatusActive(user.status)) {
+      return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
+    }
+
+    userId = authedUserId;
+    if (purpose === EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE) {
+      if (!user.email || !user.email_verified_at) {
+        return c.json({ error: AUTH_ERROR_CODES.EMAIL_NOT_VERIFIED }, 400);
+      }
+      if (parsed.data.email !== undefined) {
+        if (!isValidEmail(parsed.data.email) || normalizeEmail(parsed.data.email) !== normalizeEmail(user.email)) {
+          return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+        }
+      }
+      targetEmail = normalizeEmail(user.email);
+    } else {
+      if (!isValidEmail(parsed.data.email)) {
+        return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+      }
+      targetEmail = normalizeEmail(parsed.data.email);
+      const existing = await getUserByEmail(c.env.DB, targetEmail);
+      if (existing && existing.id !== authedUserId) {
+        return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
+      }
+    }
+    lockoutIdentity = `email-send:${purpose}:${authedUserId}`;
+  } else {
+    if (!isValidEmail(parsed.data.email)) {
+      return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+    }
+    targetEmail = normalizeEmail(parsed.data.email);
+    if (purpose === EMAIL_AUTH_PURPOSE.REGISTER) {
+      const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
+      if (regEnabled === 'false') {
+        return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
+      }
+      const existing = await getUserByEmail(c.env.DB, targetEmail);
+      if (existing) {
+        return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
+      }
+    } else {
+      const existing = await getUserByVerifiedEmail(c.env.DB, targetEmail);
+      if (!existing || !isUserStatusActive(existing.status)) {
+        suppressSendForAntiEnumeration = true;
+      } else {
+        userId = existing.id;
+      }
+    }
+    lockoutIdentity = `email-send:${purpose}:${targetEmail}`;
+  }
+
+  const lockout = await checkAuthLockout(c.env.DB, lockoutIdentity);
+  if (lockout.locked) {
+    return c.json({
+      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+      retryAfterMs: lockout.lockedUntil ? lockout.lockedUntil - Date.now() : 0,
+    }, 429);
+  }
+
+  try {
+    const issued = await issueEmailVerificationCode(c.env.DB, c.env, {
+      email: targetEmail,
+      purpose,
+      userId,
+      lang,
+      suppressSendForAntiEnumeration,
+    });
+    if (!issued.ok) {
+      return c.json({ error: issued.error, retryAfterMs: issued.retryAfterMs }, 429);
+    }
+  } catch (err) {
+    if (err instanceof EmailServiceError) {
+      logger.warn({ purpose, code: err.code, category: err.category }, '[auth] email send failed');
+      return c.json({ error: 'email_send_failed' }, 502);
+    }
+    throw err;
+  }
+
+  return c.json({ ok: true });
+});
+
+const bindEmailSchema = z.object({
+  email: z.string(),
+  code: z.string(),
+});
+
+// POST /api/auth/email/bind — bind or replace verified email for logged-in user
+authRoutes.post('/email/bind', async (c) => {
+  if (!isEmailAuthEnabled(c.env)) {
+    return c.json({ error: AUTH_ERROR_CODES.EMAIL_AUTH_DISABLED }, 403);
+  }
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const userLockout = await checkAuthLockout(c.env.DB, `user:${userId}`);
+  if (userLockout.locked) {
+    return c.json({
+      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+      retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0,
+    }, 429);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = bindEmailSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
+
+  if (!isValidEmail(parsed.data.email)) {
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+  }
+  if (!isValidEmailOtp(parsed.data.code)) {
+    return c.json({ error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED }, 400);
+  }
+
+  const normalizedEmail = normalizeEmail(parsed.data.email);
+  const code = parsed.data.code.trim();
+
+  const bindTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ id: string; status: string }>(
+      'SELECT id, status FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    if (!lockedUser) {
+      return { ok: false as const, status: 404 as const, error: 'not_found' };
+    }
+    if (!isUserStatusActive(lockedUser.status)) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+    const existing = await tx.queryOne<{ id: string }>(
+      'SELECT id FROM users WHERE LOWER(email) = $1',
+      [normalizedEmail],
+    );
+    if (existing && existing.id !== userId) {
+      return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
+    }
+
+    const txNow = Date.now();
+    const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+      email: normalizedEmail,
+      purpose: EMAIL_AUTH_PURPOSE.BIND_EMAIL,
+      code,
+      userId,
+      now: txNow,
+    });
+    if (!consumed.ok) {
+      return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
+    }
+
+    await tx.execute(
+      'UPDATE users SET email = $1, email_verified_at = $2 WHERE id = $3',
+      [normalizedEmail, txNow, userId],
+    );
+    return { ok: true as const };
+  });
+
+  if (!bindTx.ok) {
+    if ('recordFailure' in bindTx && bindTx.recordFailure) {
+      await recordAuthFailure(c.env.DB, `user:${userId}`, 'email_bind_invalid_code');
+    }
+    return c.json({ error: bindTx.error }, bindTx.status);
+  }
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAuthAudit(c, { userId, action: 'auth.email_bind', ip }, c.env.DB);
+  return c.json({ ok: true, email: normalizedEmail, email_verified: true });
+});
+
+// POST /api/auth/password/register — create a new user with username + password (+ email OTP when enabled)
 const passwordRegisterSchema = z.object({
   username: z.string().min(3).max(32),
   password: z.string().min(8),
   displayName: z.string().max(100).optional(),
+  email: z.string().optional(),
+  emailCode: z.string().optional(),
   native: z.boolean().optional(),
 });
 
@@ -740,7 +987,8 @@ authRoutes.post('/password/register', async (c) => {
   const parsed = passwordRegisterSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
-  const { username, password, displayName, native } = parsed.data;
+  const { username, password, displayName, email, emailCode, native } = parsed.data;
+  const emailAuthEnabled = isEmailAuthEnabled(c.env);
 
   // Validate password complexity
   const complexity = validatePasswordComplexity(password);
@@ -754,29 +1002,87 @@ authRoutes.post('/password/register', async (c) => {
     return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
+  let normalizedEmail: string | null = null;
+  let normalizedEmailCode: string | null = null;
+  if (emailAuthEnabled) {
+    if (typeof email !== 'string' || !email.trim()) {
+      return c.json({ error: AUTH_ERROR_CODES.EMAIL_REQUIRED }, 400);
+    }
+    if (!isValidEmail(email)) {
+      return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+    }
+    if (!isValidEmailOtp(emailCode)) {
+      return c.json({ error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED }, 400);
+    }
+    normalizedEmail = normalizeEmail(email);
+    normalizedEmailCode = emailCode.trim();
+  }
+
   // Check username availability
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser) {
     return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
+  if (normalizedEmail) {
+    const existingEmailUser = await getUserByEmail(c.env.DB, normalizedEmail);
+    if (existingEmailUser) {
+      return c.json({ error: AUTH_ERROR_CODES.EMAIL_TAKEN }, 409);
+    }
+  }
 
-  // Create user
   const userId = randomHex(16);
-  await createUser(c.env.DB, userId);
-
-  // Set username, password, display name
   const passwordHash = await hashPassword(password);
-  const now = Date.now();
-  await c.env.DB.execute(
-    'UPDATE users SET username = $1, password_hash = $2, display_name = $3 WHERE id = $4',
-    [normalizedUsername, passwordHash, displayName?.trim() || normalizedUsername, userId],
-  );
-
-  // Set status to pending if approval is required
   const requireApproval = await getSetting(c.env.DB, 'require_approval');
   const isPending = requireApproval === 'true';
-  if (isPending) {
-    await updateUserStatus(c.env.DB, userId, 'pending');
+  const now = Date.now();
+  const effectiveDisplayName = displayName?.trim() || normalizedUsername;
+
+  if (emailAuthEnabled && normalizedEmail && normalizedEmailCode) {
+    const regTx = await withTransaction(c.env.DB, async (tx) => {
+      const txExistingUsername = await getUserByUsername(tx, normalizedUsername);
+      if (txExistingUsername) {
+        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.USERNAME_TAKEN };
+      }
+      const txExistingEmail = await getUserByEmail(tx, normalizedEmail);
+      if (txExistingEmail) {
+        return { ok: false as const, status: 409 as const, error: AUTH_ERROR_CODES.EMAIL_TAKEN };
+      }
+
+      const txNow = Date.now();
+      const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+        email: normalizedEmail,
+        purpose: EMAIL_AUTH_PURPOSE.REGISTER,
+        code: normalizedEmailCode,
+        now: txNow,
+      });
+      if (!consumed.ok) {
+        return { ok: false as const, status: 400 as const, error: consumed.error };
+      }
+
+      await tx.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, txNow]);
+      await tx.execute(
+        'UPDATE users SET username = $1, password_hash = $2, display_name = $3, email = $4, email_verified_at = $5 WHERE id = $6',
+        [normalizedUsername, passwordHash, effectiveDisplayName, normalizedEmail, txNow, userId],
+      );
+      if (isPending) {
+        await tx.execute('UPDATE users SET status = $1 WHERE id = $2', ['pending', userId]);
+      }
+      return { ok: true as const };
+    });
+
+    if (!regTx.ok) {
+      return c.json({ error: regTx.error }, regTx.status);
+    }
+  } else {
+    // Legacy flow when EMAIL_AUTH_ENABLED is off
+    await createUser(c.env.DB, userId);
+    await c.env.DB.execute(
+      'UPDATE users SET username = $1, password_hash = $2, display_name = $3 WHERE id = $4',
+      [normalizedUsername, passwordHash, effectiveDisplayName, userId],
+    );
+    if (isPending) {
+      await updateUserStatus(c.env.DB, userId, 'pending');
+    }
   }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
@@ -851,7 +1157,9 @@ authRoutes.post('/password/login', async (c) => {
     return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  const user = await getUserByUsername(c.env.DB, normalizedUsername);
+  const user = normalizedUsername.includes('@')
+    ? await getUserByVerifiedEmail(c.env.DB, normalizedUsername)
+    : await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
     // Unified failure: record against the attempted username even when it does
     // not exist. This cannot affect another account.
@@ -987,10 +1295,105 @@ authRoutes.patch('/user/me', async (c) => {
   return c.json(toClientUser(user));
 });
 
+// POST /api/auth/password/reset — forgot-password reset with verified email OTP
+const passwordResetSchema = z.object({
+  email: z.string(),
+  code: z.string(),
+  newPassword: z.string().min(8),
+});
+
+authRoutes.post('/password/reset', async (c) => {
+  if (!isEmailAuthEnabled(c.env)) {
+    return c.json({ error: AUTH_ERROR_CODES.EMAIL_AUTH_DISABLED }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = passwordResetSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
+
+  if (!isValidEmail(parsed.data.email)) {
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_EMAIL }, 400);
+  }
+  if (!isValidEmailOtp(parsed.data.code)) {
+    return c.json({ error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED }, 400);
+  }
+
+  const complexity = validatePasswordComplexity(parsed.data.newPassword);
+  if (!complexity.valid) {
+    return c.json({ error: complexity.errorKey }, 400);
+  }
+
+  const normalizedEmail = normalizeEmail(parsed.data.email);
+  const code = parsed.data.code.trim();
+  const lockoutKey = `email-reset:${normalizedEmail}`;
+  const resetLockout = await checkAuthLockout(c.env.DB, lockoutKey);
+  if (resetLockout.locked) {
+    return c.json({
+      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+      retryAfterMs: resetLockout.lockedUntil ? resetLockout.lockedUntil - Date.now() : 0,
+    }, 429);
+  }
+
+  const newHash = await hashPassword(parsed.data.newPassword);
+  const resetTx = await withTransaction(c.env.DB, async (tx) => {
+    const txNow = Date.now();
+    const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+      email: normalizedEmail,
+      purpose: EMAIL_AUTH_PURPOSE.PASSWORD_RESET,
+      code,
+      now: txNow,
+    });
+    if (!consumed.ok) {
+      return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
+    }
+
+    const lockedUser = await tx.queryOne<{ id: string; status: string; sessions_valid_after: string | number }>(
+      'SELECT id, status, sessions_valid_after FROM users WHERE LOWER(email) = $1 AND email_verified_at IS NOT NULL FOR UPDATE',
+      [normalizedEmail],
+    );
+    if (!lockedUser) {
+      return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_CODE_INVALID };
+    }
+    if (!isUserStatusActive(lockedUser.status)) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+
+    const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
+    const newValidAfter = nextSessionValidAfter(prevValidAfter, txNow);
+
+    await tx.execute(
+      'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
+      [newHash, lockedUser.id, newValidAfter],
+    );
+    await tx.execute(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
+      [txNow, lockedUser.id],
+    );
+
+    return { ok: true as const, userId: lockedUser.id };
+  });
+
+  if (!resetTx.ok) {
+    if ('recordFailure' in resetTx && resetTx.recordFailure) {
+      await recordAuthFailure(c.env.DB, lockoutKey, 'password_reset_invalid_code');
+    }
+    return c.json({ error: resetTx.error }, resetTx.status);
+  }
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAuthAudit(c, { userId: resetTx.userId, action: 'auth.password_reset', ip }, c.env.DB);
+  return c.json({ ok: true });
+});
+
 // POST /api/auth/password/change — change password (requires auth)
 const passwordChangeSchema = z.object({
-  oldPassword: z.string().min(1),
+  oldPassword: z.string().min(1).optional(),
   newPassword: z.string().min(8),
+  emailCode: z.string().optional(),
 });
 
 authRoutes.post('/password/change', async (c) => {
@@ -1009,7 +1412,7 @@ authRoutes.post('/password/change', async (c) => {
   const parsed = passwordChangeSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const { oldPassword, newPassword } = parsed.data;
+  const { oldPassword, newPassword, emailCode } = parsed.data;
 
   // Validate password complexity
   const complexity = validatePasswordComplexity(newPassword);
@@ -1020,18 +1423,46 @@ authRoutes.post('/password/change', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);
 
-  const valid = await verifyPassword(oldPassword, user.password_hash);
-  if (!valid) {
-    await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
-    return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
+  const requiresEmailCode = isEmailAuthEnabled(c.env)
+    && !user.password_must_change
+    && Boolean(user.email && user.email_verified_at);
+
+  if (!requiresEmailCode) {
+    if (typeof oldPassword !== 'string' || oldPassword.length === 0) {
+      return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
+    }
+    const valid = await verifyPassword(oldPassword, user.password_hash);
+    if (!valid) {
+      await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
+      return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
+    }
+  } else {
+    if (!isValidEmailOtp(emailCode)) {
+      return c.json({ error: AUTH_ERROR_CODES.EMAIL_CODE_REQUIRED }, 400);
+    }
+    if (typeof oldPassword === 'string' && oldPassword.length > 0) {
+      const valid = await verifyPassword(oldPassword, user.password_hash);
+      if (!valid) {
+        await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
+        return c.json({ error: AUTH_ERROR_CODES.INVALID_OLD_PASSWORD }, 401);
+      }
+    }
   }
 
   const newHash = await hashPassword(newPassword);
   const hadSessionCookie = !c.req.header('Authorization') && !!getCookie(c, COOKIE_SESSION);
 
   const changeTx = await withTransaction(c.env.DB, async (tx) => {
-    const lockedUser = await tx.queryOne<{ id: string; password_hash: string | null; status: string; sessions_valid_after: string | number }>(
-      'SELECT id, password_hash, status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+    const lockedUser = await tx.queryOne<{
+      id: string;
+      password_hash: string | null;
+      status: string;
+      sessions_valid_after: string | number;
+      email: string | null;
+      email_verified_at: string | number | null;
+      password_must_change: boolean | null;
+    }>(
+      'SELECT id, password_hash, status, sessions_valid_after, email, email_verified_at, password_must_change FROM users WHERE id = $1 FOR UPDATE',
       [userId],
     );
     if (!lockedUser || !lockedUser.password_hash) {
@@ -1049,6 +1480,22 @@ authRoutes.post('/password/change', async (c) => {
     }
 
     const txNow = Date.now();
+    if (requiresEmailCode) {
+      if (!lockedUser.email || !lockedUser.email_verified_at) {
+        return { ok: false as const, status: 400 as const, error: AUTH_ERROR_CODES.EMAIL_NOT_VERIFIED };
+      }
+      const consumed = await consumeEmailVerificationCode(tx, c.env.JWT_SIGNING_KEY, {
+        email: lockedUser.email,
+        purpose: EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE,
+        code: emailCode!.trim(),
+        userId,
+        now: txNow,
+      });
+      if (!consumed.ok) {
+        return { ok: false as const, status: 400 as const, error: consumed.error, recordFailure: true };
+      }
+    }
+
     const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
     const newValidAfter = nextSessionValidAfter(prevValidAfter, txNow);
 
@@ -1075,6 +1522,9 @@ authRoutes.post('/password/change', async (c) => {
   });
 
   if (!changeTx.ok) {
+    if ('recordFailure' in changeTx && changeTx.recordFailure) {
+      await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_email_code');
+    }
     return c.json({ error: changeTx.error }, changeTx.status);
   }
 

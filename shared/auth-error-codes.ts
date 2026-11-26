@@ -11,6 +11,15 @@ export const AUTH_ERROR_CODES = {
   INVALID_USERNAME_FORMAT: 'invalid_username_format',
   USERNAME_TAKEN: 'username_taken',
   INVALID_BODY: 'invalid_body',
+  EMAIL_AUTH_DISABLED: 'email_auth_disabled',
+  INVALID_EMAIL: 'invalid_email',
+  EMAIL_TAKEN: 'email_taken',
+  EMAIL_REQUIRED: 'email_required',
+  EMAIL_CODE_REQUIRED: 'email_code_required',
+  EMAIL_CODE_INVALID: 'email_code_invalid',
+  EMAIL_CODE_EXPIRED: 'email_code_expired',
+  EMAIL_CODE_RATE_LIMITED: 'email_code_rate_limited',
+  EMAIL_NOT_VERIFIED: 'email_not_verified',
 } as const;
 
 export type AuthErrorCode = (typeof AUTH_ERROR_CODES)[keyof typeof AUTH_ERROR_CODES];
