@@ -158,6 +158,9 @@ describe('PC App in-page transparent voice HUD', () => {
     expect(styleEl.textContent).toContain('pointer-events: none');
     expect(styleEl.textContent).toContain('user-select: none');
     expect(styleEl.textContent).toContain('background: transparent');
+    expect(styleEl.textContent).toContain('flex-wrap: nowrap');
+    expect(styleEl.textContent).toContain('.voice-active-service-chip');
+    expect(styleEl.textContent).toContain('text-overflow: ellipsis');
     expect(styleEl.textContent).toContain(`width: ${VOICE_HUD_BAR_WIDTH_PX}px`);
     expect(styleEl.textContent).toContain(`max-height: ${VOICE_HUD_BAR_MAX_HEIGHT_PX}px`);
     expect(styleEl.textContent).not.toContain('rgba(15, 23, 42, 0.9)');

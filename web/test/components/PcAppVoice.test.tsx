@@ -523,4 +523,112 @@ describe('PC App inline voice dictation and quick permission grant', () => {
       expect(screen.queryByTestId('inline-voice-service-chip')).toBeNull();
     });
   });
+
+  it('portals active voice service chip inline inside visible #imcodes-voice-hud-root, handles dynamic/hidden transitions, and suppresses duplicate loading chip', async () => {
+    const getSpeechModelStatus = vi.fn(async () => ({
+      selectedModel: 'qwen3-1.7b' as const,
+      activeBackend: 'qwen3-1.7b' as const,
+      state: 'ready' as const,
+      progress: 1,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      mlxSupported: true,
+    }));
+    const fake = createFakePcAppBridge({ getSpeechModelStatus });
+    (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
+
+    // Start with hidden pre-existing HUD root (as left after an earlier dictation).
+    const hudRoot = document.createElement('div');
+    hudRoot.id = 'imcodes-voice-hud-root';
+    hudRoot.setAttribute('data-mode', 'hidden');
+    hudRoot.style.display = 'none';
+    const hudLabel = document.createElement('span');
+    hudLabel.id = 'imcodes-voice-hud-label';
+    hudLabel.textContent = '请说话';
+    const hudBars = document.createElement('div');
+    hudBars.id = 'imcodes-voice-hud-bars';
+    hudRoot.appendChild(hudLabel);
+    hudRoot.appendChild(hudBars);
+    document.body.appendChild(hudRoot);
+
+    try {
+      const { container, unmount } = render(
+        <SessionControls
+          ws={makeWs()}
+          activeSession={{
+            name: 'deck_app_brain',
+            project: 'app',
+            role: 'brain',
+            state: 'idle',
+            projectDir: '/work/app',
+            agentType: 'claude-code',
+          } as never}
+          quickData={quickData}
+          serverId="srv1"
+          sessions={[]}
+          subSessions={[]}
+          onSend={vi.fn()}
+        />,
+      );
+
+      const controlsWrapper = container.querySelector('.controls-wrapper') as HTMLElement;
+      const micBtn = container.querySelector('button[data-voice-trigger="desktop"]') as HTMLButtonElement;
+
+      fireEvent.click(micBtn);
+      // Before HUD transitions from hidden -> visible, chip renders only inside the out-of-flow fallback overlay.
+      const fallbackChip = await screen.findByTestId('inline-voice-service-chip');
+      expect(controlsWrapper.contains(fallbackChip)).toBe(true);
+      expect(hudRoot.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+
+      // Transition HUD to loading mode -> duplicate voice-model-loading-chip is suppressed, service chip moves into HUD.
+      fake.emit({ type: 'loading', variant: '1.7b' });
+      hudRoot.setAttribute('data-mode', 'loading');
+      hudRoot.style.display = 'flex';
+      hudLabel.textContent = '正在加载语音模型…';
+
+      await waitFor(() => {
+        const hudChip = hudRoot.querySelector('[data-testid="inline-voice-service-chip"]');
+        expect(hudChip).not.toBeNull();
+        expect(hudChip?.textContent).toContain('Qwen3-ASR 1.7B');
+        expect(controlsWrapper.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+        expect(screen.queryByTestId('voice-model-loading-chip')).toBeNull();
+      });
+
+      // Transition HUD to listening -> chip remains inline on the same row as label + waveform bars.
+      fake.emit({ type: 'start' });
+      hudRoot.setAttribute('data-mode', 'listening');
+      hudLabel.textContent = '请说话';
+      await waitFor(() => {
+        const hudChip = hudRoot.querySelector('[data-testid="inline-voice-service-chip"]');
+        expect(hudChip).not.toBeNull();
+        expect(hudRoot.contains(hudLabel)).toBe(true);
+        expect(hudRoot.contains(hudBars)).toBe(true);
+        expect(controlsWrapper.querySelector('.voice-inline-chips')).toBeNull();
+      });
+
+      // Hide HUD -> chip falls back out of HUD without leaving orphan DOM inside #imcodes-voice-hud-root.
+      hudRoot.setAttribute('data-mode', 'hidden');
+      hudRoot.style.display = 'none';
+      await waitFor(() => {
+        expect(hudRoot.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+        expect(controlsWrapper.querySelector('[data-testid="inline-voice-service-chip"]')).not.toBeNull();
+      });
+
+      // Dynamically recreate HUD while listening -> chip portals back in, then cleans up completely on unmount.
+      hudRoot.remove();
+      const recreatedHud = document.createElement('div');
+      recreatedHud.id = 'imcodes-voice-hud-root';
+      recreatedHud.setAttribute('data-mode', 'listening');
+      recreatedHud.style.display = 'flex';
+      document.body.appendChild(recreatedHud);
+      await waitFor(() => {
+        expect(recreatedHud.querySelector('[data-testid="inline-voice-service-chip"]')).not.toBeNull();
+      });
+
+      unmount();
+      expect(recreatedHud.querySelector('[data-testid="inline-voice-service-chip"]')).toBeNull();
+    } finally {
+      document.getElementById('imcodes-voice-hud-root')?.remove();
+    }
+  });
 });

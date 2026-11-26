@@ -3198,14 +3198,32 @@ html.native-ios-mac .chat-dl-btn {
 .pc-voice-mic-select:hover:not(:disabled), .pc-voice-mic-select:focus-visible { color: #dbeafe; background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); outline: none; }
 .pc-voice-mic-select:disabled { opacity: 0.46; cursor: default; }
 .voice-inline-chips {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% + 6px);
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
-  align-self: flex-start;
-  max-width: 100%;
+  max-width: calc(100% - 16px);
   min-width: 0;
-  margin: 0 8px 4px;
+  margin: 0;
+  pointer-events: none;
+  z-index: 20;
+}
+#imcodes-voice-hud-root {
+  flex-wrap: nowrap;
+  max-width: calc(100vw - 24px);
+}
+#imcodes-voice-hud-root .voice-active-service-chip,
+#imcodes-voice-hud-root .voice-model-loading-chip {
+  flex: 0 1 auto;
+  max-width: min(180px, 42vw);
+  min-width: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  pointer-events: none;
 }
 .voice-active-service-chip {
   display: inline-flex;

@@ -67,8 +67,11 @@ export function buildVoiceHudSyncScript(state: VoiceHudRenderState): string {
     style.id = STYLE_ID;
     style.textContent = [
       '@keyframes imcodesVoiceHudPulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.75); opacity: 0.55; } }',
-      '#' + ROOT_ID + ' { position: fixed; bottom: 76px; left: 50%; transform: translateX(-50%); z-index: 2147483645; pointer-events: none; user-select: none; background: transparent; display: flex; align-items: center; gap: 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; filter: drop-shadow(0 2px 10px rgba(2, 6, 23, 0.72)); }',
+      '#' + ROOT_ID + ' { position: fixed; bottom: 76px; left: 50%; transform: translateX(-50%); z-index: 2147483645; pointer-events: none; user-select: none; background: transparent; display: flex; flex-wrap: nowrap; max-width: calc(100vw - 24px); align-items: center; gap: 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; filter: drop-shadow(0 2px 10px rgba(2, 6, 23, 0.72)); }',
       '#' + ROOT_ID + ' * { pointer-events: none; user-select: none; }',
+      '#' + ROOT_ID + ' .voice-active-service-chip { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; max-width: min(180px, 42vw); min-width: 0; padding: 2px 8px; border-radius: 999px; font-size: 11px; line-height: 1.3; color: #cffafe; background: rgba(8, 145, 178, 0.24); border: 1px solid rgba(34, 211, 238, 0.4); }',
+      '#' + ROOT_ID + ' .voice-active-service-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: #22d3ee; }',
+      '#' + ROOT_ID + ' .voice-active-service-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
       '#imcodes-voice-hud-dot { width: 9px; height: 9px; border-radius: 9999px; flex-shrink: 0; background: #f59e0b; box-shadow: 0 0 10px rgba(245, 158, 11, 0.85); animation: imcodesVoiceHudPulse 1.2s ease-in-out infinite; }',
       '#imcodes-voice-hud-dot.listening { background: #22d3ee; box-shadow: 0 0 12px rgba(34, 211, 238, 0.9), 0 0 4px rgba(52, 211, 153, 0.85); animation: none; }',
       '#imcodes-voice-hud-label { font-size: 13px; font-weight: 600; line-height: 1; letter-spacing: 0.01em; color: #f8fafc; white-space: nowrap; text-shadow: 0 1px 6px rgba(2, 6, 23, 0.92), 0 0 2px rgba(2, 6, 23, 0.95); background: transparent; }',

@@ -2485,6 +2485,65 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const inlineVoiceServiceLabel = inlineVoiceActive
     ? formatActiveVoiceServiceLabel(activeVoiceService, t, isIosVoiceRuntime)
     : '';
+  const [voiceHudMount, setVoiceHudMount] = useState<{ root: HTMLElement; mode: string } | null>(null);
+  useEffect(() => {
+    if (!inlineVoiceActive && !voiceModelLoading) {
+      setVoiceHudMount(null);
+      return;
+    }
+    if (typeof document === 'undefined' || !document.body) {
+      setVoiceHudMount(null);
+      return;
+    }
+
+    let currentRoot: HTMLElement | null = null;
+    let attrObserver: MutationObserver | null = null;
+
+    const readVisibleHud = (): { root: HTMLElement; mode: string } | null => {
+      const el = document.getElementById('imcodes-voice-hud-root');
+      if (!el) return null;
+      const mode = el.getAttribute('data-mode') ?? '';
+      if (mode === 'hidden' || el.style.display === 'none') return null;
+      return { root: el, mode };
+    };
+
+    const syncHudMount = () => {
+      const el = document.getElementById('imcodes-voice-hud-root');
+      if (el !== currentRoot) {
+        attrObserver?.disconnect();
+        attrObserver = null;
+        currentRoot = el;
+        if (currentRoot && typeof MutationObserver !== 'undefined') {
+          attrObserver = new MutationObserver(() => {
+            syncHudMount();
+          });
+          attrObserver.observe(currentRoot, {
+            attributes: true,
+            attributeFilter: ['data-mode', 'style'],
+          });
+        }
+      }
+      const next = readVisibleHud();
+      setVoiceHudMount((prev) => {
+        if (prev?.root === next?.root && prev?.mode === next?.mode) return prev;
+        return next;
+      });
+    };
+
+    syncHudMount();
+    const bodyObserver = typeof MutationObserver !== 'undefined'
+      ? new MutationObserver(() => {
+          syncHudMount();
+        })
+      : null;
+    bodyObserver?.observe(document.body, { childList: true });
+
+    return () => {
+      bodyObserver?.disconnect();
+      attrObserver?.disconnect();
+      setVoiceHudMount(null);
+    };
+  }, [inlineVoiceActive, voiceModelLoading]);
   const voiceHoldServiceLabel = voiceHoldHudActive
     ? formatActiveVoiceServiceLabel(activeOrHoldVoiceService, t, isIosVoiceRuntime)
     : '';
@@ -10728,33 +10787,43 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       )}
 
-      {(voiceModelLoading || (inlineVoiceActive && inlineVoiceServiceLabel)) && (
-        <div class="voice-inline-chips">
-          {inlineVoiceActive && inlineVoiceServiceLabel && (
-            <div
-              data-testid="inline-voice-service-chip"
-              class="voice-active-service-chip"
-              role="status"
-              aria-live="polite"
-              title={inlineVoiceServiceLabel}
-            >
-              <span class="voice-active-service-dot" aria-hidden="true" />
-              <span class="voice-active-service-text">{inlineVoiceServiceLabel}</span>
-            </div>
-          )}
-          {voiceModelLoading && (
-            <div
-              data-testid="voice-model-loading-chip"
-              class="voice-model-loading-chip"
-              role="status"
-              aria-live="polite"
-            >
-              <span class="voice-model-loading-dot" aria-hidden="true" />
-              <span>{t('voice.loading_model')}</span>
-            </div>
-          )}
-        </div>
-      )}
+      {(() => {
+        const serviceChip = inlineVoiceActive && inlineVoiceServiceLabel ? (
+          <div
+            data-testid="inline-voice-service-chip"
+            class="voice-active-service-chip"
+            role="status"
+            aria-live="polite"
+            title={inlineVoiceServiceLabel}
+          >
+            <span class="voice-active-service-dot" aria-hidden="true" />
+            <span class="voice-active-service-text">{inlineVoiceServiceLabel}</span>
+          </div>
+        ) : null;
+        const showLoadingChip = voiceModelLoading && voiceHudMount?.mode !== 'loading';
+        const showFallbackOverlay = (!voiceHudMount && Boolean(serviceChip)) || showLoadingChip;
+        return (
+          <>
+            {voiceHudMount && serviceChip && createPortal(serviceChip, voiceHudMount.root)}
+            {showFallbackOverlay && (
+              <div class="voice-inline-chips">
+                {!voiceHudMount && serviceChip}
+                {showLoadingChip && (
+                  <div
+                    data-testid="voice-model-loading-chip"
+                    class="voice-model-loading-chip"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span class="voice-model-loading-dot" aria-hidden="true" />
+                    <span>{t('voice.loading_model')}</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {voiceHoldError && (
         <div

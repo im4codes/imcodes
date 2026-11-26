@@ -2168,6 +2168,15 @@ describe('styles.css regression contracts', () => {
       expect(rule, String(selector)).toMatch(/text-overflow:\s*ellipsis/);
       expect(rule, String(selector)).toMatch(/white-space:\s*nowrap/);
     }
+    const inlineChipsRule = cssWithoutComments.match(/\.voice-inline-chips\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(inlineChipsRule).toMatch(/position:\s*absolute/);
+    expect(inlineChipsRule).toMatch(/pointer-events:\s*none/);
+    expect(inlineChipsRule).toMatch(/flex-wrap:\s*nowrap/);
+    const hudRootRule = cssWithoutComments.match(/#imcodes-voice-hud-root\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(hudRootRule).toMatch(/flex-wrap:\s*nowrap/);
+    const hudChipRule = cssWithoutComments.match(/#imcodes-voice-hud-root\s+\.voice-active-service-chip[^{]*\{[^}]*\}/)?.[0] ?? '';
+    expect(hudChipRule).toMatch(/pointer-events:\s*none/);
+    expect(hudChipRule).toMatch(/max-width:/);
     const localesDir = resolve(__dirname, '../src/i18n/locales');
     const enVoice = JSON.parse(readFileSync(join(localesDir, 'en.json'), 'utf8')).voice as Record<string, string>;
     expect(enVoice.engine_web).toBeTruthy();
