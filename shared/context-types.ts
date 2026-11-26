@@ -122,6 +122,8 @@ export interface TransportMemoryRecallArtifact {
   injectionSurface?: MemoryRecallInjectionSurface;
   authoritySource?: ContextAuthorityDecision['authoritySource'];
   sourceKind?: MemoryRecallSourceKind;
+  /** True when the artifact only carries Managed Skills (no historical memory items). */
+  managedSkillsOnly?: boolean;
 }
 
 /**

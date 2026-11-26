@@ -141,7 +141,12 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(profile.initialCatalogBudgetMs).toBeLessThan(profile.backendDelayMs);
     expect(profile.catalogWaitMs).toBeGreaterThan(profile.backendDelayMs);
 
-    const { client, transport } = connect({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: String(profile.backendDelayMs) });
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-delayed-'));
+    const startLog = join(dir, 'starts.log');
+    const { client, transport } = connect({
+      IMCODES_MEMORY_MCP_TEST_DELAY_MS: String(profile.backendDelayMs),
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+    });
     const startedAt = Date.now();
     await client.connect(transport);
     const initial = await client.listTools();
@@ -151,10 +156,11 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(Date.now() - startedAt).toBeLessThan(profile.initialCatalogBudgetMs);
     expect(initial.tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
     expect(initial.tools.length).toBeGreaterThan(35);
+    expect(await readFile(startLog, 'utf8').catch(() => '')).toBe('');
 
-    await waitForFixtureCatalog(client, profile.catalogWaitMs);
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'ready' } }))
       .resolves.toMatchObject({ structuredContent: { echoed: 'ready' } });
+    await waitForFixtureCatalog(client, profile.catalogWaitMs);
   }
 
   it('dispatches before the daemon CLI graph and serves initialize/catalog while backend import is delayed', async () => {
@@ -178,10 +184,10 @@ describe('memory MCP lightweight bootstrap', () => {
     await client.connect(transport);
     expect((await client.listTools()).tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
 
-    await waitForFixtureCatalog(client);
-    expect(stderr.join('')).toContain('reconnecting automatically');
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'recovered' } }))
       .resolves.toMatchObject({ structuredContent: { echoed: 'recovered' } });
+    await waitForFixtureCatalog(client);
+    expect(stderr.join('')).toContain('reconnecting automatically');
   }, 15_000);
 
   it('does not restart a deterministic caller-env rejection and returns its reason', async () => {
@@ -260,6 +266,7 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_RESOURCE_RUNTIME_EPOCH: 'epoch-backend-owned',
     });
     await client.connect(transport);
+    await client.callTool({ name: 'mcp_tool_search', arguments: { query: 'session_runtime_identity_get' } }).catch(() => {});
     const registryDir = join(home, 'session-resources');
     // The backend-owner registration happens after the source-mode child has
     // loaded the daemon graph and started its supervised generation.  Under a
@@ -319,6 +326,7 @@ describe('memory MCP lightweight bootstrap', () => {
         IMCODES_MCP_HOST_LIFETIME: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST,
       });
       await client.connect(transport);
+      await client.callTool({ name: 'mcp_tool_search', arguments: { query: 'session_runtime_identity_get' } }).catch(() => {});
       await waitFor(async () => (await registry.list()).find((row) => row.resourceId.startsWith(`mcp-backend:${epoch}:`)), 30_000);
     }
     expect(await registry.list()).toHaveLength(4);
@@ -341,6 +349,7 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_STABLE_UPTIME_MS: '5000',
     });
     await client.connect(transport);
+    void client.callTool({ name: 'fixture_echo', arguments: { value: 'wake' } }).catch(() => {});
     const starts = await waitForStarts(startLog, 4);
     expect(starts[2]! - starts[1]!).toBeGreaterThanOrEqual(750);
     expect(starts[3]! - starts[2]!).toBeGreaterThanOrEqual(2_500);
@@ -356,7 +365,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_TOOL_CALL_TIMEOUT_MS: '150',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'hang-once' } }))
       .rejects.toThrow(/memory_mcp_backend_request_timeout/);
     await waitForStarts(startLog, 2);
@@ -373,6 +381,8 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
     });
     await client.connect(transport);
+    await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'warmup' } }))
+      .resolves.toMatchObject({ structuredContent: { echoed: 'warmup' } });
     await waitForFixtureCatalog(client);
 
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'exit-now' } }))
@@ -397,7 +407,6 @@ describe('memory MCP lightweight bootstrap', () => {
     })}\n`);
     await waitFor(() => messages.find((message) => message.id === 1));
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-    await waitFor(() => messages.find((message) => message.method === 'notifications/tools/list_changed'));
 
     child.stdin.write(`${JSON.stringify({
       jsonrpc: '2.0', id: 77, method: 'tools/call',
@@ -415,7 +424,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS: '150',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({
       name: 'fixture_echo',
       arguments: { value: 'declared-timeout', delayMs: 300, timeoutMs: 120_000 },
@@ -428,7 +436,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_TOOL_TIMEOUT_HEADROOM_MS: '50',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({
       name: 'fixture_echo',
       arguments: { value: 'short-declared-timeout', delayMs: 500, timeoutMs: 100 },
@@ -442,7 +449,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
 
     const slow = client.callTool({
       name: 'fixture_echo',
@@ -456,4 +462,308 @@ describe('memory MCP lightweight bootstrap', () => {
     await expect(slow).resolves.toMatchObject({ structuredContent: { echoed: 'slow' } });
     expect(await waitForStarts(startLog, 1)).toHaveLength(1);
   }, 50_000);
+
+  it('stays lazy across initialize/ping/tools/list and reaps idle backend with transparent respawn', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-idle-reap-'));
+    const startLog = join(dir, 'starts.log');
+    const { client, transport, stderr } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '200',
+    });
+    await client.connect(transport);
+    await client.ping();
+    const initialTools = await client.listTools();
+    expect(initialTools.tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+    expect(await readFile(startLog, 'utf8').catch(() => ''), 'must not spawn backend before first real call').toBe('');
+
+    // First real call wakes the backend and protects in-flight work past the idle TTL.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'in-flight-hold', delayMs: 350 },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'in-flight-hold' } });
+    expect(await waitForStarts(startLog, 1)).toHaveLength(1);
+
+    // After the call settles and the idle window elapses, the backend exits cleanly without restart.
+    const idleExitEvent = await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      const events = log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+      return events.find((e) => e.event === 'backend_exit' && e.reason === 'idle_timeout');
+    }, 5_000);
+    expect(idleExitEvent).toMatchObject({ expected: true, reason: 'idle_timeout' });
+    expect(stderr.join('')).not.toContain('reconnecting automatically');
+
+    await new Promise((resolveWait) => setTimeout(resolveWait, 350));
+    expect(await waitForStarts(startLog, 1)).toHaveLength(1);
+
+    // Next real call transparently respawns generation 2 and succeeds.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'respawned' },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'respawned' } });
+    expect(await waitForStarts(startLog, 2)).toHaveLength(2);
+  }, 15_000);
+
+  it('replays published dynamic-catalog selection (without fallbackCall) before direct long-tail calls after idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-dynamic-reap-'));
+    const startLog = join(dir, 'starts.log');
+    const callLog = join(dir, 'calls.log');
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_DYNAMIC_CATALOG: '1',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_CALL_LOG: callLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '200',
+    });
+    await client.connect(transport);
+    const initialList = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(initialList).toContain('mcp_tool_search');
+    expect(initialList).not.toContain('fixture_echo');
+
+    const searchResult = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'should-not-replay' } },
+      },
+    });
+    expect(searchResult).toMatchObject({ structuredContent: { published: ['fixture_echo'], fallbackExecuted: true } });
+    await waitForFixtureCatalog(client);
+
+    // Wait for idle reap of backend generation 1.
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.includes('"idle_timeout"') ? true : undefined;
+    }, 5_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+    // Direct call on the same MCP client succeeds transparently on generation 2.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'after-idle-reap' },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'after-idle-reap' } });
+    expect(await waitForStarts(startLog, 2)).toHaveLength(2);
+
+    const calls = (await readFile(callLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { name: string; arguments: Record<string, unknown> });
+    // Calls: [gen1 search+fallback, gen2 search(activate:true, NO fallbackCall), gen2 fixture_echo]
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toEqual({ name: 'mcp_tool_search', arguments: { query: 'fixture_echo', activate: true } });
+    expect(calls[2]).toEqual({ name: 'fixture_echo', arguments: { value: 'after-idle-reap' } });
+  }, 15_000);
+
+  it('restores real-backend dynamic catalog publication across idle reap on direct long-tail call', async () => {
+    const home = isolatedImcodesHome();
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+      IMCODES_DAEMON_USER_ID: 'user-real',
+      IMCODES_DAEMON_NAMESPACE: JSON.stringify({ scope: 'personal', userId: 'user-real', projectId: 'github.com/acme/realproj' }),
+      IMCODES_DAEMON_SERVER_ID: 'srv-real',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_real_w1',
+      IMCODES_DAEMON_PROJECT_NAME: 'realproj',
+      IMCODES_DAEMON_PROJECT_ROOT: '/tmp/realproj',
+    });
+    await client.connect(transport);
+
+    const searchResult = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'memory_injection_get' },
+    });
+    expect(searchResult).toMatchObject({ structuredContent: { status: 'ok', published: ['memory_injection_get'] } });
+    await waitFor(async () => {
+      const list = await client.listTools();
+      return list.tools.some((t) => t.name === 'memory_injection_get') ? true : undefined;
+    }, 8_000);
+
+    // Wait for real backend generation 1 idle reap.
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.includes('"idle_timeout"') ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+    // Direct call to memory_injection_get succeeds transparently after generation 2 replays mcp_tool_search.
+    const injResult = await client.callTool({
+      name: 'memory_injection_get',
+      arguments: {},
+    });
+    expect(injResult).toMatchObject({
+      structuredContent: { status: 'ok', enabled: true },
+    });
+  }, 20_000);
+
+  it('tracks real-backend empty clear and fallbackCall business-error publication transitions across idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+      IMCODES_DAEMON_USER_ID: 'user-real',
+      IMCODES_DAEMON_NAMESPACE: JSON.stringify({ scope: 'personal', userId: 'user-real', projectId: 'github.com/acme/realproj' }),
+      IMCODES_DAEMON_SERVER_ID: 'srv-real',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_real_w1',
+      IMCODES_DAEMON_PROJECT_NAME: 'realproj',
+      IMCODES_DAEMON_PROJECT_ROOT: '/tmp/realproj',
+    });
+    await client.connect(transport);
+
+    // 1. Publish pair_list first.
+    await expect(client.callTool({ name: 'mcp_tool_search', arguments: { query: 'pair_list' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', published: ['pair_list'] } });
+    await waitFor(async () => ((await client.listTools()).tools.some((t) => t.name === 'pair_list') ? true : undefined), 8_000);
+
+    // 2. Replacing via fallbackCall where target tool returns a business error (no daemon hook port -> status: 'error')
+    //    still updates the backend's published selection to session_identity_get.
+    const fallbackErrRes = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'session_identity_get', fallbackCall: { name: 'session_identity_get', arguments: {} } },
+    });
+    expect(fallbackErrRes).toMatchObject({ structuredContent: { status: 'error' } });
+
+    // 3. Reap idle generation 1, then trigger generation 2; backend should publish session_identity_get, NOT stale pair_list.
+    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await client.callTool({ name: 'session_identity_get', arguments: {} });
+    const gen2Tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(gen2Tools).toContain('session_identity_get');
+    expect(gen2Tools).not.toContain('pair_list');
+
+    // 4. An ordinary unmatched search with activate=true clears the published tail on backend.
+    await expect(client.callTool({ name: 'mcp_tool_search', arguments: { query: 'totally_missing_tool_xyz_123' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', published: [] } });
+
+    // Reap generation 2, respawn generation 3, confirm cleared tail stays empty (session_identity_get NOT resurrected).
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.split('"idle_timeout"').length >= 3 ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await client.callTool({ name: 'memory_injection_get', arguments: {} }).catch(() => {});
+    const gen3Tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(gen3Tools).not.toContain('session_identity_get');
+  }, 60_000);
+
+  it('bounds discovery metadata cleanly on queue-full and deterministic caller-env failures', async () => {
+    const { child, messages } = rawBootstrap({
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_CALLER_ENV_ERROR: 'deterministic bad env',
+      IMCODES_MEMORY_MCP_TEST_DELAY_MS: '500',
+    });
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'bound-test', version: '1' } },
+    })}\n`);
+    await waitFor(() => messages.find((m) => m.id === 1));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+
+    // Burst 80 activating mcp_tool_search calls (> MAX_QUEUED_REQUESTS=64) while backend startup fails deterministically.
+    for (let i = 100; i < 180; i += 1) {
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: '2.0', id: i, method: 'tools/call',
+        params: { name: 'mcp_tool_search', arguments: { query: `tool_${i}` } },
+      })}\n`);
+    }
+
+    await waitFor(() => (messages.filter((m) => typeof m.id === 'number' && m.id >= 100).length === 80 ? true : undefined), 10_000);
+    const replies = messages.filter((m) => typeof m.id === 'number' && m.id >= 100);
+    const queueFullCount = replies.filter((m) => (m.error as { code?: number; message?: string } | undefined)?.message === 'memory_mcp_backend_queue_full').length;
+    const fatalCount = replies.filter((m) => (m.error as { code?: number; message?: string } | undefined)?.code === -32004).length;
+    expect(queueFullCount).toBe(16);
+    expect(fatalCount).toBe(64);
+
+    // Further calls after deterministic failure fail immediately and never replay prior discovery queries.
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 999, method: 'tools/call',
+      params: { name: 'mcp_tool_search', arguments: { query: 'post_fatal' } },
+    })}\n`);
+    const lateReply = await waitFor(() => messages.find((m) => m.id === 999));
+    expect(lateReply).toMatchObject({ error: { code: -32004 } });
+  }, 15_000);
+
+  it('tracks committed publication order across slow overlapping fallbackCall and later selection/clear across idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-seq-overlap-'));
+    const startLog = join(dir, 'starts.log');
+    const callLog = join(dir, 'calls.log');
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_DYNAMIC_CATALOG: '1',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_CALL_LOG: callLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+    });
+    await client.connect(transport);
+
+    // 1. Start slow fallbackCall A (commits fixture_echo first at seq=1, delays 300ms before returning).
+    const slowA = client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'slow-fallback', delayMs: 300 } },
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+
+    // 2. While slowA is awaiting its fallback, commit fixture_other at seq=2 (returns first!).
+    const fastB = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'fixture_other' },
+    });
+    expect(fastB).toMatchObject({ structuredContent: { published: ['fixture_other'] } });
+    // Even though slowA finishes LAST, its seq=1 MUST NOT overwrite fastB seq=2!
+    const slowARes = await slowA;
+    expect(slowARes).toMatchObject({ structuredContent: { published: ['fixture_echo'], fallbackExecuted: true } });
+
+    // Reap gen 1, wake gen 2 -> must replay fixture_other (seq=2), NOT stale fixture_echo (seq=1),
+    // and never replay slow-fallback!
+    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await expect(client.callTool({ name: 'fixture_other', arguments: { value: 'after-switch' } }))
+      .resolves.toMatchObject({ structuredContent: { echoed: 'after-switch' } });
+    expect((await client.listTools()).tools.map((t) => t.name)).toContain('fixture_other');
+    expect((await client.listTools()).tools.map((t) => t.name)).not.toContain('fixture_echo');
+
+    // Repeat overlap with slowA (seq=2 in gen 2) followed by unmatched empty clear (seq=3 in gen 2).
+    const slowA2 = client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'slow-fallback-2', delayMs: 300 } },
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+    const fastClear = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'missing_clear_xyz' },
+    });
+    expect(fastClear).toMatchObject({ structuredContent: { published: [] } });
+    await slowA2;
+
+    // Reap gen 2, wake gen 3 -> cleared state stays empty; fixture_echo is NOT resurrected!
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.split('"idle_timeout"').length >= 3 ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'should-fail' } })).rejects.toThrow();
+    expect((await client.listTools()).tools.map((t) => t.name)).toEqual(['mcp_tool_search']);
+
+    const calls = (await readFile(callLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { name: string; arguments: Record<string, unknown> });
+    const replaySearches = calls.filter((c) => c.name === 'mcp_tool_search' && c.arguments.activate === true);
+    expect(replaySearches).toEqual([{ name: 'mcp_tool_search', arguments: { query: 'fixture_other', activate: true } }]);
+    expect(calls.filter((c) => (c.arguments as { fallbackCall?: unknown }).fallbackCall)).toHaveLength(2);
+  }, 25_000);
 });

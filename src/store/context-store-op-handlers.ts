@@ -87,6 +87,9 @@ export function buildContextStoreOpHandlers(): ContextStoreOpHandlerMap {
   handlers.set('commitMaterialization', (args) =>
     store.commitMaterialization(args[0] as Parameters<typeof store.commitMaterialization>[0]),
   );
+  handlers.set('abandonMaterializationBatch', (args) =>
+    store.abandonMaterializationBatch(args[0] as Parameters<typeof store.abandonMaterializationBatch>[0]),
+  );
   handlers.set('ingestContextEvent', (args) =>
     store.ingestContextEvent(
       args[0] as Parameters<typeof store.ingestContextEvent>[0],

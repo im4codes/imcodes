@@ -69,8 +69,8 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     };
   }
 
-  it('disables incognito checkbox when server lacks session.incognito capability and sends incognito:true for supported runtimes when enabled', async () => {
-    // 1. Server lacks capability -> checkbox disabled, status shown
+  it('collapses incognito explanation by default, expands on demand, disables checkbox when unsupported, and sends incognito:true when enabled', async () => {
+    // 1. Server lacks capability -> checkbox disabled, explanation collapsed by default, expandable on demand
     const wsNoCap = makeDialogWs([GIT_REMOTE_CLONE_CAPABILITY_V1]);
     const viewNoCap = render(
       <NewSessionDialog
@@ -83,10 +83,23 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     const checkboxNoCap = viewNoCap.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
     expect(checkboxNoCap).toBeTruthy();
     expect(checkboxNoCap.disabled).toBe(true);
+    const helpBtnNoCap = viewNoCap.container.querySelector('.incognito-create-option .incognito-help-toggle') as HTMLButtonElement;
+    expect(helpBtnNoCap).toBeTruthy();
+    expect(helpBtnNoCap.getAttribute('aria-expanded')).toBe('false');
+    expect(viewNoCap.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
+    expect(viewNoCap.container.querySelector('.incognito-create-option [role="status"]')).toBeNull();
+
+    fireEvent.click(helpBtnNoCap);
+    expect(helpBtnNoCap.getAttribute('aria-expanded')).toBe('true');
+    expect(viewNoCap.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_available');
     expect(viewNoCap.container.querySelector('.incognito-create-option [role="status"]')?.textContent).toBe('session.incognito_unsupported');
+
+    fireEvent.click(helpBtnNoCap);
+    expect(helpBtnNoCap.getAttribute('aria-expanded')).toBe('false');
+    expect(viewNoCap.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
     cleanup();
 
-    // 2. Server supports capability -> toggling disables unsupported process runtimes and submits session.start with incognito: true
+    // 2. Server supports capability -> toggling incognito leaves help collapsed until user expands; reopening resets collapsed
     const wsCap = makeDialogWs([GIT_REMOTE_CLONE_CAPABILITY_V1, SESSION_INCOGNITO_CAPABILITY]);
     const view = render(
       <NewSessionDialog
@@ -98,9 +111,25 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     );
 
     const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
+    const helpBtn = view.container.querySelector('.incognito-create-option .incognito-help-toggle') as HTMLButtonElement;
     expect(checkbox.disabled).toBe(false);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option p')).toBeNull();
+
     fireEvent.click(checkbox);
     expect(checkbox.checked).toBe(true);
+    // Toggling incognito does not unexpectedly auto-expand details
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
+
+    // Expanding shows hint; toggling incognito while expanded updates text to available -> hint
+    fireEvent.click(helpBtn);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_hint');
+    fireEvent.click(checkbox);
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_available');
+    fireEvent.click(checkbox);
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_hint');
 
     // Unsupported CLI process agent card ('claude-code') must be disabled in incognito mode
     const cliButton = view.container.querySelector('[data-agent-type="claude-code"]') as HTMLButtonElement | null;
@@ -125,6 +154,20 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
       }));
     });
     expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
+
+    // Closing (unmount) and reopening dialog starts collapsed again
+    cleanup();
+    const reopened = render(
+      <NewSessionDialog
+        ws={wsCap as any}
+        serverId="srv-1"
+        onClose={vi.fn()}
+        onSessionStarted={vi.fn()}
+      />,
+    );
+    const reopenedHelpBtn = reopened.container.querySelector('.incognito-create-option .incognito-help-toggle') as HTMLButtonElement;
+    expect(reopenedHelpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(reopened.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
   });
 
   it('allows selecting pi in incognito mode and submits session.start with agentType: pi and incognito: true', async () => {
@@ -400,15 +443,17 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
   });
 
-  it('all 7 UI locales mention both Claude SDK and Codex SDK for incognito availability and unsupported strings', async () => {
+  it('all 7 UI locales mention both Claude SDK and Codex SDK for incognito availability and unsupported strings and include details toggle label', async () => {
     const locales = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'] as const;
     for (const locale of locales) {
       const mod = await import(`../../src/i18n/locales/${locale}.json`);
-      const data = mod.default as { session: { incognito_available: string; incognito_unsupported: string } };
+      const data = mod.default as { session: { incognito_available: string; incognito_unsupported: string; incognito_details_toggle?: string } };
       expect(data.session.incognito_available, `${locale}.session.incognito_available`).toMatch(/claude/i);
       expect(data.session.incognito_available, `${locale}.session.incognito_available`).toMatch(/codex/i);
       expect(data.session.incognito_unsupported, `${locale}.session.incognito_unsupported`).toMatch(/claude/i);
       expect(data.session.incognito_unsupported, `${locale}.session.incognito_unsupported`).toMatch(/codex/i);
+      expect(typeof data.session.incognito_details_toggle, `${locale}.session.incognito_details_toggle`).toBe('string');
+      expect(data.session.incognito_details_toggle!.trim().length, `${locale}.session.incognito_details_toggle`).toBeGreaterThan(0);
     }
   });
 });

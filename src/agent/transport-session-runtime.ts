@@ -15,7 +15,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderActiveWorkSnapshotOptions, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import { shouldRetryProviderErrorWithBackoff } from '../../shared/provider-error-classifier.js';
 import { CAPACITY_RETRY_LOG_EVERY_ATTEMPTS, CAPACITY_RETRY_SUCCESS_AFTER_MS, capacityRetryDelayMs } from '../../shared/capacity-retry.js';
@@ -104,6 +104,7 @@ import {
 } from '../context/summary-sync.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { CROSS_VENDOR_HANDOFF_DEFAULTS, type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
@@ -391,6 +392,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   blockingWorkCount: number;
   backgroundWorkCount: number;
   backgroundKeepsSessionRunning?: boolean;
+  lastBackgroundProgressAt?: number | null;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Present for the whole episode (from the first capacity failure until the turn goes through, STOP, or a permanent error). */
@@ -598,6 +600,12 @@ function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: 
   return `${automaticSupervision ? 'automatic' : 'manual'}:${taskPairEngine}`;
 }
 
+function isSkillsOnlyStartupArtifact(artifact: TransportMemoryRecallArtifact | null | undefined): boolean {
+  if (!artifact) return false;
+  if (artifact.managedSkillsOnly === true) return true;
+  return artifact.items.length > 0 && artifact.items.every((item) => item.id.startsWith('skill:'));
+}
+
 export class TransportSessionRuntime implements SessionRuntime {
   private incognito = false;
   readonly type = RUNTIME_TYPES.TRANSPORT;
@@ -672,9 +680,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
   private _projectDir: string | undefined;
+  private _serverId: string | undefined;
+  private _trustedOwnerId: string | undefined;
+  private _skillSessionId: string | undefined;
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
+  private _managedSkillsStartupDelivered = false;
   private _pendingHandoff: CrossVendorHandoffPack | null = null;
   private _pendingHandoffReady: Promise<CrossVendorHandoffPack | undefined> | undefined;
   private _pendingHandoffWaitMs: number = CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs;
@@ -1583,7 +1595,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     return replayed;
   }
 
-  getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
+  getDiagnosticSnapshot(
+    nowMs: number = Date.now(),
+    options?: ProviderActiveWorkSnapshotOptions,
+  ): TransportRuntimeDiagnosticSnapshot {
     let providerDiagnostics: Record<string, unknown> | null | undefined;
     if (this._providerSessionId) {
       try {
@@ -1596,7 +1611,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }, 'Transport provider diagnostics read failed');
       }
     }
-    const activitySnapshot = this.getActivitySnapshot();
+    const activitySnapshot = this.getActivitySnapshot(options);
     const oldestUnacked = this._unacknowledgedActiveAppends[0]?.appendedAt ?? null;
     return {
       status: this._status,
@@ -1621,6 +1636,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       blockingWorkCount: activitySnapshot.blockingWorkCount,
       backgroundWorkCount: activitySnapshot.backgroundWorkCount,
       ...(activitySnapshot.backgroundKeepsSessionRunning ? { backgroundKeepsSessionRunning: true } : {}),
+      ...(activitySnapshot.lastBackgroundProgressAt !== null ? { lastBackgroundProgressAt: activitySnapshot.lastBackgroundProgressAt } : {}),
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
       ...(this._capacityRetryStartedAt > 0
@@ -2533,10 +2549,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       || this._openTools.size > 0;
   }
 
-  private getProviderActiveWorkSnapshot(): ProviderActiveWorkSnapshot | null {
+  private getProviderActiveWorkSnapshot(options?: ProviderActiveWorkSnapshotOptions): ProviderActiveWorkSnapshot | null {
     if (!this._providerSessionId || !this.provider.getActiveWorkSnapshot) return null;
     try {
-      return this.provider.getActiveWorkSnapshot(this._providerSessionId);
+      return this.provider.getActiveWorkSnapshot(this._providerSessionId, options);
     } catch (err) {
       logger.warn(
         { err, sessionKey: this.sessionKey, providerSessionId: this._providerSessionId, provider: this.provider.id },
@@ -2672,10 +2688,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     return closed;
   }
 
-  private getActivitySnapshot(): {
+  private getActivitySnapshot(options?: ProviderActiveWorkSnapshotOptions): {
     blockingWorkCount: number;
     backgroundWorkCount: number;
     backgroundKeepsSessionRunning: boolean;
+    lastBackgroundProgressAt: number | null;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
     providerSnapshot: ProviderActiveWorkSnapshot | null;
@@ -2684,6 +2701,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     let blockingWorkCount = 0;
     let backgroundWorkCount = 0;
     let backgroundKeepsSessionRunning = false;
+    let lastBackgroundProgressAt: number | null = null;
     const add = (reason: SessionActivityBusyReason, count = 1) => {
       if (count <= 0) return;
       blockingWorkCount += count;
@@ -2697,7 +2715,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const openToolCount = this._openTools.size;
     add('open_tool_call', openToolCount);
 
-    const providerSnapshot = this.getProviderActiveWorkSnapshot();
+    const providerSnapshot = this.getProviderActiveWorkSnapshot(options);
     if (providerSnapshot) {
       const expectedGeneration = this._activityGeneration > 0
         ? this.currentActivityGeneration()
@@ -2714,6 +2732,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           const providerWork = this.providerWorkBreakdown(providerSnapshot);
           backgroundWorkCount = providerWork.backgroundWorkCount;
           backgroundKeepsSessionRunning = backgroundWorkCount > 0 && providerSnapshot.backgroundSessionStatus === 'running';
+          if (
+            backgroundWorkCount > 0
+            && typeof providerSnapshot.lastBackgroundProgressAt === 'number'
+            && Number.isFinite(providerSnapshot.lastBackgroundProgressAt)
+          ) {
+            lastBackgroundProgressAt = providerSnapshot.lastBackgroundProgressAt;
+          }
           const turnWork = providerWork.turnWorkCount;
           if (turnWork > 0 || providerWork.reportedBackgroundWorkCount === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
@@ -2731,6 +2756,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       blockingWorkCount,
       backgroundWorkCount,
       backgroundKeepsSessionRunning,
+      lastBackgroundProgressAt,
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
@@ -2905,6 +2931,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (alreadyInjected) {
       this._startupMemoryInjected = true;
       this._startupMemoryTimelineEmitted = true;
+      this._managedSkillsStartupDelivered = true;
       this._startupMemory = null;
     }
 
@@ -2943,6 +2970,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Capture identity for assembly-time injection. Daemon-injected and
     // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
     this._projectDir = config.cwd;
+    this._serverId = config.serverId;
+    this._trustedOwnerId = config.trustedOwnerId;
+    this._skillSessionId = config.sessionName ?? this.sessionKey;
     this._agentId = config.agentId;
     this._effort = config.effort;
     this.applyContextBootstrap({
@@ -2971,6 +3001,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // the timeline replay.
       this._startupMemoryTimelineEmitted = false;
       this._startupMemoryInjected = false;
+      this._managedSkillsStartupDelivered = false;
     }
     // Provider session is now bound and the runtime is fully configured
     // (systemPrompt/description/identity/context all set above), so it can
@@ -5082,23 +5113,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
       const suppressMemoryContext = this.incognito || suppressTurnContext || isPrivateControlDispatch;
+      const daemonMemoryEnabled = isMemoryDaemonEnabled();
       // The toggle is re-read here, not only at bootstrap: a session whose
       // first-turn memory was assembled before injection was turned off must
       // still honor the switch without a restart. Managed Skills stay.
       const startupInjectionDisabled = !suppressMemoryContext
         && !this._startupMemoryInjected
         && !!this._contextNamespace
-        && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true));
+        && (!daemonMemoryEnabled || !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true)));
+      const canUseExistingSkillsOnlyStartup = isSkillsOnlyStartupArtifact(this._startupMemory)
+        && !this._managedSkillsStartupDelivered;
       const startupMemory = suppressMemoryContext ? null : startupInjectionDisabled
-        ? (await buildTransportStartupMemory(this._contextNamespace!, {
-          projectDir: this._projectDir,
-          managedSkillsOnly: true,
-        })) ?? null
-        : (this._startupMemory ?? (
-          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-            ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
-            : null
-        ));
+        ? (canUseExistingSkillsOnlyStartup
+            ? this._startupMemory
+            : !this._managedSkillsStartupDelivered && this._contextNamespace
+              ? (await this.buildExactStartupMemory(this._contextNamespace, { managedSkillsOnly: true })) ?? null
+              : null)
+        : (this._startupMemory && !isSkillsOnlyStartupArtifact(this._startupMemory)
+            ? this._startupMemory
+            : (
+              !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
+                ? (await this.buildExactStartupMemory(this._contextNamespace)) ?? (
+                    canUseExistingSkillsOnlyStartup ? this._startupMemory : null
+                  )
+                : (canUseExistingSkillsOnlyStartup ? this._startupMemory : null)
+            ));
       const memoryRecallResult = this.incognito || isPrivateControlDispatch
         ? { artifact: null }
         : suppressTurnContext
@@ -5324,27 +5363,36 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       this._preferenceContextInjectionAttempt = null;
       this._supervisionContractInjectionAttempt = null;
-      if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
-        this._startupMemoryInjected = true;
-        recordSyncedSummaryFingerprints(
-          this.sessionKey,
-          recentSummaryFingerprintsFromItems(dispatchResult.payload.startupMemory.items),
-        );
-        // Emit the "Historical context · injected" timeline card at the
-        // same commit boundary as the persisted flag. Doing this here
-        // (instead of eagerly in `initialize`) guarantees restart-before-
-        // first-message never leaks an unbacked card — the card appears
-        // exactly once, for the turn that actually carried the preamble.
-        this.emitStartupMemoryContext(
-          dispatchResult.payload.startupMemory,
-          extractPreferenceContextTimelineItems(dispatchResult.payload.messagePreamble),
-        );
-        this._startupMemory = null;
-        // Notify session-manager so the flag is persisted to SessionRecord.
-        // Invoked synchronously — the callback just schedules an upsert and
-        // returns, so there's no ordering risk with the rest of this turn.
-        try { this._onStartupMemoryInjected?.(); } catch (err) {
-          logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
+      if (dispatchResult.payload?.startupMemory) {
+        if (isSkillsOnlyStartupArtifact(dispatchResult.payload.startupMemory)) {
+          // Delivering Managed Skills while memory injection/daemon is disabled
+          // must not consume the one-shot startup-memory flag so enabling memory
+          // later still injects regular startup memory once.
+          this._managedSkillsStartupDelivered = true;
+          this._startupMemory = null;
+        } else if (!this._startupMemoryInjected) {
+          this._startupMemoryInjected = true;
+          this._managedSkillsStartupDelivered = true;
+          recordSyncedSummaryFingerprints(
+            this.sessionKey,
+            recentSummaryFingerprintsFromItems(dispatchResult.payload.startupMemory.items),
+          );
+          // Emit the "Historical context · injected" timeline card at the
+          // same commit boundary as the persisted flag. Doing this here
+          // (instead of eagerly in `initialize`) guarantees restart-before-
+          // first-message never leaks an unbacked card — the card appears
+          // exactly once, for the turn that actually carried the preamble.
+          this.emitStartupMemoryContext(
+            dispatchResult.payload.startupMemory,
+            extractPreferenceContextTimelineItems(dispatchResult.payload.messagePreamble),
+          );
+          this._startupMemory = null;
+          // Notify session-manager so the flag is persisted to SessionRecord.
+          // Invoked synchronously — the callback just schedules an upsert and
+          // returns, so there's no ordering risk with the rest of this turn.
+          try { this._onStartupMemoryInjected?.(); } catch (err) {
+            logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
+          }
         }
       }
     })()
@@ -6216,6 +6264,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
+  private buildExactStartupMemory(
+    namespace: ContextNamespace,
+    options?: { managedSkillsOnly?: boolean },
+  ): Promise<TransportMemoryRecallArtifact | undefined> {
+    return buildTransportStartupMemory(namespace, {
+      projectDir: this._projectDir,
+      sessionId: this._skillSessionId ?? this.sessionKey,
+      providerId: this.provider.id,
+      serverId: this._serverId,
+      trustedOwnerId: this._trustedOwnerId,
+      ...(options?.managedSkillsOnly ? { managedSkillsOnly: true } : {}),
+    });
+  }
+
   private applyContextBootstrap(
     bootstrap: Partial<TransportContextBootstrap> & {
       namespace?: ContextNamespace;
@@ -6233,7 +6295,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
-    if (!this._startupMemoryInjected) this._startupMemory = bootstrap.startupMemory ?? null;
+    if (!this._startupMemoryInjected) {
+      this._startupMemory = (this._managedSkillsStartupDelivered && isSkillsOnlyStartupArtifact(bootstrap.startupMemory))
+        ? null
+        : (bootstrap.startupMemory ?? null);
+    }
     this._onSessionInfoChange?.({
       contextNamespace: this._contextNamespace,
       contextNamespaceDiagnostics: [...this._contextNamespaceDiagnostics],
@@ -6322,6 +6388,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           sourceKind: 'local_processed',
         }),
       };
+    }
+    if (!isMemoryDaemonEnabled()) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: daemon memory disabled');
+      return { artifact: null };
     }
     if (this._contextNamespace && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true))) {
       return { artifact: null };

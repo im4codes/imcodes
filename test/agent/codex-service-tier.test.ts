@@ -80,4 +80,51 @@ describe('codex service tier', () => {
     const { provider } = providerWithSession();
     await expect(provider.setServiceTier('missing', CODEX_SERVICE_TIER.DEFAULT)).rejects.toThrow();
   });
+
+  it('still rejects when a real child dies during ensureThreadLoaded or thread/settings/update', async () => {
+    const { provider } = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.FAST });
+    const channel = (provider as any).normalChannel;
+    channel.child = { pid: 1234 };
+    (provider as any).ensureThreadLoaded = vi.fn(async () => {
+      channel.child = null;
+    });
+
+    await expect(provider.setServiceTier('sess-1', CODEX_SERVICE_TIER.DEFAULT))
+      .rejects.toThrow(/restarted/i);
+
+    // Child spawned during ensureThreadLoaded, then lost during requestOnChannel.
+    const second = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.FAST });
+    const ch2 = (second.provider as any).normalChannel;
+    (second.provider as any).ensureThreadLoaded = vi.fn(async () => {
+      ch2.child = { pid: 2345 };
+    });
+    (second.provider as any).requestOnChannel = vi.fn(async () => {
+      ch2.child = null;
+      return {};
+    });
+
+    await expect(second.provider.setServiceTier('sess-1', CODEX_SERVICE_TIER.DEFAULT))
+      .rejects.toThrow(/codex_service_tier_session_closed/);
+  });
+
+  it('still rejects when channel generation advances mid-call even on a mocked childless transport', async () => {
+    const { provider } = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.FAST });
+    const channel = (provider as any).normalChannel;
+    (provider as any).ensureThreadLoaded = vi.fn(async () => {
+      channel.generation += 1;
+    });
+
+    await expect(provider.setServiceTier('sess-1', CODEX_SERVICE_TIER.DEFAULT))
+      .rejects.toThrow(/restarted/i);
+
+    const second = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.FAST });
+    const ch2 = (second.provider as any).normalChannel;
+    (second.provider as any).requestOnChannel = vi.fn(async () => {
+      ch2.generation += 1;
+      return {};
+    });
+
+    await expect(second.provider.setServiceTier('sess-1', CODEX_SERVICE_TIER.DEFAULT))
+      .rejects.toThrow(/codex_service_tier_session_closed/);
+  });
 });

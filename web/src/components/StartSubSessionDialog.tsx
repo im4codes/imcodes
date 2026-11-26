@@ -47,6 +47,7 @@ import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
+import { IncognitoCreateOption } from './IncognitoCreateOption.js';
 
 /** Upper bound on how many identical sub-sessions one launch can request at once. */
 const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
@@ -1112,19 +1113,12 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
           </div>
         </div>
 
-        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
-          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
-            <input
-              type="checkbox"
-              checked={incognito}
-              disabled={!canIncognito}
-              onChange={(event) => setIncognito(event.currentTarget.checked)}
-            />
-            <span>🕶️ {t('session.incognito')}</span>
-          </label>
-          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
-          {(!canIncognito || (incognito && !supportsSessionIncognito(type))) && <p role="status">{t('session.incognito_unsupported')}</p>}
-        </div>
+        <IncognitoCreateOption
+          incognito={incognito}
+          canIncognito={canIncognito}
+          agentType={type}
+          onChange={setIncognito}
+        />
 
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>

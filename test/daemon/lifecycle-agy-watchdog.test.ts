@@ -51,7 +51,11 @@ vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
   getTransportRuntime: () => runtimeRef.current,
 }));
 
-const { recoverAgyStalledSession, shouldRunGenericSilentActiveTurnRecovery } = await import('../../src/daemon/lifecycle.js');
+const {
+  recoverAgyStalledSession,
+  runSessionWatchdogRecoverySweep,
+  shouldRunGenericSilentActiveTurnRecovery,
+} = await import('../../src/daemon/lifecycle.js');
 const { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } = await import('../../shared/chat-message-origin.js');
 
 const SESSION = 'deck_agy_watchdog_brain';
@@ -76,6 +80,7 @@ function makeAgyMockProvider() {
   };
 
   let activeBackgroundCount = 0;
+  let backgroundProgressAt: number | undefined;
   const provider: TransportProvider = {
     id: 'agy-sdk',
     connectionMode: 'local-sdk',
@@ -95,6 +100,7 @@ function makeAgyMockProvider() {
             activeWorkCount: activeBackgroundCount,
             activeToolCount: 0,
             backgroundWorkCount: activeBackgroundCount,
+            ...(backgroundProgressAt !== undefined ? { lastBackgroundProgressAt: backgroundProgressAt } : {}),
             busyReasons: ['provider_background_work'],
           }
         : null
@@ -137,6 +143,9 @@ function makeAgyMockProvider() {
     },
     setBackgroundWorkCount(count: number) {
       activeBackgroundCount = count;
+    },
+    setBackgroundProgressAt(at: number | undefined) {
+      backgroundProgressAt = at;
     },
     fireError(sid = 'agy-sess-1') {
       for (const cb of errorCbs) cb(sid, { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'cancelled', recoverable: true });
@@ -191,7 +200,7 @@ describe('agy stale active-turn watchdog', () => {
     resetContextStoreClientForTests();
   });
 
-  it('auto-recovers a hung silent agy-sdk turn after 6 minutes with STALE_WATCHDOG and dispatches system continue once per generation', async () => {
+  it('auto-recovers a hung silent agy-sdk turn after 12 minutes with STALE_WATCHDOG and dispatches system continue once per generation', async () => {
     const t0 = 1_700_100_000_000;
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
 
@@ -204,15 +213,17 @@ describe('agy stale active-turn watchdog', () => {
     mock.fireTool('agy-sess-1', { id: 'tool-1', name: 'Read', status: 'completed' });
     expect(runtime.getDiagnosticSnapshot(t0).activeToolCount).toBe(0);
 
-    // Below 6m threshold (including old 3m threshold): does not recover.
+    // Below 12m threshold (including old 3m and 6m thresholds, 7m, 11m, and 11m59.999s): does not recover.
     const initialGen = runtime.getDiagnosticSnapshot(t0).activityGeneration;
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 180_000)).toBe(false);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 359_999)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 360_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 11 * 60_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 719_999)).toBe(false);
     expect(mock.provider.cancel).not.toHaveBeenCalled();
 
-    // At 6m threshold: recovers once via STALE_WATCHDOG and dispatches system `continue`.
-    nowSpy.mockReturnValue(t0 + 360_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 360_000)).toBe(true);
+    // At 12m threshold: recovers once via STALE_WATCHDOG and dispatches system `continue`.
+    nowSpy.mockReturnValue(t0 + 720_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 720_000)).toBe(true);
     expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
       origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
     });
@@ -226,7 +237,7 @@ describe('agy stale active-turn watchdog', () => {
       'assistant.text',
       expect.objectContaining({
         noticeCode: DAEMON_USER_NOTICE_CODE.AGY_WATCHDOG_RECOVERED,
-        noticeParams: { minutes: 6 },
+        noticeParams: { minutes: 12 },
         streaming: false,
         automation: true,
       }),
@@ -243,7 +254,7 @@ describe('agy stale active-turn watchdog', () => {
     );
 
     // Calling again on the newly dispatched turn at +5s does not re-trigger.
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 365_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 725_000)).toBe(false);
 
     // Bounded to once per activity generation even if the previously recovered generation remains active.
     const cancelSpy = vi.fn(async () => undefined);
@@ -258,10 +269,10 @@ describe('agy stale active-turn watchdog', () => {
         stalePendingRecoveryActive: false,
         providerSessionBound: true,
         lastActivityAt: t0,
-        lastActivityAgeMs: 380_000,
+        lastActivityAgeMs: 740_000,
         lastProviderOutputAt: t0,
-        lastProviderOutputAgeMs: 380_000,
-        providerOutputSilenceMs: 380_000,
+        lastProviderOutputAgeMs: 740_000,
+        providerOutputSilenceMs: 740_000,
         unacknowledgedActiveAppendCount: 0,
         oldestUnacknowledgedActiveAppendAt: null,
         activityGeneration: initialGen,
@@ -274,12 +285,12 @@ describe('agy stale active-turn watchdog', () => {
       send: sendSpy,
       cancel: cancelSpy,
     } as unknown as TransportSessionRuntime;
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 380_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 740_000)).toBe(false);
     expect(cancelSpy).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
   });
 
-  it('recovers after 6m when unacknowledged active-turn steering prompts wait with zero output, replaying them in order without duplicate user bubbles', async () => {
+  it('recovers after 12m when unacknowledged active-turn steering prompts wait with zero output, replaying them in order without duplicate user bubbles', async () => {
     const t0 = 1_700_200_000_000;
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
 
@@ -308,13 +319,13 @@ describe('agy stale active-turn watchdog', () => {
     // Status pings do not reset output silence or ack the steering prompts.
     mock.fireStatus('agy-sess-1', { status: 'thinking', label: 'Thinking...' });
 
-    // Below 6m threshold (including old 90s / 3m thresholds and 5m59.999s): does not recover.
+    // Below 12m threshold (including old 90s / 3m / 6m thresholds and 11m59.999s): does not recover.
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 90_000)).toBe(false);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 180_000)).toBe(false);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 359_999)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 360_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 719_999)).toBe(false);
     expect(mock.provider.cancel).not.toHaveBeenCalled();
 
-    // At 6m after unacked steering prompt: triggers recovery & replays both in order.
+    // At 12m after unacked steering prompt: triggers recovery & replays both in order.
     const drainedTimelineEntries: unknown[] = [];
     const drainedMetaIds: string[] = [];
     runtime.onDrain = (entries, _merged, _count, meta) => {
@@ -322,8 +333,8 @@ describe('agy stale active-turn watchdog', () => {
       for (const item of meta.entries) drainedMetaIds.push(item.clientMessageId);
     };
 
-    nowSpy.mockReturnValue(tAppend + 360_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 360_000)).toBe(true);
+    nowSpy.mockReturnValue(tAppend + 720_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 720_000)).toBe(true);
     expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
       origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
     });
@@ -336,7 +347,7 @@ describe('agy stale active-turn watchdog', () => {
       'assistant.text',
       expect.objectContaining({
         noticeCode: DAEMON_USER_NOTICE_CODE.AGY_WATCHDOG_RECOVERED,
-        noticeParams: { minutes: 6 },
+        noticeParams: { minutes: 12 },
         streaming: false,
         automation: true,
       }),
@@ -405,14 +416,90 @@ describe('agy stale active-turn watchdog', () => {
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'kimi-sdk' }, t0 + 10 * 60_000)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'codex-sdk', providerId: 'codex-sdk' }, false)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk', providerId: 'claude-code-sdk' }, false)).toBe(true);
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'agy-sdk', providerId: 'agy-sdk' }, false)).toBe(false);
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'agy-sdk', providerId: 'agy-sdk' }, true)).toBe(false);
   });
 
-  it('protects running tools and background work against unacknowledged steering timeout below 15m and enforces the 15m ceiling', async () => {
+  it('health poll sweep prevents generic silent-turn fallback from bypassing AGY 30m env override or live background progress, while recovering frozen AGY and generic providers', async () => {
+    const t0 = 1_700_450_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    vi.stubEnv('IMCODES_AGY_STALE_ACTIVE_TURN_MS', String(30 * 60_000));
+
+    expect(runtime.send('long task without open tools', 'cmd-health-sweep')).toBe('sent');
+    await waitForSendCount(mock.provider.send, 1);
+    await flushDispatch();
+    expect(runtime.getDiagnosticSnapshot(t0).activeToolCount).toBe(0);
+
+    // 1) Custom 30m threshold: at 25m silent with zero open tools, neither AGY nor generic settle cancels the turn.
+    const t25 = t0 + 25 * 60_000;
+    nowSpy.mockReturnValue(t25);
+    const customSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      t25,
+    );
+    expect(customSweep).toMatchObject({ agyRecovered: false, genericRecovered: false });
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    // 2) Live background progress (1s ago) past 25m with activeToolCount === 0: health poll leaves it running untouched.
+    vi.unstubAllEnvs();
+    mock.setBackgroundWorkCount(1);
+    mock.setBackgroundProgressAt(t25 - 1_000);
+    const liveBgSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      t25,
+    );
+    expect(liveBgSweep).toMatchObject({ agyRecovered: false, genericRecovered: false });
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    // 3) Once background progress freezes for 20m, AGY watchdog recovers (not generic fallback).
+    const tFrozen = t25 - 1_000 + 20 * 60_000;
+    nowSpy.mockReturnValue(tFrozen);
+    const frozenSweep = await runSessionWatchdogRecoverySweep(
+      { name: config.sessionKey, agentType: 'agy-sdk', providerId: 'agy-sdk', state: 'running' },
+      tFrozen,
+    );
+    expect(frozenSweep).toMatchObject({ agyRecovered: true, genericRecovered: false });
+    expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    });
+
+    // 4) Non-AGY generic transport (claude-code-sdk) still uses generic silent-turn recovery at 12m.
+    mock.setBackgroundWorkCount(0);
+    mock.setBackgroundProgressAt(undefined);
+    const genericCancel = vi.fn(async () => undefined);
+    const genericSend = vi.fn(async () => {});
+    const genericProvider = {
+      ...mock.provider,
+      id: 'claude-code-sdk',
+      cancel: genericCancel,
+      send: genericSend,
+      getActiveWorkSnapshot: () => null,
+    };
+    const genericRuntime = new TransportSessionRuntime(genericProvider, `${config.sessionKey}_claude`);
+    await genericRuntime.initialize({ sessionKey: `${config.sessionKey}_claude` });
+    runtimeRef.current = genericRuntime;
+    nowSpy.mockReturnValue(t0);
+    expect(genericRuntime.send('claude silent', 'cmd-claude')).toBe('sent');
+    await waitForSendCount(genericSend, 1);
+    await flushDispatch();
+    const tClaude13 = t0 + 13 * 60_000;
+    nowSpy.mockReturnValue(tClaude13);
+    const claudeSweep = await runSessionWatchdogRecoverySweep(
+      { name: `${config.sessionKey}_claude`, agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', state: 'running' },
+      tClaude13,
+    );
+    expect(claudeSweep).toMatchObject({ agyRecovered: false, genericRecovered: true });
+    expect(genericCancel).toHaveBeenCalledWith('agy-sess-1', expect.objectContaining({
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    }));
+    await genericRuntime.kill().catch(() => {});
+  });
+
+  it('protects running tools and phantom background work against unacknowledged steering timeout below 20m and enforces the 20m ceiling', async () => {
     const t0 = 1_700_500_000_000;
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
 
-    // 1) Running tool protects unacknowledged steering at 90s and 6m, then recovers cleanly at the 15m ceiling.
+    // 1) Running tool protects unacknowledged steering at 90s, 12m, and 19m, then recovers cleanly at the 20m ceiling.
     expect(runtime.send('turn with phantom tool', 'cmd-phantom')).toBe('sent');
     await waitForSendCount(mock.provider.send, 1);
     await flushDispatch();
@@ -428,11 +515,12 @@ describe('agy stale active-turn watchdog', () => {
       await flushDispatch();
     }
     expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 90_000)).toBe(false);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 6 * 60_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tAppend + 12 * 60_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 19 * 60_000)).toBe(false);
     expect(mock.provider.cancel).not.toHaveBeenCalled();
 
-    nowSpy.mockReturnValue(t0 + 15 * 60_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 15 * 60_000)).toBe(true);
+    nowSpy.mockReturnValue(t0 + 20 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 20 * 60_000)).toBe(true);
     expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
       origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
     });
@@ -441,10 +529,11 @@ describe('agy stale active-turn watchdog', () => {
       userMessage: 'steer past phantom tool',
     }));
 
-    // 1b) Active background work also protects unacknowledged steering below 15m, then recovers at 15m.
-    const tBg = t0 + 15 * 60_000 + 5_000;
+    // 1b) Phantom/leaked background work without live progress also protects unacknowledged steering below 20m, then recovers at 20m.
+    const tBg = t0 + 20 * 60_000 + 5_000;
     nowSpy.mockReturnValue(tBg);
     mock.setBackgroundWorkCount(1);
+    mock.setBackgroundProgressAt(undefined);
     expect(runtime.send('steer during background work', 'steer-bg-1', undefined, undefined, {
       deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       timelineCommitted: true,
@@ -452,19 +541,19 @@ describe('agy stale active-turn watchdog', () => {
     for (let i = 0; i < 50 && runtime.getDiagnosticSnapshot(tBg).unacknowledgedActiveAppendCount !== 1; i++) {
       await flushDispatch();
     }
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tBg + 6 * 60_000)).toBe(false);
-    nowSpy.mockReturnValue(tBg + 15 * 60_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tBg + 15 * 60_000)).toBe(true);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tBg + 12 * 60_000)).toBe(false);
+    nowSpy.mockReturnValue(tBg + 20 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tBg + 20 * 60_000)).toBe(true);
     await waitForSendCount(mock.provider.send, 3);
     mock.setBackgroundWorkCount(0);
 
-    // 2) Without unacked steering, open tool / backgroundWorkCount still protect at 10m but recover at the 15m ceiling.
-    const tCeiling = tBg + 15 * 60_000 + 5_000;
+    // 2) Without unacked steering, open tool / phantom backgroundWorkCount still protect at 15m but recover at the 20m ceiling.
+    const tCeiling = tBg + 20 * 60_000 + 5_000;
     nowSpy.mockReturnValue(tCeiling);
     mock.fireTool('agy-sess-1', { id: 'tool-hung', name: 'Bash', status: 'running' });
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 10 * 60_000)).toBe(false);
-    nowSpy.mockReturnValue(tCeiling + 15 * 60_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 15 * 60_000)).toBe(true);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 15 * 60_000)).toBe(false);
+    nowSpy.mockReturnValue(tCeiling + 20 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 20 * 60_000)).toBe(true);
 
     // 3) Stale reactive thinking / orphan background work with activeDispatchCount=0 cancels before dispatching continue.
     const callOrder: string[] = [];
@@ -480,10 +569,10 @@ describe('agy stale active-turn watchdog', () => {
         stalePendingRecoveryActive: false,
         providerSessionBound: true,
         lastActivityAt: tCeiling,
-        lastActivityAgeMs: 15 * 60_000,
+        lastActivityAgeMs: 20 * 60_000,
         lastProviderOutputAt: tCeiling,
-        lastProviderOutputAgeMs: 15 * 60_000,
-        providerOutputSilenceMs: 15 * 60_000,
+        lastProviderOutputAgeMs: 20 * 60_000,
+        providerOutputSilenceMs: 20 * 60_000,
         unacknowledgedActiveAppendCount: 0,
         oldestUnacknowledgedActiveAppendAt: null,
         activityGeneration: 'reactive-orphan-gen',
@@ -497,9 +586,77 @@ describe('agy stale active-turn watchdog', () => {
       cancel: customCancel,
     } as unknown as TransportSessionRuntime;
 
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 15 * 60_000)).toBe(true);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, tCeiling + 20 * 60_000)).toBe(true);
     expect(callOrder).toEqual(['cancel', 'send']);
     expect(customCancel).toHaveBeenCalledWith({ origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG });
+  });
+
+  it('never cancels an active background task reporting live progress past 20m-35m, and still recovers once progress freezes for 20m', async () => {
+    const t0 = 1_700_550_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+
+    expect(runtime.send('run long vitest suite', 'cmd-long-vitest')).toBe('sent');
+    await waitForSendCount(mock.provider.send, 1);
+    await flushDispatch();
+
+    // Background command stays alive while log keeps progressing even though providerSilenceMs is 25m and 35m,
+    // and even with an unacked active steering append waiting 22m.
+    mock.setBackgroundWorkCount(1);
+    mock.setBackgroundProgressAt(t0);
+    expect(runtime.send('steer during live suite', 'steer-live-bg', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      timelineCommitted: true,
+    })).toBe('queued');
+    for (let i = 0; i < 50 && runtime.getDiagnosticSnapshot(t0).unacknowledgedActiveAppendCount !== 1; i++) {
+      await flushDispatch();
+    }
+
+    const diagSpy = vi.spyOn(runtime, 'getDiagnosticSnapshot');
+    const t25 = t0 + 25 * 60_000;
+    nowSpy.mockReturnValue(t25);
+    mock.setBackgroundProgressAt(t25 - 10_000);
+    expect(runtime.getDiagnosticSnapshot(t25, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t25 - 10_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t25)).toBe(false);
+    expect(diagSpy).toHaveBeenCalledWith(t25, { sampleBackgroundProgress: true });
+
+    const t35 = t0 + 35 * 60_000;
+    nowSpy.mockReturnValue(t35);
+    mock.setBackgroundProgressAt(t35 - 5_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t35)).toBe(false);
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    // Once background log progress freezes at (t35 - 5s), it stays protected below 20m and recovers at +20m.
+    const frozenAt = t35 - 5_000;
+    nowSpy.mockReturnValue(frozenAt + 19 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, frozenAt + 19 * 60_000)).toBe(false);
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    nowSpy.mockReturnValue(frozenAt + 20 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, frozenAt + 20 * 60_000)).toBe(true);
+    expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    });
+  });
+
+  it('supports larger IMCODES_AGY_STALE_ACTIVE_TURN_MS overrides such as 30 minutes', async () => {
+    const t0 = 1_700_580_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0);
+    vi.stubEnv('IMCODES_AGY_STALE_ACTIVE_TURN_MS', String(30 * 60_000));
+
+    expect(runtime.send('high context long thinking', 'cmd-30m')).toBe('sent');
+    await waitForSendCount(mock.provider.send, 1);
+    await flushDispatch();
+
+    // At 12m, 20m, and 29m: must NOT recover when configured to 30m.
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 12 * 60_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 29 * 60_000)).toBe(false);
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+
+    nowSpy.mockReturnValue(t0 + 30 * 60_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 30 * 60_000)).toBe(true);
+    expect(mock.provider.cancel).toHaveBeenCalledWith('agy-sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+    });
   });
 
   it('does not permanently blacklist an activity generation when recovery send or cancel fails; retries after cooldown up to cap', async () => {
@@ -520,10 +677,10 @@ describe('agy stale active-turn watchdog', () => {
         stalePendingRecoveryActive: false,
         providerSessionBound: true,
         lastActivityAt: t0,
-        lastActivityAgeMs: 360_000,
+        lastActivityAgeMs: 720_000,
         lastProviderOutputAt: t0,
-        lastProviderOutputAgeMs: 360_000,
-        providerOutputSilenceMs: 360_000,
+        lastProviderOutputAgeMs: 720_000,
+        providerOutputSilenceMs: 720_000,
         unacknowledgedActiveAppendCount: 0,
         oldestUnacknowledgedActiveAppendAt: null,
         activityGeneration: gen,
@@ -538,30 +695,30 @@ describe('agy stale active-turn watchdog', () => {
     } as unknown as TransportSessionRuntime;
 
     // Attempt 1 fails because send returns dropped -> returns false without completing generation.
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 360_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 720_000)).toBe(false);
     expect(sendSpy).toHaveBeenCalledTimes(1);
 
     // Cooldown prevents immediate retry stampede before 60s.
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 390_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 750_000)).toBe(false);
     expect(sendSpy).toHaveBeenCalledTimes(1);
 
     // Attempt 2 after cooldown: send succeeds, cancel throws -> still eligible for final retry after cooldown.
     sendResult = 'queued';
     cancelImpl = vi.fn(async () => { throw new Error('transient disconnect'); });
     (runtimeRef.current as unknown as { cancel: typeof cancelImpl }).cancel = cancelImpl;
-    nowSpy.mockReturnValue(t0 + 420_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 420_000)).toBe(false);
+    nowSpy.mockReturnValue(t0 + 780_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 780_000)).toBe(false);
     expect(sendSpy).toHaveBeenCalledTimes(2);
     expect(cancelImpl).toHaveBeenCalledTimes(1);
 
     // Attempt 3 after cooldown succeeds -> marks generation complete and deduplicates thereafter.
     const okCancel = vi.fn(async () => undefined);
     (runtimeRef.current as unknown as { cancel: typeof okCancel }).cancel = okCancel;
-    nowSpy.mockReturnValue(t0 + 480_000);
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 480_000)).toBe(true);
+    nowSpy.mockReturnValue(t0 + 840_000);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 840_000)).toBe(true);
     expect(okCancel).toHaveBeenCalledWith({ origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG });
 
-    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 540_000)).toBe(false);
+    expect(await recoverAgyStalledSession({ name: config.sessionKey, agentType: 'agy-sdk' }, t0 + 900_000)).toBe(false);
     expect(sendSpy).toHaveBeenCalledTimes(3);
   });
 });

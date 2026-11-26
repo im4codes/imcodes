@@ -270,10 +270,20 @@ const childProcessMock = vi.hoisted(() => {
   };
 });
 
+const hookPortMock = vi.hoisted(() => ({ port: null as number | null }));
+
 vi.mock('node:child_process', () => ({
   spawn: childProcessMock.spawn,
   execFile: childProcessMock.execFile,
 }));
+
+vi.mock('../../src/daemon/hook-server-state.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/hook-server-state.js')>();
+  return {
+    ...actual,
+    getActiveHookServerPort: () => hookPortMock.port,
+  };
+});
 
 vi.mock('../../src/util/logger.js', () => ({
   default: loggerMock,
@@ -318,6 +328,7 @@ import {
   buildCodexMcpThreadConfig,
 } from '../../src/agent/providers/codex-sdk.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { HOOK_SESSION_CREDENTIAL_ENV, HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 import {
   PROVIDER_ERROR_CODES,
   type AgentMessage,
@@ -3238,6 +3249,168 @@ describe('CodexSdkProvider', () => {
     const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
     expect(methods).toContain('thread/start');
     expect(methods).not.toContain('mcpServer/tool/call');
+  });
+
+  it('restarts idle app-server and resumes the thread with the new /mcp port or stdio fallback when the hook listener changes', async () => {
+    hookPortMock.port = 52101;
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'c1-http-rebind',
+        cwd: '/tmp/project',
+        sessionName: 'deck_rebind_w1',
+        sessionInstanceId: 'inst-rebind-1',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-rebind-1' },
+      });
+
+      const flush = () => new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+      await provider.send('c1-http-rebind', { ...brainPayload('c1-http-rebind'), sessionRole: 'w1' as const });
+      expect(childProcessMock.children).toHaveLength(1);
+      const firstChild = childProcessMock.children[0]!;
+      const firstStart = firstChild.requests.find((r) => r.method === 'thread/start');
+      expect(firstStart?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52101/mcp');
+      expect(firstStart?.params?.config?.mcp_servers?.['imcodes-memory']?.http_headers?.[HOOK_SESSION_CREDENTIAL_HEADER]).toBe('cred-rebind-1');
+      firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+      await flush();
+
+      // Simulate listener rebind onto a new ephemeral port.
+      hookPortMock.port = 52102;
+      await provider.send('c1-http-rebind', { ...brainPayload('c1-http-rebind'), sessionRole: 'w1' as const, userMessage: 'after rebind', assembledMessage: 'after rebind' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const secondChild = childProcessMock.children[1]!;
+      const resumed = secondChild.requests.find((r) => r.method === 'thread/resume');
+      expect(resumed?.params?.threadId).toBe('thread-1');
+      expect(resumed?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52102/mcp');
+      secondChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'completed' } } });
+      await flush();
+
+      // Closing the hook server falls back to stdio command/args on the same existing thread.
+      hookPortMock.port = null;
+      await provider.send('c1-http-rebind', { ...brainPayload('c1-http-rebind'), sessionRole: 'w1' as const, userMessage: 'after close', assembledMessage: 'after close' });
+      expect(childProcessMock.children).toHaveLength(3);
+      const stdioResumed = childProcessMock.children[2]!.requests.find((r) => r.method === 'thread/resume');
+      expect(stdioResumed?.params?.threadId).toBe('thread-1');
+      expect(stdioResumed?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBeUndefined();
+      expect(stdioResumed?.params?.config?.mcp_servers?.['imcodes-memory']?.command).toBeDefined();
+    } finally {
+      hookPortMock.port = null;
+    }
+  });
+
+  it('recovers after observed Streamable HTTP 404 / transport failure by switching idle channel to the new port', async () => {
+    hookPortMock.port = 52201;
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'c1-http-404',
+        cwd: '/tmp/project',
+        sessionName: 'deck_404_w1',
+        sessionInstanceId: 'inst-404-1',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-404-1' },
+      });
+
+      const flush = () => new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+      mcpStatusPages = [connectedPage];
+      const payload = { ...brainPayload('c1-http-404'), sessionRole: 'w1' as const };
+      await provider.send('c1-http-404', payload);
+      const firstChild = childProcessMock.children[0]!;
+      // Emit a Streamable HTTP 404 Session not found MCP tool failure mid-turn, then fail turn.
+      firstChild.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-404', type: 'mcpToolCall', status: 'failed',
+            server: 'imcodes-memory', tool: 'search_memory',
+            arguments: { query: 'x' },
+            error: { message: 'Transport send error: unexpected server response: HTTP 404 Not Found: Session not found' },
+          },
+        },
+      });
+      firstChild.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed', error: { message: 'turn failed' } } },
+      });
+      await flush();
+
+      hookPortMock.port = 52202;
+      await provider.send('c1-http-404', { ...payload, userMessage: 'retry after 404', assembledMessage: 'retry after 404' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const resumed = childProcessMock.children[1]!.requests.find((r) => r.method === 'thread/resume');
+      expect(resumed?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52202/mcp');
+    } finally {
+      hookPortMock.port = null;
+    }
+  });
+
+  it('keeps pending /mcp port migration when another thread on the shared channel is busy and migrates safely once idle', async () => {
+    hookPortMock.port = 52301;
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'c1-busy-A',
+        cwd: '/tmp/project',
+        resumeId: 'thread-busy-A',
+        sessionName: 'deck_busy_w1',
+        sessionInstanceId: 'inst-busy-a',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-busy-a' },
+      });
+      await provider.createSession({
+        sessionKey: 'c1-busy-B',
+        cwd: '/tmp/project',
+        resumeId: 'thread-busy-B',
+        sessionName: 'deck_busy_w2',
+        sessionInstanceId: 'inst-busy-b',
+        env: { [HOOK_SESSION_CREDENTIAL_ENV]: 'cred-busy-b' },
+      });
+
+      const flush = () => new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+      // Warm up B and leave it idle; start A and keep A actively busy on child 1.
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const });
+      const child1 = childProcessMock.children[0]!;
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-1', status: 'completed' } } });
+      await flush();
+
+      await provider.send('c1-busy-A', { ...brainPayload('c1-busy-A'), sessionRole: 'w1' as const });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      // Rebind hook server while A is actively running a turn.
+      hookPortMock.port = 52302;
+
+      // Sending a turn on B while A is busy MUST NOT interrupt A or kill child 1,
+      // and MUST NOT falsely mark loadedMcpConfigJson as migrated on child 1.
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const, userMessage: 'during-busy', assembledMessage: 'during-busy' });
+      expect(childProcessMock.children).toHaveLength(1);
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-2', status: 'completed' } } });
+      await flush();
+
+      // Finish A uninterrupted on child 1.
+      child1.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-A', turn: { id: 'turn-3', status: 'completed' } } });
+      await flush();
+
+      // Now channel is idle: next turn on B MUST detect pending port change and restart app-server to child 2!
+      await provider.send('c1-busy-B', { ...brainPayload('c1-busy-B'), sessionRole: 'w1' as const, userMessage: 'after-idle-b', assembledMessage: 'after-idle-b' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const child2 = childProcessMock.children[1]!;
+      const resumedB = child2.requests.find((r) => r.method === 'thread/resume');
+      expect(resumedB?.params?.threadId).toBe('thread-busy-B');
+      expect(resumedB?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52302/mcp');
+      child2.emits({ method: 'turn/completed', params: { threadId: 'thread-busy-B', turn: { id: 'turn-4', status: 'completed' } } });
+      await flush();
+
+      // Subsequent turn on A resumes directly onto child 2 (no extra child 3 spawn) with port 52302.
+      await provider.send('c1-busy-A', { ...brainPayload('c1-busy-A'), sessionRole: 'w1' as const, userMessage: 'after-idle-a', assembledMessage: 'after-idle-a' });
+      expect(childProcessMock.children).toHaveLength(2);
+      const resumeCalls2 = child2.requests.filter((r) => r.method === 'thread/resume');
+      expect(resumeCalls2).toHaveLength(2);
+      expect(resumeCalls2[1]?.params?.threadId).toBe('thread-busy-A');
+      expect(resumeCalls2[1]?.params?.config?.mcp_servers?.['imcodes-memory']?.url).toBe('http://127.0.0.1:52302/mcp');
+    } finally {
+      hookPortMock.port = null;
+    }
   });
 
   // E: model-agnostic matrix.

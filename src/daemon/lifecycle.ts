@@ -2336,9 +2336,8 @@ const HEALTH_POLL_MS = 30_000;
 const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
 const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
-const DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
-const AGY_STALE_ACTIVE_APPEND_RECOVER_AFTER_MS = DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS;
-const AGY_STALE_ACTIVE_WORK_CEILING_MS = 15 * 60_000;
+const DEFAULT_AGY_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
+const AGY_STALE_ACTIVE_WORK_CEILING_MS = 20 * 60_000;
 const AGY_STALE_RETRY_COOLDOWN_MS = 60_000;
 const AGY_STALE_MAX_RETRY_ATTEMPTS = 3;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
@@ -2487,6 +2486,71 @@ export async function runExecutionCloneSweep(now: number): Promise<void> {
   });
 }
 
+/** Run per-session watchdog and stale-turn recovery checks on each health tick. */
+export async function runSessionWatchdogRecoverySweep(
+  s: Pick<SessionRecord, 'name' | 'agentType' | 'providerId' | 'state'>,
+  nowMs = Date.now(),
+): Promise<{
+  memoryCompressionRecovered: boolean;
+  codexSettledFromRollout: boolean;
+  codexRecovered: boolean;
+  agyRecovered: boolean;
+  genericRecovered: boolean;
+}> {
+  let memoryCompressionRecovered = false;
+  try {
+    memoryCompressionRecovered = await recoverMemoryCompressionStalledSession(s.name, nowMs);
+  } catch (err) {
+    logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
+  }
+  // Store-driven settle backstop runs FIRST: if the rollout proves the
+  // turn already completed, settle it to idle (no `continue` nudge) rather
+  // than letting the stale-turn watchdog treat a finished turn as stalled.
+  let codexSettledFromRollout = false;
+  if (!memoryCompressionRecovered) {
+    codexSettledFromRollout = await reconcileCodexCompletedTurnFromRollout(s, nowMs).catch((err) => {
+      logger.warn({ err, sessionName: s.name }, 'codex rollout settle backstop failed');
+      return false;
+    });
+  }
+  let codexRecovered = false;
+  if (!memoryCompressionRecovered && !codexSettledFromRollout) {
+    codexRecovered = await recoverCodexStalledSession(s, nowMs).catch((err) => {
+      logger.warn({ err, sessionName: s.name }, 'codex stale-turn auto-continue watchdog failed');
+      return false;
+    });
+  }
+  let agyRecovered = false;
+  if (!memoryCompressionRecovered && !codexSettledFromRollout && !codexRecovered) {
+    agyRecovered = await recoverAgyStalledSession(s, nowMs).catch((err) => {
+      logger.warn({ err, sessionName: s.name }, 'agy stale-turn auto-recovery watchdog failed');
+      return false;
+    });
+  }
+  // Safety net: settle a phantom (silent-but-"active") transport turn to
+  // idle — and drain any queued work — so the session can't stay "working"
+  // forever. Fires whether or not anything is queued.
+  let genericRecovered = false;
+  try {
+    if (shouldRunGenericSilentActiveTurnRecovery(s, memoryCompressionRecovered || codexRecovered || agyRecovered)) {
+      genericRecovered = getTransportRuntime(s.name)?.recoverSilentActiveTurn({
+        reason: 'health-poll-stale-active-turn',
+        staleMs: TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS,
+        nowMs,
+      }) ?? false;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionName: s.name }, 'transport stale-active-turn recovery sweep error');
+  }
+  return {
+    memoryCompressionRecovered,
+    codexSettledFromRollout,
+    codexRecovered,
+    agyRecovered,
+    genericRecovered,
+  };
+}
+
 /** Periodically check all running sessions; restart any that have disappeared or died. */
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
@@ -2494,49 +2558,7 @@ function startHealthPoller(): void {
     const tmuxProbe = createTmuxHealthProbe();
     for (const s of sessions) {
       await checkSessionHealth(s, tmuxProbe);
-      let memoryCompressionRecovered = false;
-      try {
-        memoryCompressionRecovered = await recoverMemoryCompressionStalledSession(s.name);
-      } catch (err) {
-        logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
-      }
-      // Store-driven settle backstop runs FIRST: if the rollout proves the
-      // turn already completed, settle it to idle (no `continue` nudge) rather
-      // than letting the stale-turn watchdog treat a finished turn as stalled.
-      let codexSettledFromRollout = false;
-      if (!memoryCompressionRecovered) {
-        codexSettledFromRollout = await reconcileCodexCompletedTurnFromRollout(s).catch((err) => {
-          logger.warn({ err, sessionName: s.name }, 'codex rollout settle backstop failed');
-          return false;
-        });
-      }
-      let codexRecovered = false;
-      if (!memoryCompressionRecovered && !codexSettledFromRollout) {
-        codexRecovered = await recoverCodexStalledSession(s).catch((err) => {
-          logger.warn({ err, sessionName: s.name }, 'codex stale-turn auto-continue watchdog failed');
-          return false;
-        });
-      }
-      let agyRecovered = false;
-      if (!memoryCompressionRecovered && !codexSettledFromRollout && !codexRecovered) {
-        agyRecovered = await recoverAgyStalledSession(s).catch((err) => {
-          logger.warn({ err, sessionName: s.name }, 'agy stale-turn auto-recovery watchdog failed');
-          return false;
-        });
-      }
-      // Safety net: settle a phantom (silent-but-"active") transport turn to
-      // idle — and drain any queued work — so the session can't stay "working"
-      // forever. Fires whether or not anything is queued.
-      try {
-        if (shouldRunGenericSilentActiveTurnRecovery(s, memoryCompressionRecovered || codexRecovered || agyRecovered)) {
-          getTransportRuntime(s.name)?.recoverSilentActiveTurn({
-            reason: 'health-poll-stale-active-turn',
-            staleMs: TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS,
-          });
-        }
-      } catch (err) {
-        logger.warn({ err, sessionName: s.name }, 'transport stale-active-turn recovery sweep error');
-      }
+      await runSessionWatchdogRecoverySweep(s);
       // Safety net: rehydrate transport-queue rows that survive only in SQLite
       // (a message queued behind an in-flight turn before a restart, then the
       // runtime was rebuilt with an empty in-memory queue) and drain them. The
@@ -2700,11 +2722,11 @@ export function shouldRunGenericSilentActiveTurnRecovery(
   recoveredByContinueWatchdog = false,
 ): boolean {
   if (recoveredByContinueWatchdog) return false;
-  // Codex silent-turn recovery is owned by recoverCodexStalledSession(), which
-  // stops the stale turn and sends a front-of-queue `continue`. The generic
-  // settle-only recovery runs earlier and would otherwise swallow the stale turn
-  // before the Codex continuation branch can fire.
-  return !isCodexTransportSession(s);
+  // Codex and AGY silent-turn recovery are owned by recoverCodexStalledSession()
+  // and recoverAgyStalledSession(), which enforce provider-specific env thresholds
+  // and live background-work progress protections before cancelling. Letting the
+  // generic settle-only recovery run would bypass those protections and kill active work.
+  return !isCodexTransportSession(s) && !isAgyTransportSession(s);
 }
 
 function rememberBoundedGeneration(generations: Set<string>, generationKey: string): void {
@@ -2821,7 +2843,7 @@ export async function recoverAgyStalledSession(
   if (!isAgyTransportSession(s)) return false;
   const runtime = getTransportRuntime(s.name);
   if (!runtime) return false;
-  const diagnostic = runtime.getDiagnosticSnapshot(nowMs);
+  const diagnostic = runtime.getDiagnosticSnapshot(nowMs, { sampleBackgroundProgress: true });
   if (!isTransportDiagnosticActive(diagnostic)) return false;
 
   const staleMs = getAgyStaleActiveTurnAutoContinueAfterMs();
@@ -2833,18 +2855,35 @@ export async function recoverAgyStalledSession(
   const unackedAgeMs = unackedCount > 0 && oldestUnackedAt !== null
     ? Math.max(0, nowMs - oldestUnackedAt)
     : 0;
-  const appendTimedOut = unackedCount > 0 && unackedAgeMs >= AGY_STALE_ACTIVE_APPEND_RECOVER_AFTER_MS;
+  const appendTimedOut = unackedCount > 0 && unackedAgeMs >= staleMs;
   const silenceTimedOut = providerSilenceMs >= staleMs;
   if (!appendTimedOut && !silenceTimedOut) return false;
 
-  // Running tools and active background work protect against both the normal 6m
-  // silence threshold and unacknowledged active appends up to the bounded 15m
+  // Running tools and active background work protect against both the normal 12m
+  // silence threshold and unacknowledged active appends up to the bounded 20m
   // ceiling (preventing phantom tool / leaked background stalls from hanging forever).
+  // When an active background task reports live progress (`lastBackgroundProgressAt`),
+  // measure silence from that latest progress so long-running live commands (e.g.
+  // 25m+ test suites) keep running uninterrupted while still recovering if they hang.
   const activeWorkCeilingMs = Math.max(staleMs, AGY_STALE_ACTIVE_WORK_CEILING_MS);
+  const backgroundProgressAt = diagnostic.lastBackgroundProgressAt ?? null;
+  const hasLiveBackgroundProgress = (diagnostic.backgroundWorkCount ?? 0) > 0
+    && typeof backgroundProgressAt === 'number'
+    && Number.isFinite(backgroundProgressAt);
+  const backgroundSilenceMs = hasLiveBackgroundProgress
+    ? Math.max(0, nowMs - backgroundProgressAt)
+    : null;
+  const effectiveSilenceMs = backgroundSilenceMs !== null
+    ? Math.min(providerSilenceMs, backgroundSilenceMs)
+    : providerSilenceMs;
   if (
     (diagnostic.activeToolCount > 0 || (diagnostic.backgroundWorkCount ?? 0) > 0)
-    && providerSilenceMs < activeWorkCeilingMs
-    && (!appendTimedOut || unackedAgeMs < activeWorkCeilingMs)
+    && effectiveSilenceMs < activeWorkCeilingMs
+    && (
+      !appendTimedOut
+      || unackedAgeMs < activeWorkCeilingMs
+      || (backgroundSilenceMs !== null && backgroundSilenceMs < activeWorkCeilingMs)
+    )
   ) {
     return false;
   }
@@ -2866,7 +2905,7 @@ export async function recoverAgyStalledSession(
   recordAgyGenerationAttempt(generationKey, attemptState);
 
   const replayedEntries = runtime.requeueUnacknowledgedActiveAppendsFront?.() ?? [];
-  const effectiveWaitMs = appendTimedOut ? unackedAgeMs : providerSilenceMs;
+  const effectiveWaitMs = appendTimedOut && backgroundSilenceMs === null ? unackedAgeMs : effectiveSilenceMs;
   const minutes = Math.max(1, Math.round(effectiveWaitMs / 60_000));
 
   logger.warn(
@@ -2875,7 +2914,10 @@ export async function recoverAgyStalledSession(
       generationKey,
       attempt: attemptState.attempts,
       providerSilenceMs,
+      backgroundSilenceMs,
+      effectiveSilenceMs,
       staleMs,
+      activeWorkCeilingMs,
       unackedCount,
       unackedAgeMs,
       replayedCount: replayedEntries.length,

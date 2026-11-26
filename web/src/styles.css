@@ -3448,14 +3448,45 @@ html.native-ios-mac .chat-dl-btn {
 .pc-voice-mic-select:hover:not(:disabled), .pc-voice-mic-select:focus-visible { color: #dbeafe; background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); outline: none; }
 .pc-voice-mic-select:disabled { opacity: 0.46; cursor: default; }
 .voice-inline-chips {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% + 6px);
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
-  align-self: flex-start;
-  max-width: 100%;
+  max-width: calc(100% - 16px);
   min-width: 0;
-  margin: 0 8px 4px;
+  margin: 0;
+  pointer-events: none;
+  z-index: 20;
+}
+#imcodes-voice-hud-root {
+  flex-wrap: nowrap;
+  max-width: calc(100vw - 24px);
+}
+#imcodes-voice-hud-root .voice-active-service-chip,
+#imcodes-voice-hud-root .voice-model-loading-chip {
+  flex: 0 1 auto;
+  max-width: min(180px, 42vw);
+  min-width: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  pointer-events: none;
+}
+.voice-sr-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  pointer-events: none;
 }
 .voice-active-service-chip {
   display: inline-flex;
@@ -21114,12 +21145,20 @@ button.quick-agent-delegation-preset.active {
 .subsession-task-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .subsession-task-state { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #67e8f9; font-size: 10px; }
 
-.incognito-create-option { padding: 12px 20px; border-top: 1px dashed rgba(167, 139, 250, 0.42); background: linear-gradient(135deg, rgba(76, 29, 149, 0.28), rgba(30, 27, 75, 0.42)); color: #ddd6fe; font-size: 13px; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
+.incognito-create-option { padding: 6px 16px; border-top: 1px dashed rgba(167, 139, 250, 0.42); background: linear-gradient(135deg, rgba(76, 29, 149, 0.28), rgba(30, 27, 75, 0.42)); color: #ddd6fe; font-size: 12px; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
 .incognito-create-option.is-active { background: linear-gradient(135deg, rgba(109, 40, 217, 0.44), rgba(76, 29, 149, 0.52)); border-top-color: rgba(196, 181, 253, 0.72); box-shadow: inset 0 1px 0 rgba(221, 214, 254, 0.18), 0 0 16px rgba(139, 92, 246, 0.22); }
-.incognito-toggle-btn { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 8px; border: 1px dashed rgba(167, 139, 250, 0.6); background: rgba(76, 29, 149, 0.56); color: #ede9fe; font-weight: 600; cursor: pointer; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
+.incognito-create-option-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.incognito-toggle-btn { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 6px; border: 1px dashed rgba(167, 139, 250, 0.6); background: rgba(76, 29, 149, 0.56); color: #ede9fe; font-size: 11px; line-height: 1.25; font-weight: 600; cursor: pointer; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
+.incognito-toggle-btn input[type="checkbox"] { width: 13px; height: 13px; margin: 0; accent-color: #8b5cf6; cursor: pointer; }
+.incognito-toggle-btn input[type="checkbox"]:disabled { cursor: not-allowed; }
 .incognito-toggle-btn:hover { background: rgba(91, 33, 182, 0.72); border-color: rgba(196, 181, 253, 0.85); }
 .incognito-toggle-btn.is-active { background: linear-gradient(135deg, #7c3aed, #5b21b6); border-color: #ddd6fe; color: #ffffff; box-shadow: 0 0 14px rgba(139, 92, 246, 0.5); }
-.incognito-create-option p { margin: 8px 0 0; font-size: 12px; color: #c4b5fd; opacity: 0.88; }
+.incognito-help-toggle { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border-radius: 999px; border: 1px solid rgba(167, 139, 250, 0.45); background: rgba(30, 27, 75, 0.52); color: #c4b5fd; font-size: 11px; line-height: 1; font-weight: 600; cursor: pointer; flex-shrink: 0; transition: background 0.15s, border-color 0.15s, color 0.15s; }
+.incognito-help-toggle:hover,
+.incognito-help-toggle[aria-expanded="true"] { background: rgba(91, 33, 182, 0.64); border-color: rgba(196, 181, 253, 0.8); color: #ede9fe; }
+.incognito-help-body { margin-top: 6px; }
+.incognito-create-option p { margin: 4px 0 0; font-size: 11px; line-height: 1.4; color: #c4b5fd; opacity: 0.88; }
+.incognito-create-option .incognito-help-body p:first-child { margin-top: 0; }
 .btn-primary.incognito-launch-btn { background: linear-gradient(180deg, rgba(139, 92, 246, 0.96), rgba(91, 33, 182, 0.96)); border-style: dashed; border-color: rgba(221, 214, 254, 0.72); box-shadow: 0 0 16px rgba(139, 92, 246, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.18); }
 .btn-primary.incognito-launch-btn:hover:not(:disabled) { background: linear-gradient(180deg, rgba(167, 139, 250, 0.98), rgba(109, 40, 217, 0.98)); border-color: rgba(237, 233, 254, 0.9); box-shadow: 0 0 22px rgba(139, 92, 246, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.24); }
 .incognito-session-badge { align-self: flex-start; margin: 4px 12px; padding: 4px 10px; border-radius: 999px; border: 1px dashed #8b5cf6; color: #ddd6fe; background: #2e1065; font-size: 12px; }
@@ -27817,15 +27856,45 @@ html.native-ios-mac .global-task-mode-entry-btn {
     min-width: 0;
   }
 
+  .global-task-desktop-running-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+
   .global-task-desktop-running-row {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 4px 12px;
-    font-size: 11.5px;
+    gap: 2px 6px;
+    flex: 1 1 0%;
+    min-width: 0;
+    font-size: 10.5px;
     line-height: 1.35;
     color: #94a3b8;
     overflow-wrap: anywhere;
+  }
+
+  .global-task-desktop-running-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+  }
+
+  .global-task-card .global-task-brief-detail-btn.is-compact,
+  .global-task-card .global-task-jump-btn.is-compact {
+    gap: 3px;
+    padding: 2px 5px;
+    border-radius: 5px;
+    font-size: 10.5px;
+    line-height: 1.25;
+    white-space: nowrap;
+    box-shadow: none;
   }
 }
 

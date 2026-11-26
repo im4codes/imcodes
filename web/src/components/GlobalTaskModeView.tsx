@@ -1377,6 +1377,41 @@ export function GlobalTaskModeView({
       </div>
     ) : null;
 
+    const renderCardActionButtons = (variant: 'running' | 'detail') => {
+      const compact = variant === 'running';
+      return (
+        <>
+          <button
+            type="button"
+            class={`global-task-brief-detail-btn${compact ? ' is-compact' : ''}`}
+            data-testid={compact ? `task-mode-running-brief-${task.taskId}` : `task-mode-detail-brief-${task.taskId}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              openBriefModal(task, total > 0 ? 'checklist' : 'brief');
+            }}
+          >
+            <span aria-hidden="true">◈</span>
+            {t('taskMode.view_brief_progress', 'Brief & Progress')}
+          </button>
+          <button
+            type="button"
+            class={`global-task-jump-btn${compact ? ' is-compact' : ''}`}
+            data-testid={compact ? `task-mode-running-jump-${task.taskId}` : `task-mode-jump-${task.taskId}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onJumpToSession(task.serverId, task.brainSession, {
+                taskId: task.taskId,
+                title: task.title,
+                status: task.status,
+              });
+            }}
+          >
+            {t('taskMode.enter_session', 'Open session')}
+          </button>
+        </>
+      );
+    };
+
     return (
       <article
         key={key}
@@ -1575,13 +1610,18 @@ export function GlobalTaskModeView({
 
             {!task.isTerminal && !expanded && (
               <div class="global-task-desktop-running-meta" data-testid={`task-mode-running-meta-${task.taskId}`}>
-                <div class="global-task-desktop-running-row">
-                  <span>{t('taskPair.card_executor')}: {executorDisplay}</span>
-                  <span>{t('taskPair.card_auditor')}: {auditorDisplay}</span>
-                  {task.projectName && task.projectName !== taskBrainLabel && (
-                    <span>{t('taskMode.project_label', 'Project')}: {task.projectName}</span>
-                  )}
-                  {task.updatedAt > 0 && <span>{formatUpdatedRelative(task.updatedAt, locale)}</span>}
+                <div class="global-task-desktop-running-bar">
+                  <div class="global-task-desktop-running-row">
+                    <span>{t('taskPair.card_executor')}: {executorDisplay}</span>
+                    <span>{t('taskPair.card_auditor')}: {auditorDisplay}</span>
+                    {task.projectName && task.projectName !== taskBrainLabel && (
+                      <span>{t('taskMode.project_label', 'Project')}: {task.projectName}</span>
+                    )}
+                    {task.updatedAt > 0 && <span>{formatUpdatedRelative(task.updatedAt, locale)}</span>}
+                  </div>
+                  <div class="global-task-desktop-running-actions" onClick={(e) => e.stopPropagation()}>
+                    {renderCardActionButtons('running')}
+                  </div>
                 </div>
                 {flagChipsEl}
               </div>
@@ -1601,33 +1641,7 @@ export function GlobalTaskModeView({
             </div>
             {flagChipsEl}
             <div class="global-task-detail-actions">
-              <button
-                type="button"
-                class="global-task-brief-detail-btn"
-                data-testid={`task-mode-detail-brief-${task.taskId}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  openBriefModal(task, total > 0 ? 'checklist' : 'brief');
-                }}
-              >
-                <span aria-hidden="true">◈</span>
-                {t('taskMode.view_brief_progress', 'Brief & Progress')}
-              </button>
-              <button
-                type="button"
-                class="global-task-jump-btn"
-                data-testid={`task-mode-jump-${task.taskId}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onJumpToSession(task.serverId, task.brainSession, {
-                    taskId: task.taskId,
-                    title: task.title,
-                    status: task.status,
-                  });
-                }}
-              >
-                {t('taskMode.enter_session', 'Open session')}
-              </button>
+              {renderCardActionButtons('detail')}
             </div>
           </div>
         )}

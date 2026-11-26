@@ -329,6 +329,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   projectName?: string;
   /** Runtime-bound server id for daemon-dependent managed MCP tools. */
   serverId?: string;
+  /** Authenticated account owner identity for managed Skill bindings. */
+  trustedOwnerId?: string;
   /** Exact provider identity injected into managed MCP authorization context. */
   providerId?: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
@@ -596,6 +598,11 @@ export interface ToolExecutionRequest {
 export type ToolExecutionGuardDecision = { allow: true } | { allow: false; reason: string };
 export type ToolExecutionGuard = (providerSessionId: string, request: ToolExecutionRequest) => ToolExecutionGuardDecision;
 
+export interface ProviderActiveWorkSnapshotOptions {
+  /** When true, sample external background task log/progress sources (diagnostic/health-poll paths only). */
+  sampleBackgroundProgress?: boolean;
+}
+
 export interface TransportProvider {
   /** Unique stable identifier for this provider implementation (e.g. 'openclaw', 'minimax'). */
   readonly id: string;
@@ -694,7 +701,7 @@ export interface TransportProvider {
    * while this snapshot is a small contract that runtimes may use to defer
    * clean idle/queue drain while provider-owned tool or background work is open.
    */
-  getActiveWorkSnapshot?(sessionId: string): ProviderActiveWorkSnapshot | null;
+  getActiveWorkSnapshot?(sessionId: string, options?: ProviderActiveWorkSnapshotOptions): ProviderActiveWorkSnapshot | null;
 
   /**
    * Create a new session on the provider.

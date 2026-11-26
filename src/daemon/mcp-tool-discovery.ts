@@ -20,6 +20,7 @@ import {
   RETIRED_SUPERVISION_MCP_TOOL_SET,
 } from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
+import { IMCODES_MEMORY_MCP_BACKEND_ENV } from './mcp-stdio-lifecycle.js';
 
 export type RegisteredMcpToolCatalog = ReadonlyMap<string, RegisteredTool>;
 
@@ -152,6 +153,7 @@ export function registerMcpToolDiscovery(
   // per-connection schema publication starts hidden.
   for (const [name, tool] of tools) tool.enabled = staticFullCatalog || isDefaultActiveMcpTool(name);
   let catalogGeneration = 1;
+  let publicationSeq = 0;
 
   return server.registerTool(MCP_TOOL_DISCOVERY_NAME, {
     // This is the sole model-visible copy of the lazy-routing hint. Publishing
@@ -245,6 +247,7 @@ export function registerMcpToolDiscovery(
           tool.enabled = shouldBeEnabled;
         }
       }
+      publicationSeq += 1;
       // Always re-emit for a non-empty legitimate selection. A host may have
       // missed the previous notification even though the service was already
       // active and the server-side publication state is unchanged.
@@ -254,10 +257,31 @@ export function registerMcpToolDiscovery(
       }
     }
 
+    const publishedSelectionQuery = exactGroup && publishedNames.length > 0
+      ? `${MCP_TOOL_GROUP_QUERY_PREFIX}${exactGroup.id}`
+      : (exactToolName ?? null);
+    const committedPublicationSeq = shouldPublish && !staticFullCatalog ? publicationSeq : null;
+    const attachPublishedMeta = <T extends { [key: string]: unknown }>(payload: T): T => {
+      if (!shouldPublish || staticFullCatalog || process.env[IMCODES_MEMORY_MCP_BACKEND_ENV] !== '1') {
+        return payload;
+      }
+      const existingMeta = payload._meta && typeof payload._meta === 'object' && !Array.isArray(payload._meta)
+        ? (payload._meta as Record<string, unknown>)
+        : {};
+      return {
+        ...payload,
+        _meta: {
+          ...existingMeta,
+          imcodesPublishedQuery: publishedSelectionQuery,
+          imcodesPublishedSeq: committedPublicationSeq,
+        },
+      };
+    };
+
     if (fallbackCall) {
       const fallbackName = typeof fallbackCall.name === 'string' ? fallbackCall.name.trim() : '';
       if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(fallbackName.toLowerCase())) {
-        return discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE);
+        return attachPublishedMeta(discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE));
       }
       const fallbackArguments = fallbackCall.arguments === undefined
         ? {}
@@ -274,10 +298,10 @@ export function registerMcpToolDiscovery(
         || typeof fallbackArguments !== 'object'
         || fallbackArguments === null
         || Array.isArray(fallbackArguments)) {
-        return discoveryError('fallbackCall requires one exact registered tool query with activation enabled');
+        return attachPublishedMeta(discoveryError('fallbackCall requires one exact registered tool query with activation enabled'));
       }
       logger.info({ wrapper: MCP_TOOL_DISCOVERY_NAME, target: fallbackName }, 'MCP exact fallback invocation');
-      return invokeFallbackTool(exactTool, fallbackArguments as Record<string, unknown>, extra);
+      return attachPublishedMeta(await invokeFallbackTool(exactTool, fallbackArguments as Record<string, unknown>, extra));
     }
 
     const result = {
@@ -326,6 +350,6 @@ export function registerMcpToolDiscovery(
       published: shouldPublish ? publishedNames : [],
       catalogGeneration,
     };
-    return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] };
+    return attachPublishedMeta({ structuredContent: result, content: [{ type: 'text' as const, text: JSON.stringify(result) }] });
   });
 }

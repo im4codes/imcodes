@@ -41,7 +41,7 @@ describe('StartSubSessionDialog incognito mode', () => {
     cleanup();
   });
 
-  it('disables incognito toggle when daemon lacks capability', () => {
+  it('disables incognito toggle when daemon lacks capability and collapses explanation until toggled', () => {
     const view = render(
       <StartSubSessionDialog
         ws={makeWs([]) as any}
@@ -56,13 +56,28 @@ describe('StartSubSessionDialog incognito mode', () => {
 
     const option = view.container.querySelector('.incognito-create-option') as HTMLElement | null;
     const toggle = view.container.querySelector('.incognito-create-option .incognito-toggle-btn') as HTMLElement | null;
+    const helpBtn = view.container.querySelector('.incognito-create-option .incognito-help-toggle') as HTMLButtonElement | null;
     expect(option).toBeTruthy();
     expect(toggle).toBeTruthy();
+    expect(helpBtn).toBeTruthy();
+    expect(helpBtn!.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
+    expect(view.container.querySelector('.incognito-create-option [role="status"]')).toBeNull();
+
     const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
     expect(checkbox.disabled).toBe(true);
+
+    fireEvent.click(helpBtn!);
+    expect(helpBtn!.getAttribute('aria-expanded')).toBe('true');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_available');
+    expect(view.container.querySelector('.incognito-create-option [role="status"]')?.textContent).toBe('session.incognito_unsupported');
+
+    fireEvent.click(helpBtn!);
+    expect(helpBtn!.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
   });
 
-  it('toggles active styling, disables non-SDK runtimes, and passes incognito:true on launch', async () => {
+  it('toggles active styling, disables non-SDK runtimes, keeps details collapsed unless opened, and passes incognito:true on launch', async () => {
     const onStart = vi.fn();
     const view = render(
       <StartSubSessionDialog
@@ -78,9 +93,12 @@ describe('StartSubSessionDialog incognito mode', () => {
 
     const option = view.container.querySelector('.incognito-create-option')!;
     const toggle = view.container.querySelector('.incognito-create-option .incognito-toggle-btn')!;
+    const helpBtn = view.container.querySelector('.incognito-create-option .incognito-help-toggle') as HTMLButtonElement;
     expect(toggle).toBeTruthy();
     expect(option.classList.contains('is-active')).toBe(false);
     expect(toggle.classList.contains('is-active')).toBe(false);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option p')).toBeNull();
     expect(view.container.querySelector('.dialog-footer .btn-primary.incognito-launch-btn')).toBeNull();
 
     const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
@@ -88,6 +106,15 @@ describe('StartSubSessionDialog incognito mode', () => {
     expect(checkbox.checked).toBe(true);
     expect(option.classList.contains('is-active')).toBe(true);
     expect(toggle.classList.contains('is-active')).toBe(true);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
+
+    fireEvent.click(helpBtn);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')?.textContent).toContain('session.incognito_hint');
+    fireEvent.click(helpBtn);
+    expect(helpBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.incognito-create-option .incognito-help-body')).toBeNull();
 
     const launchBtn = view.container.querySelector('.dialog-footer .btn-primary') as HTMLButtonElement;
     expect(launchBtn.classList.contains('incognito-launch-btn')).toBe(true);

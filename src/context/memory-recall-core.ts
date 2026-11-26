@@ -30,7 +30,12 @@ import type {
   ProcessedContextProjectionStatus,
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
-import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
+import {
+  observationContentText,
+  observationSummaryText,
+  type ObservationClass,
+  type ObservationState,
+} from '../../shared/memory-observation.js';
 import { projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import { cosineSimilarity } from '../../shared/embedding-config.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
@@ -40,14 +45,18 @@ import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
 // memory-config-resolver (which would drag in session-store et al.).
 import type { MemoryConfigResolver } from './memory-config-resolver.js';
 import {
+  countContextObservationsByNamespace,
+  countProcessedProjectionsForSearch,
   listContextEvents,
   listDirtyTargets,
   listContextNamespaces,
   listContextObservations,
+  listProcessedProjectionsForSearch,
   queryProcessedProjections,
   LEGACY_DAEMON_LOCAL_USER_ID,
   type ContextNamespaceRow,
   type ContextObservationRow,
+  type ProcessedProjectionNamespaceFilter,
 } from '../store/context-store.js';
 import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
@@ -108,6 +117,8 @@ export interface MemorySearchResultItem {
   projectionClass?: ProcessedContextClass;
   /** Session whose timeline produced this projection, when provenance is known. */
   sourceSessionName?: string;
+  /** Daemon that owns the projection's raw sources, when remotely replicated. */
+  originServerId?: string;
   summary: string;
   content?: string;
   createdAt: number;
@@ -138,61 +149,237 @@ export interface AuthorizedMemorySearchQuery extends Omit<MemorySearchQuery, 'na
 
 // ── Authorized management read (worker-safe R5 path) ─────────────────────────
 
-export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery): MemorySearchResult {
-  if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
-  const allItems: MemorySearchResultItem[] = [];
-  const seenProjectionIds = new Set<string>();
-  const seenObservationIds = new Set<string>();
-  const requestedWindow = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
-
+function buildAuthorizedProcessedNamespaceFilters(query: AuthorizedMemorySearchQuery): ProcessedProjectionNamespaceFilter[] {
+  const out: ProcessedProjectionNamespaceFilter[] = [];
+  const seen = new Set<string>();
   for (const namespace of query.authorizedNamespaces) {
-    const projections = queryProcessedProjections({
+    if (query.scope && namespace.scope !== query.scope) continue;
+    const key = [
+      namespace.scope,
+      namespace.enterpriseId ?? '',
+      namespace.workspaceId ?? '',
+      namespace.userId ?? '',
+      namespace.projectId ?? '',
+      query.includeLegacyPersonalOwner ? '1' : '0',
+    ].join('\u0000');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
       scope: namespace.scope,
       enterpriseId: namespace.enterpriseId,
       workspaceId: namespace.workspaceId,
       userId: namespace.userId,
       projectId: namespace.projectId,
       includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
-      projectionClass: query.projectionClass,
-      query: query.query,
-      includeArchived: query.includeArchived,
-      limit: requestedWindow,
     });
-    for (const projection of projections) {
-      if (seenProjectionIds.has(projection.id)) continue;
-      seenProjectionIds.add(projection.id);
-      const item = projectionToItem(projection);
-      if (matchesQuery(item, query)) {
-        allItems.push(withMatchKind(item, query));
-      }
+  }
+  return out;
+}
+
+function buildSearchProcessedNamespaceFilters(query: MemorySearchQuery): ProcessedProjectionNamespaceFilter[] {
+  const namespace = query.namespace;
+  if (!namespace) {
+    return [{
+      scope: query.scope,
+      userId: query.userId,
+      projectId: query.repo,
+      includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
+    }];
+  }
+  const out: ProcessedProjectionNamespaceFilter[] = [{
+    scope: namespace.scope,
+    enterpriseId: namespace.enterpriseId,
+    workspaceId: namespace.workspaceId,
+    userId: namespace.userId,
+    projectId: namespace.projectId,
+    includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
+    exactEmptyFields: true,
+  }];
+  if (
+    namespace.scope !== 'user_private'
+    && namespace.userId?.trim()
+    && namespace.projectId?.trim()
+  ) {
+    out.push({
+      scope: 'user_private',
+      userId: namespace.userId,
+      projectId: namespace.projectId,
+      includeLegacyPersonalOwner: false,
+      exactEmptyFields: true,
+    });
+  }
+  return out;
+}
+
+function mappedNamespaceRowMatches(row: ContextNamespaceRow, query: MemorySearchQuery): boolean {
+  return matchesNamespace({
+    scope: row.scope as ContextNamespace['scope'],
+    projectId: row.projectId ?? '',
+    enterpriseId: row.orgId,
+    workspaceId: row.workspaceId,
+    userId: row.userId,
+  }, query);
+}
+
+function executePaginatedMemorySearch(input: {
+  query: MemorySearchQuery;
+  processedNamespaceFilters: readonly ProcessedProjectionNamespaceFilter[];
+  processedRowUserId?: string;
+  processedRowIncludeLegacyPersonalOwner?: boolean;
+  observationNamespaces: Map<string, ContextNamespaceRow>;
+  observationScope?: ContextNamespace['scope'];
+}): MemorySearchResult {
+  const {
+    query,
+    processedNamespaceFilters,
+    processedRowUserId,
+    processedRowIncludeLegacyPersonalOwner,
+    observationNamespaces,
+    observationScope,
+  } = input;
+  if (query.query && !query.query.trim()) {
+    return {
+      items: [],
+      stats: {
+        ...computeStats([]),
+        matchedRecords: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: listDirtyTargets().length,
+        pendingJobCount: 0,
+      },
+    };
+  }
+  const offset = Math.max(0, Math.floor(query.offset ?? 0));
+  const limit = Math.max(0, Math.floor(query.limit ?? 50));
+  const after = query.after ? query.after : undefined;
+  const before = query.before ? query.before : undefined;
+  const matchedProjectIds = new Set<string>();
+  const pageItems: MemorySearchResultItem[] = [];
+
+  // Bucket 0: Unprojected observations (typeRank=0, updatedAt DESC, id ASC).
+  let obsTotal = 0;
+  if (query.includeObservations !== false && !query.projectionClass && observationNamespaces.size > 0) {
+    const states: readonly ObservationState[] = query.observationStates ?? ['candidate', 'active', 'promoted'];
+    const obsFilter = {
+      namespaceIds: [...observationNamespaces.keys()],
+      scope: observationScope,
+      class: query.observationClass,
+      state: states,
+      withoutProjection: true,
+      after,
+      before,
+      query: query.query,
+    };
+    const obsCounts = countContextObservationsByNamespace(obsFilter);
+    obsTotal = obsCounts.total;
+    for (const [nsId, cnt] of obsCounts.countsByNamespace) {
+      if (cnt <= 0) continue;
+      matchedProjectIds.add(observationNamespaces.get(nsId)?.projectId ?? '');
     }
-    if (!query.projectionClass) {
-      for (const item of collectObservationItems({ ...query, namespace })) {
-        if (seenObservationIds.has(item.id)) continue;
-        seenObservationIds.add(item.id);
-        if (matchesQuery(item, { ...query, namespace })) {
-          allItems.push(withMatchKind(item, query));
-        }
+    const obsOffset = Math.min(offset, obsTotal);
+    const obsLimit = Math.max(0, Math.min(limit, obsTotal - obsOffset));
+    if (obsLimit > 0) {
+      const rows = listContextObservations({ ...obsFilter, limit: obsLimit, offset: obsOffset });
+      for (const row of rows) {
+        if (row.projectionId) continue;
+        const namespaceRow = observationNamespaces.get(row.namespaceId);
+        if (!namespaceRow) continue;
+        pageItems.push(withMatchKind(observationToItem(row, namespaceRow), query));
       }
     }
   }
 
-  allItems.sort(compareSearchItems);
-  const stats = computeStats(allItems);
-  const offset = query.offset ?? 0;
-  const limit = query.limit ?? 50;
-  const paginated = allItems.slice(offset, offset + limit);
+  // Buckets 1 & 2: Processed projections (durable_memory_candidate before recent/master, updatedAt DESC).
+  // `matchesQuery` always rejects processed projections whenever `query.observationClass` is set.
+  let procStats = {
+    total: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectIds: new Set<string>(),
+  };
+  if (!query.observationClass && processedNamespaceFilters.length > 0) {
+    const procFilter = {
+      namespaceFilters: processedNamespaceFilters,
+      rowUserId: processedRowUserId,
+      rowIncludeLegacyPersonalOwner: processedRowIncludeLegacyPersonalOwner,
+      projectionClass: query.projectionClass,
+      includeArchived: query.includeArchived,
+      after,
+      before,
+      query: query.query,
+    };
+    procStats = countProcessedProjectionsForSearch(procFilter);
+    for (const projId of procStats.projectIds) {
+      matchedProjectIds.add(projId);
+    }
+    const procOffset = Math.max(0, offset - obsTotal);
+    const remainingSlots = Math.max(0, limit - pageItems.length);
+    const procLimit = Math.max(0, Math.min(remainingSlots, procStats.total - procOffset));
+    if (procLimit > 0) {
+      const projections = listProcessedProjectionsForSearch({
+        ...procFilter,
+        limit: procLimit,
+        offset: procOffset,
+      });
+      for (const projection of projections) {
+        pageItems.push(withMatchKind(projectionToItem(projection), query));
+      }
+    }
+  }
 
+  // Bucket 3: Raw staged events (searchLocalMemory with includeRaw only).
+  let rawTotal = 0;
+  if (query.includeRaw) {
+    const rawItems = collectRawEvents(query)
+      .filter((item) => matchesQuery(item, query))
+      .sort(compareSearchItems);
+    rawTotal = rawItems.length;
+    for (const item of rawItems) {
+      matchedProjectIds.add(item.projectId);
+    }
+    const rawOffset = Math.max(0, offset - (obsTotal + procStats.total));
+    const remainingSlots = Math.max(0, limit - pageItems.length);
+    if (remainingSlots > 0 && rawOffset < rawTotal) {
+      pageItems.push(...rawItems.slice(rawOffset, rawOffset + remainingSlots));
+    }
+  }
+
+  const totalMatched = obsTotal + procStats.total + rawTotal;
   return {
-    items: paginated,
+    items: pageItems,
     stats: {
-      ...stats,
-      matchedRecords: allItems.length,
-      stagedEventCount: 0,
+      totalRecords: totalMatched,
+      matchedRecords: totalMatched,
+      recentSummaryCount: procStats.recentSummaryCount,
+      durableCandidateCount: procStats.durableCandidateCount,
+      projectCount: matchedProjectIds.size,
+      stagedEventCount: rawTotal,
       dirtyTargetCount: listDirtyTargets().length,
       pendingJobCount: 0,
     },
   };
+}
+
+export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery): MemorySearchResult {
+  if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
+  const observationNamespaces = new Map<string, ContextNamespaceRow>();
+  if (!query.projectionClass && query.includeObservations !== false) {
+    const allNamespaces = listContextNamespaces();
+    for (const namespace of query.authorizedNamespaces) {
+      const nsQuery = { ...query, namespace };
+      for (const [id, row] of observationNamespacesForQuery(nsQuery, allNamespaces)) {
+        if (!mappedNamespaceRowMatches(row, nsQuery)) continue;
+        observationNamespaces.set(id, row);
+      }
+    }
+  }
+  return executePaginatedMemorySearch({
+    query,
+    processedNamespaceFilters: buildAuthorizedProcessedNamespaceFilters(query),
+    processedRowUserId: query.userId,
+    processedRowIncludeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
+    observationNamespaces,
+  });
 }
 
 // ── Trivial-query filter ───────────────────────────────────────────────────────
@@ -344,48 +531,57 @@ export async function rerankCandidatesBySemantic(
   return dedupedByContent.slice(0, limit).map((s) => s.item);
 }
 
-// ── Substring search implementation ────────────────────────────────────────────
+// ── Substring & candidate search implementation ──────────────────────────────
 
-export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult {
+/** Fast bounded candidate collection for semantic rerank (no full COUNT(*) scan). */
+export function searchLocalMemoryCandidates(query: MemorySearchQuery): MemorySearchResult {
   if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
+  if (query.query && !query.query.trim()) {
+    return {
+      items: [],
+      stats: {
+        ...computeStats([]),
+        matchedRecords: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: listDirtyTargets().length,
+        pendingJobCount: 0,
+      },
+    };
+  }
+  const offset = Math.max(0, Math.floor(query.offset ?? 0));
+  const limit = Math.max(0, Math.floor(query.limit ?? 50));
+  const windowLimit = Math.max(offset + limit, limit, 50);
+  const windowQuery: MemorySearchQuery = { ...query, offset: 0, limit: windowLimit };
   const allItems: MemorySearchResultItem[] = [];
 
-  // Collect processed projections from local SQLite
-  const processedByNs = collectProcessedProjections(query);
+  const processedByNs = collectProcessedProjections(windowQuery);
   for (const projection of processedByNs) {
     const item = projectionToItem(projection);
-    if (matchesQuery(item, query)) {
-      allItems.push(withMatchKind(item, query));
+    if (matchesQuery(item, windowQuery)) {
+      allItems.push(withMatchKind(item, windowQuery));
     }
   }
 
-  if (query.includeObservations !== false && !query.projectionClass) {
-    const observationItems = collectObservationItems(query);
+  if (windowQuery.includeObservations !== false && !windowQuery.projectionClass) {
+    const observationItems = collectObservationItems(windowQuery);
     for (const item of observationItems) {
-      if (matchesQuery(item, query)) {
-        allItems.push(withMatchKind(item, query));
+      if (matchesQuery(item, windowQuery)) {
+        allItems.push(withMatchKind(item, windowQuery));
       }
     }
   }
 
-  // Collect raw events if requested
-  if (query.includeRaw) {
-    const rawItems = collectRawEvents(query);
+  if (windowQuery.includeRaw) {
+    const rawItems = collectRawEvents(windowQuery);
     for (const item of rawItems) {
-      if (matchesQuery(item, query)) {
+      if (matchesQuery(item, windowQuery)) {
         allItems.push(item);
       }
     }
   }
 
   allItems.sort(compareSearchItems);
-
-  // Compute stats before pagination
   const stats = computeStats(allItems);
-
-  // Apply pagination
-  const offset = query.offset ?? 0;
-  const limit = query.limit ?? 50;
   const paginated = allItems.slice(offset, offset + limit);
 
   return {
@@ -393,16 +589,33 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
     stats: {
       ...stats,
       matchedRecords: allItems.length,
-      stagedEventCount: query.includeRaw ? allItems.filter((i) => i.type === 'raw').length : 0,
+      stagedEventCount: windowQuery.includeRaw ? allItems.filter((i) => i.type === 'raw').length : 0,
       dirtyTargetCount: listDirtyTargets().length,
       pendingJobCount: 0,
     },
   };
 }
 
+export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult {
+  if (!isMemoryDaemonEnabled()) return { items: [], stats: { ...computeStats([]), matchedRecords: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 } };
+  const observationNamespaces = new Map<string, ContextNamespaceRow>();
+  if (!query.projectionClass && query.includeObservations !== false) {
+    for (const [id, row] of observationNamespacesForQuery(query)) {
+      if (!mappedNamespaceRowMatches(row, query)) continue;
+      observationNamespaces.set(id, row);
+    }
+  }
+  return executePaginatedMemorySearch({
+    query,
+    processedNamespaceFilters: buildSearchProcessedNamespaceFilters(query),
+    observationNamespaces,
+  });
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 export function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
+  const limit = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
   const baseFilters = {
     scope: query.namespace?.scope ?? query.scope,
     enterpriseId: query.namespace?.enterpriseId,
@@ -413,6 +626,7 @@ export function collectProcessedProjections(query: MemorySearchQuery): Processed
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
+    limit,
   };
   const projections = queryProcessedProjections(baseFilters);
   const namespace = query.namespace;
@@ -470,8 +684,11 @@ export function observationNamespace(row: ContextNamespaceRow | undefined, fallb
   };
 }
 
-export function observationNamespacesForQuery(query: MemorySearchQuery): Map<string, ContextNamespaceRow> {
-  const rows = listContextNamespaces();
+export function observationNamespacesForQuery(
+  query: MemorySearchQuery,
+  preloadedRows?: readonly ContextNamespaceRow[],
+): Map<string, ContextNamespaceRow> {
+  const rows = preloadedRows ?? listContextNamespaces();
   const out = new Map<string, ContextNamespaceRow>();
   for (const row of rows) {
     const namespace = observationNamespace(row, row.scope);
@@ -502,9 +719,18 @@ export function collectObservationItems(query: MemorySearchQuery): MemorySearchR
   const namespaceRows = observationNamespacesForQuery(query);
   if (namespaceRows.size === 0) return [];
   const states: readonly ObservationState[] = query.observationStates ?? ['candidate', 'active', 'promoted'];
+  const limit = query.limit === undefined ? undefined : Math.max(0, Math.floor(query.limit));
+  const offset = query.offset === undefined ? undefined : Math.max(0, Math.floor(query.offset));
   const rows = listContextObservations({
+    namespaceIds: [...namespaceRows.keys()],
     class: query.observationClass,
     state: states,
+    withoutProjection: true,
+    after: query.after ? query.after : undefined,
+    before: query.before ? query.before : undefined,
+    query: query.query,
+    limit,
+    offset,
   });
   const items: MemorySearchResultItem[] = [];
   for (const row of rows) {
@@ -547,18 +773,11 @@ export function projectionToItem(projection: ProcessedContextProjection): Memory
 }
 
 export function observationText(observation: ContextObservationRow): string {
-  const rawText = observation.content.text;
-  if (typeof rawText === 'string' && rawText.trim()) return rawText.trim();
-  const title = observation.content.title;
-  if (typeof title === 'string' && title.trim()) return title.trim();
-  return JSON.stringify(observation.content);
+  return observationContentText(observation.content);
 }
 
 export function observationSummary(observation: ContextObservationRow): string {
-  const text = observationText(observation).replace(/\s+/g, ' ').trim();
-  const title = typeof observation.content.title === 'string' ? observation.content.title.trim() : '';
-  const base = title && !text.startsWith(title) ? `${title}: ${text}` : text;
-  return base.length > 500 ? `${base.slice(0, 497)}...` : base;
+  return observationSummaryText(observation.content);
 }
 
 export function observationToItem(observation: ContextObservationRow, namespaceRow: ContextNamespaceRow): MemorySearchResultItem {

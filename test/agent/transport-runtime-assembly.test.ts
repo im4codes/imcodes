@@ -784,6 +784,38 @@ describe('buildProviderContextPayload', () => {
     expect(payload.diagnostics).toContain('memory:start:local-auxiliary');
   });
 
+  it('preserves managedSkillsOnly startup metadata when memory authority is none, while suppressing regular memory', () => {
+    const skillsOnlyPayload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Use managed skill',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      startupMemory: makeRecall({
+        reason: 'startup',
+        managedSkillsOnly: true,
+        injectedText: '<!-- SKILL_INDEX -->\nskill: managed/session-bound-skill\ncapability-id: skill-1',
+        items: [{ id: 'skill:managed:1', projectId: 'repo-1', summary: 'managed/session-bound-skill' }],
+      }),
+    });
+    expect(skillsOnlyPayload.authority.authoritySource).toBe('none');
+    expect(skillsOnlyPayload.startupMemory).toEqual(expect.objectContaining({
+      managedSkillsOnly: true,
+      injectedText: expect.stringContaining('capability-id: skill-1'),
+    }));
+    expect(skillsOnlyPayload.messagePreamble).toContain('capability-id: skill-1');
+    expect(skillsOnlyPayload.diagnostics).toContain('memory:start');
+
+    const regularDisabledPayload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory',
+      }),
+    });
+    expect(regularDisabledPayload.authority.authoritySource).toBe('none');
+    expect(regularDisabledPayload.startupMemory).toBeUndefined();
+    expect(regularDisabledPayload.diagnostics).toContain('memory:start:suppressed-authority');
+  });
+
   it('injects remote startup memory when remote processed context is authoritative', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',

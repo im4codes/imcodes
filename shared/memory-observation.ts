@@ -122,6 +122,34 @@ export function normalizeObservationText(text: string): string {
   return text.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+export function observationContentText(content: Record<string, unknown>): string {
+  const rawText = content.text;
+  if (typeof rawText === 'string' && rawText.trim()) return rawText.trim();
+  const title = content.title;
+  if (typeof title === 'string' && title.trim()) return title.trim();
+  return JSON.stringify(content);
+}
+
+export function observationSummaryText(content: Record<string, unknown>): string {
+  const text = observationContentText(content).replace(/\s+/g, ' ').trim();
+  const title = typeof content.title === 'string' ? content.title.trim() : '';
+  const base = title && !text.startsWith(title) ? `${title}: ${text}` : text;
+  return base.length > 500 ? `${base.slice(0, 497)}...` : base;
+}
+
+export function observationSearchHaystack(input: {
+  observationClass: string;
+  content: Record<string, unknown>;
+  sourceEventIds: readonly string[];
+}): string {
+  return [
+    observationSummaryText(input.content),
+    JSON.stringify(input.content),
+    input.observationClass,
+    ...input.sourceEventIds,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0).join(' ').toLowerCase();
+}
+
 export function normalizeObservationSourceIds(sourceEventIds: readonly string[] | undefined): string[] {
   const out: string[] = [];
   const seen = new Set<string>();

@@ -9,6 +9,9 @@ import { ensureContextNamespace, writeContextObservation, writeProcessedProjecti
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 import { setMemoryInjectionEnabled } from '../../src/context/memory-injection-toggle.js';
+import { getContextStoreClient } from '../../src/store/context-store-worker-client.js';
+import { setMemoryDaemonEnabled } from '../../src/store/memory-daemon-switch.js';
+import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
 
@@ -915,5 +918,85 @@ describe('resolveTransportContextBootstrap', () => {
       onNamespaceResolved: () => { throw new Error('observer bug'); },
     });
     expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
+  });
+
+  it('short-circuits context-store RPCs when daemon memory is disabled while preserving Managed Skills and recovers when re-enabled', async () => {
+    const switchPath = join(tempDir, 'memory-daemon-switch.json');
+    vi.stubEnv('IMCODES_MEMORY_DAEMON_SWITCH_PATH', switchPath);
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), '1');
+
+    tempProjectDir = await mkdtemp(join(tmpdir(), 'runtime-skill-disable-'));
+    const skillDir = join(tempProjectDir, '.imc', 'skills', 'testing');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(tempProjectDir, '.imc', 'skills', SKILL_REGISTRY_FILE_NAME), JSON.stringify({
+      schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
+      generatedAt: 1000,
+      entries: [{
+        schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
+        key: 'testing/managed-check',
+        layer: 'project_escape_hatch',
+        metadata: {
+          schemaVersion: 1,
+          name: 'managed-check',
+          category: 'testing',
+          description: 'Verify managed skill still injects when daemon memory is off.',
+        },
+        path: join(skillDir, 'managed-check.md'),
+        displayPath: '.imc/skills/testing/managed-check.md',
+        uri: makeSkillUri('project_escape_hatch', 'testing/managed-check'),
+        fingerprint: 'managed-check-fp',
+        updatedAt: 1000,
+      }],
+    }, null, 2));
+
+    const namespace = {
+      scope: 'personal' as const,
+      projectId: 'github.com/acme/repo',
+    };
+    ensureContextNamespace(namespace);
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-disable-1'],
+      summary: 'Stored startup memory that must stay skipped when memory daemon is off',
+      content: {},
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const runSpy = vi.spyOn(getContextStoreClient(), 'run');
+    try {
+      setMemoryDaemonEnabled(false);
+
+      const disabledBootstrap = await resolveTransportContextBootstrap({
+        projectDir: tempProjectDir,
+        transportConfig: { sharedContextNamespace: namespace },
+      });
+      expect(runSpy).not.toHaveBeenCalled();
+      expect(disabledBootstrap.localProcessedFreshness).toBeUndefined();
+      expect(disabledBootstrap.diagnostics).toContain('daemon-memory:disabled');
+      expect(disabledBootstrap.startupMemory?.injectedText).toContain('testing/managed-check');
+      expect(disabledBootstrap.startupMemory?.injectedText).not.toContain('Stored startup memory');
+
+      const directStartup = await buildTransportStartupMemory(namespace, {
+        projectDir: tempProjectDir,
+        skillsFeatureEnabled: true,
+      });
+      expect(runSpy).not.toHaveBeenCalled();
+      expect(directStartup?.injectedText).toContain('testing/managed-check');
+      expect(directStartup?.injectedText).not.toContain('Stored startup memory');
+
+      // Re-enabling immediately restores full startup memory & context-store RPCs (no stale disable cache).
+      setMemoryDaemonEnabled(true);
+      const reenabledBootstrap = await resolveTransportContextBootstrap({
+        projectDir: tempProjectDir,
+        transportConfig: { sharedContextNamespace: namespace },
+      });
+      expect(runSpy).toHaveBeenCalled();
+      expect(reenabledBootstrap.localProcessedFreshness).toBe('fresh');
+      expect(reenabledBootstrap.startupMemory?.injectedText).toContain('Stored startup memory that must stay skipped when memory daemon is off');
+    } finally {
+      runSpy.mockRestore();
+    }
   });
 });

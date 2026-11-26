@@ -2168,6 +2168,21 @@ describe('styles.css regression contracts', () => {
       expect(rule, String(selector)).toMatch(/text-overflow:\s*ellipsis/);
       expect(rule, String(selector)).toMatch(/white-space:\s*nowrap/);
     }
+    const inlineChipsRule = cssWithoutComments.match(/\.voice-inline-chips\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(inlineChipsRule).toMatch(/position:\s*absolute/);
+    expect(inlineChipsRule).toMatch(/pointer-events:\s*none/);
+    expect(inlineChipsRule).toMatch(/flex-wrap:\s*nowrap/);
+    const hudRootRule = cssWithoutComments.match(/#imcodes-voice-hud-root\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(hudRootRule).toMatch(/flex-wrap:\s*nowrap/);
+    const hudChipRule = cssWithoutComments.match(/#imcodes-voice-hud-root\s+\.voice-active-service-chip[^{]*\{[^}]*\}/)?.[0] ?? '';
+    expect(hudChipRule).toMatch(/pointer-events:\s*none/);
+    expect(hudChipRule).toMatch(/max-width:/);
+    const srStatusRule = cssWithoutComments.match(/\.voice-sr-status\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(srStatusRule).toMatch(/position:\s*absolute/);
+    expect(srStatusRule).toMatch(/width:\s*1px/);
+    expect(srStatusRule).toMatch(/height:\s*1px/);
+    expect(srStatusRule).toMatch(/overflow:\s*hidden/);
+    expect(srStatusRule).toMatch(/pointer-events:\s*none/);
     const localesDir = resolve(__dirname, '../src/i18n/locales');
     const enVoice = JSON.parse(readFileSync(join(localesDir, 'en.json'), 'utf8')).voice as Record<string, string>;
     expect(enVoice.engine_web).toBeTruthy();
@@ -2293,5 +2308,15 @@ describe('styles.css regression contracts', () => {
     expect(collapseRule).toMatch(/touch-action:\s*manipulation/);
     const addBtnRule = extractDirectStyleRule(topLevelCss, /(?:^|\n)\.session-tree-add-btn\s*/) ?? '';
     expect(addBtnRule).toMatch(/touch-action:\s*manipulation/);
+  });
+
+  it('keeps incognito create option compact and preserves active and launch styles', () => {
+    expect(css).toMatch(/\.incognito-create-option\s*\{[^}]*padding:\s*6px\s+16px;/s);
+    expect(css).toMatch(/\.incognito-create-option-row\s*\{[^}]*display:\s*flex;\s*align-items:\s*center;/s);
+    expect(css).toMatch(/\.incognito-toggle-btn\s*\{[^}]*padding:\s*3px\s+8px;[^}]*font-size:\s*11px;/s);
+    expect(css).toMatch(/\.incognito-toggle-btn\.is-active\s*\{/);
+    expect(css).toMatch(/\.incognito-help-toggle\s*\{/);
+    expect(css).toMatch(/\.incognito-help-body\s*\{/);
+    expect(css).toMatch(/\.btn-primary\.incognito-launch-btn\s*\{/);
   });
 });

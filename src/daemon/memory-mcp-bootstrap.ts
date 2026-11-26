@@ -49,20 +49,30 @@ const TOOL_CALL_DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const TOOL_CALL_TIMEOUT_HEADROOM_MS = 60_000;
 const TOOL_CALL_MAX_DECLARED_TIMEOUT_MS = 60 * 60_000;
 const BACKEND_STABLE_UPTIME_MS = 30_000;
+const BACKEND_IDLE_TIMEOUT_MS = 5 * 60_000;
 const BACKEND_CALLER_ENV_EXIT_CODE = 2;
 const BACKEND_FATAL_ERROR_CODE = -32004;
 const MAX_QUEUED_REQUESTS = 64;
 const RESTART_DELAYS_MS = [250, 1_000, 3_000, 5_000] as const;
 
+interface DiscoveryCallMeta {
+  query: string;
+  hadFallback: boolean;
+  activatesSelection: boolean;
+  seq?: number;
+}
+
 interface QueuedMessage {
   message: JsonRpcMessage;
   timer: ReturnType<typeof setTimeout> | null;
+  discovery?: DiscoveryCallMeta;
 }
 
 interface InFlightRequest {
   id: JsonRpcId;
   generation: number;
   timer: ReturnType<typeof setTimeout>;
+  discovery?: DiscoveryCallMeta;
 }
 
 function testOnlyDuration(name: string, fallback: number): number {
@@ -140,11 +150,16 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
   let startupTimer: ReturnType<typeof setTimeout> | null = null;
   let stableBackendTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let backendFatalError: string | null = null;
   let shuttingDown = false;
   let clientInitialized = false;
+  let lastPublishedDiscoveryQuery: string | null = null;
+  let lastAppliedPublishedSeq = 0;
+  let generationDiscoverySeq = 0;
   const queued: QueuedMessage[] = [];
   const inFlight = new Map<string, InFlightRequest>();
+  const idleTerminatingChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   const inFlightRequestTimeoutMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS',
     IN_FLIGHT_REQUEST_TIMEOUT_MS,
@@ -160,6 +175,10 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const stableBackendUptimeMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_STABLE_UPTIME_MS',
     BACKEND_STABLE_UPTIME_MS,
+  );
+  const backendIdleTimeoutMs = testOnlyDuration(
+    'IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS',
+    BACKEND_IDLE_TIMEOUT_MS,
   );
   const owner: SessionResourceOwner | null = (() => {
     const sessionName = process.env.IMCODES_SESSION?.trim()
@@ -212,6 +231,45 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     }
   };
 
+  const clearIdleTimer = () => {
+    if (!idleTimer) return;
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  };
+
+  const terminateBackend = (child: ChildProcessWithoutNullStreams) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    const force = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }, 2_000);
+    force.unref?.();
+  };
+
+  const armIdleTimerIfIdle = () => {
+    clearIdleTimer();
+    if (shuttingDown || !backend || !backendReady || inFlight.size > 0 || queued.length > 0) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (shuttingDown || !backend || !backendReady || inFlight.size > 0 || queued.length > 0) return;
+      const child = backend;
+      idleTerminatingChildren.add(child);
+      backend = null;
+      backendReady = false;
+      restartAttempt = 0;
+      if (startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = null;
+      }
+      if (stableBackendTimer) {
+        clearTimeout(stableBackendTimer);
+        stableBackendTimer = null;
+      }
+      terminateBackend(child);
+    }, backendIdleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
   const clearInFlight = (key: string): InFlightRequest | undefined => {
     const request = inFlight.get(key);
     if (!request) return undefined;
@@ -220,12 +278,33 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     return request;
   };
 
+  const extractDiscoveryCallMeta = (message: JsonRpcMessage): DiscoveryCallMeta | undefined => {
+    if (message.method !== 'tools/call') return undefined;
+    const params = message.params;
+    const name = params && typeof params === 'object' && typeof (params as { name?: unknown }).name === 'string'
+      ? (params as { name: string }).name.trim().toLowerCase()
+      : '';
+    if (name !== 'mcp_tool_search' || !params || typeof params !== 'object') return undefined;
+    const rawArgs = (params as { arguments?: unknown }).arguments;
+    if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) return undefined;
+    const typedArgs = rawArgs as { query?: unknown; activate?: unknown; fallbackCall?: unknown };
+    const query = typeof typedArgs.query === 'string' ? typedArgs.query.trim() : '';
+    if (!query || typedArgs.activate === false) return undefined;
+    return {
+      query,
+      hadFallback: Boolean(typedArgs.fallbackCall && typeof typedArgs.fallbackCall === 'object'),
+      activatesSelection: true,
+    };
+  };
+
   const trackInFlight = (
     id: JsonRpcId,
     message: JsonRpcMessage,
     child: ChildProcessWithoutNullStreams,
     currentGeneration: number,
+    discovery?: DiscoveryCallMeta,
   ) => {
+    clearIdleTimer();
     const key = idKey(id);
     clearInFlight(key);
     const declaredToolTimeoutMs = requestedToolTimeoutMs(message);
@@ -241,9 +320,18 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_request_timeout'));
       notifyWarning('backend request timed out; restarting it without replaying the request');
       if (backend === child) terminateBackend(child);
+      armIdleTimerIfIdle();
     }, timeoutMs);
     timer.unref?.();
-    inFlight.set(key, { id, generation: currentGeneration, timer });
+    const trackedDiscovery = discovery
+      ? { ...discovery, seq: ++generationDiscoverySeq }
+      : undefined;
+    inFlight.set(key, {
+      id,
+      generation: currentGeneration,
+      timer,
+      ...(trackedDiscovery ? { discovery: trackedDiscovery } : {}),
+    });
   };
 
   const flushQueued = () => {
@@ -254,12 +342,13 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       if (item.timer) clearTimeout(item.timer);
       const id = requestId(item.message);
       const child = backend;
-      if (id !== undefined && child) trackInFlight(id, item.message, child, generation);
+      if (id !== undefined && child) trackInFlight(id, item.message, child, generation, item.discovery);
       sendBackend(item.message);
     }
+    armIdleTimerIfIdle();
   };
 
-  const enqueue = (message: JsonRpcMessage) => {
+  const enqueue = (message: JsonRpcMessage, discovery?: DiscoveryCallMeta) => {
     const id = requestId(message);
     if (backendFatalError) {
       if (id !== undefined) writeMessage(errorResponse(id, BACKEND_FATAL_ERROR_CODE, backendFatalError));
@@ -269,16 +358,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       if (id !== undefined) writeMessage(errorResponse(id, -32001, 'memory_mcp_backend_queue_full'));
       return;
     }
-    const item: QueuedMessage = { message, timer: null };
+    clearIdleTimer();
+    const item: QueuedMessage = { message, timer: null, ...(discovery ? { discovery } : {}) };
     if (id !== undefined) {
       item.timer = setTimeout(() => {
         const index = queued.indexOf(item);
         if (index >= 0) queued.splice(index, 1);
         writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_unavailable'));
+        armIdleTimerIfIdle();
       }, QUEUED_REQUEST_TIMEOUT_MS);
       item.timer.unref?.();
     }
     queued.push(item);
+  };
+
+  const ensureBackendStarted = () => {
+    if (shuttingDown || backend || backendFatalError || restartTimer) return;
+    startBackend();
   };
 
   const scheduleRestart = () => {
@@ -292,18 +388,11 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     restartTimer.unref?.();
   };
 
-  const terminateBackend = (child: ChildProcessWithoutNullStreams) => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill('SIGTERM');
-    const force = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    }, 2_000);
-    force.unref?.();
-  };
-
   const startBackend = () => {
     if (shuttingDown || backend) return;
     generation += 1;
+    generationDiscoverySeq = 0;
+    lastAppliedPublishedSeq = 0;
     const currentGeneration = generation;
     const command = backendCommand();
     const child = spawn(command.command, command.args, {
@@ -320,6 +409,9 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     let childCallerEnvError: string | null = null;
     const initializeId = `__imcodes_bootstrap_${currentGeneration}_initialize`;
     const listId = `__imcodes_bootstrap_${currentGeneration}_tools`;
+    const restoreDiscoveryId = `__imcodes_bootstrap_${currentGeneration}_restore_discovery`;
+    const restoreListId = `__imcodes_bootstrap_${currentGeneration}_restore_tools`;
+    let awaitingInitialRestore = false;
 
     startupTimer = setTimeout(() => {
       if (backend === child && !backendReady) {
@@ -328,6 +420,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
     }, BACKEND_START_TIMEOUT_MS);
     startupTimer.unref?.();
+
+    const completeCatalogReady = (next: Tool[]) => {
+      const changed = JSON.stringify(next) !== JSON.stringify(cachedTools);
+      cachedTools = next;
+      backendReady = true;
+      if (stableBackendTimer) clearTimeout(stableBackendTimer);
+      stableBackendTimer = setTimeout(() => {
+        if (backend === child && backendReady) restartAttempt = 0;
+      }, stableBackendUptimeMs);
+      stableBackendTimer.unref?.();
+      if (startupTimer) clearTimeout(startupTimer);
+      startupTimer = null;
+      flushQueued();
+      if (changed || currentGeneration > 1) {
+        writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+      }
+    };
 
     const output = createInterface({ input: child.stdout, crlfDelay: Infinity });
     output.on('line', (line) => {
@@ -343,41 +452,100 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
         return;
       }
-      if (message.id === listId) {
+      if (message.id === listId || message.id === restoreListId) {
         const result = message.result;
         if (result && typeof result === 'object' && Array.isArray((result as { tools?: unknown }).tools)) {
           const next = (result as { tools: Tool[] }).tools;
-          const changed = JSON.stringify(next) !== JSON.stringify(cachedTools);
-          cachedTools = next;
-          backendReady = true;
-          if (stableBackendTimer) clearTimeout(stableBackendTimer);
-          stableBackendTimer = setTimeout(() => {
-            if (backend === child && backendReady) restartAttempt = 0;
-          }, stableBackendUptimeMs);
-          stableBackendTimer.unref?.();
-          if (startupTimer) clearTimeout(startupTimer);
-          startupTimer = null;
-          flushQueued();
-          if (changed || currentGeneration > 1) {
-            writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+          if (message.id === listId && !backendReady && lastPublishedDiscoveryQuery && !awaitingInitialRestore) {
+            awaitingInitialRestore = true;
+            sendBackend({
+              jsonrpc: '2.0',
+              id: restoreDiscoveryId,
+              method: 'tools/call',
+              params: {
+                name: 'mcp_tool_search',
+                arguments: { query: lastPublishedDiscoveryQuery, activate: true },
+              },
+            });
+            return;
           }
+          completeCatalogReady(next);
         } else {
           notifyWarning('backend returned an invalid tools catalog; restarting it');
           terminateBackend(child);
         }
         return;
       }
+      if (message.id === restoreDiscoveryId) {
+        sendBackend({ jsonrpc: '2.0', id: restoreListId, method: 'tools/list', params: {} });
+        return;
+      }
       if (message.method === 'notifications/tools/list_changed') {
-        sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
+        if (backendReady) {
+          sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
+        }
         return;
       }
       const id = requestId(message);
-      if (id !== undefined && !clearInFlight(idKey(id))) {
-        // The request already timed out (or belongs to a retired generation).
-        // Never emit a second terminal response after the timeout.
-        return;
+      if (id !== undefined) {
+        const key = idKey(id);
+        const settledRequest = clearInFlight(key);
+        if (!settledRequest) {
+          // The request already timed out (or belongs to a retired generation).
+          // Never emit a second terminal response after the timeout.
+          return;
+        }
+        const discovery = settledRequest.discovery;
+        if (settledRequest.generation === generation && !message.error && message.result && typeof message.result === 'object') {
+          const resultObj = message.result as Record<string, unknown>;
+          const meta = resultObj._meta && typeof resultObj._meta === 'object' && !Array.isArray(resultObj._meta)
+            ? (resultObj._meta as Record<string, unknown>)
+            : undefined;
+          const hasAuthoritativeMeta = Boolean(meta && Object.prototype.hasOwnProperty.call(meta, 'imcodesPublishedQuery'));
+          if (hasAuthoritativeMeta && meta) {
+            const rawPublished = meta.imcodesPublishedQuery;
+            const rawSeq = meta.imcodesPublishedSeq;
+            const seq = typeof rawSeq === 'number' && Number.isSafeInteger(rawSeq) ? rawSeq : discovery?.seq;
+            if (seq === undefined || seq > lastAppliedPublishedSeq) {
+              lastPublishedDiscoveryQuery = typeof rawPublished === 'string' && rawPublished.trim().length > 0
+                ? rawPublished.trim()
+                : null;
+              if (seq !== undefined) lastAppliedPublishedSeq = seq;
+            }
+            delete meta.imcodesPublishedQuery;
+            delete meta.imcodesPublishedSeq;
+            if (Object.keys(meta).length === 0) {
+              delete resultObj._meta;
+            }
+          } else if (discovery?.activatesSelection) {
+            const seq = discovery.seq;
+            if (seq === undefined || seq > lastAppliedPublishedSeq) {
+              const sc = resultObj.structuredContent as Record<string, unknown> | undefined;
+              if (sc && (Array.isArray(sc.publishedGroups) || Array.isArray(sc.published))) {
+                const publishedGroups = Array.isArray(sc.publishedGroups)
+                  ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0)
+                  : [];
+                const publishedTools = Array.isArray(sc.published)
+                  ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+                  : [];
+                if (publishedGroups.length > 0) {
+                  lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
+                } else if (publishedTools.length > 0) {
+                  lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
+                } else {
+                  lastPublishedDiscoveryQuery = null;
+                }
+              } else if (discovery.hadFallback) {
+                // Target tool ran after query publication (including business-error results).
+                lastPublishedDiscoveryQuery = discovery.query;
+              }
+              if (seq !== undefined) lastAppliedPublishedSeq = seq;
+            }
+          }
+        }
       }
       writeMessage(message);
+      armIdleTimerIfIdle();
     });
     child.stderr.on('data', (chunk: Buffer) => {
       const text = String(chunk);
@@ -393,20 +561,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     child.on('error', (error) => notifyWarning(`backend process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       output.close();
-      const deterministicFailure = code === BACKEND_CALLER_ENV_EXIT_CODE;
+      const idleReaped = idleTerminatingChildren.has(child);
+      const deterministicFailure = !idleReaped && code === BACKEND_CALLER_ENV_EXIT_CODE;
       appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BACKEND_EXIT, {
         ...lifecycleFields,
         backendPid: child.pid,
         generation: currentGeneration,
         code,
         signal,
-        expected: shuttingDown || backend !== child,
+        expected: shuttingDown || idleReaped || backend !== child,
+        ...(idleReaped ? { reason: 'idle_timeout' } : {}),
         ...(deterministicFailure ? {
           reason: 'caller_env_rejected',
           error: childCallerEnvError ?? 'caller environment rejected',
         } : {}),
       });
       if (backend !== child) return;
+      clearIdleTimer();
       backend = null;
       backendReady = false;
       if (deterministicFailure) {
@@ -474,6 +645,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const shutdown = async (releaseOwnResource = true) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    clearIdleTimer();
     if (restartTimer) clearTimeout(restartTimer);
     if (startupTimer) clearTimeout(startupTimer);
     if (stableBackendTimer) clearTimeout(stableBackendTimer);
@@ -578,12 +750,16 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       writeMessage(errorResponse(id, -32601, 'Method not found'));
       return;
     }
+    const discoveryMeta = extractDiscoveryCallMeta(message);
+    clearIdleTimer();
     const child = backend;
     if (backendReady && child && sendBackend(message)) {
-      if (id !== undefined) trackInFlight(id, message, child, generation);
+      if (id !== undefined) trackInFlight(id, message, child, generation, discoveryMeta);
+      else armIdleTimerIfIdle();
       return;
     }
-    enqueue(message);
+    enqueue(message, discoveryMeta);
+    ensureBackendStarted();
   });
   input.on('close', () => {
     logExit(MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE);
@@ -619,5 +795,4 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       error: message.slice(0, 500),
     });
   });
-  startBackend();
 }

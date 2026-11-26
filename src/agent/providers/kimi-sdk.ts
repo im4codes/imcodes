@@ -60,13 +60,13 @@ const AGY_EMITTED_TEXT_STEP_LIMIT = 512;
 
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { realpathSync, statSync } from 'node:fs';
+import fs, { realpathSync, statSync } from 'node:fs';
 import { once } from 'node:events';
 import { homedir } from 'node:os';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   ndJsonStream,
   RequestError,
@@ -101,6 +101,7 @@ import {
 } from '../../../shared/session-control-commands.js';
 import type {
   TransportProvider,
+  ProviderActiveWorkSnapshotOptions,
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
@@ -833,16 +834,17 @@ export class KimiSdkProvider implements TransportProvider {
     };
   }
 
-  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+  getActiveWorkSnapshot(sessionId: string, options?: ProviderActiveWorkSnapshotOptions): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    const nowMs = Date.now();
     if (
       this.id === AGY_SDK_PROVIDER_ID
       && state.agyReactive
       && !state.promptInFlight
     ) {
       const reactiveActivityAt = state.agyReactiveLastActivityAt ?? state.agyReactiveSinceMs ?? state.lastActivityAt ?? 0;
-      if (Date.now() - reactiveActivityAt >= AGY_STALE_REACTIVE_SILENCE_MS) {
+      if (nowMs - reactiveActivityAt >= AGY_STALE_REACTIVE_SILENCE_MS) {
         setAgyReactive(state, false);
         this.syncAgyStatusAfterTurn(sessionId, state);
         this.scheduleDeferredSharedRecycleIfDrained();
@@ -857,6 +859,13 @@ export class KimiSdkProvider implements TransportProvider {
       ? 1
       : 0;
     const backgroundStatusCount = backgroundTaskCount + reactiveWorkCount;
+    const lastBackgroundProgressAt = this.id === AGY_SDK_PROVIDER_ID && backgroundTaskCount > 0
+      ? (
+          options?.sampleBackgroundProgress
+            ? resolveAgyBackgroundTasksProgressAt(state.agyBackgroundTasks, nowMs)
+            : readCachedAgyBackgroundTasksProgressAt(state.agyBackgroundTasks)
+        )
+      : undefined;
     const acpActiveToolCount = [...state.toolCalls.values()]
       .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
     const hasNativeRunningTool = this.id === AGY_SDK_PROVIDER_ID
@@ -878,11 +887,12 @@ export class KimiSdkProvider implements TransportProvider {
       ...(this.id === AGY_SDK_PROVIDER_ID ? {
         backgroundWorkCount: backgroundStatusCount,
         ...(backgroundStatusCount > 0 ? { backgroundSessionStatus: 'running' as const } : {}),
+        ...(lastBackgroundProgressAt !== undefined ? { lastBackgroundProgressAt } : {}),
       } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.acpSessionId ?? null,
-      updatedAt: Date.now(),
+      updatedAt: nowMs,
     };
   }
 
@@ -1326,8 +1336,15 @@ export class KimiSdkProvider implements TransportProvider {
         && opts.toolStatus !== 'error'
         && isEligibleAgyBackgroundStartTool(opts.toolName, opts.toolInput)
       ) {
+        const logPath = extractAgyBackgroundTaskLogPath(text);
         for (const id of extractAgyBackgroundTaskStartIds(text)) {
-          if (tasks.has(id)) continue;
+          const existing = tasks.get(id);
+          if (existing) {
+            if (!existing.logPath && logPath) {
+              existing.logPath = logPath;
+            }
+            continue;
+          }
           while (tasks.size >= AGY_BACKGROUND_TASK_MAX_ACTIVE) {
             const oldestKey = tasks.keys().next().value;
             if (oldestKey === undefined) break;
@@ -1346,6 +1363,7 @@ export class KimiSdkProvider implements TransportProvider {
             description: extractAgyBackgroundTaskDescription(text, opts),
             startedAtMs: Date.now(),
             ...(opts.toolId ? { toolId: opts.toolId } : {}),
+            ...(logPath ? { logPath } : {}),
           };
           tasks.set(id, entry);
           this.emitAgyBackgroundTaskEvent(
@@ -5212,11 +5230,17 @@ interface AgyBackgroundTaskEntry {
   description: string;
   startedAtMs: number;
   toolId?: string;
+  logPath?: string;
+  lastTrustedMtimeMs?: number;
+  lastObservedSize?: number;
+  lastProgressAtMs?: number;
 }
 
 const AGY_BACKGROUND_TASK_MAX_ACTIVE = 256;
+const AGY_BACKGROUND_CLOCK_SKEW_MS = 60_000;
 const AGY_BACKGROUND_TASKS_RESTART_RE = /All your subagents and background tasks have been stopped(?:\s+due to ([^.\n]+))?\.?/i;
 const AGY_BACKGROUND_TASK_START_RE = /^\s*Tool is running as a background task with task id:\s*([A-Za-z0-9._:/-]+)/i;
+const AGY_BACKGROUND_TASK_LOG_PATH_RE = /(?:^|\n)\s*Task logs are available at:\s*([^\r\n]+)/i;
 const AGY_SYNC_OUTPUT_ENVELOPE_RE = /(?:^|\n)\s*(?:Created At:|Completed At:|The tool's output was truncated\b|Command exited with code\s+-?\d+\b|Command output:)/i;
 const AGY_BACKGROUND_SPAWNING_TOOLS = new Set(['runcommand', 'schedule', 'runworkflow']);
 const AGY_BACKGROUND_TASK_DESCRIPTION_RE = /(?:^|\n)\s*Task Description:\s*(.+)/i;
@@ -5552,6 +5576,123 @@ function extractAgyBackgroundTaskStartIds(text: string): string[] {
   const envelopeHead = logStart >= 0 ? text.slice(0, logStart) : text;
   if (AGY_SYNC_OUTPUT_ENVELOPE_RE.test(envelopeHead)) return [];
   return [match[1]];
+}
+
+export function isLocalAgyLogPath(candidate: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (!candidate) return false;
+  if (platform === 'win32') {
+    // Only local drive root paths (`C:\...` or `C:/...`). Rejects UNC shares
+    // (`\\server\share`, `//server/share`), namespace/device paths (`\\?\UNC\...`, `\\.\...`),
+    // drive-relative paths (`C:foo`), and drive-less root paths (`/foo`, `\foo`).
+    return /^[A-Za-z]:[\\/]/.test(candidate);
+  }
+  return candidate.startsWith('/') && !candidate.startsWith('//') && !candidate.startsWith('\\\\');
+}
+
+/**
+ * Extracts a local filesystem log path from Antigravity background task start output
+ * (`Task logs are available at: file:///...` or plain local absolute path).
+ * Remote hosts and Windows UNC/network paths are rejected without I/O.
+ */
+export function extractAgyBackgroundTaskLogPath(
+  text: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const logStart = text.search(/(?:^|\n)\s*Log output:/i);
+  const envelopeHead = logStart >= 0 ? text.slice(0, logStart) : text;
+  if (AGY_SYNC_OUTPUT_ENVELOPE_RE.test(envelopeHead)) return undefined;
+  const match = AGY_BACKGROUND_TASK_LOG_PATH_RE.exec(envelopeHead);
+  const raw = match?.[1]?.trim();
+  if (!raw) return undefined;
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost') {
+        return undefined;
+      }
+      const fsPath = fileURLToPath(parsed, { windows: platform === 'win32' });
+      return isLocalAgyLogPath(fsPath, platform) ? fsPath : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    return undefined;
+  }
+  return isLocalAgyLogPath(raw, platform) ? raw : undefined;
+}
+
+function refreshAgyBackgroundTaskProgress(entry: AgyBackgroundTaskEntry, nowMs: number): number | undefined {
+  if (!entry.logPath) return entry.lastProgressAtMs;
+  try {
+    const st = fs.statSync(entry.logPath);
+    if (!st.isFile()) return entry.lastProgressAtMs;
+    const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : Number.NaN;
+    const size = Number.isFinite(st.size) ? st.size : 0;
+    const mtimeTrusted = Number.isFinite(mtimeMs) && mtimeMs <= nowMs + AGY_BACKGROUND_CLOCK_SKEW_MS;
+
+    let sizeChanged = false;
+    if (entry.lastObservedSize === undefined) {
+      entry.lastObservedSize = size;
+    } else if (size !== entry.lastObservedSize) {
+      entry.lastObservedSize = size;
+      sizeChanged = true;
+    }
+
+    let mtimeAdvanced = false;
+    if (mtimeTrusted) {
+      if (entry.lastTrustedMtimeMs === undefined) {
+        entry.lastTrustedMtimeMs = mtimeMs;
+        if (mtimeMs >= entry.startedAtMs - 1_000) {
+          entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, Math.min(mtimeMs, nowMs));
+        }
+      } else if (mtimeMs > entry.lastTrustedMtimeMs) {
+        entry.lastTrustedMtimeMs = mtimeMs;
+        mtimeAdvanced = true;
+      }
+    }
+
+    if (sizeChanged || mtimeAdvanced) {
+      entry.lastProgressAtMs = Math.max(entry.lastProgressAtMs ?? 0, nowMs);
+    }
+  } catch {
+    // Missing, deleted, or unreadable log paths gracefully produce no live progress.
+  }
+  return entry.lastProgressAtMs;
+}
+
+function readCachedAgyBackgroundTasksProgressAt(
+  tasks: Map<string, AgyBackgroundTaskEntry> | undefined,
+): number | undefined {
+  if (!tasks || tasks.size === 0) return undefined;
+  let latestProgressAt: number | undefined;
+  let checked = 0;
+  for (const entry of tasks.values()) {
+    if (checked >= AGY_BACKGROUND_TASK_MAX_ACTIVE) break;
+    checked += 1;
+    if (entry.lastProgressAtMs !== undefined && (latestProgressAt === undefined || entry.lastProgressAtMs > latestProgressAt)) {
+      latestProgressAt = entry.lastProgressAtMs;
+    }
+  }
+  return latestProgressAt;
+}
+
+function resolveAgyBackgroundTasksProgressAt(
+  tasks: Map<string, AgyBackgroundTaskEntry> | undefined,
+  nowMs: number,
+): number | undefined {
+  if (!tasks || tasks.size === 0) return undefined;
+  let latestProgressAt: number | undefined;
+  let checked = 0;
+  for (const entry of tasks.values()) {
+    if (checked >= AGY_BACKGROUND_TASK_MAX_ACTIVE) break;
+    checked += 1;
+    const progressAt = refreshAgyBackgroundTaskProgress(entry, nowMs);
+    if (progressAt !== undefined && (latestProgressAt === undefined || progressAt > latestProgressAt)) {
+      latestProgressAt = progressAt;
+    }
+  }
+  return latestProgressAt;
 }
 
 function resolveAgyBackgroundSystemTerminalStatus(text: string): SdkSubagentNormalizedStatus {

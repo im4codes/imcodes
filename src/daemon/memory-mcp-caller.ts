@@ -5,7 +5,7 @@ import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-
 import { isValidImcodesSessionName } from '../../shared/session-scope.js';
 import { createMemoryToolCaller, type MemoryToolCaller } from '../context/memory-read-tools.js';
 
-export type MemoryMcpTransport = 'stdio' | 'in_process';
+export type MemoryMcpTransport = 'stdio' | 'in_process' | 'streamable_http';
 
 export interface McpRuntimeCaller {
   userId: string;

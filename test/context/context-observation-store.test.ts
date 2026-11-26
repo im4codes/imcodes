@@ -1,3 +1,5 @@
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
@@ -16,8 +18,12 @@ import {
   writeContextObservation,
   writeProcessedProjection,
   deleteMemory,
+  resetContextStoreForTests,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 describe('post-1.1 context namespace and observation store', () => {
   let tempDir: string;
@@ -361,5 +367,138 @@ describe('post-1.1 context namespace and observation store', () => {
     });
     expect(audit).toMatchObject({ observationId: observation.id, fromScope: 'personal', toScope: 'project_shared' });
     expect(listObservationPromotionAudits(observation.id)).toEqual([audit]);
+  });
+
+  it('filters withoutProjection, after/before, and text prefilter, and creates idempotent index without full-table scan', () => {
+    const nsRow = ensureContextNamespace(namespace, 100);
+    const unprojOld = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'bugfix',
+      origin: 'user_note',
+      fingerprint: 'fp-unproj-old',
+      content: { text: 'unprojected alpha detail', title: 'Alpha' },
+      sourceEventIds: ['evt-special-100'],
+      now: 100,
+    });
+    const unprojInWindow = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'decision',
+      origin: 'agent_learned',
+      fingerprint: 'fp-unproj-mid',
+      content: { text: 'unprojected beta detail' },
+      sourceEventIds: ['evt-special-200'],
+      now: 250,
+    });
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      origin: 'chat_compacted',
+      sourceEventIds: ['evt-proj-300'],
+      summary: 'projected detail beta',
+      content: { text: 'projected detail beta' },
+      createdAt: 300,
+      updatedAt: 300,
+    });
+
+    // Also verify a legacy/raw row with projection_id = '' is treated identically to NULL.
+    const dbPath = join(tempDir, 'context.sqlite');
+    resetContextStoreForTests();
+    const rawEmptyProjDb = new DatabaseSync(dbPath);
+    rawEmptyProjDb.prepare(`
+      INSERT INTO context_observations (
+        id, namespace_id, scope, class, origin, fingerprint, content_json, text_hash,
+        source_event_ids_json, projection_id, state, confidence, created_at, updated_at, promoted_at
+      ) VALUES (?, ?, 'personal', 'note', 'user_note', ?, ?, ?, '[]', '', 'active', NULL, ?, ?, NULL)
+    `).run('obs-empty-proj', nsRow.id, 'fp-empty-proj', JSON.stringify({ text: 'empty string projection id row' }), 'hash-empty-proj', 260, 260);
+    rawEmptyProjDb.close();
+
+    expect(listContextObservations({
+      namespaceIds: [nsRow.id],
+      state: ['active'],
+      withoutProjection: true,
+    }).map((r) => r.id)).toEqual(['obs-empty-proj', unprojInWindow.id, unprojOld.id]);
+
+    expect(listContextObservations({
+      namespaceIds: [nsRow.id],
+      withoutProjection: true,
+      after: 200,
+      before: 250,
+    }).map((r) => r.id)).toEqual([unprojInWindow.id]);
+
+    expect(listContextObservations({
+      namespaceIds: [nsRow.id],
+      withoutProjection: true,
+      query: 'bugfix evt-special-100',
+    }).map((r) => r.id)).toEqual([unprojOld.id]);
+
+    expect(listContextObservations({
+      namespaceIds: [nsRow.id],
+      withoutProjection: true,
+      projectionId: 'any-id',
+    })).toEqual([]);
+
+    // Verify idempotent index creation when reopening an existing DB and verify EXPLAIN QUERY PLAN.
+    resetContextStoreForTests();
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec('DROP INDEX IF EXISTS idx_context_observations_namespace_state_projection_updated');
+    rawDb.close();
+
+    // Reopening via store API idempotently recreates the composite index.
+    expect(listContextObservations({
+      namespaceIds: [nsRow.id],
+      state: ['active'],
+      withoutProjection: true,
+    }).map((r) => r.id)).toEqual(['obs-empty-proj', unprojInWindow.id, unprojOld.id]);
+
+    const inspectDb = new DatabaseSync(dbPath);
+    const indexes = inspectDb.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'context_observations'").all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain('idx_context_observations_namespace_state_projection_updated');
+
+    const plan = inspectDb.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT *
+        FROM context_observations
+       WHERE namespace_id IN (?, ?)
+         AND state IN ('candidate', 'active', 'promoted')
+         AND COALESCE(projection_id, '') = ''
+       ORDER BY updated_at DESC, id ASC
+       LIMIT 50
+    `).all(nsRow.id, 'other-ns') as Array<{ detail: string }>;
+    inspectDb.close();
+    const planDetails = plan.map((row) => row.detail).join('\n');
+    expect(planDetails).toContain('idx_context_observations_namespace_state_projection_updated');
+    expect(planDetails).not.toMatch(/\bSCAN context_observations\b/);
+  });
+
+  it('allows explicit empty projectionId to clear a prior non-empty projectionId on upsert', () => {
+    const nsRow = ensureContextNamespace(namespace, 100);
+    const linked = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-clear-proj',
+      content: { text: 'observation initially linked then unlinked' },
+      projectionId: 'proj-initial-1',
+      now: 100,
+    });
+    expect(listContextObservations({ projectionId: 'proj-initial-1' }).map((r) => r.id)).toEqual([linked.id]);
+    expect(listContextObservations({ namespaceIds: [nsRow.id], withoutProjection: true })).toEqual([]);
+
+    const unlinked = writeContextObservation({
+      namespaceId: nsRow.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'fp-clear-proj',
+      content: { text: 'observation initially linked then unlinked' },
+      projectionId: '',
+      now: 200,
+    });
+    expect(unlinked.id).toBe(linked.id);
+    expect(listContextObservations({ projectionId: 'proj-initial-1' })).toEqual([]);
+    expect(listContextObservations({ namespaceIds: [nsRow.id], withoutProjection: true }).map((r) => r.id)).toEqual([linked.id]);
   });
 });

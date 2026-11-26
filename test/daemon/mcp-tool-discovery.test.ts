@@ -259,4 +259,42 @@ describe('exact MCP discovery fallback', () => {
     });
     expect(malformedOutputHandler).toHaveBeenCalledOnce();
   });
+
+  it('stamps monotonic committed publication sequence across overlapping slow fallbackCall and later selection/clear in backend mode', async () => {
+    const prevBackendEnv = process.env.IMCODES_MEMORY_MCP_BACKEND;
+    process.env.IMCODES_MEMORY_MCP_BACKEND = '1';
+    try {
+      let releaseSlow!: () => void;
+      const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+      const slowHandler = vi.fn(async () => {
+        await slowGate;
+        return { content: [{ type: 'text' as const, text: 'slow' }], structuredContent: { ok: true } };
+      });
+      const fastHandler = vi.fn(async () => ({
+        content: [{ type: 'text' as const, text: 'fast' }],
+        structuredContent: { ok: true },
+      }));
+      const toolA = registeredTool({ name: 'tool_a_slow', outputSchema: z.object({ ok: z.boolean() }).strict(), handler: slowHandler });
+      const toolB = registeredTool({ name: 'tool_b_fast', outputSchema: z.object({ ok: z.boolean() }).strict(), handler: fastHandler });
+      const { call } = harness([toolA, toolB]);
+
+      // Start slow fallback A first (commits A synchronously as seq=1 before awaiting slowHandler).
+      const promiseA = call({ query: 'tool_a_slow', fallbackCall: { name: 'tool_a_slow', arguments: {} } });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Overlapped fast search B commits seq=2, then unmatched clear commits seq=3 and settles first.
+      const resB = await call({ query: 'tool_b_fast' });
+      expect(resB._meta).toMatchObject({ imcodesPublishedQuery: 'tool_b_fast', imcodesPublishedSeq: 2 });
+      const resClear = await call({ query: 'nonexistent_clear' });
+      expect(resClear._meta).toMatchObject({ imcodesPublishedQuery: null, imcodesPublishedSeq: 3 });
+
+      releaseSlow();
+      const resA = await promiseA;
+      expect(resA._meta).toMatchObject({ imcodesPublishedQuery: 'tool_a_slow', imcodesPublishedSeq: 1 });
+      expect(slowHandler).toHaveBeenCalledOnce();
+    } finally {
+      if (prevBackendEnv === undefined) delete process.env.IMCODES_MEMORY_MCP_BACKEND;
+      else process.env.IMCODES_MEMORY_MCP_BACKEND = prevBackendEnv;
+    }
+  });
 });

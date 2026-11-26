@@ -93,6 +93,7 @@ export const CONTEXT_STORE_L1_OPS = [
   'recordContextEvent',
   'enqueueContextJob',
   'claimContextJob',
+  'releaseClaimedContextJob',
   'updateContextJob',
   'deleteStagedEventsByIds',
   'deleteTentativeProjections',
@@ -141,6 +142,8 @@ export const CONTEXT_STORE_L2_OPS = [
   'ingestContextEvent',
   /** post-SDK materialization commit bundle in ONE worker SQLite transaction */
   'commitMaterialization',
+  /** noise-filter / retry-exhausted batch abandon bundle in ONE worker SQLite transaction */
+  'abandonMaterializationBatch',
 ] as const;
 
 // ── L3: bounded front-of-turn recall orchestration ops (high priority by default) ──
@@ -219,6 +222,7 @@ export const CONTEXT_STORE_LOW_PRIORITY_OPS = [
   // write, and one-per-drain-slice on the low lane let a normal-lane burst
   // queue live ingests until the client reported "remained queued".
   'commitMaterialization',
+  'abandonMaterializationBatch',
   'selectTurnUsageSyncBatch',
   'recordTurnUsageSyncResults',
   'recordTurnUsageSyncRequestFailure',
@@ -355,8 +359,9 @@ export const CONTEXT_STORE_UNSAFE_RETRY_OPS = [
   'runArchiveBackfillBatch',
   'archiveEventsForMaterialization',
   'pruneArchiveIfDue',
-  // multi-statement commit bundle - a partial apply must be reconciled, not replayed
+  // multi-statement commit / abandon bundles - a partial apply must be reconciled, not replayed
   'commitMaterialization',
+  'abandonMaterializationBatch',
 ] as const;
 const UNSAFE_RETRY_SET: ReadonlySet<string> = new Set(CONTEXT_STORE_UNSAFE_RETRY_OPS);
 

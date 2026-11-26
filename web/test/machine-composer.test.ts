@@ -5,6 +5,7 @@ import { insertMachineMarkerAtCaret } from '../src/util/machine-insert.js';
 import {
   buildMachineComposerReference,
   buildMachineMarker,
+  MACHINE_REF_NAME_MAX,
   parseMachineMarkers,
   type MachineRef,
 } from '@shared/machine-reference.js';
@@ -30,6 +31,31 @@ describe('matchInlineMachineTrigger (8.3)', () => {
   it('does not trigger when the query is broken by a space', () => {
     expect(matchInlineMachineTrigger('^win now')).toBeNull();
   });
+
+  it('opens on Chinese IME Shift+6 ellipsis `……` (\\u2026\\u2026) at start or after whitespace and captures ASCII/CJK queries', () => {
+    expect(matchInlineMachineTrigger('……')).toBe('');
+    expect(matchInlineMachineTrigger('\u2026\u2026')).toBe('');
+    expect(matchInlineMachineTrigger('……vm')).toBe('vm');
+    expect(matchInlineMachineTrigger('查看 ……vm-97')).toBe('vm-97');
+    expect(matchInlineMachineTrigger('部署到 ……山东')).toBe('山东');
+    expect(matchInlineMachineTrigger('查看\n……node_01.prod')).toBe('node_01.prod');
+  });
+  it('does not falsely trigger on mid-prose ellipsis, backspaced single `…`, repeated ellipses, or trailing space', () => {
+    expect(matchInlineMachineTrigger('等等……')).toBeNull();
+    expect(matchInlineMachineTrigger('算了……再说')).toBeNull();
+    expect(matchInlineMachineTrigger('go …………')).toBeNull();
+    expect(matchInlineMachineTrigger('go ………')).toBeNull();
+    expect(matchInlineMachineTrigger('…………')).toBeNull();
+    expect(matchInlineMachineTrigger('…… ')).toBeNull();
+    expect(matchInlineMachineTrigger('……vm now')).toBeNull();
+    expect(matchInlineMachineTrigger('…')).toBeNull();
+    expect(matchInlineMachineTrigger('查看 …')).toBeNull();
+  });
+  it('enforces MACHINE_REF_NAME_MAX for `……` triggers', () => {
+    const maxQuery = 'x'.repeat(MACHINE_REF_NAME_MAX);
+    expect(matchInlineMachineTrigger(`……${maxQuery}`)).toBe(maxQuery);
+    expect(matchInlineMachineTrigger(`……${maxQuery}y`)).toBeNull();
+  });
 });
 
 describe('stripInlineMachineTrigger (8.3)', () => {
@@ -37,8 +63,17 @@ describe('stripInlineMachineTrigger (8.3)', () => {
     expect(stripInlineMachineTrigger('run ^wi')).toBe('run ');
     expect(stripInlineMachineTrigger('^wi')).toBe('');
   });
+  it('removes a trailing `……query` fragment, keeping boundary whitespace', () => {
+    expect(stripInlineMachineTrigger('……')).toBe('');
+    expect(stripInlineMachineTrigger('……vm')).toBe('');
+    expect(stripInlineMachineTrigger('查看 ……vm-97')).toBe('查看 ');
+    expect(stripInlineMachineTrigger('部署到 ……山东')).toBe('部署到 ');
+  });
   it('leaves text without a trailing trigger unchanged', () => {
     expect(stripInlineMachineTrigger('plain text')).toBe('plain text');
+    expect(stripInlineMachineTrigger('等等……')).toBe('等等……');
+    expect(stripInlineMachineTrigger('go …………')).toBe('go …………');
+    expect(stripInlineMachineTrigger('…… ')).toBe('…… ');
     expect(stripInlineMachineTrigger(`done ${buildMachineMarker('win')}`)).toBe(`done ${buildMachineMarker('win')}`);
   });
 });

@@ -16,7 +16,7 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function sameSecret(expected: string, presented: string): boolean {
+export function sameHookCredential(expected: string, presented: string): boolean {
   const a = Buffer.from(expected);
   const b = Buffer.from(presented);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -35,5 +35,5 @@ export function hookClaimAllowed(
   const expected = getSession(claimedSession)?.hookCredential;
   if (!expected) return true;
   const presented = headerValue(headers[HOOK_SESSION_CREDENTIAL_HEADER]);
-  return typeof presented === 'string' && presented.length > 0 && sameSecret(expected, presented);
+  return typeof presented === 'string' && presented.length > 0 && sameHookCredential(expected, presented);
 }
