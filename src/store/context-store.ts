@@ -3796,8 +3796,11 @@ export function countConsecutiveFailedJobs(target: ContextTargetRef): number {
  * Called before committing a successful SDK compression to remove the
  * placeholder local-fallback summary from prior failed attempts.
  */
-export function deleteTentativeProjections(namespace: ContextNamespace, projectionClass: ProcessedContextClass): number {
-  const database = ensureDb();
+function deleteTentativeProjectionsForDb(
+  database: DatabaseSyncInstance,
+  namespace: ContextNamespace,
+  projectionClass: ProcessedContextClass,
+): number {
   const namespaceKey = serializeContextNamespace(namespace);
   // Scan matching rows and delete those with content.tentative === true
   const rows = database.prepare(
@@ -3812,6 +3815,10 @@ export function deleteTentativeProjections(namespace: ContextNamespace, projecti
     }
   }
   return deleted;
+}
+
+export function deleteTentativeProjections(namespace: ContextNamespace, projectionClass: ProcessedContextClass): number {
+  return deleteTentativeProjectionsForDb(ensureDb(), namespace, projectionClass);
 }
 
 /**
@@ -4060,6 +4067,47 @@ export interface MaterializationCommitResult {
   durableProjection?: ProcessedContextProjection;
 }
 
+export interface MaterializationAbandonInput {
+  deleteTentativeNamespace?: ContextNamespace;
+  archiveEvents: LocalContextEvent[];
+  archivedAt: number;
+  deleteStagedEventIds: string[];
+  completeJobId: string;
+  completedAt: number;
+  completionError?: string;
+  clearDirty: ContextTargetRef;
+}
+
+export interface MaterializationAbandonResult {
+  abandoned: boolean;
+  paused?: boolean;
+}
+
+function runImmediateWithBusyRetry<T>(
+  database: DatabaseSyncInstance,
+  source: string,
+  fn: () => T,
+): T {
+  let lastBusyError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      const result = fn();
+      database.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+      if (!isSqliteBusy(error)) throw error;
+      lastBusyError = error;
+      if (attempt === 2) break;
+      sleepSync(25 * (attempt + 1));
+    }
+  }
+  incrementCounter('mem.write.retry_exhausted', { source });
+  warnOncePerHour(`${source}.sqlite_busy`, { error: lastBusyError instanceof Error ? lastBusyError.message : String(lastBusyError) });
+  throw lastBusyError instanceof Error ? lastBusyError : new Error(String(lastBusyError));
+}
+
 /** Run the post-SDK materialization commit bundle as ONE atomic transaction:
  *  archive events + write summary projection (+ optional durable) + set
  *  replication state + delete staged events + complete job + clear dirty. A
@@ -4069,39 +4117,50 @@ export interface MaterializationCommitResult {
 export function commitMaterialization(input: MaterializationCommitInput): MaterializationCommitResult {
   assertMemoryDaemonEnabled();
   const database = ensureDb();
-  let lastBusyError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      database.exec('BEGIN IMMEDIATE');
-      archiveEventsForMaterializationForDb(database, input.archiveEvents, input.archivedAt);
-      const summary = writeProcessedProjectionForDb(database, input.summaryProjection);
-      const durable = input.durableProjection ? writeProcessedProjectionForDb(database, input.durableProjection) : undefined;
-      const pendingProjectionIds = Array.from(new Set([
-        ...input.replication.priorPendingProjectionIds,
-        summary.id,
-        ...(durable ? [durable.id] : []),
-      ]));
-      setReplicationStateForDb(database, input.replication.namespace, {
-        pendingProjectionIds,
-        lastReplicatedAt: input.replication.lastReplicatedAt,
-        lastError: input.replication.lastError,
-      });
-      deleteStagedEventsByIdsForDb(database, input.deleteStagedEventIds);
-      updateContextJobForDb(database, input.completeJobId, 'completed', { now: input.completedAt });
-      clearDirtyTargetForDb(database, input.clearDirty);
-      database.exec('COMMIT');
-      return { summaryProjection: summary, durableProjection: durable };
-    } catch (error) {
-      try { database.exec('ROLLBACK'); } catch { /* ignore */ }
-      if (!isSqliteBusy(error)) throw error;
-      lastBusyError = error;
-      if (attempt === 2) break;
-      sleepSync(25 * (attempt + 1));
+  return runImmediateWithBusyRetry(database, 'commitMaterialization', () => {
+    archiveEventsForMaterializationForDb(database, input.archiveEvents, input.archivedAt);
+    const summary = writeProcessedProjectionForDb(database, input.summaryProjection);
+    const durable = input.durableProjection ? writeProcessedProjectionForDb(database, input.durableProjection) : undefined;
+    const pendingProjectionIds = Array.from(new Set([
+      ...input.replication.priorPendingProjectionIds,
+      summary.id,
+      ...(durable ? [durable.id] : []),
+    ]));
+    setReplicationStateForDb(database, input.replication.namespace, {
+      pendingProjectionIds,
+      lastReplicatedAt: input.replication.lastReplicatedAt,
+      lastError: input.replication.lastError,
+    });
+    deleteStagedEventsByIdsForDb(database, input.deleteStagedEventIds);
+    updateContextJobForDb(database, input.completeJobId, 'completed', { now: input.completedAt });
+    clearDirtyTargetForDb(database, input.clearDirty);
+    return { summaryProjection: summary, durableProjection: durable };
+  });
+}
+
+/**
+ * Atomically abandon a filtered/exhausted materialization batch in ONE
+ * transaction. When daemon memory is disabled before execution, returns
+ * `{ abandoned: false, paused: true }` without deleting staged events or
+ * mutating job/dirty state so the batch can resume cleanly once re-enabled.
+ */
+export function abandonMaterializationBatch(input: MaterializationAbandonInput): MaterializationAbandonResult {
+  if (!isMemoryDaemonEnabled()) return { abandoned: false, paused: true };
+  const database = ensureDb();
+  return runImmediateWithBusyRetry(database, 'abandonMaterializationBatch', () => {
+    if (!isMemoryDaemonEnabled()) return { abandoned: false, paused: true };
+    if (input.deleteTentativeNamespace) {
+      deleteTentativeProjectionsForDb(database, input.deleteTentativeNamespace, 'recent_summary');
     }
-  }
-  incrementCounter('mem.write.retry_exhausted', { source: 'commitMaterialization' });
-  warnOncePerHour('commitMaterialization.sqlite_busy', { error: lastBusyError instanceof Error ? lastBusyError.message : String(lastBusyError) });
-  throw lastBusyError instanceof Error ? lastBusyError : new Error(String(lastBusyError));
+    archiveEventsForMaterializationForDb(database, input.archiveEvents, input.archivedAt);
+    deleteStagedEventsByIdsForDb(database, input.deleteStagedEventIds);
+    updateContextJobForDb(database, input.completeJobId, 'completed', {
+      now: input.completedAt,
+      ...(input.completionError ? { error: input.completionError } : {}),
+    });
+    clearDirtyTargetForDb(database, input.clearDirty);
+    return { abandoned: true };
+  });
 }
 
 export function ensureContextNamespace(input: CanonicalNamespaceInput | ContextNamespace, now = Date.now()): ContextNamespaceRow {

@@ -22,6 +22,8 @@ import type {
   IngestContextEventResult,
   LatestRecentSummarySession,
   ListProcessedProjectionsOptions,
+  MaterializationAbandonInput,
+  MaterializationAbandonResult,
   MaterializationCommitInput,
   MaterializationCommitResult,
   PinnedNote,
@@ -38,7 +40,7 @@ import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
 import { ensureProjectionEmbeddingForProjection } from './projection-embedding-maintenance.js';
-import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
+import { isMemoryDaemonEnabled, isMemoryDisabledError } from '../store/memory-daemon-switch.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
   decideSkillReviewSchedule,
@@ -182,6 +184,7 @@ export class MaterializationCoordinator {
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
   private readonly _archiveEventsForMaterialization: ArchiveEventsForMaterializationFn;
+  private readonly _archiveEventsForMaterializationIsOverride: boolean;
   private readonly _commitMaterialization: CommitMaterializationFn;
   /** True when a test injected `commitMaterialization` — then we always use the
    *  injected fn and never route to the worker. */
@@ -203,6 +206,7 @@ export class MaterializationCoordinator {
     // context-store import. Injected test overrides bypass the client entirely.
     this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization
       ?? ((events, archivedAt) => getContextStoreClient().run<void>('archiveEventsForMaterialization', [events, archivedAt ?? Date.now()]));
+    this._archiveEventsForMaterializationIsOverride = options?.archiveEventsForMaterialization !== undefined;
     // The default commit routes through the async client (worker when warm via
     // runMaterializationCommit; in-process cold fallback here). An injected
     // override bypasses the client entirely.
@@ -319,12 +323,45 @@ export class MaterializationCoordinator {
             [input],
             { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
           );
-        } catch {
+        } catch (error) {
+          if (isMemoryDisabledError(error) || !isMemoryDaemonEnabled()) throw error;
           // Worker failed/timeout — fall back to the in-process cold path below.
         }
       }
     }
     return this._commitMaterialization(input);
+  }
+
+  private async runMaterializationAbandon(input: MaterializationAbandonInput): Promise<MaterializationAbandonResult> {
+    if (!isMemoryDaemonEnabled()) return { abandoned: false, paused: true };
+    if (this._archiveEventsForMaterializationIsOverride) {
+      const client = getContextStoreClient();
+      if (input.deleteTentativeNamespace) {
+        await client.run<number>('deleteTentativeProjections', [input.deleteTentativeNamespace, 'recent_summary']);
+        if (!isMemoryDaemonEnabled()) return { abandoned: false, paused: true };
+      }
+      await this._archiveEventsForMaterialization(input.archiveEvents, input.archivedAt);
+      if (!isMemoryDaemonEnabled()) return { abandoned: false, paused: true };
+      await client.run<void>('deleteStagedEventsByIds', [input.deleteStagedEventIds]);
+      await client.run<void>('updateContextJob', [input.completeJobId, 'completed', {
+        now: input.completedAt,
+        ...(input.completionError ? { error: input.completionError } : {}),
+      }]);
+      await client.run<void>('clearDirtyTarget', [input.clearDirty]);
+      return { abandoned: true };
+    }
+    try {
+      return await getContextStoreClient().run<MaterializationAbandonResult>(
+        'abandonMaterializationBatch',
+        [input],
+        { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
+      );
+    } catch (error) {
+      if (isMemoryDisabledError(error) || !isMemoryDaemonEnabled()) {
+        return { abandoned: false, paused: true };
+      }
+      throw error;
+    }
   }
 
   private pauseClaimedMaterializationJob(jobId: string): MaterializationResult {
@@ -389,11 +426,15 @@ export class MaterializationCoordinator {
     const hasUsableAssistantTurn = events.some((event) => event.eventType === 'assistant.text' || event.eventType === 'assistant.turn');
 
     if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
-      await this._archiveEventsForMaterialization(allEvents, now);
-      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
-      await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
-      await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
-      await client.run<void>('clearDirtyTarget', [target]);
+      const abandoned = await this.runMaterializationAbandon({
+        archiveEvents: allEvents,
+        archivedAt: now,
+        deleteStagedEventIds: sourceEventIds,
+        completeJobId: job.id,
+        completedAt: now,
+        clearDirty: target,
+      });
+      if (abandoned.paused) return this.pauseClaimedMaterializationJob(job.id);
       return {
         replicationQueued: false,
         filteredOut: true,
@@ -590,13 +631,16 @@ export class MaterializationCoordinator {
     // A fromSdk: false result means "no real summary was produced" — the
     // fallback branch below owns that case; we don't treat it as noise.
     if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
-      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
-      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
-      await this._archiveEventsForMaterialization(allEvents, now);
-      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
-      await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
-      await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
-      await client.run<void>('clearDirtyTarget', [target]);
+      const abandoned = await this.runMaterializationAbandon({
+        deleteTentativeNamespace: target.namespace,
+        archiveEvents: allEvents,
+        archivedAt: now,
+        deleteStagedEventIds: sourceEventIds,
+        completeJobId: job.id,
+        completedAt: now,
+        clearDirty: target,
+      });
+      if (abandoned.paused) return this.pauseClaimedMaterializationJob(job.id);
       return {
         replicationQueued: false,
         compression,
@@ -640,31 +684,34 @@ export class MaterializationCoordinator {
       // (priorFailures + 1) makes the constant match its name.
       const totalFailuresIncludingCurrent = priorFailures + 1;
       const retryBudgetExhausted = totalFailuresIncludingCurrent >= MAX_SDK_RETRY_ATTEMPTS;
-      // Any legacy tentative rows from earlier versions of this code get
-      // scrubbed here — the new design never writes tentatives, so the only
-      // tentative rows that can exist are pre-migration leftovers.
-      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
-      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
 
       if (retryBudgetExhausted) {
-        // Abandon batch: delete staged events, clear dirty target so we
-        // don't keep re-triggering for the same data. Job status is
-        // 'completed' (not 'materialization_failed') so the next fresh
-        // batch starts with a clean failure counter.
-        await this._archiveEventsForMaterialization(allEvents, now);
-        if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
+        // Abandon batch atomically: scrub tentative, archive events, delete
+        // staged events, mark job completed, and clear dirty target in ONE tx.
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
-        await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
-        await client.run<void>('updateContextJob', [job.id, 'completed', { now,
-          error: `SDK compression abandoned after ${totalFailuresIncludingCurrent} consecutive failures — events discarded, no summary written`,
-        }]);
-        await client.run<void>('clearDirtyTarget', [target]);
+        const abandoned = await this.runMaterializationAbandon({
+          deleteTentativeNamespace: target.namespace,
+          archiveEvents: allEvents,
+          archivedAt: now,
+          deleteStagedEventIds: sourceEventIds,
+          completeJobId: job.id,
+          completedAt: now,
+          completionError: `SDK compression abandoned after ${totalFailuresIncludingCurrent} consecutive failures — events discarded, no summary written`,
+          clearDirty: target,
+        });
+        if (abandoned.paused) return this.pauseClaimedMaterializationJob(job.id);
         return {
           replicationQueued: false,
           compression,
           filteredOut: true,
         };
       }
+
+      // Any legacy tentative rows from earlier versions of this code get
+      // scrubbed here — the new design never writes tentatives, so the only
+      // tentative rows that can exist are pre-migration leftovers.
+      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
+      if (!isMemoryDaemonEnabled()) return this.pauseClaimedMaterializationJob(job.id);
 
       // Retry path: keep staged events, leave dirty target in place, mark
       // job materialization_failed so the next trigger retries SDK.
@@ -751,6 +798,9 @@ export class MaterializationCoordinator {
         clearDirty: target,
       });
     } catch (error) {
+      if (isMemoryDisabledError(error) || !isMemoryDaemonEnabled()) {
+        return this.pauseClaimedMaterializationJob(job.id);
+      }
       // The whole bundle rolled back atomically — staged events remain, so the
       // target re-materializes cleanly on retry (no duplicate).
       await client.run<void>('updateContextJob', [job.id, 'materialization_failed', { now,

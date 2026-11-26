@@ -569,4 +569,159 @@ describe('daemon-wide memory disable gate', () => {
       ingestion.dispose();
     }
   });
+
+  it('abandons noise batches atomically with pause on mid-queue disable and completes on re-enable without orphaned staged state', async () => {
+    setMemoryDaemonEnabled(true);
+    const client = getContextStoreClient();
+    const coordinator = new MaterializationCoordinator({
+      memoryConfig: {
+        enabled: true,
+        autoTriggerTokens: 1,
+        minEventCount: 1,
+        idleMs: 1,
+        scheduleMs: 1,
+        maxBatchTokens: 1000,
+        batchTargetTokens: 500,
+        manualCompactTargetTokens: 500,
+        masterIdleHours: 1,
+        archiveRetentionDays: 30,
+        extraRedactPatterns: [],
+      },
+    });
+
+    await coordinator.ingestEvent({
+      id: 'ev-noise-only-1',
+      target,
+      eventType: 'assistant.text',
+      content: '[API Error: Connection error. (cause: fetch failed)]',
+      createdAt: 5_000,
+    });
+    expect(listContextEvents(target)).toHaveLength(1);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(1);
+
+    const origRun = client.run.bind(client);
+    const opsAfterAbandonBlocked: string[] = [];
+    let releaseAbandonGate!: () => void;
+    let blockAbandon = true;
+    let abandonReached = false;
+    const runSpy = vi.spyOn(client, 'run').mockImplementation(async (op, args, opts) => {
+      if (abandonReached) opsAfterAbandonBlocked.push(op);
+      if (blockAbandon && op === 'abandonMaterializationBatch') {
+        abandonReached = true;
+        blockAbandon = false;
+        await new Promise<void>((resolve) => {
+          releaseAbandonGate = resolve;
+        });
+      }
+      return origRun(op, args, opts);
+    });
+
+    const matPromise = coordinator.materializeTarget(target, 'manual', 5_100);
+    await vi.waitFor(() => expect(abandonReached).toBe(true));
+    // Simulate disable happening while abandonMaterializationBatch was queued before worker execution.
+    setMemoryDaemonEnabled(false);
+    releaseAbandonGate();
+
+    const pausedRes = await matPromise;
+    expect(pausedRes).toEqual({ replicationQueued: false, disabled: true });
+    // Single atomic op only — zero follow-up deleteStagedEventsByIds / updateContextJob / clearDirtyTarget RPCs.
+    expect(opsAfterAbandonBlocked).toEqual([]);
+    // Staged event & dirty target remain intact together with the running job (no partial split).
+    expect(listContextEvents(target)).toHaveLength(1);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(1);
+
+    // Re-enable on the same coordinator -> releases running job to pending and atomically finishes noise abandon.
+    runSpy.mockRestore();
+    setMemoryDaemonEnabled(true);
+    const due = await coordinator.scheduleDueTargets(5_200);
+    expect(due.length).toBeGreaterThanOrEqual(1);
+    const resumedRes = await coordinator.materializeTarget(target, 'manual', 5_200);
+    expect(resumedRes).toEqual({ replicationQueued: false, filteredOut: true });
+    expect(listContextEvents(target)).toHaveLength(0);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(0);
+  });
+
+  it('pauses cleanly when commitMaterialization fails with disabled error without sending updateContextJob or fallback commit', async () => {
+    setMemoryDaemonEnabled(true);
+    const client = getContextStoreClient();
+    const coordinator = new MaterializationCoordinator({
+      memoryConfig: {
+        enabled: true,
+        autoTriggerTokens: 1,
+        minEventCount: 1,
+        idleMs: 1,
+        scheduleMs: 1,
+        maxBatchTokens: 1000,
+        batchTargetTokens: 500,
+        manualCompactTargetTokens: 500,
+        masterIdleHours: 1,
+        archiveRetentionDays: 30,
+        extraRedactPatterns: [],
+      },
+      compressor: async () => ({
+        summary: '## Recent Summary\nCommit pause recovery summary.',
+        model: 'test-model',
+        backend: 'test-backend',
+        usedBackup: false,
+        fromSdk: true,
+        inputTokens: 10,
+        outputTokens: 12,
+        targetTokens: 100,
+        durationMs: 5,
+      }),
+    });
+
+    await coordinator.ingestEvent({
+      id: 'ev-commit-disabled-1',
+      target,
+      eventType: 'assistant.text',
+      content: 'Meaningful turn to commit after re-enable',
+      createdAt: 6_000,
+    });
+
+    const isReadySpy = vi.spyOn(client, 'isReady', 'get').mockReturnValue(true);
+    const origRun = client.run.bind(client);
+    const postCommitErrorRunOps: string[] = [];
+    let commitCallStarted = false;
+    let releaseCommitCall!: () => void;
+    const callSpy = vi.spyOn(client, 'call').mockImplementation(async (op, args, opts) => {
+      if (op === 'commitMaterialization') {
+        commitCallStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseCommitCall = resolve;
+        });
+      }
+      return origRun(op, args, opts);
+    });
+    const runSpy = vi.spyOn(client, 'run').mockImplementation(async (op, args, opts) => {
+      if (commitCallStarted) postCommitErrorRunOps.push(op);
+      return origRun(op, args, opts);
+    });
+
+    const matPromise = coordinator.materializeTarget(target, 'manual', 6_100);
+    await vi.waitFor(() => expect(commitCallStarted).toBe(true));
+    setMemoryDaemonEnabled(false);
+    releaseCommitCall();
+
+    const pausedRes = await matPromise;
+    expect(pausedRes).toEqual({ replicationQueued: false, disabled: true });
+    // Must NOT fall back to a second commitMaterialization run() AND must NOT call updateContextJob('materialization_failed').
+    expect(postCommitErrorRunOps).toEqual([]);
+    expect(listContextEvents(target)).toHaveLength(1);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(1);
+    expect(listProcessedProjections(target.namespace)).toHaveLength(0);
+
+    // Re-enable on the same coordinator -> completes the batch cleanly.
+    callSpy.mockRestore();
+    runSpy.mockRestore();
+    isReadySpy.mockRestore();
+    setMemoryDaemonEnabled(true);
+    const due = await coordinator.scheduleDueTargets(6_200);
+    expect(due.length).toBeGreaterThanOrEqual(1);
+    await coordinator.materializeTarget(target, 'manual', 6_200);
+    expect(listContextEvents(target)).toHaveLength(0);
+    expect(listDirtyTargets(target.namespace)).toHaveLength(0);
+    expect(listProcessedProjections(target.namespace)).toHaveLength(1);
+    expect(listProcessedProjections(target.namespace)[0]?.summary).toContain('Commit pause recovery summary.');
+  });
 });
