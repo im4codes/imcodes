@@ -49,6 +49,7 @@ const TOOL_CALL_DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const TOOL_CALL_TIMEOUT_HEADROOM_MS = 60_000;
 const TOOL_CALL_MAX_DECLARED_TIMEOUT_MS = 60 * 60_000;
 const BACKEND_STABLE_UPTIME_MS = 30_000;
+const BACKEND_IDLE_TIMEOUT_MS = 5 * 60_000;
 const BACKEND_CALLER_ENV_EXIT_CODE = 2;
 const BACKEND_FATAL_ERROR_CODE = -32004;
 const MAX_QUEUED_REQUESTS = 64;
@@ -140,11 +141,13 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
   let startupTimer: ReturnType<typeof setTimeout> | null = null;
   let stableBackendTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let backendFatalError: string | null = null;
   let shuttingDown = false;
   let clientInitialized = false;
   const queued: QueuedMessage[] = [];
   const inFlight = new Map<string, InFlightRequest>();
+  const idleTerminatingChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   const inFlightRequestTimeoutMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS',
     IN_FLIGHT_REQUEST_TIMEOUT_MS,
@@ -160,6 +163,10 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const stableBackendUptimeMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_STABLE_UPTIME_MS',
     BACKEND_STABLE_UPTIME_MS,
+  );
+  const backendIdleTimeoutMs = testOnlyDuration(
+    'IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS',
+    BACKEND_IDLE_TIMEOUT_MS,
   );
   const owner: SessionResourceOwner | null = (() => {
     const sessionName = process.env.IMCODES_SESSION?.trim()
@@ -212,6 +219,45 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     }
   };
 
+  const clearIdleTimer = () => {
+    if (!idleTimer) return;
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  };
+
+  const terminateBackend = (child: ChildProcessWithoutNullStreams) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    const force = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }, 2_000);
+    force.unref?.();
+  };
+
+  const armIdleTimerIfIdle = () => {
+    clearIdleTimer();
+    if (shuttingDown || !backend || !backendReady || inFlight.size > 0 || queued.length > 0) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (shuttingDown || !backend || !backendReady || inFlight.size > 0 || queued.length > 0) return;
+      const child = backend;
+      idleTerminatingChildren.add(child);
+      backend = null;
+      backendReady = false;
+      restartAttempt = 0;
+      if (startupTimer) {
+        clearTimeout(startupTimer);
+        startupTimer = null;
+      }
+      if (stableBackendTimer) {
+        clearTimeout(stableBackendTimer);
+        stableBackendTimer = null;
+      }
+      terminateBackend(child);
+    }, backendIdleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
   const clearInFlight = (key: string): InFlightRequest | undefined => {
     const request = inFlight.get(key);
     if (!request) return undefined;
@@ -226,6 +272,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     child: ChildProcessWithoutNullStreams,
     currentGeneration: number,
   ) => {
+    clearIdleTimer();
     const key = idKey(id);
     clearInFlight(key);
     const declaredToolTimeoutMs = requestedToolTimeoutMs(message);
@@ -241,6 +288,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_request_timeout'));
       notifyWarning('backend request timed out; restarting it without replaying the request');
       if (backend === child) terminateBackend(child);
+      armIdleTimerIfIdle();
     }, timeoutMs);
     timer.unref?.();
     inFlight.set(key, { id, generation: currentGeneration, timer });
@@ -257,6 +305,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       if (id !== undefined && child) trackInFlight(id, item.message, child, generation);
       sendBackend(item.message);
     }
+    armIdleTimerIfIdle();
   };
 
   const enqueue = (message: JsonRpcMessage) => {
@@ -269,16 +318,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       if (id !== undefined) writeMessage(errorResponse(id, -32001, 'memory_mcp_backend_queue_full'));
       return;
     }
+    clearIdleTimer();
     const item: QueuedMessage = { message, timer: null };
     if (id !== undefined) {
       item.timer = setTimeout(() => {
         const index = queued.indexOf(item);
         if (index >= 0) queued.splice(index, 1);
         writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_unavailable'));
+        armIdleTimerIfIdle();
       }, QUEUED_REQUEST_TIMEOUT_MS);
       item.timer.unref?.();
     }
     queued.push(item);
+  };
+
+  const ensureBackendStarted = () => {
+    if (shuttingDown || backend || backendFatalError || restartTimer) return;
+    startBackend();
   };
 
   const scheduleRestart = () => {
@@ -290,15 +346,6 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       startBackend();
     }, delay);
     restartTimer.unref?.();
-  };
-
-  const terminateBackend = (child: ChildProcessWithoutNullStreams) => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill('SIGTERM');
-    const force = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    }, 2_000);
-    force.unref?.();
   };
 
   const startBackend = () => {
@@ -378,6 +425,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         return;
       }
       writeMessage(message);
+      armIdleTimerIfIdle();
     });
     child.stderr.on('data', (chunk: Buffer) => {
       const text = String(chunk);
@@ -393,20 +441,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     child.on('error', (error) => notifyWarning(`backend process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       output.close();
-      const deterministicFailure = code === BACKEND_CALLER_ENV_EXIT_CODE;
+      const idleReaped = idleTerminatingChildren.has(child);
+      const deterministicFailure = !idleReaped && code === BACKEND_CALLER_ENV_EXIT_CODE;
       appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BACKEND_EXIT, {
         ...lifecycleFields,
         backendPid: child.pid,
         generation: currentGeneration,
         code,
         signal,
-        expected: shuttingDown || backend !== child,
+        expected: shuttingDown || idleReaped || backend !== child,
+        ...(idleReaped ? { reason: 'idle_timeout' } : {}),
         ...(deterministicFailure ? {
           reason: 'caller_env_rejected',
           error: childCallerEnvError ?? 'caller environment rejected',
         } : {}),
       });
       if (backend !== child) return;
+      clearIdleTimer();
       backend = null;
       backendReady = false;
       if (deterministicFailure) {
@@ -474,6 +525,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const shutdown = async (releaseOwnResource = true) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    clearIdleTimer();
     if (restartTimer) clearTimeout(restartTimer);
     if (startupTimer) clearTimeout(startupTimer);
     if (stableBackendTimer) clearTimeout(stableBackendTimer);
@@ -578,12 +630,15 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       writeMessage(errorResponse(id, -32601, 'Method not found'));
       return;
     }
+    clearIdleTimer();
     const child = backend;
     if (backendReady && child && sendBackend(message)) {
       if (id !== undefined) trackInFlight(id, message, child, generation);
+      else armIdleTimerIfIdle();
       return;
     }
     enqueue(message);
+    ensureBackendStarted();
   });
   input.on('close', () => {
     logExit(MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE);
@@ -619,5 +674,4 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       error: message.slice(0, 500),
     });
   });
-  startBackend();
 }

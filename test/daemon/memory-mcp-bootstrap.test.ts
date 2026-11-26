@@ -141,7 +141,12 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(profile.initialCatalogBudgetMs).toBeLessThan(profile.backendDelayMs);
     expect(profile.catalogWaitMs).toBeGreaterThan(profile.backendDelayMs);
 
-    const { client, transport } = connect({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: String(profile.backendDelayMs) });
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-delayed-'));
+    const startLog = join(dir, 'starts.log');
+    const { client, transport } = connect({
+      IMCODES_MEMORY_MCP_TEST_DELAY_MS: String(profile.backendDelayMs),
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+    });
     const startedAt = Date.now();
     await client.connect(transport);
     const initial = await client.listTools();
@@ -151,10 +156,11 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(Date.now() - startedAt).toBeLessThan(profile.initialCatalogBudgetMs);
     expect(initial.tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
     expect(initial.tools.length).toBeGreaterThan(35);
+    expect(await readFile(startLog, 'utf8').catch(() => '')).toBe('');
 
-    await waitForFixtureCatalog(client, profile.catalogWaitMs);
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'ready' } }))
       .resolves.toMatchObject({ structuredContent: { echoed: 'ready' } });
+    await waitForFixtureCatalog(client, profile.catalogWaitMs);
   }
 
   it('dispatches before the daemon CLI graph and serves initialize/catalog while backend import is delayed', async () => {
@@ -178,10 +184,10 @@ describe('memory MCP lightweight bootstrap', () => {
     await client.connect(transport);
     expect((await client.listTools()).tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
 
-    await waitForFixtureCatalog(client);
-    expect(stderr.join('')).toContain('reconnecting automatically');
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'recovered' } }))
       .resolves.toMatchObject({ structuredContent: { echoed: 'recovered' } });
+    await waitForFixtureCatalog(client);
+    expect(stderr.join('')).toContain('reconnecting automatically');
   }, 15_000);
 
   it('does not restart a deterministic caller-env rejection and returns its reason', async () => {
@@ -260,6 +266,7 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_RESOURCE_RUNTIME_EPOCH: 'epoch-backend-owned',
     });
     await client.connect(transport);
+    await client.callTool({ name: 'mcp_tool_search', arguments: { query: 'session_runtime_identity_get' } }).catch(() => {});
     const registryDir = join(home, 'session-resources');
     // The backend-owner registration happens after the source-mode child has
     // loaded the daemon graph and started its supervised generation.  Under a
@@ -319,6 +326,7 @@ describe('memory MCP lightweight bootstrap', () => {
         IMCODES_MCP_HOST_LIFETIME: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST,
       });
       await client.connect(transport);
+      await client.callTool({ name: 'mcp_tool_search', arguments: { query: 'session_runtime_identity_get' } }).catch(() => {});
       await waitFor(async () => (await registry.list()).find((row) => row.resourceId.startsWith(`mcp-backend:${epoch}:`)), 30_000);
     }
     expect(await registry.list()).toHaveLength(4);
@@ -341,6 +349,7 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_STABLE_UPTIME_MS: '5000',
     });
     await client.connect(transport);
+    void client.callTool({ name: 'fixture_echo', arguments: { value: 'wake' } }).catch(() => {});
     const starts = await waitForStarts(startLog, 4);
     expect(starts[2]! - starts[1]!).toBeGreaterThanOrEqual(750);
     expect(starts[3]! - starts[2]!).toBeGreaterThanOrEqual(2_500);
@@ -356,7 +365,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_TOOL_CALL_TIMEOUT_MS: '150',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'hang-once' } }))
       .rejects.toThrow(/memory_mcp_backend_request_timeout/);
     await waitForStarts(startLog, 2);
@@ -373,6 +381,8 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
     });
     await client.connect(transport);
+    await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'warmup' } }))
+      .resolves.toMatchObject({ structuredContent: { echoed: 'warmup' } });
     await waitForFixtureCatalog(client);
 
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'exit-now' } }))
@@ -397,7 +407,6 @@ describe('memory MCP lightweight bootstrap', () => {
     })}\n`);
     await waitFor(() => messages.find((message) => message.id === 1));
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-    await waitFor(() => messages.find((message) => message.method === 'notifications/tools/list_changed'));
 
     child.stdin.write(`${JSON.stringify({
       jsonrpc: '2.0', id: 77, method: 'tools/call',
@@ -415,7 +424,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS: '150',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({
       name: 'fixture_echo',
       arguments: { value: 'declared-timeout', delayMs: 300, timeoutMs: 120_000 },
@@ -428,7 +436,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_TOOL_TIMEOUT_HEADROOM_MS: '50',
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
     await expect(client.callTool({
       name: 'fixture_echo',
       arguments: { value: 'short-declared-timeout', delayMs: 500, timeoutMs: 100 },
@@ -442,7 +449,6 @@ describe('memory MCP lightweight bootstrap', () => {
       IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
     });
     await client.connect(transport);
-    await waitForFixtureCatalog(client);
 
     const slow = client.callTool({
       name: 'fixture_echo',
@@ -456,4 +462,48 @@ describe('memory MCP lightweight bootstrap', () => {
     await expect(slow).resolves.toMatchObject({ structuredContent: { echoed: 'slow' } });
     expect(await waitForStarts(startLog, 1)).toHaveLength(1);
   }, 50_000);
+
+  it('stays lazy across initialize/ping/tools/list and reaps idle backend with transparent respawn', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-idle-reap-'));
+    const startLog = join(dir, 'starts.log');
+    const { client, transport, stderr } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '200',
+    });
+    await client.connect(transport);
+    await client.ping();
+    const initialTools = await client.listTools();
+    expect(initialTools.tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+    expect(await readFile(startLog, 'utf8').catch(() => ''), 'must not spawn backend before first real call').toBe('');
+
+    // First real call wakes the backend and protects in-flight work past the idle TTL.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'in-flight-hold', delayMs: 350 },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'in-flight-hold' } });
+    expect(await waitForStarts(startLog, 1)).toHaveLength(1);
+
+    // After the call settles and the idle window elapses, the backend exits cleanly without restart.
+    const idleExitEvent = await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      const events = log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+      return events.find((e) => e.event === 'backend_exit' && e.reason === 'idle_timeout');
+    }, 5_000);
+    expect(idleExitEvent).toMatchObject({ expected: true, reason: 'idle_timeout' });
+    expect(stderr.join('')).not.toContain('reconnecting automatically');
+
+    await new Promise((resolveWait) => setTimeout(resolveWait, 350));
+    expect(await waitForStarts(startLog, 1)).toHaveLength(1);
+
+    // Next real call transparently respawns generation 2 and succeeds.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'respawned' },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'respawned' } });
+    expect(await waitForStarts(startLog, 2)).toHaveLength(2);
+  }, 15_000);
 });

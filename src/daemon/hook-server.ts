@@ -60,7 +60,6 @@ import {
   AGENT_DELEGATION_REPLY_TOTAL_BYTES,
 } from '../../shared/agent-delegation.js';
 import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
-import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
@@ -85,18 +84,29 @@ import {
   isMemoryMcpDaemonToolName,
   type MemoryMcpDaemonToolName,
 } from '../../shared/memory-mcp-daemon-rpc.js';
-import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import {
+  MEMORY_MCP_HTTP_PATH,
+  createMemoryMcpHttpHandler,
+  resolveSessionMcpCallerContext,
+  scopeMemoryCallerForParticipantTurn,
+  validCapabilityNamespace,
+} from './memory-mcp-http.js';
+import {
+  clearLiveHookServerPort,
+  getActiveHookServerPort,
+  setLiveHookServerPort,
+} from './hook-server-state.js';
 import {
   SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { AMBIGUOUS_PARTICIPANT_ACTOR, readSenderParticipantTurn, type SenderParticipantTurn } from './sender-participant-turn.js';
+import { readSenderParticipantTurn } from './sender-participant-turn.js';
 import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
-export { DEFAULT_HOOK_PORT };
+export { DEFAULT_HOOK_PORT, getActiveHookServerPort };
 
 
 /** Max body size: 1 MB */
@@ -119,19 +129,6 @@ const SESSION_RESTART_BATCH_MAX = 50;
 const LIFECYCLE_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
 /** Max broadcast recipients */
 const MAX_BROADCAST_RECIPIENTS = 8;
-
-function validCapabilityNamespace(value: unknown): value is ContextNamespace {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const namespace = value as ContextNamespace;
-  if (!isMemoryScope(namespace.scope)) return false;
-  return validateMemoryScopeIdentity(namespace.scope, {
-    user_id: namespace.userId,
-    project_id: namespace.projectId,
-    workspace_id: namespace.workspaceId,
-    org_id: namespace.enterpriseId,
-    tenant_id: namespace.localTenant,
-  }).ok;
-}
 
 function capabilityNamespaceForSession(session: SessionRecord, ownerId: string): ContextNamespace {
   const rawNamespace: unknown = session.contextNamespace;
@@ -288,12 +285,20 @@ class HookRebindPublishError extends Error {
 
 /** Servers whose close was REQUESTED by the daemon. */
 const intentionallyClosing = new WeakSet<http.Server>();
+const serverCloseCleanups = new WeakMap<http.Server, () => Promise<void>>();
 
 /** Close the hook server and await it. Daemon shutdown MUST use this so the
  *  self-healing rebind is not armed in the middle of teardown. */
-export function closeHookServer(server: http.Server): Promise<void> {
+export async function closeHookServer(server: http.Server): Promise<void> {
   intentionallyClosing.add(server);
-  return new Promise<void>((resolve, reject) => {
+  clearLiveHookServerPort(server);
+  const cleanup = serverCloseCleanups.get(server);
+  if (cleanup) {
+    serverCloseCleanups.delete(server);
+    await cleanup().catch(() => {});
+  }
+  server.closeAllConnections?.();
+  await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
 }
@@ -958,51 +963,6 @@ export interface HookServerOptions {
   switchSessionModel?: (sessionName: string, model?: string, thinking?: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>;
 }
 
-const PARTICIPANT_SCOPED_MEMORY_TOOLS = new Set<MemoryMcpDaemonToolName>([
-  MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-  MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
-  MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-  MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
-  MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY,
-  MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
-  MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY,
-  MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
-  MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
-  MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
-]);
-
-function scopeMemoryCallerForParticipantTurn(
-  baseCaller: McpRuntimeCaller,
-  participantTurn: SenderParticipantTurn | boolean | null,
-  tool: MemoryMcpDaemonToolName,
-): McpRuntimeCaller {
-  if (!participantTurn || !PARTICIPANT_SCOPED_MEMORY_TOOLS.has(tool)) {
-    return baseCaller;
-  }
-  const actorUserId = typeof participantTurn === 'object'
-    && participantTurn !== null
-    && typeof participantTurn.actorUserId === 'string'
-    && participantTurn.actorUserId.trim()
-    ? participantTurn.actorUserId.trim()
-    : AMBIGUOUS_PARTICIPANT_ACTOR;
-  const participantAuthority = typeof participantTurn === 'object'
-    && participantTurn !== null
-    && typeof participantTurn.authority === 'string'
-    && participantTurn.authority.trim()
-    ? participantTurn.authority.trim()
-    : null;
-  return Object.freeze({
-    ...baseCaller,
-    userId: actorUserId,
-    namespace: {
-      ...baseCaller.namespace,
-      userId: actorUserId,
-    },
-    isParticipantTurn: true,
-    participantAuthority,
-  });
-}
-
 async function invokeDaemonMemoryMcpTool(
   caller: McpRuntimeCaller,
   tool: MemoryMcpDaemonToolName,
@@ -1023,9 +983,22 @@ export async function startHookServer(
   // identity on the instance so one server can never advertise another
   // server's port when starts overlap.
   let boundPort = preferredPort;
+  const memoryMcpHttp = createMemoryMcpHttpHandler({
+    port: () => boundPort,
+    memoryMcpServerId: options.memoryMcpServerId,
+    invokeMemoryMcpTool: options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool,
+  });
 
   const server = http.createServer(async (req, res) => {
-    if (req.method !== 'POST') {
+    const urlPath = (req.url ?? '').split('?', 1)[0];
+    const isMemoryMcpHttp = urlPath === MEMORY_MCP_HTTP_PATH;
+    if (isMemoryMcpHttp) {
+      if (req.method !== 'POST' && req.method !== 'GET' && req.method !== 'DELETE') {
+        res.writeHead(405, { 'Allow': 'GET, POST, DELETE' });
+        res.end();
+        return;
+      }
+    } else if (req.method !== 'POST') {
       res.writeHead(404);
       res.end();
       return;
@@ -1049,6 +1022,11 @@ export async function startHookServer(
       return true;
     };
     if (rejectUnverifiedClaim(Array.isArray(claimedHeader) ? claimedHeader[0] : claimedHeader)) return;
+
+    if (isMemoryMcpHttp) {
+      await memoryMcpHttp.handleRequest(req, res);
+      return;
+    }
 
     // Owner verification. Unauthenticated on purpose: every local client (the
     // stdio MCP child, `imcodes send`, the peer-audit CLI) must be able to ask
@@ -1122,42 +1100,18 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_tool_forbidden' }));
           return;
         }
-        const requestedServerId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
-        const authenticatedOwner = requestedServerId
-          ? getAuthenticatedCapabilityOwner(requestedServerId)
-          : undefined;
-        const daemonServerId = options.memoryMcpServerId?.trim() ?? '';
-        // Normalize the legacy implicit owner before validation. Validating
-        // first rejects persisted personal namespaces that intentionally omit
-        // userId, then silently falls back to a different user_private
-        // namespace and makes every existing project memory row disappear.
-        const normalizedStoredNamespace = session.contextNamespace
-          ? normalizeDaemonLocalMemoryNamespace(session.contextNamespace)
-          : null;
-        const storedNamespace = validCapabilityNamespace(normalizedStoredNamespace)
-          ? normalizedStoredNamespace
-          : { scope: 'user_private' as const, userId: LEGACY_DAEMON_LOCAL_USER_ID };
-        const storedUserId = storedNamespace.userId?.trim() || LEGACY_DAEMON_LOCAL_USER_ID;
-        const isDaemonBoundLegacyNamespace = storedUserId === LEGACY_DAEMON_LOCAL_USER_ID
-          && Boolean(daemonServerId)
-          && requestedServerId === daemonServerId;
-        if (requestedServerId
-          && authenticatedOwner !== storedUserId
-          && !isDaemonBoundLegacyNamespace) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_server_identity_unavailable' }));
+        const callerCtx = resolveSessionMcpCallerContext({
+          session,
+          requestedServerId: typeof body.serverId === 'string' ? body.serverId : undefined,
+          daemonServerId: options.memoryMcpServerId,
+          transport: 'in_process',
+          fallbackToDaemonServerId: false,
+        });
+        if (!callerCtx.ok) {
+          res.writeHead(callerCtx.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: callerCtx.error }));
           return;
         }
-        const baseCaller: McpRuntimeCaller = Object.freeze({
-          userId: storedUserId,
-          namespace: storedNamespace,
-          sessionName: session.name,
-          projectName: session.projectName,
-          projectRoot: session.projectDir,
-          serverId: requestedServerId || null,
-          providerId: session.providerId ?? session.agentType,
-          transport: 'in_process',
-        });
         const participantTurn = readSenderParticipantTurn(session.name);
         // Strictly user-personal preference writes stay isolated from shared-session participant turns;
         // memory read/write tools are scoped to the participant actor identity rather than owner-private storage,
@@ -1174,7 +1128,7 @@ export async function startHookServer(
           }));
           return;
         }
-        const caller = scopeMemoryCallerForParticipantTurn(baseCaller, participantTurn, body.tool);
+        const caller = scopeMemoryCallerForParticipantTurn(callerCtx.caller, participantTurn, body.tool);
         const invoke = options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool;
         const result = await invoke(caller, body.tool, body.input);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1893,6 +1847,7 @@ export async function startHookServer(
           : port;
         boundPort = actualPort;
         activeHookPort = actualPort;
+        setLiveHookServerPort(server, actualPort);
         return actualPort;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
@@ -1921,11 +1876,19 @@ export async function startHookServer(
   /** Close the listener if it is up. Re-entry is already blocked by
    *  `rebinding`, so the `'close'` this emits is ignored. */
   const releaseListener = async (): Promise<void> => {
+    clearLiveHookServerPort(server);
     if (!server.listening) return;
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
   };
+
+  serverCloseCleanups.set(server, () => memoryMcpHttp.closeAll());
+  server.once('close', () => {
+    clearLiveHookServerPort(server);
+    serverCloseCleanups.delete(server);
+    void memoryMcpHttp.closeAll();
+  });
 
   const rebindOnce = async (cause: string): Promise<number> => {
     // An `'error'` event does NOT imply the handle was released, and `listen()`

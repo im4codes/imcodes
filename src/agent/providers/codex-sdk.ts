@@ -112,6 +112,12 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-serve
 import { IMCODES_MCP_HOST_LIFETIME_ENV, SESSION_RESOURCE_LIFETIME } from '../../../shared/session-resource-lifecycle.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
+import { getActiveHookServerPort, MEMORY_MCP_HTTP_HEADERS, MEMORY_MCP_HTTP_PATH } from '../../daemon/hook-server-state.js';
+import { HOOK_SESSION_CREDENTIAL_ENV } from '../../../shared/hook-session-credential.js';
+import { IMCODES_DAEMON_SERVER_ID_ENV, IMCODES_DAEMON_SESSION_NAME_ENV } from '../../../shared/memory-mcp-env.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
+import { getSession } from '../../store/session-store.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -1302,23 +1308,53 @@ function buildCodexShellEnvironmentSet(config: SessionConfig): Record<string, st
   };
 }
 
-export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
-  const server = config.incognito ? undefined : getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+export function buildCodexMcpThreadConfig(
+  config: SessionConfig,
+  options: { httpPort?: number | null } = {},
+): Record<string, unknown> | undefined {
   const shellEnvSet = buildCodexShellEnvironmentSet(config);
-  if (!server && !shellEnvSet) return undefined;
-  return {
-    ...(server ? {
-      mcp_servers: {
-        [IMCODES_MEMORY_MCP_SERVER_NAME]: {
-          command: server.command,
-          args: server.args,
-          // The server is a child of the SHARED app-server and lives with this
-          // thread, which Codex keeps loaded across our session relaunch (a
-          // resume of a loaded thread never respawns MCP servers). Declare that,
-          // so relaunch cleanup and the orphan sweep never reap it by owner
-          // epoch and strand the thread on "Transport closed".
-          env: { ...server.env, [IMCODES_MCP_HOST_LIFETIME_ENV]: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST },
+  const env = config.env ?? {};
+  const sessionName = (config.sessionName ?? env[IMCODES_SESSION_ENV] ?? env[IMCODES_DAEMON_SESSION_NAME_ENV])?.trim();
+  const liveHttpPort = config.incognito
+    ? null
+    : (options.httpPort === undefined ? getActiveHookServerPort() : options.httpPort);
+
+  let mcpServerEntry: Record<string, unknown> | undefined;
+  if (!config.incognito) {
+    if (liveHttpPort !== null && sessionName) {
+      const sessionInstanceId = (config.sessionInstanceId ?? env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID])?.trim();
+      const serverId = (config.serverId ?? env[IMCODES_DAEMON_SERVER_ID_ENV])?.trim();
+      const hookCredential = (env[HOOK_SESSION_CREDENTIAL_ENV] ?? getSession(sessionName)?.hookCredential)?.trim();
+      mcpServerEntry = {
+        url: `http://127.0.0.1:${liveHttpPort}${MEMORY_MCP_HTTP_PATH}`,
+        http_headers: {
+          [MEMORY_MCP_HTTP_HEADERS.SESSION]: sessionName,
+          [MEMORY_MCP_HTTP_HEADERS.TOOL_CATALOG_MODE]: MCP_TOOL_CATALOG_MODES.STATIC_FULL,
+          ...(sessionInstanceId ? { [MEMORY_MCP_HTTP_HEADERS.SESSION_INSTANCE_ID]: sessionInstanceId } : {}),
+          ...(serverId ? { [MEMORY_MCP_HTTP_HEADERS.SERVER_ID]: serverId } : {}),
+          ...(hookCredential ? { [MEMORY_MCP_HTTP_HEADERS.HOOK_CREDENTIAL]: hookCredential } : {}),
         },
+      };
+    } else {
+      const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+      mcpServerEntry = {
+        command: server.command,
+        args: server.args,
+        // The server is a child of the SHARED app-server and lives with this
+        // thread, which Codex keeps loaded across our session relaunch (a
+        // resume of a loaded thread never respawns MCP servers). Declare that,
+        // so relaunch cleanup and the orphan sweep never reap it by owner
+        // epoch and strand the thread on "Transport closed".
+        env: { ...server.env, [IMCODES_MCP_HOST_LIFETIME_ENV]: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST },
+      };
+    }
+  }
+
+  if (!mcpServerEntry && !shellEnvSet) return undefined;
+  return {
+    ...(mcpServerEntry ? {
+      mcp_servers: {
+        [IMCODES_MEMORY_MCP_SERVER_NAME]: mcpServerEntry,
       },
     } : {}),
     ...(shellEnvSet ? { shell_environment_policy: { set: shellEnvSet } } : {}),

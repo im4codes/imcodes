@@ -26,7 +26,13 @@ import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
 } from '../../../shared/memory-ws.js';
-import { getDefaultCodexMcpArgs, getCodexAppServerArgs } from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
+import {
+  getDefaultCodexMcpArgs,
+  getCodexAppServerArgs,
+  collectCodexTomlMcpServerKeysForIncognito,
+  findEnabledImcodesMcpKeysFromConfig,
+} from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
+import { buildCodexMcpThreadConfig } from '../../../src/agent/providers/codex-sdk.js';
 import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
@@ -299,5 +305,40 @@ describe('production parent-identity injection', () => {
     expect(server.args).toEqual([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]);
     const codex = getDefaultCodexMcpArgs(sessionConfig).join(' ');
     expect(codex).toContain(`command=${JSON.stringify(IMCODES_MEMORY_MCP_LAUNCH_COMMAND)}`);
+  });
+
+  it('switches Codex per-thread MCP to Streamable HTTP when a live hook port is active and preserves incognito isolation', () => {
+    expect(getDefaultCodexMcpArgs({ httpPort: 51999 })).toEqual([]);
+    expect(getCodexAppServerArgs({ httpPort: 51999 })).toEqual([
+      '-c',
+      'features.default_mode_request_user_input=true',
+      'app-server',
+    ]);
+
+    const httpCfg = buildCodexMcpThreadConfig(sessionConfig, { httpPort: 51999 }) as Record<string, any>;
+    expect(httpCfg.mcp_servers[IMCODES_MEMORY_MCP_SERVER_NAME]).toEqual({
+      url: 'http://127.0.0.1:51999/mcp',
+      http_headers: {
+        'x-imcodes-session': 'deck_alpha_worker',
+        'x-imcodes-session-instance-id': 'instance-bound',
+        'x-imcodes-mcp-catalog-mode': 'static_full',
+        'x-imcodes-server-id': 'srv-bound',
+      },
+    });
+
+    const incogHttpCfg = buildCodexMcpThreadConfig({ ...sessionConfig, incognito: true }, { httpPort: 51999 });
+    expect(incogHttpCfg?.mcp_servers).toBeUndefined();
+
+    expect(collectCodexTomlMcpServerKeysForIncognito(`
+[mcp_servers.custom-http]
+url = "http://127.0.0.1:51915/mcp"
+[mcp_servers.custom-hdr.http_headers]
+x-imcodes-session = "deck_cd_brain"
+`)).toEqual(['custom-http', 'custom-hdr']);
+
+    expect(findEnabledImcodesMcpKeysFromConfig({
+      'custom-http': { url: 'http://127.0.0.1:51915/mcp' },
+      'disabled-http': { url: 'http://127.0.0.1:51915/mcp', enabled: false },
+    })).toEqual(['custom-http']);
   });
 });

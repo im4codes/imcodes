@@ -7,6 +7,11 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-serve
 import { IMCODES_MCP_TOOL_CATALOG_MODE_ENV } from '../../../shared/memory-mcp-env.js';
 import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 import { CODEX_DEFAULT_USER_INPUT_CONFIG } from '../../../shared/codex-user-input.js';
+import {
+  getActiveHookServerPort,
+  MEMORY_MCP_HTTP_HEADERS,
+  MEMORY_MCP_HTTP_PATH,
+} from '../../daemon/hook-server-state.js';
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
@@ -145,12 +150,29 @@ function parseSimpleTomlStringArray(raw: string): string[] | undefined {
   return items;
 }
 
+function isImcodesMemoryMcpUrl(url: unknown): boolean {
+  if (typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1' || parsed.hostname === '[::1]')
+      && parsed.pathname === MEMORY_MCP_HTTP_PATH;
+  } catch {
+    return false;
+  }
+}
+
+function hasImcodesMemoryHttpHeaders(headers: unknown): boolean {
+  if (!headers || typeof headers !== 'object') return false;
+  const record = headers as Record<string, unknown>;
+  return Object.keys(record).some((key) => key.toLowerCase() === MEMORY_MCP_HTTP_HEADERS.SESSION);
+}
+
 /**
  * Finds `mcp_servers` keys in Codex `config.toml` that name or launch IM.codes memory MCP
  * so incognito app-server processes can explicitly disable them via `-c mcp_servers.<key>.enabled=false`.
  */
 export function collectCodexTomlMcpServerKeysForIncognito(tomlText: string): string[] {
-  const tracked = new Map<string, { directName: boolean; command?: string; args?: string[] }>();
+  const tracked = new Map<string, { directName: boolean; command?: string; args?: string[]; url?: string; hasImcodesHeader?: boolean }>();
   const ensureEntry = (name: string) => {
     let entry = tracked.get(name);
     if (!entry) {
@@ -191,11 +213,21 @@ export function collectCodexTomlMcpServerKeysForIncognito(tomlText: string): str
     } else if (fullPath.length === 3 && fullPath[2] === 'args') {
       const args = parseSimpleTomlStringArray(valuePart);
       if (args !== undefined) entry.args = args;
+    } else if (fullPath.length === 3 && fullPath[2] === 'url') {
+      const url = parseSimpleTomlStringValue(valuePart);
+      if (url !== undefined) entry.url = url;
+    } else if (fullPath.length === 4 && fullPath[2] === 'http_headers' && fullPath[3]?.toLowerCase() === MEMORY_MCP_HTTP_HEADERS.SESSION) {
+      entry.hasImcodesHeader = true;
     }
   }
   const result: string[] = [];
   for (const [name, info] of tracked) {
-    if (info.directName || (info.command && info.args && isImcodesMemoryMcpLaunch(info.command, info.args))) {
+    if (
+      info.directName
+      || (info.command && info.args && isImcodesMemoryMcpLaunch(info.command, info.args))
+      || isImcodesMemoryMcpUrl(info.url)
+      || info.hasImcodesHeader
+    ) {
       result.push(name);
     }
   }
@@ -204,7 +236,7 @@ export function collectCodexTomlMcpServerKeysForIncognito(tomlText: string): str
 
 /**
  * Inspects Codex `config/read` `config.mcp_servers` output and returns any server names
- * representing `imcodes-memory` (by canonical name or launch command/args) that are not disabled.
+ * representing `imcodes-memory` (by canonical name, stdio launch, or HTTP URL/headers) that are not disabled.
  */
 export function findEnabledImcodesMcpKeysFromConfig(mcpServers: unknown): string[] {
   if (!mcpServers || typeof mcpServers !== 'object') return [];
@@ -213,7 +245,12 @@ export function findEnabledImcodesMcpKeysFromConfig(mcpServers: unknown): string
     if (!rawEntry || typeof rawEntry !== 'object') continue;
     const entry = rawEntry as Record<string, unknown>;
     if (entry.enabled === false) continue;
-    if (name === IMCODES_MEMORY_MCP_SERVER_NAME || isImcodesMemoryMcpLaunch(entry.command, entry.args)) {
+    if (
+      name === IMCODES_MEMORY_MCP_SERVER_NAME
+      || isImcodesMemoryMcpLaunch(entry.command, entry.args)
+      || isImcodesMemoryMcpUrl(entry.url)
+      || hasImcodesMemoryHttpHeaders(entry.http_headers)
+    ) {
       enabled.push(name);
     }
   }
@@ -247,7 +284,11 @@ export function getCodexIncognitoAppServerArgs(disabledMcpServers: readonly stri
   ];
 }
 
-export function getDefaultCodexMcpArgs(): string[] {
+export function getDefaultCodexMcpArgs(options: { httpPort?: number | null } & Record<string, unknown> = {}): string[] {
+  const livePort = options.httpPort === undefined ? getActiveHookServerPort() : options.httpPort;
+  if (livePort !== null) {
+    return [];
+  }
   const prefix = `mcp_servers.${IMCODES_MEMORY_MCP_SERVER_NAME}`;
   return [
     '-c',
@@ -274,11 +315,11 @@ export function getDefaultCodexMcpArgs(): string[] {
  * (src/daemon/native-agent-admission.ts). The MCP catalog stays static_full,
  * so IM send_message and the supervision tools remain the authoritative route.
  */
-export function getCodexAppServerArgs(): string[] {
+export function getCodexAppServerArgs(options: { httpPort?: number | null } = {}): string[] {
   // Native questions are otherwise Plan-only. Enable the actual Codex tool in
   // Default mode too; do not invent or override its provider-owned schema.
   return [
-    ...getDefaultCodexMcpArgs(),
+    ...getDefaultCodexMcpArgs(options),
     '-c',
     CODEX_DEFAULT_USER_INPUT_CONFIG,
     '-c',
