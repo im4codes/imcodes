@@ -506,4 +506,98 @@ describe('memory MCP lightweight bootstrap', () => {
     })).resolves.toMatchObject({ structuredContent: { echoed: 'respawned' } });
     expect(await waitForStarts(startLog, 2)).toHaveLength(2);
   }, 15_000);
+
+  it('replays published dynamic-catalog selection (without fallbackCall) before direct long-tail calls after idle reap', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-dynamic-reap-'));
+    const startLog = join(dir, 'starts.log');
+    const callLog = join(dir, 'calls.log');
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_DYNAMIC_CATALOG: '1',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+      IMCODES_MEMORY_MCP_TEST_CALL_LOG: callLog,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '200',
+    });
+    await client.connect(transport);
+    const initialList = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(initialList).toContain('mcp_tool_search');
+    expect(initialList).not.toContain('fixture_echo');
+
+    const searchResult = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: {
+        query: 'fixture_echo',
+        fallbackCall: { name: 'fixture_echo', arguments: { value: 'should-not-replay' } },
+      },
+    });
+    expect(searchResult).toMatchObject({ structuredContent: { published: ['fixture_echo'], fallbackExecuted: true } });
+    await waitForFixtureCatalog(client);
+
+    // Wait for idle reap of backend generation 1.
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.includes('"idle_timeout"') ? true : undefined;
+    }, 5_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+    // Direct call on the same MCP client succeeds transparently on generation 2.
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'after-idle-reap' },
+    })).resolves.toMatchObject({ structuredContent: { echoed: 'after-idle-reap' } });
+    expect(await waitForStarts(startLog, 2)).toHaveLength(2);
+
+    const calls = (await readFile(callLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { name: string; arguments: Record<string, unknown> });
+    // Calls: [gen1 search+fallback, gen2 search(activate:true, NO fallbackCall), gen2 fixture_echo]
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toEqual({ name: 'mcp_tool_search', arguments: { query: 'fixture_echo', activate: true } });
+    expect(calls[2]).toEqual({ name: 'fixture_echo', arguments: { value: 'after-idle-reap' } });
+  }, 15_000);
+
+  it('restores real-backend dynamic catalog publication across idle reap on direct long-tail call', async () => {
+    const home = isolatedImcodesHome();
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'dynamic',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_IDLE_MS: '250',
+      IMCODES_DAEMON_USER_ID: 'user-real',
+      IMCODES_DAEMON_NAMESPACE: JSON.stringify({ scope: 'personal', userId: 'user-real', projectId: 'github.com/acme/realproj' }),
+      IMCODES_DAEMON_SERVER_ID: 'srv-real',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_real_w1',
+      IMCODES_DAEMON_PROJECT_NAME: 'realproj',
+      IMCODES_DAEMON_PROJECT_ROOT: '/tmp/realproj',
+    });
+    await client.connect(transport);
+
+    const searchResult = await client.callTool({
+      name: 'mcp_tool_search',
+      arguments: { query: 'memory_injection_get' },
+    });
+    expect(searchResult).toMatchObject({ structuredContent: { status: 'ok', published: ['memory_injection_get'] } });
+    await waitFor(async () => {
+      const list = await client.listTools();
+      return list.tools.some((t) => t.name === 'memory_injection_get') ? true : undefined;
+    }, 8_000);
+
+    // Wait for real backend generation 1 idle reap.
+    await waitFor(async () => {
+      const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
+      return log.includes('"idle_timeout"') ? true : undefined;
+    }, 8_000);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+    // Direct call to memory_injection_get succeeds transparently after generation 2 replays mcp_tool_search.
+    const injResult = await client.callTool({
+      name: 'memory_injection_get',
+      arguments: {},
+    });
+    expect(injResult).toMatchObject({
+      structuredContent: { status: 'ok', enabled: true },
+    });
+  }, 20_000);
 });

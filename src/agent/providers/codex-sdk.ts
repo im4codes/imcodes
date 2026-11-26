@@ -1151,7 +1151,9 @@ interface CodexSdkSessionState {
    */
   turnCwd?: string;
   env?: Record<string, string>;
+  sourceConfig?: SessionConfig;
   mcpConfig?: Record<string, unknown>;
+  loadedMcpConfigJson?: string;
   /** Custom model provider (third-party / OpenAI-compatible endpoint) */
   customModelProvider?: CodexModelProviderConfig;
   /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
@@ -1322,9 +1324,14 @@ export function buildCodexMcpThreadConfig(
   let mcpServerEntry: Record<string, unknown> | undefined;
   if (!config.incognito) {
     if (liveHttpPort !== null && sessionName) {
-      const sessionInstanceId = (config.sessionInstanceId ?? env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID])?.trim();
+      const storedSession = getSession(sessionName);
+      const sessionInstanceId = (
+        config.sessionInstanceId
+        ?? env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]
+        ?? storedSession?.sessionInstanceId
+      )?.trim();
       const serverId = (config.serverId ?? env[IMCODES_DAEMON_SERVER_ID_ENV])?.trim();
-      const hookCredential = (env[HOOK_SESSION_CREDENTIAL_ENV] ?? getSession(sessionName)?.hookCredential)?.trim();
+      const hookCredential = (env[HOOK_SESSION_CREDENTIAL_ENV] ?? storedSession?.hookCredential)?.trim();
       mcpServerEntry = {
         url: `http://127.0.0.1:${liveHttpPort}${MEMORY_MCP_HTTP_PATH}`,
         http_headers: {
@@ -1530,10 +1537,16 @@ function meaningfulString(value: unknown): string | undefined {
   return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
 }
 
-/** Codex's wording for an MCP server whose stdio transport is gone. */
+/** Codex's wording for an MCP server whose stdio or Streamable HTTP transport is gone. */
 function isClosedMcpTransportMessage(message: string): boolean {
   return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
-    || /MCP client is not connected/i.test(message);
+    || /MCP client is not connected/i.test(message)
+    || /Transport send error/i.test(message)
+    || /Send message error Transport/i.test(message)
+    || /HTTP request failed/i.test(message)
+    || /error sending request for url/i.test(message)
+    || /unexpected server response:\s*HTTP\s*404/i.test(message)
+    || /Session not found/i.test(message);
 }
 
 function isImcodesMcpTransportClosedItem(item: Record<string, any>): boolean {
@@ -3084,7 +3097,9 @@ export class CodexSdkProvider implements TransportProvider {
       ...(effectiveConfig.sessionName ? { imcodesSessionName: effectiveConfig.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
       cwd: normalizeTransportCwd(effectiveConfig.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((effectiveConfig.env as Record<string, string> | undefined) ?? {}) },
+      sourceConfig: effectiveConfig,
       mcpConfig: buildCodexMcpThreadConfig(effectiveConfig) ?? (incognito ? undefined : existing?.mcpConfig),
+      loadedMcpConfigJson: incognito ? undefined : existing?.loadedMcpConfigJson,
       customModelProvider,
       imcodesMcpRecoveryRequired: false,
       imcodesMcpRecoveryPromise: undefined,
@@ -3865,6 +3880,42 @@ export class CodexSdkProvider implements TransportProvider {
     throw lastError;
   }
 
+  private resolveLatestMcpConfig(state: CodexSdkSessionState): Record<string, unknown> | undefined {
+    if (state.incognito) return undefined;
+    if (!state.sourceConfig) return state.mcpConfig;
+    const refreshed = buildCodexMcpThreadConfig({
+      ...state.sourceConfig,
+      cwd: state.cwd,
+      env: state.env,
+      ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+    });
+    if (refreshed) {
+      state.mcpConfig = refreshed;
+    }
+    return state.mcpConfig;
+  }
+
+  private hasMcpConfigChangedSinceLoad(state: CodexSdkSessionState): boolean {
+    if (state.incognito || !state.threadId || !state.loaded || state.loadedMcpConfigJson === undefined) return false;
+    const currentJson = JSON.stringify(this.resolveLatestMcpConfig(state)?.mcp_servers ?? null);
+    return currentJson !== state.loadedMcpConfigJson;
+  }
+
+  private async reconcileMcpTransportConfig(
+    sessionId: string,
+    state: CodexSdkSessionState,
+  ): Promise<void> {
+    if (state.incognito) return;
+    if (!this.hasMcpConfigChangedSinceLoad(state)) return;
+    const channel = this.getChannelForSession(state);
+    state.loaded = false;
+    if (channel.kind === 'normal' && channel.child && this.getActiveWorkSessionIds(sessionId, channel).length === 0) {
+      logger.info({ provider: this.id, sessionId, threadId: state.threadId },
+        'Codex IM.codes MCP transport configuration changed; restarting idle app-server so thread reloads updated endpoint');
+      await this.restartAppServerPreservingSessions('mcp-config-changed', sessionId, channel);
+    }
+  }
+
   private recoverImcodesMcpAfterObservedClosure(
     sessionId: string,
     state: CodexSdkSessionState,
@@ -3874,9 +3925,29 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.imcodesMcpRecoveryPromise) return state.imcodesMcpRecoveryPromise;
     const threadId = state.threadId;
     if (!threadId) return Promise.reject(new ImcodesDelegationUnavailableError());
+    const channel = this.getChannelForSession(state);
     const recovery = (async () => {
-      await this.reloadImcodesMcpClient(reason);
-      await this.waitForImcodesMcpHydration(threadId);
+      const configChanged = this.hasMcpConfigChangedSinceLoad(state);
+      const canRestartChannel = channel.kind === 'normal' && this.getActiveWorkSessionIds(sessionId, channel).length === 0;
+      const restartAndResume = async () => {
+        await this.restartAppServerPreservingSessions(reason, sessionId, channel);
+        const baseInstructions = await resolveBaseInstructionsOverride(state.model);
+        await this.resumeThread(sessionId, state, baseInstructions);
+      };
+      if (configChanged && canRestartChannel) {
+        await restartAndResume();
+        await this.waitForImcodesMcpHydration(threadId);
+      } else {
+        try {
+          await this.reloadImcodesMcpClient(reason);
+          await this.waitForImcodesMcpHydration(threadId);
+        } catch (reloadErr) {
+          if (!canRestartChannel) throw reloadErr;
+          this.resolveLatestMcpConfig(state);
+          await restartAndResume();
+          await this.waitForImcodesMcpHydration(threadId);
+        }
+      }
       if (this.sessions.get(sessionId) === state && state.threadId === threadId) {
         state.imcodesMcpRecoveryRequired = false;
       }
@@ -4278,6 +4349,9 @@ export class CodexSdkProvider implements TransportProvider {
         && desiredSessionSystemText
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
+      if (!state.incognito) {
+        await this.reconcileMcpTransportConfig(sessionId, state);
+      }
       const reusesExistingThread = Boolean(state.threadId);
       await this.ensureThreadLoaded(sessionId, state, payload);
       this.assertSessionStateActiveForSend(sessionId, state, channel, channelGeneration);
@@ -4746,6 +4820,9 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.incognito && !state.ephemeral) {
       this.markThreadResident(channel, resumedId);
     }
+    if (!state.incognito) {
+      state.loadedMcpConfigJson = JSON.stringify((threadConfigParams.config as Record<string, unknown> | undefined)?.mcp_servers ?? null);
+    }
     channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
   }
@@ -4810,6 +4887,9 @@ export class CodexSdkProvider implements TransportProvider {
       state.loaded = true;
       if (!state.incognito && !state.ephemeral) {
         this.markThreadResident(channel, threadId);
+      }
+      if (!state.incognito) {
+        state.loadedMcpConfigJson = JSON.stringify((threadConfigParams.config as Record<string, unknown> | undefined)?.mcp_servers ?? null);
       }
       channel.threadToSession.set(threadId, sessionId);
       if (!state.incognito || state.model) {
@@ -4878,7 +4958,8 @@ export class CodexSdkProvider implements TransportProvider {
     state: CodexSdkSessionState,
     fenced?: boolean,
   ): { config?: Record<string, unknown>; modelProvider?: string } {
-    const rawMcp = fenced ? withCodexNativeAgentFence(state.mcpConfig) : (state.mcpConfig ?? {});
+    const latestMcp = this.resolveLatestMcpConfig(state);
+    const rawMcp = fenced ? withCodexNativeAgentFence(latestMcp) : (latestMcp ?? {});
     const baseConfig = rawMcp ? { ...rawMcp } : {};
     if (state.incognito) delete baseConfig.mcp_servers;
     const provider = state.customModelProvider;

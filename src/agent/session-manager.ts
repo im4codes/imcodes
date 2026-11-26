@@ -3507,6 +3507,7 @@ export async function restoreTransportSessions(
       // process we are about to start.
       const restoreIdentity = getSession(s.name) ?? s;
       const restoredSessionInstanceId = restoreIdentity.sessionInstanceId?.trim();
+      const restoredHookCredential = restoreIdentity.hookCredential?.trim() || mintHookCredential();
       const restoredRuntimeEpoch = s.providerId === AGY_SDK_PROVIDER_ID
         ? randomUUID() : restoreIdentity.runtimeEpoch?.trim();
       await runtime.initialize({
@@ -3520,7 +3521,11 @@ export async function restoreTransportSessions(
         fresh: freshOnRestore,
         bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshOnRestore && !!s.providerSessionId,
-        env: buildTransportSessionEnv(s.name, s.label, { ...(extraEnv ?? {}), ...(restoreAuthContext?.env ?? {}) }, provider.id),
+        env: buildTransportSessionEnv(s.name, s.label, {
+          ...(extraEnv ?? {}),
+          ...(restoreAuthContext?.env ?? {}),
+          ...hookCredentialEnv(restoredHookCredential),
+        }, provider.id),
         authContext: restoreAuthContext,
         // Directory-scoped providers may persist a symlinked path spelling.
         // Reuse the provider's authoritative spelling for the resume RPC while
@@ -3584,6 +3589,7 @@ export async function restoreTransportSessions(
       registerProviderRoute(actualProviderSid, s.name);
       const restoredRecord: SessionRecord = {
         ...currentForFinalize,
+        hookCredential: restoredHookCredential,
         ...(s.providerId === AGY_SDK_PROVIDER_ID ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         state: 'idle',
         updatedAt: Date.now(),
@@ -4164,6 +4170,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     });
   }
 
+  // Inject both the display identity and the exact logical/runtime owner tuple.
+  const hookCredential = (!opts.fresh && existing?.agentType === agentType && existing?.hookCredential)
+    ? existing.hookCredential
+    : mintHookCredential();
   // Create session on provider
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
@@ -4177,7 +4187,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     trustedOwnerId: capabilityOwnerId,
     providerId: provider.id,
     fresh: !!opts.fresh,
-    env: buildTransportSessionEnv(name, label, { ...(transportEnv ?? {}), ...(launchAuthContext?.env ?? {}) }, agentType),
+    env: buildTransportSessionEnv(name, label, {
+      ...(transportEnv ?? {}),
+      ...(launchAuthContext?.env ?? {}),
+      ...hookCredentialEnv(hookCredential),
+    }, agentType),
     authContext: launchAuthContext,
     cwd: projectDir,
     label: label || name,
@@ -4226,6 +4240,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         name,
         sessionInstanceId: resourceSessionInstanceId,
         runtimeEpoch: resourceRuntimeEpoch,
+        ...(hookCredential ? { hookCredential } : {}),
         projectName,
         role,
         agentType,

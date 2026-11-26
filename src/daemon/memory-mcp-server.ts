@@ -100,6 +100,7 @@ import { getTransportQueueStore } from './transport-queue-store.js';
 import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
 import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { fileTransferMcpTimeoutMs } from '../../shared/transport/file-transfer.js';
+import { HOOK_SESSION_CREDENTIAL_ENV } from '../../shared/hook-session-credential.js';
 import {
   PARTICIPANT_TURN_TOOL_REFUSAL,
   isToolAllowedInParticipantTurn,
@@ -135,6 +136,8 @@ export interface MemoryMcpDaemonBridgeDeps {
   enqueueTransportResend?: typeof enqueueDurableResend;
   now?: () => number;
   env?: NodeJS.ProcessEnv;
+  /** Session hook credential for daemon-hosted transports lacking process env credentials. */
+  hookCredential?: string | (() => string | undefined);
 }
 
 const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
@@ -501,7 +504,10 @@ function capabilityError(message: string): CapabilityErrorResult {
   return { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN, error: message, retryable: false };
 }
 
-export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller): Promise<CapabilityRuntimeIdentity | null> {
+export async function resolveDaemonCapabilityIdentity(
+  caller: McpRuntimeCaller,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<CapabilityRuntimeIdentity | null> {
   if (!caller.sessionName || !caller.providerId || !caller.serverId) return null;
   const port = await resolveLiveHookPort();
   if (!port) return null;
@@ -509,7 +515,7 @@ export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller):
     const response = await postHookSend(port, {
       providerId: caller.providerId,
       serverId: caller.serverId,
-    }, '/capability-identity', caller.sessionName, 2_000);
+    }, '/capability-identity', caller.sessionName, 2_000, false, env);
     const namespace = response.namespace;
     const validNamespace = Boolean(namespace && typeof namespace === 'object' && !Array.isArray(namespace)
       && isMemoryScope((namespace as ContextNamespace).scope)
@@ -565,6 +571,13 @@ export function mergeDefaultToolDeps(
   const resolveHookPort = bridgeDeps.resolveHookPort ?? resolveLiveHookPort;
   const resolveAuthority = bridgeDeps.resolveHookAuthority
     ?? (() => resolveHookAuthority(bridgeDeps.env ? { home: imcodesStateDir(bridgeDeps.env) } : {}));
+  const resolveBridgeEnv = (): NodeJS.ProcessEnv => {
+    const base = bridgeDeps.env ?? process.env;
+    const cred = typeof bridgeDeps.hookCredential === 'function'
+      ? bridgeDeps.hookCredential()
+      : bridgeDeps.hookCredential;
+    return cred ? { ...base, [HOOK_SESSION_CREDENTIAL_ENV]: cred } : base;
+  };
   /** Resolve the hook endpoint or throw the ACCURATE endpoint-authority error.
    *
    *  This replaces `if (!port) throw new Error('daemon_memory_worker_unavailable')`.
@@ -581,7 +594,8 @@ export function mergeDefaultToolDeps(
   const now = bridgeDeps.now ?? Date.now;
   const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
   const resolveCapabilityIdentity = toolDeps.resolveCapabilityIdentity
-    ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
+    ?? (usesDefaultCapabilityService ? (c: McpRuntimeCaller) => resolveDaemonCapabilityIdentity(c, resolveBridgeEnv()) : undefined);
+  const initialBridgeEnv = resolveBridgeEnv();
   const postSharedMachineAuthorityHook = resourceOwner && caller.sessionName
     ? createResourceOwnerHookWithEpochRefresh({
       resourceOwner,
@@ -591,12 +605,13 @@ export function mergeDefaultToolDeps(
       timeoutMs: 2_000,
       staleRuntimeError: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
       rejectStopped: true,
+      env: initialBridgeEnv,
     })
     : null;
   const loadSharedMachineAuthority = createSessionSharedMachineAuthorityLoader({
     callerSessionName: caller.sessionName,
     resourceOwner,
-    env: bridgeDeps.env,
+    env: initialBridgeEnv,
     requireHookPort,
   });
   return {
@@ -650,6 +665,7 @@ export function mergeDefaultToolDeps(
                 timeoutMs: MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS,
                 staleRuntimeError: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR,
                 rejectStopped: true,
+                env: initialBridgeEnv,
               });
             return async (name: MemoryMcpDaemonToolName, input?: unknown) => {
               const response = await postResourceOwnerHook({ serverId: caller.serverId, tool: name, input });
@@ -704,6 +720,7 @@ export function mergeDefaultToolDeps(
         caller.sessionName,
         undefined,
         true,
+        resolveBridgeEnv(),
       );
     }),
     delegationReply: toolDeps.delegationReply ?? (async (envelope) => {
@@ -717,6 +734,7 @@ export function mergeDefaultToolDeps(
         caller.sessionName,
         DELEGATION_REPLY_HOOK_TIMEOUT_MS,
         true,
+        resolveBridgeEnv(),
       );
     }),
     restartSession: toolDeps.restartSession ?? (async (target, restartOptions) => {
@@ -727,7 +745,7 @@ export function mergeDefaultToolDeps(
         from: caller.sessionName,
         to: target.name,
         reset: restartOptions.reset,
-      }, MEMORY_MCP_SESSION_RESTART_HOOK_PATH, caller.sessionName);
+      }, MEMORY_MCP_SESSION_RESTART_HOOK_PATH, caller.sessionName, undefined, false, resolveBridgeEnv());
       return response.accepted === true;
     }),
     restartSessionBatch: toolDeps.restartSessionBatch ?? (async (targets) => {
@@ -737,7 +755,7 @@ export function mergeDefaultToolDeps(
       const response = await postHookSend(port, {
         from: caller.sessionName,
         targets: targets.map((item) => ({ target: item.target.name, reset: item.reset, ...(item.idempotencyKey ? { idempotencyKey: item.idempotencyKey } : {}) })),
-      }, MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH, caller.sessionName);
+      }, MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH, caller.sessionName, undefined, false, resolveBridgeEnv());
       return response;
     }),
     closeSession: toolDeps.closeSession ?? (async (request) => {
@@ -750,7 +768,7 @@ export function mergeDefaultToolDeps(
           target: request.target,
           ...(request.force ? { force: true } : {}),
           ...(request.confirmUserCreated ? { confirmUserCreated: true } : {}),
-        }, MEMORY_MCP_SESSION_CLOSE_HOOK_PATH, caller.sessionName);
+        }, MEMORY_MCP_SESSION_CLOSE_HOOK_PATH, caller.sessionName, undefined, false, resolveBridgeEnv());
         const { ok: _ok, ...result } = response;
         return result as unknown as SessionCloseResult;
       } catch (hookError) {
@@ -765,12 +783,12 @@ export function mergeDefaultToolDeps(
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon model control is unavailable');
       if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
-      return postHookSend(port, { from: caller.sessionName, to: target }, MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH, caller.sessionName);
+      return postHookSend(port, { from: caller.sessionName, to: target }, MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH, caller.sessionName, undefined, false, resolveBridgeEnv());
     }),
     legacyToolForwarder: toolDeps.legacyToolForwarder ?? (caller.sessionName ? async (tool, input) => {
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon task-pair hook is unavailable');
-      const response = await postHookSend(port, { from: caller.sessionName, tool, input }, TASK_PAIR_LEGACY_TOOL_HOOK_PATH, caller.sessionName!);
+      const response = await postHookSend(port, { from: caller.sessionName, tool, input }, TASK_PAIR_LEGACY_TOOL_HOOK_PATH, caller.sessionName!, undefined, false, resolveBridgeEnv());
       return {
         handled: response.handled === true,
         ...(response.result && typeof response.result === 'object' ? { result: response.result as Record<string, unknown> } : {}),
@@ -780,7 +798,7 @@ export function mergeDefaultToolDeps(
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon model control is unavailable');
       if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
-      return postHookSend(port, { from: caller.sessionName, to: target, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) }, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.sessionName);
+      return postHookSend(port, { from: caller.sessionName, to: target, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) }, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.sessionName, undefined, false, resolveBridgeEnv());
     }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.
@@ -795,7 +813,7 @@ export function mergeDefaultToolDeps(
         : async () => null,
     }),
     cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
-      ...(bridgeDeps.env ? { env: bridgeDeps.env } : {}),
+      ...(bridgeDeps.env || bridgeDeps.hookCredential ? { env: initialBridgeEnv } : {}),
       loadSharedMachineAuthority,
     }),
     sendDeps: {
@@ -810,7 +828,7 @@ export function mergeDefaultToolDeps(
           const port = await resolveHookPort();
           if (!port) return false;
           try {
-            const response = await postHookSend(port, {}, '/sessions/live', caller.sessionName ?? undefined, 2_000);
+            const response = await postHookSend(port, {}, '/sessions/live', caller.sessionName ?? undefined, 2_000, false, resolveBridgeEnv());
             const sessions = Array.isArray(response.sessions) ? response.sessions : [];
             const current = sessions.find((entry) => (
               entry && typeof entry === 'object'
@@ -902,7 +920,7 @@ export function mergeDefaultToolDeps(
             // Dedicated path: an older daemon answers 404 and the command is
             // refused, never delivered wrapped through the ordinary `/send`.
             try {
-              const response = await postHookSend(port, body, SEND_COMMAND_HOOK_PATH);
+              const response = await postHookSend(port, body, SEND_COMMAND_HOOK_PATH, undefined, undefined, false, resolveBridgeEnv());
               return response.queued === true ? 'queued' : 'sent';
             } catch (err) {
               if (err instanceof Error && /status 404\b/.test(err.message)) {
@@ -911,7 +929,7 @@ export function mergeDefaultToolDeps(
               throw err;
             }
           }
-          const response = await postHookSend(port, body);
+          const response = await postHookSend(port, body, '/send', undefined, undefined, false, resolveBridgeEnv());
           return response.queued === true ? 'queued' : 'sent';
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise
@@ -926,7 +944,7 @@ export function mergeDefaultToolDeps(
           const res = await postHookSend(port, {
             from: caller.sessionName,
             to: target.name,
-          }, '/stop');
+          }, '/stop', undefined, undefined, false, resolveBridgeEnv());
           return (res as { stopped?: boolean }).stopped !== false;
         }),
     },

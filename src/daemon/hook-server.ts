@@ -1877,6 +1877,8 @@ export async function startHookServer(
    *  `rebinding`, so the `'close'` this emits is ignored. */
   const releaseListener = async (): Promise<void> => {
     clearLiveHookServerPort(server);
+    await memoryMcpHttp.resetSessions().catch(() => {});
+    server.closeAllConnections?.();
     if (!server.listening) return;
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
@@ -1886,8 +1888,6 @@ export async function startHookServer(
   serverCloseCleanups.set(server, () => memoryMcpHttp.closeAll());
   server.once('close', () => {
     clearLiveHookServerPort(server);
-    serverCloseCleanups.delete(server);
-    void memoryMcpHttp.closeAll();
   });
 
   const rebindOnce = async (cause: string): Promise<number> => {
@@ -1937,6 +1937,7 @@ export async function startHookServer(
               // "after exhaustion nothing is serving", so enforce it here too
               // rather than relying on every failure path remembering.
               await releaseListener();
+              await memoryMcpHttp.closeAll().catch(() => {});
               logger.error(
                 { err: rebindError, cause, attempts: attempt, listening: server.listening },
                 'Hook server: rebind failed; hook endpoint is down',

@@ -145,8 +145,10 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let backendFatalError: string | null = null;
   let shuttingDown = false;
   let clientInitialized = false;
+  let lastPublishedDiscoveryQuery: string | null = null;
   const queued: QueuedMessage[] = [];
   const inFlight = new Map<string, InFlightRequest>();
+  const pendingDiscoveryCalls = new Map<string, { query: string; hadFallback: boolean }>();
   const idleTerminatingChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   const inFlightRequestTimeoutMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS',
@@ -285,6 +287,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       const request = inFlight.get(key);
       if (!request || request.generation !== currentGeneration) return;
       inFlight.delete(key);
+      pendingDiscoveryCalls.delete(key);
       writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_request_timeout'));
       notifyWarning('backend request timed out; restarting it without replaying the request');
       if (backend === child) terminateBackend(child);
@@ -324,6 +327,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       item.timer = setTimeout(() => {
         const index = queued.indexOf(item);
         if (index >= 0) queued.splice(index, 1);
+        pendingDiscoveryCalls.delete(idKey(id));
         writeMessage(errorResponse(id, -32002, 'memory_mcp_backend_unavailable'));
         armIdleTimerIfIdle();
       }, QUEUED_REQUEST_TIMEOUT_MS);
@@ -367,6 +371,9 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     let childCallerEnvError: string | null = null;
     const initializeId = `__imcodes_bootstrap_${currentGeneration}_initialize`;
     const listId = `__imcodes_bootstrap_${currentGeneration}_tools`;
+    const restoreDiscoveryId = `__imcodes_bootstrap_${currentGeneration}_restore_discovery`;
+    const restoreListId = `__imcodes_bootstrap_${currentGeneration}_restore_tools`;
+    let awaitingInitialRestore = false;
 
     startupTimer = setTimeout(() => {
       if (backend === child && !backendReady) {
@@ -375,6 +382,23 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
     }, BACKEND_START_TIMEOUT_MS);
     startupTimer.unref?.();
+
+    const completeCatalogReady = (next: Tool[]) => {
+      const changed = JSON.stringify(next) !== JSON.stringify(cachedTools);
+      cachedTools = next;
+      backendReady = true;
+      if (stableBackendTimer) clearTimeout(stableBackendTimer);
+      stableBackendTimer = setTimeout(() => {
+        if (backend === child && backendReady) restartAttempt = 0;
+      }, stableBackendUptimeMs);
+      stableBackendTimer.unref?.();
+      if (startupTimer) clearTimeout(startupTimer);
+      startupTimer = null;
+      flushQueued();
+      if (changed || currentGeneration > 1) {
+        writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+      }
+    };
 
     const output = createInterface({ input: child.stdout, crlfDelay: Infinity });
     output.on('line', (line) => {
@@ -390,39 +414,66 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
         return;
       }
-      if (message.id === listId) {
+      if (message.id === listId || message.id === restoreListId) {
         const result = message.result;
         if (result && typeof result === 'object' && Array.isArray((result as { tools?: unknown }).tools)) {
           const next = (result as { tools: Tool[] }).tools;
-          const changed = JSON.stringify(next) !== JSON.stringify(cachedTools);
-          cachedTools = next;
-          backendReady = true;
-          if (stableBackendTimer) clearTimeout(stableBackendTimer);
-          stableBackendTimer = setTimeout(() => {
-            if (backend === child && backendReady) restartAttempt = 0;
-          }, stableBackendUptimeMs);
-          stableBackendTimer.unref?.();
-          if (startupTimer) clearTimeout(startupTimer);
-          startupTimer = null;
-          flushQueued();
-          if (changed || currentGeneration > 1) {
-            writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+          if (message.id === listId && !backendReady && lastPublishedDiscoveryQuery && !awaitingInitialRestore) {
+            awaitingInitialRestore = true;
+            sendBackend({
+              jsonrpc: '2.0',
+              id: restoreDiscoveryId,
+              method: 'tools/call',
+              params: {
+                name: 'mcp_tool_search',
+                arguments: { query: lastPublishedDiscoveryQuery, activate: true },
+              },
+            });
+            return;
           }
+          completeCatalogReady(next);
         } else {
           notifyWarning('backend returned an invalid tools catalog; restarting it');
           terminateBackend(child);
         }
         return;
       }
+      if (message.id === restoreDiscoveryId) {
+        sendBackend({ jsonrpc: '2.0', id: restoreListId, method: 'tools/list', params: {} });
+        return;
+      }
       if (message.method === 'notifications/tools/list_changed') {
-        sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
+        if (backendReady) {
+          sendBackend({ jsonrpc: '2.0', id: listId, method: 'tools/list', params: {} });
+        }
         return;
       }
       const id = requestId(message);
-      if (id !== undefined && !clearInFlight(idKey(id))) {
-        // The request already timed out (or belongs to a retired generation).
-        // Never emit a second terminal response after the timeout.
-        return;
+      if (id !== undefined) {
+        const key = idKey(id);
+        const discovery = pendingDiscoveryCalls.get(key);
+        pendingDiscoveryCalls.delete(key);
+        if (!clearInFlight(key)) {
+          // The request already timed out (or belongs to a retired generation).
+          // Never emit a second terminal response after the timeout.
+          return;
+        }
+        if (discovery && !message.error) {
+          const resultObj = message.result;
+          const isErr = Boolean(resultObj && typeof resultObj === 'object' && (resultObj as { isError?: unknown }).isError === true);
+          if (!isErr && resultObj && typeof resultObj === 'object') {
+            const sc = (resultObj as { structuredContent?: unknown }).structuredContent as Record<string, unknown> | undefined;
+            const publishedGroups = Array.isArray(sc?.publishedGroups) ? sc.publishedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0) : [];
+            const publishedTools = Array.isArray(sc?.published) ? sc.published.filter((t): t is string => typeof t === 'string' && t.trim().length > 0) : [];
+            if (publishedGroups.length > 0) {
+              lastPublishedDiscoveryQuery = `group:${publishedGroups[0]!.trim()}`;
+            } else if (publishedTools.length > 0) {
+              lastPublishedDiscoveryQuery = publishedTools[0]!.trim();
+            } else if (discovery.hadFallback) {
+              lastPublishedDiscoveryQuery = discovery.query;
+            }
+          }
+        }
       }
       writeMessage(message);
       armIdleTimerIfIdle();
@@ -466,6 +517,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
       for (const request of inFlight.values()) {
         clearTimeout(request.timer);
+        pendingDiscoveryCalls.delete(idKey(request.id));
         writeMessage(errorResponse(
           request.id,
           deterministicFailure ? BACKEND_FATAL_ERROR_CODE : -32003,
@@ -607,6 +659,19 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
           content: [{ type: 'text', text: JSON.stringify(result) }],
         } });
         return;
+      }
+      if (name === 'mcp_tool_search' && params && typeof params === 'object') {
+        const rawArgs = (params as { arguments?: unknown }).arguments;
+        if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+          const typedArgs = rawArgs as { query?: unknown; activate?: unknown; fallbackCall?: unknown };
+          const query = typeof typedArgs.query === 'string' ? typedArgs.query.trim() : '';
+          if (query && typedArgs.activate !== false) {
+            pendingDiscoveryCalls.set(idKey(id), {
+              query,
+              hadFallback: Boolean(typedArgs.fallbackCall && typeof typedArgs.fallbackCall === 'object'),
+            });
+          }
+        }
       }
     }
     if (message.method === 'tools/list' && id !== undefined) {
