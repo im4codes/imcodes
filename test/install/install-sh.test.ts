@@ -344,15 +344,17 @@ esac
 
       const stdout = execFileSync(
         'bash',
-        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', isoInstallRoot],
+        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', isoInstallRoot, '--skip-opencode'],
         { ...EXEC_OPTS, env: isolatedEnv },
       );
       expect(stdout).toContain('downloading imcodes@2026.11.9999 from R2 (master)');
       expect(stdout).toContain('imcodes installed  2026.11.9999');
+      expect(stdout).toContain('OpenCode CLI: skipped');
       expect(execFileSync(join(isoPrefix, 'bin', 'imcodes'), ['--version'], { encoding: 'utf8', env: isolatedEnv }).trim()).toBe('2026.11.9999');
       expect(readdirSync(tmpScope).filter((n) => n.startsWith('imcodes-r2-'))).toEqual([]);
 
       // Fallback scenario: tamper expected sha256 -> install.sh must clean R2 temp dir and fall back to npm install -g imcodes@latest
+      // and also install opencode-ai cleanly via the same mirror/direct registry without failing.
       writeFileSync(manifestFile, JSON.stringify({
         version: '2026.11.9999',
         channel: 'master',
@@ -369,10 +371,19 @@ esac
 echo "$@" >> "${fallbackLog}"
 if [ "\${1:-}" = "root" ]; then echo "${isoPrefix}/lib/node_modules"; exit 0; fi
 if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+if [[ "$*" == *"opencode-ai"* ]]; then
+  printf '#!/usr/bin/env bash\necho "1.19.6"\n' > "${isoPrefix}/bin/opencode"
+  chmod +x "${isoPrefix}/bin/opencode"
+fi
 exit 0
 `,
         { mode: 0o755 },
       );
+      const pathWithoutOpencode = (process.env.PATH ?? '')
+        .split(':')
+        .filter((d) => d && !existsSync(join(d, 'opencode')))
+        .join(':');
+
       const fallbackOut = execFileSync(
         'bash',
         [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', isoInstallRoot],
@@ -380,23 +391,181 @@ exit 0
           ...EXEC_OPTS,
           env: {
             ...isolatedEnv,
-            PATH: `${shimBin}:${npmShimBin}:${isoPrefix}/bin:${process.env.PATH ?? ''}`,
+            PATH: `${shimBin}:${npmShimBin}:${isoPrefix}/bin:${pathWithoutOpencode}`,
           },
         },
       );
       expect(fallbackOut).toContain('falling back to npm');
+      expect(fallbackOut).toContain('OpenCode CLI: ready');
       const loggedNpm = execFileSync('cat', [fallbackLog], { encoding: 'utf8' });
       expect(loggedNpm).toContain('install -g imcodes@latest --no-fund --no-audit --registry https://registry.npmjs.org/');
+      expect(loggedNpm).toContain('install -g opencode-ai --no-fund --no-audit --registry https://registry.npmjs.org/');
       expect(readdirSync(tmpScope).filter((n) => n.startsWith('imcodes-r2-'))).toEqual([]);
+      // Ensure ~/.npmrc was NOT mutated to point at a registry
+      expect(execFileSync('cat', [isolatedNpmRc], { encoding: 'utf8' })).toBe(`prefix=${isoPrefix}\n`);
     });
 
-    it('passes bash syntax check on install.sh and init.sh and validates init.sh R2 helpers', () => {
+    it('auto-installs opencode-ai offline via helper, respects skip/existing detection, and stays non-blocking on npm failure', () => {
+      const ocRoot = mkdtempSync(join(dir, 'oc-case-'));
+      const cleanPath = (process.env.PATH ?? '')
+        .split(':')
+        .filter((d) => d && !existsSync(join(d, 'opencode')))
+        .join(':');
+
+      // 1) --skip-opencode flag & IMCODES_SKIP_OPENCODE=1 skip without invoking npm
+      const skipNpmMarker = join(ocRoot, 'skip-npm-called');
+      const skipBinDir = join(ocRoot, 'bin with spaces');
+      mkdirSync(skipBinDir, { recursive: true });
+      const stubNpmSpace = join(skipBinDir, 'npm');
+      writeFileSync(
+        stubNpmSpace,
+        `#!/usr/bin/env bash\ntouch "${skipNpmMarker}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const skipHome = join(ocRoot, 'home with spaces');
+      mkdirSync(skipHome, { recursive: true });
+
+      const envSkipOut = sourced(
+        `try_install_opencode_cli "${stubNpmSpace}" "https://mirrors.cloud.tencent.com/npm/"; echo "STATUS=$OPENCODE_STATUS"`,
+        { HOME: skipHome, PATH: `${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '1' },
+      );
+      expect(envSkipOut).toContain('STATUS=skipped');
+      expect(existsSync(skipNpmMarker)).toBe(false);
+
+      const flagSkipOut = sourced(
+        `SKIP_OPENCODE=1; try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS"`,
+        { HOME: skipHome, PATH: `${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(flagSkipOut).toContain('STATUS=skipped');
+      expect(existsSync(skipNpmMarker)).toBe(false);
+
+      // 2a) Existing `opencode` on PATH skips npm
+      const pathOcDir = join(ocRoot, 'path-oc-bin');
+      mkdirSync(pathOcDir, { recursive: true });
+      writeFileSync(join(pathOcDir, 'opencode'), '#!/usr/bin/env bash\necho "1.19.6"\n', { mode: 0o755 });
+      const pathExistOut = sourced(
+        `try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS"`,
+        { HOME: skipHome, PATH: `${pathOcDir}:${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(pathExistOut).toContain('STATUS=existing');
+      expect(pathExistOut).toContain('1.19.6');
+      expect(existsSync(skipNpmMarker)).toBe(false);
+
+      // 2b) Existing `~/.opencode/bin/opencode` (not on PATH) skips npm
+      const dotOcHome = join(ocRoot, 'dot-oc-home');
+      mkdirSync(join(dotOcHome, '.opencode', 'bin'), { recursive: true });
+      writeFileSync(join(dotOcHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.18.0"\n', { mode: 0o755 });
+      const dotExistOut = sourced(
+        `try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS"`,
+        { HOME: dotOcHome, PATH: `${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(dotExistOut).toContain('STATUS=existing');
+      expect(dotExistOut).toContain('1.18.0');
+      expect(existsSync(skipNpmMarker)).toBe(false);
+
+      // 3) Missing `opencode` invokes npm with mirror registry & handles spaces in HOME / npm_bin
+      const okLog = join(ocRoot, 'ok-npm.log');
+      const okBinDir = join(ocRoot, 'ok bin');
+      mkdirSync(okBinDir, { recursive: true });
+      const okNpm = join(okBinDir, 'npm');
+      writeFileSync(
+        okNpm,
+        `#!/usr/bin/env bash
+echo "$@" > "${okLog}"
+printf '#!/usr/bin/env bash\necho "1.19.6"\n' > "${okBinDir}/opencode"
+chmod +x "${okBinDir}/opencode"
+`,
+        { mode: 0o755 },
+      );
+      const installOut = sourced(
+        `try_install_opencode_cli "${okNpm}" "https://mirrors.cloud.tencent.com/npm/"; echo "STATUS=$OPENCODE_STATUS"`,
+        { HOME: skipHome, PATH: `${okBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(installOut).toContain('STATUS=installed');
+      expect(installOut).toContain('opencode CLI installed (1.19.6)');
+      expect(execFileSync('cat', [okLog], { encoding: 'utf8' }).trim()).toBe(
+        'install -g opencode-ai --no-fund --no-audit --registry https://mirrors.cloud.tencent.com/npm/',
+      );
+
+      // 4) Non-blocking under `set -euo pipefail` when npm install fails
+      const failBinDir = join(ocRoot, 'fail-bin');
+      mkdirSync(failBinDir, { recursive: true });
+      const failNpm = join(failBinDir, 'npm');
+      writeFileSync(failNpm, '#!/usr/bin/env bash\nexit 1\n', { mode: 0o755 });
+      const failHome = join(ocRoot, 'fail-home');
+      mkdirSync(failHome, { recursive: true });
+      const failOut = sourced(
+        `set -euo pipefail; try_install_opencode_cli "${failNpm}" "https://registry.npmjs.org/"; echo "AFTER=$? STATUS=$OPENCODE_STATUS"`,
+        { HOME: failHome, PATH: `${failBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(failOut).toContain('WARNING: OpenCode CLI install failed (non-blocking)');
+      expect(failOut).toContain('AFTER=0 STATUS=failed');
+
+      // 5) Full script failure non-blocking test (E2E R2 succeeds, opencode npm fails -> install.sh exits 0!)
+      const e2eFailRoot = mkdtempSync(join(dir, 'e2e-oc-fail-'));
+      const e2eFailHome = join(e2eFailRoot, 'home with space');
+      const e2eFailPrefix = join(e2eFailRoot, 'prefix');
+      const e2eFailInstallRoot = join(e2eFailRoot, 'install-root');
+      const e2eFailShim = join(e2eFailRoot, 'shim');
+      mkdirSync(e2eFailHome, { recursive: true });
+      mkdirSync(join(e2eFailPrefix, 'lib', 'node_modules'), { recursive: true });
+      mkdirSync(join(e2eFailPrefix, 'bin'), { recursive: true });
+      mkdirSync(e2eFailInstallRoot, { recursive: true });
+      mkdirSync(e2eFailShim, { recursive: true });
+      const e2eNpmRc = join(e2eFailHome, '.npmrc');
+      writeFileSync(e2eNpmRc, `prefix=${e2eFailPrefix}\n`);
+      writeFileSync(
+        join(e2eFailShim, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "root" ]; then echo "${e2eFailPrefix}/lib/node_modules"; exit 0; fi
+if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+if [[ "$*" == *"opencode-ai"* ]]; then exit 1; fi
+echo "installed-fake-imcodes"
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(e2eFailShim, 'imcodes'),
+        '#!/usr/bin/env bash\necho "2026.11.9999"\n',
+        { mode: 0o755 },
+      );
+      const e2eFailOut = execFileSync(
+        'bash',
+        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', e2eFailInstallRoot],
+        {
+          ...EXEC_OPTS,
+          env: {
+            PATH: `${e2eFailShim}:${cleanPath}`,
+            HOME: e2eFailHome,
+            TMPDIR: e2eFailRoot,
+            IMCODES_USE_R2: 'false',
+          },
+        },
+      );
+      expect(e2eFailOut).toContain('imcodes installed  2026.11.9999');
+      expect(e2eFailOut).toContain('WARNING: OpenCode CLI install failed (non-blocking)');
+      expect(e2eFailOut).toContain('OpenCode CLI: not installed');
+    });
+
+    it('passes bash syntax check on install.sh and init.sh, and locks install.ps1 OpenCode parity contracts', () => {
       const initScript = join(HERE, '..', '..', 'landing', 'init.sh');
+      const ps1Script = join(HERE, '..', '..', 'landing', 'install.ps1');
       execFileSync('bash', ['-n', SCRIPT, initScript], { encoding: 'utf8' });
       const initSrc = execFileSync('cat', [initScript], { encoding: 'utf8' });
       expect(initSrc).toContain('try_install_from_r2');
       expect(initSrc).toContain('parse_daemon_r2_manifest');
       expect(initSrc).toContain('npm install -g --no-fund --no-audit --registry "$NPM_REGISTRY" "imcodes@$CHANNEL"');
+
+      // Static contract checks matching install-smoke.yml / PS 5.1+ parity
+      const ps1 = execFileSync('cat', [ps1Script], { encoding: 'utf8' });
+      expect(ps1).toContain('[switch]$SkipOpenCode');
+      expect(ps1).toContain('IMCODES_SKIP_OPENCODE');
+      expect(ps1).toContain("'.opencode\\bin\\opencode.exe'");
+      expect(ps1).toContain('& $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry');
+      expect(ps1).toContain('WARNING: OpenCode CLI install');
+      expect(ps1).toContain('OpenCode CLI: ready');
+      // Guard against PS 7-only pipeline/null-coalescing operators breaking Windows PS 5.1
+      expect(ps1).not.toMatch(/\s\?\?\s|\s&&\s|\s\|\|\s/);
     });
   });
 });

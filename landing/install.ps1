@@ -9,6 +9,10 @@
 #   Force mirror / direct source, or pass params explicitly:
 #     & ([scriptblock]::Create((irm https://im.codes/install.ps1))) -Channel dev -Source mirror
 #
+#   Skip optional OpenCode CLI auto-install:
+#     & ([scriptblock]::Create((irm https://im.codes/install.ps1))) -SkipOpenCode
+#     # or: $env:IMCODES_SKIP_OPENCODE = '1'
+#
 # Behavior (no admin required):
 #   1. Source auto-detect: probes a host that only resolves on unrestricted
 #      networks. If unreachable, assumes a restricted-network region and uses
@@ -17,7 +21,9 @@
 #      gate). Only when npm is missing do we install Node (portable zip).
 #   3. Installs the daemon with a plain dist-tag: npm install -g imcodes@<channel>.
 #      No version pinning and no custom upgrade logic — the daemon's own
-#      auto-upgrade handles updates from here on. In a restricted-network region
+#      auto-upgrade handles updates from here on. Also installs official OpenCode
+#      CLI (opencode-ai) if not already present (idempotent, non-blocking, opt-out
+#      via -SkipOpenCode). In a restricted-network region
 #      the mirror registry is recorded in ~/.imcodes/install.json (NOT the global
 #      ~/.npmrc) so the daemon passes it explicitly on its own `npm i -g` without
 #      affecting other npm projects.
@@ -26,10 +32,11 @@
 
 [CmdletBinding()]
 param(
-  [string]$Channel    = $env:IMCODES_CHANNEL,   # latest | dev          (default: latest)
-  [string]$Source     = $env:IMCODES_SOURCE,    # auto | mirror | direct (default: auto)
-  [string]$NodeMajor  = '24',
-  [string]$InstallRoot = "$env:LOCALAPPDATA\imcodes"
+  [string]$Channel      = $env:IMCODES_CHANNEL,   # latest | dev          (default: latest)
+  [string]$Source       = $env:IMCODES_SOURCE,    # auto | mirror | direct (default: auto)
+  [string]$NodeMajor    = '24',
+  [string]$InstallRoot  = "$env:LOCALAPPDATA\imcodes",
+  [switch]$SkipOpenCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +53,9 @@ if ($Channel -notin @('latest','dev'))           { throw "Invalid -Channel '$Cha
 if ($Source  -notin @('auto','mirror','direct'))  { throw "Invalid -Source '$Source' (use: auto | mirror | direct)" }
 if ($NodeMajor -notmatch '^\d+$')                { throw "Invalid -NodeMajor '$NodeMajor' (must be an integer)" }
 if ($PSVersionTable.PSVersion.Major -lt 5)       { throw "Windows PowerShell 5.1+ is required." }
+$skipOpenCodeEffective = $SkipOpenCode.IsPresent -or (
+  ([string]$env:IMCODES_SKIP_OPENCODE).Trim().ToLower() -in @('1','true','yes')
+)
 
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "    $m"  -ForegroundColor Green }
@@ -279,11 +289,73 @@ if (-not $installedFromR2) {
   if ($LASTEXITCODE -ne 0) { throw "npm install failed (exit $LASTEXITCODE)" }
 }
 
+# ── OpenCode CLI (official opencode-ai, idempotent & non-blocking) ────────────
+function Test-OpenCodeInstalled {
+  if (Get-Command opencode -ErrorAction SilentlyContinue) { return $true }
+  $userOc = Join-Path $env:USERPROFILE '.opencode\bin\opencode.exe'
+  return (Test-Path -LiteralPath $userOc)
+}
+
+function Get-OpenCodeVersion {
+  $cmd = Get-Command opencode -ErrorAction SilentlyContinue
+  if ($cmd) {
+    return try { (& opencode --version 2>$null | Select-Object -First 1) } catch { '' }
+  }
+  $userOc = Join-Path $env:USERPROFILE '.opencode\bin\opencode.exe'
+  if (Test-Path -LiteralPath $userOc) {
+    return try { (& $userOc --version 2>$null | Select-Object -First 1) } catch { '' }
+  }
+  return ''
+}
+
+$openCodeStatus = 'failed'
+if ($skipOpenCodeEffective) {
+  Write-Note "skipping OpenCode CLI install (opted out via -SkipOpenCode / IMCODES_SKIP_OPENCODE)"
+  $openCodeStatus = 'skipped'
+} elseif (Test-OpenCodeInstalled) {
+  $ocVer = Get-OpenCodeVersion
+  if ($ocVer) {
+    Write-Ok "found opencode $ocVer — keeping existing install"
+  } else {
+    Write-Ok "found existing opencode CLI — keeping existing install"
+  }
+  $openCodeStatus = 'existing'
+} else {
+  Write-Step "Installing OpenCode CLI (opencode-ai) ..."
+  try {
+    & $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry
+    if ($LASTEXITCODE -eq 0) {
+      $ocVer = Get-OpenCodeVersion
+      if ($ocVer) {
+        Write-Ok "opencode CLI installed ($ocVer)"
+      } else {
+        Write-Ok "opencode CLI installed"
+      }
+      $openCodeStatus = 'installed'
+    } else {
+      Write-Note "WARNING: OpenCode CLI install exited $LASTEXITCODE (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
+      Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+      $openCodeStatus = 'failed'
+    }
+  } catch {
+    Write-Note "WARNING: OpenCode CLI install failed (non-blocking: $($_.Exception.Message)) — IM.codes was installed cleanly. To retry manually later:"
+    Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+    $openCodeStatus = 'failed'
+  }
+}
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 $installed = ''
 try { $installed = (& imcodes --version) 2>$null } catch {}
 Write-Host ""
 Write-Host "  imcodes installed  $installed" -ForegroundColor Green
+if ($openCodeStatus -in @('installed', 'existing')) {
+  Write-Host "  OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" -ForegroundColor Green
+} elseif ($openCodeStatus -eq 'skipped') {
+  Write-Host "  OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" -ForegroundColor Yellow
+} else {
+  Write-Host "  OpenCode CLI: not installed (IM.codes works normally; retry: npm install -g opencode-ai)" -ForegroundColor Yellow
+}
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor White
 Write-Host "    1) Open a NEW terminal (so the updated PATH takes effect)" -ForegroundColor Gray

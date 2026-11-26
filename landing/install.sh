@@ -10,6 +10,10 @@
 #   Force mirror / direct source, or pass flags:
 #     curl -fsSL https://im.codes/install.sh | bash -s -- --channel dev --source mirror
 #
+#   Skip optional OpenCode CLI auto-install:
+#     curl -fsSL https://im.codes/install.sh | bash -s -- --skip-opencode
+#     # or: IMCODES_SKIP_OPENCODE=1
+#
 # Behavior (no sudo):
 #   1. Source auto-detect: probes a host reachable only on unrestricted networks.
 #      If unreachable, assumes a restricted-network region and uses the mirror
@@ -18,7 +22,9 @@
 #      only when npm is missing do we install Node (portable tarball).
 #   3. Installs with a plain dist-tag (imcodes@<channel>) — no version pin and no
 #      custom upgrade logic; the daemon's own auto-upgrade takes over from here.
-#      To keep that auto-upgrade working without sudo, we fall back to a
+#      Also installs official OpenCode CLI (opencode-ai) if not already present
+#      (idempotent, non-blocking, opt-out via --skip-opencode).
+#      To keep auto-upgrade working without sudo, we fall back to a
 #      user-writable npm prefix when the global one isn't writable; in a
 #      restricted-network region we record the mirror registry in
 #      ~/.imcodes/install.json (NOT the global ~/.npmrc) so the daemon passes it
@@ -30,6 +36,7 @@ CHANNEL="${IMCODES_CHANNEL:-}"
 SOURCE="${IMCODES_SOURCE:-}"
 NODE_MAJOR="${IMCODES_NODE_MAJOR:-24}"
 INSTALL_ROOT="${IMCODES_INSTALL_ROOT:-$HOME/.imcodes}"
+SKIP_OPENCODE="${IMCODES_SKIP_OPENCODE:-}"
 
 # ── Validate NODE_MAJOR ───────────────────────────────────────────────────────
 if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
@@ -39,10 +46,11 @@ fi
 # ── Parse flags ───────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
-    --channel)      CHANNEL="${2:-}"; shift 2 ;;
-    --source)       SOURCE="${2:-}"; shift 2 ;;
-    --node-major)   NODE_MAJOR="${2:-}"; shift 2 ;;
-    --install-root) INSTALL_ROOT="${2:-}"; shift 2 ;;
+    --channel)       CHANNEL="${2:-}"; shift 2 ;;
+    --source)        SOURCE="${2:-}"; shift 2 ;;
+    --node-major)    NODE_MAJOR="${2:-}"; shift 2 ;;
+    --install-root)  INSTALL_ROOT="${2:-}"; shift 2 ;;
+    --skip-opencode) SKIP_OPENCODE="1"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -192,6 +200,64 @@ try_install_from_r2() {
     return 1
   fi
   rm -rf "$r2_tmp"
+  return 0
+}
+
+opencode_skip_enabled() {
+  local raw="${SKIP_OPENCODE:-${IMCODES_SKIP_OPENCODE:-}}"
+  local norm
+  norm=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  case "$norm" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+opencode_bin_path() {
+  if have opencode; then
+    command -v opencode
+    return 0
+  fi
+  if [ -n "${HOME:-}" ] && [ -x "$HOME/.opencode/bin/opencode" ]; then
+    printf '%s\n' "$HOME/.opencode/bin/opencode"
+    return 0
+  fi
+  return 1
+}
+
+opencode_is_installed() {
+  opencode_bin_path >/dev/null 2>&1
+}
+
+OPENCODE_STATUS=""
+try_install_opencode_cli() {
+  local npm_bin="${1:-npm}" npm_reg="${2:-https://registry.npmjs.org/}"
+  if opencode_skip_enabled; then
+    note "skipping OpenCode CLI install (opted out via --skip-opencode / IMCODES_SKIP_OPENCODE)"
+    OPENCODE_STATUS="skipped"
+    return 0
+  fi
+
+  local existing_bin oc_ver=""
+  if existing_bin=$(opencode_bin_path 2>/dev/null); then
+    oc_ver=$("$existing_bin" --version 2>/dev/null | head -n1 || true)
+    ok "found opencode${oc_ver:+ $oc_ver} ($existing_bin) — keeping existing install"
+    OPENCODE_STATUS="existing"
+    return 0
+  fi
+
+  step "Installing OpenCode CLI (opencode-ai) ..."
+  if "$npm_bin" install -g opencode-ai --no-fund --no-audit --registry "$npm_reg"; then
+    if existing_bin=$(opencode_bin_path 2>/dev/null); then
+      oc_ver=$("$existing_bin" --version 2>/dev/null | head -n1 || true)
+    fi
+    ok "opencode CLI installed${oc_ver:+ ($oc_ver)}"
+    OPENCODE_STATUS="installed"
+  else
+    note "WARNING: OpenCode CLI install failed (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
+    note "  $npm_bin install -g opencode-ai --registry $npm_reg"
+    OPENCODE_STATUS="failed"
+  fi
   return 0
 }
 
@@ -351,6 +417,9 @@ else
   "$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit --registry "$NPM_REGISTRY"
 fi
 
+# ── Install official OpenCode CLI (idempotent, opt-out, non-blocking) ─────────
+try_install_opencode_cli "$NPM" "$NPM_REGISTRY"
+
 # ── Persist PATH to shell rc files (only when we added a dir) ──────────────────
 #    Written as a single managed block delimited by begin/end markers so a re-run
 #    (e.g. a Node major bump) REPLACES the old block instead of accumulating dead,
@@ -387,7 +456,16 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 installed="$(imcodes --version 2>/dev/null || true)"
-printf "\n  ${G}imcodes installed  %s${N}\n\n" "$installed"
+printf "\n  ${G}imcodes installed  %s${N}\n" "$installed"
+case "$OPENCODE_STATUS" in
+  installed|existing)
+    ok "OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" ;;
+  skipped)
+    note "OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" ;;
+  *)
+    note "OpenCode CLI: not installed (IM.codes daemon works normally; retry: npm install -g opencode-ai)" ;;
+esac
+echo ""
 echo "  Next steps:"
 [ -n "$PATH_DIR" ] && echo "    1) Restart your shell  (or: export PATH=\"$PATH_DIR:\$PATH\")"
 echo "    2) imcodes bind     # connect this machine to your IM.codes server"
