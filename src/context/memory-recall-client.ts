@@ -14,6 +14,7 @@
  * throws on the front-of-turn path.
  */
 import { ContextStoreError, getContextStoreClient } from '../store/context-store-worker-client.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { CONTEXT_STORE_RPC_ERROR, CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import {
   isTrivialRecallQuery,
@@ -71,6 +72,7 @@ async function prepareSemanticManagementArgs(query: MemorySearchQuery): Promise<
 export async function searchLocalMemorySemanticViaWorker(
   query: MemorySearchQuery,
 ): Promise<MemorySearchResult | null> {
+  if (!isMemoryDaemonEnabled()) return null;
   if (!query.query || isTrivialRecallQuery(query.query)) return null;
 
   const client = getContextStoreClient();
@@ -108,6 +110,7 @@ export async function searchLocalMemorySemanticViaWorker(
 export async function searchLocalMemoryViaWorker(
   query: MemorySearchQuery,
 ): Promise<MemorySearchResult | null> {
+  if (!isMemoryDaemonEnabled()) return null;
   const client = getContextStoreClient();
   if (!client.isReady) return null;
   const timeoutMs = Math.min(getRecallBudgetMs(), CONTEXT_STORE_RPC_TIMEOUT_MS.r1FrontOfTurnMax);
@@ -131,6 +134,7 @@ export async function selectStartupMemoryViaWorker(
   namespace: ContextNamespace,
   options: StartupMemorySelectionOptions = {},
 ): Promise<MemorySearchResultItem[] | null> {
+  if (!isMemoryDaemonEnabled()) return null;
   const client = getContextStoreClient();
   if (!client.isReady) return null;
   const timeoutMs = Math.min(getRecallBudgetMs(), CONTEXT_STORE_RPC_TIMEOUT_MS.r1FrontOfTurnMax);
@@ -228,6 +232,7 @@ export function emptyMemorySearchResult(): MemorySearchResult {
 export async function searchLocalMemorySemanticFrontOfTurn(
   query: MemorySearchQuery,
 ): Promise<MemorySearchResult> {
+  if (!isMemoryDaemonEnabled()) return emptyMemorySearchResult();
   const viaWorker = await searchLocalMemorySemanticViaWorker(query);
   if (viaWorker) return viaWorker;
   if (getContextStoreClient().isProductionOwner) return emptyMemorySearchResult();
@@ -243,6 +248,7 @@ export async function selectStartupMemoryForBootstrap(
   namespace: ContextNamespace,
   options: StartupMemorySelectionOptions = {},
 ): Promise<MemorySearchResultItem[]> {
+  if (!isMemoryDaemonEnabled()) return [];
   const viaWorker = await selectStartupMemoryViaWorker(namespace, options);
   if (viaWorker) return viaWorker;
   if (getContextStoreClient().isProductionOwner) return [];

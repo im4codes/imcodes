@@ -171,7 +171,9 @@ export class LiveContextIngestion {
   }
 
   handleTimelineEvent(event: TimelineEvent): Promise<void> {
+    if (!isMemoryDaemonEnabled()) return Promise.resolve();
     return this.enqueueSessionWork(event.sessionId, async () => {
+      if (!isMemoryDaemonEnabled()) return;
       let action: PreparedTimelineAction;
       try {
         action = await this.prepareTimelineAction(event);
@@ -240,6 +242,7 @@ export class LiveContextIngestion {
   }
 
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
+    if (!isMemoryDaemonEnabled()) return;
     const session = this.sessionLookup(sessionName);
     if (!session || events.length === 0) return;
     const backfillEvents = dedupeTimelineEventsByLogicalId(events);
@@ -295,6 +298,7 @@ export class LiveContextIngestion {
     event: TimelineEvent,
     options: GetBootstrapOptions = {},
   ): Promise<PreparedTimelineAction> {
+    if (!isMemoryDaemonEnabled()) return { kind: 'noop', event };
     const session = this.sessionLookup(event.sessionId);
     if (!session) return { kind: 'noop', event };
     if (this.shouldIngestTimelineEvent && !this.shouldIngestTimelineEvent(event, session)) return { kind: 'noop', event };
@@ -474,6 +478,7 @@ export class LiveContextIngestion {
     sessionId: string,
     options: { forceDue?: boolean } = {},
   ): Promise<FlushRetryBufferResult> {
+    if (!isMemoryDaemonEnabled()) return { status: 'drained' };
     const queue = this.retryBuffer.get(sessionId);
     if (!queue || queue.length === 0) return { status: 'drained' };
     while (queue.length > 0) {
@@ -522,10 +527,12 @@ export class LiveContextIngestion {
   }
 
   private scheduleRetryDrainForSession(sessionId: string, delayMs = INGEST_RETRY_BACKOFF_BASE_MS): void {
-    if (this.retryDrainTimers.has(sessionId)) return;
+    if (!isMemoryDaemonEnabled() || this.retryDrainTimers.has(sessionId)) return;
     const timer = setTimeout(() => {
       this.retryDrainTimers.delete(sessionId);
+      if (!isMemoryDaemonEnabled()) return;
       void this.enqueueSessionWork(sessionId, async () => {
+        if (!isMemoryDaemonEnabled()) return;
         await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId));
       });
     }, Math.max(0, delayMs));
@@ -580,12 +587,14 @@ export class LiveContextIngestion {
   }
 
   private async hasDirtyTarget(target: ContextTargetRef): Promise<boolean> {
+    if (!isMemoryDaemonEnabled()) return false;
     return (await this.coordinator.listDirtyTargets(target.namespace)).some((entry) =>
       entry.target.kind === target.kind && entry.target.sessionName === target.sessionName,
     );
   }
 
   private async hasAnyActivity(target: ContextTargetRef): Promise<boolean> {
+    if (!isMemoryDaemonEnabled()) return false;
     if (await this.hasDirtyTarget(target)) return true;
     // Target-specific activity gate: avoid suppressing backfill for one
     // session just because another target in the same namespace has summaries.

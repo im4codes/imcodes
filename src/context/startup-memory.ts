@@ -5,6 +5,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import type { MemorySearchResultItem } from './memory-recall-core.js';
 import { searchLocalMemory } from './memory-recall-core.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
@@ -330,6 +331,7 @@ export async function selectStartupObservationItems(
   namespace: ContextNamespace,
   options: Pick<StartupMemorySelectionOptions, 'observationLimit'> = {},
 ): Promise<MemorySearchResultItem[]> {
+  if (!isMemoryDaemonEnabled()) return [];
   const limit = options.observationLimit ?? STARTUP_OBSERVATION_INDEX_LIMIT;
   const client = getContextStoreClient();
   let namespaceRows: ContextNamespaceRow[];

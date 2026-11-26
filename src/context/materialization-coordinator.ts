@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type {
   ContextDirtyTarget,
   ContextJobRecord,
@@ -231,6 +232,17 @@ export class MaterializationCoordinator {
     // Only memory-eligible events (assistant.text) count toward materialization
     // triggers; streaming deltas / tool calls / system events are excluded.
     const eligible = isMemoryEligibleEvent(input.eventType);
+    if (!isMemoryDaemonEnabled()) {
+      const event: LocalContextEvent = {
+        id: input.id ?? randomUUID(),
+        target: input.target,
+        eventType: input.eventType,
+        content: input.content,
+        metadata: input.metadata,
+        createdAt: input.createdAt ?? Date.now(),
+      };
+      return eligible ? { event } : { event, filtered: true };
+    }
     const client = getContextStoreClient();
     // ONE aggregate RPC: always record to staging, and (for eligible events) read
     // the dirty target + staged-token upper bound + latest recent-summary
@@ -261,6 +273,7 @@ export class MaterializationCoordinator {
   }
 
   async listDirtyTargets(namespace?: ContextNamespace): Promise<ContextDirtyTarget[]> {
+    if (!isMemoryDaemonEnabled()) return [];
     return getContextStoreClient().run<ContextDirtyTarget[]>('listDirtyTargets', [namespace]);
   }
 
@@ -870,6 +883,7 @@ export class MaterializationCoordinator {
   }
 
   private async selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): Promise<ContextJobTrigger | undefined> {
+    if (!isMemoryDaemonEnabled()) return undefined;
     const client = getContextStoreClient();
     return this.decideTrigger(
       dirtyTarget,
@@ -893,6 +907,7 @@ export class MaterializationCoordinator {
   /** Routed through the worker when warm (in-process cold fallback otherwise) —
    *  the daemon main thread never opens the DB for this admission read. */
   private async getLatestSummaryUpdatedAt(target: ContextTargetRef): Promise<number | undefined> {
+    if (!isMemoryDaemonEnabled()) return undefined;
     return getContextStoreClient().run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [target]);
   }
 
@@ -955,6 +970,7 @@ async function collectPinnedNotesForNamespace(namespace: ContextNamespace): Prom
 }
 
 export async function materializeMasterSummary(sessionName: string, namespace?: ContextNamespace, now = Date.now(), memoryConfig?: MemoryConfig): Promise<ProcessedContextProjection | undefined> {
+  if (!isMemoryDaemonEnabled()) return undefined;
   const client = getContextStoreClient();
   const resolvedNamespace = namespace ?? await findNamespaceForSessionSummaries(sessionName);
   if (!resolvedNamespace) return undefined;

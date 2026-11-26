@@ -6,6 +6,7 @@ import { MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS, type MemoryShortRefHealth } fr
 import { createHash, randomUUID } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
@@ -806,7 +807,7 @@ function mergePersistedShortRefRows(
  * because another process can persist a handle after this warm-load finishes.
  */
 export async function loadMemoryShortRefsFromStore(): Promise<number> {
-  if (shortRefStorePath()) return 0;
+  if (shortRefStorePath() || !isMemoryDaemonEnabled()) return 0;
   // Load the emergency journal before touching the worker. Even if the worker
   // is still unavailable after a daemon restart, refs protected during the
   // prior self-heal window are immediately resolvable from this local index.
