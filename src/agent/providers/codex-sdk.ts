@@ -300,6 +300,15 @@ const CODEX_IM_MCP_PROBE_TIMEOUT_MS = 2_000;
 // `thread/unsubscribe` blocked ending (and therefore relaunching) a session.
 export const CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS = 20_000;
 export const CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
+export const CODEX_IDLE_THREAD_EVICT_MS = 20 * 60 * 1000;
+export const CODEX_MAX_LOADED_THREADS = 24;
+export const CODEX_IDLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+export interface CodexSdkProviderOptions {
+  idleThreadEvictMs?: number;
+  maxLoadedThreads?: number;
+  idleSweepIntervalMs?: number;
+}
 
 export class ImcodesDelegationUnavailableError extends Error {
   constructor() {
@@ -1117,6 +1126,7 @@ export interface CodexModelProviderConfig {
 interface CodexSdkSessionState {
   routeId: string;
   incognito?: boolean;
+  ephemeral?: boolean;
   /**
    * Authorized IM.codes dispatch facts observed in the CURRENT turn. This is
    * the only evidence a delegation claim is ever built from; it is reset at
@@ -1156,6 +1166,10 @@ interface CodexSdkSessionState {
   /** The fence of a `thread/start` in flight (no thread id yet). */
   pendingThreadFence?: NativeAgentFence;
   loaded: boolean;
+  lastActivityAt: number;
+  sendInFlightCount: number;
+  threadLoadInFlightCount: number;
+  threadUnsubscribePromise?: Promise<void>;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
   turnDispatchGeneration: number;
@@ -2789,6 +2803,22 @@ export class CodexSdkProvider implements TransportProvider {
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
   private nextActiveTurnLeaseId = 1;
   private heartbeatInFlightCount = 0;
+  private readonly idleThreadEvictMs: number;
+  private readonly maxLoadedThreads: number;
+  private readonly idleSweepIntervalMs: number;
+  private idleSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(options: CodexSdkProviderOptions = {}) {
+    this.idleThreadEvictMs = typeof options.idleThreadEvictMs === 'number' && Number.isFinite(options.idleThreadEvictMs) && options.idleThreadEvictMs > 0
+      ? options.idleThreadEvictMs
+      : CODEX_IDLE_THREAD_EVICT_MS;
+    this.maxLoadedThreads = typeof options.maxLoadedThreads === 'number' && Number.isFinite(options.maxLoadedThreads) && options.maxLoadedThreads >= 1
+      ? Math.floor(options.maxLoadedThreads)
+      : CODEX_MAX_LOADED_THREADS;
+    this.idleSweepIntervalMs = typeof options.idleSweepIntervalMs === 'number' && Number.isFinite(options.idleSweepIntervalMs) && options.idleSweepIntervalMs > 0
+      ? options.idleSweepIntervalMs
+      : CODEX_IDLE_SWEEP_INTERVAL_MS;
+  }
 
   private getChannelForSession(state: Pick<CodexSdkSessionState, 'incognito'>): CodexAppServerChannel {
     return state.incognito ? this.incognitoChannel : this.normalChannel;
@@ -2820,6 +2850,7 @@ export class CodexSdkProvider implements TransportProvider {
       });
     });
     await this.startChannelAppServer(this.normalChannel, binaryPath, config, { clearSessions: true });
+    this.startIdleThreadSweepTimer();
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
@@ -2942,6 +2973,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.stopIdleThreadSweepTimer();
     await Promise.all([
       this.stopChannelAppServer(this.normalChannel, { clearSessions: true }),
       this.stopChannelAppServer(this.incognitoChannel, { clearSessions: true }),
@@ -2990,9 +3022,10 @@ export class CodexSdkProvider implements TransportProvider {
     }
     const effectiveConfig: SessionConfig = incognito ? { ...config, incognito: true } : config;
     const customModelProvider = this.extractCustomModelProvider(effectiveConfig, existing?.customModelProvider);
+    const now = Date.now();
     const state: CodexSdkSessionState = {
       routeId,
-      ...(incognito ? { incognito: true } : {}),
+      ...(incognito ? { incognito: true, ephemeral: true } : {}),
       ...(effectiveConfig.sessionName ? { imcodesSessionName: effectiveConfig.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
       cwd: normalizeTransportCwd(effectiveConfig.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((effectiveConfig.env as Record<string, string> | undefined) ?? {}) },
@@ -3005,6 +3038,10 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: incognito ? undefined : (effectiveConfig.resumeId ?? existing?.threadId),
       ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
+      lastActivityAt: now,
+      sendInFlightCount: 0,
+      threadLoadInFlightCount: 0,
+      threadUnsubscribePromise: undefined,
       runningTurnId: undefined,
       turnDispatchGeneration: 0,
       currentTurnPayload: undefined,
@@ -3079,6 +3116,9 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);
     this.clearChildSubagentRolloutPollTimer(state);
     const channel = this.getChannelForSession(state);
+    if (state.threadUnsubscribePromise) {
+      await state.threadUnsubscribePromise.catch(() => {});
+    }
     if (state.threadId) {
       if (state.loaded) {
         await this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
@@ -3086,7 +3126,9 @@ export class CodexSdkProvider implements TransportProvider {
       channel.threadToSession.delete(state.threadId);
     }
     state.loaded = false;
-    this.sessions.delete(sessionId);
+    if (this.sessions.get(sessionId) === state) {
+      this.sessions.delete(sessionId);
+    }
     this.maybeRunDeferredAuthRefresh(channel, 'end-session');
   }
 
@@ -3184,6 +3226,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (channel.kind === 'normal' && !channel.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
+    this.touchSessionActivity(state);
     return this.runWithPrivacy(sessionId, state, () => this.sendWithPrivacy(sessionId, state, payloadOrMessage, attachments, extraSystemPrompt));
   }
 
@@ -3191,78 +3234,84 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.runningTurnId || state.runningCompact || state.turnStartInFlight || state.authRecoveryPending) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
-    const channel = this.getChannelForSession(state);
-    if (channel.child) {
-      await this.refreshAppServerForLatestAuth('send', channel);
-    }
-    if (channel.kind === 'incognito') {
-      if (!this.config) {
+    state.sendInFlightCount += 1;
+    this.touchSessionActivity(state);
+    try {
+      const channel = this.getChannelForSession(state);
+      if (channel.child) {
+        await this.refreshAppServerForLatestAuth('send', channel);
+      }
+      if (channel.kind === 'incognito') {
+        if (!this.config) {
+          throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+        }
+        if (!channel.child && !state.threadId) {
+          await this.ensureIncognitoChannelStarted();
+        }
+      } else if (!this.config || !channel.child) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
       }
-      if (!channel.child && !state.threadId) {
-        await this.ensureIncognitoChannelStarted();
-      }
-    } else if (!this.config || !channel.child) {
-      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
-    }
 
-    if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
-      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'abandoned', 'generation_rollover');
-      state.activeToolItemIds.clear();
-      state.activeCompactionItemIds.clear();
-      state.activeItemIds.clear();
-    }
-    state.currentText = '';
-    state.currentMessageId = null;
-    this.clearActiveItemEvidence(state);
-    this.clearActiveTurnLease(state);
-    state.cancelled = false;
-    this.clearCancelTimer(state);
-    state.lastUsage = undefined;
-    state.lastStatusSignature = null;
-    state.generatedImageTracking = null;
-    state.generatedImagePaths = [];
-    const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    state.runtimeActivityGeneration = payload.activityGeneration;
-    if (this.isCompactCommand(payload)) {
-      await this.startCompact(sessionId, state, payload);
-      return;
-    }
-    const turnDispatchGeneration = ++state.turnDispatchGeneration;
-    state.currentTurnPayload = payload;
-    state.authRecoveryPending = false;
-    state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
-    state.authRecoveryReplayUnsafe = false;
-    let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
-    if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
-    if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
-      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
-    }
-    for (;;) {
-      try {
-        await this.startTurn(
-          sessionId,
-          state,
-          payload,
-          turnDispatchGeneration,
-          CODEX_AUTH_RECOVERY_RETRY_LIMIT,
-        );
-        state.imcodesMcpRecoveryRequired = false;
-        break;
-      } catch (error) {
-        if (!(error instanceof ImcodesDelegationUnavailableError)
-          || delegationRecoveryRetriesRemaining <= 0
-          || state.cancelled
-          || this.sessions.get(sessionId) !== state
-          || state.turnDispatchGeneration !== turnDispatchGeneration) throw error;
-        delegationRecoveryRetriesRemaining -= 1;
-        // The readiness failure happens before turn/start, provider output, or
-        // any tool side effect. Restarting is therefore replay-safe. Preserve
-        // the SAME durable session/thread identity, reload only the stale MCP
-        // client/catalog, and retry exactly once; no model turn or MCP tool call
-        // has started, so this boundary is replay-safe.
-        await this.reloadImcodesMcpClient('im-delegation-unavailable');
+      if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'abandoned', 'generation_rollover');
+        state.activeToolItemIds.clear();
+        state.activeCompactionItemIds.clear();
+        state.activeItemIds.clear();
       }
+      state.currentText = '';
+      state.currentMessageId = null;
+      this.clearActiveItemEvidence(state);
+      this.clearActiveTurnLease(state);
+      state.cancelled = false;
+      this.clearCancelTimer(state);
+      state.lastUsage = undefined;
+      state.lastStatusSignature = null;
+      state.generatedImageTracking = null;
+      state.generatedImagePaths = [];
+      const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+      state.runtimeActivityGeneration = payload.activityGeneration;
+      if (this.isCompactCommand(payload)) {
+        await this.startCompact(sessionId, state, payload);
+        return;
+      }
+      const turnDispatchGeneration = ++state.turnDispatchGeneration;
+      state.currentTurnPayload = payload;
+      state.authRecoveryPending = false;
+      state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
+      state.authRecoveryReplayUnsafe = false;
+      let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
+      if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+      if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
+        await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+      }
+      for (;;) {
+        try {
+          await this.startTurn(
+            sessionId,
+            state,
+            payload,
+            turnDispatchGeneration,
+            CODEX_AUTH_RECOVERY_RETRY_LIMIT,
+          );
+          state.imcodesMcpRecoveryRequired = false;
+          break;
+        } catch (error) {
+          if (!(error instanceof ImcodesDelegationUnavailableError)
+            || delegationRecoveryRetriesRemaining <= 0
+            || state.cancelled
+            || this.sessions.get(sessionId) !== state
+            || state.turnDispatchGeneration !== turnDispatchGeneration) throw error;
+          delegationRecoveryRetriesRemaining -= 1;
+          // The readiness failure happens before turn/start, provider output, or
+          // any tool side effect. Restarting is therefore replay-safe. Preserve
+          // the SAME durable session/thread identity, reload only the stale MCP
+          // client/catalog, and retry exactly once; no model turn or MCP tool call
+          // has started, so this boundary is replay-safe.
+          await this.reloadImcodesMcpClient('im-delegation-unavailable');
+        }
+      }
+    } finally {
+      state.sendInFlightCount = Math.max(0, state.sendInFlightCount - 1);
     }
   }
 
@@ -3275,6 +3324,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state || !turnId || state.cancelled) {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
+    this.touchSessionActivity(state);
     try {
       await this.requestOnChannel(this.getChannelForSession(state), 'turn/steer', {
         threadId: state.threadId,
@@ -3468,6 +3518,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearStatus(sessionId, state);
     this.rememberTerminatedActiveTurn(state);
     state.loaded = false;
+    state.threadUnsubscribePromise = undefined;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.runningCompact = false;
@@ -4394,66 +4445,83 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
-    if (state.threadId && state.loaded) return;
+    if (state.threadUnsubscribePromise) {
+      await state.threadUnsubscribePromise.catch(() => {});
+    }
+    if (state.threadId && state.loaded) {
+      this.touchSessionActivity(state);
+      return;
+    }
     if (state.incognito && state.threadId) {
       throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
     }
-    if (state.incognito && !this.incognitoChannel.child?.stdin.writable) {
-      await this.ensureIncognitoChannelStarted();
-    }
 
-    // Always send `baseInstructions`. Catalog models get codex's full
-    // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
-    // models fall back to a short provider-neutral default. Either way, the
-    // Responses API never sees an empty `instructions` field, which it now
-    // rejects with `{"type":"invalid_request_error","message":"Instructions
-    // are required"}`.
-    const resolvedBaseInstructions = await resolveBaseInstructionsOverride(state.model);
-    const baseInstructions = payload
-      ? appendImcodesBaseInstructions(resolvedBaseInstructions, payload)
-      : resolvedBaseInstructions;
-    const sessionSystemText = payload ? getProviderSystemTextParts(payload).sessionSystemText : undefined;
-
-    if (state.threadId) {
-      try {
-        await this.resumeThread(sessionId, state, baseInstructions);
-        state.lastInjectedSessionSystemText = sessionSystemText;
-        return;
-      } catch (err) {
-        if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
-
-        // A never-materialized thread names no rollout file, so there is no
-        // history to repair; replace it without probing unrelated files.
-        const repaired = !isCodexThreadNeverMaterializedError(err)
-          && await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
-          logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
-          return false;
-        });
-        if (repaired) {
-          try {
-            await this.resumeThread(sessionId, state, baseInstructions);
-            state.lastInjectedSessionSystemText = sessionSystemText;
-            return;
-          } catch (retryErr) {
-            logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
-          }
-        }
-
-        const oldThreadId = state.threadId;
-        logger.warn(
-          { provider: this.id, sessionId, threadId: oldThreadId, err },
-          isCodexThreadNeverMaterializedError(err)
-            ? 'Codex SDK stored thread has no rollout; starting replacement thread'
-            : 'Codex SDK stored thread history is unreadable; starting replacement thread',
-        );
-        if (oldThreadId) this.getChannelForSession(state).threadToSession.delete(oldThreadId);
-        state.threadId = undefined;
-        state.loaded = false;
+    state.threadLoadInFlightCount += 1;
+    try {
+      if (state.incognito && !this.incognitoChannel.child?.stdin.writable) {
+        await this.ensureIncognitoChannelStarted();
       }
-    }
 
-    await this.startNewThread(sessionId, state, baseInstructions);
-    state.lastInjectedSessionSystemText = sessionSystemText;
+      // Always send `baseInstructions`. Catalog models get codex's full
+      // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
+      // models fall back to a short provider-neutral default. Either way, the
+      // Responses API never sees an empty `instructions` field, which it now
+      // rejects with `{"type":"invalid_request_error","message":"Instructions
+      // are required"}`.
+      const resolvedBaseInstructions = await resolveBaseInstructionsOverride(state.model);
+      const baseInstructions = payload
+        ? appendImcodesBaseInstructions(resolvedBaseInstructions, payload)
+        : resolvedBaseInstructions;
+      const sessionSystemText = payload ? getProviderSystemTextParts(payload).sessionSystemText : undefined;
+      const finalizeLoaded = (): void => {
+        state.lastInjectedSessionSystemText = sessionSystemText;
+        this.touchSessionActivity(state);
+        void this.evictIdleThreadsForChannel(this.getChannelForSession(state), 'lru-cap', sessionId);
+      };
+
+      if (state.threadId) {
+        try {
+          await this.resumeThread(sessionId, state, baseInstructions);
+          finalizeLoaded();
+          return;
+        } catch (err) {
+          if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
+
+          // A never-materialized thread names no rollout file, so there is no
+          // history to repair; replace it without probing unrelated files.
+          const repaired = !isCodexThreadNeverMaterializedError(err)
+            && await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
+            logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
+            return false;
+          });
+          if (repaired) {
+            try {
+              await this.resumeThread(sessionId, state, baseInstructions);
+              finalizeLoaded();
+              return;
+            } catch (retryErr) {
+              logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
+            }
+          }
+
+          const oldThreadId = state.threadId;
+          logger.warn(
+            { provider: this.id, sessionId, threadId: oldThreadId, err },
+            isCodexThreadNeverMaterializedError(err)
+              ? 'Codex SDK stored thread has no rollout; starting replacement thread'
+              : 'Codex SDK stored thread history is unreadable; starting replacement thread',
+          );
+          if (oldThreadId) this.getChannelForSession(state).threadToSession.delete(oldThreadId);
+          state.threadId = undefined;
+          state.loaded = false;
+        }
+      }
+
+      await this.startNewThread(sessionId, state, baseInstructions);
+      finalizeLoaded();
+    } finally {
+      state.threadLoadInFlightCount = Math.max(0, state.threadLoadInFlightCount - 1);
+    }
   }
 
   private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
@@ -7252,22 +7320,183 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) throw new Error('codex_service_tier_unknown_session');
     const wasLoaded = Boolean(state.threadId && state.loaded);
-    await this.ensureThreadLoaded(sessionId, state);
-    if (!state.threadId) throw new Error('codex_service_tier_no_thread');
+    state.sendInFlightCount += 1;
+    this.touchSessionActivity(state);
     try {
-      await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
-        threadId: state.threadId,
-        serviceTier: tier,
-      });
-      this.adoptServiceTier(sessionId, state, tier);
+      await this.ensureThreadLoaded(sessionId, state);
+      if (!state.threadId) throw new Error('codex_service_tier_no_thread');
+      try {
+        await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
+          threadId: state.threadId,
+          serviceTier: tier,
+        });
+        this.adoptServiceTier(sessionId, state, tier);
+      } finally {
+        if (!wasLoaded && !state.incognito && !state.lastInjectedSessionSystemText) {
+          // `ensureThreadLoaded` ran without a payload (`baseInstructions` had no
+          // IM.codes tail/sessionSystemText). Mark unloaded so the next `send()`
+          // re-establishes full `baseInstructions` via `thread/resume`.
+          state.loaded = false;
+        }
+      }
     } finally {
-      if (!wasLoaded && !state.incognito && !state.lastInjectedSessionSystemText) {
-        // `ensureThreadLoaded` ran without a payload (`baseInstructions` had no
-        // IM.codes tail/sessionSystemText). Mark unloaded so the next `send()`
-        // re-establishes full `baseInstructions` via `thread/resume`.
-        state.loaded = false;
+      state.sendInFlightCount = Math.max(0, state.sendInFlightCount - 1);
+    }
+  }
+
+  private touchSessionActivity(state: CodexSdkSessionState, now = Date.now()): void {
+    state.lastActivityAt = now;
+  }
+
+  private isThreadEligibleForIdleEviction(sessionId: string, state: CodexSdkSessionState): boolean {
+    if (!state.loaded || !state.threadId) return false;
+    if (state.ephemeral || state.incognito) return false;
+    if (state.threadUnsubscribePromise || state.threadLoadInFlightCount > 0 || state.sendInFlightCount > 0) {
+      return false;
+    }
+    if (
+      state.runningTurnId
+      || state.turnStartInFlight
+      || state.activeTurnLease
+      || state.runningCompact
+      || state.compactCommandInFlight
+      || state.authRecoveryPending
+      || state.cancelTimer
+      || state.idleSettleTimer
+      || state.deferredIdleSettleTurnId
+      || state.deferredCompactSettleTurnId
+      || state.rolloutSettlePollTimer
+      || state.rolloutAuthorityWatcher
+      || state.imcodesMcpRecoveryPromise
+      || state.activeItemIds.size > 0
+      || state.activeToolItemIds.size > 0
+      || state.activeCompactionItemIds.size > 0
+      || state.openProviderToolCalls.size > 0
+      || this.confirmedCancelOperations.has(sessionId)
+    ) {
+      return false;
+    }
+    if (this.getCurrentTurnWorkState(state).activeWorkCount > 0) {
+      return false;
+    }
+    if (
+      state.pendingAgentMessageQuestions
+      || this.questions.has(sessionId)
+      || this.questionInputs.has(sessionId)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  private startIdleThreadSweepTimer(): void {
+    this.stopIdleThreadSweepTimer();
+    const intervalMs = this.idleSweepIntervalMs;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+    const timer = setInterval(() => {
+      void this.sweepIdleThreads('periodic-idle-sweep').catch((err) => {
+        logger.warn({ provider: this.id, err }, 'Codex idle thread sweep failed');
+      });
+    }, intervalMs);
+    timer.unref?.();
+    this.idleSweepTimer = timer;
+  }
+
+  private stopIdleThreadSweepTimer(): void {
+    if (!this.idleSweepTimer) return;
+    clearInterval(this.idleSweepTimer);
+    this.idleSweepTimer = null;
+  }
+
+  /** Evict idle durable threads on both channels; returns number of threads unsubscribed. */
+  async sweepIdleThreads(reason: 'periodic-idle-sweep' | 'lru-cap' = 'periodic-idle-sweep'): Promise<number> {
+    const counts = await Promise.all([
+      this.evictIdleThreadsForChannel(this.normalChannel, reason),
+      this.evictIdleThreadsForChannel(this.incognitoChannel, reason),
+    ]);
+    return counts.reduce((sum, count) => sum + count, 0);
+  }
+
+  private async evictIdleThreadsForChannel(
+    channel: CodexAppServerChannel,
+    reason: 'periodic-idle-sweep' | 'lru-cap',
+    excludeSessionId?: string,
+  ): Promise<number> {
+    if (!this.config || !channel.child?.stdin.writable) return 0;
+    const channelSessions = this.getSessionsForChannel(channel);
+    const loadedSessions = channelSessions.filter(([, state]) => state.loaded && Boolean(state.threadId));
+    if (loadedSessions.length === 0) return 0;
+
+    const now = Date.now();
+    const targets: Array<[string, CodexSdkSessionState]> = [];
+    const selectedIds = new Set<string>();
+
+    if (reason === 'periodic-idle-sweep') {
+      for (const entry of loadedSessions) {
+        const [sessionId, state] = entry;
+        if (sessionId === excludeSessionId) continue;
+        if (!this.isThreadEligibleForIdleEviction(sessionId, state)) continue;
+        if (now - state.lastActivityAt >= this.idleThreadEvictMs) {
+          targets.push(entry);
+          selectedIds.add(sessionId);
+        }
       }
     }
+
+    const remainingLoadedCount = loadedSessions.length - targets.length;
+    const lruExcess = remainingLoadedCount - this.maxLoadedThreads;
+    if (lruExcess > 0) {
+      const lruCandidates = loadedSessions
+        .filter(([sessionId, state]) => (
+          sessionId !== excludeSessionId
+          && !selectedIds.has(sessionId)
+          && this.isThreadEligibleForIdleEviction(sessionId, state)
+        ))
+        .sort((a, b) => a[1].lastActivityAt - b[1].lastActivityAt);
+      for (const entry of lruCandidates.slice(0, lruExcess)) {
+        targets.push(entry);
+        selectedIds.add(entry[0]);
+      }
+    }
+
+    if (targets.length === 0) return 0;
+
+    const evictPromises: Array<Promise<void>> = [];
+    for (const [sessionId, state] of targets) {
+      const threadId = state.threadId;
+      if (!threadId || !this.isThreadEligibleForIdleEviction(sessionId, state)) continue;
+      // Mark unloaded synchronously before yielding to the RPC so concurrent sends await
+      // this unsubscribe before calling thread/resume, and concurrent sweeps do not double-evict.
+      state.loaded = false;
+      const unsubscribePromise = this.requestOnChannel(
+        channel,
+        'thread/unsubscribe',
+        { threadId },
+        CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS,
+      )
+        .then(() => {
+          logger.debug(
+            { provider: this.id, channel: channel.kind, sessionId, threadId, reason },
+            'codex-sdk: evicted idle loaded thread',
+          );
+        })
+        .catch((err) => {
+          logger.debug(
+            { provider: this.id, channel: channel.kind, sessionId, threadId, reason, err },
+            'codex-sdk: idle thread/unsubscribe failed or timed out; thread remains unloaded',
+          );
+        })
+        .finally(() => {
+          if (state.threadUnsubscribePromise === unsubscribePromise) {
+            state.threadUnsubscribePromise = undefined;
+          }
+        });
+      state.threadUnsubscribePromise = unsubscribePromise;
+      evictPromises.push(unsubscribePromise);
+    }
+
+    await Promise.allSettled(evictPromises);
+    return evictPromises.length;
   }
 
   private runWithPrivacy<T>(sessionId: string, state: CodexSdkSessionState | undefined, fn: () => T): T {
@@ -7276,6 +7505,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private emitDelta(sessionId: string, delta: MessageDelta): void {
     const state = this.sessions.get(sessionId);
+    if (state) this.touchSessionActivity(state);
     this.runWithPrivacy(sessionId, state, () => {
       for (const cb of this.deltaCallbacks) cb(sessionId, delta);
     });
@@ -7283,6 +7513,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private emitComplete(sessionId: string, message: AgentMessage): void {
     const state = this.sessions.get(sessionId);
+    if (state) this.touchSessionActivity(state);
     this.runWithPrivacy(sessionId, state, () => {
       for (const cb of this.completeCallbacks) cb(sessionId, message);
     });
@@ -7291,6 +7522,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private emitUsage(sessionId: string, update: ProviderUsageUpdate): void {
     const state = this.sessions.get(sessionId);
+    if (state) this.touchSessionActivity(state);
     this.runWithPrivacy(sessionId, state, () => {
       for (const cb of this.usageCallbacks) cb(sessionId, update);
     });
@@ -7298,6 +7530,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private emitToolCall(sessionId: string, tool: ToolCallEvent): void {
     const state = this.sessions.get(sessionId);
+    if (state) this.touchSessionActivity(state);
     this.runWithPrivacy(sessionId, state, () => {
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
     });
@@ -7317,6 +7550,7 @@ export class CodexSdkProvider implements TransportProvider {
     });
     if (state.lastStatusSignature === signature) return;
     state.lastStatusSignature = signature;
+    this.touchSessionActivity(state);
     this.runWithPrivacy(sessionId, state, () => {
       for (const cb of this.statusCallbacks) cb(sessionId, status);
     });
