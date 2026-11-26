@@ -314,4 +314,227 @@ describe('GlobalTaskModeView card real Chromium zero-extra-height parity', () =>
       await browser.close();
     }
   });
+
+  it('shows compact same-row Brief & Open session buttons on desktop (>=721px) and hides them until expand on mobile (<=720px)', { timeout: 90000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    const systemChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    const executablePath = existsSync(chromium.executablePath())
+      ? chromium.executablePath()
+      : (existsSync(systemChromePath) ? systemChromePath : null);
+    if (!executablePath) {
+      return;
+    }
+    const { build } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const webDir = resolve(here, '../..');
+    const repoRoot = resolve(webDir, '..');
+    const viewPath = resolve(webDir, 'src/components/GlobalTaskModeView.tsx');
+    const i18nPath = resolve(webDir, 'src/i18n/index.ts');
+    const storePath = resolve(webDir, 'src/global-task-mode-store.ts');
+    const headBaseCss = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
+    const headBriefCss = readFileSync(resolve(webDir, 'src/components/global-task-mode-brief.css'), 'utf8');
+
+    const harnessEntry = `
+      import { render } from 'preact';
+      import i18n from ${JSON.stringify(i18nPath)};
+      import { globalTaskModeStore, clearGlobalTaskModeSessionState } from ${JSON.stringify(storePath)};
+      import { GlobalTaskModeView } from ${JSON.stringify(viewPath)};
+      class NoopWebSocket {
+        static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+        readyState = 1; send() {} close() {} addEventListener() {} removeEventListener() {}
+      }
+      window.WebSocket = NoopWebSocket;
+      window.__mountCards = async (tasks, cardWidthPx) => {
+        await i18n.changeLanguage('en');
+        clearGlobalTaskModeSessionState();
+        globalTaskModeStore.setState({
+          loading: false,
+          connected: true,
+          connecting: false,
+          servers: [{ id: 'srv-1', name: tasks[0].serverName, online: true }],
+          brains: [],
+          tasks,
+        });
+        const root = document.getElementById('root');
+        root.style.width = cardWidthPx ? (cardWidthPx + 'px') : '100%';
+        render(null, root);
+        render(<GlobalTaskModeView onExit={() => {}} onJumpToSession={() => {}} />, root);
+        await new Promise((r) => setTimeout(r, 40));
+      };
+    `;
+
+    const buildResult = await build({
+      absWorkingDir: webDir,
+      stdin: { contents: harnessEntry, resolveDir: webDir, loader: 'tsx' },
+      bundle: true,
+      write: false,
+      outfile: 'harness.js',
+      jsx: 'automatic',
+      jsxImportSource: 'preact',
+      platform: 'browser',
+      alias: {
+        react: 'preact/compat',
+        'react-dom': 'preact/compat',
+        '@shared': resolve(repoRoot, 'shared'),
+      },
+      plugins: [
+        {
+          name: 'ignore-css',
+          setup(pluginBuild) {
+            pluginBuild.onLoad({ filter: /\.css$/ }, () => ({ contents: '', loader: 'css' }));
+          },
+        },
+      ],
+    });
+    const bundle = buildResult.outputFiles.find((f) => f.path.endsWith('.js'))!.text;
+
+    const activeNow = Date.now();
+    const activeTask = {
+      serverId: 'srv-1',
+      serverName: 'M3',
+      serverOnline: true,
+      projectName: 'Main',
+      brainSession: 'deck_cd_brain',
+      brainLabel: 'Main',
+      taskId: 'tsk_inline_actions',
+      title: 'Compact inline actions card',
+      status: 'working',
+      flags: [],
+      round: 1,
+      checklist: { total: 5, implemented: 2, audited: 1 },
+      executorLabel: 'Exec1',
+      auditorLabel: 'Aud1',
+      executorModel: 'gemini-4-neon',
+      auditorModel: 'gpt-6.2-astra',
+      createdAt: activeNow - 120_000,
+      updatedAt: activeNow - 30_000,
+      isTerminal: false,
+      needsAttention: false,
+    };
+
+    const distAssetsDir = resolve(webDir, 'dist/assets');
+    const builtCssName = existsSync(distAssetsDir)
+      ? readdirSync(distAssetsDir).find((name) => /^index-.*\.css$/.test(name))
+      : undefined;
+    const cssVariants = [
+      `${headBriefCss}\n${headBaseCss}`,
+      ...(builtCssName ? [readFileSync(resolve(distAssetsDir, builtCssName), 'utf8')] : []),
+    ];
+
+    const browser = await chromium.launch({ executablePath, headless: true });
+    try {
+      const page = await browser.newPage({ colorScheme: 'dark', reducedMotion: 'reduce' });
+      await page.route('https://imcodes.test/**', async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;background:#080d16;"><div id="root"></div></body></html>',
+        });
+      });
+
+      for (const css of cssVariants) {
+        // Desktop: 500px container (card >= 460px min desktop track) and full 1280px 2-col grid
+        for (const cardWidthPx of [500, 0]) {
+          await page.setViewportSize({ width: 1280, height: 800 });
+          await page.goto('https://imcodes.test/', { waitUntil: 'domcontentloaded' });
+          await page.addStyleTag({ content: css });
+          await page.addScriptTag({ content: bundle });
+          const tasks = cardWidthPx === 0
+            ? [activeTask, { ...activeTask, taskId: 'tsk_inline_actions_2' }]
+            : [activeTask];
+          await page.evaluate(async ({ tasks: tList, width }) => {
+            const w = window as unknown as { __mountCards: (t: unknown, w: number) => Promise<void> };
+            await w.__mountCards(tList, width);
+          }, { tasks, width: cardWidthPx });
+
+          const desktopMetrics = await page.evaluate((id) => {
+            const card = document.querySelector(`[data-testid="task-mode-card-${id}"]`) as HTMLElement;
+            const meta = card.querySelector(`[data-testid="task-mode-running-meta-${id}"]`) as HTMLElement;
+            const row = meta.querySelector('.global-task-desktop-running-row') as HTMLElement;
+            const spans = Array.from(row.querySelectorAll('span')).map((el) => el.getBoundingClientRect().toJSON());
+            const brief = card.querySelector(`[data-testid="task-mode-running-brief-${id}"]`) as HTMLElement;
+            const jump = card.querySelector(`[data-testid="task-mode-running-jump-${id}"]`) as HTMLElement;
+            return {
+              cardWidth: card.getBoundingClientRect().width,
+              metaDisplay: getComputedStyle(meta).display,
+              rowText: row.innerText,
+              rowRect: row.getBoundingClientRect().toJSON(),
+              lastSpanRight: spans.length > 0 ? Math.max(...spans.map((s) => s.right)) : 0,
+              briefRect: brief.getBoundingClientRect().toJSON(),
+              jumpRect: jump.getBoundingClientRect().toJSON(),
+              hasDetails: Boolean(card.querySelector(`[data-testid="task-mode-details-${id}"]`)),
+            };
+          }, activeTask.taskId);
+
+          expect(desktopMetrics.cardWidth).toBeGreaterThanOrEqual(460);
+          expect(desktopMetrics.metaDisplay).toBe('flex');
+          expect(desktopMetrics.hasDetails).toBe(false);
+          expect(desktopMetrics.briefRect.width).toBeGreaterThan(0);
+          expect(desktopMetrics.briefRect.height).toBeGreaterThan(0);
+          expect(desktopMetrics.briefRect.height).toBeLessThanOrEqual(24);
+          expect(desktopMetrics.jumpRect.width).toBeGreaterThan(0);
+          expect(desktopMetrics.jumpRect.height).toBeGreaterThan(0);
+          expect(desktopMetrics.jumpRect.height).toBeLessThanOrEqual(24);
+          // Same horizontal row: metadata text ends before Brief button, and Brief + Jump sit aligned on one line
+          expect(Math.abs(desktopMetrics.briefRect.top - desktopMetrics.jumpRect.top)).toBeLessThanOrEqual(1);
+          expect(desktopMetrics.briefRect.right).toBeLessThanOrEqual(desktopMetrics.jumpRect.left + 0.5);
+          expect(desktopMetrics.lastSpanRight).toBeLessThanOrEqual(desktopMetrics.briefRect.left + 0.5);
+          expect(Math.abs(desktopMetrics.rowRect.top - desktopMetrics.briefRect.top), JSON.stringify(desktopMetrics)).toBeLessThanOrEqual(6);
+          expect(desktopMetrics.rowRect.height).toBeLessThanOrEqual(24);
+
+          // Clicking inline brief button opens brief modal without expanding card
+          await page.click(`[data-testid="task-mode-running-brief-${activeTask.taskId}"]`);
+          const afterBriefClick = await page.evaluate((id) => ({
+            hasModal: Boolean(document.querySelector('[data-testid="global-task-brief-hud"]')),
+            hasDetails: Boolean(document.querySelector(`[data-testid="task-mode-details-${id}"]`)),
+          }), activeTask.taskId);
+          expect(afterBriefClick.hasModal).toBe(true);
+          expect(afterBriefClick.hasDetails).toBe(false);
+        }
+
+        // Mobile (<= 720px): inline desktop bar remains display:none; must expand card to access buttons
+        await page.setViewportSize({ width: 393, height: 844 });
+        await page.goto('https://imcodes.test/', { waitUntil: 'domcontentloaded' });
+        await page.addStyleTag({ content: css });
+        await page.addScriptTag({ content: bundle });
+        await page.evaluate(async ({ tasks, width }) => {
+          const w = window as unknown as { __mountCards: (t: unknown, w: number) => Promise<void> };
+          await w.__mountCards(tasks, width);
+        }, { tasks: [activeTask], width: 335 });
+
+        const mobileBefore = await page.evaluate((id) => {
+          const meta = document.querySelector(`[data-testid="task-mode-running-meta-${id}"]`) as HTMLElement;
+          const brief = document.querySelector(`[data-testid="task-mode-running-brief-${id}"]`) as HTMLElement;
+          const jump = document.querySelector(`[data-testid="task-mode-running-jump-${id}"]`) as HTMLElement;
+          return {
+            metaDisplay: getComputedStyle(meta).display,
+            briefWidth: brief.getBoundingClientRect().width,
+            jumpWidth: jump.getBoundingClientRect().width,
+            hasDetails: Boolean(document.querySelector(`[data-testid="task-mode-details-${id}"]`)),
+          };
+        }, activeTask.taskId);
+        expect(mobileBefore.metaDisplay).toBe('none');
+        expect(mobileBefore.briefWidth).toBe(0);
+        expect(mobileBefore.jumpWidth).toBe(0);
+        expect(mobileBefore.hasDetails).toBe(false);
+
+        await page.click(`[data-testid="task-mode-card-${activeTask.taskId}"]`);
+        const mobileAfter = await page.evaluate((id) => {
+          const brief = document.querySelector(`[data-testid="task-mode-detail-brief-${id}"]`) as HTMLElement | null;
+          const jump = document.querySelector(`[data-testid="task-mode-jump-${id}"]`) as HTMLElement | null;
+          return {
+            hasDetails: Boolean(document.querySelector(`[data-testid="task-mode-details-${id}"]`)),
+            briefWidth: brief ? brief.getBoundingClientRect().width : 0,
+            jumpWidth: jump ? jump.getBoundingClientRect().width : 0,
+          };
+        }, activeTask.taskId);
+        expect(mobileAfter.hasDetails).toBe(true);
+        expect(mobileAfter.briefWidth).toBeGreaterThan(0);
+        expect(mobileAfter.jumpWidth).toBeGreaterThan(0);
+      }
+    } finally {
+      await browser.close();
+    }
+  });
 });

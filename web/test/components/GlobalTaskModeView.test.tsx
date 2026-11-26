@@ -2928,7 +2928,8 @@ describe('GlobalTaskModeView', () => {
 
   it('enlarges desktop active cards via @media (min-width: 721px), exposes running-only metadata without duplication on expand, and keeps mobile <= 720px unchanged', async () => {
     const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
-    render(<GlobalTaskModeView onExit={vi.fn()} onJumpToSession={vi.fn()} />);
+    const onJumpToSession = vi.fn();
+    render(<GlobalTaskModeView onExit={vi.fn()} onJumpToSession={onJumpToSession} />);
     await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
     const ws = MockWebSocket.instances[0]!;
     const now = Date.now();
@@ -2999,7 +3000,7 @@ describe('GlobalTaskModeView', () => {
     expect(finishedGrid?.className).toContain('is-finished-grid');
     expect(screen.queryByTestId('task-mode-running-meta-tsk_term_compact')).toBeNull();
 
-    // Active running card surfaces executor, auditor, project (!= brainLabel), relative time, and flag chips before expand
+    // Active running card surfaces executor, auditor, project (!= brainLabel), relative time, inline action buttons, and flag chips before expand
     const runningMeta = screen.getByTestId('task-mode-running-meta-tsk_run_dense');
     expect(runningMeta.textContent).toContain('Executor: CxExec');
     expect(runningMeta.textContent).toContain('Auditor: SolAud');
@@ -3008,12 +3009,42 @@ describe('GlobalTaskModeView', () => {
     expect(runningMeta.textContent).toMatch(/\d{1,2}:\d{2}/);
     expect(screen.queryByTestId('task-mode-details-tsk_run_dense')).toBeNull();
 
-    // Clicking active card expands full details and hides running-meta strip so rows/flags are never duplicated
+    const runningBar = runningMeta.querySelector('.global-task-desktop-running-bar');
+    expect(runningBar).not.toBeNull();
+    expect(runningBar?.querySelector('.global-task-desktop-running-row')).not.toBeNull();
+    const runningBriefBtn = screen.getByTestId('task-mode-running-brief-tsk_run_dense');
+    const runningJumpBtn = screen.getByTestId('task-mode-running-jump-tsk_run_dense');
+    expect(runningBriefBtn.closest('.global-task-desktop-running-actions')?.parentElement).toBe(runningBar);
+    expect(runningJumpBtn.closest('.global-task-desktop-running-actions')?.parentElement).toBe(runningBar);
+    expect(runningBriefBtn.className).toContain('is-compact');
+    expect(runningJumpBtn.className).toContain('is-compact');
+    expect(screen.queryByTestId('task-mode-running-brief-tsk_term_compact')).toBeNull();
+    expect(screen.queryByTestId('task-mode-running-jump-tsk_term_compact')).toBeNull();
+
+    // Clicking desktop inline buttons opens brief modal or jumps to session without expanding the card
+    fireEvent.click(runningBriefBtn);
+    expect(screen.getByTestId('global-task-brief-hud')).toBeTruthy();
+    expect(screen.queryByTestId('task-mode-details-tsk_run_dense')).toBeNull();
+    fireEvent.click(screen.getByTestId('global-task-brief-hud-close'));
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+
+    fireEvent.click(runningJumpBtn);
+    expect(onJumpToSession).toHaveBeenCalledWith('srv-1', 'deck_cd_brain', {
+      taskId: 'tsk_run_dense',
+      title: 'Unwrapped very long desktop active task title that must remain completely readable without truncation',
+      status: 'working',
+    });
+    expect(screen.queryByTestId('task-mode-details-tsk_run_dense')).toBeNull();
+
+    // Clicking active card expands full details and hides running-meta strip so rows/actions/flags are never duplicated
     fireEvent.click(screen.getByTestId('task-mode-card-tsk_run_dense'));
     expect(screen.queryByTestId('task-mode-running-meta-tsk_run_dense')).toBeNull();
+    expect(screen.queryByTestId('task-mode-running-brief-tsk_run_dense')).toBeNull();
+    expect(screen.queryByTestId('task-mode-running-jump-tsk_run_dense')).toBeNull();
     const details = screen.getByTestId('task-mode-details-tsk_run_dense');
     expect(details.textContent).toContain('Executor: CxExec');
     expect(details.textContent).toContain('Auditor: SolAud');
+    expect(screen.getByTestId('task-mode-detail-brief-tsk_run_dense')).toBeTruthy();
     expect(screen.getByTestId('task-mode-jump-tsk_run_dense')).toBeTruthy();
 
     // CSS contract: desktop overrides strictly scoped to @media (min-width: 721px), mobile @media (max-width: 720px) unchanged
@@ -3033,5 +3064,8 @@ describe('GlobalTaskModeView', () => {
     expect(desktopBlock).toMatch(/\.global-task-card:not\(\.is-terminal\)\s+\.global-task-live-summary\s*\{[^}]*-webkit-line-clamp:\s*3;/s);
     expect(desktopBlock).toMatch(/\.global-task-card:not\(\.is-terminal\)\s+\.global-task-brain-preview-text\s*\{[^}]*-webkit-line-clamp:\s*3;/s);
     expect(desktopBlock).toMatch(/\.global-task-desktop-running-meta\s*\{[^}]*display:\s*flex;/s);
+    expect(desktopBlock).toMatch(/\.global-task-desktop-running-bar\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*justify-content:\s*space-between;/s);
+    expect(desktopBlock).toMatch(/\.global-task-desktop-running-actions\s*\{[^}]*display:\s*inline-flex;/s);
+    expect(desktopBlock).toMatch(/\.global-task-card\s+\.global-task-brief-detail-btn\.is-compact,\s*\.global-task-card\s+\.global-task-jump-btn\.is-compact\s*\{[^}]*white-space:\s*nowrap;/s);
   });
 });
