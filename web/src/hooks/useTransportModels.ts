@@ -189,6 +189,9 @@ export function readCachedTransportModels(
       } catch { /* corrupt or inaccessible storage: use the next cache or fallback */ }
     }
   }
+  // Custom presets resolve their own third-party endpoints and model IDs from
+  // the daemon; never synthesize first-party static models on a cold preset cache.
+  if (hasPreset) return null;
   const fallback = getStaticFallbackModels(agentType);
   return fallback ? {
     models: fallback.models,

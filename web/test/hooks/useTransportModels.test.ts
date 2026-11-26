@@ -417,4 +417,25 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(result.current.defaultModel).toBeUndefined();
   });
 
+  it('returns null on cold preset cache miss instead of first-party fallback while preserving non-preset fallback', () => {
+    expect(readCachedTransportModels('srv-a\0sess\0claude-code-sdk\0glm', 'claude-code-sdk', 'srv-a')).toBeNull();
+    expect(readCachedTransportModels('srv-a\0sess\0codex-sdk\0custom', 'codex-sdk', 'srv-a')).toBeNull();
+
+    const presetClaude = renderHook(() => useTransportModels(null, 'claude-code-sdk', 'glm', 'sess', 'srv-a'));
+    expect(presetClaude.result.current.models).toEqual([]);
+    expect(presetClaude.result.current.defaultModel).toBeUndefined();
+
+    const nonPresetClaude = renderHook(() => useTransportModels(null, 'claude-code-sdk', undefined, 'sess', 'srv-a'));
+    expect(nonPresetClaude.result.current.models.length).toBeGreaterThan(0);
+    expect(nonPresetClaude.result.current.defaultModel).toBeTruthy();
+
+    const presetCodex = renderHook(() => useTransportModels(null, 'codex-sdk', 'custom', 'sess', 'srv-a'));
+    expect(presetCodex.result.current.models).toEqual([]);
+    expect(presetCodex.result.current.defaultModel).toBeUndefined();
+
+    const nonPresetCodex = renderHook(() => useTransportModels(null, 'codex-sdk', undefined, 'sess', 'srv-a'));
+    expect(nonPresetCodex.result.current.models.length).toBeGreaterThan(0);
+    expect(nonPresetCodex.result.current.defaultModel).toBeTruthy();
+  });
+
 });

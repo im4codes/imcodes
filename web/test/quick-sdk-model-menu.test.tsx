@@ -523,4 +523,87 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
       cleanup();
     }
   });
+
+  it('sends requestedModel: null on cold preserved-preset default switch until live preset models arrive', async () => {
+    expect(resolveCrossSdkModels({
+      sdk: 'claude-code-sdk',
+      sessionName: 'deck_app_brain',
+      ccPreset: 'glm',
+      targetScope: 'srv-a',
+    })).toEqual({ models: [], defaultModel: null, loading: false });
+
+    expect(resolveCrossSdkModels({
+      sdk: 'codex-sdk',
+      sessionName: 'deck_app_brain',
+      ccPreset: 'custom',
+      targetScope: 'srv-a',
+    })).toEqual({ models: [], defaultModel: null, loading: false });
+
+    const { container, ws, onSessionSaved } = renderSessionControls({
+      agentType: 'claude-code',
+      ccPreset: 'glm',
+    });
+    const trigger = container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement;
+    fireEvent.click(trigger);
+
+    // Preview compatible claude-code-sdk on cold cache: no first-party models (fable/sonnet/etc.), only default switch.
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    expect(document.body.querySelectorAll('[data-cross-model-id]')).toHaveLength(0);
+    const defaultBtn = document.body.querySelector('[data-testid="quick-sdk-default-switch"]') as HTMLButtonElement;
+    expect(defaultBtn).not.toBeNull();
+    expect(defaultBtn.querySelector('.quick-sdk-default-tag')).toBeNull();
+
+    // First click on default before live preset models arrive sends requestedModel: null so daemon uses preset default.
+    fireEvent.click(defaultBtn);
+    await waitFor(() => {
+      expect(mockApi.patchSession).toHaveBeenCalledWith('srv1', 'deck_app_brain', {
+        agentType: 'claude-code-sdk',
+        requestedModel: null,
+        activeModel: null,
+      });
+    });
+    expect(onSessionSaved).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      requestedModel: null,
+      ccPreset: 'glm',
+    }));
+
+    vi.clearAllMocks();
+    mockApi.patchSession.mockResolvedValue({ ok: true });
+
+    // Reopen, preview claude-code-sdk, deliver live preset-exclusive models, then select one.
+    fireEvent.click(trigger);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    await waitFor(() => {
+      const req = ws.send.mock.calls
+        .map((c: unknown[]) => c[0] as Record<string, unknown>)
+        .find((m) => m?.type === TRANSPORT_MSG.LIST_MODELS && m?.agentType === 'claude-code-sdk' && m?.ccPreset === 'glm');
+      expect(req).toBeDefined();
+    });
+    const req = ws.send.mock.calls
+      .map((c: unknown[]) => c[0] as Record<string, unknown>)
+      .find((m) => m?.type === TRANSPORT_MSG.LIST_MODELS && m?.agentType === 'claude-code-sdk' && m?.ccPreset === 'glm')!;
+    ws.emitMessage({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      agentType: 'claude-code-sdk',
+      ccPreset: 'glm',
+      requestId: req.requestId,
+      models: [{ id: 'glm-4.5' }, { id: 'glm-4.5-air' }],
+      defaultModel: 'glm-4.5',
+    });
+
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-cross-model-id="glm-4.5-air"]')).not.toBeNull();
+    });
+    expect(document.body.querySelector('[data-testid="quick-sdk-default-switch"]')?.textContent).toContain('glm-4.5');
+
+    fireEvent.click(document.body.querySelector('[data-cross-model-id="glm-4.5-air"]') as HTMLButtonElement);
+    await waitFor(() => {
+      expect(mockApi.patchSession).toHaveBeenCalledWith('srv1', 'deck_app_brain', {
+        agentType: 'claude-code-sdk',
+        requestedModel: 'glm-4.5-air',
+        activeModel: null,
+      });
+    });
+  });
 });
