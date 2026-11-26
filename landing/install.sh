@@ -229,6 +229,23 @@ opencode_is_installed() {
   opencode_bin_path >/dev/null 2>&1
 }
 
+add_managed_path_dir() {
+  local d="${1:-}"
+  [ -n "$d" ] || return 0
+  case ":${PATH:-}:" in
+    *":$d:"*) ;;
+    *) export PATH="$d${PATH:+:$PATH}" ;;
+  esac
+  if [ -z "${PATH_DIR:-}" ]; then
+    PATH_DIR="$d"
+  else
+    case ":$PATH_DIR:" in
+      *":$d:"*) ;;
+      *) PATH_DIR="${PATH_DIR}:$d" ;;
+    esac
+  fi
+}
+
 OPENCODE_STATUS=""
 try_install_opencode_cli() {
   local npm_bin="${1:-npm}" npm_reg="${2:-https://registry.npmjs.org/}"
@@ -238,21 +255,45 @@ try_install_opencode_cli() {
     return 0
   fi
 
-  local existing_bin oc_ver=""
-  if existing_bin=$(opencode_bin_path 2>/dev/null); then
-    oc_ver=$("$existing_bin" --version 2>/dev/null | head -n1 || true)
-    ok "found opencode${oc_ver:+ $oc_ver} ($existing_bin) — keeping existing install"
+  local oc_ver=""
+  if have opencode; then
+    oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+    ok "found opencode${oc_ver:+ $oc_ver} ($(command -v opencode)) — keeping existing install"
     OPENCODE_STATUS="existing"
+    return 0
+  fi
+
+  if [ -n "${HOME:-}" ] && [ -x "$HOME/.opencode/bin/opencode" ]; then
+    add_managed_path_dir "$HOME/.opencode/bin"
+    if have opencode; then
+      oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+      ok "found opencode${oc_ver:+ $oc_ver} ($HOME/.opencode/bin/opencode, added to PATH) — keeping existing install"
+      OPENCODE_STATUS="existing"
+    else
+      note "WARNING: found $HOME/.opencode/bin/opencode, but could not expose 'opencode' on PATH"
+      OPENCODE_STATUS="unverified"
+    fi
     return 0
   fi
 
   step "Installing OpenCode CLI (opencode-ai) ..."
   if "$npm_bin" install -g opencode-ai --no-fund --no-audit --registry "$npm_reg"; then
-    if existing_bin=$(opencode_bin_path 2>/dev/null); then
-      oc_ver=$("$existing_bin" --version 2>/dev/null | head -n1 || true)
+    if ! have opencode; then
+      local oc_prefix=""
+      oc_prefix=$("$npm_bin" prefix -g 2>/dev/null | head -n1 || true)
+      if [ -n "$oc_prefix" ] && [ -x "$oc_prefix/bin/opencode" ]; then
+        add_managed_path_dir "$oc_prefix/bin"
+      fi
     fi
-    ok "opencode CLI installed${oc_ver:+ ($oc_ver)}"
-    OPENCODE_STATUS="installed"
+    if have opencode; then
+      oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+      ok "opencode CLI installed${oc_ver:+ ($oc_ver)}"
+      OPENCODE_STATUS="installed"
+    else
+      note "WARNING: opencode-ai npm install finished, but 'opencode' was not found on PATH — IM.codes was installed cleanly."
+      note "  Check npm global bin or retry manually: $npm_bin install -g opencode-ai --registry $npm_reg"
+      OPENCODE_STATUS="unverified"
+    fi
   else
     note "WARNING: OpenCode CLI install failed (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
     note "  $npm_bin install -g opencode-ai --registry $npm_reg"
@@ -359,10 +400,9 @@ else
   tar -xzf "$tmp/node.tar.gz" -C "$node_dir"
   rm -rf "$tmp"
   node_home="$node_dir/$pkg"
-  PATH_DIR="$node_home/bin"
-  export PATH="$PATH_DIR:$PATH"
-  NPM="$PATH_DIR/npm"
-  ok "node $("$PATH_DIR/node" -v) installed"
+  add_managed_path_dir "$node_home/bin"
+  NPM="$node_home/bin/npm"
+  ok "node $("$node_home/bin/node" -v) installed"
 fi
 
 # ── Existing npm whose global dir isn't writable: use a user prefix (no sudo) ──
@@ -376,8 +416,7 @@ if [ "$NPM" = npm ]; then
     step "Global npm dir not writable — using a user prefix (no sudo): $prefix"
     mkdir -p "$prefix"
     npm config set prefix "$prefix"
-    PATH_DIR="$prefix/bin"
-    export PATH="$PATH_DIR:$PATH"
+    add_managed_path_dir "$prefix/bin"
     ok "npm prefix -> $prefix"
   fi
 fi
@@ -462,6 +501,8 @@ case "$OPENCODE_STATUS" in
     ok "OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" ;;
   skipped)
     note "OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" ;;
+  unverified)
+    note "OpenCode CLI: installed by npm, but 'opencode' was not found on PATH (verify npm global bin / open a new shell)" ;;
   *)
     note "OpenCode CLI: not installed (IM.codes daemon works normally; retry: npm install -g opencode-ai)" ;;
 esac

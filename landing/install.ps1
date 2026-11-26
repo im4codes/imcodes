@@ -61,6 +61,39 @@ function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "    $m"  -ForegroundColor Green }
 function Write-Note($m) { Write-Host "    $m"  -ForegroundColor Yellow }
 
+function Add-UserPathEntry([string]$Dir) {
+  if (-not $Dir) { return }
+  $trimmed = $Dir.TrimEnd('\')
+  $userPathRaw = [Environment]::GetEnvironmentVariable('Path', 'User')
+  $userEntries = @()
+  if ($userPathRaw) {
+    $userEntries = @($userPathRaw -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
+  }
+  $existsUser = $false
+  foreach ($e in $userEntries) {
+    if ($e.TrimEnd('\').Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $existsUser = $true
+      break
+    }
+  }
+  if (-not $existsUser) {
+    $newUserPath = if ($userPathRaw) { "$trimmed;$userPathRaw" } else { $trimmed }
+    [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+    Write-Ok "added to user PATH: $trimmed"
+  }
+  $procEntries = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
+  $existsProc = $false
+  foreach ($e in $procEntries) {
+    if ($e.TrimEnd('\').Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $existsProc = $true
+      break
+    }
+  }
+  if (-not $existsProc) {
+    $env:Path = if ($env:Path) { "$trimmed;$env:Path" } else { $trimmed }
+  }
+}
+
 Write-Host ""
 Write-Host "  IM.codes daemon installer" -ForegroundColor White
 Write-Host "  channel=$Channel  source=$Source" -ForegroundColor DarkGray
@@ -186,12 +219,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
 
   # Persist to user PATH (no admin) so a freshly-launched daemon can find node/npm
   # for its own auto-upgrade; also make it available in the current session.
-  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  if (($userPath -split ';') -notcontains $nodeHome) {
-    [Environment]::SetEnvironmentVariable('Path', "$nodeHome;$userPath", 'User')
-    Write-Ok "added to user PATH: $nodeHome"
-  }
-  $env:Path = "$nodeHome;$env:Path"
+  Add-UserPathEntry $nodeHome
   $npmExe   = Join-Path $nodeHome 'npm.cmd'
   Write-Ok "node $(& "$nodeHome\node.exe" -v) installed"
 }
@@ -212,11 +240,7 @@ if ($npmExe -eq 'npm') {
     New-Item -ItemType Directory -Force -Path $prefix | Out-Null
     Write-Step "Global npm dir not writable — using a user prefix (no admin): $prefix"
     & npm config set prefix $prefix
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if (($userPath -split ';') -notcontains $prefix) {
-      [Environment]::SetEnvironmentVariable('Path', "$prefix;$userPath", 'User')
-    }
-    $env:Path = "$prefix;$env:Path"
+    Add-UserPathEntry $prefix
     Write-Ok "npm prefix -> $prefix"
   }
 }
@@ -290,58 +314,93 @@ if (-not $installedFromR2) {
 }
 
 # ── OpenCode CLI (official opencode-ai, idempotent & non-blocking) ────────────
-function Test-OpenCodeInstalled {
-  if (Get-Command opencode -ErrorAction SilentlyContinue) { return $true }
-  $userOc = Join-Path $env:USERPROFILE '.opencode\bin\opencode.exe'
-  return (Test-Path -LiteralPath $userOc)
-}
-
-function Get-OpenCodeVersion {
-  $cmd = Get-Command opencode -ErrorAction SilentlyContinue
-  if ($cmd) {
-    return try { (& opencode --version 2>$null | Select-Object -First 1) } catch { '' }
+function Get-OpenCodeVersion([string]$BinPath) {
+  try {
+    $out = & $BinPath --version 2>$null | Select-Object -First 1
+    if ($null -eq $out) { return '' }
+    return ([string]$out).Trim()
+  } catch {
+    return ''
   }
-  $userOc = Join-Path $env:USERPROFILE '.opencode\bin\opencode.exe'
-  if (Test-Path -LiteralPath $userOc) {
-    return try { (& $userOc --version 2>$null | Select-Object -First 1) } catch { '' }
-  }
-  return ''
 }
 
 $openCodeStatus = 'failed'
-if ($skipOpenCodeEffective) {
-  Write-Note "skipping OpenCode CLI install (opted out via -SkipOpenCode / IMCODES_SKIP_OPENCODE)"
-  $openCodeStatus = 'skipped'
-} elseif (Test-OpenCodeInstalled) {
-  $ocVer = Get-OpenCodeVersion
-  if ($ocVer) {
-    Write-Ok "found opencode $ocVer — keeping existing install"
+try {
+  if ($skipOpenCodeEffective) {
+    Write-Note "skipping OpenCode CLI install (opted out via -SkipOpenCode / IMCODES_SKIP_OPENCODE)"
+    $openCodeStatus = 'skipped'
   } else {
-    Write-Ok "found existing opencode CLI — keeping existing install"
-  }
-  $openCodeStatus = 'existing'
-} else {
-  Write-Step "Installing OpenCode CLI (opencode-ai) ..."
-  try {
-    & $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry
-    if ($LASTEXITCODE -eq 0) {
-      $ocVer = Get-OpenCodeVersion
+    $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+    $userOcDir = Join-Path $env:USERPROFILE '.opencode\bin'
+    $userOcExe = Join-Path $userOcDir 'opencode.exe'
+    if ($ocCmd) {
+      $ocVer = Get-OpenCodeVersion $ocCmd.Source
       if ($ocVer) {
-        Write-Ok "opencode CLI installed ($ocVer)"
+        Write-Ok "found opencode $ocVer ($($ocCmd.Source)) — keeping existing install"
       } else {
-        Write-Ok "opencode CLI installed"
+        Write-Ok "found existing opencode CLI ($($ocCmd.Source)) — keeping existing install"
       }
-      $openCodeStatus = 'installed'
+      $openCodeStatus = 'existing'
+    } elseif (Test-Path -LiteralPath $userOcExe) {
+      Add-UserPathEntry $userOcDir
+      $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+      if ($ocCmd) {
+        $ocVer = Get-OpenCodeVersion $ocCmd.Source
+        if ($ocVer) {
+          Write-Ok "found opencode $ocVer ($userOcExe, added to PATH) — keeping existing install"
+        } else {
+          Write-Ok "found existing opencode CLI ($userOcExe, added to PATH) — keeping existing install"
+        }
+        $openCodeStatus = 'existing'
+      } else {
+        Write-Note "WARNING: found $userOcExe, but could not verify 'opencode' on PATH"
+        $openCodeStatus = 'unverified'
+      }
     } else {
-      Write-Note "WARNING: OpenCode CLI install exited $LASTEXITCODE (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
-      Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
-      $openCodeStatus = 'failed'
+      Write-Step "Installing OpenCode CLI (opencode-ai) ..."
+      & $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry
+      if ($LASTEXITCODE -eq 0) {
+        $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+        if (-not $ocCmd) {
+          $ocPrefix = ''
+          try {
+            $p = & $npmExe prefix -g 2>$null | Select-Object -First 1
+            if ($p) { $ocPrefix = ([string]$p).Trim() }
+          } catch {
+            $ocPrefix = ''
+          }
+          if ($ocPrefix) {
+            $hasShim = (Test-Path -LiteralPath (Join-Path $ocPrefix 'opencode.cmd')) -or (Test-Path -LiteralPath (Join-Path $ocPrefix 'opencode.exe'))
+            if ($hasShim) {
+              Add-UserPathEntry $ocPrefix
+              $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+            }
+          }
+        }
+        if ($ocCmd) {
+          $ocVer = Get-OpenCodeVersion $ocCmd.Source
+          if ($ocVer) {
+            Write-Ok "opencode CLI installed ($ocVer)"
+          } else {
+            Write-Ok "opencode CLI installed"
+          }
+          $openCodeStatus = 'installed'
+        } else {
+          Write-Note "WARNING: opencode-ai npm install finished, but 'opencode' was not found on PATH — IM.codes was installed cleanly."
+          Write-Note "  Check your npm global prefix or retry manually: $npmExe install -g opencode-ai --registry $npmRegistry"
+          $openCodeStatus = 'unverified'
+        }
+      } else {
+        Write-Note "WARNING: OpenCode CLI install exited $LASTEXITCODE (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
+        Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+        $openCodeStatus = 'failed'
+      }
     }
-  } catch {
-    Write-Note "WARNING: OpenCode CLI install failed (non-blocking: $($_.Exception.Message)) — IM.codes was installed cleanly. To retry manually later:"
-    Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
-    $openCodeStatus = 'failed'
   }
+} catch {
+  Write-Note "WARNING: OpenCode CLI install failed (non-blocking: $($_.Exception.Message)) — IM.codes was installed cleanly. To retry manually later:"
+  Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+  $openCodeStatus = 'failed'
 }
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -353,6 +412,8 @@ if ($openCodeStatus -in @('installed', 'existing')) {
   Write-Host "  OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" -ForegroundColor Green
 } elseif ($openCodeStatus -eq 'skipped') {
   Write-Host "  OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" -ForegroundColor Yellow
+} elseif ($openCodeStatus -eq 'unverified') {
+  Write-Host "  OpenCode CLI: installed by npm, but 'opencode' was not found on PATH (verify npm global bin / open a new shell)" -ForegroundColor Yellow
 } else {
   Write-Host "  OpenCode CLI: not installed (IM.codes works normally; retry: npm install -g opencode-ai)" -ForegroundColor Yellow
 }

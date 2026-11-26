@@ -451,17 +451,70 @@ exit 0
       expect(pathExistOut).toContain('1.19.6');
       expect(existsSync(skipNpmMarker)).toBe(false);
 
-      // 2b) Existing `~/.opencode/bin/opencode` (not on PATH) skips npm
+      // 2b) Existing `~/.opencode/bin/opencode` (NOT initially on PATH) skips npm AND exposes dir on running PATH + PATH_DIR
       const dotOcHome = join(ocRoot, 'dot-oc-home');
       mkdirSync(join(dotOcHome, '.opencode', 'bin'), { recursive: true });
       writeFileSync(join(dotOcHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.18.0"\n', { mode: 0o755 });
       const dotExistOut = sourced(
-        `try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS"`,
+        `PATH_DIR="/tmp/existing-node-bin"; try_install_opencode_cli "${stubNpmSpace}" "https://registry.npmjs.org/"; RESOLVED="$(command -v opencode 2>/dev/null || true)"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$RESOLVED PATH_DIR=$PATH_DIR"`,
         { HOME: dotOcHome, PATH: `${skipBinDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
       );
       expect(dotExistOut).toContain('STATUS=existing');
       expect(dotExistOut).toContain('1.18.0');
+      expect(dotExistOut).toContain(`RESOLVED=${join(dotOcHome, '.opencode', 'bin', 'opencode')}`);
+      expect(dotExistOut).toContain(`PATH_DIR=/tmp/existing-node-bin:${join(dotOcHome, '.opencode', 'bin')}`);
       expect(existsSync(skipNpmMarker)).toBe(false);
+
+      // 2c) Full E2E with existing `~/.opencode/bin/opencode` (not on PATH) + non-writable global npm root:
+      // ~/.profile must persist BOTH npm-global/bin AND ~/.opencode/bin so a reopened shell finds BOTH `imcodes` and `opencode`
+      const dotE2eRoot = mkdtempSync(join(dir, 'dot-oc-e2e-'));
+      const dotE2eHome = join(dotE2eRoot, 'home');
+      const dotE2ePrefix = join(dotE2eRoot, 'install-root', 'npm-global');
+      const dotE2eReadonlyRoot = join(dotE2eRoot, 'readonly-global-root');
+      const dotE2eShim = join(dotE2eRoot, 'shim');
+      mkdirSync(join(dotE2eHome, '.opencode', 'bin'), { recursive: true });
+      mkdirSync(dotE2eReadonlyRoot, { recursive: true, mode: 0o555 });
+      mkdirSync(dotE2eShim, { recursive: true });
+      writeFileSync(join(dotE2eHome, '.opencode', 'bin', 'opencode'), '#!/usr/bin/env bash\necho "1.18.0"\n', { mode: 0o755 });
+      writeFileSync(
+        join(dotE2eShim, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "root" ]; then echo "${dotE2eReadonlyRoot}"; exit 0; fi
+if [ "\${1:-}" = "config" ] && [ "\${2:-}" = "set" ] && [ "\${3:-}" = "prefix" ]; then
+  mkdir -p "\${4}/bin"
+  printf '#!/usr/bin/env bash\\necho "2026.11.9999"\\n' > "\${4}/bin/imcodes"
+  chmod +x "\${4}/bin/imcodes"
+  exit 0
+fi
+if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const dotE2eOut = execFileSync(
+        'bash',
+        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', join(dotE2eRoot, 'install-root')],
+        {
+          ...EXEC_OPTS,
+          env: {
+            PATH: `${dotE2eShim}:${cleanPath}`,
+            HOME: dotE2eHome,
+            TMPDIR: dotE2eRoot,
+            IMCODES_USE_R2: 'false',
+          },
+        },
+      );
+      expect(dotE2eOut).toContain('OpenCode CLI: ready');
+      const profileSrc = execFileSync('cat', [join(dotE2eHome, '.profile')], { encoding: 'utf8' });
+      expect(profileSrc).toContain(`${dotE2ePrefix}/bin`);
+      expect(profileSrc).toContain(`${dotE2eHome}/.opencode/bin`);
+      const freshShellOut = execFileSync(
+        'bash',
+        ['-c', `PATH="/usr/bin:/bin"; source "${join(dotE2eHome, '.profile')}"; echo "IM=$(command -v imcodes) OC=$(command -v opencode)"`],
+        { ...EXEC_OPTS, env: { HOME: dotE2eHome, PATH: '/usr/bin:/bin' } },
+      ).trim();
+      expect(freshShellOut).toContain(`IM=${join(dotE2ePrefix, 'bin', 'imcodes')}`);
+      expect(freshShellOut).toContain(`OC=${join(dotE2eHome, '.opencode', 'bin', 'opencode')}`);
 
       // 3) Missing `opencode` invokes npm with mirror registry & handles spaces in HOME / npm_bin
       const okLog = join(ocRoot, 'ok-npm.log');
@@ -486,6 +539,86 @@ chmod +x "${okBinDir}/opencode"
       expect(execFileSync('cat', [okLog], { encoding: 'utf8' }).trim()).toBe(
         'install -g opencode-ai --no-fund --no-audit --registry https://mirrors.cloud.tencent.com/npm/',
       );
+
+      // 3b) npm installs opencode into custom `npm prefix -g` NOT yet on PATH -> resolves via prefix -g/bin & persists PATH_DIR
+      const prefRoot = mkdtempSync(join(dir, 'oc-prefix-'));
+      const prefGlobal = join(prefRoot, 'custom-global');
+      const prefBinOnly = join(prefRoot, 'npm-only');
+      mkdirSync(join(prefGlobal, 'bin'), { recursive: true });
+      mkdirSync(prefBinOnly, { recursive: true });
+      writeFileSync(
+        join(prefBinOnly, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "prefix" ] && [ "\${2:-}" = "-g" ]; then echo "${prefGlobal}"; exit 0; fi
+printf '#!/usr/bin/env bash\\necho "1.19.7"\\n' > "${prefGlobal}/bin/opencode"
+chmod +x "${prefGlobal}/bin/opencode"
+`,
+        { mode: 0o755 },
+      );
+      const prefOut = sourced(
+        `PATH_DIR=""; try_install_opencode_cli "${join(prefBinOnly, 'npm')}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$(command -v opencode) PATH_DIR=$PATH_DIR"`,
+        { HOME: skipHome, PATH: `${prefBinOnly}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(prefOut).toContain('STATUS=installed');
+      expect(prefOut).toContain(`RESOLVED=${join(prefGlobal, 'bin', 'opencode')}`);
+      expect(prefOut).toContain(`PATH_DIR=${join(prefGlobal, 'bin')}`);
+
+      // 3c) Counterexample: npm exits 0 WITHOUT creating an opencode binary on PATH or prefix/bin -> must NOT report ready!
+      const fakeOkDir = join(ocRoot, 'fake-ok-bin');
+      mkdirSync(fakeOkDir, { recursive: true });
+      const fakeOkNpm = join(fakeOkDir, 'npm');
+      writeFileSync(
+        fakeOkNpm,
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "prefix" ] && [ "\${2:-}" = "-g" ]; then echo "${join(ocRoot, 'empty-prefix')}"; exit 0; fi
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const unverifiedOut = sourced(
+        `try_install_opencode_cli "${fakeOkNpm}" "https://registry.npmjs.org/"; echo "STATUS=$OPENCODE_STATUS RESOLVED=$(command -v opencode 2>/dev/null || echo none)"`,
+        { HOME: skipHome, PATH: `${fakeOkDir}:${cleanPath}`, IMCODES_SKIP_OPENCODE: '' },
+      );
+      expect(unverifiedOut).toContain('STATUS=unverified');
+      expect(unverifiedOut).toContain('RESOLVED=none');
+      expect(unverifiedOut).toContain('was not found on PATH');
+
+      // Also verify full E2E with fake-ok npm exiting 0 without binary does NOT print "OpenCode CLI: ready"
+      const fakeE2eRoot = mkdtempSync(join(dir, 'fake-ok-e2e-'));
+      const fakeE2eHome = join(fakeE2eRoot, 'home');
+      const fakeE2ePrefix = join(fakeE2eRoot, 'prefix');
+      const fakeE2eShim = join(fakeE2eRoot, 'shim');
+      mkdirSync(fakeE2eHome, { recursive: true });
+      mkdirSync(join(fakeE2ePrefix, 'lib', 'node_modules'), { recursive: true });
+      mkdirSync(fakeE2eShim, { recursive: true });
+      writeFileSync(join(fakeE2eHome, '.npmrc'), `prefix=${fakeE2ePrefix}\n`);
+      writeFileSync(
+        join(fakeE2eShim, 'npm'),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "root" ]; then echo "${fakeE2ePrefix}/lib/node_modules"; exit 0; fi
+if [ "\${1:-}" = "prefix" ]; then echo "${fakeE2ePrefix}"; exit 0; fi
+if [ "\${1:-}" = "config" ]; then echo "https://registry.npmjs.org/"; exit 0; fi
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(join(fakeE2eShim, 'imcodes'), '#!/usr/bin/env bash\necho "2026.11.9999"\n', { mode: 0o755 });
+      const fakeE2eOut = execFileSync(
+        'bash',
+        [SCRIPT, '--channel', 'latest', '--source', 'direct', '--install-root', join(fakeE2eRoot, 'ir')],
+        {
+          ...EXEC_OPTS,
+          env: {
+            PATH: `${fakeE2eShim}:${cleanPath}`,
+            HOME: fakeE2eHome,
+            TMPDIR: fakeE2eRoot,
+            IMCODES_USE_R2: 'false',
+          },
+        },
+      );
+      expect(fakeE2eOut).toContain('imcodes installed  2026.11.9999');
+      expect(fakeE2eOut).not.toContain('OpenCode CLI: ready');
+      expect(fakeE2eOut).toContain("was not found on PATH");
 
       // 4) Non-blocking under `set -euo pipefail` when npm install fails
       const failBinDir = join(ocRoot, 'fail-bin');
@@ -560,12 +693,106 @@ echo "installed-fake-imcodes"
       const ps1 = execFileSync('cat', [ps1Script], { encoding: 'utf8' });
       expect(ps1).toContain('[switch]$SkipOpenCode');
       expect(ps1).toContain('IMCODES_SKIP_OPENCODE');
-      expect(ps1).toContain("'.opencode\\bin\\opencode.exe'");
+      expect(ps1).toContain("'.opencode\\bin'");
+      expect(ps1).toContain("'opencode.exe'");
+      expect(ps1).toContain('Add-UserPathEntry');
       expect(ps1).toContain('& $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry');
+      expect(ps1).toContain('$npmExe prefix -g');
+      expect(ps1).toContain("was not found on PATH");
       expect(ps1).toContain('WARNING: OpenCode CLI install');
       expect(ps1).toContain('OpenCode CLI: ready');
-      // Guard against PS 7-only pipeline/null-coalescing operators breaking Windows PS 5.1
+      // Guard against PS runtime & 5.1 hazards: `return try { ... }` (runtime failure!) and PS 7-only operators
+      expect(ps1).not.toMatch(/\breturn\s+try\b/i);
       expect(ps1).not.toMatch(/\s\?\?\s|\s&&\s|\s\|\|\s/);
+    });
+  });
+
+  const pwshPath = (() => {
+    try {
+      return execFileSync('bash', ['-c', 'command -v pwsh || true'], { encoding: 'utf8' }).trim();
+    } catch {
+      return '';
+    }
+  })();
+
+  describe.skipIf(!pwshPath)('landing/install.ps1 runtime OpenCode tests (pwsh)', () => {
+    it('parses install.ps1 cleanly and handles existing binaries, broken --version, PATH additions, fake-ok, and npm failure without aborting', () => {
+      const ps1Script = join(HERE, '..', '..', 'landing', 'install.ps1');
+      const ps1Src = execFileSync('cat', [ps1Script], { encoding: 'utf8' });
+      const addPathMatch = ps1Src.match(/function Add-UserPathEntry[\s\S]*?\n\}/);
+      const ocBlockMatch = ps1Src.match(/# ── OpenCode CLI[\s\S]*?# ── Done[\s\S]*?Write-Host "  Next steps:"/);
+      expect(addPathMatch?.[0]).toBeTruthy();
+      expect(ocBlockMatch?.[0]).toBeTruthy();
+
+      const psRoot = mkdtempSync(join(dir, 'pwsh-oc-'));
+      const harness = join(psRoot, 'harness.ps1');
+      // Full-file AST parse check + runtime scenarios exercising the exact extracted Add-UserPathEntry & OpenCode/Done blocks
+      writeFileSync(
+        harness,
+        `
+$ErrorActionPreference = 'Stop'
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile('${ps1Script}', [ref]$null, [ref]$errors) | Out-Null
+if ($errors -and $errors.Count -gt 0) { throw "Parse errors: $($errors[0].Message)" }
+
+function Write-Step($m) { Write-Host "==> $m" }
+function Write-Ok($m)   { Write-Host "    $m" }
+function Write-Note($m) { Write-Host "    $m" }
+${addPathMatch![0]}
+
+function Run-OcScenario([string]$CaseDir, [string]$Mode) {
+  $origPath = $env:Path
+  $origProfile = $env:USERPROFILE
+  $origSkip = $env:IMCODES_SKIP_OPENCODE
+  try {
+    $env:USERPROFILE = Join-Path $CaseDir 'home'
+    $env:IMCODES_SKIP_OPENCODE = ''
+    $binDir = Join-Path $CaseDir 'bin'
+    $null = New-Item -ItemType Directory -Force -Path $env:USERPROFILE, $binDir
+    $npmLog = Join-Path $CaseDir 'npm.log'
+    $script:LastPrefix = ''
+    $npmExe = Join-Path $CaseDir 'fake-npm.ps1'
+    if ($Mode -eq 'fail-npm') {
+      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) "npm $($a -join \" \")" | Add-Content "' + $npmLog + '"; $global:LASTEXITCODE = 2'
+    } elseif ($Mode -eq 'fake-ok') {
+      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) if ($a[0] -eq "prefix") { Write-Output "' + (Join-Path $CaseDir 'empty-pref') + '" }; $global:LASTEXITCODE = 0'
+    } else {
+      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) "npm $($a -join \" \")" | Add-Content "' + $npmLog + '"; $global:LASTEXITCODE = 0'
+    }
+    if ($Mode -eq 'path-bad-ver') {
+      $ocName = if ($IsWindows -or -not $PSVersionTable.Platform -or $PSVersionTable.Platform -eq 'Win32NT') { 'opencode.cmd' } else { 'opencode' }
+      $oc = Join-Path $binDir $ocName
+      if ($ocName -eq 'opencode.cmd') {
+        Set-Content $oc "@echo off\`r\`nexit /b 1"
+      } else {
+        Set-Content $oc "#!/usr/bin/env bash\`nexit 1"
+        chmod +x $oc
+      }
+    }
+    $sep = [System.IO.Path]::PathSeparator
+    $env:Path = @($binDir, '/usr/bin', '/bin') -join $sep
+    $npmRegistry = 'https://registry.npmjs.org/'
+    $skipOpenCodeEffective = $false
+    ${ocBlockMatch![0]}
+    Write-Output "MODE=$Mode STATUS=$openCodeStatus RESOLVED=$($(Get-Command opencode -ErrorAction SilentlyContinue | ForEach-Object Source) -join '')"
+  } finally {
+    $env:Path = $origPath
+    $env:USERPROFILE = $origProfile
+    $env:IMCODES_SKIP_OPENCODE = $origSkip
+  }
+}
+
+Write-Output (Run-OcScenario (Join-Path '${psRoot}' 'c1') 'path-bad-ver')
+Write-Output (Run-OcScenario (Join-Path '${psRoot}' 'c2') 'fail-npm')
+Write-Output (Run-OcScenario (Join-Path '${psRoot}' 'c3') 'fake-ok')
+`,
+      );
+      const out = execFileSync(pwshPath, ['-NoProfile', '-NonInteractive', '-File', harness], {
+        ...EXEC_OPTS,
+      });
+      expect(out).toContain('MODE=path-bad-ver STATUS=existing');
+      expect(out).toContain('MODE=fail-npm STATUS=failed');
+      expect(out).toContain('MODE=fake-ok STATUS=unverified');
     });
   });
 });
