@@ -731,13 +731,34 @@ describe('Email Auth PostgreSQL Integration', () => {
       const legacyRes = await connectWs(legacyPreResetTicket);
       expect(legacyRes.status).toBe(401);
 
-      // 3. When EMAIL_AUTH_ENABLED=false, legacy password/change + account-watch MUST NOT evict existing sockets
+      // 3. When EMAIL_AUTH_ENABLED=false, legacy password/change + account-watch MUST NOT evict existing sockets,
+      //    AND an already-minted unexpired share-ws-ticket MUST remain reconnectable across a real WS upgrade!
       const disabledEnv = makeEnv({ EMAIL_AUTH_ENABLED: 'false' });
       const disabledApp = buildApp(disabledEnv);
+      const disabledShareLogin = await (await disabledApp.request('/api/auth/password/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'sharee', password: 'SharePass1!' }),
+      }, disabledEnv)).json() as { accessToken: string };
+      const disabledShareTicketRes = await disabledApp.request('/api/shares/ws-ticket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${disabledShareLogin.accessToken}` },
+        body: JSON.stringify({ target: { kind: 'server', serverId } }),
+      }, disabledEnv);
+      expect(disabledShareTicketRes.status).toBe(200);
+      const { ticket: preChangeDisabledShareTicket } = await disabledShareTicketRes.json() as { ticket: string };
+
       const ownerLogin = await (await disabledApp.request('/api/auth/password/login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: 'shareowner', password: 'OwnerPass1!' }),
       }, disabledEnv)).json() as { accessToken: string };
+      const preChangeOwnerWsTicketRes = await disabledApp.request('/api/auth/ws-ticket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerLogin.accessToken}` },
+        body: JSON.stringify({ serverId }),
+      }, disabledEnv);
+      expect(preChangeOwnerWsTicketRes.status).toBe(200);
+      const preChangeOwnerWsTicket = (await preChangeOwnerWsTicketRes.json() as { ticket: string }).ticket;
+
       const ownerSocket = new FakeSocket();
       const daemonWs = new FakeSocket();
       (bridge as unknown as { daemonWs: unknown; authenticated: boolean; daemonOwnerUserId: string }).daemonWs = daemonWs;
@@ -753,12 +774,51 @@ describe('Email Auth PostgreSQL Integration', () => {
       expect(legacyPwChange.status).toBe(200);
       expect(ownerSocket.closed).toBeNull();
 
+      // Legacy password/change on sharee advances sessions_valid_after, revoking old HTTP JWT while preserving share WS reconnects when EMAIL_AUTH_ENABLED=false
+      const shareeLegacyPwChange = await disabledApp.request('/api/auth/password/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${disabledShareLogin.accessToken}` },
+        body: JSON.stringify({ oldPassword: 'SharePass1!', newPassword: 'SharePass2!' }),
+      }, disabledEnv);
+      expect(shareeLegacyPwChange.status).toBe(200);
+      expect((await disabledApp.request('/api/auth/user/me', {
+        headers: { Authorization: `Bearer ${disabledShareLogin.accessToken}` },
+      }, disabledEnv)).status).toBe(401);
+
+      const disabledHttpServer: HttpServer = createServer();
+      setupWebSocketUpgrade(disabledHttpServer, disabledEnv);
+      await new Promise<void>((resolve) => disabledHttpServer.listen(0, '127.0.0.1', resolve));
+      const disabledPort = (disabledHttpServer.address() as { port: number }).port;
+      try {
+        const connectDisabledWs = (ticket: string) => new Promise<{ status?: number; ws?: WebSocket }>((resolve) => {
+          const ws = new WebSocket(`ws://127.0.0.1:${disabledPort}/api/server/${serverId}/ws?ticket=${encodeURIComponent(ticket)}`, {
+            headers: { Origin: ORIGIN },
+          });
+          ws.once('open', () => resolve({ ws }));
+          ws.once('unexpected-response', (_req, res) => resolve({ status: res.statusCode }));
+        });
+        const conn1 = await connectDisabledWs(preChangeDisabledShareTicket);
+        expect(conn1.ws?.readyState).toBe(WebSocket.OPEN);
+        conn1.ws?.close();
+        // Reconnect with the exact same unexpired share ticket after legacy password/change
+        const conn2 = await connectDisabledWs(preChangeDisabledShareTicket);
+        expect(conn2.ws?.readyState).toBe(WebSocket.OPEN);
+        conn2.ws?.close();
+        // Pre-change member ws-ticket is also accepted when EMAIL_AUTH_ENABLED=false
+        const memberConn = await connectDisabledWs(preChangeOwnerWsTicket);
+        expect(memberConn.ws?.readyState).toBe(WebSocket.OPEN);
+        memberConn.ws?.close();
+      } finally {
+        await new Promise<void>((resolve) => disabledHttpServer.close(() => resolve()));
+      }
+
       const disabledWatch = await closeConnectionsOfInactiveUsers(db, [bridge], { emailAuthEnabled: false });
       expect(disabledWatch.browserSockets).toBe(0);
       expect(ownerSocket.closed).toBeNull();
       expect(daemonWs.closed).toBeNull();
 
-      // 4. Now password reset on sharee DOES evict sharee's pre-reset share socket, while preserving daemon
+      // 4. Now password reset on sharee DOES evict sharee's pre-reset share socket, while preserving daemon,
+      //    and rejects pre-reset share tickets while allowing newly minted post-reset share tickets to connect.
       await app.request('/api/auth/email/send-code', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: 'sharee@example.com', purpose: 'password_reset' }),
@@ -777,6 +837,24 @@ describe('Email Auth PostgreSQL Integration', () => {
       const closedFrame = await closePromise;
       expect(closedFrame.code).toBe(ACCOUNT_WS_CLOSE_CODE);
       expect(daemonWs.closed).toBeNull();
+
+      // Pre-reset share ticket is now rejected with 401 on enabled upgrade server; post-reset login + share ticket succeeds
+      const postResetOldShareRes = await connectWs(freshShareTicket);
+      expect(postResetOldShareRes.status).toBe(401);
+
+      const postResetShareLogin = await (await app.request('/api/auth/password/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'sharee@example.com', password: 'ShareNewPass2!' }),
+      }, env)).json() as { accessToken: string };
+      const postResetTicketRes = await app.request('/api/shares/ws-ticket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${postResetShareLogin.accessToken}` },
+        body: JSON.stringify({ target: { kind: 'server', serverId } }),
+      }, env);
+      expect(postResetTicketRes.status).toBe(200);
+      const postResetConn = await connectWs((await postResetTicketRes.json() as { ticket: string }).ticket);
+      expect(postResetConn.ws?.readyState).toBe(WebSocket.OPEN);
+      postResetConn.ws?.close();
 
       (bridge as unknown as { daemonWs: unknown; authenticated: boolean }).daemonWs = null;
       (bridge as unknown as { authenticated: boolean }).authenticated = false;

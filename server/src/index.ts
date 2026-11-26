@@ -41,7 +41,7 @@ import { gzip as gzipCallback } from 'node:zlib';
 const gzipAsync = promisify(gzipCallback);
 import type { IncomingMessage } from 'node:http';
 
-import { loadEnv, type Env, type EnvConfig } from './env.js';
+import { isEmailAuthEnabled, loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
 import { flushAllSessionTextTailCacheWrites } from './db/queries.js';
 import { runMigrations } from './db/migrate.js';
@@ -1152,11 +1152,12 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
-        let shareSessionEpoch = shareTicket.sva ?? 0;
+        const emailAuthEnabled = isEmailAuthEnabled(env);
+        let shareSessionEpoch = emailAuthEnabled ? (shareTicket.sva ?? 0) : 0;
         try {
           const shareUserAccess = await loadUserAccess(env.DB, shareTicket.sub);
           const shareUserDecision = evaluateUserAccess(shareUserAccess);
-          const epochStale = shareUserAccess !== null && shareUserAccess.sessionsValidAfter > 0 && (
+          const epochStale = emailAuthEnabled && shareUserAccess !== null && shareUserAccess.sessionsValidAfter > 0 && (
             typeof shareTicket.sva === 'number'
               ? shareUserAccess.sessionsValidAfter > shareTicket.sva
               : shareTicket.issuedAt < shareUserAccess.sessionsValidAfter
@@ -1166,7 +1167,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
             socket.destroy();
             return;
           }
-          shareSessionEpoch = shareUserAccess?.sessionsValidAfter ?? shareSessionEpoch;
+          shareSessionEpoch = emailAuthEnabled ? (shareUserAccess?.sessionsValidAfter ?? shareSessionEpoch) : 0;
         } catch {
           socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
           socket.destroy();
@@ -1211,18 +1212,19 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
       }
 
+      const emailAuthEnabled = isEmailAuthEnabled(env);
       let sessionsValidAfter = 0;
       try {
         const access = await loadUserAccess(env.DB, payload.sub as string);
         const decision = evaluateUserAccess(
           access,
-          typeof payload.iat === 'number' ? payload.iat : undefined,
+          emailAuthEnabled && typeof payload.iat === 'number' ? payload.iat : undefined,
         );
-        const epochStale = typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
+        const epochStale = emailAuthEnabled && typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
         if (!decision.ok || epochStale) {
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
         }
-        sessionsValidAfter = access?.sessionsValidAfter ?? 0;
+        sessionsValidAfter = emailAuthEnabled ? (access?.sessionsValidAfter ?? 0) : 0;
       } catch {
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); socket.destroy(); return;
       }
