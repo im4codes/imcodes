@@ -626,6 +626,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_observations(scope, state, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_observations_namespace_state
       ON context_observations(namespace_id, state, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_context_observations_namespace_state_projection_updated
+      ON context_observations(namespace_id, state, COALESCE(projection_id, ''), updated_at DESC, id ASC);
 
     CREATE TABLE IF NOT EXISTS observation_promotion_audit (
       id TEXT PRIMARY KEY,
@@ -1175,7 +1177,7 @@ function upsertContextObservationForDb(database: DatabaseSyncInstance, input: Co
     JSON.stringify(contentForDb),
     textHash,
     JSON.stringify(mergedSourceIds),
-    input.projectionId ?? prior?.projection_id ?? null,
+    normalizeOptional(input.projectionId) ?? normalizeOptional(prior?.projection_id ?? undefined) ?? null,
     state,
     input.confidence ?? null,
     prior?.created_at ?? now,
@@ -4207,6 +4209,36 @@ export function writeContextObservation(input: ContextObservationInput): Context
   }
 }
 
+const SAFE_OBSERVATION_LIKE_TOKEN_RE = /^[\x20-\x7e\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef]+$/;
+
+function escapeLikePattern(token: string): string {
+  return token.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/** Strict superset SQL text prefilter for observation search.
+ * Matches every token from `memoryTextMatchesQuery` tokenization across
+ * `content_json`, `class`, and `source_event_ids_json`. Skips tokens containing
+ * non-ASCII cased characters (where SQLite ASCII-only LIKE differs from JS
+ * `.toLowerCase()`) so zero valid matches can be dropped before JS `matchesQuery`. */
+function appendObservationTextSearchSql(
+  conditions: string[],
+  params: Array<string | number>,
+  query: string | undefined,
+): void {
+  const normalized = query?.trim().toLowerCase() ?? '';
+  if (!normalized) return;
+  const terms = normalized
+    .split(/[\s\p{P}]+/u)
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0 && SAFE_OBSERVATION_LIKE_TOKEN_RE.test(term))
+    .slice(0, 16);
+  for (const term of terms) {
+    const pattern = `%${escapeLikePattern(term)}%`;
+    conditions.push("(content_json LIKE ? ESCAPE '\\' OR class LIKE ? ESCAPE '\\' OR source_event_ids_json LIKE ? ESCAPE '\\')");
+    params.push(pattern, pattern, pattern);
+  }
+}
+
 export function listContextObservations(filters: {
   namespaceId?: string;
   namespaceIds?: readonly string[];
@@ -4214,6 +4246,10 @@ export function listContextObservations(filters: {
   class?: ObservationClass;
   state?: ObservationState | readonly ObservationState[];
   projectionId?: string;
+  withoutProjection?: boolean;
+  after?: number;
+  before?: number;
+  query?: string;
   limit?: number;
 } = {}): ContextObservationRow[] {
   const namespaceIds = filters.namespaceIds === undefined
@@ -4229,7 +4265,14 @@ export function listContextObservations(filters: {
     : Number.isFinite(filters.limit)
       ? Math.max(0, Math.min(10_000, Math.floor(filters.limit)))
       : 0;
-  if (namespaceIds?.length === 0 || states?.length === 0 || limit === 0) return [];
+  if (
+    namespaceIds?.length === 0
+    || states?.length === 0
+    || limit === 0
+    || (filters.withoutProjection && filters.projectionId)
+  ) {
+    return [];
+  }
 
   const database = ensureDb();
   const conditions: string[] = [];
@@ -4257,7 +4300,18 @@ export function listContextObservations(filters: {
   if (filters.projectionId) {
     conditions.push('projection_id = ?');
     params.push(filters.projectionId);
+  } else if (filters.withoutProjection) {
+    conditions.push("COALESCE(projection_id, '') = ''");
   }
+  if (typeof filters.after === 'number' && Number.isFinite(filters.after)) {
+    conditions.push('created_at >= ?');
+    params.push(filters.after);
+  }
+  if (typeof filters.before === 'number' && Number.isFinite(filters.before)) {
+    conditions.push('created_at <= ?');
+    params.push(filters.before);
+  }
+  appendObservationTextSearchSql(conditions, params, filters.query);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const limitSql = limit === undefined ? '' : 'LIMIT ?';
   if (limit !== undefined) params.push(limit);

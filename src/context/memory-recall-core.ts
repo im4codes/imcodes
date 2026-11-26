@@ -108,6 +108,8 @@ export interface MemorySearchResultItem {
   projectionClass?: ProcessedContextClass;
   /** Session whose timeline produced this projection, when provenance is known. */
   sourceSessionName?: string;
+  /** Daemon that owns the projection's raw sources, when remotely replicated. */
+  originServerId?: string;
   summary: string;
   content?: string;
   createdAt: number;
@@ -403,6 +405,7 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 export function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
+  const requestedWindow = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
   const baseFilters = {
     scope: query.namespace?.scope ?? query.scope,
     enterpriseId: query.namespace?.enterpriseId,
@@ -413,6 +416,7 @@ export function collectProcessedProjections(query: MemorySearchQuery): Processed
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
+    limit: Math.min(10_000, requestedWindow),
   };
   const projections = queryProcessedProjections(baseFilters);
   const namespace = query.namespace;
@@ -502,9 +506,19 @@ export function collectObservationItems(query: MemorySearchQuery): MemorySearchR
   const namespaceRows = observationNamespacesForQuery(query);
   if (namespaceRows.size === 0) return [];
   const states: readonly ObservationState[] = query.observationStates ?? ['candidate', 'active', 'promoted'];
+  const requestedWindow = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
+  const candidateLimit = query.query?.trim()
+    ? Math.min(10_000, Math.max(requestedWindow * 4, 100))
+    : Math.min(10_000, requestedWindow);
   const rows = listContextObservations({
+    namespaceIds: [...namespaceRows.keys()],
     class: query.observationClass,
     state: states,
+    withoutProjection: true,
+    after: query.after ? query.after : undefined,
+    before: query.before ? query.before : undefined,
+    query: query.query,
+    limit: candidateLimit,
   });
   const items: MemorySearchResultItem[] = [];
   for (const row of rows) {
