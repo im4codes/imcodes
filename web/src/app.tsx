@@ -1,4 +1,5 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { isPresetCompatibleCrossSdkSwitch } from './components/quick-sdk-model.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
 import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
@@ -10801,6 +10802,8 @@ function InternalMainApp() {
                       updated.runtimeType = getSessionRuntimeType(fields.type);
                       if (fields.type !== session.agentType) delete updated.qwenModel;
                     }
+                    if (fields.ccPreset === null) delete updated.ccPreset;
+                    else if (fields.ccPreset !== undefined) updated.ccPreset = fields.ccPreset;
                     if (fields.requestedModel === null) delete updated.requestedModel;
                     else if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
                     if (fields.activeModel === null) delete updated.activeModel;
@@ -11925,6 +11928,7 @@ function InternalMainApp() {
               onSessionSaved={(fields) => updateSubLocal(sub.id, {
                 type: fields.type !== undefined ? fields.type : undefined,
                 runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                ccPresetId: fields.ccPreset !== undefined ? fields.ccPreset : undefined,
                 requestedModel: fields.requestedModel,
                 activeModel: fields.activeModel,
                 modelDisplay: fields.modelDisplay,
@@ -12168,6 +12172,9 @@ function InternalMainApp() {
               updateSubLocal(settingsTarget.subId, {
                 type: fields.type !== undefined ? fields.type : undefined,
                 runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                ...(fields.type !== undefined && !isPresetCompatibleCrossSdkSwitch(settingsTarget.type, fields.type)
+                  ? { ccPresetId: null }
+                  : {}),
                 label: fields.label !== undefined ? (fields.label ?? null) : undefined,
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
@@ -12185,6 +12192,7 @@ function InternalMainApp() {
                   updated.agentType = fields.type;
                   updated.runtimeType = getSessionRuntimeType(fields.type);
                   if (fields.type !== s.agentType) delete updated.qwenModel;
+                  if (!isPresetCompatibleCrossSdkSwitch(s.agentType, fields.type)) delete updated.ccPreset;
                 }
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;

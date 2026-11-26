@@ -5,6 +5,8 @@ import {
   MODEL_DROPDOWN_TRIGGER_GAP_PX,
   MODEL_DROPDOWN_VIEWPORT_HEIGHT_CAP_RATIO,
   readSafeAreaBottomPx,
+  readSafeAreaLeftPx,
+  readSafeAreaRightPx,
   readSafeAreaTopPx,
 } from '../src/util/model-dropdown-style.js';
 
@@ -331,5 +333,34 @@ describe('computeModelDropdownStyle', () => {
       { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
     );
     expect(evalCssPx(mobileKeyboard.maxHeight, { sat: 47 })).toBe(179);
+
+    // Non-zero horizontal safe areas + VisualViewport offsetLeft/offsetTop intersection
+    const notchedLandscape = computeModelDropdownStyle(
+      { top: 320, bottom: 352, left: 300, right: 380, width: 80 },
+      {
+        innerWidth: 390,
+        innerHeight: 844,
+        visualViewportWidth: 350,
+        visualViewportHeight: 420,
+        visualViewportOffsetLeft: 20,
+        visualViewportOffsetTop: 24,
+        safeAreaTop: 47,
+        safeAreaBottom: 34,
+        safeAreaLeft: 22,
+        safeAreaRight: 22,
+      },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    // visibleRight = 370 => rightInsetFromLayoutRight = max(20, 22) + 8 = 30; leftSafeBoundary = max(20, 22) + 8 = 30
+    expect(notchedLandscape.right).toBe('30px');
+    expect(notchedLandscape.maxWidth).toBe('330px');
+    expect(evalCssPx(notchedLandscape.maxHeight, { sat: 47, sab: 34 })).toBe(193);
+
+    document.documentElement.style.setProperty('--sal', '22px');
+    document.documentElement.style.setProperty('--sar', '22px');
+    expect(readSafeAreaLeftPx(document)).toBe(22);
+    expect(readSafeAreaRightPx(document)).toBe(22);
+    document.documentElement.style.removeProperty('--sal');
+    document.documentElement.style.removeProperty('--sar');
   });
 });

@@ -114,7 +114,7 @@ interface Props {
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
-  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null }) => void;
+  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
   onLiveSessionStateChange?: (state: SubSession['state']) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;

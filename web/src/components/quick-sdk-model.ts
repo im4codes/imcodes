@@ -1,5 +1,10 @@
-import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
+import {
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+  isClaudeCodeFamily,
+  isCodexFamily,
+} from '@shared/agent-types.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import {
   CODEBUDDY_CHINA_MODEL_FALLBACK,
   CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
@@ -13,6 +18,7 @@ import {
   mergeModelSuggestions,
 } from '../../../src/shared/models/options.js';
 import {
+  buildTransportModelCatalogIdentity,
   getStaticFallbackModels,
   readCachedTransportModels,
   supportsDynamicTransportModels,
@@ -53,7 +59,9 @@ export function isQuickSdkSwitchAllowed({
   if (!activeSession || !serverId?.trim()) return false;
   if (activeSessionIncognito || !canSharedSessionSend || modelSwitchDisabled) return false;
   if (NON_SWITCHABLE_AGENT_TYPES.has(activeSession.agentType)) return false;
-  return isSessionAgentTypeSelectable(activeSession.agentType) || activeSession.agentType === 'qwen' || activeSession.agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
+  return isSessionAgentTypeSelectable(activeSession.agentType)
+    || activeSession.agentType === 'qwen'
+    || activeSession.agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
 }
 
 export function supportsQuickModelTrigger(
@@ -74,11 +82,45 @@ export function supportsQuickModelTrigger(
   return splitAllowed && isSessionAgentTypeSelectable(agentType);
 }
 
+/**
+ * Mirrors daemon `isPresetCompatibleAgentSwitch`: custom presets carry across
+ * same-family transitions (`claude-code` <-> `claude-code-sdk`, `codex` <->
+ * `codex-sdk`) when targeting a preset-capable SDK, and clear otherwise.
+ */
+export function isPresetCompatibleCrossSdkSwitch(
+  sourceAgentType: string | undefined | null,
+  targetAgentType: string | undefined | null,
+): boolean {
+  if (!sourceAgentType || !targetAgentType) return false;
+  if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType)) return false;
+  if (sourceAgentType === targetAgentType) return true;
+  if (isClaudeCodeFamily(sourceAgentType) && isClaudeCodeFamily(targetAgentType)) return true;
+  if (isCodexFamily(sourceAgentType) && isCodexFamily(targetAgentType)) return true;
+  return false;
+}
+
+export function resolveEffectiveCrossSdkPreset(
+  sourceAgentType: string | undefined | null,
+  targetAgentType: string | undefined | null,
+  sourceCcPreset: string | undefined | null,
+): string | null {
+  const trimmed = sourceCcPreset?.trim() ?? '';
+  if (!trimmed) return null;
+  return isPresetCompatibleCrossSdkSwitch(sourceAgentType, targetAgentType) ? trimmed : null;
+}
+
 export interface QuickSdkGroup {
   id: SessionAgentGroupId;
   items: SessionAgentChoice[];
 }
 
+/**
+ * Cross-SDK switch targets are strictly Transport SDKs (plus the active
+ * session's own agent type so current CLI sessions still keep their existing
+ * zero-restart same-SDK list while switching out only to Transport SDKs).
+ * Non-current CLI process targets cannot accept `requestedModel` via handoff
+ * relaunch and must not be offered as destinations.
+ */
 export function getQuickSwitchableSdkGroups(
   currentAgentType: string | undefined | null,
   surface: SessionAgentSurface = 'new-session',
@@ -88,7 +130,8 @@ export function getQuickSwitchableSdkGroups(
     .map((group) => ({
       id: group.id,
       items: group.items.filter((choice) => (
-        !choice.hidden
+        choice.group === 'transport'
+        && !choice.hidden
         && !NON_SWITCHABLE_AGENT_TYPES.has(choice.id)
         && isSessionAgentTypeSelectable(choice.id)
       )),
@@ -98,15 +141,15 @@ export function getQuickSwitchableSdkGroups(
   if (currentAgentType && !NON_SWITCHABLE_AGENT_TYPES.has(currentAgentType)) {
     const alreadyPresent = filtered.some((g) => g.items.some((item) => item.id === currentAgentType));
     if (!alreadyPresent) {
-      const hiddenMatch = groups
+      const currentMatch = groups
         .flatMap((g) => g.items)
         .find((item) => item.id === currentAgentType);
-      if (hiddenMatch) {
-        const targetGroup = filtered.find((g) => g.id === hiddenMatch.group);
+      if (currentMatch) {
+        const targetGroup = filtered.find((g) => g.id === currentMatch.group);
         if (targetGroup) {
-          targetGroup.items = [hiddenMatch, ...targetGroup.items];
+          targetGroup.items = [currentMatch, ...targetGroup.items];
         } else {
-          filtered.unshift({ id: hiddenMatch.group, items: [hiddenMatch] });
+          filtered.push({ id: currentMatch.group, items: [currentMatch] });
         }
       }
     }
@@ -134,42 +177,50 @@ export interface ResolvedCrossSdkModels {
 export function resolveCrossSdkModels(options: {
   sdk: string;
   sessionName?: string | null;
+  ccPreset?: string | null;
+  targetScope?: string | null;
   dynamicState?: Pick<TransportModelState, 'models' | 'defaultModel' | 'loading'> | null;
   cachedCatalog?: CachedTransportModelCatalog | null;
 }): ResolvedCrossSdkModels {
-  const { sdk, sessionName, dynamicState } = options;
+  const { sdk, sessionName, ccPreset, targetScope, dynamicState } = options;
+  const normalizedPreset = ccPreset?.trim() || null;
+  const catalogIdentity = buildTransportModelCatalogIdentity({
+    agentType: sdk,
+    ccPreset: normalizedPreset,
+    sessionName,
+    targetScope,
+  });
   const cachedCatalog = options.cachedCatalog !== undefined
     ? options.cachedCatalog
-    : readCachedTransportModels(
-      `${sessionName?.trim() ?? ''}\0${sdk}\0`,
-      sdk,
-    );
+    : readCachedTransportModels(catalogIdentity, sdk, targetScope);
 
   const dynamicIds = (dynamicState?.models ?? []).map((m) => m.id).filter(Boolean);
   const cachedIds = (cachedCatalog?.models ?? []).map((m) => m.id).filter(Boolean);
-  const staticFallback = getStaticFallbackModels(sdk);
+  const staticFallback = normalizedPreset ? null : getStaticFallbackModels(sdk);
 
   let staticList: readonly string[] = [];
-  if (sdk === 'claude-code' || sdk === 'claude-code-sdk' || sdk === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
-    staticList = CLAUDE_CODE_MODEL_IDS;
-  } else if (sdk === 'codex' || sdk === 'codex-sdk') {
-    staticList = CODEX_MODEL_IDS;
-  } else if (sdk === 'qwen') {
-    staticList = getKnownQwenModelOptions().map((entry) => entry.id);
-  } else if (sdk === AGY_SDK_PROVIDER_ID) {
-    staticList = QUICK_AGY_SDK_MODEL_SUGGESTIONS;
-  } else if (sdk === 'copilot-sdk') {
-    staticList = QUICK_COPILOT_SDK_MODEL_SUGGESTIONS;
-  } else if (sdk === 'cursor-headless') {
-    staticList = QUICK_CURSOR_HEADLESS_MODEL_SUGGESTIONS;
-  } else if (sdk === 'muse-code-sdk') {
-    staticList = QUICK_MUSE_SDK_MODEL_SUGGESTIONS;
-  } else if (sdk === CODEBUDDY_PROVIDER_IDS.CHINA) {
-    staticList = CODEBUDDY_CHINA_MODEL_FALLBACK;
-  } else if (sdk === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
-    staticList = CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK;
-  } else if (staticFallback) {
-    staticList = staticFallback.models.map((m) => m.id);
+  if (!normalizedPreset) {
+    if (sdk === 'claude-code-sdk' || sdk === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
+      staticList = CLAUDE_CODE_MODEL_IDS;
+    } else if (sdk === 'codex-sdk') {
+      staticList = CODEX_MODEL_IDS;
+    } else if (sdk === 'qwen') {
+      staticList = getKnownQwenModelOptions().map((entry) => entry.id);
+    } else if (sdk === AGY_SDK_PROVIDER_ID) {
+      staticList = QUICK_AGY_SDK_MODEL_SUGGESTIONS;
+    } else if (sdk === 'copilot-sdk') {
+      staticList = QUICK_COPILOT_SDK_MODEL_SUGGESTIONS;
+    } else if (sdk === 'cursor-headless') {
+      staticList = QUICK_CURSOR_HEADLESS_MODEL_SUGGESTIONS;
+    } else if (sdk === 'muse-code-sdk') {
+      staticList = QUICK_MUSE_SDK_MODEL_SUGGESTIONS;
+    } else if (sdk === CODEBUDDY_PROVIDER_IDS.CHINA) {
+      staticList = CODEBUDDY_CHINA_MODEL_FALLBACK;
+    } else if (sdk === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+      staticList = CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK;
+    } else if (staticFallback) {
+      staticList = staticFallback.models.map((m) => m.id);
+    }
   }
 
   let models: string[];
@@ -185,7 +236,8 @@ export function resolveCrossSdkModels(options: {
 
   const resolvedDefault =
     dynamicState?.defaultModel?.trim()
-    || cachedCatalog?.defaultModel?.trim()
+    || (!normalizedPreset ? cachedCatalog?.defaultModel?.trim() : undefined)
+    || (normalizedPreset ? cachedCatalog?.defaultModel?.trim() : undefined)
     || (sdk === AGY_SDK_PROVIDER_ID ? AGY_DEFAULT_MODEL_ID : null)
     || staticFallback?.defaultModel?.trim()
     || models[0]

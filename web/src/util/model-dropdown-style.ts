@@ -27,8 +27,11 @@ export interface ModelDropdownViewport {
   visualViewportWidth?: number | null;
   visualViewportHeight?: number | null;
   visualViewportOffsetTop?: number | null;
+  visualViewportOffsetLeft?: number | null;
   safeAreaTop?: number | null;
   safeAreaBottom?: number | null;
+  safeAreaLeft?: number | null;
+  safeAreaRight?: number | null;
 }
 
 function isPositiveFinite(value: number | null | undefined): value is number {
@@ -74,6 +77,53 @@ export function readSafeAreaBottomPx(
   return Number.isFinite(sabRaw) && sabRaw > 0 ? sabRaw : 0;
 }
 
+/**
+ * Read measurable left safe-area inset in CSS px from `--sal` and `.layout`
+ * (`padding-left: var(--sal)`). Returns `0` when unresolvable.
+ */
+export function readSafeAreaLeftPx(
+  doc: Document | undefined = typeof document !== 'undefined' ? document : undefined,
+): number {
+  if (!doc || typeof getComputedStyle === 'undefined') return 0;
+  const root = doc.documentElement;
+  const salRaw = root ? Number.parseFloat(getComputedStyle(root).getPropertyValue('--sal')) : Number.NaN;
+  const sal = Number.isFinite(salRaw) && salRaw > 0 ? salRaw : 0;
+
+  const layoutEl = doc.querySelector('.layout');
+  if (!layoutEl) return sal;
+
+  const padLeftRaw = Number.parseFloat(getComputedStyle(layoutEl).paddingLeft);
+  const padLeft = Number.isFinite(padLeftRaw) && padLeftRaw > 0 ? padLeftRaw : 0;
+  const rectLeft = layoutEl.getBoundingClientRect().left;
+  const layoutLeft = Number.isFinite(rectLeft) && rectLeft > 0 ? rectLeft : 0;
+  return Math.max(sal, padLeft, layoutLeft);
+}
+
+/**
+ * Read measurable right safe-area inset in CSS px from `--sar` and `.layout`
+ * (`padding-right: var(--sar)`). Returns `0` when unresolvable.
+ */
+export function readSafeAreaRightPx(
+  doc: Document | undefined = typeof document !== 'undefined' ? document : undefined,
+): number {
+  if (!doc || typeof getComputedStyle === 'undefined') return 0;
+  const root = doc.documentElement;
+  const sarRaw = root ? Number.parseFloat(getComputedStyle(root).getPropertyValue('--sar')) : Number.NaN;
+  const sar = Number.isFinite(sarRaw) && sarRaw > 0 ? sarRaw : 0;
+
+  const layoutEl = doc.querySelector('.layout');
+  if (!layoutEl) return sar;
+
+  const padRightRaw = Number.parseFloat(getComputedStyle(layoutEl).paddingRight);
+  const padRight = Number.isFinite(padRightRaw) && padRightRaw > 0 ? padRightRaw : 0;
+  const viewWidth = doc.defaultView?.innerWidth ?? 0;
+  const rectRight = layoutEl.getBoundingClientRect().right;
+  const layoutRight = viewWidth > 0 && Number.isFinite(rectRight) && rectRight < viewWidth
+    ? Math.max(0, viewWidth - rectRight)
+    : 0;
+  return Math.max(sar, padRight, layoutRight);
+}
+
 export interface ModelDropdownStyleOptions {
   minWidth?: number;
   preferredWidth?: number;
@@ -82,12 +132,13 @@ export interface ModelDropdownStyleOptions {
 }
 
 /**
- * Compute fixed portal positioning and bounded `maxHeight` for `.menu-dropdown-models`.
+ * Compute fixed portal positioning and bounded `maxHeight` / `maxWidth` for
+ * `.menu-dropdown-models`.
  *
- * Combines JS viewport/safe-area metrics (including `visualViewport`) with CSS
- * `min(...)` / `max(var(--sat, 0px), env(safe-area-inset-top, 0px))` so the menu
- * never stretches behind the iOS status bar / Dynamic Island or overflows short
- * keyboard-open viewports even when `--sat` does not resolve numerically in JS.
+ * Intersects layout bounds with `visualViewport` (`width`, `height`,
+ * `offsetLeft`, `offsetTop`) and all four safe-area insets (`sat`, `sab`,
+ * `sal`, `sar`) so the menu stays clear of notches, landscape side cutouts,
+ * home indicators, and on-screen keyboards.
  */
 export function computeModelDropdownStyle(
   rect: ModelDropdownTriggerRect,
@@ -96,30 +147,38 @@ export function computeModelDropdownStyle(
 ): JSX.CSSProperties {
   const layoutWidth = isPositiveFinite(viewport.innerWidth) ? viewport.innerWidth : 0;
   const layoutHeight = isPositiveFinite(viewport.innerHeight) ? viewport.innerHeight : 0;
-  const effectiveWidth = isPositiveFinite(viewport.visualViewportWidth)
-    ? Math.min(layoutWidth > 0 ? layoutWidth : viewport.visualViewportWidth, viewport.visualViewportWidth)
-    : layoutWidth;
-  const effectiveHeight = isPositiveFinite(viewport.visualViewportHeight)
-    ? Math.min(layoutHeight > 0 ? layoutHeight : viewport.visualViewportHeight, viewport.visualViewportHeight)
-    : layoutHeight;
+  const visibleLeft = isNonNegativeFinite(viewport.visualViewportOffsetLeft) ? viewport.visualViewportOffsetLeft : 0;
+  const vvWidth = isPositiveFinite(viewport.visualViewportWidth) ? viewport.visualViewportWidth : layoutWidth;
+  const visibleRight = layoutWidth > 0 ? Math.min(layoutWidth, visibleLeft + vvWidth) : visibleLeft + vvWidth;
+  const effectiveWidth = Math.max(0, visibleRight - visibleLeft);
+
   const visibleTop = isPositiveFinite(viewport.visualViewportOffsetTop) ? viewport.visualViewportOffsetTop : 0;
-  const visibleBottom = isPositiveFinite(viewport.visualViewportHeight)
-    ? Math.min(layoutHeight > 0 ? layoutHeight : visibleTop + effectiveHeight, visibleTop + effectiveHeight)
-    : layoutHeight;
+  const vvHeight = isPositiveFinite(viewport.visualViewportHeight) ? viewport.visualViewportHeight : layoutHeight;
+  const visibleBottom = layoutHeight > 0 ? Math.min(layoutHeight, visibleTop + vvHeight) : visibleTop + vvHeight;
+  const effectiveHeight = Math.max(0, visibleBottom - visibleTop);
 
   const safeTop = isNonNegativeFinite(viewport.safeAreaTop) ? viewport.safeAreaTop : 0;
   const safeBottom = isNonNegativeFinite(viewport.safeAreaBottom) ? viewport.safeAreaBottom : 0;
+  const safeLeft = isNonNegativeFinite(viewport.safeAreaLeft) ? viewport.safeAreaLeft : 0;
+  const safeRight = isNonNegativeFinite(viewport.safeAreaRight) ? viewport.safeAreaRight : 0;
+
+  const topSafeBoundary = Math.max(visibleTop, safeTop) + MODEL_DROPDOWN_TOP_MARGIN_PX;
+  const bottomSafeBoundary = Math.min(visibleBottom, layoutHeight > 0 ? layoutHeight - safeBottom : visibleBottom)
+    - MODEL_DROPDOWN_BOTTOM_INSET_PX;
 
   const targetAboveBottomY = Math.min(
     rect.top - MODEL_DROPDOWN_TRIGGER_GAP_PX,
-    visibleBottom - MODEL_DROPDOWN_BOTTOM_INSET_PX,
+    bottomSafeBoundary,
+  );
+  const minBottomInset = Math.max(
+    MODEL_DROPDOWN_BOTTOM_INSET_PX + safeBottom,
+    layoutHeight - visibleBottom + MODEL_DROPDOWN_BOTTOM_INSET_PX,
   );
   const bottomPx = Math.max(
-    MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
+    minBottomInset,
     Math.round(layoutHeight - targetAboveBottomY),
   );
   const resolvedAboveBottomY = layoutHeight - bottomPx;
-  const topSafeBoundary = Math.max(visibleTop, safeTop) + MODEL_DROPDOWN_TOP_MARGIN_PX;
   const availableAbove = Math.floor(resolvedAboveBottomY - topSafeBoundary);
 
   const rawBelowTopY = Math.max(
@@ -127,7 +186,6 @@ export function computeModelDropdownStyle(
     Math.round(visibleTop + MODEL_DROPDOWN_TOP_MARGIN_PX),
   );
   const effectiveBelowTopY = Math.max(rawBelowTopY, Math.round(safeTop + MODEL_DROPDOWN_TOP_MARGIN_PX));
-  const bottomSafeBoundary = Math.min(visibleBottom, layoutHeight - safeBottom) - MODEL_DROPDOWN_BOTTOM_INSET_PX;
   const availableBelow = Math.floor(bottomSafeBoundary - effectiveBelowTopY);
 
   const shouldOpenBelow =
@@ -140,6 +198,7 @@ export function computeModelDropdownStyle(
   const boundedViewportCap = isPositiveFinite(options?.maxHeightPx)
     ? Math.min(rawViewportCap, Math.floor(options.maxHeightPx))
     : rawViewportCap;
+
   let maxHeight: string;
   if (shouldOpenBelow) {
     const numericRoom = Math.max(0, availableBelow);
@@ -171,13 +230,19 @@ export function computeModelDropdownStyle(
     maxHeight = `min(${numericCap}px, max(0px, ${cssTopRoom}))`;
   }
 
-  const isRightHalf = rect.left + rect.width / 2 > effectiveWidth / 2;
-  const horizontalLimit = Math.max(0, effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX * 2);
+  const leftSafeBoundary = Math.max(visibleLeft, safeLeft) + MODEL_DROPDOWN_HORIZONTAL_INSET_PX;
+  const rightInsetFromLayoutRight = Math.max(Math.max(0, layoutWidth - visibleRight), safeRight)
+    + MODEL_DROPDOWN_HORIZONTAL_INSET_PX;
+  const rightSafeBoundary = Math.max(leftSafeBoundary, layoutWidth - rightInsetFromLayoutRight);
+  const horizontalLimit = Math.max(0, Math.floor(rightSafeBoundary - leftSafeBoundary));
+
   const requestedMinWidth = isPositiveFinite(options?.minWidth) ? options.minWidth : MODEL_DROPDOWN_MIN_WIDTH_PX;
   const clampedMinWidth = Math.max(0, Math.min(requestedMinWidth, horizontalLimit));
   const preferredWidth = isPositiveFinite(options?.preferredWidth)
     ? Math.min(options.preferredWidth, horizontalLimit)
     : undefined;
+
+  const isRightHalf = rect.left + rect.width / 2 > visibleLeft + effectiveWidth / 2;
 
   const style: JSX.CSSProperties = {
     position: 'fixed',
@@ -198,44 +263,31 @@ export function computeModelDropdownStyle(
   }
 
   if (isRightHalf) {
-    const minRightInset = MODEL_DROPDOWN_HORIZONTAL_INSET_PX + Math.max(0, layoutWidth - effectiveWidth);
-    const idealRightOffset = Math.max(minRightInset, layoutWidth - rect.right);
+    const idealRightOffset = Math.max(rightInsetFromLayoutRight, layoutWidth - rect.right);
     const maxShiftRightOffset = preferredWidth !== undefined
-      ? Math.max(minRightInset, layoutWidth - targetRightBound(effectiveWidth, preferredWidth))
+      ? Math.max(
+        rightInsetFromLayoutRight,
+        layoutWidth - Math.min(rightSafeBoundary, leftSafeBoundary + preferredWidth),
+      )
       : idealRightOffset;
     const rightOffset = preferredWidth !== undefined
       ? Math.min(idealRightOffset, maxShiftRightOffset)
       : idealRightOffset;
-    const availableLeftWidth = Math.max(
-      MODEL_DROPDOWN_FALLBACK_MAX_WIDTH_PX,
-      layoutWidth - rightOffset - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
-    );
+    const availableLeftWidth = Math.max(0, Math.floor(layoutWidth - rightOffset - leftSafeBoundary));
     style.right = `${Math.round(rightOffset)}px`;
     style.left = 'auto';
     style.maxWidth = `${Math.round(Math.min(availableLeftWidth, horizontalLimit))}px`;
   } else {
-    const idealLeftOffset = Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, rect.left);
+    const idealLeftOffset = Math.max(leftSafeBoundary, rect.left);
     const maxShiftLeftOffset = preferredWidth !== undefined
-      ? Math.max(MODEL_DROPDOWN_HORIZONTAL_INSET_PX, effectiveWidth - preferredWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX)
-      : idealLeftOffset;
-    const leftOffset = preferredWidth !== undefined
-      ? Math.min(idealLeftOffset, maxShiftLeftOffset)
-      : idealLeftOffset;
-    const maxAvailableWidth = Math.max(
-      MODEL_DROPDOWN_FALLBACK_MAX_WIDTH_PX,
-      effectiveWidth - leftOffset - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
-    );
+      ? Math.max(leftSafeBoundary, rightSafeBoundary - preferredWidth)
+      : Math.max(leftSafeBoundary, rightSafeBoundary - clampedMinWidth);
+    const leftOffset = Math.min(idealLeftOffset, maxShiftLeftOffset);
+    const availableRightWidth = Math.max(0, Math.floor(rightSafeBoundary - leftOffset));
     style.left = `${Math.round(leftOffset)}px`;
     style.right = 'auto';
-    style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, horizontalLimit))}px`;
+    style.maxWidth = `${Math.round(Math.min(availableRightWidth, horizontalLimit))}px`;
   }
 
   return style;
-}
-
-function targetRightBound(effectiveWidth: number, preferredWidth: number): number {
-  return Math.min(
-    effectiveWidth - MODEL_DROPDOWN_HORIZONTAL_INSET_PX,
-    MODEL_DROPDOWN_HORIZONTAL_INSET_PX + preferredWidth,
-  );
 }

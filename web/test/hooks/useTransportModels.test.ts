@@ -381,4 +381,40 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(firstPartyCached?.models.map((m) => m.id)).toContain('gpt-6.2-sol');
   });
 
+  it('never writes unscoped preset catalogs into generic provider cache or exposes stale models across SDK switches', () => {
+    writeCachedTransportModels('sess-preset\0claude-code-sdk\0glm', 'claude-code-sdk', {
+      models: [{ id: 'glm-only-model' }],
+      defaultModel: 'glm-only-model',
+    });
+
+    const unscopedNonPreset = readCachedTransportModels('sess-plain\0claude-code-sdk\0', 'claude-code-sdk');
+    expect(unscopedNonPreset?.models.map((m) => m.id) ?? []).not.toContain('glm-only-model');
+
+    let listener: ((msg: unknown) => void) | undefined;
+    let seq = 0;
+    const ws = {
+      connected: true,
+      onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; },
+      requestTransportModels: () => `req-${++seq}`,
+    } as unknown as WsClient;
+
+    const { result, rerender } = renderHook(
+      ({ agent }) => useTransportModels(ws, agent, undefined, 'sess-switch', 'srv-1'),
+      { initialProps: { agent: 'codex-sdk' as string } },
+    );
+    act(() => listener?.({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      agentType: 'codex-sdk',
+      requestId: 'req-1',
+      models: [{ id: 'gpt-6.8-sol' }],
+      defaultModel: 'gpt-6.8-sol',
+    }));
+    expect(result.current.models.map((m) => m.id)).toEqual(['gpt-6.8-sol']);
+
+    // Switching to an empty-catalog SDK must drop codex-sdk models synchronously before any reply arrives.
+    rerender({ agent: 'opencode-sdk' });
+    expect(result.current.models).toEqual([]);
+    expect(result.current.defaultModel).toBeUndefined();
+  });
+
 });

@@ -3,7 +3,11 @@ import { useTranslation } from 'react-i18next';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { saveAgyModelPreference } from '../agy-model-preference.js';
-import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
+import {
+  buildTransportModelCatalogIdentity,
+  supportsDynamicTransportModels,
+  useTransportModels,
+} from '../hooks/useTransportModels.js';
 import type { SessionInfo } from '../types.js';
 import type { WsClient } from '../ws-client.js';
 import { getSessionAgentLabel } from './session-agent-options.js';
@@ -11,6 +15,7 @@ import {
   findQuickSdkChoice,
   getQuickSwitchableSdkGroups,
   resolveCrossSdkModels,
+  resolveEffectiveCrossSdkPreset,
 } from './quick-sdk-model.js';
 
 export interface QuickSdkSavedFields {
@@ -18,12 +23,104 @@ export interface QuickSdkSavedFields {
   requestedModel: string | null;
   activeModel: null;
   modelDisplay: null;
+  ccPreset?: string | null;
 }
 
 export interface SameSdkModelItem {
   id: string;
   label?: string;
   title?: string;
+}
+
+interface CrossSdkPreviewCatalogProps {
+  ws: WsClient | null;
+  sessionName: string | undefined;
+  targetScope: string | undefined;
+  previewSdk: string;
+  effectivePreset: string | null;
+  switching: boolean;
+  onSelectCrossModel: (modelId: string | null) => void;
+}
+
+/**
+ * Keyed per `(targetScope, sessionName, previewSdk, effectivePreset)` by parent
+ * so changing the previewed SDK or preset remounts cleanly with fresh
+ * `useTransportModels` state and zero cross-SDK/preset stale bleed.
+ */
+function CrossSdkPreviewCatalog({
+  ws,
+  sessionName,
+  targetScope,
+  previewSdk,
+  effectivePreset,
+  switching,
+  onSelectCrossModel,
+}: CrossSdkPreviewCatalogProps) {
+  const { t } = useTranslation();
+  const dynamicModels = useTransportModels(
+    ws,
+    supportsDynamicTransportModels(previewSdk) ? previewSdk : null,
+    effectivePreset,
+    sessionName,
+    targetScope,
+  );
+
+  const catalog = useMemo(
+    () => resolveCrossSdkModels({
+      sdk: previewSdk,
+      sessionName,
+      ccPreset: effectivePreset,
+      targetScope,
+      dynamicState: dynamicModels,
+    }),
+    [previewSdk, sessionName, effectivePreset, targetScope, dynamicModels],
+  );
+
+  return (
+    <>
+      <button
+        type="button"
+        data-testid="quick-sdk-default-switch"
+        class="menu-item quick-sdk-model-item quick-sdk-default-item"
+        disabled={switching}
+        onClick={() => onSelectCrossModel(catalog.defaultModel)}
+        title={catalog.defaultModel
+          ? `${t('session.quickSwitch.useDefaultModel')} (${catalog.defaultModel})`
+          : t('session.quickSwitch.useDefaultModel')}
+      >
+        <span class="quick-sdk-model-item-text">↻ {t('session.quickSwitch.useDefaultModel')}</span>
+        {catalog.defaultModel && (
+          <span class="quick-sdk-default-tag">{catalog.defaultModel}</span>
+        )}
+      </button>
+
+      {catalog.loading && (
+        <div class="quick-sdk-status-row" data-testid="quick-sdk-loading">
+          {t('session.quickSwitch.loadingModels')}
+        </div>
+      )}
+
+      {catalog.models.map((modelId) => (
+        <button
+          key={modelId}
+          type="button"
+          data-cross-model-id={modelId}
+          class="menu-item quick-sdk-model-item"
+          disabled={switching}
+          onClick={() => onSelectCrossModel(modelId)}
+          title={modelId}
+        >
+          <span class="quick-sdk-model-item-text">○ {modelId}</span>
+        </button>
+      ))}
+
+      {!catalog.loading && catalog.models.length === 0 && (
+        <div class="quick-sdk-empty-row" data-testid="quick-sdk-empty">
+          {t('session.quickSwitch.noModels')}
+        </div>
+      )}
+    </>
+  );
 }
 
 interface QuickSdkModelMenuProps {
@@ -33,6 +130,7 @@ interface QuickSdkModelMenuProps {
   subSessionId?: string;
   modelOpen: boolean;
   splitAllowed: boolean;
+  disabled?: boolean;
   switching?: boolean;
   onSwitchingChange?: (switching: boolean) => void;
   currentSdk: string;
@@ -52,6 +150,7 @@ export function QuickSdkModelMenu({
   subSessionId,
   modelOpen,
   splitAllowed,
+  disabled = false,
   switching: switchingProp,
   onSwitchingChange,
   currentSdk,
@@ -67,6 +166,7 @@ export function QuickSdkModelMenu({
   const [previewSdk, setPreviewSdk] = useState<string>(currentSdk);
   const [internalSwitching, setInternalSwitching] = useState(false);
   const switching = switchingProp ?? internalSwitching;
+  const actionDisabled = Boolean(disabled || switching);
   const switchingRef = useRef(false);
   switchingRef.current = switching;
   const mountedRef = useRef(true);
@@ -98,32 +198,29 @@ export function QuickSdkModelMenu({
     [currentSdk, subSessionId],
   );
 
-  const isCrossSdkPreview = splitAllowed && previewSdk !== currentSdk;
-
-  // Lazy discovery: ONLY query daemon models for a different previewed SDK while
-  // the dropdown is open. Never fan out across SDKs when closed or on mount.
-  const crossSdkDynamicAgentType =
-    modelOpen && isCrossSdkPreview && supportsDynamicTransportModels(previewSdk)
-      ? previewSdk
-      : null;
-
-  const crossSdkDynamicModels = useTransportModels(
-    ws,
-    crossSdkDynamicAgentType,
-    undefined,
-    activeSession?.name,
+  const effectiveTargetScope = useMemo(
+    () => serverId?.trim()
+      || (ws as { getServerId?: () => string } | null)?.getServerId?.()?.trim()
+      || ws?.getDaemonCapabilitySnapshot?.()?.daemonId?.trim()
+      || undefined,
+    [serverId, ws],
   );
 
-  const crossSdkCatalog = useMemo(() => {
-    if (!isCrossSdkPreview) {
-      return { models: [] as string[], defaultModel: null as string | null, loading: false };
-    }
-    return resolveCrossSdkModels({
-      sdk: previewSdk,
+  const isCrossSdkPreview = splitAllowed && previewSdk !== currentSdk;
+  const effectivePreviewPreset = useMemo(
+    () => resolveEffectiveCrossSdkPreset(currentSdk, previewSdk, activeSession?.ccPreset),
+    [currentSdk, previewSdk, activeSession?.ccPreset],
+  );
+
+  const previewIdentityKey = useMemo(
+    () => buildTransportModelCatalogIdentity({
+      agentType: previewSdk,
+      ccPreset: effectivePreviewPreset,
       sessionName: activeSession?.name,
-      dynamicState: crossSdkDynamicModels,
-    });
-  }, [isCrossSdkPreview, previewSdk, activeSession?.name, crossSdkDynamicModels]);
+      targetScope: effectiveTargetScope,
+    }),
+    [previewSdk, effectivePreviewPreset, activeSession?.name, effectiveTargetScope],
+  );
 
   const previewChoice = useMemo(
     () => findQuickSdkChoice(sdkGroups, previewSdk),
@@ -133,8 +230,18 @@ export function QuickSdkModelMenu({
     ? getSessionAgentLabel(t, previewChoice)
     : previewSdk;
 
+  const handleSameSdkSelect = (modelId: string) => {
+    if (disabled || switchingRef.current) return;
+    onSelectSameSdkModel(modelId);
+  };
+
   const handleCrossSdkSwitch = async (nextSdk: string, nextModel: string | null) => {
-    if (switchingRef.current || !activeSession || !serverId?.trim()) return;
+    if (disabled || switchingRef.current || !activeSession || !serverId?.trim()) return;
+    const nextEffectivePreset = resolveEffectiveCrossSdkPreset(
+      currentSdk,
+      nextSdk,
+      activeSession.ccPreset,
+    );
     updateSwitching(true);
     onClose();
     try {
@@ -159,6 +266,7 @@ export function QuickSdkModelMenu({
         requestedModel: nextModel,
         activeModel: null,
         modelDisplay: null,
+        ccPreset: nextEffectivePreset,
       });
       onAfterAction?.();
     } catch (err) {
@@ -177,7 +285,8 @@ export function QuickSdkModelMenu({
             key={item.id}
             type="button"
             class={`menu-item ${currentModel === item.id ? 'menu-item-active' : ''}`}
-            onClick={() => onSelectSameSdkModel(item.id)}
+            disabled={actionDisabled}
+            onClick={() => handleSameSdkSelect(item.id)}
             title={item.title ?? item.id}
           >
             {currentModel === item.id ? '● ' : '○ '}{item.label ?? item.id}
@@ -196,7 +305,6 @@ export function QuickSdkModelMenu({
     >
       <div
         class="quick-sdk-model-sdks"
-        role="listbox"
         aria-label={t('session.quickSwitch.sdkTitle')}
       >
         <div class="quick-sdk-col-header">
@@ -214,10 +322,10 @@ export function QuickSdkModelMenu({
                   <button
                     key={choice.id}
                     type="button"
-                    role="option"
-                    aria-selected={isPreview}
+                    aria-pressed={isPreview}
                     data-sdk-id={choice.id}
                     class={`quick-sdk-item${isPreview ? ' is-preview' : ''}${isCurrent ? ' is-current' : ''}`}
+                    disabled={actionDisabled}
                     onClick={() => setPreviewSdk(choice.id)}
                     title={label}
                   >
@@ -236,7 +344,6 @@ export function QuickSdkModelMenu({
 
       <div
         class="quick-sdk-model-models"
-        role="listbox"
         aria-label={t('session.quickSwitch.modelsTitle')}
       >
         <div class="quick-sdk-col-header quick-sdk-col-header-models">
@@ -254,10 +361,10 @@ export function QuickSdkModelMenu({
                 <button
                   key={item.id}
                   type="button"
-                  role="option"
-                  aria-selected={currentModel === item.id}
+                  aria-pressed={currentModel === item.id}
                   class={`menu-item quick-sdk-model-item${currentModel === item.id ? ' menu-item-active' : ''}`}
-                  onClick={() => onSelectSameSdkModel(item.id)}
+                  disabled={actionDisabled}
+                  onClick={() => handleSameSdkSelect(item.id)}
                   title={item.title ?? item.id}
                 >
                   <span class="quick-sdk-model-item-text">
@@ -269,51 +376,18 @@ export function QuickSdkModelMenu({
               <div class="quick-sdk-empty-row">{t('session.quickSwitch.noModelsCurrent')}</div>
             )
           ) : (
-            <>
-              <button
-                type="button"
-                data-testid="quick-sdk-default-switch"
-                class="menu-item quick-sdk-model-item quick-sdk-default-item"
-                disabled={switching}
-                onClick={() => void handleCrossSdkSwitch(previewSdk, crossSdkCatalog.defaultModel)}
-                title={crossSdkCatalog.defaultModel
-                  ? `${t('session.quickSwitch.useDefaultModel')} (${crossSdkCatalog.defaultModel})`
-                  : t('session.quickSwitch.useDefaultModel')}
-              >
-                <span class="quick-sdk-model-item-text">↻ {t('session.quickSwitch.useDefaultModel')}</span>
-                {crossSdkCatalog.defaultModel && (
-                  <span class="quick-sdk-default-tag">{crossSdkCatalog.defaultModel}</span>
-                )}
-              </button>
-
-              {crossSdkCatalog.loading && (
-                <div class="quick-sdk-status-row" data-testid="quick-sdk-loading">
-                  {t('session.quickSwitch.loadingModels')}
-                </div>
-              )}
-
-              {crossSdkCatalog.models.map((modelId) => (
-                <button
-                  key={modelId}
-                  type="button"
-                  role="option"
-                  aria-selected={false}
-                  data-cross-model-id={modelId}
-                  class="menu-item quick-sdk-model-item"
-                  disabled={switching}
-                  onClick={() => void handleCrossSdkSwitch(previewSdk, modelId)}
-                  title={modelId}
-                >
-                  <span class="quick-sdk-model-item-text">○ {modelId}</span>
-                </button>
-              ))}
-
-              {!crossSdkCatalog.loading && crossSdkCatalog.models.length === 0 && (
-                <div class="quick-sdk-empty-row" data-testid="quick-sdk-empty">
-                  {t('session.quickSwitch.noModels')}
-                </div>
-              )}
-            </>
+            modelOpen && (
+              <CrossSdkPreviewCatalog
+                key={previewIdentityKey}
+                ws={ws}
+                sessionName={activeSession?.name}
+                targetScope={effectiveTargetScope}
+                previewSdk={previewSdk}
+                effectivePreset={effectivePreviewPreset}
+                switching={actionDisabled}
+                onSelectCrossModel={(modelId) => void handleCrossSdkSwitch(previewSdk, modelId)}
+              />
+            )
           )}
         </div>
       </div>

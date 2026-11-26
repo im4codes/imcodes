@@ -90,6 +90,8 @@ import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-se
 import {
   computeModelDropdownStyle,
   readSafeAreaBottomPx,
+  readSafeAreaLeftPx,
+  readSafeAreaRightPx,
   readSafeAreaTopPx,
 } from '../util/model-dropdown-style.js';
 
@@ -3613,6 +3615,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     modelSwitchDisabled,
   });
   const effectiveModelSwitchDisabled = modelSwitchDisabled || quickSdkSwitching;
+  useEffect(() => {
+    if (effectiveModelSwitchDisabled && modelOpen) {
+      setModelOpen(false);
+    }
+  }, [effectiveModelSwitchDisabled, modelOpen]);
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -3675,6 +3682,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       ? activeSession.ccPreset
       : undefined,
     activeSession?.name,
+    serverId,
   );
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {
@@ -5144,8 +5152,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       visualViewportWidth: viewport?.width,
       visualViewportHeight: viewport?.height,
       visualViewportOffsetTop: viewport?.offsetTop,
+      visualViewportOffsetLeft: viewport?.offsetLeft,
       safeAreaTop: readSafeAreaTopPx(),
       safeAreaBottom: readSafeAreaBottomPx(),
+      safeAreaLeft: readSafeAreaLeftPx(),
+      safeAreaRight: readSafeAreaRightPx(),
     }, quickSdkSplitAllowed ? {
       minWidth: isNarrowViewport ? 280 : 340,
       preferredWidth: isNarrowViewport ? 374 : 416,
@@ -9257,7 +9268,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const dispatchModelSwitch = (nextModel: string): boolean => {
-    if (!ws || !activeSession) return false;
+    if (!ws || !activeSession || effectiveModelSwitchDisabled) return false;
     dispatchSessionModelSwitch({
       sendMessage: (text) => sendSessionMessage(text),
       setSubSessionModel: (sessionName, modelId, cwd) => ws.subSessionSetModel(sessionName, modelId, cwd),
@@ -10202,6 +10213,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 subSessionId={subSessionId}
                 modelOpen={modelOpen}
                 splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
                 switching={quickSdkSwitching}
                 onSwitchingChange={setQuickSdkSwitching}
                 currentSdk={activeSession?.agentType ?? 'claude-code'}
@@ -10244,6 +10256,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 subSessionId={subSessionId}
                 modelOpen={modelOpen}
                 splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
                 switching={quickSdkSwitching}
                 onSwitchingChange={setQuickSdkSwitching}
                 currentSdk={activeSession?.agentType ?? 'codex'}
@@ -10297,6 +10310,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 subSessionId={subSessionId}
                 modelOpen={modelOpen}
                 splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
                 switching={quickSdkSwitching}
                 onSwitchingChange={setQuickSdkSwitching}
                 currentSdk={activeSession?.agentType ?? 'qwen'}
@@ -10337,6 +10351,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 subSessionId={subSessionId}
                 modelOpen={modelOpen}
                 splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
                 switching={quickSdkSwitching}
                 onSwitchingChange={setQuickSdkSwitching}
                 currentSdk={activeSession?.agentType ?? ''}
@@ -10381,6 +10396,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 subSessionId={subSessionId}
                 modelOpen={modelOpen}
                 splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
                 switching={quickSdkSwitching}
                 onSwitchingChange={setQuickSdkSwitching}
                 currentSdk={activeSession.agentType}

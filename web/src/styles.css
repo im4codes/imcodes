@@ -2187,6 +2187,7 @@ html.native-ios-mac .chat-dl-btn {
 .menu-dropdown-models:has(.quick-sdk-model-split) {
   display: flex;
   flex-direction: column;
+  box-sizing: border-box;
   width: min(416px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
   overflow: hidden !important;
   padding: 0;
@@ -2203,14 +2204,17 @@ html.native-ios-mac .chat-dl-btn {
   display: flex;
   flex: 1 1 auto;
   min-height: 0;
-  width: min(414px, calc(var(--imcodes-ui-vw, 100vw) - 18px));
+  min-width: 0;
+  width: min(414px, 100%);
+  max-width: 100%;
   height: min(370px, 50vh);
+  max-height: 100%;
   overflow: hidden;
   color: #e2e8f0;
 }
 .quick-sdk-model-sdks {
-  flex: 0 0 150px;
-  width: 150px;
+  flex: 0 0 clamp(118px, 36%, 150px);
+  width: clamp(118px, 36%, 150px);
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -2396,12 +2400,13 @@ html.native-ios-mac .chat-dl-btn {
     width: min(374px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
   }
   .quick-sdk-model-split {
-    width: min(372px, calc(var(--imcodes-ui-vw, 100vw) - 18px));
+    width: min(372px, 100%);
     height: min(340px, 46vh);
+    max-height: 100%;
   }
   .quick-sdk-model-sdks {
-    flex: 0 0 126px;
-    width: 126px;
+    flex: 0 0 clamp(96px, 34%, 126px);
+    width: clamp(96px, 34%, 126px);
   }
   .quick-sdk-item,
   .menu-dropdown-models .quick-sdk-model-item {
@@ -2410,8 +2415,8 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (max-width: 359px) {
   .quick-sdk-model-sdks {
-    flex: 0 0 106px;
-    width: 106px;
+    flex: 0 0 clamp(88px, 34%, 106px);
+    width: clamp(88px, 34%, 106px);
   }
   .quick-sdk-item,
   .menu-dropdown-models .quick-sdk-model-item {

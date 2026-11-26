@@ -119,7 +119,7 @@ export interface SessionPaneProps {
   onToggleSessionPin?: (sessionName: string) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
-  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null }) => void;
+  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
   /** Open a file preview in the shared floating preview host. */
