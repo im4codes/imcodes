@@ -841,7 +841,7 @@ footer {
   </blockquote>
   <p class="lead" data-i18n="hero_intro">IM.codes unifies your AI agents, remote machines, and team specs in one real-time workbench. Dispatch cross-vendor Task Pairs from an Execution Pool, operate behind-NAT computers through Controlled Nodes and Computer Use, take over anytime with built-in 4K Remote Desktop, inject Cloud Docs into chats, and share live workspaces with fine-grained access control.</p>
   <div class="sovereignty-bar" data-i18n="sovereignty_note">
-    <strong>Self-hosted, source-available (BSL 1.1), zero vendor lock-in</strong> — free for personal &amp; small-team use (&lt;= 5 users &amp; &lt;= 50 headcount); your memory, code, docs, and tools stay on your own infrastructure.
+    <strong>Self-hosted, source-available (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), zero vendor lock-in</strong> — your memory, code, docs, and tools stay on your own infrastructure, and you can swap any AI model or provider freely (see <a href="#license-info" style="color:inherit;text-decoration:underline;">license terms</a>).
   </div>
   <div class="hero-terminal" onclick="copy(this)">
     <code class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></code>
@@ -1091,7 +1091,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_cron_name">scheduled tasks</div><div class="feat-desc" data-i18n="f_cron_desc">cron-style automation, timezone-aware, execution history with jump-to-session</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs &amp; panels synced to server</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_i18n_name">7 languages</div><div class="feat-desc" data-i18n="f_i18n_desc">EN, 中文, 繁體, ES, RU, JA, KO</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_self_name">self-hosted · zero lock-in</div><div class="feat-desc" data-i18n="f_self_desc">BSL 1.1 source-available (free personal &amp; &lt;= 5/50 teams), your infra, swap any provider freely</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_self_name">self-hosted · zero lock-in</div><div class="feat-desc" data-i18n="f_self_desc">source-available (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), your infra, your data, swap any provider freely</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_ota_name">OTA updates</div><div class="feat-desc" data-i18n="f_ota_desc">upgrade daemons from the web UI</div></div>
   </div>
 </section>
@@ -1247,12 +1247,12 @@ docker compose up -d</div>
   </div>
 </section>
 
-<section>
+<section id="license-info">
   <p style="color:var(--fg-dim); font-size:12px; line-height:1.6;" data-i18n="disclaimer">
     IM.codes is an independent source-available project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
   </p>
   <p style="color:var(--fg-dim); font-size:12px; line-height:1.6; margin-top:8px;" data-i18n="license_note">
-    <strong>License (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>):</strong> Free for non-production, personal production use, and small-team internal production (&lt;= 5 active users and &lt;= 50 headcount aggregated across entity, affiliates, and instances). Exceeding those limits or offering hosted/SaaS/white-label commercial services requires a <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">commercial license</a> via <code>support@im.codes</code>. Change Date: <code>2030-11-26</code> (Apache License 2.0). See <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">Third-Party Notices</a>.
+    <strong>License (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">Commercial Licensing Guide</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">Third-Party Notices</a>):</strong><br>&bull; <strong>Non-Production &amp; Personal Production Use:</strong> Non-production use (evaluation, testing, development), copying, modification, and compliant redistribution preserving notices and trademark terms are free for any organization size under standard BSL 1.1. Personal production use by natural persons for personal development, learning, research, or personal self-hosting on personal devices/servers (not centrally deployed or shared across an organization, and excluding third-party hosting/SaaS/white-label commercial services) is permanently free regardless of employer size.<br>&bull; <strong>Small-Team Internal Production Use:</strong> Covered free under the Additional Use Grant only when <strong>both</strong> active users/seats <code>&lt;= 5</code> <strong>and</strong> total organization headcount <code>&lt;= 50</code>, aggregated across the legal entity, all affiliates, and all deployed instances.<br>&bull; <strong>Outside the Additional Use Grant (Commercial License):</strong> Prior to the Change Date, production use above either threshold (e.g. <code>6/50</code> or <code>5/51</code> across entity/affiliates/instances), or production use for hosted/managed/multi-tenant SaaS or commercial white-label services/resale (even by a single person), is excluded from the Additional Use Grant and requires a commercial license via <code>support@im.codes</code>.<br>&bull; <strong>Change Date:</strong> Converts to <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a> 4 years after each version's public release (<code>2030-11-26</code> for this release).
   </p>
 </section>
 
@@ -1280,7 +1280,7 @@ const I18N = {
     couplet_l1: '别再只和一个 AI 对话，指挥一整支 AI Force。',
     couplet_l2: '一座工作台，调遣所有模型与机器。',
     hero_intro: 'IM.codes 把 AI Agent、远程机器与团队文档统一到同一座实时工作台。通过执行池派发跨厂商 Task Pairs，用受控节点与 Computer Use 操作内网机器，用内置 4K 远程桌面随时接管，在聊天中直接注入云文档，并用细粒度权限与团队安全共享。',
-    sovereignty_note: '<strong>自托管、源码可用（BSL 1.1）、零厂商绑定</strong> —— 个人与 &lt;= 5 用户且 &lt;= 50 人团队免费使用，记忆、代码、文档与工具都在自己手里。',
+    sovereignty_note: '<strong>自托管、源码可用（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>）、零厂商绑定</strong> —— 记忆、代码、文档与工具都在自己手里，任何模型与供应商随时自由切换（详见<a href="#license-info" style="color:inherit;text-decoration:underline;">许可证条款</a>）。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     copy_hint: '点击复制',
     cta_install: '一键安装', cta_download: 'App 与桌面客户端下载', cta_selfhost: 'Docker 自托管',
@@ -1376,7 +1376,7 @@ const I18N = {
     f_cron_name: '定时任务', f_cron_desc: 'Cron 定时自动化，时区感知，执行历史可跳转到会话',
     f_sync_name: '跨设备同步', f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
     f_i18n_name: '7 种语言', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: '自托管 · 零厂商绑定', f_self_desc: 'BSL 1.1 源码可用（个人与 <= 5/50 团队免费），数据留本地，模型随时切换',
+    f_self_name: '自托管 · 零厂商绑定', f_self_desc: '源码可用（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>），数据留本地，模型与供应商随时切换',
     f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
     h_arch: '架构',
     arch_desc: '守护进程运行在你的开发机与内网受控节点上，通过 tmux/ConPTY 与 SDK 管理所有会话，并托管 MCP server（记忆、Task Pairs、云文档、OCU、Send 与 Cron）。自托管服务端负责在多端与节点间中转会话、云文档与 4K 远程桌面流，全部数据留在你的基础设施内，零厂商绑定。',
@@ -1412,7 +1412,7 @@ const I18N = {
     h_about: '关于',
     about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 Antigravity CLI 也有重要贡献。',
     disclaimer: 'IM.codes 是一个独立的源码可用（source-available）项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
-    license_note: '<strong>许可证（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>）：</strong> 非生产使用、个人生产使用以及按法律实体/关联方/全部实例合并计算活跃用户 &lt;= 5 人且总人数 &lt;= 50 人的小型团队内部生产使用免费；超过阈值或用于托管/SaaS/白标商业服务需通过 <code>support@im.codes</code> 获取<a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商业授权</a>。开源转换日：<code>2030-11-26</code>（转为 Apache License 2.0）。另见 <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">第三方组件声明</a>。',
+    license_note: '<strong>许可证（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商业授权说明</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">第三方组件声明</a>）：</strong><br>&bull; <strong>非生产使用与个人生产使用：</strong> 在保留版权/协议声明及遵守商标限制的前提下，非生产环境评估/测试、复制、修改与合规再分发对任意规模组织均免费；自然人在个人设备/服务器上用于个人开发、学习、研究或个人自托管的个人使用永久免费（非组织集中部署或跨团队共享，且不用于第三方托管/SaaS/白标商业服务），不受雇主规模限制。<br>&bull; <strong>小型团队内部生产使用：</strong> 仅当按法律实体、所有关联公司/子公司及所有部署实例<strong>合并计算</strong>同时满足活跃用户/席位 <code>&lt;= 5 人</code>且组织总人数 <code>&lt;= 50 人</code>时，内部生产使用才属于附加使用授权的免费范围。<br>&bull; <strong>超出附加授权范围（需商业授权）：</strong> 在开源转换日前，合计超过任一阈值（如 <code>6/50</code> 或 <code>5/51</code>）的内部生产使用，或向第三方提供托管服务、多租户 SaaS、白标转售的生产使用（即使只有 1 人），均<strong>不属于</strong>附加生产使用授权范围，请联系 <code>support@im.codes</code> 获取商业授权。<br>&bull; <strong>开源转换：</strong> 每个版本公开发布满 4 年后自动转为 <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a>（本版本转换日期为 <code>2030-11-26</code>）。',
   },
   'zh-TW': {
     nav_pillars: '核心能力', nav_shots: '截圖', nav_download: '下載',
@@ -1421,7 +1421,7 @@ const I18N = {
     couplet_l1: '別再只和一個 AI 對話，指揮一整支 AI Force。',
     couplet_l2: '一座工作台，調遣所有模型與機器。',
     hero_intro: 'IM.codes 將 AI Agent、遠端機器與團隊文件統一至同一座即時工作台。透過執行池派發跨廠商 Task Pairs，以受控節點與 Computer Use 操作內網機器，以內建 4K 遠端桌面隨時接管，在對話中直接注入雲端文件，並以細粒度權限與團隊安全共享。',
-    sovereignty_note: '<strong>自託管、源碼可用（BSL 1.1）、零廠商綁定</strong> —— 個人與 &lt;= 5 使用者且 &lt;= 50 人團隊免費使用，記憶、程式碼、文件與工具都在自己手裡。',
+    sovereignty_note: '<strong>自託管、源碼可用（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>）、零廠商綁定</strong> —— 記憶、程式碼、文件與工具都在自己手裡，任何模型與供應商隨時自由切換（詳見<a href="#license-info" style="color:inherit;text-decoration:underline;">授權條款</a>）。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     copy_hint: '點擊複製',
     cta_install: '一鍵安裝', cta_download: 'App 與桌面端下載', cta_selfhost: 'Docker 自託管',
@@ -1517,7 +1517,7 @@ const I18N = {
     f_cron_name: '排程任務', f_cron_desc: 'Cron 定時自動化，時區感知，執行歷史可跳轉至會話',
     f_sync_name: '跨裝置同步', f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
     f_i18n_name: '7 種語言', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: '自託管 · 零廠商綁定', f_self_desc: 'BSL 1.1 源碼可用（個人與 <= 5/50 團隊免費），資料留本地，模型隨時切換',
+    f_self_name: '自託管 · 零廠商綁定', f_self_desc: '源碼可用（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>），資料留本地，模型與供應商隨時切換',
     f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
     h_arch: '架構',
     arch_desc: '守護程序運行在你的開發機與內網受控節點上，透過 tmux/ConPTY 與 SDK 管理所有會話，並託管 MCP server（記憶、Task Pairs、雲端文件、OCU、Send 與 Cron）。自託管伺服器負責在多端與節點間中轉會話、雲端文件與 4K 遠端桌面流，全部資料留在你的基礎設施內，零廠商綁定。',
@@ -1553,7 +1553,7 @@ const I18N = {
     h_about: '關於',
     about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 Antigravity CLI 也有重要貢獻。',
     disclaimer: 'IM.codes 是一個獨立的源碼可用（source-available）專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
-    license_note: '<strong>授權條款（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>）：</strong> 非生產使用、個人生產使用以及按法律實體/關聯企業/全部實例合併計算活躍使用者 &lt;= 5 人且組織總人數 &lt;= 50 人的小型團隊內部生產使用免費；超過門檻或用於託管/SaaS/白標商業服務需透過 <code>support@im.codes</code> 取得<a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商業授權</a>。開源轉換日：<code>2030-11-26</code>（轉為 Apache License 2.0）。另見 <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">第三方元件聲明</a>。',
+    license_note: '<strong>授權條款（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商業授權說明</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">第三方元件聲明</a>）：</strong><br>&bull; <strong>非生產使用與個人生產使用：</strong> 在保留版權/授權聲明並遵守商標限制的前提下，非生產環境評估/測試、複製、修改與合規再分發對任意規模組織均免費；自然人在個人裝置/伺服器上用於個人開發、學習、研究或個人自託管的個人使用永久免費（非組織集中部署或跨團隊共享，且不用於第三方託管/SaaS/白標商業服務），不受雇主規模限制。<br>&bull; <strong>小型團隊內部生產使用：</strong> 僅當按法律實體、所有關聯企業/子公司及所有部署實例<strong>合併計算</strong>同時滿足活躍使用者/席位 <code>&lt;= 5 人</code>且組織總人數 <code>&lt;= 50 人</code>時，內部生產使用才屬於附加使用授權的免費範圍。<br>&bull; <strong>超出附加授權範圍（需商業授權）：</strong> 在開源轉換日前，合計超過任一門檻（如 <code>6/50</code> 或 <code>5/51</code>）的內部生產使用，或向第三方提供託管服務、多租戶 SaaS、白標轉售的生產使用（即使僅有 1 人），均<strong>不屬於</strong>附加生產使用授權範圍，請聯繫 <code>support@im.codes</code> 取得商業授權。<br>&bull; <strong>開源轉換：</strong> 每個版本公開發布滿 4 年後自動轉為 <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a>（本版本轉換日期為 <code>2030-11-26</code>）。',
   },
   ja: {
     nav_pillars: '主要機能', nav_shots: 'スクリーンショット', nav_download: 'ダウンロード',
@@ -1562,7 +1562,7 @@ const I18N = {
     couplet_l1: '1つの AI と話すのは終わり。AI Force を指揮せよ。',
     couplet_l2: 'ひとつのワークベンチから、あらゆるモデルとマシンを意のままに。',
     hero_intro: 'IM.codes は AI エージェント、リモートマシン、チーム仕様書をひとつのリアルタイム・ワークベンチに統合します。Execution Pool からクロスベンダーの Task Pairs を配車し、Controlled Nodes と Computer Use で NAT 越しのマシンを操作し、内蔵 4K リモートデスクトップでいつでも引き継ぎ、Cloud Docs をチャットに注入して細かな権限で共有できます。',
-    sovereignty_note: '<strong>セルフホスト・ソース公開（BSL 1.1）・ベンダーロックインなし</strong> —— 個人および 5 名以下かつ総人員 50 名以下の小規模チームは無料。メモリ、コード、ドキュメントはすべて手元に残ります。',
+    sovereignty_note: '<strong>セルフホスト・ソース公開（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>）・ベンダーロックインなし</strong> —— メモリ、コード、ドキュメントはすべて自分のインフラに残り、任意のモデルやプロバイダーを切り替えられます（詳細は<a href="#license-info" style="color:inherit;text-decoration:underline;">ライセンス条項</a>）。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     copy_hint: 'クリックでコピー',
     cta_install: 'クイックインストール', cta_download: 'アプリ & デスクトップ版', cta_selfhost: 'Docker セルフホスト',
@@ -1658,7 +1658,7 @@ const I18N = {
     f_cron_name: 'スケジュールタスク', f_cron_desc: 'タイムゾーン対応 Cron 自動化、実行履歴からセッションへジャンプ',
     f_sync_name: 'クロスデバイス同期', f_sync_desc: 'タブ順序・固定タブ・パネルをサーバー同期',
     f_i18n_name: '7言語対応', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: 'セルフホスト · ロックインなし', f_self_desc: 'BSL 1.1 ソース公開（個人・5名/50名以下チーム無料）、自社データ保持、モデル切替自由',
+    f_self_name: 'セルフホスト · ロックインなし', f_self_desc: 'ソース公開（<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>）、自社データ保持、モデル・ベンダーを自由に切替',
     f_ota_name: 'OTA アップデート', f_ota_desc: 'Web UI からデーモンを遠隔更新',
     h_arch: 'アーキテクチャ',
     arch_desc: 'デーモンは開発機および NAT 配下の制御対象ノードで動作し、tmux / ConPTY / SDK で各セッションを管理するとともに MCP サーバー（Memory・Task Pairs・Cloud Docs・OCU・Send・Cron）を提供します。セルフホストサーバーが各端末・ノード間の接続、Cloud Docs、4K リモートデスクトップストリームを中継し、すべてのデータを自社インフラ内に保持します。',
@@ -1694,7 +1694,7 @@ const I18N = {
     h_about: '概要',
     about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と Antigravity CLI も重要な貢献。',
     disclaimer: 'IM.codes は独立したソース公開（source-available）プロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
-    license_note: '<strong>ライセンス（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>）：</strong> 非本番利用、個人本番利用、および法人・関連会社・全インスタンス合算でアクティブユーザー 5 名以下かつ総人員 50 名以下の内部本番利用は無料です。上限超過やホスティング/SaaS/ホワイトラベル商用提供は <code>support@im.codes</code> にて<a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商用ライセンス</a>が必要です。移行日：<code>2030-11-26</code>（Apache License 2.0 へ移行）。<a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">サードパーティ表記</a>も参照してください。',
+    license_note: '<strong>ライセンス（<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">商用ライセンス案内</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">サードパーティ表記</a>）：</strong><br>&bull; <strong>非本番利用および個人本番利用:</strong> 著作権・ライセンス表示と商標規定を遵守する限り、非本番環境での評価・テスト・複製・改変・再配布は組織規模を問わず無料です。自然人が個人端末・個人サーバーで個人開発・学習・研究・個人セルフホストのために利用する場合は雇用主の規模に関わらず永続的に無料です（組織による集中配備・共有および第三者向けホスティング/SaaS/ホワイトラベル商用提供を除く）。<br>&bull; <strong>小規模チームの本番利用:</strong> 法人・関連会社および全インスタンスを<strong>合算</strong>し、アクティブユーザー <code>&lt;= 5 名</code> <strong>かつ</strong> 組織総人員 <code>&lt;= 50 名</code>の両方を満たす場合に限り、内部本番利用が追加利用許諾の無料対象となります。<br>&bull; <strong>追加利用許諾の対象外（商用ライセンス必須）:</strong> 移行日前において上記上限を超える内部本番利用（例: <code>6/50</code> や <code>5/51</code>）、または人数を問わず（1 名でも）ホスティング・マネージド・マルチテナント SaaS やホワイトラベル商用提供の本番利用は追加利用許諾の対象外となり、<code>support@im.codes</code> での商用ライセンス取得が必要です。<br>&bull; <strong>移行日:</strong> 各バージョンの公開から 4 年後（本リリースは <code>2030-11-26</code>）に <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a> へ移行します。',
   },
   ko: {
     nav_pillars: '핵심 기능', nav_shots: '스크린샷', nav_download: '다운로드',
@@ -1703,7 +1703,7 @@ const I18N = {
     couplet_l1: '단 하나의 AI와 대화하지 마세요. AI Force를 지휘하세요.',
     couplet_l2: '하나의 워크벤치에서 모든 모델과 머신을 지휘합니다.',
     hero_intro: 'IM.codes는 AI 에이전트, 원격 머신, 팀 문서를 하나의 실시간 워크벤치로 통합합니다. Execution Pool에서 크로스 벤더 Task Pairs를 배치하고, Controlled Nodes와 Computer Use로 NAT 뒤 머신을 조작하며, 내장 4K 원격 데스크톱으로 언제든 인계받고, Cloud Docs를 채팅에 주입해 세밀한 권한으로 공유하세요.',
-    sovereignty_note: '<strong>셀프 호스팅, 소스 공개(BSL 1.1), 벤더 종속 없음</strong> — 개인 및 활성 사용자 5명 이하·전체 인원 50명 이하 소규모 팀은 무료이며, 메모리·코드·문서는 모두 내 인프라에 남습니다.',
+    sovereignty_note: '<strong>셀프 호스팅, 소스 공개(<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), 벤더 종속 없음</strong> — 메모리, 코드, 문서는 모두 내 인프라에 남으며 어떤 모델과 공급자든 자유롭게 전환할 수 있습니다(<a href="#license-info" style="color:inherit;text-decoration:underline;">라이선스 안내</a>).',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     copy_hint: '클릭하여 복사',
     cta_install: '빠른 설치', cta_download: '앱 & 데스크톱 설치', cta_selfhost: 'Docker 셀프 호스팅',
@@ -1799,7 +1799,7 @@ const I18N = {
     f_cron_name: '예약 작업', f_cron_desc: '시간대 인식 Cron 자동화, 실행 기록에서 세션으로 즉시 이동',
     f_sync_name: '기기 간 동기화', f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
     f_i18n_name: '7개 언어', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: '셀프 호스팅 · 무종속', f_self_desc: 'BSL 1.1 소스 공개(개인·5/50 이하 팀 무료), 내 인프라 유지, 모델 자유 교체',
+    f_self_name: '셀프 호스팅 · 무종속', f_self_desc: '소스 공개(<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), 내 데이터·인프라 유지, 모델·공급자 자유 교체',
     f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
     h_arch: '아키텍처',
     arch_desc: '데몬은 개발 머신과 NAT 뒤 제어 노드에서 실행되며 tmux / ConPTY / SDK로 세션을 관리하고 MCP 서버(Memory, Task Pairs, Cloud Docs, OCU, Send, Cron)를 소유합니다. 셀프 호스팅 서버가 기기와 노드 간 세션, Cloud Docs, 4K 원격 데스크톱 스트림을 중계하며 모든 데이터는 자체 인프라에 유지됩니다.',
@@ -1835,7 +1835,7 @@ const I18N = {
     h_about: '소개',
     about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 Antigravity CLI도 중요한 기여.',
     disclaimer: 'IM.codes는 독립적인 소스 공개(source-available) 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
-    license_note: '<strong>라이선스(<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>):</strong> 비프로덕션, 개인 프로덕션, 법인·관계사·모든 인스턴스 합산 활성 사용자 5명 이하 및 전체 인원 50명 이하 소규모 팀 내부 프로덕션은 무료입니다. 기준 초과 또는 호스팅/SaaS/화이트라벨 상용 서비스는 <code>support@im.codes</code>를 통해 <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">상용 라이선스</a>가 필요합니다. 전환일: <code>2030-11-26</code>(Apache License 2.0). <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">서드파티 고지</a>도 확인하세요.',
+    license_note: '<strong>라이선스(<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">상용 라이선스 안내</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">서드파티 고지</a>):</strong><br>&bull; <strong>비프로덕션 및 개인 프로덕션 사용:</strong> 저작권·라이선스 고지와 상표 제한을 준수하는 범위의 비프로덕션 평가·테스트·복제·수정·재배포는 조직 규모와 무관하게 무료입니다. 개인이 본인 기기/서버에서 개인 개발·학습·연구·개인 셀프호스팅 목적으로 사용하는 경우 소속 회사 규모와 관계없이 영구 무료입니다(조직의 중앙 배포/사내 공유 및 제3자 호스팅/SaaS/화이트라벨 상용 서비스 제외).<br>&bull; <strong>소규모 팀 내부 프로덕션 사용:</strong> 법인·관계사 및 모든 배포 인스턴스를 <strong>합산</strong>하여 활성 사용자/시트 <code>&lt;= 5명</code> <strong>및</strong> 전체 조직 인원 <code>&lt;= 50명</code>을 모두 충족하는 경우에만 추가 사용 허가 무료 범위에 포함됩니다.<br>&bull; <strong>추가 사용 허가 제외(상용 라이선스 필요):</strong> 전환일 이전에는 합산 기준 초과 내부 프로덕션 사용(예: <code>6/50</code> 또는 <code>5/51</code>)이나 인원 규모와 무관한(1인 포함) 호스팅·멀티테넌트 SaaS·화이트라벨 상용 서비스 프로덕션 사용은 추가 사용 허가 대상에서 제외되며 <code>support@im.codes</code>로 상용 라이선스가 필요합니다.<br>&bull; <strong>전환일:</strong> 각 버전 공개 후 4년 뒤(본 릴리스는 <code>2030-11-26</code>) <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a>으로 전환됩니다.',
   },
   es: {
     nav_pillars: 'Pilares', nav_shots: 'Capturas', nav_download: 'Descargar',
@@ -1844,7 +1844,7 @@ const I18N = {
     couplet_l1: 'Deja de chatear con una sola IA. Dirige una AI Force.',
     couplet_l2: 'Un solo workbench: cada modelo y cada máquina bajo tu mando.',
     hero_intro: 'IM.codes reúne tus agentes de IA, máquinas remotas y documentos del equipo en un solo workbench en tiempo real. Despacha Task Pairs entre proveedores desde tu Execution Pool, opera equipos detrás de NAT con Nodos Controlados y Computer Use, toma el control cuando quieras con Escritorio Remoto 4K integrado, inyecta Cloud Docs en el chat y comparte con control de acceso granular.',
-    sovereignty_note: '<strong>Autoalojado, de código disponible (BSL 1.1) y sin vendor lock-in</strong> — gratis para uso personal y equipos pequeños (&lt;= 5 usuarios y &lt;= 50 personas); tu memoria, código y documentos permanecen bajo tu control.',
+    sovereignty_note: '<strong>Autoalojado, de código disponible (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>) y sin vendor lock-in</strong> — tu memoria, código, documentos y herramientas permanecen bajo tu control y puedes cambiar de modelo libremente (ver <a href="#license-info" style="color:inherit;text-decoration:underline;">licencia</a>).',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     copy_hint: 'clic para copiar',
     cta_install: 'Instalación rápida', cta_download: 'Apps e instaladores', cta_selfhost: 'Autoalojar con Docker',
@@ -1940,7 +1940,7 @@ const I18N = {
     f_cron_name: 'tareas programadas', f_cron_desc: 'automatización cron con zonas horarias e historial navegable',
     f_sync_name: 'sincronización multi-dispositivo', f_sync_desc: 'orden de pestañas y paneles fijados sincronizados',
     f_i18n_name: '7 idiomas', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: 'autoalojado · sin ataduras', f_self_desc: 'BSL 1.1 código disponible (gratis personal y equipos <= 5/50), tus datos en tu infra',
+    f_self_name: 'autoalojado · sin ataduras', f_self_desc: 'código disponible (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), tus datos en tu infra, cambia de proveedor libremente',
     f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
     h_arch: 'arquitectura',
     arch_desc: 'El daemon se ejecuta en tus máquinas y Nodos Controlados detrás de NAT, gestionando sesiones con tmux/ConPTY/SDK y alojando el servidor MCP gestionado (Memoria, Task Pairs, Cloud Docs, OCU, Send y Cron). Tu servidor autoalojado retransmite sesiones, Cloud Docs y flujos de Escritorio Remoto 4K: todo permanece bajo tu control sin vendor lock-in.',
@@ -1976,7 +1976,7 @@ const I18N = {
     h_about: 'acerca de',
     about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y Antigravity CLI.',
     disclaimer: 'IM.codes es un proyecto independiente de código disponible (source-available) y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
-    license_note: '<strong>Licencia (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>):</strong> Gratis para uso no productivo, uso personal en producción y equipos pequeños internos (&lt;= 5 usuarios activos y &lt;= 50 personas agregadas entre entidad, filiales e instancias). Superar esos límites o prestar servicios comerciales alojados/SaaS/marca blanca requiere una <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">licencia comercial</a> vía <code>support@im.codes</code>. Fecha de cambio: <code>2030-11-26</code> (Apache License 2.0). Consulta también los <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">avisos de terceros</a>.',
+    license_note: '<strong>Licencia (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">Guía de licencia comercial</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">Avisos de terceros</a>):</strong><br>&bull; <strong>Uso no productivo y uso personal en producción:</strong> El uso no productivo (evaluación, pruebas, desarrollo), la copia, modificación y redistribución conforme manteniendo avisos de derechos y marcas son gratuitos para cualquier tamaño de organización bajo BSL 1.1; el uso personal en producción por personas físicas para desarrollo personal, aprendizaje, investigación o autoalojamiento personal en sus propios dispositivos o servidores (no desplegado centralmente ni compartido en una organización, ni para servicios comerciales alojados/SaaS/marca blanca a terceros) es gratuito permanentemente, sin importar el tamaño del empleador.<br>&bull; <strong>Equipos pequeños en producción interna:</strong> Cubierto gratis bajo la Concesión de Uso Adicional solo si se cumplen <strong>ambas</strong> condiciones <strong>agregadas entre entidad legal, filiales y todas las instancias</strong>: <code>&lt;= 5</code> usuarios activos/asientos <strong>y</strong> <code>&lt;= 50</code> personas en toda la organización.<br>&bull; <strong>Fuera de la Concesión Adicional (licencia comercial):</strong> Antes de la fecha de cambio, el uso en producción que supere cualquier límite agregado (<code>6/50</code> o <code>5/51</code>), así como el uso en producción para servicios alojados/gestionados, SaaS multi-tenant o reventa de marca blanca (incluso por 1 persona), queda fuera de la Concesión de Uso Adicional y requiere licencia comercial vía <code>support@im.codes</code>.<br>&bull; <strong>Fecha de cambio:</strong> Se convierte a <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a> 4 años después de la publicación de cada versión (<code>2030-11-26</code> para esta versión).',
   },
   ru: {
     nav_pillars: 'Ключевое', nav_shots: 'Скриншоты', nav_download: 'Скачать',
@@ -1985,7 +1985,7 @@ const I18N = {
     couplet_l1: 'Хватит общаться с одним ИИ. Командуйте AI Force.',
     couplet_l2: 'Один workbench — каждая модель и каждая машина под вашим управлением.',
     hero_intro: 'IM.codes объединяет ваших ИИ-агентов, удалённые компьютеры и документацию команды в одном workbench реального времени. Запускайте кросс-вендорные Task Pairs из Execution Pool, управляйте машинами за NAT через Управляемые узлы и Computer Use, перехватывайте экран через встроенный 4K Remote Desktop, вставляйте Cloud Docs в чат и делитесь доступом с гибкими правами.',
-    sovereignty_note: '<strong>Self-hosted, с доступным исходным кодом (BSL 1.1), без vendor lock-in</strong> — бесплатно для личного использования и малых команд (&lt;= 5 пользователей и &lt;= 50 человек); память, код и документы остаются у вас.',
+    sovereignty_note: '<strong>Self-hosted, с доступным исходным кодом (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), без vendor lock-in</strong> — память, код, документы и инструменты остаются в вашей инфраструктуре, а любую модель можно свободно заменить (см. <a href="#license-info" style="color:inherit;text-decoration:underline;">условия лицензии</a>).',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     copy_hint: 'нажмите для копирования',
     cta_install: 'Быстрая установка', cta_download: 'Приложения и ПК', cta_selfhost: 'Docker Self-Host',
@@ -2081,7 +2081,7 @@ const I18N = {
     f_cron_name: 'задачи по расписанию', f_cron_desc: 'cron-автоматизация с часовыми поясами и переходом к сессии из истории',
     f_sync_name: 'синхронизация устройств', f_sync_desc: 'порядок вкладок и закреплённые панели синхронизируются через сервер',
     f_i18n_name: '7 языков', f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    f_self_name: 'self-hosted · без lock-in', f_self_desc: 'BSL 1.1 доступный код (бесплатно лично и командам <= 5/50), ваша инфраструктура',
+    f_self_name: 'self-hosted · без lock-in', f_self_desc: 'доступный код (<a href="#license-info" style="color:inherit;text-decoration:underline;">BSL 1.1</a>), ваша инфраструктура, свободная смена провайдеров',
     f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
     h_arch: 'архитектура',
     arch_desc: 'Демон работает на ваших машинах и Управляемых узлах за NAT, управляя сессиями через tmux/ConPTY/SDK и размещая MCP-сервер (Память, Task Pairs, Cloud Docs, OCU, Send и Cron). Ваш self-hosted сервер ретранслирует сессии, Cloud Docs и потоки 4K Remote Desktop — всё остаётся под вашим контролем без vendor lock-in.',
@@ -2117,7 +2117,7 @@ const I18N = {
     h_about: 'о проекте',
     about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и Antigravity CLI.',
     disclaimer: 'IM.codes — независимый проект с доступным исходным кодом (source-available), не связанный с Anthropic, OpenAI, Google, Alibaba, OpenClaw или любой другой упомянутой компанией. Все названия продуктов и товарные знаки являются собственностью их владельцев.',
-    license_note: '<strong>Лицензия (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">BSL 1.1</a>):</strong> Бесплатно для непродуктивного, личного продуктивного использования и внутренних команд до 5 активных пользователей и до 50 человек по группе компаний и всем инстансам. Превышение порогов или коммерческие SaaS/hosting/white-label услуги требуют <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">коммерческой лицензии</a> через <code>support@im.codes</code>. Дата перехода: <code>2030-11-26</code> (Apache License 2.0). См. <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">уведомления третьих сторон</a>.',
+    license_note: '<strong>Лицензия (<a href="https://github.com/im4codes/imcodes/blob/master/LICENSE">Business Source License 1.1 / BSL 1.1</a> — <a href="https://github.com/im4codes/imcodes/blob/master/COMMERCIAL-LICENSE.md">Коммерческое лицензирование</a> | <a href="https://github.com/im4codes/imcodes/blob/master/THIRD_PARTY_NOTICES.md">Уведомления о сторонних компонентах</a>):</strong><br>&bull; <strong>Непродуктивное и личное продуктивное использование:</strong> Непродуктивное использование (оценка, тестирование, разработка), копирование, модификация и соблюдающее лицензию распространение с сохранением уведомлений об авторском праве и товарных знаках бесплатны для организаций любого размера по BSL 1.1; личное продуктивное использование физическими лицами для личной разработки, обучения, исследований или личного self-hosting на своих устройствах/серверах (без централизованного развёртывания/совместного использования в организации и без оказания коммерческих услуг хостинга/SaaS/white-label третьим лицам) бессрочно бесплатно независимо от размера работодателя.<br>&bull; <strong>Малые команды (внутренний production):</strong> Бесплатно по дополнительному разрешению только при одновременном соблюдении <strong>обоих</strong> лимитов <strong>в сумме по юридическому лицу, аффилированным компаниям и всем развёрнутым инстансам</strong>: <code>&lt;= 5</code> активных пользователей/мест <strong>и</strong> общая численность организации <code>&lt;= 50</code> человек.<br>&bull; <strong>Вне дополнительного разрешения (коммерческая лицензия):</strong> До даты перехода использование в production сверх любого из порогов (например, <code>6/50</code> или <code>5/51</code>), а также использование в production для коммерческого хостинга, managed-услуг, multi-tenant SaaS или white-label перепродажи (даже одним человеком) исключены из дополнительного разрешения и требуют коммерческой лицензии (<code>support@im.codes</code>).<br>&bull; <strong>Дата перехода:</strong> Переходит под <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a> через 4 года после публикации каждой версии (<code>2030-11-26</code> для данного релиза).',
   }
 };
 

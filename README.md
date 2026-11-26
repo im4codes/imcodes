@@ -8,7 +8,7 @@
 > One workbench — every model, every machine, under your command.<br>
 > — IM.codes
 
-IM.codes unifies your AI agents, computers, and team documents in one real-time workbench. **Self-hosted, source-available ([BSL 1.1](LICENSE) — free for personal & small-team use `<= 5` users & `<= 50` headcount), and built with zero vendor lock-in** — your memory, code, docs, and tools stay in your own infrastructure, and you can mix or swap any AI model or provider freely ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode, and more).
+IM.codes unifies your AI agents, computers, and team documents in one real-time workbench. **Self-hosted, source-available ([BSL 1.1](#license)), and built with zero vendor lock-in** — your memory, code, docs, and tools stay in your own infrastructure, and you can mix or swap any AI model or provider freely ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode, and more).
 
 > **Disclaimer:** This is an actively developed personal source-available project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
 

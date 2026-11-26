@@ -8,7 +8,7 @@
 > Один workbench — каждая модель и каждая машина под вашим управлением.<br>
 > — IM.codes
 
-IM.codes объединяет ваших ИИ-агентов, удалённые компьютеры и документацию команды в одном workbench реального времени. **Self-hosted, с доступным исходным кодом ([BSL 1.1](../LICENSE) — бесплатно для личного использования и малых команд `<= 5` пользователей и `<= 50` человек), и без vendor lock-in** — память, код, документы и инструменты остаются в вашей инфраструктуре, а любую модель или провайдера ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode и др.) можно свободно заменить в любой момент.
+IM.codes объединяет ваших ИИ-агентов, удалённые компьютеры и документацию команды в одном workbench реального времени. **Self-hosted, с доступным исходным кодом ([BSL 1.1](#лицензия)) и без vendor lock-in** — память, код, документы и инструменты остаются в вашей инфраструктуре, а любую модель или провайдера ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode и др.) можно свободно заменить в любой момент.
 
 > Это перевод. **Каноническая версия — английский README (`../README.md`).** Если есть расхождения, ориентируйтесь на английский вариант.
 

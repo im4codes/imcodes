@@ -8,7 +8,7 @@
 > ひとつのワークベンチから、あらゆるモデルとマシンを意のままに。<br>
 > — IM.codes
 
-IM.codes は AI エージェント、リモートマシン、チームドキュメントをひとつのリアルタイム・ワークベンチに統合します。**セルフホスト・ソース公開（[BSL 1.1](../LICENSE) — 個人および 5 名以下かつ総人員 50 名以下の小規模チームは無料）・ベンダーロックインなし** —— メモリ、コード、ドキュメント、ツールはすべて自分のインフラに残り、任意の AI モデルやプロバイダー（[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent)、GitHub Copilot、Cursor、OpenCode など）をいつでも自由に切り替えられます。
+IM.codes は AI エージェント、リモートマシン、チームドキュメントをひとつのリアルタイム・ワークベンチに統合します。**セルフホスト・ソース公開（[BSL 1.1](#ライセンス)）・ベンダーロックインなし** —— メモリ、コード、ドキュメント、ツールはすべて自分のインフラに残り、任意の AI モデルやプロバイダー（[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent)、GitHub Copilot、Cursor、OpenCode など）をいつでも自由に切り替えられます。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 

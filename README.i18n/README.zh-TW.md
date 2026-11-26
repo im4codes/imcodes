@@ -8,7 +8,7 @@
 > 一座工作台，調遣所有模型與機器。<br>
 > — IM.codes
 
-IM.codes 將 AI Agent、遠端電腦與團隊文件統一至同一座即時工作台。**自託管、源碼可用（[BSL 1.1](../LICENSE) —— 個人與 `<= 5` 使用者且 `<= 50` 人團隊免費使用）、零廠商綁定** —— 記憶、程式碼、文件與工具都在自己手裡，任何模型與供應商隨時自由切換（[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent)、GitHub Copilot、Cursor、OpenCode 等）。
+IM.codes 將 AI Agent、遠端電腦與團隊文件統一至同一座即時工作台。**自託管、源碼可用（[BSL 1.1](#授權條款)）、零廠商綁定** —— 記憶、程式碼、文件與工具都在自己手裡，任何模型與供應商隨時自由切換（[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity CLI、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent)、GitHub Copilot、Cursor、OpenCode 等）。
 
 > **說明：** 本文件是繁體中文翻譯版。**英文 README（`../README.md`）是規範版本。** 若內容有出入，以英文版為準。
 

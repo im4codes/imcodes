@@ -8,7 +8,7 @@
 > 하나의 워크벤치에서 모든 모델과 머신을 지휘합니다.<br>
 > — IM.codes
 
-IM.codes는 AI 에이전트, 원격 머신, 팀 문서를 하나의 실시간 워크벤치로 통합합니다. **셀프 호스팅, 소스 공개([BSL 1.1](../LICENSE) — 개인 및 활성 사용자 5명 이하·전체 인원 50명 이하 소규모 팀 무료), 벤더 종속 없음** — 메모리, 코드, 문서, 도구는 모두 내 인프라에 남으며 어떤 AI 모델이나 공급자([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode 등)든 자유롭게 전환할 수 있습니다.
+IM.codes는 AI 에이전트, 원격 머신, 팀 문서를 하나의 실시간 워크벤치로 통합합니다. **셀프 호스팅, 소스 공개([BSL 1.1](#라이선스)), 벤더 종속 없음** — 메모리, 코드, 문서, 도구는 모두 내 인프라에 남으며 어떤 AI 모델이나 공급자([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode 등)든 자유롭게 전환할 수 있습니다.
 
 > 이 문서는 번역본입니다. **기준 문서는 영어 README(`../README.md`)입니다.** 차이가 있으면 영어판을 우선합니다.
 
