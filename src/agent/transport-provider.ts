@@ -329,6 +329,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   projectName?: string;
   /** Runtime-bound server id for daemon-dependent managed MCP tools. */
   serverId?: string;
+  /** Authenticated account owner identity for managed Skill bindings. */
+  trustedOwnerId?: string;
   /** Exact provider identity injected into managed MCP authorization context. */
   providerId?: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */

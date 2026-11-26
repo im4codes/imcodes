@@ -4174,6 +4174,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     runtimeEpoch: resourceRuntimeEpoch,
     projectName,
     serverId: boundServerId,
+    trustedOwnerId: capabilityOwnerId,
     providerId: provider.id,
     fresh: !!opts.fresh,
     env: buildTransportSessionEnv(name, label, { ...(transportEnv ?? {}), ...(launchAuthContext?.env ?? {}) }, agentType),

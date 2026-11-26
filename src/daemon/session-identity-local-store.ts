@@ -47,6 +47,9 @@ function report(payload: Record<string, unknown>): void {
 const STORE_FILE = 'session-identities.json';
 const DB_FILE = 'session-identities.sqlite';
 const WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024;
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+const WAL_TRUNCATE_RETRY_COOLDOWN_MS = 250;
+const WAL_TRUNCATE_MAX_TIMER_ATTEMPTS = 8;
 
 interface DiskProfile extends Omit<SessionIdentityProfile, 'content'> {
   content: string;
@@ -116,6 +119,17 @@ registerMemoryProbe('identityStore', () => ({
 
 let activeDb: DatabaseSyncInstance | null = null;
 let activeDbPath: string | null = null;
+let pendingWalTruncatePath: string | null = null;
+let lastWalTruncateAttemptAt = 0;
+let walTruncateRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let walTruncateTimerAttempts = 0;
+
+function clearWalMaintenanceTimer(): void {
+  if (walTruncateRetryTimer) {
+    clearTimeout(walTruncateRetryTimer);
+    walTruncateRetryTimer = null;
+  }
+}
 
 function isLegacyJsonMigrated(db: DatabaseSyncInstance): boolean {
   const check = db.prepare(`SELECT value FROM session_identity_meta WHERE key = 'legacy_json_migrated'`).get() as { value: string } | undefined;
@@ -222,39 +236,121 @@ function walFileSizeBytes(dbPath: string): number {
   }
 }
 
+function runWalCheckpoint(
+  db: DatabaseSyncInstance,
+  mode: 'PASSIVE' | 'TRUNCATE',
+): { busy: number; log: number; checkpointed: number } {
+  try {
+    if (mode === 'TRUNCATE') {
+      db.exec('PRAGMA busy_timeout = 0');
+    }
+    const row = db.prepare(`PRAGMA wal_checkpoint(${mode})`).get() as
+      | { busy?: number; log?: number; checkpointed?: number }
+      | undefined;
+    return {
+      busy: Number(row?.busy ?? 0),
+      log: Number(row?.log ?? 0),
+      checkpointed: Number(row?.checkpointed ?? 0),
+    };
+  } catch {
+    return { busy: 1, log: 0, checkpointed: 0 };
+  } finally {
+    if (mode === 'TRUNCATE') {
+      try {
+        db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS}`);
+      } catch {
+        // ignore if closing
+      }
+    }
+  }
+}
+
+function scheduleWalTruncateMaintenance(dbPath: string): void {
+  if (dbPath === ':memory:' || walTruncateRetryTimer) return;
+  if (walTruncateTimerAttempts >= WAL_TRUNCATE_MAX_TIMER_ATTEMPTS) return;
+  const delayMs = Math.min(2000, 150 * Math.pow(2, walTruncateTimerAttempts));
+  walTruncateTimerAttempts += 1;
+  walTruncateRetryTimer = setTimeout(() => {
+    walTruncateRetryTimer = null;
+    if (!activeDb || activeDbPath !== dbPath || pendingWalTruncatePath !== dbPath) return;
+    tryBoundedWalTruncate(activeDb, dbPath, true);
+  }, delayMs);
+  walTruncateRetryTimer.unref?.();
+}
+
+function tryBoundedWalTruncate(db: DatabaseSyncInstance, dbPath: string, forceNow = false): void {
+  if (dbPath === ':memory:') return;
+  const walBytes = walFileSizeBytes(dbPath);
+  if (walBytes <= WAL_SIZE_LIMIT_BYTES) {
+    if (pendingWalTruncatePath === dbPath) {
+      pendingWalTruncatePath = null;
+      walTruncateTimerAttempts = 0;
+      clearWalMaintenanceTimer();
+    }
+    return;
+  }
+
+  const now = Date.now();
+  if (!forceNow && now - lastWalTruncateAttemptAt < WAL_TRUNCATE_RETRY_COOLDOWN_MS) {
+    pendingWalTruncatePath = dbPath;
+    scheduleWalTruncateMaintenance(dbPath);
+    return;
+  }
+
+  lastWalTruncateAttemptAt = now;
+  const result = runWalCheckpoint(db, 'TRUNCATE');
+  const remainingBytes = walFileSizeBytes(dbPath);
+  if (result.busy === 0 && remainingBytes <= WAL_SIZE_LIMIT_BYTES) {
+    pendingWalTruncatePath = null;
+    walTruncateTimerAttempts = 0;
+    clearWalMaintenanceTimer();
+    readStats.walCheckpoints += 1;
+    return;
+  }
+
+  pendingWalTruncatePath = dbPath;
+  scheduleWalTruncateMaintenance(dbPath);
+}
+
 function checkpointWal(db: DatabaseSyncInstance, dbPath: string, reason: 'startup' | 'write'): void {
   if (dbPath === ':memory:') return;
-  try {
-    const walBytes = walFileSizeBytes(dbPath);
-    if (reason === 'startup') {
-      if (walBytes === 0) return;
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-      readStats.walCheckpoints += 1;
-      return;
-    }
-    if (walBytes > WAL_SIZE_LIMIT_BYTES) {
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    } else {
-      db.exec('PRAGMA wal_checkpoint(PASSIVE)');
-    }
-    readStats.walCheckpoints += 1;
-  } catch {
-    // Another process may hold a read snapshot; SQLite retries on the next write or open.
+  if (reason === 'startup') {
+    tryBoundedWalTruncate(db, dbPath, true);
+    return;
   }
+  if (walFileSizeBytes(dbPath) > WAL_SIZE_LIMIT_BYTES) {
+    tryBoundedWalTruncate(db, dbPath);
+    return;
+  }
+  const result = runWalCheckpoint(db, 'PASSIVE');
+  if (result.busy === 0 && pendingWalTruncatePath === dbPath && walFileSizeBytes(dbPath) <= WAL_SIZE_LIMIT_BYTES) {
+    pendingWalTruncatePath = null;
+    walTruncateTimerAttempts = 0;
+    clearWalMaintenanceTimer();
+  }
+  readStats.walCheckpoints += 1;
 }
 
 function getDb(): DatabaseSyncInstance {
   const dbPath = localSessionIdentityDbPath();
   if (activeDb && activeDbPath === dbPath) {
     if (dbPath !== ':memory:' && !existsSync(dbPath)) {
+      clearWalMaintenanceTimer();
+      pendingWalTruncatePath = null;
       try { activeDb.close(); } catch { /* ignore */ }
       activeDb = null;
     } else {
+      if (pendingWalTruncatePath === dbPath) {
+        tryBoundedWalTruncate(activeDb, dbPath);
+      }
       return activeDb;
     }
   }
 
   if (activeDb) {
+    clearWalMaintenanceTimer();
+    pendingWalTruncatePath = null;
+    walTruncateTimerAttempts = 0;
     try { activeDb.close(); } catch { /* ignore */ }
     activeDb = null;
   }
@@ -268,7 +364,7 @@ function getDb(): DatabaseSyncInstance {
   try {
     db.exec(`
       PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = 5000;
+      PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS};
       PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES};
 
       CREATE TABLE IF NOT EXISTS session_identity_meta (
@@ -594,6 +690,10 @@ export function identityStoreReadStatsForTests(): {
 }
 
 export function resetIdentityStoreCacheForTests(): void {
+  clearWalMaintenanceTimer();
+  pendingWalTruncatePath = null;
+  lastWalTruncateAttemptAt = 0;
+  walTruncateTimerAttempts = 0;
   if (activeDb) {
     try { activeDb.close(); } catch { /* ignore */ }
     activeDb = null;

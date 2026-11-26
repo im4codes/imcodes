@@ -371,6 +371,14 @@ function filterStartupMemoryForAuthority(
   authority: ContextAuthorityDecision,
 ): TransportMemoryRecallArtifact | undefined {
   if (!startupMemory) return undefined;
+  // Managed Skill startup metadata is a capability catalog, not memory
+  // history, so keep it when memory authority is absent ('none', e.g. memory
+  // daemon disabled) as long as the provider itself is policy-allowed.
+  if (startupMemory.managedSkillsOnly === true) {
+    return authority.providerPolicyOutcome === 'unsupported' || authority.providerPolicyOutcome === 'degraded-blocked'
+      ? undefined
+      : startupMemory;
+  }
   if (authority.authoritySource === 'processed_local') return startupMemory;
   if (authority.authoritySource !== 'processed_remote') return undefined;
   const remoteItems = startupMemory.items.filter((item) => (

@@ -238,4 +238,56 @@ describe('daemon-local session identity store', () => {
     const shrunkWalBytes = existsSync(walPath) ? statSync(walPath).size : 0;
     expect(shrunkWalBytes).toBeLessThan(1024 * 1024);
   });
+
+  it('does not block on startup when a concurrent reader pins a bloated WAL, and auto-truncates once the read lock drops without user writes', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await mkdir(home, { recursive: true });
+
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'seed', source: 'web' });
+    resetIdentityStoreCacheForTests();
+
+    const dbPath = localSessionIdentityDbPath();
+    const pinReader = new DatabaseSync(dbPath);
+    pinReader.exec('BEGIN; SELECT count(*) FROM session_identity_profiles;');
+
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;');
+    const bigText = 'Z'.repeat(400_000);
+    const stmt = rawDb.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES ('session', ?, ?, 'h', 1, 1000, 'mcp', NULL)
+    `);
+    for (let i = 0; i < 28; i += 1) {
+      stmt.run(`locked-bloat-${i}`, bigText);
+    }
+    rawDb.close();
+
+    const walPath = `${dbPath}-wal`;
+    expect(statSync(walPath).size).toBeGreaterThan(8 * 1024 * 1024);
+
+    // 1. Open while pinReader holds an active read snapshot -> read succeeds immediately (never waits 5s busy_timeout).
+    const startedAt = Date.now();
+    try {
+      expect(await getLocalSessionIdentityProfile('session', 'locked-bloat-3')).toMatchObject({ content: bigText });
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      expect(statSync(walPath).size).toBeGreaterThan(8 * 1024 * 1024);
+
+      // 2. Release read snapshot with ZERO subsequent user writes -> coalesced maintenance shrinks WAL automatically.
+      pinReader.exec('ROLLBACK');
+      await vi.waitFor(() => {
+        const size = existsSync(walPath) ? statSync(walPath).size : 0;
+        expect(size).toBeLessThan(1024 * 1024);
+      }, { timeout: 3_000 });
+
+      // 3. Subsequent writes and reads keep monotonic revision and normal busy_timeout intact.
+      const w1 = await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'after-truncate-1', source: 'mcp' });
+      const w2 = await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'after-truncate-2', source: 'mcp' });
+      expect(w1.revision).toBe(2);
+      expect(w2.revision).toBe(3);
+      expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'after-truncate-2', revision: 3 });
+    } finally {
+      try { pinReader.close(); } catch { /* ignore */ }
+    }
+  });
 });

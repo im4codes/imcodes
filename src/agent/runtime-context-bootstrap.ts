@@ -352,6 +352,7 @@ export async function buildTransportStartupMemory(
       injectionSurface: 'message-preamble',
       items,
       injectedText: renderStartupMemoryText(selectedCandidates, memoryById),
+      ...(managedSkillsOnly ? { managedSkillsOnly: true } : {}),
     };
   } catch {
     return undefined;

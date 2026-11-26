@@ -6,10 +6,16 @@ import { MCP_TOOL_CATALOG_MODES } from '../../shared/mcp-tool-discovery.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setMemoryDaemonEnabled } from '../../src/store/memory-daemon-switch.js';
+import { resolveTransportContextBootstrap } from '../../src/agent/runtime-context-bootstrap.js';
+import { publishManagedSkillVersion } from '../../src/capability/managed-skill-store.js';
+import { inventoryAgentSkillPackage } from '../../src/capability/agent-skill-package.js';
+import { scanAgentSkillPackage } from '../../src/capability/skill-scanner.js';
+import { authorizedManagedBindings } from '../capability/capability-authorization-fixture.js';
+import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
@@ -9102,6 +9108,253 @@ ${PREFERENCE_CONTEXT_END}`;
             injectedText: expect.stringContaining('Should be skipped while memory daemon is off'),
           }),
         }));
+      } finally {
+        vi.unstubAllEnvs();
+        await localRuntime.kill().catch(() => {});
+        await rm(switchDir, { recursive: true, force: true });
+      }
+    });
+
+    it('preserves session/provider/machine-bound Managed Skills on dispatch when memory is disabled, and isolates unauthorized sessions', async () => {
+      const tempRoot = await mkdtemp(join(tmpdir(), 'imcodes-bound-skill-'));
+      const homeDir = join(tempRoot, 'home');
+      const sourceDir = join(tempRoot, 'skill-src');
+      const switchPath = join(tempRoot, 'memory-daemon-switch.json');
+      vi.stubEnv('HOME', homeDir);
+      vi.stubEnv('IMCODES_HOME', join(homeDir, '.imcodes'));
+      vi.stubEnv('IMCODES_MEMORY_DAEMON_SWITCH_PATH', switchPath);
+      vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), '1');
+
+      await mkdir(sourceDir, { recursive: true });
+      await writeFile(join(sourceDir, 'SKILL.md'), [
+        '---',
+        'name: session-bound-skill',
+        'description: Bound only to authorized session/provider/server.',
+        'compatibility: IM.codes',
+        '---',
+        'Restricted instructions.',
+        '',
+      ].join('\n'));
+      const inventory = inventoryAgentSkillPackage(sourceDir);
+      const scan = scanAgentSkillPackage(inventory);
+      publishManagedSkillVersion({
+        registryId: 'skill-session-bound',
+        versionId: inventory.treeDigest,
+        quarantinePath: sourceDir,
+        source: 'runtime-bound-test@immutable',
+        scannerDigest: scan.scannerDigest,
+        auditDigest: 'audit-pass',
+        auditPolicyVersion: 'test-v1',
+        bindings: authorizedManagedBindings({
+          ownerId: 'owner-1',
+          serverId: 'srv-1',
+          capabilityId: 'skill-session-bound',
+          versionId: inventory.treeDigest,
+          artifactDigest: inventory.treeDigest,
+          auditDigest: 'audit-pass',
+          bindings: [{
+            scope: 'session',
+            ownerId: 'owner-1',
+            sessionId: 'deck_skill_auth',
+            providers: ['mock'],
+            machines: ['srv-1'],
+          }],
+        }),
+      }, homeDir);
+
+      const authMock = makeMockProvider('mock');
+      const unauthMock = makeMockProvider('mock');
+      const authRuntime = new TransportSessionRuntime(authMock.provider, 'deck_skill_auth');
+      const unauthRuntime = new TransportSessionRuntime(unauthMock.provider, 'deck_skill_other');
+      try {
+        setMemoryDaemonEnabled(false);
+        const ns = { scope: 'personal' as const, projectId: 'repo-1', userId: 'owner-1' };
+
+        authRuntime.setContextBootstrapResolver(() => resolveTransportContextBootstrap({
+          projectDir: tempRoot,
+          sessionId: 'deck_skill_auth',
+          providerId: 'mock',
+          serverId: 'srv-1',
+          trustedOwnerId: 'owner-1',
+          transportConfig: { sharedContextNamespace: ns },
+        }));
+        unauthRuntime.setContextBootstrapResolver(() => resolveTransportContextBootstrap({
+          projectDir: tempRoot,
+          sessionId: 'deck_skill_other',
+          providerId: 'mock',
+          serverId: 'srv-1',
+          trustedOwnerId: 'owner-1',
+          transportConfig: { sharedContextNamespace: ns },
+        }));
+
+        await authRuntime.initialize({
+          ...defaultConfig,
+          sessionKey: 'deck_skill_auth',
+          sessionName: 'deck_skill_auth',
+          serverId: 'srv-1',
+          providerId: 'mock',
+          trustedOwnerId: 'owner-1',
+        });
+        await unauthRuntime.initialize({
+          ...defaultConfig,
+          sessionKey: 'deck_skill_other',
+          sessionName: 'deck_skill_other',
+          serverId: 'srv-1',
+          providerId: 'mock',
+          trustedOwnerId: 'owner-1',
+        });
+
+        // Also test the fallback rebuild path when bootstrap happened before disable, so runtime must drop memories and rebuild skills with exact identity.
+        const fallbackAuthMock = makeMockProvider('mock');
+        const fallbackAuthRuntime = new TransportSessionRuntime(fallbackAuthMock.provider, 'deck_skill_auth');
+        try {
+          await fallbackAuthRuntime.initialize({
+            ...defaultConfig,
+            sessionKey: 'deck_skill_auth',
+            sessionName: 'deck_skill_auth',
+            serverId: 'srv-1',
+            providerId: 'mock',
+            trustedOwnerId: 'owner-1',
+            contextNamespace: ns,
+          });
+          // Simulate non-skills historical memory existing on _startupMemory before dispatch while memory is off.
+          (fallbackAuthRuntime as unknown as { _startupMemory: unknown })._startupMemory = {
+            reason: 'startup',
+            items: [{ id: 'proj-mem-1', type: 'processed', projectId: 'repo-1', summary: 'Must drop historical memory when off' }],
+            injectedText: 'Must drop historical memory when off',
+          };
+          expect(fallbackAuthRuntime.send('Run with fallback skills rebuild', 'turn-fallback-skill')).toBe('sent');
+          await waitForProviderSendCount(fallbackAuthMock.provider, 1);
+          expect(fallbackAuthMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+            startupMemory: expect.objectContaining({
+              managedSkillsOnly: true,
+              injectedText: expect.stringContaining('capability-id: skill-session-bound'),
+            }),
+          }));
+          expect((fallbackAuthMock.provider.send.mock.calls[0]?.[1] as { messagePreamble?: string })?.messagePreamble)
+            .not.toContain('Must drop historical memory when off');
+        } finally {
+          await fallbackAuthRuntime.kill().catch(() => {});
+        }
+
+        expect(authRuntime.send('Turn with bound managed skill', 'turn-auth-skill')).toBe('sent');
+        await waitForProviderSendCount(authMock.provider, 1);
+        expect(authMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+          startupMemory: expect.objectContaining({
+            managedSkillsOnly: true,
+            injectedText: expect.stringContaining('capability-id: skill-session-bound'),
+          }),
+        }));
+
+        expect(unauthRuntime.send('Turn for unauthorized session', 'turn-unauth-skill')).toBe('sent');
+        await waitForProviderSendCount(unauthMock.provider, 1);
+        expect(unauthMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.not.objectContaining({
+          startupMemory: expect.anything(),
+        }));
+      } finally {
+        vi.unstubAllEnvs();
+        await authRuntime.kill().catch(() => {});
+        await unauthRuntime.kill().catch(() => {});
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('does not consume regular startupMemoryInjected when delivering skills-only startup while disabled, then delivers regular startup memory once on re-enable', async () => {
+      const switchDir = await mkdtemp(join(tmpdir(), 'imcodes-mem-startup-toggle-'));
+      const switchPath = join(switchDir, 'memory-daemon-switch.json');
+      vi.stubEnv('IMCODES_MEMORY_DAEMON_SWITCH_PATH', switchPath);
+
+      const localMock = makeMockProvider('mock');
+      const localRuntime = new TransportSessionRuntime(localMock.provider, 'deck_startup_toggle_brain');
+      const onInjected = vi.fn();
+      localRuntime.onStartupMemoryInjected = onInjected;
+      try {
+        setMemoryDaemonEnabled(false);
+        const skillsOnlyStartup = {
+          reason: 'startup' as const,
+          runtimeFamily: 'transport' as const,
+          authoritySource: 'processed_local' as const,
+          sourceKind: 'local_processed' as const,
+          injectionSurface: 'message-preamble' as const,
+          managedSkillsOnly: true,
+          items: [{
+            id: 'skill:managed:gen-1',
+            type: 'processed' as const,
+            projectId: 'repo-1',
+            scope: 'personal',
+            summary: 'managed skill summary',
+          }],
+          injectedText: 'managed/test-skill',
+        };
+        const regularStartup = {
+          reason: 'startup' as const,
+          runtimeFamily: 'transport' as const,
+          authoritySource: 'processed_local' as const,
+          sourceKind: 'local_processed' as const,
+          injectionSurface: 'message-preamble' as const,
+          items: [{
+            id: 'proj-startup-1',
+            type: 'processed' as const,
+            projectId: 'repo-1',
+            scope: 'personal',
+            projectionClass: 'durable_memory_candidate' as const,
+            summary: 'Regular durable startup memory',
+          }],
+          injectedText: 'Regular durable startup memory',
+        };
+
+        localRuntime.setContextBootstrapResolver(async () => ({
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+          diagnostics: ['namespace:explicit'],
+          localProcessedFreshness: 'fresh',
+          startupMemory: process.env.IMCODES_MEMORY_DAEMON_SWITCH_PATH &&
+            JSON.parse(readFileSync(switchPath, 'utf8')).enabled === false
+            ? skillsOnlyStartup
+            : regularStartup,
+        }));
+        await localRuntime.initialize({ ...defaultConfig, sessionKey: 'deck_startup_toggle_brain' });
+
+        // 1. Memory OFF Turn 1 -> sends skills-only startup, does NOT consume regular startupMemoryInjected.
+        expect(localRuntime.send('Turn 1 while disabled', 't1-off')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 1);
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+          startupMemory: expect.objectContaining({ injectedText: 'managed/test-skill', managedSkillsOnly: true }),
+        }));
+        expect(onInjected).not.toHaveBeenCalled();
+
+        localMock.fireComplete('sess-1');
+        await flushDispatch();
+
+        // 2. Memory OFF Turn 2 -> skills-only is NOT duplicated; onInjected still not called.
+        expect(localRuntime.send('Turn 2 still disabled', 't2-off')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 2);
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.not.objectContaining({
+          startupMemory: expect.anything(),
+        }));
+        expect(onInjected).not.toHaveBeenCalled();
+
+        localMock.fireComplete('sess-1');
+        await flushDispatch();
+
+        // 3. Re-enable memory -> Turn 3 receives regular startup memory ONCE and fires onInjected!
+        setMemoryDaemonEnabled(true);
+        expect(localRuntime.send('Turn 3 after re-enable', 't3-on')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 3);
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.objectContaining({
+          startupMemory: expect.objectContaining({ injectedText: 'Regular durable startup memory' }),
+        }));
+        expect(onInjected).toHaveBeenCalledTimes(1);
+
+        localMock.fireComplete('sess-1');
+        await flushDispatch();
+
+        // 4. Turn 4 -> regular startup memory is NEVER repeated!
+        expect(localRuntime.send('Turn 4 stays deduped', 't4-on')).toBe('sent');
+        await waitForProviderSendCount(localMock.provider, 4);
+        expect(localMock.provider.send).toHaveBeenNthCalledWith(4, 'sess-1', expect.not.objectContaining({
+          startupMemory: expect.anything(),
+        }));
+        expect(onInjected).toHaveBeenCalledTimes(1);
       } finally {
         vi.unstubAllEnvs();
         await localRuntime.kill().catch(() => {});
