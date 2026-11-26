@@ -2716,6 +2716,9 @@ interface CodexAppServerChannel {
   threadToSession: Map<string, string>;
   /** Durable threadIds currently loaded/resident in this child generation (physical residency, shared across session rebinds). */
   residentThreadIds: Set<string>;
+  /** Monotonic residency version per threadId on this channel generation; prevents lagged list snapshots from erasing newer start/resume. */
+  residentThreadVersions: Map<string, number>;
+  nextResidencyVersion: number;
   /** Serialized in-flight thread/unsubscribe promises keyed by physical threadId on this channel generation. */
   pendingThreadUnsubscribes: Map<string, Promise<void>>;
   /** Waiters notified when thread/closed or status=notLoaded arrives for a closing threadId. */
@@ -2740,6 +2743,8 @@ function createAppServerChannel(kind: CodexAppServerChannelKind): CodexAppServer
     disabledMcpKeys: [],
     threadToSession: new Map(),
     residentThreadIds: new Set(),
+    residentThreadVersions: new Map(),
+    nextResidencyVersion: 0,
     pendingThreadUnsubscribes: new Map(),
     threadClosedWaiters: new Map(),
   };
@@ -4613,6 +4618,7 @@ export class CodexSdkProvider implements TransportProvider {
           }
           if (oldThreadId && !this.hasActiveSessionUsingThread(channel, oldThreadId, state)) {
             channel.residentThreadIds.delete(oldThreadId);
+            channel.residentThreadVersions.delete(oldThreadId);
           }
           state.threadId = undefined;
           state.loaded = false;
@@ -4682,7 +4688,7 @@ export class CodexSdkProvider implements TransportProvider {
     const resumedId = result?.thread?.id ?? targetThreadId;
     if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
       if (channel.child && channel.generation === generation && resumedId) {
-        if (!state.incognito && !state.ephemeral) channel.residentThreadIds.add(resumedId);
+        if (!state.incognito && !state.ephemeral) this.markThreadResident(channel, resumedId);
         void this.unsubscribeChannelThread(channel, generation, resumedId, {
           excludingState: state,
           reason: 'stale-resume',
@@ -4702,7 +4708,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.threadId = resumedId;
     state.loaded = true;
     if (!state.incognito && !state.ephemeral) {
-      channel.residentThreadIds.add(resumedId);
+      this.markThreadResident(channel, resumedId);
     }
     channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
@@ -4754,7 +4760,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (!this.isSessionStateActiveOnChannel(sessionId, state, channel, generation)) {
         if (!state.incognito && !state.ephemeral && channel.child && channel.generation === generation) {
-          channel.residentThreadIds.add(threadId);
+          this.markThreadResident(channel, threadId);
           void this.unsubscribeChannelThread(channel, generation, threadId, {
             excludingState: state,
             reason: 'stale-start',
@@ -4767,7 +4773,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.nativeAgentFence = { threadId, fence };
       state.loaded = true;
       if (!state.incognito && !state.ephemeral) {
-        channel.residentThreadIds.add(threadId);
+        this.markThreadResident(channel, threadId);
       }
       channel.threadToSession.set(threadId, sessionId);
       if (!state.incognito || state.model) {
@@ -5807,7 +5813,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.threadId = threadId;
       state.loaded = true;
       if (!state.incognito && !state.ephemeral && params.thread?.ephemeral !== true) {
-        channel.residentThreadIds.add(threadId);
+        this.markThreadResident(channel, threadId);
       }
       this.adoptServiceTier(sessionId, state, params.thread?.serviceTier);
       if (!state.incognito || state.model || state.serviceTier) {
@@ -5879,8 +5885,12 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
-      if (threadId && !state.incognito && !state.ephemeral && (isThreadActiveStatus(status) || isThreadIdleStatus(status))) {
-        channel.residentThreadIds.add(threadId);
+      if (threadId && !state.incognito && !state.ephemeral) {
+        if (isThreadActiveStatus(status)) {
+          this.markThreadResident(channel, threadId);
+        } else if (isThreadIdleStatus(status) && !channel.residentThreadIds.has(threadId)) {
+          this.markThreadResident(channel, threadId);
+        }
       }
       if (isThreadActiveStatus(status)) {
         this.clearIdleSettleTimer(state); // turn resumed → cancel any pending idle settle
@@ -7558,6 +7568,7 @@ export class CodexSdkProvider implements TransportProvider {
   private clearChannelThreadTracking(channel: CodexAppServerChannel): void {
     channel.threadToSession.clear();
     channel.residentThreadIds.clear();
+    channel.residentThreadVersions.clear();
     channel.pendingThreadUnsubscribes.clear();
     for (const waiters of channel.threadClosedWaiters.values()) {
       for (const wake of waiters) wake();
@@ -7565,8 +7576,23 @@ export class CodexSdkProvider implements TransportProvider {
     channel.threadClosedWaiters.clear();
   }
 
-  private markThreadPhysicallyUnloaded(channel: CodexAppServerChannel, threadId: string): void {
+  private markThreadResident(channel: CodexAppServerChannel, threadId: string): number {
+    channel.nextResidencyVersion += 1;
+    channel.residentThreadIds.add(threadId);
+    channel.residentThreadVersions.set(threadId, channel.nextResidencyVersion);
+    return channel.nextResidencyVersion;
+  }
+
+  private markThreadPhysicallyUnloaded(
+    channel: CodexAppServerChannel,
+    threadId: string,
+    expectedVersion?: number,
+  ): boolean {
+    if (expectedVersion !== undefined && channel.residentThreadVersions.get(threadId) !== expectedVersion) {
+      return false;
+    }
     channel.residentThreadIds.delete(threadId);
+    channel.residentThreadVersions.delete(threadId);
     const waiters = channel.threadClosedWaiters.get(threadId);
     if (waiters) {
       channel.threadClosedWaiters.delete(threadId);
@@ -7583,6 +7609,24 @@ export class CodexSdkProvider implements TransportProvider {
         st.loaded = false;
       }
     }
+    return true;
+  }
+
+  private hasBusyOrLoadingSessionForThread(channel: CodexAppServerChannel, threadId: string): boolean {
+    for (const [, state] of this.sessions.entries()) {
+      if (state.ending) continue;
+      if (this.getChannelForSession(state) !== channel) continue;
+      if (state.threadId !== threadId) continue;
+      if (
+        state.threadLoadInFlightCount > 0
+        || state.sendInFlightCount > 0
+        || Boolean(state.runningTurnId)
+        || state.turnStartInFlight
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private hasActiveSessionUsingThread(
@@ -7636,8 +7680,11 @@ export class CodexSdkProvider implements TransportProvider {
     });
   }
 
-  private async syncChannelLoadedThreads(channel: CodexAppServerChannel): Promise<Set<string> | null> {
-    if (!channel.child?.stdin.writable) return null;
+  private async syncChannelLoadedThreads(
+    channel: CodexAppServerChannel,
+    targetVersions: ReadonlyMap<string, number>,
+  ): Promise<Set<string> | null> {
+    if (!channel.child?.stdin.writable || targetVersions.size === 0) return null;
     const generation = channel.generation;
     const loadedIds = new Set<string>();
     const seenCursors = new Set<string>();
@@ -7659,10 +7706,13 @@ export class CodexSdkProvider implements TransportProvider {
           ? result.nextCursor.trim()
           : null;
         if (!nextCursor) {
-          for (const trackedId of [...channel.residentThreadIds]) {
-            if (!loadedIds.has(trackedId)) {
-              this.markThreadPhysicallyUnloaded(channel, trackedId);
-            }
+          for (const [targetId, expectedVersion] of targetVersions.entries()) {
+            if (loadedIds.has(targetId)) continue;
+            if (!channel.residentThreadIds.has(targetId)) continue;
+            if (channel.residentThreadVersions.get(targetId) !== expectedVersion) continue;
+            if (channel.pendingThreadUnsubscribes.has(targetId)) continue;
+            if (this.hasBusyOrLoadingSessionForThread(channel, targetId)) continue;
+            this.markThreadPhysicallyUnloaded(channel, targetId, expectedVersion);
           }
           return loadedIds;
         }
@@ -7940,27 +7990,31 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (targetThreadIds.length === 0) return 0;
 
-    let needsLoadedListSync = false;
+    const pendingSyncVersions = new Map<string, number>();
     const evictPromises = targetThreadIds.map(async (threadId) => {
+      const versionAtAttempt = channel.residentThreadVersions.get(threadId);
       const outcome = await this.unsubscribeChannelThread(channel, generation, threadId, {
         requireIdleOwners: true,
         skipIfNotResident: true,
         reason,
       });
-      if (outcome === 'still-loaded') {
-        needsLoadedListSync = true;
+      if (
+        outcome === 'still-loaded'
+        && versionAtAttempt !== undefined
+        && channel.residentThreadVersions.get(threadId) === versionAtAttempt
+      ) {
+        pendingSyncVersions.set(threadId, versionAtAttempt);
       }
     });
 
     await Promise.allSettled(evictPromises);
 
     if (
-      needsLoadedListSync
+      pendingSyncVersions.size > 0
       && channel.child?.stdin.writable
       && channel.generation === generation
-      && targetThreadIds.some((threadId) => channel.residentThreadIds.has(threadId))
     ) {
-      await this.syncChannelLoadedThreads(channel);
+      await this.syncChannelLoadedThreads(channel, pendingSyncVersions);
     }
 
     let confirmedEvictedCount = 0;

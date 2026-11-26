@@ -21,8 +21,12 @@ const appServer = vi.hoisted(() => {
   let resumeHandler:
     | ((params: Record<string, any> | undefined, record: FakeChild, id: number) => 'auto' | 'defer' | { error: string })
     | undefined;
+  let loadedListHandler:
+    | ((params: Record<string, any> | undefined, record: FakeChild, id: number) => 'auto' | 'defer')
+    | undefined;
   const deferredUnsubscribes: Array<() => void> = [];
   const deferredResumes: Array<() => void> = [];
+  const deferredLoadedLists: Array<(data?: string[], nextCursor?: string | null) => void> = [];
 
   const emitUnloadComplete = (record: FakeChild, threadId: string): void => {
     if (!threadId) return;
@@ -74,7 +78,15 @@ const appServer = vi.hoisted(() => {
               record.emits({ id, result: { thread: { id: threadId } } });
             }
           } else if (message.method === 'thread/loaded/list') {
-            record.emits({ id, result: { data: [...record.residentThreads], nextCursor: null } });
+            const action = loadedListHandler?.(message.params, record, id) ?? 'auto';
+            if (action === 'defer') {
+              const snapshot = [...record.residentThreads];
+              deferredLoadedLists.push((data = snapshot, nextCursor = null) => {
+                record.emits({ id, result: { data, nextCursor } });
+              });
+            } else {
+              record.emits({ id, result: { data: [...record.residentThreads], nextCursor: null } });
+            }
           } else if (message.method === 'turn/start') {
             turnCounter += 1;
             record.emits({
@@ -143,6 +155,7 @@ const appServer = vi.hoisted(() => {
     children,
     deferredUnsubscribes,
     deferredResumes,
+    deferredLoadedLists,
     emitUnloadComplete,
     spawn,
     execFile,
@@ -152,14 +165,19 @@ const appServer = vi.hoisted(() => {
     setResumeHandler: (fn: typeof resumeHandler) => {
       resumeHandler = fn;
     },
+    setLoadedListHandler: (fn: typeof loadedListHandler) => {
+      loadedListHandler = fn;
+    },
     reset: () => {
       children.length = 0;
       deferredUnsubscribes.length = 0;
       deferredResumes.length = 0;
+      deferredLoadedLists.length = 0;
       threadCounter = 0;
       turnCounter = 0;
       unsubscribeHandler = undefined;
       resumeHandler = undefined;
+      loadedListHandler = undefined;
     },
   };
 });
@@ -868,6 +886,72 @@ describe('CodexSdkProvider idle thread eviction & LRU cap', () => {
     });
     await waitForCondition(() => completed.length === 1);
     expect(completed).toEqual(['resumed-ok']);
+
+    await provider.disconnect();
+  });
+
+  it('ignores stale lagged thread/loaded/list snapshots for newly loaded and same-id re-resumed threads and preserves subsequent LRU eviction', async () => {
+    const provider = new CodexSdkProvider({
+      maxLoadedThreads: 2,
+      idleThreadEvictMs: 1_000,
+      idleSweepIntervalMs: 60_000,
+    });
+    await provider.connect({ binaryPath: 'codex' });
+    const child = appServer.children[0]!;
+    const channel = (provider as unknown as { normalChannel: { residentThreadIds: Set<string> } }).normalChannel;
+
+    // 1. Load s-stale (thread-1) and advance past idleThreadEvictMs.
+    await provider.createSession({ sessionKey: 's-stale', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-stale', 'init');
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // 2. Unsubscribe returns { status: 'unsubscribed' } without thread/closed yet ('delayed-unload'),
+    //    and thread/loaded/list is held in flight returning an empty/stale snapshot later.
+    appServer.setUnsubscribeHandler(() => 'delayed-unload');
+    appServer.setLoadedListHandler(() => 'defer');
+    const sweepPromise = provider.sweepIdleThreads('periodic-idle-sweep');
+    await waitForCondition(() => appServer.deferredLoadedLists.length === 1);
+
+    // 3. While the stale thread/loaded/list RPC is still in flight:
+    //    (a) Re-resume the SAME durable threadId (`thread-1`) on `s-stale`, AND
+    //    (b) Start a BRAND NEW thread (`thread-2`) on `s-new`.
+    appServer.setUnsubscribeHandler(undefined);
+    appServer.setLoadedListHandler(undefined);
+    await runCompleteTurn(provider, child, 's-stale', 're-resumed');
+    await vi.advanceTimersByTimeAsync(100);
+    await provider.createSession({ sessionKey: 's-new', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-new', 'new-thread');
+
+    expect(getSessionState(provider, 's-stale')?.loaded).toBe(true);
+    expect(getSessionState(provider, 's-new')?.loaded).toBe(true);
+    expect(channel.residentThreadIds.has('thread-1')).toBe(true);
+    expect(channel.residentThreadIds.has('thread-2')).toBe(true);
+
+    // 4. Now resolve the lagged old thread/loaded/list snapshot containing NEITHER thread-1 NOR thread-2!
+    appServer.deferredLoadedLists.shift()!([]);
+    await expect(sweepPromise).resolves.toBe(0);
+
+    // CRITICAL INVARIANTS:
+    // - `s-new` (`thread-2`) was NOT in the targeted sync set and MUST keep loaded=true & residentThreadIds entry.
+    // - `s-stale` (`thread-1`) bumped its residency version on re-resume and MUST keep loaded=true & residentThreadIds entry.
+    expect(getSessionState(provider, 's-stale')?.loaded).toBe(true);
+    expect(getSessionState(provider, 's-new')?.loaded).toBe(true);
+    expect(channel.residentThreadIds.has('thread-1')).toBe(true);
+    expect(channel.residentThreadIds.has('thread-2')).toBe(true);
+    expect(channel.residentThreadIds.size).toBe(2);
+
+    // 5. Subsequent LRU cap (maxLoadedThreads=2): starting a 3rd session MUST still see thread-1 & thread-2 as resident
+    //    and evict oldest (`thread-1`) cleanly, leaving <= 2 resident threads.
+    await vi.advanceTimersByTimeAsync(100);
+    await provider.createSession({ sessionKey: 's-third', cwd: '/tmp/p', agentId: 'gpt-5.4' });
+    await runCompleteTurn(provider, child, 's-third', 'third');
+    await flushIo();
+
+    expect(child.residentThreads.has('thread-1')).toBe(false);
+    expect(channel.residentThreadIds.has('thread-1')).toBe(false);
+    expect(channel.residentThreadIds.has('thread-2')).toBe(true);
+    expect(channel.residentThreadIds.has('thread-3')).toBe(true);
+    expect(channel.residentThreadIds.size).toBeLessThanOrEqual(2);
 
     await provider.disconnect();
   });
